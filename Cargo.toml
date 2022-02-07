@@ -1,0 +1,12 @@
+[package]
+name = "mess"
+version = "0.0.1-placeholder"
+edition = "2021"
+authors = ["Bob"]
+description = "placeholder for a prototype message storage lib"
+repository = "https://github.com/bobisme/mess"
+homepage = "https://github.com/bobisme/mess"
+documentation = "https://github.com/bobisme/mess"
+readme = "README.md"
+
+[dependencies]
