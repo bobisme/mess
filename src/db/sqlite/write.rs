@@ -41,7 +41,7 @@ async fn write_message(
         stream_version(&mut tx, stream_name).await?.unwrap_or(-1);
     if let Some(expected_version) = expected_version {
         if expected_version != stream_version {
-            return Err(Error::WrongStreamVersion {
+            return Err(Error::WrongStreamPosition {
                 stream: stream_name.into(),
                 expected: expected_version,
                 found: stream_version,
@@ -84,51 +84,84 @@ async fn write_message(
 #[cfg(test)]
 mod test {
     use super::*;
-    use rstest::*;
-    use serde_json::json;
 
-    #[fixture]
-    async fn test_db() -> SqliteConnection {
-        let mut c = SqliteConnection::connect("sqlite::memory:").await.unwrap();
-        crate::db::sqlite::migration::mig(&mut c).await.unwrap();
-        c
-    }
+    mod write_message_fn {
+        use super::*;
+        use rstest::*;
+        use serde_json::json;
 
-    #[rstest]
-    async fn it_writes_messages(
-        #[future] test_db: SqliteConnection,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut conn = test_db.await;
-        let data = json!({ "one": 1, "two": 2 });
-        let meta = json!({ "three": 3, "four": 4 });
-        let pos = write_message(
-            &mut conn,
-            Id::from("fartxx.poopxx"),
-            "thing-xyz123.twothr",
-            "Donked",
-            &data,
-            &meta,
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(pos, Position { global: 1, stream: Some(0) });
+        #[fixture]
+        async fn test_db() -> SqliteConnection {
+            let mut c =
+                SqliteConnection::connect("sqlite::memory:").await.unwrap();
+            crate::db::sqlite::migration::mig(&mut c).await.unwrap();
+            c
+        }
 
-        let rows = sqlx::query!("SELECT * FROM messages LIMIT 2")
-            .fetch_all(&mut conn)
-            .await
-            .unwrap();
+        #[rstest]
+        async fn it_writes_messages(
+            #[future] test_db: SqliteConnection,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            let mut conn = test_db.await;
+            let data = json!({ "one": 1, "two": 2 });
+            let meta = json!({ "three": 3, "four": 4 });
+            let pos = write_message(
+                &mut conn,
+                Id::from("fartxx.poopxx"),
+                "thing-xyz123.twothr",
+                "Donked",
+                &data,
+                &meta,
+                None,
+            )
+            .await?;
+            assert_eq!(pos, Position { global: 1, stream: Some(0) });
 
-        assert_eq!(rows.len(), 1);
-        let row = &rows[0];
-        assert_eq!(row.global_position, 1);
-        assert_eq!(row.position, 0);
-        // assert!(row.time, "poot!");
-        assert_eq!(row.stream_name, "thing-xyz123.twothr");
-        assert_eq!(row.message_type, "Donked");
-        assert_eq!(row.data, json!({"one":1,"two":2}).to_string());
-        assert_eq!(row.metadata, Some(json!({"three":3,"four":4}).to_string()));
-        assert_eq!(row.id, "fartxx.poopxx");
-        Ok(())
+            let rows = sqlx::query!("SELECT * FROM messages LIMIT 2")
+                .fetch_all(&mut conn)
+                .await?;
+
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(row.global_position, 1);
+            assert_eq!(row.position, 0);
+            // assert!(row.time, "poot!");
+            assert_eq!(row.stream_name, "thing-xyz123.twothr");
+            assert_eq!(row.message_type, "Donked");
+            assert_eq!(row.data, json!({"one":1,"two":2}).to_string());
+            assert_eq!(
+                row.metadata,
+                Some(json!({"three":3,"four":4}).to_string())
+            );
+            assert_eq!(row.id, "fartxx.poopxx");
+            Ok(())
+        }
+
+        #[rstest]
+        async fn it_errors_if_stream_version_is_unexpected(
+            #[future] test_db: SqliteConnection,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            let mut conn = test_db.await;
+            let res = write_message(
+                &mut conn,
+                Id::from("fartxx.poopxx"),
+                "thing-xyz123.twothr",
+                "Donked",
+                &json!({ "one": 1, "two": 2 }),
+                None::<()>,
+                Some(77),
+            )
+            .await;
+            let err = res.unwrap_err();
+            if let Error::WrongStreamPosition { stream, expected, found } = err
+            {
+                assert_eq!(stream, "thing-xyz123.twothr");
+                assert_eq!(expected, 77);
+                assert_eq!(found, -1);
+            } else {
+                return Err("wrong enum type".into());
+            }
+            Ok(())
+        }
     }
 }

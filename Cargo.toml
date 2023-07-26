@@ -10,6 +10,9 @@ documentation = "https://github.com/bobisme/mess"
 readme = "README.md"
 license = "WTFPL"
 
+[workspace]
+members = ["xtask"]
+
 [lib]
 name = "mess"
 

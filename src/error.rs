@@ -17,12 +17,12 @@ pub enum Error {
     // #[error("failed to set user_version")]
     // UserVersion,
     #[error(
-        "wrong stream ver. for {} expected {}, had {}",
+        "wrong stream pos for {} expected {}, had {}",
         stream,
         expected,
         found
     )]
-    WrongStreamVersion { stream: String, expected: i64, found: i64 },
+    WrongStreamPosition { stream: String, expected: i64, found: i64 },
     // #[error("the data for key `{0}` is not available")]
     // Redaction(String),
     // #[error("invalid header (expected {expected:?}, found {found:?})")]
