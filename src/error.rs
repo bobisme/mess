@@ -1,5 +1,3 @@
-use std::borrow::Cow;
-
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -16,13 +14,8 @@ pub enum Error {
     // InitFailure,
     // #[error("failed to set user_version")]
     // UserVersion,
-    #[error(
-        "wrong stream pos for {} expected {}, had {}",
-        stream,
-        expected,
-        found
-    )]
-    WrongStreamPosition { stream: String, expected: i64, found: i64 },
+    #[error("wrong stream pos for {}", stream)]
+    WrongStreamPosition { stream: String },
     // #[error("the data for key `{0}` is not available")]
     // Redaction(String),
     // #[error("invalid header (expected {expected:?}, found {found:?})")]

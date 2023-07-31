@@ -1,7 +1,7 @@
 // future: replace with std::cell:LazyCell
 use once_cell::sync::Lazy;
 use sqlx::migrate::Migrator;
-use sqlx::{Connection, SqliteConnection, Transaction};
+use sqlx::{Connection, SqliteConnection, SqlitePool, Transaction};
 use std::{future::Future, pin::Pin};
 use tracing::{error, info};
 
@@ -64,8 +64,8 @@ async fn set_user_version(
     Ok(())
 }
 
-pub async fn mig(conn: &mut SqliteConnection) -> MessResult<()> {
-    MIGRATOR.run(conn).await.map_err(|e| Error::external(e.into()))
+pub async fn mig(pool: &SqlitePool) -> MessResult<()> {
+    MIGRATOR.run(pool).await.map_err(|e| Error::external(e.into()))
 }
 
 /// Runs thoughs migrations which have not been run and runs them, updating

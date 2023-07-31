@@ -13,3 +13,15 @@ impl Position {
         Self { global, stream }
     }
 }
+
+#[derive(sqlx::FromRow, PartialEq, Eq, Debug)]
+pub struct Message {
+    global_position: i64,
+    position: i64,
+    time: String,
+    stream_name: String,
+    message_type: String,
+    data: String,
+    metadata: Option<String>,
+    id: String,
+}
