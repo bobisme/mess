@@ -1,4 +1,28 @@
-use crate::db::Message;
+use crate::db::{read::ReadMessages, Message};
+
+// ```
+// use mess::db::read::ReadMessages;
+// use mess::db::sqlite::read::fetch;
+// let read_messages = ReadMessages::default()
+//     .from_stream("some_stream_name")
+//     .with_limit(5);
+// fetch(read_messages, &pool).unwrap();
+// ```
+pub async fn fetch(
+    rm: ReadMessages<'_>,
+    executor: impl sqlx::SqliteExecutor<'_>,
+) -> Result<Vec<Message>, sqlx::Error> {
+    if let Some(stream) = rm.stream_name() {
+        get_stream_messages(executor, stream, Some(rm.limit() as i32)).await
+    } else {
+        get_messages(
+            executor,
+            rm.global_position() as i32,
+            Some(rm.limit() as i32),
+        )
+        .await
+    }
+}
 
 pub async fn get_messages(
     executor: impl sqlx::SqliteExecutor<'_>,
@@ -12,7 +36,7 @@ pub async fn get_messages(
         SELECT
             global_position,
             position,
-            time,
+            time_ms,
             stream_name,
             message_type,
             data,
@@ -30,7 +54,7 @@ pub async fn get_messages(
     Ok(messages)
 }
 
-pub async fn get_stream_messages_batch(
+pub async fn get_stream_messages(
     executor: impl sqlx::SqliteExecutor<'_>,
     stream_name: &str,
     limit: Option<i32>,
@@ -42,7 +66,7 @@ pub async fn get_stream_messages_batch(
         SELECT
             global_position,
             position,
-            time,
+            time_ms,
             stream_name,
             message_type,
             data,
@@ -71,7 +95,7 @@ pub async fn get_latest_stream_message(
         SELECT 
             global_position,
             position,
-            time,
+            time_ms,
             stream_name,
             message_type,
             data,
@@ -172,7 +196,7 @@ mod test {
             let m = &messages[0];
             assert_eq!(m.global_position, 1);
             assert_eq!(m.position, 0);
-            assert_ne!(m.time, "");
+            assert_ne!(m.time_ms, 0);
             assert_eq!(m.stream_name, "stream1");
             assert_eq!(m.message_type, "X");
             assert_eq!(m.data, "0");
@@ -188,7 +212,7 @@ mod test {
             let m = &messages[0];
             assert_eq!(m.global_position, 5);
             assert_eq!(m.position, 2);
-            assert_ne!(m.time, "");
+            assert_ne!(m.time_ms, 0);
             assert_eq!(m.stream_name, "stream1");
             assert_eq!(m.message_type, "X");
             assert_eq!(m.data, "2");
@@ -217,12 +241,12 @@ mod test {
             assert_eq!(messages.len(), 1_000);
         }
 
-        // #[rstest]
-        // async fn the_max_is_10_000() {
-        //     let pool = test_db(5_010).await;
-        //     let messages = get_messages(&pool, 0, Some(100_000)).await.unwrap();
-        //     assert_eq!(messages.len(), 10_000);
-        // }
+        #[rstest]
+        async fn the_max_is_10_000() {
+            let pool = test_db(5_010).await;
+            let messages = get_messages(&pool, 0, Some(100_000)).await.unwrap();
+            assert_eq!(messages.len(), 10_000);
+        }
     }
 
     mod fn_get_stream_messages {
@@ -231,9 +255,8 @@ mod test {
         #[rstest]
         async fn it_only_returns_messages_from_given_stream() {
             let pool = test_db(5).await;
-            let messages = get_stream_messages_batch(&pool, "stream1", Some(5))
-                .await
-                .unwrap();
+            let messages =
+                get_stream_messages(&pool, "stream1", Some(5)).await.unwrap();
             assert_eq!(messages.len(), 5);
             for message in messages {
                 assert_eq!(message.stream_name, "stream1");
@@ -252,7 +275,7 @@ mod test {
                 .await
                 .unwrap()
                 .unwrap();
-            assert_ne!(m.time, "");
+            assert_ne!(m.time_ms, 0);
             assert_eq!(m.global_position, 9);
             assert_eq!(m.position, 4);
             assert_eq!(m.stream_name, "stream1");

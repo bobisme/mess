@@ -18,7 +18,7 @@ impl Position {
 pub struct Message {
     global_position: i64,
     position: i64,
-    time: String,
+    time_ms: i64,
     stream_name: String,
     message_type: String,
     data: String,
