@@ -24,6 +24,8 @@ pub enum Error {
     // InvalidHeader { expected: String, found: String },
     // #[error("unknown data store error")]
     // Unknown,
+    #[error("could not get prepared statement {}", key)]
+    PreparedStmtError { key: usize },
 }
 
 impl Error {

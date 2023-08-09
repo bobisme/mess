@@ -1,9 +1,11 @@
 use ident::Id;
 use rusqlite::{params, Connection};
 use serde::Serialize;
-use serde_json::Value;
 
-use crate::{db::Position, error::MessResult};
+use crate::{
+    db::Position,
+    error::{Error, MessResult},
+};
 
 pub fn write_message(
     conn: &Connection,
@@ -16,13 +18,13 @@ pub fn write_message(
 ) -> MessResult<Position> {
     let next_position = expected_version.unwrap_or(0);
     let msg_id_str = msg_id.to_string();
-    let data = Value::String(serde_json::to_string(&data)?);
+    let data = serde_json::to_string(&data)?;
     let meta = match meta {
-        Some(m) => Some(Value::String(serde_json::to_string(&m)?)),
+        Some(m) => Some(serde_json::to_string(&m)?),
         None => None,
     };
 
-    conn.execute(
+    let mut stmt = conn.prepare_cached(
         r#"
         INSERT INTO messages (
             id,
@@ -32,15 +34,36 @@ pub fn write_message(
             data,
             metadata
         ) VALUES (?, ?, ?, ?, ?, ?)
-        "#,
-        params![msg_id_str, stream_name, next_position, msg_type, data, meta],
+        RETURNING global_position, position"#,
     )?;
+    let (global_position, position): (i64, i64) = stmt
+        .query_row(
+            params![
+                msg_id_str,
+                stream_name,
+                next_position,
+                msg_type,
+                data,
+                meta
+            ],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(|err| match err {
+            rusqlite::Error::SqliteFailure(e, Some(ref msg)) => {
+                match (e.code, msg.as_str()) {
+                    (
+                        rusqlite::ErrorCode::ConstraintViolation,
+                        "stream position mismatch",
+                    ) => Error::WrongStreamPosition {
+                        stream: stream_name.into(),
+                    },
+                    _ => err.into(),
+                }
+            }
+            _ => err.into(),
+        })?;
 
-    let global_position: i64 = conn.last_insert_rowid();
-    Ok(Position::new(
-        global_position as u64,
-        Some(next_position.unsigned_abs()),
-    ))
+    Ok(Position::new(global_position as u64, Some(position.unsigned_abs())))
 }
 
 #[cfg(test)]
@@ -79,23 +102,25 @@ mod test {
     mod write_message_fn {
         // use crate::db::sqlite::test::new_memory_pool;
 
+        use super::*;
         use crate::error::Error;
 
-        use super::*;
+        use pretty_assertions::{assert_eq, assert_ne};
         use rstest::*;
+        use rusqlite::Connection;
         use serde_json::json;
 
         #[fixture]
-        fn test_db() -> Connection {
+        fn test_db<'a>() -> Connection {
             let mut conn = Connection::open_in_memory().unwrap();
             crate::db::rusqlite::migration::migrate(&mut conn).unwrap();
             conn
         }
 
         #[rstest]
-        fn it_writes_messages(
-            test_db: Connection,
-        ) -> Result<(), Box<dyn std::error::Error>> {
+        fn it_writes_messages(// test_db: Connection,
+        ) {
+            let test_db = test_db();
             let data = json!({ "one": 1, "two": 2 });
             let meta = json!({ "three": 3, "four": 4 });
             let pos = write_message(
@@ -106,11 +131,12 @@ mod test {
                 data,
                 Some(&meta),
                 None,
-            )?;
+            )
+            .unwrap();
             assert_eq!(pos, Position { global: 1, stream: Some(0) });
-            let mut stmt = test_db.prepare(r#"SELECT (
-                global_position, position, stream_name, message_type, data, metadata
-            ) FROM messages
+            let mut stmt = test_db.prepare(r#"SELECT
+                global_position, position, time_ms, stream_name, message_type, data, metadata, id
+            FROM messages
             LIMIT 2"#).unwrap();
             let rows: Result<Vec<MessageRow>, rusqlite::Error> =
                 stmt.query_map([], |row| row.try_into()).unwrap().collect();
@@ -128,7 +154,6 @@ mod test {
                 Some(json!({"three":3,"four":4}).to_string())
             );
             assert_eq!(row.id, "fartxx.poopxx");
-            Ok(())
         }
 
         #[rstest]
@@ -177,8 +202,8 @@ mod test {
 
         #[rstest]
         fn it_stores_json_metadata_when_some(
-            test_db: Connection,
         ) -> Result<(), Box<dyn std::error::Error>> {
+            let test_db: Connection = test_db();
             write_message(
                 &test_db,
                 Id::new(),
@@ -188,11 +213,11 @@ mod test {
                 Some(&json!({ "some": "meta" })),
                 None,
             )?;
-            let rec: MessageRow = test_db
-                .query_row("SELECT * FROM messages LIMIT 1", [], |r| {
-                    r.try_into()
-                })
-                .unwrap();
+            let rec: MessageRow = test_db.query_row(
+                "SELECT * FROM messages LIMIT 1",
+                [],
+                |r| r.try_into(),
+            )?;
             assert_eq!(
                 rec.metadata,
                 Some(json!({ "some": "meta" }).to_string())
@@ -207,6 +232,7 @@ mod testprops {
     use super::*;
     use proptest::prelude::*;
     use rstest::*;
+    use rusqlite::Connection;
 
     fn test_db() -> Connection {
         let mut conn = Connection::open_in_memory().unwrap();
@@ -220,18 +246,18 @@ mod testprops {
             msg_type in "\\PC*", stream_name in "\\PC*",
             data in "\\PC*", meta in "\\PC*",
         ) {
-                let conn = test_db();
-                let pos = write_message(
-                    &conn,
-                    Id::new(),
-                    &stream_name,
-                    &msg_type,
-                    data,
-                    Some(&meta),
-                    None,
-                )
-                .unwrap();
-                assert_eq!(pos, Position { global: 1, stream: Some(0) });
+            let conn = test_db();
+            let pos = write_message(
+                &conn,
+                Id::new(),
+                &stream_name,
+                &msg_type,
+                data,
+                Some(&meta),
+                None,
+            )
+            .unwrap();
+            assert_eq!(pos, Position { global: 1, stream: Some(0) });
         }
     }
 }

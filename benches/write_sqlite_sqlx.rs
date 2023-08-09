@@ -76,7 +76,7 @@ async fn write_a_message(conn: &mut SqliteConnection, expect: i64) {
 }
 
 pub fn once_to_memory(c: &mut Criterion) {
-    c.bench_function("write_message_once_to_memory", |b| {
+    c.bench_function("sqlx_write_message_once_to_memory", |b| {
         b.to_async(AsyncStdExecutor).iter_batched(
             || async {
                 let pool = new_memory_pool().await;
@@ -99,7 +99,7 @@ pub fn many_to_memory(c: &mut Criterion) {
         pool
     });
     let pos = Cell::new(0i64);
-    c.bench_function("write_many_messages_to_memory", |b| {
+    c.bench_function("sqlx_write_many_messages_to_memory", |b| {
         b.to_async(AsyncStdExecutor).iter(|| async {
             let p = pos.get();
             let mut conn = pool.acquire().await.unwrap();
@@ -116,11 +116,11 @@ pub fn writing_to_disk(c: &mut Criterion) {
         pool
     });
     let pos = Cell::new(0i64);
-    c.bench_function("write_message_to_disk", |b| {
+    c.bench_function("sqlx_write_many_messages_to_disk", |b| {
         b.to_async(AsyncStdExecutor).iter(|| async {
             let p = pos.get();
             let mut conn = pool.deref().acquire().await.unwrap();
-            write_a_message(&mut conn, pos.get()).await;
+            write_a_message(&mut conn, p).await;
             pos.set(p + 1);
         })
     });

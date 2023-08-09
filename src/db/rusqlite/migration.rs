@@ -73,16 +73,14 @@ static MIGRATIONS: Lazy<[MigrationFn; 1]> = Lazy::new(|| {
                 ),
                 [],
             )?;
+            tx.execute("DROP INDEX IF EXISTS messages_ord", [])?;
             tx.execute(
-                r#"
-                    DROP INDEX IF EXISTS messages_ord;
-                    CREATE INDEX messages_ord ON messages (ord);
-                "#,
+                "CREATE UNIQUE INDEX messages_ord ON messages (ord)",
                 [],
             )?;
+            tx.execute("DROP TRIGGER IF EXISTS clock_timestamp", [])?;
             tx.execute(
                 r#"
-DROP TRIGGER IF EXISTS clock_timestamp;
 CREATE TRIGGER clock_timestamp
 AFTER INSERT ON messages
 FOR EACH ROW
@@ -95,9 +93,9 @@ END;
                 [],
             )?;
             // CHECK: messages.position must match the next sequential
+            tx.execute("DROP TRIGGER IF EXISTS check_stream_position", [])?;
             tx.execute(
                 r#"
-DROP TRIGGER IF EXISTS check_stream_position;
 CREATE TRIGGER check_stream_position
 BEFORE INSERT ON messages
 FOR EACH ROW
@@ -116,13 +114,8 @@ END;
                 [],
             )?;
             // INDEX: messages.id
-            tx.execute(
-                r#"
-DROP INDEX IF EXISTS messages_id;
-CREATE UNIQUE INDEX messages_id ON messages (id);
-        "#,
-                [],
-            )?;
+            tx.execute("DROP INDEX IF EXISTS messages_id", [])?;
+            tx.execute("CREATE UNIQUE INDEX messages_id ON messages (id)", [])?;
             Ok(())
         }),
         // Migration 2...
@@ -211,7 +204,7 @@ mod test {
         migrate(&mut conn).unwrap();
 
         let rec = conn.query_row(
-            r#"SELECT (type, name, tbl_name) FROM sqlite_schema WHERE tbl_name = ?1"#,
+            r#"SELECT type, name, tbl_name FROM sqlite_schema WHERE tbl_name = ?1"#,
             params!["messages"],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         )
