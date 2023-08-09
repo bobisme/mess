@@ -1,5 +1,6 @@
 pub mod read;
-pub mod sqlite;
+pub mod rusqlite;
+pub mod sqlx;
 pub mod write;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -14,7 +15,7 @@ impl Position {
     }
 }
 
-#[derive(sqlx::FromRow, PartialEq, Eq, Debug)]
+#[derive(::sqlx::FromRow, PartialEq, Eq, Debug)]
 pub struct Message {
     global_position: i64,
     position: i64,

@@ -23,7 +23,7 @@ pub(crate) mod test {
 
     pub(crate) async fn new_memory_pool_with_migrations() -> SqlitePool {
         let pool = new_memory_pool().await;
-        crate::db::sqlite::migration::mig(&pool).await.unwrap();
+        crate::db::sqlx::migration::mig(&pool).await.unwrap();
         pool
     }
 }

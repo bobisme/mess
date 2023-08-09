@@ -1,4 +1,4 @@
-use mess::db::sqlite::migration;
+use mess::db::sqlx::migration;
 use sqlx::{migrate::MigrateDatabase, Connection, Sqlite, SqliteConnection};
 use tracing::info;
 use tracing_subscriber::{filter::LevelFilter, fmt, prelude::*, EnvFilter};

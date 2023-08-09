@@ -6,8 +6,10 @@ pub enum Error {
     External(#[from] Box<dyn std::error::Error>),
     #[error(transparent)]
     SqlxError(#[from] sqlx::Error),
+    #[error(transparent)]
+    RusqliteError(#[from] rusqlite::Error),
     #[error("database migration {0} failed: {1}")]
-    MigrationFailed(i32, sqlx::Error),
+    MigrationFailed(i32, Box<dyn std::error::Error>),
     #[error(transparent)]
     JSONError(#[from] serde_json::Error),
     // #[error("failed to initialize database")]

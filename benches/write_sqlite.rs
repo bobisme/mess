@@ -6,15 +6,14 @@ use std::time::Duration;
 use async_std::task::block_on;
 use criterion::async_executor::AsyncStdExecutor;
 use criterion::{
-    black_box, criterion_group, criterion_main, BatchSize, BenchmarkId,
-    Criterion,
+    black_box, criterion_group, criterion_main, BatchSize, Criterion,
 };
 
 use ident::Id;
 use serde_json::json;
 use sqlx::{SqliteConnection, SqlitePool};
 
-use mess::db::sqlite::write::write_message;
+use mess::db::sqlx::write::write_message;
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous,
 };
@@ -81,7 +80,7 @@ pub fn once_to_memory(c: &mut Criterion) {
         b.to_async(AsyncStdExecutor).iter_batched(
             || async {
                 let pool = new_memory_pool().await;
-                mess::db::sqlite::migration::mig(&pool).await.unwrap();
+                mess::db::sqlx::migration::mig(&pool).await.unwrap();
                 pool
             },
             |pool| async {
@@ -96,7 +95,7 @@ pub fn once_to_memory(c: &mut Criterion) {
 pub fn many_to_memory(c: &mut Criterion) {
     let pool = block_on(async {
         let pool = new_memory_pool().await;
-        mess::db::sqlite::migration::mig(&pool).await.unwrap();
+        mess::db::sqlx::migration::mig(&pool).await.unwrap();
         pool
     });
     let pos = Cell::new(0i64);
@@ -113,7 +112,7 @@ pub fn many_to_memory(c: &mut Criterion) {
 pub fn writing_to_disk(c: &mut Criterion) {
     let pool = block_on(async {
         let pool = new_disk_pool().await;
-        mess::db::sqlite::migration::mig(&pool).await.unwrap();
+        mess::db::sqlx::migration::mig(&pool).await.unwrap();
         pool
     });
     let pos = Cell::new(0i64);

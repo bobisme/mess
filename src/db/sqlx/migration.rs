@@ -82,7 +82,7 @@ pub async fn migrate(conn: &mut SqliteConnection) -> MessResult<()> {
 
         let res = migration(&mut tx).await;
         if let Err(err) = res {
-            let err = Error::MigrationFailed(version, err);
+            let err = Error::MigrationFailed(version, err.into());
             error!(?err, "Migration failed");
             return Err(err);
         }

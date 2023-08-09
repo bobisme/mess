@@ -1,26 +1,28 @@
 use ident::Id;
+use rusqlite::{params, Connection};
 use serde::Serialize;
-use sqlx::types::Json;
+use serde_json::Value;
 
-use crate::{
-    db::Position,
-    error::{Error, MessResult},
-};
+use crate::{db::Position, error::MessResult};
 
-pub async fn write_message(
-    executor: impl sqlx::SqliteExecutor<'_>,
+pub fn write_message(
+    conn: &Connection,
     msg_id: Id,
     stream_name: &str,
     msg_type: &str,
-    data: impl Serialize + Sync,
-    meta: Option<impl Serialize + Sync>,
+    data: impl Serialize,
+    meta: Option<impl Serialize>,
     expected_version: Option<i64>,
 ) -> MessResult<Position> {
     let next_position = expected_version.unwrap_or(0);
     let msg_id_str = msg_id.to_string();
-    let data = Json(data);
-    let meta = meta.map(|x| Json(x));
-    let record = sqlx::query!(
+    let data = Value::String(serde_json::to_string(&data)?);
+    let meta = match meta {
+        Some(m) => Some(Value::String(serde_json::to_string(&m)?)),
+        None => None,
+    };
+
+    conn.execute(
         r#"
         INSERT INTO messages (
             id,
@@ -29,30 +31,14 @@ pub async fn write_message(
             message_type,
             data,
             metadata
-        ) VALUES (
-            $1, $2, $3, $4, $5, $6
-        )
-        RETURNING global_position;"#,
-        msg_id_str,
-        stream_name,
-        next_position,
-        msg_type,
-        data,
-        meta,
-    )
-    .fetch_one(executor)
-    // .fetch_one(&mut *tx)
-    .await
-    .map_err(|err| {
-        if err.to_string().contains("stream position mismatch") {
-            Error::WrongStreamPosition { stream: stream_name.to_owned() }
-        } else {
-            Error::SqlxError(err)
-        }
-    })?;
-    // tx.commit().await?;
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        "#,
+        params![msg_id_str, stream_name, next_position, msg_type, data, meta],
+    )?;
+
+    let global_position: i64 = conn.last_insert_rowid();
     Ok(Position::new(
-        record.global_position as u64,
+        global_position as u64,
         Some(next_position.unsigned_abs()),
     ))
 }
@@ -61,49 +47,79 @@ pub async fn write_message(
 mod test {
     use super::*;
 
+    #[derive(PartialEq, Eq, Debug)]
+    pub struct MessageRow {
+        global_position: i64,
+        position: i64,
+        time_ms: i64,
+        stream_name: String,
+        message_type: String,
+        data: String,
+        metadata: Option<String>,
+        id: String,
+    }
+
+    impl TryFrom<&rusqlite::Row<'_>> for MessageRow {
+        type Error = rusqlite::Error;
+
+        fn try_from(row: &rusqlite::Row) -> Result<Self, Self::Error> {
+            Ok(Self {
+                global_position: row.get(0)?,
+                position: row.get(1)?,
+                time_ms: row.get(2)?,
+                stream_name: row.get(3)?,
+                message_type: row.get(4)?,
+                data: row.get(5)?,
+                metadata: row.get(6)?,
+                id: row.get(7)?,
+            })
+        }
+    }
+
     mod write_message_fn {
-        use crate::db::sqlite::test::new_memory_pool;
+        // use crate::db::sqlite::test::new_memory_pool;
+
+        use crate::error::Error;
 
         use super::*;
         use rstest::*;
         use serde_json::json;
-        use sqlx::SqlitePool;
 
         #[fixture]
-        async fn test_db() -> SqlitePool {
-            let pool = new_memory_pool().await;
-            crate::db::sqlite::migration::mig(&pool).await.unwrap();
-            pool
+        fn test_db() -> Connection {
+            let mut conn = Connection::open_in_memory().unwrap();
+            crate::db::rusqlite::migration::migrate(&mut conn).unwrap();
+            conn
         }
 
         #[rstest]
-        async fn it_writes_messages(
-            #[future] test_db: SqlitePool,
+        fn it_writes_messages(
+            test_db: Connection,
         ) -> Result<(), Box<dyn std::error::Error>> {
-            let mut conn = test_db.await.acquire().await.unwrap();
             let data = json!({ "one": 1, "two": 2 });
             let meta = json!({ "three": 3, "four": 4 });
             let pos = write_message(
-                &mut *conn,
+                &test_db,
                 Id::from("fartxx.poopxx"),
                 "thing-xyz123.twothr",
                 "Donked",
-                &data,
+                data,
                 Some(&meta),
                 None,
-            )
-            .await?;
+            )?;
             assert_eq!(pos, Position { global: 1, stream: Some(0) });
-
-            let rows = sqlx::query!("SELECT * FROM messages LIMIT 2")
-                .fetch_all(&mut *conn)
-                .await?;
-
+            let mut stmt = test_db.prepare(r#"SELECT (
+                global_position, position, stream_name, message_type, data, metadata
+            ) FROM messages
+            LIMIT 2"#).unwrap();
+            let rows: Result<Vec<MessageRow>, rusqlite::Error> =
+                stmt.query_map([], |row| row.try_into()).unwrap().collect();
+            let rows = rows.unwrap();
             assert_eq!(rows.len(), 1);
             let row = &rows[0];
             assert_eq!(row.global_position, 1);
             assert_eq!(row.position, 0);
-            // assert!(row.time, "poot!");
+            assert_ne!(row.time_ms, 0);
             assert_eq!(row.stream_name, "thing-xyz123.twothr");
             assert_eq!(row.message_type, "Donked");
             assert_eq!(row.data, json!({"one":1,"two":2}).to_string());
@@ -116,20 +132,18 @@ mod test {
         }
 
         #[rstest]
-        async fn it_errors_if_stream_version_is_unexpected(
-            #[future] test_db: SqlitePool,
+        fn it_errors_if_stream_version_is_unexpected(
+            test_db: Connection,
         ) -> Result<(), Box<dyn std::error::Error>> {
-            let mut conn = test_db.await.acquire().await.unwrap();
             let res = write_message(
-                &mut *conn,
+                &test_db,
                 Id::from("fartxx.poopxx"),
                 "thing-xyz123.twothr",
                 "Donked",
-                &json!({ "one": 1, "two": 2 }),
+                json!({ "one": 1, "two": 2 }),
                 None::<()>,
                 Some(77),
-            )
-            .await;
+            );
             let err = res.unwrap_err();
             if let Error::WrongStreamPosition { stream } = err {
                 assert_eq!(stream, "thing-xyz123.twothr");
@@ -140,45 +154,45 @@ mod test {
         }
 
         #[rstest]
-        async fn it_stores_null_when_metadata_is_none(
-            #[future] test_db: SqlitePool,
+        fn it_stores_null_when_metadata_is_none(
+            test_db: Connection,
         ) -> Result<(), Box<dyn std::error::Error>> {
-            let mut conn = test_db.await.acquire().await.unwrap();
             write_message(
-                &mut *conn,
+                &test_db,
                 Id::new(),
                 "stream1",
                 "X",
                 "data",
                 None::<()>,
                 None,
-            )
-            .await?;
-            let rec = sqlx::query!("SELECT * FROM messages LIMIT 1")
-                .fetch_one(&mut *conn)
-                .await?;
+            )?;
+            let rec: MessageRow = test_db
+                .query_row("SELECT * FROM messages LIMIT 1", [], |r| {
+                    r.try_into()
+                })
+                .unwrap();
             assert_eq!(rec.metadata, None);
             Ok(())
         }
 
         #[rstest]
-        async fn it_stores_json_metadata_when_some(
-            #[future] test_db: SqlitePool,
+        fn it_stores_json_metadata_when_some(
+            test_db: Connection,
         ) -> Result<(), Box<dyn std::error::Error>> {
-            let mut conn = test_db.await.acquire().await.unwrap();
             write_message(
-                &mut *conn,
+                &test_db,
                 Id::new(),
                 "stream2",
                 "X",
                 "data",
                 Some(&json!({ "some": "meta" })),
                 None,
-            )
-            .await?;
-            let rec = sqlx::query!("SELECT * FROM messages LIMIT 1")
-                .fetch_one(&mut *conn)
-                .await?;
+            )?;
+            let rec: MessageRow = test_db
+                .query_row("SELECT * FROM messages LIMIT 1", [], |r| {
+                    r.try_into()
+                })
+                .unwrap();
             assert_eq!(
                 rec.metadata,
                 Some(json!({ "some": "meta" }).to_string())
@@ -193,10 +207,11 @@ mod testprops {
     use super::*;
     use proptest::prelude::*;
     use rstest::*;
-    use sqlx::SqlitePool;
 
-    async fn test_db() -> SqlitePool {
-        crate::db::sqlite::test::new_memory_pool_with_migrations().await
+    fn test_db() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::rusqlite::migration::migrate(&mut conn).unwrap();
+        conn
     }
 
     proptest! {
@@ -205,20 +220,18 @@ mod testprops {
             msg_type in "\\PC*", stream_name in "\\PC*",
             data in "\\PC*", meta in "\\PC*",
         ) {
-            async_std::task::block_on(async {
-                let pool = test_db().await;
+                let conn = test_db();
                 let pos = write_message(
-                    &pool,
+                    &conn,
                     Id::new(),
                     &stream_name,
                     &msg_type,
-                    &data,
+                    data,
                     Some(&meta),
                     None,
                 )
-                .await.unwrap();
+                .unwrap();
                 assert_eq!(pos, Position { global: 1, stream: Some(0) });
-            });
         }
     }
 }
