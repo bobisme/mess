@@ -1,3 +1,5 @@
+pub mod error;
+pub mod msg;
 pub mod read;
 pub mod rusqlite;
 pub mod sqlx;
@@ -25,4 +27,21 @@ pub struct Message {
     data: String,
     metadata: Option<String>,
     id: String,
+}
+
+impl TryFrom<&::rusqlite::Row<'_>> for Message {
+    type Error = ::rusqlite::Error;
+
+    fn try_from(row: &::rusqlite::Row<'_>) -> Result<Self, Self::Error> {
+        Ok(Self {
+            global_position: row.get(0)?,
+            position: row.get(1)?,
+            time_ms: row.get(2)?,
+            stream_name: row.get(3)?,
+            message_type: row.get(4)?,
+            data: row.get(5)?,
+            metadata: row.get(6)?,
+            id: row.get(7)?,
+        })
+    }
 }

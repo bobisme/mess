@@ -1,4 +1,4 @@
-use crate::db::{read::ReadMessages, Message};
+use crate::{read::ReadMessages, Message};
 
 // ```
 // use mess::db::read::ReadMessages;
@@ -136,7 +136,7 @@ pub async fn get_latest_stream_position(
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::db::sqlx::test::new_memory_pool;
+    use crate::sqlx::test::new_memory_pool;
     use rstest::*;
     use sqlx::{QueryBuilder, SqlitePool};
 
@@ -145,7 +145,7 @@ mod test {
     async fn test_db(rows_per_stream: i64) -> SqlitePool {
         let rows_per_stream = rows_per_stream.max(0) as usize;
         let pool = new_memory_pool().await;
-        crate::db::sqlx::migration::mig(&pool).await.unwrap();
+        crate::sqlx::migration::mig(&pool).await.unwrap();
 
         let rows = (0..).map(|i| {
             [

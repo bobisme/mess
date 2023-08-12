@@ -2,10 +2,67 @@ use ident::Id;
 use rusqlite::{params, Connection};
 use serde::Serialize;
 
+const ROWS_PER_BULK_INSERT: usize = 100;
+
 use crate::{
-    db::Position,
     error::{Error, MessResult},
+    write::WriteMessage,
+    Position,
 };
+
+pub fn write_mess<D: Serialize, M: Serialize>(
+    conn: &Connection,
+    msg: WriteMessage<D, M>,
+) -> MessResult<Position> {
+    write_message(
+        conn,
+        msg.id,
+        &msg.stream_name,
+        &msg.message_type,
+        msg.data,
+        msg.metadata,
+        msg.expected_stream_position,
+    )
+}
+
+// pub fn write_mess_bulk<'a, D: Serialize, M: Serialize>(
+//     conn: &Connection,
+//     msgs: impl Iterator<Item = WriteMessage<'a, D, M>>,
+// ) -> MessResult<()> {
+//     let mut sql: String = r#"
+//     INSERT INTO messages (
+//         id,
+//         stream_name,
+//         position,
+//         message_type,
+//         data
+//     ) VALUES
+//     "#
+//     .to_owned();
+//     loop {
+//         let placeholder_iter = msgs.
+//         let inner = placeholder_iter.take(ROWS_PER_BULK_INSERT);
+//         let mut count = 0;
+//         for _ in inner {
+//             if count > 1 {
+//                 sql.push_str(",");
+//             }
+//             sql.push_str("\n(?, ?, ?, ?, ?)");
+//         }
+//     }
+//     // for msg in msgs {
+//     //     write_message(
+//     //         &tx,
+//     //         msg.id,
+//     //         &msg.stream_name,
+//     //         &msg.message_type,
+//     //         msg.data,
+//     //         msg.metadata,
+//     //         msg.expected_stream_position,
+//     //     )?;
+//     // }
+//     Ok(())
+// }
 
 pub fn write_message(
     conn: &Connection,
@@ -100,7 +157,7 @@ mod test {
     }
 
     mod write_message_fn {
-        // use crate::db::sqlite::test::new_memory_pool;
+        // use crate::sqlite::test::new_memory_pool;
 
         use super::*;
         use crate::error::Error;
@@ -113,7 +170,7 @@ mod test {
         #[fixture]
         fn test_db<'a>() -> Connection {
             let mut conn = Connection::open_in_memory().unwrap();
-            crate::db::rusqlite::migration::migrate(&mut conn).unwrap();
+            crate::rusqlite::migration::migrate(&mut conn).unwrap();
             conn
         }
 
@@ -236,7 +293,7 @@ mod testprops {
 
     fn test_db() -> Connection {
         let mut conn = Connection::open_in_memory().unwrap();
-        crate::db::rusqlite::migration::migrate(&mut conn).unwrap();
+        crate::rusqlite::migration::migrate(&mut conn).unwrap();
         conn
     }
 

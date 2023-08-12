@@ -3,8 +3,8 @@ use serde::Serialize;
 use sqlx::types::Json;
 
 use crate::{
-    db::Position,
     error::{Error, MessResult},
+    Position,
 };
 
 pub async fn write_message(
@@ -62,7 +62,7 @@ mod test {
     use super::*;
 
     mod write_message_fn {
-        use crate::db::sqlx::test::new_memory_pool;
+        use crate::sqlx::test::new_memory_pool;
 
         use super::*;
         use rstest::*;
@@ -72,7 +72,7 @@ mod test {
         #[fixture]
         async fn test_db() -> SqlitePool {
             let pool = new_memory_pool().await;
-            crate::db::sqlx::migration::mig(&pool).await.unwrap();
+            crate::sqlx::migration::mig(&pool).await.unwrap();
             pool
         }
 
@@ -196,7 +196,7 @@ mod testprops {
     use sqlx::SqlitePool;
 
     async fn test_db() -> SqlitePool {
-        crate::db::sqlx::test::new_memory_pool_with_migrations().await
+        crate::sqlx::test::new_memory_pool_with_migrations().await
     }
 
     proptest! {

@@ -18,9 +18,9 @@ pub(crate) mod test {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn new_memory_pool_with_migrations() -> Connection {
+    pub(crate) fn new_memory_conn_with_migrations() -> Connection {
         let mut conn = new_memory_conn();
-        crate::db::rusqlite::migration::migrate(&mut conn).unwrap();
+        crate::rusqlite::migration::migrate(&mut conn).unwrap();
         conn
     }
 }

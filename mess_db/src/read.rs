@@ -46,7 +46,7 @@ pub const LIMIT_MAX: u32 = 10_000;
 /// # Default
 ///
 /// ```
-/// use mess::db::read::ReadMessages;
+/// use mess_db::read::ReadMessages;
 /// let read_messages = ReadMessages::default();
 ///
 /// assert_eq!(read_messages.global_position(), 0);
