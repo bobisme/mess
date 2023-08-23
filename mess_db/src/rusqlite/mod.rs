@@ -1,3 +1,4 @@
+#![cfg(feature = "rusqlite")]
 pub mod connection;
 pub mod migration;
 pub mod read;

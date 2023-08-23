@@ -1,4 +1,3 @@
-#![cfg(feature = "sqlx-sqlite")]
 use ident::Id;
 use serde::Serialize;
 use sqlx::types::Json;

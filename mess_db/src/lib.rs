@@ -30,6 +30,7 @@ pub struct Message {
     id: String,
 }
 
+#[cfg(feature = "rusqlite")]
 impl TryFrom<&::rusqlite::Row<'_>> for Message {
     type Error = ::rusqlite::Error;
 

@@ -1,4 +1,3 @@
-#![cfg(feature = "sqlx-sqlite")]
 use crate::{read::ReadMessages, Message};
 
 // ```

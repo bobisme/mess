@@ -8,6 +8,7 @@ pub enum Error {
     #[cfg(feature = "sqlx")]
     SqlxError(#[from] sqlx::Error),
     #[error(transparent)]
+    #[cfg(feature = "rusqlite")]
     RusqliteError(#[from] rusqlite::Error),
     #[error("database migration {0} failed: {1}")]
     MigrationFailed(i32, Box<dyn std::error::Error>),
