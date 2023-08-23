@@ -17,7 +17,8 @@ impl Position {
     }
 }
 
-#[derive(::sqlx::FromRow, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "sqlx", derive(::sqlx::FromRow))]
 pub struct Message {
     global_position: i64,
     position: i64,

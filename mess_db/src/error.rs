@@ -5,6 +5,7 @@ pub enum Error {
     #[error(transparent)]
     External(#[from] Box<dyn std::error::Error>),
     #[error(transparent)]
+    #[cfg(feature = "sqlx")]
     SqlxError(#[from] sqlx::Error),
     #[error(transparent)]
     RusqliteError(#[from] rusqlite::Error),

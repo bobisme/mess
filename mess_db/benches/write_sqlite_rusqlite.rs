@@ -10,7 +10,7 @@ use ident::Id;
 use rusqlite::Connection;
 use serde_json::json;
 
-use mess::db::rusqlite::write::write_message;
+use mess_db::rusqlite::write::write_message;
 
 fn new_memory_conn() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
@@ -84,7 +84,7 @@ pub fn once_to_memory(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let mut conn = new_memory_conn();
-                mess::db::rusqlite::migration::migrate(&mut conn).unwrap();
+                mess_db::rusqlite::migration::migrate(&mut conn).unwrap();
                 conn
             },
             |conn| {
@@ -97,7 +97,7 @@ pub fn once_to_memory(c: &mut Criterion) {
 
 pub fn many_to_memory(c: &mut Criterion) {
     let mut conn = new_memory_conn();
-    mess::db::rusqlite::migration::migrate(&mut conn).unwrap();
+    mess_db::rusqlite::migration::migrate(&mut conn).unwrap();
     let pos = Cell::new(0i64);
     c.bench_function("rusq_write_many_messages_to_memory", |b| {
         b.iter(|| {
@@ -110,7 +110,7 @@ pub fn many_to_memory(c: &mut Criterion) {
 
 pub fn writing_to_disk(c: &mut Criterion) {
     let mut conn = new_disk_pool();
-    mess::db::rusqlite::migration::migrate(&mut conn).unwrap();
+    mess_db::rusqlite::migration::migrate(&mut conn).unwrap();
     let pos = Cell::new(0i64);
     c.bench_function("rusq_write_many_messages_to_disk", |b| {
         b.iter(|| {

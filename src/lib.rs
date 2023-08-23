@@ -1,1 +1,3 @@
-pub use mess_db::*;
+pub mod db {
+    pub use mess_db::*;
+}

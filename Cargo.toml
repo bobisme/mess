@@ -15,18 +15,10 @@ xtest = []
 proptest = []
 
 [workspace]
-members = ["mess_db", "mess_ecs", "xtask"]
+members = ["mess_db", "xtask"]
 
 [lib]
 name = "mess"
 
 [dependencies]
 mess_db = { path = "mess_db" }
-
-[[bench]]
-name = "write_sqlite_sqlx"
-harness = false
-
-[[bench]]
-name = "write_sqlite_rusqlite"
-harness = false

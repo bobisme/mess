@@ -1,3 +1,4 @@
+#![cfg(feature = "sqlx-sqlite")]
 use std::cell::Cell;
 use std::ops::Deref;
 use std::str::FromStr;
@@ -13,7 +14,7 @@ use ident::Id;
 use serde_json::json;
 use sqlx::{SqliteConnection, SqlitePool};
 
-use mess::db::sqlx::write::write_message;
+use mess_db::sqlx::write::write_message;
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous,
 };
@@ -80,7 +81,7 @@ pub fn once_to_memory(c: &mut Criterion) {
         b.to_async(AsyncStdExecutor).iter_batched(
             || async {
                 let pool = new_memory_pool().await;
-                mess::db::sqlx::migration::mig(&pool).await.unwrap();
+                mess_db::sqlx::migration::mig(&pool).await.unwrap();
                 pool
             },
             |pool| async {
@@ -95,7 +96,7 @@ pub fn once_to_memory(c: &mut Criterion) {
 pub fn many_to_memory(c: &mut Criterion) {
     let pool = block_on(async {
         let pool = new_memory_pool().await;
-        mess::db::sqlx::migration::mig(&pool).await.unwrap();
+        mess_db::sqlx::migration::mig(&pool).await.unwrap();
         pool
     });
     let pos = Cell::new(0i64);
@@ -112,7 +113,7 @@ pub fn many_to_memory(c: &mut Criterion) {
 pub fn writing_to_disk(c: &mut Criterion) {
     let pool = block_on(async {
         let pool = new_disk_pool().await;
-        mess::db::sqlx::migration::mig(&pool).await.unwrap();
+        mess_db::sqlx::migration::mig(&pool).await.unwrap();
         pool
     });
     let pos = Cell::new(0i64);
@@ -134,4 +135,5 @@ criterion_group!(
         many_to_memory,
         writing_to_disk
 );
+
 criterion_main!(benches);
