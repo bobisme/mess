@@ -9,7 +9,7 @@ use crate::{
 use rkyv::{Archive, Deserialize, Serialize};
 use rocksdb::IteratorMode;
 
-const SEPARATOR: u8 = '|' as u8;
+const SEPARATOR: u8 = b'|';
 
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
 #[archive(compare(PartialEq), check_bytes)]
@@ -23,6 +23,28 @@ pub(crate) struct GlobalRecord {
     data: Vec<u8>,
     metadata: Vec<u8>,
     ord: u64,
+}
+
+impl GlobalRecord {
+    fn from_write_message_partial<D, M>(
+        msg: &WriteMessage<'_, D, M>,
+    ) -> MessResult<Self>
+    where
+        D: serde::Serialize,
+        M: serde::Serialize,
+    {
+        let stream_position =
+            msg.expected_stream_position.map(|x| x + 1).unwrap_or(0);
+        Ok(Self {
+            id: msg.id.to_string(),
+            stream_name: msg.stream_name.as_ref().into(),
+            stream_position,
+            message_type: msg.message_type.as_ref().into(),
+            data: Default::default(),
+            metadata: Default::default(),
+            ord: 0,
+        })
+    }
 }
 
 impl<D, M> TryFrom<&WriteMessage<'_, D, M>> for GlobalRecord
@@ -71,6 +93,23 @@ impl StreamRecord {
     fn set_global_position(mut self, pos: u64) -> Self {
         self.global_position = pos;
         self
+    }
+
+    fn from_write_message_partial<D, M>(
+        msg: &WriteMessage<'_, D, M>,
+    ) -> MessResult<Self>
+    where
+        D: serde::Serialize,
+        M: serde::Serialize,
+    {
+        Ok(Self {
+            id: msg.id.to_string(),
+            global_position: Default::default(),
+            message_type: msg.message_type.as_ref().into(),
+            data: Default::default(),
+            metadata: Default::default(),
+            ord: 0,
+        })
     }
 }
 
@@ -200,7 +239,7 @@ pub fn get_last_stream_position<'a>(
     Ok(Some(key))
 }
 
-pub fn write_mess<D: ::serde::Serialize, M: ::serde::Serialize>(
+pub fn write_mess<D: serde::Serialize, M: serde::Serialize>(
     db: &DB,
     msg: WriteMessage<D, M>,
 ) -> MessResult<Position> {
@@ -216,13 +255,30 @@ pub fn write_mess<D: ::serde::Serialize, M: ::serde::Serialize>(
         }),
     }?;
 
-    let global_record = GlobalRecord::try_from(&msg)?;
+    {
+        let mut dbuf = db.data_buffer();
+        let mut mbuf = db.meta_buffer();
+        let mut data_serializer = serde_json::Serializer::new(&mut *dbuf);
+        let mut metadata_serializer = serde_json::Serializer::new(&mut *mbuf);
+        msg.data.serialize(&mut data_serializer)?;
+        msg.metadata
+            .as_ref()
+            .map(|x| x.serialize(&mut metadata_serializer))
+            .transpose()?;
+    }
+    db.clear_serialization_buffers();
+
+    let mut global_record = GlobalRecord::from_write_message_partial(&msg)?;
+    global_record.data = db.data_buffer().clone();
+    global_record.metadata = db.meta_buffer().clone();
+
+    let mut stream_record = StreamRecord::from_write_message_partial(&msg)?
+        .set_global_position(next_global.0);
+    stream_record.data = db.data_buffer().clone();
+    stream_record.metadata = db.meta_buffer().clone();
 
     let global_bytes = rkyv::to_bytes::<_, 1024>(&global_record)
         .map_err(|e| Error::SerError(e.to_string()))?;
-
-    let stream_record =
-        StreamRecord::try_from(&msg)?.set_global_position(next_global.0);
 
     let stream_bytes = rkyv::to_bytes::<_, 1024>(&stream_record)
         .map_err(|e| Error::SerError(e.to_string()))?;
@@ -238,15 +294,14 @@ pub fn write_mess<D: ::serde::Serialize, M: ::serde::Serialize>(
 #[cfg(test)]
 mod test_global_key {
     use super::*;
-
-    use pretty_assertions::assert_eq;
+    use assert2::assert;
 
     #[test]
     fn test_from_bytes() {
         // Test case 1: Valid bytes
         let bytes: [u8; 8] = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01];
         let result = GlobalKey::from_bytes(&bytes).unwrap();
-        assert_eq!(result, GlobalKey(1));
+        assert!(result == GlobalKey(1));
 
         // Test case 2: Invalid bytes (less than 8 bytes)
         let bytes: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
@@ -265,6 +320,7 @@ mod test_global_key {
 mod test_get_last_stream_position {
     use super::*;
     use crate::rocks::db::test::SelfDestructingDB;
+    use assert2::assert;
 
     #[test]
     fn it_works() {
@@ -277,7 +333,7 @@ mod test_get_last_stream_position {
         db.write(batch).unwrap();
 
         let res = get_last_stream_position(&db, "s1").unwrap();
-        assert_eq!(res, Some(StreamKey::new("s1", 0x30)));
+        assert!(res == Some(StreamKey::new("s1", 0x30)));
     }
 
     #[test]
@@ -290,25 +346,24 @@ mod test_get_last_stream_position {
         db.write(batch).unwrap();
 
         let res = get_last_stream_position(&db, "s1").unwrap();
-        assert_eq!(res, None);
+        assert!(res == None);
     }
 }
 
 #[cfg(test)]
 mod test_stream_key {
     use super::*;
-    use pretty_assertions::assert_eq;
 
     #[test]
     fn test_as_bytes() {
         let key = StreamKey::new("somestream", 70);
         let bytes = key.as_bytes();
-        assert_eq!(bytes, b"somestream|\x00\x00\x00\x00\x00\x00\x00\x46");
+        assert!(bytes == b"somestream|\x00\x00\x00\x00\x00\x00\x00\x46");
     }
 
     mod from_bytes {
         use super::*;
-        use pretty_assertions::assert_eq;
+        use assert2::assert;
 
         #[test]
         fn it_works() {
@@ -316,7 +371,7 @@ mod test_stream_key {
             let bytes = b"test_stream|\x00\x00\x00\x00\x00\x00\x00\x0D";
             let expected_result =
                 StreamKey { stream: "test_stream".into(), position: 13 };
-            assert_eq!(StreamKey::from_bytes(bytes).unwrap(), expected_result);
+            assert!(StreamKey::from_bytes(bytes).unwrap() == expected_result);
         }
 
         #[test]
