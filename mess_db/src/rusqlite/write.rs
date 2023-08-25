@@ -73,7 +73,7 @@ pub fn write_message(
     meta: Option<impl Serialize>,
     expected_stream_position: Option<u64>,
 ) -> MessResult<Position> {
-    let next_position = expected_stream_position.unwrap_or(0);
+    let next_position = expected_stream_position.map(|x| x + 1).unwrap_or(0);
     let msg_id_str = msg_id.to_string();
     let data = serde_json::to_string(&data)?;
     let meta = match meta {
@@ -113,6 +113,8 @@ pub fn write_message(
                         "stream position mismatch",
                     ) => Error::WrongStreamPosition {
                         stream: stream_name.into(),
+                        expected: expected_stream_position,
+                        got: None,
                     },
                     _ => err.into(),
                 }
@@ -227,7 +229,9 @@ mod test {
                 Some(77),
             );
             let err = res.unwrap_err();
-            if let Error::WrongStreamPosition { stream } = err {
+            if let Error::WrongStreamPosition { stream, expected: _, got: _ } =
+                err
+            {
                 assert_eq!(stream, "thing-xyz123.twothr");
             } else {
                 return Err(err.into());

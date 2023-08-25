@@ -64,7 +64,7 @@ fn new_disk_pool() -> DiskConn {
     DiskConn::new(conn)
 }
 
-fn write_a_message(conn: &Connection, expect: i64) {
+fn write_a_message(conn: &Connection, expect: Option<u64>) {
     let data = json!({ "one": 1, "two": 2 });
     let meta = Some(json!({ "three": 3, "four": 4 }));
     write_message(
@@ -74,7 +74,7 @@ fn write_a_message(conn: &Connection, expect: i64) {
         black_box("SomethingHappened"),
         black_box(&data),
         black_box(meta.as_ref()),
-        black_box(Some(expect)),
+        black_box(expect),
     )
     .unwrap();
 }
@@ -88,7 +88,7 @@ pub fn once_to_memory(c: &mut Criterion) {
                 conn
             },
             |conn| {
-                write_a_message(&conn, 0);
+                write_a_message(&conn, None);
             },
             BatchSize::SmallInput,
         )
@@ -98,12 +98,14 @@ pub fn once_to_memory(c: &mut Criterion) {
 pub fn many_to_memory(c: &mut Criterion) {
     let mut conn = new_memory_conn();
     mess_db::rusqlite::migration::migrate(&mut conn).unwrap();
-    let pos = Cell::new(0i64);
+    let mut pos = None;
     c.bench_function("rusq_write_many_messages_to_memory", |b| {
         b.iter(|| {
-            let p = pos.get();
-            write_a_message(&conn, pos.get());
-            pos.set(p + 1);
+            write_a_message(&conn, pos);
+            pos = Some(match pos {
+                Some(x) => x + 1,
+                None => 0u64,
+            });
         })
     });
 }
@@ -111,12 +113,14 @@ pub fn many_to_memory(c: &mut Criterion) {
 pub fn writing_to_disk(c: &mut Criterion) {
     let mut conn = new_disk_pool();
     mess_db::rusqlite::migration::migrate(&mut conn).unwrap();
-    let pos = Cell::new(0i64);
+    let mut pos = None;
     c.bench_function("rusq_write_many_messages_to_disk", |b| {
         b.iter(|| {
-            let p = pos.get();
-            write_a_message(&conn, p);
-            pos.set(p + 1);
+            write_a_message(&conn, pos);
+            pos = Some(match pos {
+                Some(x) => x + 1,
+                None => 0u64,
+            });
         })
     });
 }
