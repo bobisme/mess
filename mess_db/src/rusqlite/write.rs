@@ -71,9 +71,9 @@ pub fn write_message(
     msg_type: &str,
     data: impl Serialize,
     meta: Option<impl Serialize>,
-    expected_version: Option<i64>,
+    expected_stream_position: Option<u64>,
 ) -> MessResult<Position> {
-    let next_position = expected_version.unwrap_or(0);
+    let next_position = expected_stream_position.unwrap_or(0);
     let msg_id_str = msg_id.to_string();
     let data = serde_json::to_string(&data)?;
     let meta = match meta {

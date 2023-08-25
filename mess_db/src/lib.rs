@@ -1,6 +1,7 @@
 pub mod error;
 pub mod msg;
 pub mod read;
+pub mod rocks;
 pub mod rusqlite;
 pub mod sqlx;
 pub mod write;
