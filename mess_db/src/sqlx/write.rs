@@ -45,7 +45,11 @@ pub async fn write_message(
     .await
     .map_err(|err| {
         if err.to_string().contains("stream position mismatch") {
-            Error::WrongStreamPosition { stream: stream_name.to_owned() }
+            Error::WrongStreamPosition {
+                stream: stream_name.to_owned(),
+                expected: expected_version.map(|x| x as u64),
+                got: None,
+            }
         } else {
             Error::SqlxError(err)
         }
@@ -131,7 +135,9 @@ mod test {
             )
             .await;
             let err = res.unwrap_err();
-            if let Error::WrongStreamPosition { stream } = err {
+            if let Error::WrongStreamPosition { stream, expected: _, got: _ } =
+                err
+            {
                 assert_eq!(stream, "thing-xyz123.twothr");
             } else {
                 return Err(err.into());
