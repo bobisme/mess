@@ -42,7 +42,7 @@ fn new_db() -> SelfDestructingDB {
 }
 
 fn write_a_message(db: &DB, expect: Option<u64>) {
-    let data = json!({ "one": 1, "two": 2 });
+    let data = json!({ "one": 1, "two": 2, "string": "Some data here" });
     let metadata = Some(json!({ "three": 3, "four": 4 }));
     let msg = WriteMessage {
         id: Id::new(),
