@@ -2,9 +2,14 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error(transparent)]
-    External(#[from] Box<dyn std::error::Error>),
+    #[error("{0}")]
+    Other(String),
 
+    #[error(transparent)]
+    JoinError(#[from] tokio::task::JoinError),
+
+    // #[error(transparent)]
+    // External(#[from] Box<dyn std::error::Error>),
     #[error(transparent)]
     #[cfg(feature = "sqlx")]
     SqlxError(#[from] sqlx::Error),
@@ -22,7 +27,7 @@ pub enum Error {
     ParseKeyError,
 
     #[error("database migration {0} failed: {1}")]
-    MigrationFailed(i32, Box<dyn std::error::Error>),
+    MigrationFailed(i32, String),
 
     #[error(transparent)]
     JSONError(#[from] serde_json::Error),
@@ -53,14 +58,17 @@ pub enum Error {
     #[error("record serialization: {0}")]
     SerError(String),
 
+    #[error("error reading record: {0}")]
+    ReadError(String),
+
     #[error("error writing record: {0}")]
     WriteError(String),
 }
 
 impl Error {
-    pub fn external(err: Box<dyn std::error::Error>) -> Self {
-        Self::External(err)
-    }
+    // pub fn external(err: Box<dyn std::error::Error>) -> Self {
+    //     Self::External(err)
+    // }
 }
 
 pub type MessResult<T> = Result<T, Error>;

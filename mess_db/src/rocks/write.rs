@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, sync::Arc};
 
 use super::db::DB;
 use crate::{
@@ -246,7 +246,10 @@ pub fn get_last_global_position(db: &DB) -> MessResult<GlobalKey> {
     if last.is_none() {
         return Ok(GlobalKey::new(0));
     }
-    last.unwrap().map(|(key, _)| GlobalKey::from_bytes(&key))?
+    last.unwrap()
+        .map(|(key, _)| GlobalKey::from_bytes(&key))
+        .map_err(|e| Error::ReadError(e.to_string()))?
+        .map_err(|e| Error::ReadError(e.to_string()))
 }
 
 pub fn get_last_stream_position<'a>(
@@ -266,38 +269,31 @@ pub fn get_last_stream_position<'a>(
     let Some((key, _)) = last else {
         return Ok(None);
     };
-    let key = StreamKey::from_bytes(&key)?;
-    Ok(Some(key))
+    StreamKey::from_bytes(&key).map(|x| Some(x))
 }
 
-pub fn write_mess(db: &DB, msg: WriteSerialMessage) -> MessResult<Position> {
-    let next_global = get_last_global_position(db)?.next();
-    let last_stream = get_last_stream_position(db, &msg.stream_name)?;
-    let next_stream = match (msg.expected_position, last_stream) {
-        (None, None) => {
-            Ok(StreamKey::new(msg.stream_name.as_ref(), StreamPos::Serial(0)))
-        }
+fn next_stream_pos<'a>(
+    expected_position: Option<StreamPos>,
+    stream_name: &'a str,
+    last_stream: Option<StreamKey<'a>>,
+) -> Result<StreamKey<'a>, Error> {
+    match (expected_position, last_stream) {
+        (None, None) => Ok(StreamKey::new(stream_name, StreamPos::Serial(0))),
         (Some(a), Some(key)) if a == key.position => Ok(key.next()),
         (expected, key) => Err(Error::WrongStreamPosition {
-            stream: msg.stream_name.to_string(),
+            stream: stream_name.to_string(),
             expected: expected.map(|x| x.position()),
             got: key.map(|k| k.position.position()),
         }),
-    }?;
+    }
+}
 
-    // {
-    //     let mut dbuf = db.data_buffer();
-    //     let mut mbuf = db.meta_buffer();
-    //     let mut data_serializer = serde_json::Serializer::new(&mut *dbuf);
-    //     let mut metadata_serializer = serde_json::Serializer::new(&mut *mbuf);
-    //     msg.data.serialize(&mut data_serializer)?;
-    //     msg.metadata
-    //         .as_ref()
-    //         .map(|x| x.serialize(&mut metadata_serializer))
-    //         .transpose()?;
-    // }
-    // db.clear_serialization_buffers();
-
+fn write_records(
+    db: &DB,
+    msg: WriteSerialMessage,
+    next_global: GlobalKey,
+    next_stream: StreamKey,
+) -> MessResult<Position> {
     let mut global_record = GlobalRecord::from_write_serial_message(&msg)?;
     let mut stream_record =
         StreamRecord::from_write_serial_message(&msg, next_global.0)?
@@ -315,6 +311,49 @@ pub fn write_mess(db: &DB, msg: WriteSerialMessage) -> MessResult<Position> {
     db.write(batch)?;
 
     Ok(Position { global: next_global.0, stream: next_stream.position })
+}
+
+pub fn write_mess(db: &DB, msg: WriteSerialMessage) -> MessResult<Position> {
+    let next_global = get_last_global_position(db)?.next();
+    let last_stream = get_last_stream_position(db, &msg.stream_name)?;
+    let stream_name = msg.stream_name.to_owned();
+    let next_stream =
+        next_stream_pos(msg.expected_position, &stream_name, last_stream)?;
+    write_records(db, msg, next_global, next_stream)
+
+    // {
+    //     let mut dbuf = db.data_buffer();
+    //     let mut mbuf = db.meta_buffer();
+    //     let mut data_serializer = serde_json::Serializer::new(&mut *dbuf);
+    //     let mut metadata_serializer = serde_json::Serializer::new(&mut *mbuf);
+    //     msg.data.serialize(&mut data_serializer)?;
+    //     msg.metadata
+    //         .as_ref()
+    //         .map(|x| x.serialize(&mut metadata_serializer))
+    //         .transpose()?;
+    // }
+    // db.clear_serialization_buffers();
+}
+
+pub async fn write_mess_async<'a>(
+    db: Arc<DB>,
+    msg: WriteSerialMessage<'a>,
+) -> MessResult<Position> {
+    let (last_global, last_stream) = {
+        let adb = Arc::clone(&db);
+        let g = tokio::spawn(async move { get_last_global_position(&adb) });
+        let adb = Arc::clone(&db);
+        let stream_name = msg.stream_name.to_string();
+        let s = tokio::spawn(async move {
+            get_last_stream_position(&adb, &stream_name)
+        });
+        tokio::join!(g, s)
+    };
+    let next_global = last_global??.next();
+    let stream_name = msg.stream_name.to_owned();
+    let next_stream =
+        next_stream_pos(msg.expected_position, &stream_name, last_stream??)?;
+    write_records(&db, msg, next_global, next_stream)
 }
 
 #[cfg(test)]

@@ -129,13 +129,13 @@ END;
 /// Gets PRAGMA user_version.
 fn get_user_version(conn: &Connection) -> MessResult<i32> {
     conn.pragma_query_value(None, "user_version", |row| row.get(0))
-        .map_err(|err| Error::external(err.into()))
+        .map_err(|err| Error::Other(err.to_string()))
 }
 
 /// Sets PRAGMA user_version = `version`.
 fn set_user_version(conn: &Connection, version: i32) -> MessResult<()> {
     conn.pragma_update(None, "user_version", version)
-        .map_err(|err| Error::external(err.into()))
+        .map_err(|err| Error::Other(err.to_string()))
 }
 
 /// Runs thoughs migrations which have not been run and runs them, updating
@@ -151,7 +151,7 @@ pub fn migrate(conn: &mut Connection) -> MessResult<()> {
         info!("Starting migration version {}", version);
 
         if let Err(err) = migration(&tx) {
-            let err = Error::MigrationFailed(version, err.into());
+            let err = Error::MigrationFailed(version, err.to_string());
             error!(?err, "Migration failed");
             return Err(err);
         }

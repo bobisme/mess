@@ -30,13 +30,14 @@ sqlx = { version = "0.7.1", features = [
   "runtime-async-std",
 ], optional = true }
 thiserror = "1.0.44"
+tokio = { workspace = true }
 tracing = "0.1.37"
 rkyv = { version = "0.7.42", features = ["archive_le", "validation"] }
 
 [dev-dependencies]
 assert2 = "0.3.11"
 async-std = { version = "1.12", features = ["attributes"] }
-criterion = { version = "0.5", features = ["async_std"] }
+criterion = { version = "0.5", features = ["async_tokio"] }
 pretty_assertions = "1.4.0"
 # lincheck = "0.1.1"
 # loom = "0.6.1"

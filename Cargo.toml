@@ -22,3 +22,6 @@ name = "mess"
 
 [dependencies]
 mess_db = { path = "mess_db" }
+
+[workspace.dependencies]
+tokio = { version = "1.32", features = ["full"] }

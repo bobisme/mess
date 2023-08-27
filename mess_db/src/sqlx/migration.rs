@@ -48,5 +48,8 @@ pub static MIGRATIONS: Lazy<[MigrationClosure; 0]> = Lazy::new(|| {
 });
 
 pub async fn mig(pool: &SqlitePool) -> MessResult<()> {
-    MIGRATOR.run(pool).await.map_err(|e| Error::external(e.into()))
+    MIGRATOR
+        .run(pool)
+        .await
+        .map_err(|e| Error::MigrationFailed(0, e.to_string()))
 }

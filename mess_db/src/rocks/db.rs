@@ -12,8 +12,8 @@ const DEFAULT_CAPACITY: usize = 1024;
 
 pub struct DB {
     db: ::rocksdb::DB,
-    data_buf: RefCell<Vec<u8>>,
-    meta_buf: RefCell<Vec<u8>>,
+    // data_buf: RefCell<Vec<u8>>,
+    // meta_buf: RefCell<Vec<u8>>,
 }
 
 fn opts() -> Options {
@@ -42,8 +42,8 @@ impl DB {
         )?;
         Ok(Self {
             db,
-            data_buf: Vec::with_capacity(DEFAULT_CAPACITY).into(),
-            meta_buf: Vec::with_capacity(DEFAULT_CAPACITY).into(),
+            // data_buf: Vec::with_capacity(DEFAULT_CAPACITY).into(),
+            // meta_buf: Vec::with_capacity(DEFAULT_CAPACITY).into(),
         })
     }
 
@@ -55,18 +55,18 @@ impl DB {
         self.db.cf_handle("stream").expect("no stream column family")
     }
 
-    pub fn data_buffer(&self) -> RefMut<'_, Vec<u8>> {
-        self.data_buf.borrow_mut()
-    }
+    // pub fn data_buffer(&self) -> RefMut<'_, Vec<u8>> {
+    //     self.data_buf.borrow_mut()
+    // }
 
-    pub fn meta_buffer(&self) -> RefMut<'_, Vec<u8>> {
-        self.meta_buf.borrow_mut()
-    }
+    // pub fn meta_buffer(&self) -> RefMut<'_, Vec<u8>> {
+    //     self.meta_buf.borrow_mut()
+    // }
 
-    pub fn clear_serialization_buffers(&self) {
-        self.data_buf.borrow_mut().clear();
-        self.meta_buf.borrow_mut().clear();
-    }
+    // pub fn clear_serialization_buffers(&self) {
+    //     self.data_buf.borrow_mut().clear();
+    //     self.meta_buf.borrow_mut().clear();
+    // }
 }
 
 impl Deref for DB {

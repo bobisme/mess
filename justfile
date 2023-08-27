@@ -9,6 +9,10 @@ default:
 @bench *args='':
 	cargo bench --workspace "$@"
 
+@flame-bench *args='':
+  rm flamegraph.svg*
+  flamegraph -- cargo bench --workspace "$@"
+
 @watch-test *args='':
 	env CLICOLOR_FORCE=1 cargo watch -x "nextest run --workspace --failure-output=final $@"
 
