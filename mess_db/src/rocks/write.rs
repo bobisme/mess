@@ -3,8 +3,8 @@ use std::borrow::Cow;
 use super::db::DB;
 use crate::{
     error::{Error, MessResult},
-    write::WriteMessage,
-    Position,
+    write::{WriteMessage, WriteSerialMessage},
+    Position, StreamPos,
 };
 use rkyv::{Archive, Deserialize, Serialize};
 use rocksdb::IteratorMode;
@@ -42,6 +42,23 @@ impl GlobalRecord {
             message_type: msg.message_type.as_ref().into(),
             data: Default::default(),
             metadata: Default::default(),
+            ord: 0,
+        })
+    }
+
+    fn from_write_serial_message(msg: &WriteSerialMessage) -> MessResult<Self> {
+        let stream_position = msg
+            .expected_position
+            .map(|x| x.next())
+            .unwrap_or(StreamPos::Serial(0))
+            .to_store();
+        Ok(Self {
+            id: msg.id.to_string(),
+            stream_name: msg.stream_name.as_ref().into(),
+            stream_position,
+            message_type: msg.message_type.as_ref().into(),
+            data: msg.data.to_vec(),
+            metadata: msg.metadata.to_vec(),
             ord: 0,
         })
     }
@@ -111,6 +128,20 @@ impl StreamRecord {
             ord: 0,
         })
     }
+
+    fn from_write_serial_message(
+        msg: &WriteSerialMessage,
+        global_position: u64,
+    ) -> MessResult<Self> {
+        Ok(Self {
+            id: msg.id.to_string(),
+            global_position,
+            message_type: msg.message_type.as_ref().into(),
+            data: msg.data.to_vec(),
+            metadata: msg.metadata.to_vec(),
+            ord: 0,
+        })
+    }
 }
 
 impl<D, M> TryFrom<&WriteMessage<'_, D, M>> for StreamRecord
@@ -166,26 +197,26 @@ impl GlobalKey {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StreamKey<'a> {
     stream: Cow<'a, str>,
-    position: u64,
+    position: StreamPos,
 }
 
 impl<'a> StreamKey<'a> {
-    pub fn new(stream: impl Into<Cow<'a, str>>, position: u64) -> Self {
+    pub fn new(stream: impl Into<Cow<'a, str>>, position: StreamPos) -> Self {
         Self { stream: stream.into(), position }
     }
 
     pub fn max(stream: impl Into<Cow<'a, str>>) -> Self {
-        Self { stream: stream.into(), position: u64::MAX }
+        Self { stream: stream.into(), position: StreamPos::Causal(u64::MAX) }
     }
 
     pub fn next(&self) -> Self {
-        Self { stream: self.stream.clone(), position: self.position + 1 }
+        Self { stream: self.stream.clone(), position: self.position.next() }
     }
 
     pub fn as_bytes(&self) -> Vec<u8> {
         let mut bytes = self.stream.as_bytes().to_vec();
         bytes.push(SEPARATOR);
-        bytes.extend_from_slice(&self.position.to_be_bytes());
+        bytes.extend_from_slice(&self.position.to_store().to_be_bytes());
         bytes
     }
 
@@ -205,7 +236,7 @@ impl<'a> StreamKey<'a> {
             stream: String::from_utf8(stream.to_vec())
                 .map_err(|_| Error::ParseKeyError)?
                 .into(),
-            position,
+            position: StreamPos::from_store(position),
         })
     }
 }
@@ -230,52 +261,47 @@ pub fn get_last_stream_position<'a>(
                 rocksdb::Direction::Reverse,
             ),
         )
-        .next();
-    if last.is_none() {
+        .next()
+        .transpose()?;
+    let Some((key, _)) = last else {
         return Ok(None);
-    }
-    let (key, _) = last.unwrap()?;
+    };
     let key = StreamKey::from_bytes(&key)?;
     Ok(Some(key))
 }
 
-pub fn write_mess<D: serde::Serialize, M: serde::Serialize>(
-    db: &DB,
-    msg: WriteMessage<D, M>,
-) -> MessResult<Position> {
+pub fn write_mess(db: &DB, msg: WriteSerialMessage) -> MessResult<Position> {
     let next_global = get_last_global_position(db)?.next();
     let last_stream = get_last_stream_position(db, &msg.stream_name)?;
-    let next_stream = match (msg.expected_stream_position, last_stream) {
-        (None, None) => Ok(StreamKey::new(msg.stream_name.as_ref(), 0)),
+    let next_stream = match (msg.expected_position, last_stream) {
+        (None, None) => {
+            Ok(StreamKey::new(msg.stream_name.as_ref(), StreamPos::Serial(0)))
+        }
         (Some(a), Some(key)) if a == key.position => Ok(key.next()),
         (expected, key) => Err(Error::WrongStreamPosition {
             stream: msg.stream_name.to_string(),
-            expected,
-            got: key.map(|k| k.position),
+            expected: expected.map(|x| x.position()),
+            got: key.map(|k| k.position.position()),
         }),
     }?;
 
-    {
-        let mut dbuf = db.data_buffer();
-        let mut mbuf = db.meta_buffer();
-        let mut data_serializer = serde_json::Serializer::new(&mut *dbuf);
-        let mut metadata_serializer = serde_json::Serializer::new(&mut *mbuf);
-        msg.data.serialize(&mut data_serializer)?;
-        msg.metadata
-            .as_ref()
-            .map(|x| x.serialize(&mut metadata_serializer))
-            .transpose()?;
-    }
-    db.clear_serialization_buffers();
+    // {
+    //     let mut dbuf = db.data_buffer();
+    //     let mut mbuf = db.meta_buffer();
+    //     let mut data_serializer = serde_json::Serializer::new(&mut *dbuf);
+    //     let mut metadata_serializer = serde_json::Serializer::new(&mut *mbuf);
+    //     msg.data.serialize(&mut data_serializer)?;
+    //     msg.metadata
+    //         .as_ref()
+    //         .map(|x| x.serialize(&mut metadata_serializer))
+    //         .transpose()?;
+    // }
+    // db.clear_serialization_buffers();
 
-    let mut global_record = GlobalRecord::from_write_message_partial(&msg)?;
-    global_record.data = db.data_buffer().clone();
-    global_record.metadata = db.meta_buffer().clone();
-
-    let mut stream_record = StreamRecord::from_write_message_partial(&msg)?
-        .set_global_position(next_global.0);
-    stream_record.data = db.data_buffer().clone();
-    stream_record.metadata = db.meta_buffer().clone();
+    let mut global_record = GlobalRecord::from_write_serial_message(&msg)?;
+    let mut stream_record =
+        StreamRecord::from_write_serial_message(&msg, next_global.0)?
+            .set_global_position(next_global.0);
 
     let global_bytes = rkyv::to_bytes::<_, 1024>(&global_record)
         .map_err(|e| Error::SerError(e.to_string()))?;
@@ -288,7 +314,7 @@ pub fn write_mess<D: serde::Serialize, M: serde::Serialize>(
     batch.put_cf(db.stream(), next_stream.as_bytes(), &stream_bytes);
     db.write(batch)?;
 
-    Ok(Position { global: next_global.0, stream: Some(next_stream.position) })
+    Ok(Position { global: next_global.0, stream: next_stream.position })
 }
 
 #[cfg(test)]
@@ -333,7 +359,7 @@ mod test_get_last_stream_position {
         db.write(batch).unwrap();
 
         let res = get_last_stream_position(&db, "s1").unwrap();
-        assert!(res == Some(StreamKey::new("s1", 0x30)));
+        assert!(res == Some(StreamKey::new("s1", StreamPos::from_store(0x30))));
     }
 
     #[test]
@@ -353,12 +379,13 @@ mod test_get_last_stream_position {
 #[cfg(test)]
 mod test_stream_key {
     use super::*;
+    use assert2::assert;
 
     #[test]
     fn test_as_bytes() {
-        let key = StreamKey::new("somestream", 70);
+        let key = StreamKey::new("somestream", StreamPos::Serial(13));
         let bytes = key.as_bytes();
-        assert!(bytes == b"somestream|\x00\x00\x00\x00\x00\x00\x00\x46");
+        assert!(bytes == b"somestream|\x00\x00\x00\x00\x00\x00\x00\x1A");
     }
 
     mod from_bytes {
@@ -368,9 +395,11 @@ mod test_stream_key {
         #[test]
         fn it_works() {
             // Test case 1: Valid input
-            let bytes = b"test_stream|\x00\x00\x00\x00\x00\x00\x00\x0D";
-            let expected_result =
-                StreamKey { stream: "test_stream".into(), position: 13 };
+            let bytes = b"test_stream|\x00\x00\x00\x00\x00\x00\x00\x1A";
+            let expected_result = StreamKey {
+                stream: "test_stream".into(),
+                position: StreamPos::Serial(13),
+            };
             assert!(StreamKey::from_bytes(bytes).unwrap() == expected_result);
         }
 
@@ -398,7 +427,6 @@ mod test_stream_key {
 mod test_write_mess {
     use assert2::assert;
     use ident::Id;
-    use serde_json::json;
 
     use super::super::db::test::SelfDestructingDB;
     use super::*;
@@ -406,13 +434,13 @@ mod test_write_mess {
     fn setup() -> SelfDestructingDB {
         let db = SelfDestructingDB::new_tmp();
 
-        let msg = WriteMessage {
+        let msg = WriteSerialMessage {
             id: Id::new(),
             stream_name: "stream1".into(),
             message_type: "someMsgType".into(),
-            data: json!({"a": 1}),
-            metadata: Some(json!({"b": 2})),
-            expected_stream_position: None,
+            data: Cow::Borrowed(b"{\"a\": 1})"),
+            metadata: Cow::Borrowed(b"{\"b\": 2}"),
+            expected_position: None,
         };
         write_mess(&db, msg).unwrap();
         db
@@ -435,7 +463,10 @@ mod test_write_mess {
     fn it_writes_to_stream_cf() {
         let db = setup();
         let bytes = db
-            .get_cf(db.stream(), StreamKey::new("stream1", 0).as_bytes())
+            .get_cf(
+                db.stream(),
+                StreamKey::new("stream1", StreamPos::Serial(0)).as_bytes(),
+            )
             .unwrap()
             .unwrap();
 
@@ -448,18 +479,18 @@ mod test_write_mess {
     #[rstest::rstest]
     fn writing_stream_pos_out_of_order_fails() {
         let db = SelfDestructingDB::new_tmp();
-        let msg1 = WriteMessage {
+        let msg1 = WriteSerialMessage {
             id: Id::new(),
             stream_name: "stream1".into(),
             message_type: "someMsgType".into(),
-            data: json!({"a": 1}),
-            metadata: Some(json!({"b": 2})),
-            expected_stream_position: None,
+            data: Cow::Borrowed(b"{\"a\": 1})"),
+            metadata: Cow::Borrowed(b"{\"b\": 2}"),
+            expected_position: None,
         };
         let mut msg2 = msg1.clone();
-        msg2.expected_stream_position = Some(0);
+        msg2.expected_position = Some(StreamPos::Serial(0));
         let mut msg3 = msg1.clone();
-        msg3.expected_stream_position = Some(2);
+        msg3.expected_position = Some(StreamPos::Serial(2));
 
         write_mess(&db, msg1).unwrap();
         write_mess(&db, msg2).unwrap();

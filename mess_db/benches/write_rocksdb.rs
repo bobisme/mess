@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::ops::Deref;
 use std::time::Duration;
 use std::{cell::Cell, ops::DerefMut};
@@ -42,15 +43,16 @@ fn new_db() -> SelfDestructingDB {
 }
 
 fn write_a_message(db: &DB, expect: Option<u64>) {
-    let data = json!({ "one": 1, "two": 2, "string": "Some data here" });
-    let metadata = Some(json!({ "three": 3, "four": 4 }));
-    let msg = WriteMessage {
+    let data: &[u8] =
+        b"{ \"one\": 1, \"two\": 2, \"string\": \"Some data here\" }";
+    let metadata: &[u8] = b"{ \"three\": 3, \"four\": 4 }";
+    let msg = mess_db::write::WriteSerialMessage {
         id: Id::new(),
         stream_name: "stream1".into(),
         message_type: "someMsgType".into(),
-        data,
-        metadata,
-        expected_stream_position: expect,
+        data: Cow::Borrowed(data),
+        metadata: Cow::Borrowed(metadata),
+        expected_position: expect.map(|x| mess_db::StreamPos::Serial(x)),
     };
     mess_db::rocks::write::write_mess(db, black_box(msg)).unwrap();
 }

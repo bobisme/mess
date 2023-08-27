@@ -11,7 +11,10 @@ pub mod write;
 /// the system to tell immediately whether the stream is using
 /// strict Serial ordering or Causal ordering via the use of
 /// a hybrid logical clock.
-#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+///
+/// The reason for this distinction is to prevent mixing of the
+/// types within a single stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StreamPos {
     Serial(u64),
     Causal(u64),
@@ -39,16 +42,23 @@ impl StreamPos {
             Self::Serial(pos) | Self::Causal(pos) => pos,
         }
     }
+
+    pub fn next(self) -> Self {
+        match self {
+            StreamPos::Serial(pos) => Self::Serial(pos + 1),
+            StreamPos::Causal(pos) => Self::Causal(pos + 1),
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Position {
     pub global: u64,
-    pub stream: Option<u64>,
+    pub stream: StreamPos,
 }
 
 impl Position {
-    pub fn new(global: u64, stream: Option<u64>) -> Self {
+    pub fn new(global: u64, stream: StreamPos) -> Self {
         Self { global, stream }
     }
 }
