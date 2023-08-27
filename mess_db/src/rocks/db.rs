@@ -16,21 +16,29 @@ pub struct DB {
     meta_buf: RefCell<Vec<u8>>,
 }
 
+fn opts() -> Options {
+    let mut opts = Options::default();
+    opts.create_missing_column_families(true);
+    opts.create_if_missing(true);
+    let cores = std::thread::available_parallelism().unwrap().get();
+    opts.increase_parallelism(cores as i32);
+    opts
+}
+
+fn new_cf(name: &str) -> ColumnFamilyDescriptor {
+    ColumnFamilyDescriptor::new(name, opts())
+}
+
 impl DB {
     pub fn new(path: impl AsRef<Path>) -> MessResult<Self> {
         println!("DEBUG: open db at {:?}", path.as_ref());
 
-        let mut db_opts = Options::default();
-        db_opts.create_missing_column_families(true);
-        db_opts.create_if_missing(true);
+        let db_opts = opts();
         let cf_opts = Options::default();
-        let db = ::rocksdb::DB::open_cf_descriptors(
+        let db = rocksdb::DB::open_cf_descriptors(
             &db_opts,
             path,
-            vec![
-                ColumnFamilyDescriptor::new("global", cf_opts.clone()),
-                ColumnFamilyDescriptor::new("stream", cf_opts.clone()),
-            ],
+            vec![new_cf("global"), new_cf("stream")],
         )?;
         Ok(Self {
             db,
