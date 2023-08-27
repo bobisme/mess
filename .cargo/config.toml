@@ -1,2 +1,10 @@
 [alias]
 xtask = "run --package xtask --"
+
+[target.x86_64-unknown-linux-gnu]
+linker = "/usr/bin/clang"
+rustflags = [
+  "-Ctarget-cpu=native",
+  "-Clink-arg=-fuse-ld=lld",
+  "-Clink-arg=-Wl,--no-rosegment",
+]
