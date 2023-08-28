@@ -58,6 +58,9 @@ pub enum Error {
     #[error("record serialization: {0}")]
     SerError(String),
 
+    #[error("record deserialization: {0}")]
+    DeserError(String),
+
     #[error("error reading record: {0}")]
     ReadError(String),
 
