@@ -9,43 +9,48 @@ use rkyv::{Archive, Deserialize, Serialize};
 
 pub(crate) const SEPARATOR: u8 = b'|';
 
-#[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
-#[archive(compare(PartialEq), check_bytes)]
-// Derives can be passed through to the generated type:
-#[archive_attr(derive(Debug))]
-pub(crate) struct GlobalRecord {
-    pub(crate) id: String,
-    pub(crate) stream_name: String,
+#[derive(
+    Clone,
+    Debug,
+    PartialEq, // rkyv::Archive, rkyv::Deserialize, rkyv::Serialize,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+// #[archive(compare(PartialEq), check_bytes)]
+// #[archive_attr(derive(Debug))]
+pub struct GlobalRecord<'a> {
+    pub(crate) id: Cow<'a, str>,
+    pub(crate) stream_name: Cow<'a, str>,
     pub(crate) stream_position: u64,
-    pub(crate) message_type: String,
-    pub(crate) data: Vec<u8>,
-    pub(crate) metadata: Vec<u8>,
+    pub(crate) message_type: Cow<'a, str>,
+    pub(crate) data: Cow<'a, [u8]>,
+    pub(crate) metadata: Cow<'a, [u8]>,
     pub(crate) ord: u64,
 }
 
-impl GlobalRecord {
-    pub(crate) fn from_write_message_partial<D, M>(
-        msg: &WriteMessage<'_, D, M>,
-    ) -> MessResult<Self>
-    where
-        D: serde::Serialize,
-        M: serde::Serialize,
-    {
-        let stream_position =
-            msg.expected_stream_position.map(|x| x + 1).unwrap_or(0);
-        Ok(Self {
-            id: msg.id.to_string(),
-            stream_name: msg.stream_name.as_ref().into(),
-            stream_position,
-            message_type: msg.message_type.as_ref().into(),
-            data: Default::default(),
-            metadata: Default::default(),
-            ord: 0,
-        })
-    }
+impl<'a> GlobalRecord<'a> {
+    // pub(crate) fn from_write_message_partial<D, M>(
+    //     msg: &WriteMessage<'_, D, M>,
+    // ) -> MessResult<Self>
+    // where
+    //     D: serde::Serialize,
+    //     M: serde::Serialize,
+    // {
+    //     let stream_position =
+    //         msg.expected_stream_position.map(|x| x + 1).unwrap_or(0);
+    //     Ok(Self {
+    //         id: msg.id.to_string().into(),
+    //         stream_name: msg.stream_name.as_ref().into(),
+    //         stream_position,
+    //         message_type: msg.message_type.as_ref().into(),
+    //         data: Default::default(),
+    //         metadata: Default::default(),
+    //         ord: 0,
+    //     })
+    // }
 
     pub(crate) fn from_write_serial_message(
-        msg: &WriteSerialMessage,
+        msg: &'a WriteSerialMessage,
     ) -> MessResult<Self> {
         let stream_position = msg
             .expected_position
@@ -53,48 +58,83 @@ impl GlobalRecord {
             .unwrap_or(StreamPos::Serial(0))
             .to_store();
         Ok(Self {
-            id: msg.id.to_string(),
+            id: msg.id.to_string().into(),
             stream_name: msg.stream_name.as_ref().into(),
             stream_position,
             message_type: msg.message_type.as_ref().into(),
-            data: msg.data.to_vec(),
-            metadata: msg.metadata.to_vec(),
+            data: msg.data.as_ref().into(),
+            metadata: msg.metadata.as_ref().into(),
             ord: 0,
         })
     }
 
-    pub(crate) fn from_bytes(
-        bytes: &[u8],
-    ) -> MessResult<&ArchivedGlobalRecord> {
-        rkyv::check_archived_root::<Self>(&bytes[..])
+    // pub(crate) fn from_bytes(
+    //     bytes: &[u8],
+    // ) -> MessResult<&ArchivedGlobalRecord> {
+    //     rkyv::check_archived_root::<Self>(&bytes[..])
+    //         .map_err(|e| Error::DeserError(e.to_string()))
+    // }
+
+    pub(crate) fn from_bytes<B: AsRef<[u8]>>(bytes: B) -> MessResult<Self> {
+        postcard::from_bytes(bytes.as_ref())
             .map_err(|e| Error::DeserError(e.to_string()))
     }
-}
 
-impl ArchivedGlobalRecord {
-    pub(crate) fn to_message(&self, global_position: u64) -> Message {
+    pub(crate) fn to_message(&'a self, global_position: u64) -> Message<'a> {
         Message {
             global_position,
-            stream_position: StreamPos::from_store(
-                self.stream_position.value(),
-            ),
-            stream_name: self.stream_name.to_owned(),
-            message_type: self.message_type.to_owned(),
-            data: self.data.to_owned(),
+            stream_position: StreamPos::from_store(self.stream_position),
+            stream_name: self.stream_name.clone(),
+            message_type: self.message_type.clone(),
+            data: self.data.clone().to_owned(),
             metadata: if self.metadata.is_empty() {
                 None
             } else {
-                Some(self.metadata.to_owned())
+                Some(self.metadata.clone().to_owned())
+            },
+        }
+    }
+
+    pub(crate) fn into_message(self, global_position: u64) -> Message<'a> {
+        Message {
+            global_position,
+            stream_position: StreamPos::from_store(self.stream_position),
+            stream_name: self.stream_name.into(),
+            message_type: self.message_type.into(),
+            data: self.data.into(),
+            metadata: if self.metadata.is_empty() {
+                None
+            } else {
+                Some(self.metadata.into())
             },
         }
     }
 }
 
+// impl ArchivedGlobalRecord {
+//     pub(crate) fn to_message(&self, global_position: u64) -> Message {
+//         Message {
+//             global_position,
+//             stream_position: StreamPos::from_store(
+//                 self.stream_position.value(),
+//             ),
+//             stream_name: self.stream_name.to_owned(),
+//             message_type: self.message_type.to_owned(),
+//             data: self.data.to_owned(),
+//             metadata: if self.metadata.is_empty() {
+//                 None
+//             } else {
+//                 Some(self.metadata.to_owned())
+//             },
+//         }
+//     }
+// }
+
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
 #[archive(compare(PartialEq), check_bytes)]
 // Derives can be passed through to the generated type:
 #[archive_attr(derive(Debug))]
-pub(crate) struct StreamRecord {
+pub struct StreamRecord {
     pub(crate) global_position: u64,
     pub(crate) id: String,
     pub(crate) message_type: String,
@@ -149,21 +189,21 @@ impl StreamRecord {
 }
 
 impl ArchivedStreamRecord {
-    pub(crate) fn to_message(
+    pub(crate) fn to_message<'a>(
         &self,
         stream: impl Into<String>,
         stream_position: StreamPos,
-    ) -> Message {
+    ) -> Message<'a> {
         Message {
             global_position: self.global_position.value(),
             stream_position,
-            stream_name: stream.into(),
-            message_type: self.message_type.to_owned(),
-            data: self.data.to_owned(),
+            stream_name: Cow::Owned(stream.into()),
+            message_type: self.message_type.to_string().into(),
+            data: Cow::Owned(self.data.to_vec()),
             metadata: if self.metadata.is_empty() {
                 None
             } else {
-                Some(self.metadata.to_owned())
+                Some(self.metadata.to_vec().into())
             },
         }
     }

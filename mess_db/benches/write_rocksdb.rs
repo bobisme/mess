@@ -12,6 +12,7 @@ use criterion::{
 
 use ident::Id;
 use mess_db::rocks::db::DB;
+use mess_db::rocks::write::WriteSerializer;
 use mess_db::write::{WriteMessage, WriteSerialMessage};
 use serde_json::json;
 
@@ -64,17 +65,18 @@ fn msg_to_write(expect: Option<u64>) -> WriteSerialMessage<'static> {
     }
 }
 
-fn write_a_message(db: &DB, expect: Option<u64>) {
+fn write_a_message(db: &DB, expect: Option<u64>, ser: &WriteSerializer) {
     let msg = msg_to_write(expect);
-    mess_db::rocks::write::write_mess(db, black_box(msg)).unwrap();
+    mess_db::rocks::write::write_mess(db, black_box(msg), ser).unwrap();
 }
 
 pub fn writing_to_disk(c: &mut Criterion) {
     let conn = SelfDestructingDB::<Box<DB>>::new();
+    let ser = WriteSerializer::new();
     let mut pos = None;
     c.bench_function("rocks_write_many_messages_to_disk", |b| {
         b.iter(|| {
-            write_a_message(&conn, pos);
+            write_a_message(&conn, pos, &ser);
             pos = pos.and_then(|x| Some(x + 1)).or(Some(0));
         })
     });
@@ -82,17 +84,20 @@ pub fn writing_to_disk(c: &mut Criterion) {
 
 pub fn writing_to_disk_async(c: &mut Criterion) {
     let conn = SelfDestructingDB::<Arc<DB>>::new();
+    let serial = Arc::new(WriteSerializer::new());
     // let conn = Arc::new(SelfDestructingDB::<Box<DB>>::new());
     let mut pos = None;
     c.bench_with_input(
         BenchmarkId::new("rocks_async_write_many_messages_to_disk", 0),
-        &conn,
-        |b, db| {
+        &(conn, serial),
+        |b, (db, ser)| {
             b.to_async(tokio::runtime::Runtime::new().unwrap()).iter(
                 || async move {
                     let msg = msg_to_write(pos);
                     let db = Arc::clone(&db);
-                    mess_db::rocks::write::write_mess_async(db, msg).await;
+                    let ser = Arc::clone(&ser);
+                    mess_db::rocks::write::write_mess_async(db, msg, &ser)
+                        .await;
                     pos = pos.and_then(|x| Some(x + 1)).or(Some(0));
                 },
             )

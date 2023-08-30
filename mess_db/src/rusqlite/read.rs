@@ -132,12 +132,9 @@ pub fn get_latest_stream_position(
 
 #[cfg(test)]
 mod test {
-    use std::cell::Cell;
-
     use super::*;
     use rstest::*;
     use rusqlite::Connection;
-    use tracing::{error, info};
 
     const ROWS_PER_INSERT: usize = 500;
 

@@ -1,6 +1,9 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, rc::Rc};
 
-use crate::{error::MessResult, Message, StreamPos};
+use crate::{
+    error::{Error, MessResult},
+    Message, StreamPos,
+};
 
 use super::{
     db::DB,
@@ -12,13 +15,13 @@ const DEFAULT_LIMIT: u64 = 1_000;
 
 // type states for GetMessages options
 #[derive(Default, Clone, Copy)]
-struct OptUnset;
+pub struct OptUnset;
 #[derive(Default, Clone)]
-struct OptPrefix<'a>(Cow<'a, str>);
+pub struct OptPrefix<'a>(Cow<'a, str>);
 #[derive(Default, Clone, Copy)]
-struct OptGlobalPos(u64);
+pub struct OptGlobalPos(u64);
 #[derive(Clone, Copy)]
-struct OptStreamPos(StreamPos);
+pub struct OptStreamPos(StreamPos);
 
 #[derive(Clone, PartialEq, PartialOrd)]
 pub struct GetMessages<P, G, S> {
@@ -82,15 +85,15 @@ impl<P, G, S> GetMessages<P, G, S> {
 pub fn fetch_global<'a>(
     db: &'a DB,
     pos: u64,
-) -> MessResult<impl 'a + Iterator<Item = MessResult<Message>>> {
+) -> MessResult<impl 'a + Iterator<Item = Result<Message<'_>, Error>>> {
     let glob_key = pos.to_be_bytes();
     let cf = db.global();
     let iter = db.prefix_iterator_cf(cf, glob_key);
     let iter = iter.map(|res| {
-        let (k, v) = res?;
+        let (k, v) = res.as_ref().map_err(|e| Error::Other(e.to_string()))?;
         let key = GlobalKey::from_bytes(&k)?;
-        let rec = GlobalRecord::from_bytes(&v)?;
-        Ok(rec.to_message(key.0))
+        let rec = GlobalRecord::from_bytes(v)?;
+        Ok(rec.into_message(key.0))
     });
     return Ok(iter);
 }
@@ -112,18 +115,18 @@ pub fn fetch_stream<'a, P: AsRef<[u8]>>(
 
 impl<'a> GetMessages<OptUnset, OptGlobalPos, OptUnset> {
     pub fn fetch(
-        &self,
+        &'a self,
         db: &'a DB,
-    ) -> MessResult<impl 'a + Iterator<Item = MessResult<Message>>> {
+    ) -> MessResult<impl 'a + Iterator<Item = MessResult<Message<'a>>>> {
         fetch_global(db, self.start_global_position.0)
     }
 }
 
 impl<'a> GetMessages<OptPrefix<'a>, OptGlobalPos, OptUnset> {
     pub fn fetch(
-        &self,
+        &'a self,
         db: &'a DB,
-    ) -> MessResult<impl 'a + Iterator<Item = MessResult<Message>>> {
+    ) -> MessResult<impl 'a + Iterator<Item = MessResult<Message<'a>>>> {
         let prefix = self.prefix.to_owned();
         Ok(fetch_global(db, self.start_global_position.0)?.filter(move |res| {
             match res {
@@ -146,9 +149,9 @@ impl<'a> GetMessages<OptPrefix<'a>, OptUnset, OptUnset> {
 
 impl<'a> GetMessages<OptPrefix<'a>, OptUnset, OptStreamPos> {
     pub fn fetch(
-        &self,
+        &'a self,
         db: &'a DB,
-    ) -> MessResult<impl 'a + Iterator<Item = MessResult<Message>>> {
+    ) -> MessResult<impl 'a + Iterator<Item = MessResult<Message<'a>>>> {
         let key = StreamKey::new(
             self.prefix.0.as_ref(),
             self.start_stream_position.0,

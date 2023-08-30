@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 use super::{
     db::DB,
@@ -9,26 +12,46 @@ use crate::{
     write::WriteSerialMessage,
     Position, StreamPos,
 };
-use rocksdb::IteratorMode;
+use rocksdb::{IteratorMode, ReadOptions};
+
+static mut CACHED_GLOBAL: AtomicU64 = AtomicU64::new(0);
 
 pub fn get_last_global_position(db: &DB) -> MessResult<GlobalKey> {
-    let last = db.iterator_cf(db.global(), IteratorMode::End).next();
+    let cached = unsafe { CACHED_GLOBAL.load(Ordering::SeqCst) };
+    if cached != 0 {
+        return Ok(GlobalKey(cached));
+    }
+    let mut opts = ReadOptions::default();
+    opts.set_async_io(true);
+    opts.set_pin_data(true);
+    let last = db.iterator_cf_opt(db.global(), opts, IteratorMode::End).next();
     if last.is_none() {
         return Ok(GlobalKey::new(0));
     }
-    last.unwrap()
+    let result = last
+        .unwrap()
         .map(|(key, _)| GlobalKey::from_bytes(&key))
         .map_err(|e| Error::ReadError(e.to_string()))?
-        .map_err(|e| Error::ReadError(e.to_string()))
+        .map_err(|e| Error::ReadError(e.to_string()));
+    if let Ok(key) = result.as_ref() {
+        unsafe {
+            CACHED_GLOBAL.store(key.0, Ordering::Release);
+        }
+    }
+    result
 }
 
 pub fn get_last_stream_position<'a>(
     db: &DB,
     stream: &str,
 ) -> MessResult<Option<StreamKey<'a>>> {
+    let mut opts = ReadOptions::default();
+    opts.set_async_io(true);
+    opts.set_pin_data(true);
     let last = db
-        .iterator_cf(
+        .iterator_cf_opt(
             db.stream(),
+            opts,
             IteratorMode::From(
                 &StreamKey::max(stream).as_bytes(),
                 rocksdb::Direction::Reverse,
@@ -58,22 +81,46 @@ fn next_stream_pos<'a>(
     }
 }
 
+pub struct WriteSerializer<const S: usize = 1024> {
+    global_buffer: [u8; S],
+    stream_buffer: [u8; S],
+}
+
+impl<const S: usize> WriteSerializer<S> {
+    pub fn new() -> Self {
+        Self { global_buffer: [0u8; S], stream_buffer: [0u8; S] }
+    }
+
+    pub fn serialize_global(
+        &mut self,
+        global: &GlobalRecord,
+    ) -> MessResult<&[u8]> {
+        postcard::to_slice(global, &mut self.global_buffer)
+            .map(|x| &*x)
+            .map_err(|e| Error::SerError(format!("global: {e}")))
+    }
+}
+
 fn write_records(
     db: &DB,
     msg: WriteSerialMessage,
     next_global: GlobalKey,
     next_stream: StreamKey,
+    ser: &WriteSerializer,
 ) -> MessResult<Position> {
     let mut global_record = GlobalRecord::from_write_serial_message(&msg)?;
     let mut stream_record =
         StreamRecord::from_write_serial_message(&msg, next_global.0)?
             .set_global_position(next_global.0);
 
-    let global_bytes = rkyv::to_bytes::<_, 1024>(&global_record)
-        .map_err(|e| Error::SerError(e.to_string()))?;
+    // let global_bytes = rkyv::to_bytes::<_, 1024>(&global_record)
+    //     .map_err(|e| Error::SerError(e.to_string()))?;
+    let mut buf = [0u8; 1024];
+    let global_bytes = postcard::to_slice(&global_record, &mut buf)
+        .map_err(|e| Error::SerError(format!("global: {e}")))?;
 
     let stream_bytes = rkyv::to_bytes::<_, 1024>(&stream_record)
-        .map_err(|e| Error::SerError(e.to_string()))?;
+        .map_err(|e| Error::SerError(format!("stream: {e}")))?;
 
     let mut batch = rocksdb::WriteBatch::default();
     batch.put_cf(db.global(), next_global.as_bytes(), &global_bytes);
@@ -83,31 +130,29 @@ fn write_records(
     Ok(Position { global: next_global.0, stream: next_stream.position })
 }
 
-pub fn write_mess(db: &DB, msg: WriteSerialMessage) -> MessResult<Position> {
+pub fn write_mess(
+    db: &DB,
+    msg: WriteSerialMessage,
+    ser: &WriteSerializer,
+) -> MessResult<Position> {
     let next_global = get_last_global_position(db)?.next();
     let last_stream = get_last_stream_position(db, &msg.stream_name)?;
     let stream_name = msg.stream_name.to_owned();
     let next_stream =
         next_stream_pos(msg.expected_position, &stream_name, last_stream)?;
-    write_records(db, msg, next_global, next_stream)
-
-    // {
-    //     let mut dbuf = db.data_buffer();
-    //     let mut mbuf = db.meta_buffer();
-    //     let mut data_serializer = serde_json::Serializer::new(&mut *dbuf);
-    //     let mut metadata_serializer = serde_json::Serializer::new(&mut *mbuf);
-    //     msg.data.serialize(&mut data_serializer)?;
-    //     msg.metadata
-    //         .as_ref()
-    //         .map(|x| x.serialize(&mut metadata_serializer))
-    //         .transpose()?;
-    // }
-    // db.clear_serialization_buffers();
+    let res = write_records(db, msg, next_global, next_stream, ser);
+    if let Ok(position) = res.as_ref() {
+        unsafe {
+            CACHED_GLOBAL.store(position.global, Ordering::SeqCst);
+        }
+    }
+    res
 }
 
 pub async fn write_mess_async<'a>(
     db: Arc<DB>,
     msg: WriteSerialMessage<'a>,
+    ser: &WriteSerializer,
 ) -> MessResult<Position> {
     let (last_global, last_stream) = {
         let adb = Arc::clone(&db);
@@ -123,7 +168,7 @@ pub async fn write_mess_async<'a>(
     let stream_name = msg.stream_name.to_owned();
     let next_stream =
         next_stream_pos(msg.expected_position, &stream_name, last_stream??)?;
-    write_records(&db, msg, next_global, next_stream)
+    write_records(&db, msg, next_global, next_stream, ser)
 }
 
 #[cfg(test)]
@@ -242,6 +287,10 @@ mod test_write_mess {
     use super::super::db::test::SelfDestructingDB;
     use super::*;
 
+    fn ser() -> WriteSerializer {
+        WriteSerializer::new()
+    }
+
     fn setup() -> SelfDestructingDB {
         let db = SelfDestructingDB::new_tmp();
 
@@ -253,7 +302,7 @@ mod test_write_mess {
             metadata: Cow::Borrowed(b"{\"b\": 2}"),
             expected_position: None,
         };
-        write_mess(&db, msg).unwrap();
+        write_mess(&db, msg, &ser()).unwrap();
         db
     }
 
@@ -263,7 +312,8 @@ mod test_write_mess {
         let bytes =
             db.get_cf(db.global(), u64::to_be_bytes(1)).unwrap().unwrap();
 
-        let x = rkyv::check_archived_root::<GlobalRecord>(&bytes[..]).unwrap();
+        // let x = rkyv::check_archived_root::<GlobalRecord>(&bytes[..]).unwrap();
+        let x = GlobalRecord::from_bytes(&bytes).unwrap();
 
         assert!(x.stream_name == "stream1");
         assert!(x.message_type == "someMsgType");
@@ -303,9 +353,10 @@ mod test_write_mess {
         let mut msg3 = msg1.clone();
         msg3.expected_position = Some(StreamPos::Serial(2));
 
-        write_mess(&db, msg1).unwrap();
-        write_mess(&db, msg2).unwrap();
-        let result = write_mess(&db, msg3).unwrap_err();
+        let ser = ser();
+        write_mess(&db, msg1, &ser).unwrap();
+        write_mess(&db, msg2, &ser).unwrap();
+        let result = write_mess(&db, msg3, &ser).unwrap_err();
         assert!(let Error::WrongStreamPosition {
             stream: _,
             expected: Some(2),

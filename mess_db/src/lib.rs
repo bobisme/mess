@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 pub mod error;
 pub mod msg;
 pub mod read;
@@ -63,20 +65,20 @@ impl Position {
     }
 }
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "sqlx", derive(::sqlx::FromRow))]
-pub struct Message {
+pub struct Message<'a> {
     global_position: u64,
     stream_position: StreamPos,
     // time_ms: u64,
-    stream_name: String,
-    message_type: String,
-    data: Vec<u8>,
-    metadata: Option<Vec<u8>>,
+    stream_name: Cow<'a, str>,
+    message_type: Cow<'a, str>,
+    data: Cow<'a, [u8]>,
+    metadata: Option<Cow<'a, [u8]>>,
 }
 
 #[cfg(feature = "rusqlite")]
-impl TryFrom<&::rusqlite::Row<'_>> for Message {
+impl TryFrom<&::rusqlite::Row<'_>> for Message<'_> {
     type Error = ::rusqlite::Error;
 
     fn try_from(row: &::rusqlite::Row<'_>) -> Result<Self, Self::Error> {
@@ -84,10 +86,10 @@ impl TryFrom<&::rusqlite::Row<'_>> for Message {
             global_position: row.get(0)?,
             stream_position: StreamPos::from_store(row.get(1)?),
             // time_ms: row.get(2)?,
-            stream_name: row.get(3)?,
-            message_type: row.get(4)?,
-            data: row.get(5)?,
-            metadata: row.get(6)?,
+            stream_name: Cow::Owned(row.get(3)?),
+            message_type: Cow::Owned(row.get(4)?),
+            data: Cow::Owned(row.get(5)?),
+            metadata: row.get::<_, Option<Vec<u8>>>(6)?.map(|x| Cow::Owned(x)),
             // id: row.get(7)?,
         })
     }
