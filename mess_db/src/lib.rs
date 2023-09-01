@@ -108,7 +108,7 @@ impl TryFrom<&::rusqlite::Row<'_>> for Message<'_> {
             stream_name: Cow::Owned(row.get(3)?),
             message_type: Cow::Owned(row.get(4)?),
             data: Cow::Owned(row.get(5)?),
-            metadata: row.get::<_, Option<Vec<u8>>>(6)?.map(|x| Cow::Owned(x)),
+            metadata: row.get::<_, Option<Vec<u8>>>(6)?.map(Cow::Owned),
             // id: row.get(7)?,
         })
     }

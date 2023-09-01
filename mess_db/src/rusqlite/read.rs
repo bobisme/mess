@@ -101,12 +101,9 @@ pub fn get_latest_stream_message<'a>(
         ORDER BY position DESC
         LIMIT 1"#,
     )?;
-    let msg = stmt
-        .query_and_then(params![stream_name], |row| Message::try_from(row))?
-        .next()
-        .transpose()
-        .map_err(|e| e.into());
-    msg
+    let mut query = stmt
+        .query_and_then(params![stream_name], |row| Message::try_from(row))?;
+    query.next().transpose().map_err(|e| e.into())
 }
 
 pub fn get_latest_stream_position(
@@ -122,12 +119,8 @@ pub fn get_latest_stream_position(
         LIMIT 1
         "#,
     )?;
-    let msg = stmt
-        .query_and_then(params![stream_name], |row| row.get(0))?
-        .next()
-        .transpose()
-        .map_err(|e| e.into());
-    msg
+    let mut q = stmt.query_and_then(params![stream_name], |row| row.get(0))?;
+    q.next().transpose().map_err(|e| e.into())
 }
 
 #[cfg(test)]
@@ -140,7 +133,7 @@ mod test {
 
     fn test_db(rows_per_stream: i64) -> Connection {
         let rows_per_stream = rows_per_stream.max(0) as usize;
-        let mut conn = crate::rusqlite::test::new_memory_conn_with_migrations();
+        let conn = crate::rusqlite::test::new_memory_conn_with_migrations();
 
         let rows = (0..).map(|i| {
             [
@@ -166,7 +159,7 @@ mod test {
             for i in 0..total_row_count {
                 sql.push_str("\n(?, ?, ?, ?, ?)");
                 if i < (total_row_count - 1) {
-                    sql.push_str(",");
+                    sql.push(',');
                 }
             }
             let mut stmt = conn.prepare(&sql).unwrap();
@@ -175,15 +168,15 @@ mod test {
             {
                 let j = row_i * 5;
                 stmt.raw_bind_parameter(j + 1, row.0)
-                    .expect(&format!("bind {}", j + 1));
+                    .unwrap_or_else(|_| panic!("bind {}", j + 1));
                 stmt.raw_bind_parameter(j + 2, row.1)
-                    .expect(&format!("bind {}", j + 2));
+                    .unwrap_or_else(|_| panic!("bind {}", j + 2));
                 stmt.raw_bind_parameter(j + 3, row.2)
-                    .expect(&format!("bind {}", j + 3));
+                    .unwrap_or_else(|_| panic!("bind {}", j + 3));
                 stmt.raw_bind_parameter(j + 4, row.3)
-                    .expect(&format!("bind {}", j + 4));
+                    .unwrap_or_else(|_| panic!("bind {}", j + 4));
                 stmt.raw_bind_parameter(j + 5, row.4)
-                    .expect(&format!("bind {}", j + 5));
+                    .unwrap_or_else(|_| panic!("bind {}", j + 5));
             }
             stmt.raw_execute().unwrap();
         }

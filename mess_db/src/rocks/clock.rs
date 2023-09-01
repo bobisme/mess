@@ -9,7 +9,8 @@ use std::{
 /// Seconds since Unix epoch for 2020-01-01T00:00:00Z.
 const SECOND_EPOCH: u64 = 1_577_836_800;
 
-#[must_use] pub fn time_to_tick(time: Duration) -> u64 {
+#[must_use]
+pub fn time_to_tick(time: Duration) -> u64 {
     (((time.as_secs_f64() - SECOND_EPOCH as f64) * 20.0) as u64) << 16
 }
 
@@ -17,15 +18,18 @@ const SECOND_EPOCH: u64 = 1_577_836_800;
 pub struct Tick(u64);
 
 impl Tick {
-    #[must_use] pub fn to_u64(self) -> u64 {
+    #[must_use]
+    pub const fn to_u64(self) -> u64 {
         self.0
     }
 
-    #[must_use] pub fn to_secs(self) -> u64 {
+    #[must_use]
+    pub const fn to_secs(self) -> u64 {
         (self.0 >> 16) / 20 + SECOND_EPOCH
     }
 
-    #[must_use] pub fn to_secs_f64(self) -> f64 {
+    #[must_use]
+    pub fn to_secs_f64(self) -> f64 {
         (self.0 >> 16) as f64 / 20.0 + SECOND_EPOCH as f64
     }
 }
@@ -184,7 +188,7 @@ mod test_clock {
     #[derive(Copy, Clone, Debug)]
     struct BrokenClock;
 
-    fn dur_from_ms(ms: u64) -> Duration {
+    const fn dur_from_ms(ms: u64) -> Duration {
         Duration::from_millis(ms + SECOND_EPOCH * 1_000)
     }
 

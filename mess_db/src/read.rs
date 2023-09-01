@@ -56,12 +56,12 @@ impl<'a> ReadMessages<'a> {
     }
 
     #[must_use]
-    pub fn stream_name(&self) -> Option<&Cow<'_, str>> {
+    pub const fn stream_name(&self) -> Option<&Cow<'_, str>> {
         self.stream_name.as_ref()
     }
 
     #[must_use]
-    pub fn limit(&self) -> u32 {
+    pub const fn limit(&self) -> u32 {
         self.limit
     }
 }

@@ -69,6 +69,7 @@ pub struct StreamRecord<'a> {
 }
 
 impl<'a> StreamRecord<'a> {
+    #[allow(clippy::missing_const_for_fn)]
     pub(crate) fn set_global_position(mut self, pos: u64) -> Self {
         self.global_position = pos;
         self

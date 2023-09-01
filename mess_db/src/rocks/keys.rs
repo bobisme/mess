@@ -11,11 +11,13 @@ pub(crate) const SEPARATOR_CHAR: char = '|';
 pub struct GlobalKey(pub(crate) u64);
 
 impl GlobalKey {
-    #[must_use] pub const fn new(position: u64) -> Self {
+    #[must_use]
+    pub const fn new(position: u64) -> Self {
         GlobalKey(position)
     }
 
-    #[must_use] pub const fn as_bytes(&self) -> [u8; 8] {
+    #[must_use]
+    pub const fn as_bytes(&self) -> [u8; 8] {
         self.0.to_be_bytes()
     }
 
@@ -26,7 +28,8 @@ impl GlobalKey {
         Ok(GlobalKey(position))
     }
 
-    #[must_use] pub const fn next(&self) -> Self {
+    #[must_use]
+    pub const fn next(&self) -> Self {
         Self(self.0 + 1)
     }
 }
@@ -38,26 +41,32 @@ pub struct StreamKey<'a> {
 }
 
 impl<'a> StreamKey<'a> {
-    #[must_use] pub const fn new(stream: Cow<'a, str>, position: StreamPos) -> Self {
+    #[must_use]
+    pub const fn new(stream: Cow<'a, str>, position: StreamPos) -> Self {
         Self { stream, position }
     }
 
-    #[must_use] pub const fn max(stream: Cow<'a, str>) -> Self {
+    #[must_use]
+    pub const fn max(stream: Cow<'a, str>) -> Self {
         Self { stream, position: StreamPos::Causal(u64::MAX) }
     }
 
-    #[must_use] pub fn next(self) -> Self {
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn next(self) -> Self {
         Self { stream: self.stream, position: self.position.next() }
     }
 
-    #[must_use] pub fn as_bytes(&self) -> Vec<u8> {
+    #[must_use]
+    pub fn as_bytes(&self) -> Vec<u8> {
         let mut bytes = self.stream.as_bytes().to_vec();
         bytes.push(SEPARATOR);
         bytes.extend_from_slice(&self.position.encode().to_be_bytes());
         bytes
     }
 
-    #[must_use] pub fn to_bytes(self) -> Vec<u8> {
+    #[must_use]
+    pub fn to_bytes(self) -> Vec<u8> {
         self.as_bytes()
     }
 
@@ -101,7 +110,7 @@ mod test_global_key {
     #[test]
     fn test_from_bytes() {
         let bytes = [0, 0, 0, 0, 0, 0, 0, 10];
-        let key = GlobalKey::from_bytes(&bytes).unwrap();
+        let key = GlobalKey::from_bytes(bytes).unwrap();
         assert!(key.0 == 10);
     }
 

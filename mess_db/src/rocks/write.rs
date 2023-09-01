@@ -96,7 +96,8 @@ pub struct WriteSerializer<const S: usize = 1024> {
 }
 
 impl<const S: usize> WriteSerializer<S> {
-    #[must_use] pub fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self { global_buffer: [0u8; S], stream_buffer: [0u8; S] }
     }
 
@@ -116,6 +117,12 @@ impl<const S: usize> WriteSerializer<S> {
         postcard::to_slice(stream, &mut self.stream_buffer)
             .map(|x| &*x)
             .map_err(|e| Error::SerError(format!("stream: {e}")))
+    }
+}
+
+impl<const S: usize> Default for WriteSerializer<S> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -155,7 +162,7 @@ pub fn write_mess(
 ) -> MessResult<Position> {
     let next_global = get_last_global_position(db)?.next();
     let last_stream = get_last_stream_position(db, &msg.stream_name)?;
-    let stream_name = msg.stream_name.to_owned();
+    let stream_name = msg.stream_name.clone();
     let next_stream =
         next_stream_pos(msg.expected_position, &stream_name, last_stream)?;
     let res = write_records(db, msg, next_global, next_stream, ser);
@@ -183,7 +190,7 @@ pub async fn write_mess_async<'a>(
         tokio::join!(g, s)
     };
     let next_global = last_global??.next();
-    let stream_name = msg.stream_name.to_owned();
+    let stream_name = msg.stream_name.clone();
     let next_stream =
         next_stream_pos(msg.expected_position, &stream_name, last_stream??)?;
     write_records(&db, msg, next_global, next_stream, ser)
@@ -198,18 +205,18 @@ mod test_global_key {
     fn test_from_bytes() {
         // Test case 1: Valid bytes
         let bytes: [u8; 8] = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01];
-        let result = GlobalKey::from_bytes(&bytes).unwrap();
+        let result = GlobalKey::from_bytes(bytes).unwrap();
         assert!(result == GlobalKey(1));
 
         // Test case 2: Invalid bytes (less than 8 bytes)
         let bytes: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
-        let result = GlobalKey::from_bytes(&bytes).unwrap_err();
+        let result = GlobalKey::from_bytes(bytes).unwrap_err();
         assert!(matches!(result, Error::ParseKeyError));
 
         // Test case 3: Invalid bytes (more than 8 bytes)
         let bytes: [u8; 11] =
             [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let result = GlobalKey::from_bytes(&bytes).unwrap_err();
+        let result = GlobalKey::from_bytes(bytes).unwrap_err();
         assert!(matches!(result, Error::ParseKeyError));
     }
 }
@@ -267,7 +274,7 @@ mod test_write_mess {
     use super::super::db::test::SelfDestructingDB;
     use super::*;
 
-    fn ser() -> WriteSerializer {
+    const fn ser() -> WriteSerializer {
         WriteSerializer::new()
     }
 

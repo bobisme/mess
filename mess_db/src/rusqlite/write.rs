@@ -2,7 +2,7 @@ use ident::Id;
 use rusqlite::{params, Connection};
 use serde::Serialize;
 
-const ROWS_PER_BULK_INSERT: usize = 100;
+// const ROWS_PER_BULK_INSERT: usize = 100;
 
 use crate::{
     error::{Error, MessResult},

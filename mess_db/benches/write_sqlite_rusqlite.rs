@@ -1,6 +1,6 @@
 use std::ops::Deref;
+use std::ops::DerefMut;
 use std::time::Duration;
-use std::{cell::Cell, ops::DerefMut};
 
 use criterion::{
     black_box, criterion_group, criterion_main, BatchSize, Criterion,

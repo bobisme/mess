@@ -44,7 +44,8 @@ impl Default for GetMessages<Unset, Unset, Unset> {
 }
 
 impl GetMessages<Unset, Unset, Unset> {
-    #[must_use] pub const fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         GetMessages {
             start_global_position: Unset,
             start_stream_position: Unset,
@@ -66,6 +67,7 @@ impl<P, G, S> GetMessages<P, G, S> {
 }
 
 impl<P, G, S> GetMessages<P, G, S> {
+    #[allow(clippy::missing_const_for_fn)]
     pub fn from_global(self, position: u64) -> GetMessages<P, OptGlobalPos, S> {
         GetMessages {
             start_global_position: OptGlobalPos(position),
@@ -179,6 +181,8 @@ impl<'a> GetMessages<OptStream<'a>, Unset, OptStreamPos> {
 
 #[cfg(test)]
 mod test {
+    #![allow(clippy::missing_const_for_fn)]
+
     use super::*;
     use ident::Id;
     use rstest::*;
@@ -190,8 +194,6 @@ mod test {
         },
         write::WriteSerialMessage,
     };
-
-    const ROWS_PER_INSERT: usize = 500;
 
     fn test_ser() -> WriteSerializer {
         WriteSerializer::new()
@@ -205,34 +207,33 @@ mod test {
         let data = [100u8; 100];
         let meta = [99u8; 100];
 
-        let rows =
-            std::iter::once(None).chain((0u64..).map(|x| Some(x))).map(|x| {
-                let expected_position = x.map(|x| StreamPos::Serial(x));
-                let i = match x {
-                    Some(x) => x + 1,
-                    None => 0,
-                };
-                [
-                    WriteSerialMessage {
-                        id: Id::from(format!("{:x>6x}.xxxxxx", i).as_str()),
-                        stream_name: "stream1".into(),
-                        message_type: "MessageType".into(),
-                        data: data[..].into(),
-                        metadata: meta[..].into(),
-                        expected_position,
-                    },
-                    WriteSerialMessage {
-                        id: Id::from(format!("{:y>6x}.yyyyyy", i).as_str()),
-                        stream_name: "stream2".into(),
-                        message_type: "MessageType".into(),
-                        data: data[..].into(),
-                        metadata: [][..].into(),
-                        expected_position,
-                    },
-                ]
-            });
+        let rows = std::iter::once(None).chain((0u64..).map(Some)).map(|x| {
+            let expected_position = x.map(StreamPos::Serial);
+            let i = match x {
+                Some(x) => x + 1,
+                None => 0,
+            };
+            [
+                WriteSerialMessage {
+                    id: Id::from(format!("{:x>6x}.xxxxxx", i).as_str()),
+                    stream_name: "stream1".into(),
+                    message_type: "MessageType".into(),
+                    data: data[..].into(),
+                    metadata: meta[..].into(),
+                    expected_position,
+                },
+                WriteSerialMessage {
+                    id: Id::from(format!("{:y>6x}.yyyyyy", i).as_str()),
+                    stream_name: "stream2".into(),
+                    message_type: "MessageType".into(),
+                    data: data[..].into(),
+                    metadata: [][..].into(),
+                    expected_position,
+                },
+            ]
+        });
         rows.take(rows_per_stream).flatten().for_each(|msg| {
-            write_mess(&conn, msg, &mut ser);
+            write_mess(&conn, msg, &mut ser).unwrap();
         });
 
         conn
@@ -332,10 +333,10 @@ mod test {
         //     }
         // }
         //
-        mod fn_get_stream_messages {
-            use super::*;
-            use assert2::assert;
-        }
+        // mod fn_get_stream_messages {
+        //     use super::*;
+        //     use assert2::assert;
+        // }
         //
         // mod fn_get_latest_stream_message {
         //     use super::*;

@@ -1,20 +1,17 @@
 use std::borrow::{BorrowMut, Cow};
-use std::cell::{Ref, RefCell};
 use std::ops::Deref;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
-use std::{cell::Cell, ops::DerefMut};
 
 use criterion::{
-    black_box, criterion_group, criterion_main, BatchSize, BenchmarkId,
-    Criterion,
+    black_box, criterion_group, criterion_main, BenchmarkId, Criterion,
 };
 
 use ident::Id;
 use mess_db::rocks::db::DB;
 use mess_db::rocks::write::WriteSerializer;
-use mess_db::write::{WriteMessage, WriteSerialMessage};
-use serde_json::json;
+use mess_db::write::WriteSerialMessage;
 use tokio::sync::Mutex;
 
 struct SelfDestructingDB<D: Deref<Target = DB>>(Option<D>);
@@ -37,7 +34,7 @@ where
     fn drop(&mut self) {
         let path = self.0.as_ref().unwrap().path().to_owned();
         drop(std::mem::take(&mut self.0));
-        ::rocksdb::DB::destroy(&rocksdb::Options::default(), &path).unwrap();
+        ::rocksdb::DB::destroy(&rocksdb::Options::default(), path).unwrap();
     }
 }
 
@@ -62,7 +59,7 @@ fn msg_to_write(expect: Option<u64>) -> WriteSerialMessage<'static> {
         message_type: "someMsgType".into(),
         data: Cow::Borrowed(data),
         metadata: Cow::Borrowed(metadata),
-        expected_position: expect.map(|x| mess_db::StreamPos::Serial(x)),
+        expected_position: expect.map(mess_db::StreamPos::Serial),
     }
 }
 
@@ -78,7 +75,7 @@ pub fn writing_to_disk(c: &mut Criterion) {
     c.bench_function("rocks_write_many_messages_to_disk", |b| {
         b.iter(|| {
             write_a_message(&conn, pos, &mut ser);
-            pos = pos.and_then(|x| Some(x + 1)).or(Some(0));
+            pos = pos.map(|x| x + 1).or(Some(0));
         })
     });
 }
@@ -87,25 +84,36 @@ pub fn writing_to_disk_async(c: &mut Criterion) {
     let conn = SelfDestructingDB::<Arc<DB>>::new();
     let ws: WriteSerializer<1024> = WriteSerializer::new();
     let serial = Arc::new(Mutex::new(ws));
-    // let conn = Arc::new(SelfDestructingDB::<Box<DB>>::new());
-    let mut pos = None;
+    // let pos = Arc::new(Mutex::new(None));
+    let pos = std::sync::atomic::AtomicI64::new(-1);
     c.bench_with_input(
         BenchmarkId::new("rocks_async_write_many_messages_to_disk", 0),
-        &(conn, serial),
-        |b, (db, ser)| {
+        &(conn, serial, pos),
+        |b, (db, ser, pos)| {
             b.to_async(tokio::runtime::Runtime::new().unwrap()).iter(
                 || async move {
-                    let msg = msg_to_write(pos);
-                    let db = Arc::clone(&db);
-                    let ser = Arc::clone(&ser);
+                    let db = Arc::clone(db);
+                    let ser = Arc::clone(ser);
+                    let p = match pos.fetch_add(1, Ordering::AcqRel) {
+                        x if x < 0 => None,
+                        x => Some(x as u64),
+                    };
+                    // let pos = {
+                    //     let pos = Arc::clone(pos);
+                    //     let mut guard = pos.lock().await;
+                    //     let pos = *guard;
+                    //     *guard = pos.map(|x| x + 1).or(Some(0));
+                    //     pos
+                    // };
+                    let msg = msg_to_write(p);
                     let mut guard = ser.lock().await;
                     mess_db::rocks::write::write_mess_async(
                         db,
                         msg,
                         guard.borrow_mut(),
                     )
-                    .await;
-                    pos = pos.and_then(|x| Some(x + 1)).or(Some(0));
+                    .await
+                    .unwrap();
                 },
             )
         },
