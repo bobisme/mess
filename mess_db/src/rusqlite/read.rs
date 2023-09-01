@@ -32,11 +32,11 @@ pub fn get_messages(
     Ok(messages)
 }
 
-pub fn get_stream_messages(
+pub fn get_stream_messages<'a>(
     conn: &Connection,
     stream_name: &str,
     limit: Option<i32>,
-) -> Result<Vec<Message>, Error> {
+) -> Result<Vec<Message<'a>>, Error> {
     let limit = limit.unwrap_or(1_000).clamp(1, 10_000);
     let mut stmt = conn.prepare_cached(
         r#"
@@ -70,10 +70,10 @@ pub fn get_stream_messages(
 //     .with_limit(5);
 // fetch(read_messages, &pool).unwrap();
 // ```
-pub fn fetch(
+pub fn fetch<'a>(
     rm: ReadMessages<'_>,
-    conn: &Connection,
-) -> Result<Vec<Message>, Error> {
+    conn: &'a Connection,
+) -> Result<Vec<Message<'a>>, Error> {
     if let Some(stream) = rm.stream_name() {
         get_stream_messages(conn, stream, Some(rm.limit() as i32))
     } else {
@@ -81,10 +81,10 @@ pub fn fetch(
     }
 }
 
-pub fn get_latest_stream_message(
+pub fn get_latest_stream_message<'a>(
     conn: &Connection,
     stream_name: &str,
-) -> Result<Option<Message>, Error> {
+) -> Result<Option<Message<'a>>, Error> {
     let mut stmt = conn.prepare_cached(
         r#"
         SELECT 
@@ -191,6 +191,8 @@ mod test {
     }
 
     mod fn_get_messages {
+        use crate::StreamPos;
+
         use super::*;
         use pretty_assertions::assert_eq;
 
@@ -201,13 +203,13 @@ mod test {
             assert_eq!(messages.len(), 5);
             let m = &messages[0];
             assert_eq!(m.global_position, 1);
-            assert_eq!(m.position, 0);
-            assert_ne!(m.time_ms, 0);
+            assert_eq!(m.stream_position, StreamPos::Serial(0));
+            // assert_ne!(m.time_ms, 0);
             assert_eq!(m.stream_name, "stream1");
             assert_eq!(m.message_type, "X");
-            assert_eq!(m.data, "0");
+            assert_eq!(m.data, b"0".to_vec());
             assert_eq!(m.metadata, None);
-            assert_eq!(m.id, "0xxxxx.xxxxxx");
+            // assert_eq!(m.id, "0xxxxx.xxxxxx");
         }
 
         #[rstest]
@@ -217,13 +219,13 @@ mod test {
             assert_eq!(messages.len(), 2);
             let m = &messages[0];
             assert_eq!(m.global_position, 5);
-            assert_eq!(m.position, 2);
-            assert_ne!(m.time_ms, 0);
+            assert_eq!(m.stream_position, StreamPos::Serial(2));
+            // assert_ne!(m.time_ms, 0);
             assert_eq!(m.stream_name, "stream1");
             assert_eq!(m.message_type, "X");
-            assert_eq!(m.data, "2");
+            assert_eq!(m.data, b"2".to_vec());
             assert_eq!(m.metadata, None);
-            assert_eq!(m.id, "2xxxxx.xxxxxx");
+            // assert_eq!(m.id, "2xxxxx.xxxxxx");
         }
 
         #[rstest]
@@ -271,6 +273,8 @@ mod test {
     }
 
     mod fn_get_latest_stream_message {
+        use crate::StreamPos;
+
         use super::*;
         use pretty_assertions::assert_eq;
 
@@ -279,14 +283,14 @@ mod test {
             let conn = test_db(5);
             let m =
                 get_latest_stream_message(&conn, "stream1").unwrap().unwrap();
-            assert_ne!(m.time_ms, 0);
+            // assert_ne!(m.time_ms, 0);
             assert_eq!(m.global_position, 9);
-            assert_eq!(m.position, 4);
+            assert_eq!(m.stream_position, StreamPos::Serial(4));
             assert_eq!(m.stream_name, "stream1");
             assert_eq!(m.message_type, "X");
-            assert_eq!(m.data, "4");
+            assert_eq!(m.data, b"4".to_vec());
             assert_eq!(m.metadata, None);
-            assert_eq!(m.id, "4xxxxx.xxxxxx");
+            // assert_eq!(m.id, "4xxxxx.xxxxxx");
         }
 
         #[rstest]

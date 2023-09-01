@@ -8,7 +8,6 @@ pub mod msg;
 pub mod read;
 pub mod rocks;
 pub mod rusqlite;
-pub mod sqlx;
 pub mod write;
 
 /// StreamPos uses a 63-bit uint for representing position and
@@ -27,14 +26,16 @@ pub enum StreamPos {
 }
 
 impl StreamPos {
-    #[must_use] pub const fn encode(self) -> u64 {
+    #[must_use]
+    pub const fn encode(self) -> u64 {
         match self {
             StreamPos::Serial(pos) => pos << 1,
             StreamPos::Causal(pos) => (pos << 1) | 1,
         }
     }
 
-    #[must_use] pub const fn decode(stored_position: u64) -> Self {
+    #[must_use]
+    pub const fn decode(stored_position: u64) -> Self {
         match stored_position & 0b1 {
             0 => Self::Serial(stored_position >> 1),
             1 => Self::Causal(stored_position >> 1),
@@ -43,13 +44,15 @@ impl StreamPos {
     }
 
     // Returns the 63-bit position (as u64).
-    #[must_use] pub const fn position(self) -> u64 {
+    #[must_use]
+    pub const fn position(self) -> u64 {
         match self {
             Self::Serial(pos) | Self::Causal(pos) => pos,
         }
     }
 
-    #[must_use] pub const fn next(self) -> Self {
+    #[must_use]
+    pub const fn next(self) -> Self {
         match self {
             StreamPos::Serial(pos) => Self::Serial(pos + 1),
             StreamPos::Causal(pos) => Self::Causal(pos + 1),
@@ -75,7 +78,8 @@ pub struct Position {
 }
 
 impl Position {
-    #[must_use] pub const fn new(global: u64, stream: StreamPos) -> Self {
+    #[must_use]
+    pub const fn new(global: u64, stream: StreamPos) -> Self {
         Self { global, stream }
     }
 }

@@ -7,7 +7,7 @@ const ROWS_PER_BULK_INSERT: usize = 100;
 use crate::{
     error::{Error, MessResult},
     write::WriteMessage,
-    Position,
+    Position, StreamPos,
 };
 
 pub fn write_mess<D: Serialize, M: Serialize>(
@@ -122,7 +122,10 @@ pub fn write_message(
             _ => err.into(),
         })?;
 
-    Ok(Position::new(global_position as u64, Some(position.unsigned_abs())))
+    Ok(Position::new(
+        global_position as u64,
+        StreamPos::Serial(position.unsigned_abs()),
+    ))
 }
 
 #[cfg(test)]
@@ -192,7 +195,10 @@ mod test {
                 None,
             )
             .unwrap();
-            assert_eq!(pos, Position { global: 1, stream: Some(0) });
+            assert_eq!(
+                pos,
+                Position { global: 1, stream: StreamPos::Serial(0) }
+            );
             let mut stmt = test_db.prepare(r#"SELECT
                 global_position, position, time_ms, stream_name, message_type, data, metadata, id
             FROM messages
@@ -318,7 +324,7 @@ mod testprops {
                 None,
             )
             .unwrap();
-            assert_eq!(pos, Position { global: 1, stream: Some(0) });
+            assert_eq!(pos, Position { global: 1, stream: StreamPos::Serial(0) });
         }
     }
 }
