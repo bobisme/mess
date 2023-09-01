@@ -1,10 +1,7 @@
 set positional-arguments
 
-default:
-    echo 'Hello, world!'
-
 @test *args='':
-	cargo nextest run --workspace --failure-output=final "$@"
+	env CLICOLOR_FORCE=1 cargo nextest run --workspace --failure-output=final "$@"
 
 @bench *args='':
 	cargo bench --workspace "$@"

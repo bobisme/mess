@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::borrow::{BorrowMut, Cow};
 use std::cell::{Ref, RefCell};
 use std::ops::Deref;
 use std::sync::Arc;
@@ -15,6 +15,7 @@ use mess_db::rocks::db::DB;
 use mess_db::rocks::write::WriteSerializer;
 use mess_db::write::{WriteMessage, WriteSerialMessage};
 use serde_json::json;
+use tokio::sync::Mutex;
 
 struct SelfDestructingDB<D: Deref<Target = DB>>(Option<D>);
 
@@ -65,18 +66,18 @@ fn msg_to_write(expect: Option<u64>) -> WriteSerialMessage<'static> {
     }
 }
 
-fn write_a_message(db: &DB, expect: Option<u64>, ser: &WriteSerializer) {
+fn write_a_message(db: &DB, expect: Option<u64>, ser: &mut WriteSerializer) {
     let msg = msg_to_write(expect);
     mess_db::rocks::write::write_mess(db, black_box(msg), ser).unwrap();
 }
 
 pub fn writing_to_disk(c: &mut Criterion) {
     let conn = SelfDestructingDB::<Box<DB>>::new();
-    let ser = WriteSerializer::new();
+    let mut ser = WriteSerializer::new();
     let mut pos = None;
     c.bench_function("rocks_write_many_messages_to_disk", |b| {
         b.iter(|| {
-            write_a_message(&conn, pos, &ser);
+            write_a_message(&conn, pos, &mut ser);
             pos = pos.and_then(|x| Some(x + 1)).or(Some(0));
         })
     });
@@ -84,7 +85,8 @@ pub fn writing_to_disk(c: &mut Criterion) {
 
 pub fn writing_to_disk_async(c: &mut Criterion) {
     let conn = SelfDestructingDB::<Arc<DB>>::new();
-    let serial = Arc::new(WriteSerializer::new());
+    let ws: WriteSerializer<1024> = WriteSerializer::new();
+    let serial = Arc::new(Mutex::new(ws));
     // let conn = Arc::new(SelfDestructingDB::<Box<DB>>::new());
     let mut pos = None;
     c.bench_with_input(
@@ -96,8 +98,13 @@ pub fn writing_to_disk_async(c: &mut Criterion) {
                     let msg = msg_to_write(pos);
                     let db = Arc::clone(&db);
                     let ser = Arc::clone(&ser);
-                    mess_db::rocks::write::write_mess_async(db, msg, &ser)
-                        .await;
+                    let mut guard = ser.lock().await;
+                    mess_db::rocks::write::write_mess_async(
+                        db,
+                        msg,
+                        guard.borrow_mut(),
+                    )
+                    .await;
                     pos = pos.and_then(|x| Some(x + 1)).or(Some(0));
                 },
             )

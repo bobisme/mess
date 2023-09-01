@@ -5,7 +5,8 @@ use std::sync::{
 
 use super::{
     db::DB,
-    record::{GlobalKey, GlobalRecord, StreamKey, StreamRecord},
+    keys::{GlobalKey, StreamKey},
+    record::{GlobalRecord, StreamRecord},
 };
 use crate::{
     error::{Error, MessResult},
@@ -53,7 +54,7 @@ pub fn get_last_stream_position<'a>(
             db.stream(),
             opts,
             IteratorMode::From(
-                &StreamKey::max(stream).as_bytes(),
+                &StreamKey::max(stream.into()).as_bytes(),
                 rocksdb::Direction::Reverse,
             ),
         )
@@ -62,7 +63,13 @@ pub fn get_last_stream_position<'a>(
     let Some((key, _)) = last else {
         return Ok(None);
     };
-    StreamKey::from_bytes(&key).map(|x| Some(x))
+    StreamKey::from_bytes(&key).map(|x| {
+        if x.stream == stream {
+            Some(x)
+        } else {
+            None
+        }
+    })
 }
 
 fn next_stream_pos<'a>(
@@ -71,7 +78,9 @@ fn next_stream_pos<'a>(
     last_stream: Option<StreamKey<'a>>,
 ) -> Result<StreamKey<'a>, Error> {
     match (expected_position, last_stream) {
-        (None, None) => Ok(StreamKey::new(stream_name, StreamPos::Serial(0))),
+        (None, None) => {
+            Ok(StreamKey::new(stream_name.into(), StreamPos::Serial(0)))
+        }
         (Some(a), Some(key)) if a == key.position => Ok(key.next()),
         (expected, key) => Err(Error::WrongStreamPosition {
             stream: stream_name.to_string(),
@@ -99,6 +108,15 @@ impl<const S: usize> WriteSerializer<S> {
             .map(|x| &*x)
             .map_err(|e| Error::SerError(format!("global: {e}")))
     }
+
+    pub fn serialize_stream(
+        &mut self,
+        stream: &StreamRecord,
+    ) -> MessResult<&[u8]> {
+        postcard::to_slice(stream, &mut self.stream_buffer)
+            .map(|x| &*x)
+            .map_err(|e| Error::SerError(format!("stream: {e}")))
+    }
 }
 
 fn write_records(
@@ -106,21 +124,21 @@ fn write_records(
     msg: WriteSerialMessage,
     next_global: GlobalKey,
     next_stream: StreamKey,
-    ser: &WriteSerializer,
+    ser: &mut WriteSerializer,
 ) -> MessResult<Position> {
     let mut global_record = GlobalRecord::from_write_serial_message(&msg)?;
     let mut stream_record =
         StreamRecord::from_write_serial_message(&msg, next_global.0)?
             .set_global_position(next_global.0);
 
-    // let global_bytes = rkyv::to_bytes::<_, 1024>(&global_record)
-    //     .map_err(|e| Error::SerError(e.to_string()))?;
     let mut buf = [0u8; 1024];
-    let global_bytes = postcard::to_slice(&global_record, &mut buf)
-        .map_err(|e| Error::SerError(format!("global: {e}")))?;
-
-    let stream_bytes = rkyv::to_bytes::<_, 1024>(&stream_record)
-        .map_err(|e| Error::SerError(format!("stream: {e}")))?;
+    let mut buf2 = [0u8; 1024];
+    let global_bytes =
+        postcard::to_slice(&global_record, &mut ser.global_buffer)
+            .map_err(|e| Error::SerError(format!("global: {e}")))?;
+    let stream_bytes =
+        postcard::to_slice(&stream_record, &mut ser.stream_buffer)
+            .map_err(|e| Error::SerError(format!("stream: {e}")))?;
 
     let mut batch = rocksdb::WriteBatch::default();
     batch.put_cf(db.global(), next_global.as_bytes(), &global_bytes);
@@ -133,7 +151,7 @@ fn write_records(
 pub fn write_mess(
     db: &DB,
     msg: WriteSerialMessage,
-    ser: &WriteSerializer,
+    ser: &mut WriteSerializer,
 ) -> MessResult<Position> {
     let next_global = get_last_global_position(db)?.next();
     let last_stream = get_last_stream_position(db, &msg.stream_name)?;
@@ -152,7 +170,7 @@ pub fn write_mess(
 pub async fn write_mess_async<'a>(
     db: Arc<DB>,
     msg: WriteSerialMessage<'a>,
-    ser: &WriteSerializer,
+    ser: &mut WriteSerializer,
 ) -> MessResult<Position> {
     let (last_global, last_stream) = {
         let adb = Arc::clone(&db);
@@ -208,12 +226,21 @@ mod test_get_last_stream_position {
         let cf = db.stream();
         let mut batch = rocksdb::WriteBatch::default();
         batch.put_cf(cf, b"s1|\x00\x00\x00\x00\x00\x00\x00\x20", []);
+        batch.put_cf(cf, b"s2|\x00\x00\x00\x00\x00\x00\x00\x16", []);
         batch.put_cf(cf, b"s1|\x00\x00\x00\x00\x00\x00\x00\x30", []);
+        batch.put_cf(cf, b"s2|\x00\x00\x00\x00\x00\x00\x00\x26", []);
         batch.put_cf(cf, b"s1|\x00\x00\x00\x00\x00\x00\x00\x10", []);
+        batch.put_cf(cf, b"s2|\x00\x00\x00\x00\x00\x00\x00\x10", []);
         db.write(batch).unwrap();
 
         let res = get_last_stream_position(&db, "s1").unwrap();
-        assert!(res == Some(StreamKey::new("s1", StreamPos::from_store(0x30))));
+        assert!(
+            res == Some(StreamKey::new("s1".into(), StreamPos::decode(0x30)))
+        );
+        let res = get_last_stream_position(&db, "s2").unwrap();
+        assert!(
+            res == Some(StreamKey::new("s2".into(), StreamPos::decode(0x26)))
+        );
     }
 
     #[test]
@@ -227,53 +254,6 @@ mod test_get_last_stream_position {
 
         let res = get_last_stream_position(&db, "s1").unwrap();
         assert!(res == None);
-    }
-}
-
-#[cfg(test)]
-mod test_stream_key {
-    use super::*;
-    use assert2::assert;
-
-    #[test]
-    fn test_as_bytes() {
-        let key = StreamKey::new("somestream", StreamPos::Serial(13));
-        let bytes = key.as_bytes();
-        assert!(bytes == b"somestream|\x00\x00\x00\x00\x00\x00\x00\x1A");
-    }
-
-    mod from_bytes {
-        use super::*;
-        use assert2::assert;
-
-        #[test]
-        fn it_works() {
-            // Test case 1: Valid input
-            let bytes = b"test_stream|\x00\x00\x00\x00\x00\x00\x00\x1A";
-            let expected_result = StreamKey {
-                stream: "test_stream".into(),
-                position: StreamPos::Serial(13),
-            };
-            assert!(StreamKey::from_bytes(bytes).unwrap() == expected_result);
-        }
-
-        #[test]
-        fn it_fails_if_key_too_short() {
-            let bytes = b"|\x00\x00\x00\x00\x00\x00\x00\xFF";
-            assert!(matches!(
-                StreamKey::from_bytes(bytes).unwrap_err(),
-                Error::ParseKeyError
-            ));
-        }
-
-        #[test]
-        fn it_fails_if_no_separator() {
-            let bytes = b"invalid_\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF";
-            assert!(matches!(
-                StreamKey::from_bytes(bytes).unwrap_err(),
-                Error::ParseKeyError
-            ));
-        }
     }
 }
 
@@ -293,6 +273,7 @@ mod test_write_mess {
 
     fn setup() -> SelfDestructingDB {
         let db = SelfDestructingDB::new_tmp();
+        let mut ser = ser();
 
         let msg = WriteSerialMessage {
             id: Id::new(),
@@ -302,7 +283,34 @@ mod test_write_mess {
             metadata: Cow::Borrowed(b"{\"b\": 2}"),
             expected_position: None,
         };
-        write_mess(&db, msg, &ser()).unwrap();
+        write_mess(&db, msg, &mut ser).unwrap();
+        let msg = WriteSerialMessage {
+            id: Id::new(),
+            stream_name: "stream2".into(),
+            message_type: "someMsgType".into(),
+            data: Cow::Borrowed(b"{\"a\": 1})"),
+            metadata: Cow::Borrowed(b"{\"b\": 2}"),
+            expected_position: None,
+        };
+        write_mess(&db, msg, &mut ser).unwrap();
+        let msg = WriteSerialMessage {
+            id: Id::new(),
+            stream_name: "stream1".into(),
+            message_type: "someMsgType".into(),
+            data: Cow::Borrowed(b"{\"a\": 1})"),
+            metadata: Cow::Borrowed(b"{\"b\": 2}"),
+            expected_position: Some(StreamPos::Serial(0)),
+        };
+        write_mess(&db, msg, &mut ser).unwrap();
+        let msg = WriteSerialMessage {
+            id: Id::new(),
+            stream_name: "stream2".into(),
+            message_type: "someMsgType".into(),
+            data: Cow::Borrowed(b"{\"a\": 1})"),
+            metadata: Cow::Borrowed(b"{\"b\": 2}"),
+            expected_position: Some(StreamPos::Serial(0)),
+        };
+        write_mess(&db, msg, &mut ser).unwrap();
         db
     }
 
@@ -326,12 +334,14 @@ mod test_write_mess {
         let bytes = db
             .get_cf(
                 db.stream(),
-                StreamKey::new("stream1", StreamPos::Serial(0)).as_bytes(),
+                StreamKey::new("stream1".into(), StreamPos::Serial(0))
+                    .as_bytes(),
             )
             .unwrap()
             .unwrap();
 
-        let x = rkyv::check_archived_root::<StreamRecord>(&bytes[..]).unwrap();
+        // let x = rkyv::check_archived_root::<StreamRecord>(&bytes[..]).unwrap();
+        let x = StreamRecord::from_bytes(&bytes).unwrap();
 
         assert!(x.message_type == "someMsgType");
         assert!(x.global_position == 1);
@@ -353,10 +363,10 @@ mod test_write_mess {
         let mut msg3 = msg1.clone();
         msg3.expected_position = Some(StreamPos::Serial(2));
 
-        let ser = ser();
-        write_mess(&db, msg1, &ser).unwrap();
-        write_mess(&db, msg2, &ser).unwrap();
-        let result = write_mess(&db, msg3, &ser).unwrap_err();
+        let mut ser = ser();
+        write_mess(&db, msg1, &mut ser).unwrap();
+        write_mess(&db, msg2, &mut ser).unwrap();
+        let result = write_mess(&db, msg3, &mut ser).unwrap_err();
         assert!(let Error::WrongStreamPosition {
             stream: _,
             expected: Some(2),

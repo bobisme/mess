@@ -30,6 +30,7 @@ tokio = { workspace = true }
 tracing = "0.1.37"
 rkyv = { version = "0.7.42", features = ["archive_le", "validation"] }
 postcard = "1.0.6"
+qed = "1.6.1"
 
 [dev-dependencies]
 assert2 = "0.3.11"
