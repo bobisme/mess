@@ -96,7 +96,7 @@ pub struct WriteSerializer<const S: usize = 1024> {
 }
 
 impl<const S: usize> WriteSerializer<S> {
-    pub fn new() -> Self {
+    #[must_use] pub fn new() -> Self {
         Self { global_buffer: [0u8; S], stream_buffer: [0u8; S] }
     }
 
@@ -126,13 +126,13 @@ fn write_records(
     next_stream: StreamKey,
     ser: &mut WriteSerializer,
 ) -> MessResult<Position> {
-    let mut global_record = GlobalRecord::from_write_serial_message(&msg)?;
-    let mut stream_record =
+    let global_record = GlobalRecord::from_write_serial_message(&msg)?;
+    let stream_record =
         StreamRecord::from_write_serial_message(&msg, next_global.0)?
             .set_global_position(next_global.0);
 
-    let mut buf = [0u8; 1024];
-    let mut buf2 = [0u8; 1024];
+    // let mut buf = [0u8; 1024];
+    // let mut buf2 = [0u8; 1024];
     let global_bytes =
         postcard::to_slice(&global_record, &mut ser.global_buffer)
             .map_err(|e| Error::SerError(format!("global: {e}")))?;

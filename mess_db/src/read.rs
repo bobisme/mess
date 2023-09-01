@@ -33,7 +33,8 @@ pub struct ReadMessages<'a> {
 }
 
 impl<'a> ReadMessages<'a> {
-    pub fn from_global_position(mut self, position: u64) -> Self {
+    #[must_use]
+    pub const fn from_global_position(mut self, position: u64) -> Self {
         self.global_position = position;
         self
     }
@@ -43,19 +44,23 @@ impl<'a> ReadMessages<'a> {
         self
     }
 
+    #[must_use]
     pub fn with_limit(mut self, limit: u32) -> Self {
         self.limit = limit.clamp(1, LIMIT_MAX);
         self
     }
 
-    pub fn global_position(&self) -> u64 {
+    #[must_use]
+    pub const fn global_position(&self) -> u64 {
         self.global_position
     }
 
+    #[must_use]
     pub fn stream_name(&self) -> Option<&Cow<'_, str>> {
         self.stream_name.as_ref()
     }
 
+    #[must_use]
     pub fn limit(&self) -> u32 {
         self.limit
     }

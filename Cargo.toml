@@ -8,7 +8,6 @@ repository = "https://github.com/bobisme/mess"
 homepage = "https://github.com/bobisme/mess"
 documentation = "https://github.com/bobisme/mess"
 readme = "README.md"
-license = "WTFPL"
 
 [features]
 xtest = []
@@ -25,3 +24,6 @@ mess_db = { path = "mess_db" }
 
 [workspace.dependencies]
 tokio = { version = "1.32", features = ["full"] }
+
+[profile.dev.package.sqlx-macros]
+opt-level = 3

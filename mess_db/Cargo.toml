@@ -49,9 +49,6 @@ tracing-subscriber = { version = "^0.3.14", features = ["env-filter"] }
 #   "sqlite",
 # ], optional = true }
 
-[profile.dev.package.sqlx-macros]
-opt-level = 3
-
 [[bench]]
 name = "write_sqlite_sqlx"
 harness = false

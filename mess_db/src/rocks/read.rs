@@ -44,7 +44,7 @@ impl Default for GetMessages<Unset, Unset, Unset> {
 }
 
 impl GetMessages<Unset, Unset, Unset> {
-    pub const fn new() -> Self {
+    #[must_use] pub const fn new() -> Self {
         GetMessages {
             start_global_position: Unset,
             start_stream_position: Unset,
@@ -66,10 +66,7 @@ impl<P, G, S> GetMessages<P, G, S> {
 }
 
 impl<P, G, S> GetMessages<P, G, S> {
-    pub fn from_global(
-        mut self,
-        position: u64,
-    ) -> GetMessages<P, OptGlobalPos, S> {
+    pub fn from_global(self, position: u64) -> GetMessages<P, OptGlobalPos, S> {
         GetMessages {
             start_global_position: OptGlobalPos(position),
             start_stream_position: self.start_stream_position,
@@ -80,7 +77,7 @@ impl<P, G, S> GetMessages<P, G, S> {
 }
 
 impl<P, G, S> GetMessages<P, G, S> {
-    pub fn in_stream(mut self, name: &str) -> GetMessages<OptStream, G, S> {
+    pub fn in_stream(self, name: &str) -> GetMessages<OptStream, G, S> {
         GetMessages {
             start_global_position: self.start_global_position,
             start_stream_position: self.start_stream_position,
@@ -90,11 +87,11 @@ impl<P, G, S> GetMessages<P, G, S> {
     }
 }
 
-pub fn fetch_global<'a>(
-    db: &'a DB,
+pub fn fetch_global(
+    db: &DB,
     pos: u64,
     limit: usize,
-) -> MessResult<impl 'a + Iterator<Item = Result<Message<'_>, Error>>> {
+) -> MessResult<impl '_ + Iterator<Item = Result<Message<'_>, Error>>> {
     let glob_key = pos.to_be_bytes();
     let cf = db.global();
     let iter = db.prefix_iterator_cf(cf, glob_key);
@@ -238,17 +235,6 @@ mod test {
             write_mess(&conn, msg, &mut ser);
         });
 
-        // for i in (0..rows_per_stream).step_by(ROWS_PER_INSERT) {
-        //     let row_count = (rows_per_stream - i).min(ROWS_PER_INSERT);
-        //     let total_row_count =
-        //         rows.clone().skip(i).take(row_count).flatten().count();
-        //
-        //     for (row_i, row) in
-        //         rows.clone().skip(i).take(row_count).flatten().enumerate()
-        //     {
-        //         write_mess(&conn, row, &ser).unwrap();
-        //     }
-        // }
         conn
     }
 

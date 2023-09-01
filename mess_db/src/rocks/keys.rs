@@ -11,11 +11,11 @@ pub(crate) const SEPARATOR_CHAR: char = '|';
 pub struct GlobalKey(pub(crate) u64);
 
 impl GlobalKey {
-    pub const fn new(position: u64) -> Self {
+    #[must_use] pub const fn new(position: u64) -> Self {
         GlobalKey(position)
     }
 
-    pub const fn as_bytes(&self) -> [u8; 8] {
+    #[must_use] pub const fn as_bytes(&self) -> [u8; 8] {
         self.0.to_be_bytes()
     }
 
@@ -26,7 +26,7 @@ impl GlobalKey {
         Ok(GlobalKey(position))
     }
 
-    pub const fn next(&self) -> Self {
+    #[must_use] pub const fn next(&self) -> Self {
         Self(self.0 + 1)
     }
 }
@@ -38,26 +38,26 @@ pub struct StreamKey<'a> {
 }
 
 impl<'a> StreamKey<'a> {
-    pub const fn new(stream: Cow<'a, str>, position: StreamPos) -> Self {
+    #[must_use] pub const fn new(stream: Cow<'a, str>, position: StreamPos) -> Self {
         Self { stream, position }
     }
 
-    pub const fn max(stream: Cow<'a, str>) -> Self {
+    #[must_use] pub const fn max(stream: Cow<'a, str>) -> Self {
         Self { stream, position: StreamPos::Causal(u64::MAX) }
     }
 
-    pub fn next(self) -> Self {
+    #[must_use] pub fn next(self) -> Self {
         Self { stream: self.stream, position: self.position.next() }
     }
 
-    pub fn as_bytes(&self) -> Vec<u8> {
+    #[must_use] pub fn as_bytes(&self) -> Vec<u8> {
         let mut bytes = self.stream.as_bytes().to_vec();
         bytes.push(SEPARATOR);
         bytes.extend_from_slice(&self.position.encode().to_be_bytes());
         bytes
     }
 
-    pub fn to_bytes(self) -> Vec<u8> {
+    #[must_use] pub fn to_bytes(self) -> Vec<u8> {
         self.as_bytes()
     }
 

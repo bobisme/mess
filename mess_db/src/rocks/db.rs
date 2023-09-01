@@ -1,5 +1,4 @@
 use std::{
-    cell::{RefCell, RefMut},
     ops::{Deref, DerefMut},
     path::Path,
 };
@@ -8,12 +7,8 @@ use rocksdb::{ColumnFamilyDescriptor, ColumnFamilyRef, Options};
 
 use crate::error::MessResult;
 
-const DEFAULT_CAPACITY: usize = 1024;
-
 pub struct DB {
     db: ::rocksdb::DB,
-    // data_buf: RefCell<Vec<u8>>,
-    // meta_buf: RefCell<Vec<u8>>,
 }
 
 fn opts() -> Options {
@@ -34,39 +29,22 @@ impl DB {
         println!("DEBUG: open db at {:?}", path.as_ref());
 
         let db_opts = opts();
-        let cf_opts = Options::default();
+        // let cf_opts = Options::default();
         let db = rocksdb::DB::open_cf_descriptors(
             &db_opts,
             path,
             vec![new_cf("global"), new_cf("stream")],
         )?;
-        Ok(Self {
-            db,
-            // data_buf: Vec::with_capacity(DEFAULT_CAPACITY).into(),
-            // meta_buf: Vec::with_capacity(DEFAULT_CAPACITY).into(),
-        })
+        Ok(Self { db })
     }
 
-    pub fn global(&self) -> ColumnFamilyRef<'_> {
+    #[must_use] pub fn global(&self) -> ColumnFamilyRef<'_> {
         self.db.cf_handle("global").expect("no global column family")
     }
 
-    pub fn stream(&self) -> ColumnFamilyRef<'_> {
+    #[must_use] pub fn stream(&self) -> ColumnFamilyRef<'_> {
         self.db.cf_handle("stream").expect("no stream column family")
     }
-
-    // pub fn data_buffer(&self) -> RefMut<'_, Vec<u8>> {
-    //     self.data_buf.borrow_mut()
-    // }
-
-    // pub fn meta_buffer(&self) -> RefMut<'_, Vec<u8>> {
-    //     self.meta_buf.borrow_mut()
-    // }
-
-    // pub fn clear_serialization_buffers(&self) {
-    //     self.data_buf.borrow_mut().clear();
-    //     self.meta_buf.borrow_mut().clear();
-    // }
 }
 
 impl Deref for DB {
