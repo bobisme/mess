@@ -183,6 +183,8 @@ impl<'a> GetMessages<OptStream<'a>, Unset, OptStreamPos> {
 mod test {
     #![allow(clippy::missing_const_for_fn)]
 
+    use std::str::FromStr;
+
     use super::*;
     use ident::Id;
     use rstest::*;
@@ -215,7 +217,8 @@ mod test {
             };
             [
                 WriteSerialMessage {
-                    id: Id::from(format!("{:x>6x}.xxxxxx", i).as_str()),
+                    id: Id::from_str(format!("{:x>6x}.xxxxxx", i).as_str())
+                        .unwrap(),
                     stream_name: "stream1".into(),
                     message_type: "MessageType".into(),
                     data: data[..].into(),
@@ -223,7 +226,8 @@ mod test {
                     expected_position,
                 },
                 WriteSerialMessage {
-                    id: Id::from(format!("{:y>6x}.yyyyyy", i).as_str()),
+                    id: Id::from_str(format!("{:y>6x}.yyyyyy", i).as_str())
+                        .unwrap(),
                     stream_name: "stream2".into(),
                     message_type: "MessageType".into(),
                     data: data[..].into(),

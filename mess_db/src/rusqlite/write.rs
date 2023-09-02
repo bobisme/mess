@@ -164,6 +164,8 @@ mod test {
     mod write_message_fn {
         // use crate::sqlite::test::new_memory_pool;
 
+        use std::str::FromStr;
+
         use super::*;
         use crate::error::Error;
 
@@ -187,7 +189,7 @@ mod test {
             let meta = json!({ "three": 3, "four": 4 });
             let pos = write_message(
                 &test_db,
-                Id::from("fartxx.poopxx"),
+                Id::from_str("fartxx.poopxx").unwrap(),
                 "thing-xyz123.twothr",
                 "Donked",
                 data,
@@ -227,7 +229,7 @@ mod test {
         ) -> Result<(), Box<dyn std::error::Error>> {
             let res = write_message(
                 &test_db,
-                Id::from("fartxx.poopxx"),
+                Id::from_str("fartxx.poopxx").unwrap(),
                 "thing-xyz123.twothr",
                 "Donked",
                 json!({ "one": 1, "two": 2 }),

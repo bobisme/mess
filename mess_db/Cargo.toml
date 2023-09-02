@@ -10,7 +10,7 @@ rocksdb = ["dep:rocksdb"]
 
 [dependencies]
 chrono = "0.4.26"
-ident = { git = "https://github.com/bobisme/ident" }
+ident = { workspace = true }
 once_cell = "1.18.0"
 rusqlite = { version = "0.29.0", features = ["serde_json"], optional = true }
 rocksdb = { version = "0.21", default_features = false, features = [
