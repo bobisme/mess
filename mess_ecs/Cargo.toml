@@ -1,0 +1,16 @@
+[package]
+name = "mess_ecs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mess_db = { workspace = true }
+konst = { workspace = true }
+ident = { workspace = true }
+quick_cache = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+rstest = { workspace = true }
+assert2 = { workspace = true }
