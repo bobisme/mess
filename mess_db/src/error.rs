@@ -8,12 +8,11 @@ pub enum Error {
     #[error(transparent)]
     JoinError(#[from] tokio::task::JoinError),
 
+    #[error(transparent)]
+    RecvError(#[from] tokio::sync::oneshot::error::RecvError),
+
     // #[error(transparent)]
     // External(#[from] Box<dyn std::error::Error>),
-    #[error(transparent)]
-    #[cfg(feature = "sqlx")]
-    SqlxError(#[from] sqlx::Error),
-
     #[error(transparent)]
     #[cfg(feature = "rusqlite")]
     RusqliteError(#[from] ::rusqlite::Error),

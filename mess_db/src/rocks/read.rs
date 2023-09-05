@@ -11,8 +11,8 @@ use super::{
     record::{GlobalRecord, StreamRecord},
 };
 
-const LIMIT_MAX: usize = 10_000;
-const LIMIT_DEFAULT: usize = 1_000;
+pub const LIMIT_MAX: usize = 10_000;
+pub const LIMIT_DEFAULT: usize = 1_000;
 
 // type states for GetMessages options
 #[derive(Default, Clone, Copy)]

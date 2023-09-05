@@ -1,5 +1,4 @@
-#![warn(clippy::missing_const_for_fn)]
-#![warn(clippy::must_use_candidate)]
+#![warn(clippy::missing_const_for_fn, clippy::must_use_candidate)]
 
 use std::borrow::Cow;
 
@@ -8,6 +7,7 @@ pub mod msg;
 pub mod read;
 pub mod rocks;
 pub mod rusqlite;
+pub mod svc;
 pub mod write;
 
 /// StreamPos uses a 63-bit uint for representing position and
