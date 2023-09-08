@@ -1,4 +1,4 @@
-use crate::error::{Error, MessResult};
+use crate::error::{Error, Result};
 use once_cell::sync::Lazy;
 use rusqlite::{Connection, Transaction};
 use tracing::{error, info};
@@ -127,20 +127,20 @@ END;
 });
 
 /// Gets PRAGMA user_version.
-fn get_user_version(conn: &Connection) -> MessResult<i32> {
+fn get_user_version(conn: &Connection) -> Result<i32> {
     conn.pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|err| Error::Other(err.to_string()))
 }
 
 /// Sets PRAGMA user_version = `version`.
-fn set_user_version(conn: &Connection, version: i32) -> MessResult<()> {
+fn set_user_version(conn: &Connection, version: i32) -> Result<()> {
     conn.pragma_update(None, "user_version", version)
         .map_err(|err| Error::Other(err.to_string()))
 }
 
 /// Runs thoughs migrations which have not been run and runs them, updating
 /// the tracked migration version in the db.
-pub fn migrate(conn: &mut Connection) -> MessResult<()> {
+pub fn migrate(conn: &mut Connection) -> Result<()> {
     let starting_version = get_user_version(conn)?;
 
     for (version, migration) in

@@ -3,7 +3,6 @@
 use std::borrow::Cow;
 
 pub mod error;
-pub mod msg;
 pub mod read;
 pub mod rocks;
 pub mod rusqlite;
@@ -23,6 +22,15 @@ pub mod write;
 pub enum StreamPos {
     Serial(u64),
     Causal(u64),
+}
+
+#[cfg(feature = "rusqlite")]
+impl ::rusqlite::ToSql for StreamPos {
+    fn to_sql(&self) -> ::rusqlite::Result<::rusqlite::types::ToSqlOutput<'_>> {
+        Ok(::rusqlite::types::ToSqlOutput::Owned(
+            ::rusqlite::types::Value::Integer(self.encode() as i64),
+        ))
+    }
 }
 
 impl StreamPos {
@@ -87,13 +95,13 @@ impl Position {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "sqlx", derive(::sqlx::FromRow))]
 pub struct Message<'a> {
-    global_position: u64,
-    stream_position: StreamPos,
+    pub global_position: u64,
+    pub stream_position: StreamPos,
     // time_ms: u64,
-    stream_name: Cow<'a, str>,
-    message_type: Cow<'a, str>,
-    data: Cow<'a, [u8]>,
-    metadata: Option<Cow<'a, [u8]>>,
+    pub stream_name: Cow<'a, str>,
+    pub message_type: Cow<'a, str>,
+    pub data: Cow<'a, [u8]>,
+    pub metadata: Option<Cow<'a, [u8]>>,
 }
 
 #[cfg(feature = "rusqlite")]

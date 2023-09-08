@@ -1,5 +1,7 @@
 use std::{borrow::Cow, cell::Cell, num::NonZeroU16};
 
+use ident::Id;
+
 #[derive(Copy, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum StrPos {
     #[default]
@@ -55,6 +57,33 @@ impl<'a> StreamName<'a> {
             source,
             id_split: Cell::new(StrPos::Unset),
             ex_split: Cell::new(StrPos::Unset),
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn from_component_and_id(
+        component: &'a str,
+        id: Id,
+        extras: Option<&'a [&'a str]>,
+    ) -> Self {
+        if component.is_empty() {
+            return Self::new(Cow::Borrowed(component));
+        }
+        let source = {
+            let mut source = format!("{component}-{id}");
+            if let Some(extras) = extras {
+                source.push_str(&extras.join(","));
+            }
+            source
+        };
+        let id_split = unsafe {
+            NonZeroU16::new(component.len() as u16).unwrap_unchecked()
+        };
+        Self {
+            source: source.into(),
+            id_split: Cell::new(StrPos::Some(id_split)),
+            ex_split: Cell::new(StrPos::None),
         }
     }
 
@@ -194,5 +223,22 @@ mod test_streamname {
         let stream = Cow::Borrowed(input);
         let sn = StreamName::new(stream);
         assert!(sn.extra() == expected);
+    }
+
+    #[rstest]
+    #[case(("stream", Id::from_u128((1 << 100) - 1), None), "stream-zzzzzz-zzzzzzzz-zzzzzz")]
+    #[case(("streamWithMoreWords", Id::from_u128(1 << 10), None), "streamWithMoreWords-000000-00000000-000100")]
+    #[case(("", Id::from_u128(1 << 10), None), "")]
+    fn from_component_and_entity_works(
+        #[case] input: (&str, Id, Option<&[&str]>),
+        #[case] expected: &str,
+    ) {
+        // from_component_and_entity
+        let sn = StreamName::from_component_and_id(input.0, input.1, input.2);
+        assert!(sn.source() == expected);
+        assert!(sn.component() == input.0);
+        if !sn.source().is_empty() {
+            assert!(sn.id() == Some(input.1.to_string().as_str()));
+        }
     }
 }

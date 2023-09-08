@@ -4,7 +4,7 @@ use std::cell::RefCell;
 
 use rusqlite::Statement;
 
-use crate::error::MessResult;
+use crate::error::Result;
 
 const CACHE_SIZE: usize = 16;
 
@@ -85,7 +85,7 @@ impl<'conn> Conn<'conn> {
         Self { conn, stmt_cache: Default::default() }
     }
 
-    pub fn write_stmt(&'conn self) -> MessResult<CachedStatement<'conn>> {
+    pub fn write_stmt(&'conn self) -> Result<CachedStatement<'conn>> {
         const KEY: usize = 0;
         if let Some(stmt) = self.stmt_cache.get(KEY) {
             Ok(stmt)

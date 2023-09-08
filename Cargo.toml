@@ -37,6 +37,3 @@ tokio = { version = "1.32", features = ["full"] }
 # dev
 assert2 = "0.3.11"
 rstest = "0.18.2"
-
-[profile.dev.package.sqlx-macros]
-opt-level = 3

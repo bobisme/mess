@@ -2,79 +2,27 @@ use std::borrow::Cow;
 
 use crossbeam_queue::SegQueue;
 use tokio::sync::oneshot::{self, Sender};
+use tracing::error;
 
 use crate::{
-    error::Error,
-    rocks::{
-        keys::SEPARATOR_CHAR,
-        read::{LIMIT_DEFAULT, LIMIT_MAX},
-    },
-    Message, StreamPos,
+    error::{Error, Result},
+    read::{GetMessages, OptGlobalPos, OptStream, OptStreamPos, Unset},
+    write::WriteMessage,
+    Message, Position, StreamPos,
 };
-//
-// type states for GetMessages options
-#[derive(Default, Clone, Copy)]
-pub struct Unset;
-#[derive(Default, Clone)]
-pub struct OptStream<'a>(Cow<'a, str>);
-#[derive(Default, Clone, Copy)]
-pub struct OptGlobalPos(u64);
-#[derive(Clone, Copy)]
-pub struct OptStreamPos(StreamPos);
 
-#[derive(Clone, PartialEq, PartialOrd)]
-pub struct GetMessages<Strm, G, S> {
-    pub(crate) start_global_position: G,
-    pub(crate) start_stream_position: S,
-    pub(crate) limit: usize,
-    pub(crate) stream: Strm,
-}
-
-impl<P, G, S> GetMessages<P, G, S> {
-    pub const fn limit(mut self, limit: usize) -> Self {
-        self.limit = match limit {
-            x if x < 1 => 1,
-            x if x > LIMIT_MAX => LIMIT_MAX,
-            _ => limit,
-        };
-        self
-    }
-}
-
-impl<P, G, S> GetMessages<P, G, S> {
-    #[allow(clippy::missing_const_for_fn)]
-    pub fn from_global(self, position: u64) -> GetMessages<P, OptGlobalPos, S> {
-        GetMessages {
-            start_global_position: OptGlobalPos(position),
-            start_stream_position: self.start_stream_position,
-            limit: self.limit,
-            stream: self.stream,
-        }
-    }
-}
-
-impl<P, G, S> GetMessages<P, G, S> {
-    pub fn in_stream(self, name: &str) -> GetMessages<OptStream, G, S> {
-        let mut name = name.to_string();
-        name.push(SEPARATOR_CHAR);
-        GetMessages {
-            start_global_position: self.start_global_position,
-            start_stream_position: self.start_stream_position,
-            limit: self.limit,
-            stream: OptStream(name.into()),
-        }
-    }
-}
-
-impl Default for GetMessages<Unset, Unset, Unset> {
-    fn default() -> Self {
-        Self {
-            start_global_position: Default::default(),
-            start_stream_position: Default::default(),
-            limit: LIMIT_DEFAULT,
-            stream: Default::default(),
-        }
-    }
+pub(crate) enum RequestBody<'a> {
+    GetGlobalMessages {
+        stream: Option<Cow<'a, str>>,
+        global_pos: u64,
+        limit: usize,
+    },
+    GetStreamMessages {
+        stream: Cow<'a, str>,
+        stream_pos: Option<StreamPos>,
+        limit: usize,
+    },
+    Write(WriteMessage<'a>),
 }
 
 impl<'a> From<GetMessages<Unset, OptGlobalPos, Unset>> for Request<'a> {
@@ -124,33 +72,38 @@ impl<'a> From<GetMessages<OptStream<'a>, Unset, OptStreamPos>> for Request<'a> {
         }
     }
 }
-
-pub(crate) enum RequestBody<'a> {
-    GetGlobalMessages {
-        stream: Option<Cow<'a, str>>,
-        global_pos: u64,
-        limit: usize,
-    },
-    GetStreamMessages {
-        stream: Cow<'a, str>,
-        stream_pos: Option<StreamPos>,
-        limit: usize,
-    },
-}
 pub struct Request<'a> {
     pub(crate) body: RequestBody<'a>,
 }
-pub enum ResponseBody {
-    // Messages { iter: I },
+
+pub type DynMessageIter<'a> = Box<dyn Iterator<Item = Message<'a>>>;
+
+pub enum ResponseBody<'a> {
+    Messages { messages: DynMessageIter<'a> },
+    Write { pos: Position },
 }
-pub struct Response {
-    pub body: ResponseBody,
+
+impl<'a> std::fmt::Debug for ResponseBody<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Messages { messages: _ } => f
+                .debug_struct("Messages")
+                .field("messages", &"<...messages...>")
+                .finish(),
+            Self::Write { pos } => {
+                f.debug_struct("Write").field("pos", pos).finish()
+            }
+        }
+    }
+}
+
+pub struct Response<'a> {
+    pub body: ResponseBody<'a>,
 }
 
 #[derive(Default)]
 pub struct Connection<'a> {
-    queue:
-        SegQueue<(Request<'a>, Sender<Box<dyn Iterator<Item = Message<'a>>>>)>,
+    queue: SegQueue<(Request<'a>, Sender<Response<'a>>)>,
 }
 
 impl<'a> Connection<'a> {
@@ -162,9 +115,33 @@ impl<'a> Connection<'a> {
     pub async fn fetch_messages(
         &'a self,
         req: impl Into<Request<'a>>,
-    ) -> Result<Box<dyn Iterator<Item = Message>>, Error> {
+    ) -> Result<Box<dyn Iterator<Item = Message>>> {
         let (send, recv) = oneshot::channel();
         self.queue.push((req.into(), send));
-        recv.await.map_err(Error::from)
+        let res = recv.await.map_err(Error::from)?;
+        match res.body {
+            ResponseBody::Messages { messages } => Ok(messages),
+            resp => {
+                error!(?resp, "unexpected service response body");
+                Err(Error::SvcResponse)
+            }
+        }
+    }
+
+    pub async fn put_message(
+        &'a self,
+        wm: WriteMessage<'a>,
+    ) -> Result<Position> {
+        let req = Request { body: RequestBody::Write(wm) };
+        let (send, recv) = oneshot::channel();
+        self.queue.push((req, send));
+        let res = recv.await.map_err(Error::from)?;
+        match res.body {
+            ResponseBody::Write { pos } => Ok(pos),
+            resp => {
+                error!(?resp, "unexpected service response body");
+                Err(Error::SvcResponse)
+            }
+        }
     }
 }

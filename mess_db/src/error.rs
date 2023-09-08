@@ -65,6 +65,9 @@ pub enum Error {
 
     #[error("error writing record: {0}")]
     WriteError(String),
+
+    #[error("unexpected service response")]
+    SvcResponse,
 }
 
 impl Error {
@@ -73,4 +76,4 @@ impl Error {
     // }
 }
 
-pub type MessResult<T> = Result<T, Error>;
+pub type Result<T> = ::core::result::Result<T, Error>;

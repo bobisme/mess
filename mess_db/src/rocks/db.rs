@@ -5,7 +5,7 @@ use std::{
 
 use rocksdb::{ColumnFamilyDescriptor, ColumnFamilyRef, Options};
 
-use crate::error::MessResult;
+use crate::error::Result;
 
 pub struct DB {
     db: ::rocksdb::DB,
@@ -25,7 +25,7 @@ fn new_cf(name: &str) -> ColumnFamilyDescriptor {
 }
 
 impl DB {
-    pub fn new(path: impl AsRef<Path>) -> MessResult<Self> {
+    pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         println!("DEBUG: open db at {:?}", path.as_ref());
 
         let db_opts = opts();
@@ -38,11 +38,13 @@ impl DB {
         Ok(Self { db })
     }
 
-    #[must_use] pub fn global(&self) -> ColumnFamilyRef<'_> {
+    #[must_use]
+    pub fn global(&self) -> ColumnFamilyRef<'_> {
         self.db.cf_handle("global").expect("no global column family")
     }
 
-    #[must_use] pub fn stream(&self) -> ColumnFamilyRef<'_> {
+    #[must_use]
+    pub fn stream(&self) -> ColumnFamilyRef<'_> {
         self.db.cf_handle("stream").expect("no stream column family")
     }
 }

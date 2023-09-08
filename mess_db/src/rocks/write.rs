@@ -9,7 +9,7 @@ use super::{
     record::{GlobalRecord, StreamRecord},
 };
 use crate::{
-    error::{Error, MessResult},
+    error::{Error, Result},
     write::WriteSerialMessage,
     Position, StreamPos,
 };
@@ -17,7 +17,7 @@ use rocksdb::{IteratorMode, ReadOptions};
 
 static mut CACHED_GLOBAL: AtomicU64 = AtomicU64::new(0);
 
-pub fn get_last_global_position(db: &DB) -> MessResult<GlobalKey> {
+pub fn get_last_global_position(db: &DB) -> Result<GlobalKey> {
     let cached = unsafe { CACHED_GLOBAL.load(Ordering::SeqCst) };
     if cached != 0 {
         return Ok(GlobalKey(cached));
@@ -45,7 +45,7 @@ pub fn get_last_global_position(db: &DB) -> MessResult<GlobalKey> {
 pub fn get_last_stream_position<'a>(
     db: &DB,
     stream: &str,
-) -> MessResult<Option<StreamKey<'a>>> {
+) -> Result<Option<StreamKey<'a>>> {
     let mut opts = ReadOptions::default();
     opts.set_async_io(true);
     opts.set_pin_data(true);
@@ -76,7 +76,7 @@ fn next_stream_pos<'a>(
     expected_position: Option<StreamPos>,
     stream_name: &'a str,
     last_stream: Option<StreamKey<'a>>,
-) -> Result<StreamKey<'a>, Error> {
+) -> Result<StreamKey<'a>> {
     match (expected_position, last_stream) {
         (None, None) => {
             Ok(StreamKey::new(stream_name.into(), StreamPos::Serial(0)))
@@ -101,19 +101,13 @@ impl<const S: usize> WriteSerializer<S> {
         Self { global_buffer: [0u8; S], stream_buffer: [0u8; S] }
     }
 
-    pub fn serialize_global(
-        &mut self,
-        global: &GlobalRecord,
-    ) -> MessResult<&[u8]> {
+    pub fn serialize_global(&mut self, global: &GlobalRecord) -> Result<&[u8]> {
         postcard::to_slice(global, &mut self.global_buffer)
             .map(|x| &*x)
             .map_err(|e| Error::SerError(format!("global: {e}")))
     }
 
-    pub fn serialize_stream(
-        &mut self,
-        stream: &StreamRecord,
-    ) -> MessResult<&[u8]> {
+    pub fn serialize_stream(&mut self, stream: &StreamRecord) -> Result<&[u8]> {
         postcard::to_slice(stream, &mut self.stream_buffer)
             .map(|x| &*x)
             .map_err(|e| Error::SerError(format!("stream: {e}")))
@@ -132,7 +126,7 @@ fn write_records(
     next_global: GlobalKey,
     next_stream: StreamKey,
     ser: &mut WriteSerializer,
-) -> MessResult<Position> {
+) -> Result<Position> {
     let global_record = GlobalRecord::from_write_serial_message(&msg)?;
     let stream_record =
         StreamRecord::from_write_serial_message(&msg, next_global.0)?
@@ -159,7 +153,7 @@ pub fn write_mess(
     db: &DB,
     msg: WriteSerialMessage,
     ser: &mut WriteSerializer,
-) -> MessResult<Position> {
+) -> Result<Position> {
     let next_global = get_last_global_position(db)?.next();
     let last_stream = get_last_stream_position(db, &msg.stream_name)?;
     let stream_name = msg.stream_name.clone();
@@ -178,7 +172,7 @@ pub async fn write_mess_async<'a>(
     db: Arc<DB>,
     msg: WriteSerialMessage<'a>,
     ser: &mut WriteSerializer,
-) -> MessResult<Position> {
+) -> Result<Position> {
     let (last_global, last_stream) = {
         let adb = Arc::clone(&db);
         let g = tokio::spawn(async move { get_last_global_position(&adb) });

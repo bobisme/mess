@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
 use crate::error::Error;
-use crate::error::MessResult;
+use crate::error::Result;
 use crate::StreamPos;
 
 pub(crate) const SEPARATOR: u8 = b'|';
@@ -21,7 +21,7 @@ impl GlobalKey {
         self.0.to_be_bytes()
     }
 
-    pub fn from_bytes(bytes: impl AsRef<[u8]>) -> MessResult<Self> {
+    pub fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self> {
         let position = u64::from_be_bytes(
             bytes.as_ref().try_into().map_err(|_| Error::ParseKeyError)?,
         );
@@ -70,7 +70,7 @@ impl<'a> StreamKey<'a> {
         self.as_bytes()
     }
 
-    pub fn from_bytes(bytes: impl AsRef<[u8]>) -> MessResult<Self> {
+    pub fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self> {
         let (stream, sep_position) =
             bytes.as_ref().split_at(bytes.as_ref().len() - 9);
         if sep_position.len() != 9 || stream.is_empty() {

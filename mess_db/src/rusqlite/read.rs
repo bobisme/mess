@@ -1,6 +1,13 @@
+use std::borrow::Cow;
+
 use rusqlite::{params, Connection};
 
-use crate::{error::Error, read::ReadMessages, Message};
+use crate::{
+    error::Error,
+    read::OptStream,
+    read::{GetMessages, OptGlobalPos, OptStreamPos, Unset},
+    Message, StreamPos,
+};
 
 pub fn get_messages(
     conn: &Connection,
@@ -62,6 +69,63 @@ pub fn get_stream_messages<'a>(
     Ok(messages)
 }
 
+pub enum DbGetMessages<'a> {
+    GetGlobalMessages {
+        stream: Option<Cow<'a, str>>,
+        global_pos: u64,
+        limit: usize,
+    },
+    GetStreamMessages {
+        stream: Cow<'a, str>,
+        stream_pos: Option<StreamPos>,
+        limit: usize,
+    },
+}
+
+impl<'a> From<GetMessages<Unset, OptGlobalPos, Unset>> for DbGetMessages<'a> {
+    fn from(val: GetMessages<Unset, OptGlobalPos, Unset>) -> Self {
+        DbGetMessages::GetGlobalMessages {
+            stream: None,
+            global_pos: val.start_global_position.0,
+            limit: val.limit,
+        }
+    }
+}
+
+impl<'a> From<GetMessages<OptStream<'a>, OptGlobalPos, Unset>>
+    for DbGetMessages<'a>
+{
+    fn from(val: GetMessages<OptStream<'a>, OptGlobalPos, Unset>) -> Self {
+        DbGetMessages::GetGlobalMessages {
+            stream: Some(val.stream.0),
+            global_pos: val.start_global_position.0,
+            limit: val.limit,
+        }
+    }
+}
+
+impl<'a> From<GetMessages<OptStream<'a>, Unset, Unset>> for DbGetMessages<'a> {
+    fn from(val: GetMessages<OptStream<'a>, Unset, Unset>) -> Self {
+        DbGetMessages::GetStreamMessages {
+            stream: val.stream.0,
+            stream_pos: None,
+            limit: val.limit,
+        }
+    }
+}
+
+impl<'a> From<GetMessages<OptStream<'a>, Unset, OptStreamPos>>
+    for DbGetMessages<'a>
+{
+    fn from(val: GetMessages<OptStream<'a>, Unset, OptStreamPos>) -> Self {
+        DbGetMessages::GetStreamMessages {
+            stream: val.stream.0,
+            stream_pos: Some(val.start_stream_position.0),
+            limit: val.limit,
+        }
+    }
+}
+
 // ```
 // use mess_db::read::ReadMessages;
 // use mess_db::sqlite::read::fetch;
@@ -71,13 +135,17 @@ pub fn get_stream_messages<'a>(
 // fetch(read_messages, &pool).unwrap();
 // ```
 pub fn fetch<'a>(
-    rm: ReadMessages<'_>,
+    req: impl Into<DbGetMessages<'a>>,
     conn: &'a Connection,
 ) -> Result<Vec<Message<'a>>, Error> {
-    if let Some(stream) = rm.stream_name() {
-        get_stream_messages(conn, stream, Some(rm.limit() as i32))
-    } else {
-        get_messages(conn, rm.global_position() as i32, Some(rm.limit() as i32))
+    let req = req.into();
+    match req {
+        DbGetMessages::GetGlobalMessages { stream: _, global_pos, limit } => {
+            get_messages(conn, global_pos as i32, Some(limit as i32))
+        }
+        DbGetMessages::GetStreamMessages { stream, stream_pos: _, limit } => {
+            get_stream_messages(conn, &stream, Some(limit as i32))
+        }
     }
 }
 

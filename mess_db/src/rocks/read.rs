@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use super::keys::{GlobalKey, StreamKey, SEPARATOR, SEPARATOR_CHAR};
 use crate::{
-    error::{Error, MessResult},
+    error::{Error, Result},
     Message, StreamPos,
 };
 
@@ -93,7 +93,7 @@ pub fn fetch_global(
     db: &DB,
     pos: u64,
     limit: usize,
-) -> MessResult<impl '_ + Iterator<Item = Result<Message<'_>, Error>>> {
+) -> Result<impl '_ + Iterator<Item = Result<Message<'_>>>> {
     let glob_key = pos.to_be_bytes();
     let cf = db.global();
     let iter = db.prefix_iterator_cf(cf, glob_key);
@@ -113,7 +113,7 @@ pub fn fetch_stream<'a>(
     db: &'a DB,
     stream_name: impl AsRef<str> + 'a,
     limit: usize,
-) -> MessResult<impl 'a + Iterator<Item = MessResult<Message>>> {
+) -> Result<impl 'a + Iterator<Item = Result<Message>>> {
     let mut search_key = stream_name.as_ref().to_owned();
     search_key.push(SEPARATOR_CHAR);
     let cf = db.stream();
@@ -137,7 +137,7 @@ impl<'a> GetMessages<Unset, OptGlobalPos, Unset> {
     pub fn fetch(
         self,
         db: &'a DB,
-    ) -> MessResult<impl 'a + Iterator<Item = MessResult<Message<'a>>>> {
+    ) -> Result<impl 'a + Iterator<Item = Result<Message<'a>>>> {
         fetch_global(db, self.start_global_position.0, self.limit)
     }
 }
@@ -146,7 +146,7 @@ impl<'a> GetMessages<OptStream<'a>, OptGlobalPos, Unset> {
     pub fn fetch(
         self,
         db: &'a DB,
-    ) -> MessResult<impl 'a + Iterator<Item = MessResult<Message<'a>>>> {
+    ) -> Result<impl 'a + Iterator<Item = Result<Message<'a>>>> {
         let stream = self.stream.to_owned();
         Ok(fetch_global(db, self.start_global_position.0, self.limit)?.filter(
             move |res| {
@@ -164,7 +164,7 @@ impl<'a> GetMessages<OptStream<'a>, Unset, Unset> {
     pub fn fetch(
         self,
         db: &'a DB,
-    ) -> MessResult<impl 'a + Iterator<Item = MessResult<Message>>> {
+    ) -> Result<impl 'a + Iterator<Item = Result<Message>>> {
         fetch_stream(db, self.stream.0, self.limit)
     }
 }
@@ -173,7 +173,7 @@ impl<'a> GetMessages<OptStream<'a>, Unset, OptStreamPos> {
     pub fn fetch(
         self,
         db: &'a DB,
-    ) -> MessResult<impl 'a + Iterator<Item = MessResult<Message<'a>>>> {
+    ) -> Result<impl 'a + Iterator<Item = Result<Message<'a>>>> {
         // let key = StreamKey::new(self.stream.0, self.start_stream_position.0);
         fetch_stream(db, self.stream.0, self.limit)
     }
@@ -217,8 +217,10 @@ mod test {
             };
             [
                 WriteSerialMessage {
-                    id: Id::from_str(format!("{:x>6x}.xxxxxx", i).as_str())
-                        .unwrap(),
+                    id: Id::from_str(
+                        format!("{:x>6x}-xxxxxxxx-xxxxxx", i).as_str(),
+                    )
+                    .unwrap(),
                     stream_name: "stream1".into(),
                     message_type: "MessageType".into(),
                     data: data[..].into(),
@@ -226,8 +228,10 @@ mod test {
                     expected_position,
                 },
                 WriteSerialMessage {
-                    id: Id::from_str(format!("{:y>6x}.yyyyyy", i).as_str())
-                        .unwrap(),
+                    id: Id::from_str(
+                        format!("{:y>6x}-yyyyyyyy-yyyyyy", i).as_str(),
+                    )
+                    .unwrap(),
                     stream_name: "stream2".into(),
                     message_type: "MessageType".into(),
                     data: data[..].into(),
@@ -253,7 +257,7 @@ mod test {
             let messages =
                 GetMessages::new().from_global(0).limit(6).fetch(&db);
             let messages = messages.unwrap();
-            let messages: MessResult<Vec<_>> = messages.collect();
+            let messages: Result<Vec<_>> = messages.collect();
             let messages = messages.unwrap();
             for msg in messages.iter() {
                 eprintln!("read msg = {:?}", msg);
@@ -279,7 +283,7 @@ mod test {
                 .from_global(5)
                 .fetch(&db)
                 .unwrap()
-                .collect::<MessResult<Vec<_>>>()
+                .collect::<Result<Vec<_>>>()
                 .unwrap();
             // assert!(messages.len() == 2);
             let m = &messages[0];
@@ -308,7 +312,7 @@ mod test {
                 .in_stream("stream1")
                 .fetch(&db)
                 .unwrap()
-                .collect::<MessResult<Vec<_>>>()
+                .collect::<Result<Vec<_>>>()
                 .unwrap();
             for message in messages {
                 assert!(message.stream_name == "stream1");

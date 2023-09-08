@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
 use crate::{
-    error::{Error, MessResult},
+    error::{Error, Result},
     write::WriteSerialMessage,
     Message, StreamPos,
 };
@@ -20,7 +20,7 @@ pub struct GlobalRecord<'a> {
 impl<'a> GlobalRecord<'a> {
     pub(crate) fn from_write_serial_message(
         msg: &'a WriteSerialMessage,
-    ) -> MessResult<Self> {
+    ) -> Result<Self> {
         let stream_position = msg
             .expected_position
             .map(|x| x.next())
@@ -37,7 +37,7 @@ impl<'a> GlobalRecord<'a> {
         })
     }
 
-    pub(crate) fn from_bytes<B: AsRef<[u8]>>(bytes: B) -> MessResult<Self> {
+    pub(crate) fn from_bytes<B: AsRef<[u8]>>(bytes: B) -> Result<Self> {
         postcard::from_bytes(bytes.as_ref())
             .map_err(|e| Error::DeserError(e.to_string()))
     }
@@ -78,7 +78,7 @@ impl<'a> StreamRecord<'a> {
     pub(crate) fn from_write_serial_message(
         msg: &'a WriteSerialMessage,
         global_position: u64,
-    ) -> MessResult<Self> {
+    ) -> Result<Self> {
         Ok(Self {
             id: msg.id.to_string().into(),
             global_position,
@@ -89,7 +89,7 @@ impl<'a> StreamRecord<'a> {
         })
     }
 
-    pub(crate) fn from_bytes(bytes: impl AsRef<[u8]>) -> MessResult<Self> {
+    pub(crate) fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self> {
         postcard::from_bytes(bytes.as_ref())
             .map_err(|e| Error::DeserError(e.to_string()))
     }

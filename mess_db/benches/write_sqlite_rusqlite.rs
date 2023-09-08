@@ -7,6 +7,7 @@ use criterion::{
 };
 
 use ident::Id;
+use mess_db::StreamPos;
 use rusqlite::Connection;
 use serde_json::json;
 
@@ -64,7 +65,7 @@ fn new_disk_pool() -> DiskConn {
     DiskConn::new(conn)
 }
 
-fn write_a_message(conn: &Connection, expect: Option<u64>) {
+fn write_a_message(conn: &Connection, expect: Option<StreamPos>) {
     let data = json!({ "one": 1, "two": 2 });
     let meta = Some(json!({ "three": 3, "four": 4 }));
     write_message(
@@ -103,8 +104,8 @@ pub fn many_to_memory(c: &mut Criterion) {
         b.iter(|| {
             write_a_message(&conn, pos);
             pos = Some(match pos {
-                Some(x) => x + 1,
-                None => 0u64,
+                Some(x) => x.next(),
+                None => StreamPos::Serial(0),
             });
         })
     });
@@ -118,8 +119,8 @@ pub fn writing_to_disk(c: &mut Criterion) {
         b.iter(|| {
             write_a_message(&conn, pos);
             pos = Some(match pos {
-                Some(x) => x + 1,
-                None => 0u64,
+                Some(x) => x.next(),
+                None => StreamPos::Serial(0),
             });
         })
     });
