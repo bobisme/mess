@@ -105,7 +105,7 @@ pub fn many_to_memory(c: &mut Criterion) {
             write_a_message(&conn, pos);
             pos = Some(match pos {
                 Some(x) => x.next(),
-                None => StreamPos::Serial(0),
+                None => StreamPos::Sequential(0),
             });
         })
     });
@@ -120,7 +120,7 @@ pub fn writing_to_disk(c: &mut Criterion) {
             write_a_message(&conn, pos);
             pos = Some(match pos {
                 Some(x) => x.next(),
-                None => StreamPos::Serial(0),
+                None => StreamPos::Sequential(0),
             });
         })
     });

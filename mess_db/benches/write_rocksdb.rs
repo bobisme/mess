@@ -11,7 +11,7 @@ use criterion::{
 use ident::Id;
 use mess_db::rocks::db::DB;
 use mess_db::rocks::write::WriteSerializer;
-use mess_db::write::WriteSerialMessage;
+use mess_db::write::WriteMessage;
 use tokio::sync::Mutex;
 
 struct SelfDestructingDB<D: Deref<Target = DB>>(Option<D>);
@@ -50,16 +50,16 @@ where
     }
 }
 
-fn msg_to_write(expect: Option<u64>) -> WriteSerialMessage<'static> {
+fn msg_to_write(expect: Option<u64>) -> WriteMessage<'static> {
     let data = b"{ \"one\": 1, \"two\": 2, \"string\": \"Some data here\" }";
     let metadata = b"{ \"three\": 3, \"four\": 4 }";
-    mess_db::write::WriteSerialMessage {
+    mess_db::write::WriteMessage {
         id: Id::new(),
         stream_name: "stream1".into(),
         message_type: "someMsgType".into(),
         data: Cow::Borrowed(data),
         metadata: Cow::Borrowed(metadata),
-        expected_position: expect.map(mess_db::StreamPos::Serial),
+        expected_stream_position: expect.map(mess_db::StreamPos::Sequential),
     }
 }
 
@@ -98,13 +98,6 @@ pub fn writing_to_disk_async(c: &mut Criterion) {
                         x if x < 0 => None,
                         x => Some(x as u64),
                     };
-                    // let pos = {
-                    //     let pos = Arc::clone(pos);
-                    //     let mut guard = pos.lock().await;
-                    //     let pos = *guard;
-                    //     *guard = pos.map(|x| x + 1).or(Some(0));
-                    //     pos
-                    // };
                     let msg = msg_to_write(p);
                     let mut guard = ser.lock().await;
                     mess_db::rocks::write::write_mess_async(

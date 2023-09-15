@@ -10,6 +10,9 @@ postcard = "1.0.6"
 qed = "1.6.1"
 serde_json = "1.0.103"
 tracing = "0.1.37"
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
 
 [dependencies.crossbeam-queue]
 version = "0.3.8"
@@ -35,14 +38,6 @@ optional = true
 [dependencies.serde]
 version = "1.0.175"
 features = ["derive"]
-
-[dependencies.thiserror]
-features = []
-workspace = true
-
-[dependencies.tokio]
-features = []
-workspace = true
 
 [dev-dependencies]
 assert2 = "0.3.11"

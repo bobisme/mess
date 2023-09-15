@@ -39,14 +39,14 @@ pub struct OptGlobalPos(pub(crate) u64);
 pub struct OptStreamPos(pub(crate) StreamPos);
 
 #[derive(Clone, PartialEq, PartialOrd)]
-pub struct GetMessages<Strm, G, S> {
-    pub(crate) start_global_position: G,
-    pub(crate) start_stream_position: S,
+pub struct GetMessages<Strm, Gpos, Spos> {
+    pub(crate) start_global_position: Gpos,
+    pub(crate) start_stream_position: Spos,
     pub(crate) limit: usize,
     pub(crate) stream: Strm,
 }
 
-impl<P, G, S> GetMessages<P, G, S> {
+impl<Strm, Gpos, Spos> GetMessages<Strm, Gpos, Spos> {
     pub const fn with_limit(mut self, limit: usize) -> Self {
         self.limit = match limit {
             x if x < 1 => 1,
@@ -57,9 +57,12 @@ impl<P, G, S> GetMessages<P, G, S> {
     }
 }
 
-impl<P, G, S> GetMessages<P, G, S> {
+impl<Strm, Gpos, Spos> GetMessages<Strm, Gpos, Spos> {
     #[allow(clippy::missing_const_for_fn)]
-    pub fn from_global(self, position: u64) -> GetMessages<P, OptGlobalPos, S> {
+    pub fn from_global(
+        self,
+        position: u64,
+    ) -> GetMessages<Strm, OptGlobalPos, Spos> {
         GetMessages {
             start_global_position: OptGlobalPos(position),
             start_stream_position: self.start_stream_position,
@@ -69,9 +72,9 @@ impl<P, G, S> GetMessages<P, G, S> {
     }
 }
 
-impl<P, G, S> GetMessages<P, G, S> {
-    pub fn in_stream(self, name: &str) -> GetMessages<OptStream, G, S> {
-        let mut name = name.to_string();
+impl<Strm, Gpos, Spos> GetMessages<Strm, Gpos, Spos> {
+    pub fn in_stream(self, name: &str) -> GetMessages<OptStream, Gpos, Spos> {
+        let name = name.to_string();
         GetMessages {
             start_global_position: self.start_global_position,
             start_stream_position: self.start_stream_position,
@@ -91,6 +94,65 @@ impl Default for GetMessages<Unset, Unset, Unset> {
         }
     }
 }
+
+pub(crate) enum GetMessagesOptions<'a> {
+    Global {
+        start_position: u64,
+        limit: usize,
+    },
+    Stream {
+        stream: Cow<'a, str>,
+        global_position: Option<u64>,
+        stream_position: Option<StreamPos>,
+        limit: usize,
+    },
+}
+
+impl From<GetMessages<Unset, OptGlobalPos, Unset>> for GetMessagesOptions<'_> {
+    fn from(value: GetMessages<Unset, OptGlobalPos, Unset>) -> Self {
+        Self::Global {
+            start_position: value.start_global_position.0,
+            limit: value.limit,
+        }
+    }
+}
+
+// impl From<GetMessages<OptStream<'_>, OptGlobalPos, Unset>>
+//     for GetMessagesOptions<'_>
+// {
+//     fn from(value: GetMessages<OptStream, OptGlobalPos, Unset>) -> Self {
+//         Self::Stream {
+//             stream: value.stream.0,
+//             global_position: Some(value.start_global_position.0),
+//             stream_position: None,
+//             limit: value.limit,
+//         }
+//     }
+// }
+//
+// impl From<GetMessages<OptStream<'_>, Unset, Unset>> for GetMessagesOptions<'_> {
+//     fn from(value: GetMessages<OptStream, Unset, Unset>) -> Self {
+//         Self::Stream {
+//             stream: value.stream.0,
+//             global_position: None,
+//             stream_position: None,
+//             limit: value.limit,
+//         }
+//     }
+// }
+//
+// impl From<GetMessages<OptStream<'_>, Unset, OptStreamPos>>
+//     for GetMessagesOptions<'_>
+// {
+//     fn from(value: GetMessages<OptStream, Unset, OptStreamPos>) -> Self {
+//         Self::Stream {
+//             stream: value.stream.0,
+//             global_position: None,
+//             stream_position: Some(value.start_stream_position.0),
+//             limit: value.limit,
+//         }
+//     }
+// }
 
 #[cfg(test)]
 mod test {

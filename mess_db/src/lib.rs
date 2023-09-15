@@ -18,10 +18,9 @@ pub mod write;
 /// The reason for this distinction is to prevent mixing of the
 /// types within a single stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-#[non_exhaustive]
 pub enum StreamPos {
-    Serial(u64),
-    Causal(u64),
+    Sequential(u64),
+    Relaxed(u64),
 }
 
 #[cfg(feature = "rusqlite")]
@@ -37,16 +36,16 @@ impl StreamPos {
     #[must_use]
     pub const fn encode(self) -> u64 {
         match self {
-            StreamPos::Serial(pos) => pos << 1,
-            StreamPos::Causal(pos) => (pos << 1) | 1,
+            StreamPos::Sequential(pos) => pos << 1,
+            StreamPos::Relaxed(pos) => (pos << 1) | 1,
         }
     }
 
     #[must_use]
     pub const fn decode(stored_position: u64) -> Self {
         match stored_position & 0b1 {
-            0 => Self::Serial(stored_position >> 1),
-            1 => Self::Causal(stored_position >> 1),
+            0 => Self::Sequential(stored_position >> 1),
+            1 => Self::Relaxed(stored_position >> 1),
             _ => unreachable!(),
         }
     }
@@ -55,15 +54,15 @@ impl StreamPos {
     #[must_use]
     pub const fn position(self) -> u64 {
         match self {
-            Self::Serial(pos) | Self::Causal(pos) => pos,
+            Self::Sequential(pos) | Self::Relaxed(pos) => pos,
         }
     }
 
     #[must_use]
     pub const fn next(self) -> Self {
         match self {
-            StreamPos::Serial(pos) => Self::Serial(pos + 1),
-            StreamPos::Causal(pos) => Self::Causal(pos + 1),
+            StreamPos::Sequential(pos) => Self::Sequential(pos + 1),
+            StreamPos::Relaxed(pos) => Self::Relaxed(pos + 1),
         }
     }
 }
@@ -71,12 +70,12 @@ impl StreamPos {
 // Compile-time test cases for StreamPos
 const _: () = {
     use StreamPos::*;
-    qed::const_assert!(Serial(0b111).encode() == 0b1110);
-    qed::const_assert!(Causal(0b111).encode() == 0b1111);
-    qed::const_assert_matches!(StreamPos::decode(0b1110), Serial(0b111));
-    qed::const_assert_matches!(StreamPos::decode(0b1111), Causal(0b111));
-    qed::const_assert!(Serial(0b111).position() == 0b111);
-    qed::const_assert!(Causal(0b111).position() == 0b111);
+    qed::const_assert!(Sequential(0b111).encode() == 0b1110);
+    qed::const_assert!(Relaxed(0b111).encode() == 0b1111);
+    qed::const_assert_matches!(StreamPos::decode(0b1110), Sequential(0b111));
+    qed::const_assert_matches!(StreamPos::decode(0b1111), Relaxed(0b111));
+    qed::const_assert!(Sequential(0b111).position() == 0b111);
+    qed::const_assert!(Relaxed(0b111).position() == 0b111);
 };
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

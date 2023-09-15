@@ -75,7 +75,7 @@ pub fn write_message(
 ) -> Result<Position> {
     let next_position = expected_stream_position
         .map(|x| x.next())
-        .unwrap_or(StreamPos::Serial(0));
+        .unwrap_or(StreamPos::Sequential(0));
     let msg_id_str = msg_id.to_string();
     let data = serde_json::to_string(&data)?;
     let meta = match meta {
@@ -126,7 +126,7 @@ pub fn write_message(
 
     Ok(Position::new(
         global_position as u64,
-        StreamPos::Serial(position.unsigned_abs()),
+        StreamPos::Sequential(position.unsigned_abs()),
     ))
 }
 
@@ -201,7 +201,7 @@ mod test {
             .unwrap();
             assert_eq!(
                 pos,
-                Position { global: 1, stream: StreamPos::Serial(0) }
+                Position { global: 1, stream: StreamPos::Sequential(0) }
             );
             let mut stmt = test_db.prepare(r#"SELECT
                 global_position, position, time_ms, stream_name, message_type, data, metadata, id
@@ -233,7 +233,7 @@ mod test {
                 "Donked",
                 json!({ "one": 1, "two": 2 }),
                 None::<()>,
-                Some(StreamPos::Serial(77)),
+                Some(StreamPos::Sequential(77)),
             );
             let err = res.unwrap_err();
             let Error::WrongStreamPosition { stream, expected: _, got: _ } =
@@ -319,7 +319,7 @@ mod testprops {
                 None,
             )
             .unwrap();
-            assert!(pos == Position { global: 1, stream: StreamPos::Serial(0) });
+            assert!(pos == Position { global: 1, stream: StreamPos::Sequential(0) });
         }
     }
 }

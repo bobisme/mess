@@ -34,6 +34,7 @@ parking_lot = { version = "0.12.1", features = ["arc_lock"] }
 quick_cache = "0.4.0"
 thiserror = "1.0.44"
 tokio = { version = "1.32", features = ["full"] }
+tokio-util = "0.7.8"
 # dev
 assert2 = "0.3.11"
 rstest = "0.18.2"

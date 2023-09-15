@@ -33,3 +33,16 @@ pub struct WriteSerialMessage<'a> {
     pub metadata: Cow<'a, [u8]>,
     pub expected_position: Option<StreamPos>,
 }
+
+impl<'a> From<WriteMessage<'a>> for WriteSerialMessage<'a> {
+    fn from(msg: WriteMessage<'a>) -> Self {
+        Self {
+            id: msg.id,
+            stream_name: msg.stream_name,
+            message_type: msg.message_type,
+            data: msg.data,
+            metadata: msg.metadata,
+            expected_position: msg.expected_stream_position,
+        }
+    }
+}

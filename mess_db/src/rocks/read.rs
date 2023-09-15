@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, marker::PhantomData};
 
 use super::keys::{GlobalKey, StreamKey, SEPARATOR, SEPARATOR_CHAR};
 use crate::{
@@ -89,11 +89,11 @@ impl<P, G, S> GetMessages<P, G, S> {
     }
 }
 
-pub fn fetch_global(
-    db: &DB,
+pub fn fetch_global<'iter, 'msg, 'db: 'iter>(
+    db: &'db DB,
     pos: u64,
     limit: usize,
-) -> Result<impl '_ + Iterator<Item = Result<Message<'_>>>> {
+) -> Result<impl 'iter + Iterator<Item = Result<Message<'msg>>>> {
     let glob_key = pos.to_be_bytes();
     let cf = db.global();
     let iter = db.prefix_iterator_cf(cf, glob_key);
@@ -109,11 +109,11 @@ pub fn fetch_global(
     Ok(iter)
 }
 
-pub fn fetch_stream<'a>(
-    db: &'a DB,
-    stream_name: impl AsRef<str> + 'a,
+pub fn fetch_stream<'iter, 'msg, 'db: 'iter>(
+    db: &'db DB,
+    stream_name: impl AsRef<str> + 'iter,
     limit: usize,
-) -> Result<impl 'a + Iterator<Item = Result<Message>>> {
+) -> Result<impl 'iter + Iterator<Item = Result<Message<'msg>>>> {
     let mut search_key = stream_name.as_ref().to_owned();
     search_key.push(SEPARATOR_CHAR);
     let cf = db.stream();
@@ -133,20 +133,20 @@ pub fn fetch_stream<'a>(
     Ok(iter)
 }
 
-impl<'a> GetMessages<Unset, OptGlobalPos, Unset> {
-    pub fn fetch(
+impl GetMessages<Unset, OptGlobalPos, Unset> {
+    pub fn fetch<'iter, 'msg, 'db: 'iter>(
         self,
-        db: &'a DB,
-    ) -> Result<impl 'a + Iterator<Item = Result<Message<'a>>>> {
+        db: &'db DB,
+    ) -> Result<impl 'iter + Iterator<Item = Result<Message<'msg>>>> {
         fetch_global(db, self.start_global_position.0, self.limit)
     }
 }
 
-impl<'a> GetMessages<OptStream<'a>, OptGlobalPos, Unset> {
-    pub fn fetch(
+impl<'iter, 's: 'iter> GetMessages<OptStream<'s>, OptGlobalPos, Unset> {
+    pub fn fetch<'msg, 'db: 'iter>(
         self,
-        db: &'a DB,
-    ) -> Result<impl 'a + Iterator<Item = Result<Message<'a>>>> {
+        db: &'db DB,
+    ) -> Result<impl 'iter + Iterator<Item = Result<Message<'msg>>>> {
         let stream = self.stream.to_owned();
         Ok(fetch_global(db, self.start_global_position.0, self.limit)?.filter(
             move |res| {
@@ -160,22 +160,80 @@ impl<'a> GetMessages<OptStream<'a>, OptGlobalPos, Unset> {
     }
 }
 
-impl<'a> GetMessages<OptStream<'a>, Unset, Unset> {
+impl<'iter, 'msg, 'db: 'iter, 's: 'iter>
+    GetMessages<OptStream<'s>, Unset, Unset>
+{
     pub fn fetch(
         self,
-        db: &'a DB,
-    ) -> Result<impl 'a + Iterator<Item = Result<Message>>> {
+        db: &'db DB,
+    ) -> Result<impl 'iter + Iterator<Item = Result<Message<'msg>>>> {
         fetch_stream(db, self.stream.0, self.limit)
     }
 }
 
-impl<'a> GetMessages<OptStream<'a>, Unset, OptStreamPos> {
-    pub fn fetch(
+impl<'iter, 's: 'iter> GetMessages<OptStream<'s>, Unset, OptStreamPos> {
+    pub fn fetch<'msg, 'db: 'iter>(
         self,
-        db: &'a DB,
-    ) -> Result<impl 'a + Iterator<Item = Result<Message<'a>>>> {
+        db: &'db DB,
+    ) -> Result<impl 'iter + Iterator<Item = Result<Message<'msg>>>> {
         // let key = StreamKey::new(self.stream.0, self.start_stream_position.0);
         fetch_stream(db, self.stream.0, self.limit)
+    }
+}
+
+// trait FetchTrait<'a, Strm, Gpos, Spos, MsgIter> {
+//     fn fetch(
+//         db: &'a DB,
+//         opts: GetMessages<Strm, Gpos, Spos>,
+//     ) -> Result<MsgIter>;
+// }
+//
+// pub struct Fetch;
+pub struct Fetch<Strm, Gpos, Spos> {
+    _s: PhantomData<Strm>,
+    _gp: PhantomData<Gpos>,
+    _sp: PhantomData<Spos>,
+}
+
+impl Fetch<crate::read::Unset, crate::read::OptGlobalPos, crate::read::Unset> {
+    pub fn fetch<'iter, 'msg, 'db: 'iter>(
+        db: &'db DB,
+        opts: crate::read::GetMessages<
+            crate::read::Unset,
+            crate::read::OptGlobalPos,
+            crate::read::Unset,
+        >,
+    ) -> Result<impl 'iter + Iterator<Item = Result<Message<'msg>>>> {
+        fetch_global(db, opts.start_global_position.0, opts.limit)
+    }
+}
+
+impl<'iter, 's: 'iter>
+    Fetch<
+        crate::read::OptStream<'s>,
+        crate::read::OptGlobalPos,
+        crate::read::Unset,
+    >
+{
+    pub fn fetch<'msg, 'db: 'iter>(
+        db: &'db DB,
+        opts: crate::read::GetMessages<
+            crate::read::OptStream<'s>,
+            crate::read::OptGlobalPos,
+            crate::read::Unset,
+        >,
+        // ) -> Result<impl 'b + Iterator<Item = Result<Message<'a>>>> {
+    ) -> Result<impl 'iter + Iterator<Item = Result<Message<'msg>>>> {
+        let stream = opts.stream.to_owned();
+        Ok(fetch_global(db, opts.start_global_position.0, opts.limit)?.filter(
+            move |res| {
+                match res {
+                    Ok(rec) => rec.stream_name == stream.0.as_ref(),
+                    // pass along all errors regardless of prefix
+                    Err(_) => true,
+                }
+            },
+        ))
     }
 }
 
@@ -194,7 +252,7 @@ mod test {
             db::test::SelfDestructingDB,
             write::{write_mess, WriteSerializer},
         },
-        write::WriteSerialMessage,
+        write::WriteMessage,
     };
 
     fn test_ser() -> WriteSerializer {
@@ -210,13 +268,13 @@ mod test {
         let meta = [99u8; 100];
 
         let rows = std::iter::once(None).chain((0u64..).map(Some)).map(|x| {
-            let expected_position = x.map(StreamPos::Serial);
+            let expected_stream_position = x.map(StreamPos::Sequential);
             let i = match x {
                 Some(x) => x + 1,
                 None => 0,
             };
             [
-                WriteSerialMessage {
+                WriteMessage {
                     id: Id::from_str(
                         format!("{:x>6x}-xxxxxxxx-xxxxxx", i).as_str(),
                     )
@@ -225,9 +283,9 @@ mod test {
                     message_type: "MessageType".into(),
                     data: data[..].into(),
                     metadata: meta[..].into(),
-                    expected_position,
+                    expected_stream_position,
                 },
-                WriteSerialMessage {
+                WriteMessage {
                     id: Id::from_str(
                         format!("{:y>6x}-yyyyyyyy-yyyyyy", i).as_str(),
                     )
@@ -236,7 +294,7 @@ mod test {
                     message_type: "MessageType".into(),
                     data: data[..].into(),
                     metadata: [][..].into(),
-                    expected_position,
+                    expected_stream_position,
                 },
             ]
         });
@@ -266,7 +324,7 @@ mod test {
             assert!(messages.len() == 6);
             let m = &messages[0];
             assert!(m.global_position == 1);
-            assert!(m.stream_position == StreamPos::Serial(0));
+            assert!(m.stream_position == StreamPos::Sequential(0));
             // assert_ne!(m.time_ms, 0);
             assert!(m.stream_name == "stream1");
             assert!(m.message_type == "MessageType");
@@ -288,7 +346,7 @@ mod test {
             // assert!(messages.len() == 2);
             let m = &messages[0];
             assert!(m.global_position == 5);
-            assert!(m.stream_position == StreamPos::Serial(2));
+            assert!(m.stream_position == StreamPos::Sequential(2));
             // assert_ne!(m.time_ms, 0);
             assert!(m.stream_name == "stream1");
             assert!(m.message_type == "MessageType");

@@ -10,7 +10,7 @@ use super::{
 };
 use crate::{
     error::{Error, Result},
-    write::WriteSerialMessage,
+    write::{WriteMessage, WriteSerialMessage},
     Position, StreamPos,
 };
 use rocksdb::{IteratorMode, ReadOptions};
@@ -79,7 +79,7 @@ fn next_stream_pos<'a>(
 ) -> Result<StreamKey<'a>> {
     match (expected_position, last_stream) {
         (None, None) => {
-            Ok(StreamKey::new(stream_name.into(), StreamPos::Serial(0)))
+            Ok(StreamKey::new(stream_name.into(), StreamPos::Sequential(0)))
         }
         (Some(a), Some(key)) if a == key.position => Ok(key.next()),
         (expected, key) => Err(Error::WrongStreamPosition {
@@ -148,8 +148,20 @@ fn write_records(
 
     Ok(Position { global: next_global.0, stream: next_stream.position })
 }
-
 pub fn write_mess(
+    db: &DB,
+    msg: WriteMessage,
+    ser: &mut WriteSerializer,
+) -> Result<Position> {
+    match msg.expected_stream_position {
+        None | Some(StreamPos::Sequential(_)) => {
+            write_serial_mess(db, msg.into(), ser)
+        }
+        Some(StreamPos::Relaxed(_)) => todo!(),
+    }
+}
+
+pub fn write_serial_mess(
     db: &DB,
     msg: WriteSerialMessage,
     ser: &mut WriteSerializer,
@@ -167,8 +179,20 @@ pub fn write_mess(
     }
     res
 }
-
 pub async fn write_mess_async<'a>(
+    db: Arc<DB>,
+    msg: WriteMessage<'a>,
+    ser: &mut WriteSerializer,
+) -> Result<Position> {
+    match msg.expected_stream_position {
+        None | Some(StreamPos::Sequential(_)) => {
+            write_serial_mess_async(db, msg.into(), ser).await
+        }
+        Some(StreamPos::Relaxed(_)) => todo!(),
+    }
+}
+
+pub async fn write_serial_mess_async<'a>(
     db: Arc<DB>,
     msg: WriteSerialMessage<'a>,
     ser: &mut WriteSerializer,
@@ -276,40 +300,40 @@ mod test_write_mess {
         let db = SelfDestructingDB::new_tmp();
         let mut ser = ser();
 
-        let msg = WriteSerialMessage {
+        let msg = WriteMessage {
             id: Id::new(),
             stream_name: "stream1".into(),
             message_type: "someMsgType".into(),
             data: Cow::Borrowed(b"{\"a\": 1})"),
             metadata: Cow::Borrowed(b"{\"b\": 2}"),
-            expected_position: None,
+            expected_stream_position: None,
         };
         write_mess(&db, msg, &mut ser).unwrap();
-        let msg = WriteSerialMessage {
+        let msg = WriteMessage {
             id: Id::new(),
             stream_name: "stream2".into(),
             message_type: "someMsgType".into(),
             data: Cow::Borrowed(b"{\"a\": 1})"),
             metadata: Cow::Borrowed(b"{\"b\": 2}"),
-            expected_position: None,
+            expected_stream_position: None,
         };
         write_mess(&db, msg, &mut ser).unwrap();
-        let msg = WriteSerialMessage {
+        let msg = WriteMessage {
             id: Id::new(),
             stream_name: "stream1".into(),
             message_type: "someMsgType".into(),
             data: Cow::Borrowed(b"{\"a\": 1})"),
             metadata: Cow::Borrowed(b"{\"b\": 2}"),
-            expected_position: Some(StreamPos::Serial(0)),
+            expected_stream_position: Some(StreamPos::Sequential(0)),
         };
         write_mess(&db, msg, &mut ser).unwrap();
-        let msg = WriteSerialMessage {
+        let msg = WriteMessage {
             id: Id::new(),
             stream_name: "stream2".into(),
             message_type: "someMsgType".into(),
             data: Cow::Borrowed(b"{\"a\": 1})"),
             metadata: Cow::Borrowed(b"{\"b\": 2}"),
-            expected_position: Some(StreamPos::Serial(0)),
+            expected_stream_position: Some(StreamPos::Sequential(0)),
         };
         write_mess(&db, msg, &mut ser).unwrap();
         db
@@ -335,7 +359,7 @@ mod test_write_mess {
         let bytes = db
             .get_cf(
                 db.stream(),
-                StreamKey::new("stream1".into(), StreamPos::Serial(0))
+                StreamKey::new("stream1".into(), StreamPos::Sequential(0))
                     .as_bytes(),
             )
             .unwrap()
@@ -351,18 +375,18 @@ mod test_write_mess {
     #[rstest::rstest]
     fn writing_stream_pos_out_of_order_fails() {
         let db = SelfDestructingDB::new_tmp();
-        let msg1 = WriteSerialMessage {
+        let msg1 = WriteMessage {
             id: Id::new(),
             stream_name: "stream1".into(),
             message_type: "someMsgType".into(),
             data: Cow::Borrowed(b"{\"a\": 1})"),
             metadata: Cow::Borrowed(b"{\"b\": 2}"),
-            expected_position: None,
+            expected_stream_position: None,
         };
         let mut msg2 = msg1.clone();
-        msg2.expected_position = Some(StreamPos::Serial(0));
+        msg2.expected_stream_position = Some(StreamPos::Sequential(0));
         let mut msg3 = msg1.clone();
-        msg3.expected_position = Some(StreamPos::Serial(2));
+        msg3.expected_stream_position = Some(StreamPos::Sequential(2));
 
         let mut ser = ser();
         write_mess(&db, msg1, &mut ser).unwrap();

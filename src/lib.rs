@@ -3,5 +3,6 @@ pub mod db {
     pub use mess_db::*;
 }
 pub mod ecs {
+    pub use mess_ecs::error::*;
     pub use mess_ecs::*;
 }

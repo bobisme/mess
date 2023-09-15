@@ -11,7 +11,9 @@ use std::{borrow::Cow, fmt::Display, ops::Deref, sync::Arc};
 
 use crate::error::Error;
 use ident::Id;
-use mess_db::{svc::Connection, Message, Position, StreamPos};
+use mess_db::{
+    svc::Connection, write::WriteMessage, Message, Position, StreamPos,
+};
 use parking_lot::RwLock;
 use quick_cache::sync::Cache;
 
@@ -56,8 +58,18 @@ impl From<Version> for StreamPos {
     #[inline]
     fn from(value: Version) -> Self {
         match value {
-            Version::Sequential(x) => Self::Serial(x),
-            Version::Relaxed(x) => Self::Causal(x),
+            Version::Sequential(x) => Self::Sequential(x),
+            Version::Relaxed(x) => Self::Relaxed(x),
+        }
+    }
+}
+
+impl From<StreamPos> for Version {
+    #[inline]
+    fn from(value: StreamPos) -> Self {
+        match value {
+            StreamPos::Sequential(x) => Self::Sequential(x),
+            StreamPos::Relaxed(x) => Self::Relaxed(x),
         }
     }
 }
@@ -94,8 +106,18 @@ impl<Data> Eq for Component<Data> where Data: Eq {}
 
 pub trait Event {
     fn name<'a>(&self) -> Cow<'a, str>;
-    fn data<'a>(&self) -> Cow<'a, [u8]>;
-    fn metadata<'a>(&self) -> Cow<'a, [u8]>;
+    /// Return serialized version of the event's data.
+    ///
+    /// # Errors
+    ///
+    /// Return an error if there is a problem serializing the data.
+    fn data<'a>(&self) -> Result<Cow<'a, [u8]>, Error>;
+    /// Return serialized version of the event's metadata.
+    ///
+    /// # Errors
+    ///
+    /// Return an error if there is a problem serializing the metadata.
+    fn metadata<'a>(&self) -> Result<Cow<'a, [u8]>, Error>;
 }
 
 pub trait ApplyEvents {
@@ -179,30 +201,81 @@ impl<Data> Deref for ComponentCache<Data> {
     }
 }
 
-pub struct ComponentStore<'a, Data> {
-    cache: ComponentCache<Data>,
-    db: Arc<Connection<'a>>,
+pub struct EventDB<'req, 'iter, 'msg> {
+    db: Arc<Connection<'req, 'iter, 'msg>>,
 }
 
-impl<'a, Data> ComponentStore<'a, Data> {
+impl<'req, 'iter, 'msg> EventDB<'req, 'iter, 'msg> {
     #[must_use]
     #[inline]
-    pub fn new(db: Arc<Connection<'a>>) -> Self {
+    pub fn new(db: Arc<Connection<'req, 'iter, 'msg>>) -> Self {
+        Self { db }
+    }
+
+    /// Write the given event as a message in the database.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if there is an error in serializing
+    /// the data or metadata of the event.
+    #[inline]
+    pub async fn put(
+        &self,
+        stream_name: &str,
+        event: &impl Event,
+        expected_version: Option<Version>,
+    ) -> Result<Position, Error> {
+        // let msg = event.into();
+        let stream_name = stream_name.to_string().into();
+        let data = event.data().map_err(Error::external_to_string)?;
+        let metadata = event.metadata().map_err(Error::external_to_string)?;
+        let req = WriteMessage {
+            id: Id::new(),
+            stream_name,
+            message_type: event.name(),
+            data,
+            metadata,
+            expected_stream_position: expected_version.map(Into::into),
+        };
+        let put_res = self.db.put_message(req);
+        put_res.await.map_err(Error::from)
+        // Ok(Position { global: 0, stream: StreamPos::Sequential(0) })
+    }
+}
+
+impl<'req, 'iter, 'msg> Deref for EventDB<'req, 'iter, 'msg> {
+    type Target = Connection<'req, 'iter, 'msg>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.db
+    }
+}
+
+pub struct ComponentStore<'req, 'iter, 'msg, Data> {
+    cache: ComponentCache<Data>,
+    db: Arc<EventDB<'req, 'iter, 'msg>>,
+}
+
+impl<'req, 'iter, 'msg, Data> ComponentStore<'req, 'iter, 'msg, Data> {
+    #[must_use]
+    #[inline]
+    pub fn new(db: Arc<EventDB<'req, 'iter, 'msg>>) -> Self {
         Self { cache: ComponentCache::new(), db }
     }
 }
 
-impl<'a: 'b, 'b, Data> ComponentStore<'b, Data> {
+impl<'req, 'iter, 'msg, Data> ComponentStore<'req, 'iter, 'msg, Data> {
     /// Fetch messages from the event store.
     ///
     /// # Errors
     ///
     /// This function will return an error if fetching messages errors.
     #[inline]
-    pub async fn fetch(
-        &'a self,
+    pub async fn fetch<'slf: 'req + 'iter + 'msg>(
+        &'slf self,
         entity: Entity,
-        stream_name: &'a str,
+        stream_name: &'iter str,
     ) -> Result<Component<Data>, Error>
     where
         Data: Default + Send + Sync + ApplyMessages,
@@ -215,31 +288,13 @@ impl<'a: 'b, 'b, Data> ComponentStore<'b, Data> {
             mess_db::read::GetMessages::default().in_stream(stream_name),
         );
         let messages = fetch.await?;
+        let messages = messages.filter_map(|res| {
+            if let Err(err) = &res {
+                eprintln!("message error: {err:?}");
+            }
+            res.ok()
+        });
         comp.apply_messages(messages);
         Ok(comp)
-    }
-
-    #[inline]
-    pub async fn put<E>(
-        &'a self,
-        stream_name: &'a str,
-        event: &E,
-        expected_version: Version,
-    ) -> Result<Position, Error>
-    where
-        Data: Default + Send + Sync + ApplyMessages,
-        E: Event,
-    {
-        // let msg = event.into();
-        // let req = WriteMessage {
-        //     id: Id::new(),
-        //     stream_name: stream_name.into(),
-        //     message_type: event.name(),
-        //     data: event.data(),
-        //     metadata: event.metadata(),
-        //     expected_stream_position,
-        // };
-        // self.db.put_message(req)
-        Ok(Position { global: 0, stream: StreamPos::Serial(0) })
     }
 }

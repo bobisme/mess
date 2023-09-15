@@ -1,36 +1,89 @@
-use std::{borrow::Cow, cell::Cell, num::NonZeroU16};
+use std::{
+    borrow::Cow,
+    num::NonZeroU16,
+    sync::atomic::{AtomicU16, Ordering},
+};
 
 use ident::Id;
 
-#[derive(Copy, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum StrPos {
-    #[default]
-    Unset,
-    None,
-    Some(NonZeroU16),
-}
+#[derive(Default)]
+struct StrPos(AtomicU16);
 
 impl StrPos {
-    const fn new(x: u16) -> Self {
-        if x == 0 {
-            return Self::None;
-        }
-        unsafe { Self::Some(NonZeroU16::new_unchecked(x)) }
+    pub const fn new(val: u16) -> Self {
+        Self(AtomicU16::new(val + 1))
     }
 
-    const fn to_option(self) -> Option<NonZeroU16> {
-        match self {
-            StrPos::Unset | StrPos::None => None,
-            StrPos::Some(x) => Some(x),
+    pub const fn none() -> Self {
+        Self(AtomicU16::new(0))
+    }
+
+    pub fn pos(&self) -> Option<u16> {
+        let x = self.0.load(Ordering::Acquire);
+        if x == 0 {
+            return None;
         }
+        Some(x - 1)
+    }
+
+    pub fn set(&self, val: u16) {
+        self.0.store(val + 1, Ordering::SeqCst);
     }
 }
+impl Eq for StrPos {}
+impl std::cmp::Ord for StrPos {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.partial_cmp(other).unwrap()
+    }
+}
+
+impl Clone for StrPos {
+    fn clone(&self) -> Self {
+        Self(AtomicU16::new(self.0.load(Ordering::SeqCst)))
+    }
+}
+
+impl std::hash::Hash for StrPos {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.load(Ordering::SeqCst).hash(state);
+    }
+}
+
+impl PartialOrd for StrPos {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.0
+            .load(Ordering::SeqCst)
+            .partial_cmp(&other.0.load(Ordering::SeqCst))
+    }
+}
+
+impl PartialEq for StrPos {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.load(Ordering::SeqCst) == other.0.load(Ordering::SeqCst)
+    }
+}
+
+// impl StrPos {
+//     const fn new(x: u16) -> Self {
+//         if x == 0 {
+//             return Self::None;
+//         }
+//         unsafe { Self::Some(NonZeroU16::new_unchecked(x)) }
+//     }
+//
+//     const fn to_option(self) -> Option<NonZeroU16> {
+//         match self {
+//             StrPos::Unset | StrPos::None => None,
+//             StrPos::Some(x) => Some(x),
+//         }
+//     }
+// }
 
 #[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StreamName<'a> {
     source: Cow<'a, str>,
-    id_split: Cell<StrPos>,
-    ex_split: Cell<StrPos>,
+    id_split: StrPos,
+    ex_split: StrPos,
 }
 
 impl<'a> std::hash::Hash for StreamName<'a> {
@@ -53,11 +106,7 @@ impl<'a> StreamName<'a> {
     #[inline]
     #[must_use]
     pub const fn new(source: Cow<'a, str>) -> Self {
-        Self {
-            source,
-            id_split: Cell::new(StrPos::Unset),
-            ex_split: Cell::new(StrPos::Unset),
-        }
+        Self { source, id_split: StrPos::none(), ex_split: StrPos::none() }
     }
 
     #[inline]
@@ -77,43 +126,36 @@ impl<'a> StreamName<'a> {
             }
             source
         };
-        let id_split = unsafe {
-            NonZeroU16::new(component.len() as u16).unwrap_unchecked()
-        };
+        #[allow(clippy::cast_possible_truncation)]
+        let id_split = component.len() as u16;
         Self {
             source: source.into(),
-            id_split: Cell::new(StrPos::Some(id_split)),
-            ex_split: Cell::new(StrPos::None),
+            id_split: StrPos::new(id_split),
+            ex_split: StrPos::none(),
         }
     }
 
     fn cache_splits(&self) -> (Option<NonZeroU16>, Option<NonZeroU16>) {
         #![allow(clippy::cast_possible_truncation)]
         let (id_split, ex_split) = splits(&self.source);
-        let id_split = id_split.map_or(StrPos::None, |x| StrPos::new(x as u16));
-        let ex_split = ex_split.map_or(StrPos::None, |x| StrPos::new(x as u16));
+        let id_split = id_split.unwrap_or(0) as u16;
+        let ex_split = ex_split.unwrap_or(0) as u16;
         self.id_split.set(id_split);
         self.ex_split.set(ex_split);
-        (id_split.to_option(), ex_split.to_option())
+        (NonZeroU16::new(id_split), NonZeroU16::new(ex_split))
     }
 
     fn id_split(&self) -> Option<NonZeroU16> {
-        match self.id_split.get() {
-            StrPos::Unset => {
-                let (id_split, _) = self.cache_splits();
-                id_split
-            }
-            other => other.to_option(),
+        match self.id_split.pos() {
+            None => self.cache_splits().0,
+            Some(x) => NonZeroU16::new(x),
         }
     }
 
     fn ex_split(&self) -> Option<NonZeroU16> {
-        match self.ex_split.get() {
-            StrPos::Unset => {
-                let (_, ex_split) = self.cache_splits();
-                ex_split
-            }
-            x => x.to_option(),
+        match self.ex_split.pos() {
+            None => self.cache_splits().1,
+            Some(x) => NonZeroU16::new(x),
         }
     }
 

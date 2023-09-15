@@ -1,12 +1,18 @@
 use std::borrow::Cow;
 
 use crossbeam_queue::SegQueue;
-use tokio::sync::oneshot::{self, Sender};
+use ident::Id;
+use tokio::{
+    sync::oneshot::{self, Sender},
+    task::JoinHandle,
+};
+use tokio_util::sync::CancellationToken;
 use tracing::error;
 
 use crate::{
     error::{Error, Result},
     read::{GetMessages, OptGlobalPos, OptStream, OptStreamPos, Unset},
+    rocks::{db::DB, read::Fetch, write::WriteSerializer},
     write::WriteMessage,
     Message, Position, StreamPos,
 };
@@ -76,14 +82,15 @@ pub struct Request<'a> {
     pub(crate) body: RequestBody<'a>,
 }
 
-pub type DynMessageIter<'a> = Box<dyn Iterator<Item = Message<'a>>>;
+pub type DynMessageIter<'iter, 'msg> =
+    Box<dyn 'iter + Iterator<Item = Result<Message<'msg>>> + Send + Sync>;
 
-pub enum ResponseBody<'a> {
-    Messages { messages: DynMessageIter<'a> },
-    Write { pos: Position },
+pub enum ResponseBody<'iter, 'msg> {
+    Messages { messages: DynMessageIter<'iter, 'msg> },
+    Write { pos: Result<Position> },
 }
 
-impl<'a> std::fmt::Debug for ResponseBody<'a> {
+impl std::fmt::Debug for ResponseBody<'_, '_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Messages { messages: _ } => f
@@ -97,25 +104,55 @@ impl<'a> std::fmt::Debug for ResponseBody<'a> {
     }
 }
 
-pub struct Response<'a> {
-    pub body: ResponseBody<'a>,
+#[derive(Debug)]
+pub struct Response<'iter, 'msg> {
+    pub body: ResponseBody<'iter, 'msg>,
 }
 
-#[derive(Default)]
-pub struct Connection<'a> {
-    queue: SegQueue<(Request<'a>, Sender<Response<'a>>)>,
+const _: () = {
+    const fn takes_sync(_: &impl Sync) -> bool {
+        true
+    }
+    const U: &[u8] = &[];
+    const REQ: Request = Request {
+        body: RequestBody::Write(WriteMessage {
+            id: Id::from_u128(1234),
+            stream_name: Cow::Borrowed(""),
+            message_type: Cow::Borrowed(""),
+            data: Cow::Borrowed(U),
+            metadata: Cow::Borrowed(U),
+            expected_stream_position: None,
+        }),
+    };
+    assert!(takes_sync(&REQ));
+    const RES: Response = Response {
+        body: ResponseBody::Write {
+            pos: Ok(Position { global: 0, stream: StreamPos::Sequential(0) }),
+        },
+    };
+    assert!(takes_sync(&RES));
+};
+
+type QueueItem<'req, 'iter, 'msg> =
+    (Request<'req>, Sender<Response<'iter, 'msg>>);
+
+// #[derive(Default)]
+pub struct Connection<'req, 'iter, 'msg> {
+    db: DB,
+    queue: SegQueue<QueueItem<'req, 'iter, 'msg>>,
+    // task: tokio::runtime::Handle,
 }
 
-impl<'a> Connection<'a> {
+impl<'req, 'iter, 'msg> Connection<'req, 'iter, 'msg> {
     #[must_use]
-    pub const fn new() -> Self {
-        Self { queue: SegQueue::new() }
+    pub const fn new(db: DB) -> Self {
+        Self { queue: SegQueue::new(), db }
     }
 
-    pub async fn fetch_messages(
-        &'a self,
-        req: impl Into<Request<'a>>,
-    ) -> Result<Box<dyn Iterator<Item = Message>>> {
+    pub async fn fetch_messages<'conn: 'iter + 'msg>(
+        &'conn self,
+        req: impl Into<Request<'req>>,
+    ) -> Result<DynMessageIter<'iter, 'msg>> {
         let (send, recv) = oneshot::channel();
         self.queue.push((req.into(), send));
         let res = recv.await.map_err(Error::from)?;
@@ -129,19 +166,123 @@ impl<'a> Connection<'a> {
     }
 
     pub async fn put_message(
-        &'a self,
-        wm: WriteMessage<'a>,
+        &self,
+        wm: WriteMessage<'req>,
     ) -> Result<Position> {
         let req = Request { body: RequestBody::Write(wm) };
         let (send, recv) = oneshot::channel();
         self.queue.push((req, send));
         let res = recv.await.map_err(Error::from)?;
         match res.body {
-            ResponseBody::Write { pos } => Ok(pos),
+            ResponseBody::Write { pos } => pos,
             resp => {
                 error!(?resp, "unexpected service response body");
                 Err(Error::SvcResponse)
             }
+        }
+    }
+
+    pub fn handle_messages_tokio(
+        &'static self,
+        // conn: &'static Connection<'_, '_, '_>,
+        token: Option<CancellationToken>,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut ser = WriteSerializer::<1024>::new();
+            while token.as_ref().filter(|t| t.is_cancelled()).is_none() {
+                handle_messages_inner(self, &mut ser).await;
+            }
+        })
+    }
+
+    pub fn handle_messages_thread<'slf: 'iter>(
+        &'slf self,
+        token: CancellationToken,
+    ) {
+        let mut ser = WriteSerializer::<1024>::new();
+        while !token.is_cancelled() {
+            handle_messages_inner_thread(self, &mut ser);
+        }
+    }
+}
+
+// pub fn handle_messages(
+//     conn: &'static Connection<'_, '_, '_>,
+//     token: CancellationToken,
+// ) -> JoinHandle<()> {
+//     tokio::spawn(async move {
+//         let mut ser = WriteSerializer::<1024>::new();
+//         loop {
+//             if token.is_cancelled() {
+//                 break;
+//             }
+//             handle_messages_inner(conn, &mut ser).await;
+//         }
+//     })
+// }
+
+async fn handle_messages_inner<'conn: 'iter, 'iter>(
+    conn: &'conn Connection<'_, 'iter, '_>,
+    mut ser: &mut WriteSerializer,
+) {
+    let popped = conn.queue.pop();
+    let Some((req, resp_ch)) = popped else {
+        tokio::task::yield_now().await;
+        return;
+    };
+    match req.body {
+        RequestBody::GetGlobalMessages { stream, global_pos, limit } => {
+            let opts = GetMessages::default()
+                .from_global(global_pos)
+                .with_limit(limit);
+            let messages =
+                Fetch::<Unset, OptGlobalPos, _>::fetch(&conn.db, opts);
+            let messages = messages.unwrap();
+            let resp = Response {
+                body: ResponseBody::Messages { messages: Box::new(messages) },
+            };
+            resp_ch.send(resp).unwrap();
+        }
+        RequestBody::GetStreamMessages { stream, stream_pos, limit } => {}
+        RequestBody::Write(message) => {
+            let res =
+                crate::rocks::write::write_mess(&conn.db, message, &mut ser);
+            resp_ch
+                .send(Response { body: ResponseBody::Write { pos: res } })
+                .unwrap();
+        }
+    }
+}
+
+fn handle_messages_inner_thread<'conn: 'iter, 'iter>(
+    conn: &'conn Connection<'_, 'iter, '_>,
+    ser: &mut WriteSerializer,
+) {
+    let popped = conn.queue.pop();
+    let Some((req, resp_ch)) = popped else {
+        std::thread::yield_now();
+        // std::hint::spin_loop();
+        return;
+    };
+    match req.body {
+        RequestBody::GetGlobalMessages { stream, global_pos, limit } => {
+            let opts = GetMessages::default()
+                .from_global(global_pos)
+                .with_limit(limit);
+            let messages =
+                Fetch::<Unset, OptGlobalPos, _>::fetch(&conn.db, opts);
+            let messages = messages.unwrap();
+            let resp = Response {
+                body: ResponseBody::Messages { messages: Box::new(messages) },
+            };
+            resp_ch.send(resp).unwrap();
+        }
+        RequestBody::GetStreamMessages { stream, stream_pos, limit } => {}
+        RequestBody::Write(message) => {
+            let res = crate::rocks::write::write_mess(&conn.db, message, ser);
+            resp_ch
+                .send(Response { body: ResponseBody::Write { pos: res } })
+                .unwrap();
         }
     }
 }

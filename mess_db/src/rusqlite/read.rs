@@ -264,7 +264,7 @@ mod test {
             assert_eq!(messages.len(), 5);
             let m = &messages[0];
             assert_eq!(m.global_position, 1);
-            assert_eq!(m.stream_position, StreamPos::Serial(0));
+            assert_eq!(m.stream_position, StreamPos::Sequential(0));
             // assert_ne!(m.time_ms, 0);
             assert_eq!(m.stream_name, "stream1");
             assert_eq!(m.message_type, "X");
@@ -280,7 +280,7 @@ mod test {
             assert_eq!(messages.len(), 2);
             let m = &messages[0];
             assert_eq!(m.global_position, 5);
-            assert_eq!(m.stream_position, StreamPos::Serial(2));
+            assert_eq!(m.stream_position, StreamPos::Sequential(2));
             // assert_ne!(m.time_ms, 0);
             assert_eq!(m.stream_name, "stream1");
             assert_eq!(m.message_type, "X");
@@ -346,7 +346,7 @@ mod test {
                 get_latest_stream_message(&conn, "stream1").unwrap().unwrap();
             // assert_ne!(m.time_ms, 0);
             assert_eq!(m.global_position, 9);
-            assert_eq!(m.stream_position, StreamPos::Serial(4));
+            assert_eq!(m.stream_position, StreamPos::Sequential(4));
             assert_eq!(m.stream_name, "stream1");
             assert_eq!(m.message_type, "X");
             assert_eq!(m.data, b"4".to_vec());

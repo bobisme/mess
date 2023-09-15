@@ -48,7 +48,7 @@ impl<'a> StreamKey<'a> {
 
     #[must_use]
     pub const fn max(stream: Cow<'a, str>) -> Self {
-        Self { stream, position: StreamPos::Causal(u64::MAX) }
+        Self { stream, position: StreamPos::Relaxed(u64::MAX) }
     }
 
     #[must_use]
@@ -129,7 +129,8 @@ mod test_stream_key {
 
     #[test]
     fn test_as_bytes() {
-        let key = StreamKey::new("somestream".into(), StreamPos::Serial(13));
+        let key =
+            StreamKey::new("somestream".into(), StreamPos::Sequential(13));
         let bytes = key.as_bytes();
         assert!(bytes == b"somestream|\x00\x00\x00\x00\x00\x00\x00\x1A");
     }
@@ -144,7 +145,7 @@ mod test_stream_key {
             let bytes = b"test_stream|\x00\x00\x00\x00\x00\x00\x00\x1A";
             let expected_result = StreamKey {
                 stream: "test_stream".into(),
-                position: StreamPos::Serial(13),
+                position: StreamPos::Sequential(13),
             };
             assert!(StreamKey::from_bytes(bytes).unwrap() == expected_result);
         }
