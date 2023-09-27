@@ -14,7 +14,7 @@ xtest = []
 proptest = []
 
 [workspace]
-members = [".", "mess_ecs", "mess_db", "examples/social", "xtask"]
+members = [".", "mess_ecs", "mess_db", "mess_lsm", "examples/social", "xtask"]
 
 [lib]
 name = "mess"
@@ -22,16 +22,20 @@ name = "mess"
 [dependencies]
 mess_db = { workspace = true }
 mess_ecs = { workspace = true }
+mess_lsm = { workspace = true }
 
 [workspace.dependencies]
 mess = { path = "." }
 mess_db = { path = "mess_db" }
 mess_ecs = { path = "mess_ecs" }
+mess_lsm = { path = "mess_lsm" }
 #
 ident = { git = "https://github.com/bobisme/ident" }
 konst = "0.3.6"
 parking_lot = { version = "0.12.1", features = ["arc_lock"] }
+postcard = { version = "1.0.7", default_features = false, features = [] }
 quick_cache = "0.4.0"
+serde = { version = "1.0.188", features = ["derive"] }
 thiserror = "1.0.44"
 tokio = { version = "1.32", features = ["full"] }
 tokio-util = "0.7.8"

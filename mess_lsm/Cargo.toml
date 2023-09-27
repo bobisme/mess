@@ -1,0 +1,15 @@
+[package]
+name = "mess_lsm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { workpsace = true, features = ["derive"] }
+postcard = { workpsace = true }
+thiserror = { workpsace = true }
+zerovec = "0.10.0"
+
+[dev-dependencies]
+assert2 = { workpsace = true }
+fastrand = "2.0.1"
+rstest = { workpsace = true }
