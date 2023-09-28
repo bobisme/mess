@@ -6,8 +6,18 @@ pub enum Error {
     ZeroVecError(zerovec::ZeroVecError),
     #[error(transparent)]
     PostcardError(#[from] postcard::Error),
+    #[error(transparent)]
+    BincodeError(#[from] bincode::Error),
+    #[error("invalid header")]
+    InvalidHeader,
+    #[error("invalid entry at index: {index}")]
+    InvalidEntry { index: usize },
     #[error("the block is full")]
     BlockFull,
+    #[error("the entry is too large")]
+    EntryTooBig,
+    #[error("list is full")]
+    ListFull,
 }
 
 impl PartialEq for Error {
@@ -18,6 +28,10 @@ impl PartialEq for Error {
             }
             (Self::ZeroVecError(l0), Self::ZeroVecError(r0)) => l0 == r0,
             (Self::PostcardError(l0), Self::PostcardError(r0)) => l0 == r0,
+            (
+                Self::InvalidEntry { index: l },
+                Self::InvalidEntry { index: r },
+            ) => l == r,
             _ => {
                 core::mem::discriminant(self) == core::mem::discriminant(other)
             }
