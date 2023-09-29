@@ -6,3 +6,6 @@ pub mod ecs {
     pub use mess_ecs::error::*;
     pub use mess_ecs::*;
 }
+pub mod lsm {
+    pub use mess_lsm::*;
+}

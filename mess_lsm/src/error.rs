@@ -10,8 +10,8 @@ pub enum Error {
     BincodeError(#[from] bincode::Error),
     #[error("invalid header")]
     InvalidHeader,
-    #[error("invalid entry at index: {index}")]
-    InvalidEntry { index: usize },
+    #[error("invalid entry at index: {index:?}")]
+    InvalidEntry { index: Option<usize> },
     #[error("the block is full")]
     BlockFull,
     #[error("the entry is too large")]

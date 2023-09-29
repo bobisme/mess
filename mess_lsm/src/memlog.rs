@@ -1,17 +1,40 @@
-use std::{
-    borrow::Cow,
-    num::NonZeroU32,
-    sync::atomic::{AtomicUsize, Ordering},
+use std::{borrow::Cow, ops::Range};
+
+use crate::{
+    error::{Error, Result},
+    indexlist::{IndexIter, IndexList},
 };
 
-use crate::error::{Error, Result};
-
 const HEADER_SIZE: usize = 4 + 8;
+const ALIGN_SIZE: u8 = 1;
+
+pub fn crosses_head(
+    head: usize,
+    tail: usize,
+    start: usize,
+    end: usize,
+) -> bool {
+    match (head, tail, start, end) {
+        (h, _, s, e) if s <= h && h < e => true,
+        // (h, _, s, e) if h < t && h < e => true,
+        // (h, t, s, _) if s <= h && 0 < t && s == 0 => true,
+        // (h, t, s, _) if h < t && 0 < t && s == 0 => true,
+        _ => false,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct EntryHeader {
     offset: u64,
     len: u32,
+}
+
+fn align_idx(idx: usize) -> usize {
+    if ALIGN_SIZE == 1 {
+        return idx;
+    }
+    const ALIGN: f64 = ALIGN_SIZE as f64;
+    ((idx as f64 / ALIGN).ceil() * ALIGN) as usize
 }
 
 impl EntryHeader {
@@ -32,6 +55,10 @@ impl EntryHeader {
         out[0..8].copy_from_slice(&self.offset.to_le_bytes());
         out[8..12].copy_from_slice(&self.len.to_le_bytes());
         out
+    }
+
+    pub fn copy_to(&self, bytes: &mut [u8]) {
+        bytes.copy_from_slice(&self.as_bytes());
     }
 }
 
@@ -73,8 +100,10 @@ pub struct Entry<'a> {
 }
 
 impl<'a> Entry<'a> {
-    pub fn full_size(&self) -> usize {
-        self.data.len() + HEADER_SIZE
+    pub fn copy_to(&self, bytes: &mut [u8]) {
+        bytes[0..HEADER_SIZE].copy_from_slice(&self.header.as_bytes());
+        bytes[HEADER_SIZE..HEADER_SIZE + self.data.len()]
+            .copy_from_slice(&self.data);
     }
 }
 
@@ -84,7 +113,7 @@ impl<'a> TryFrom<&'a [u8]> for Entry<'a> {
     fn try_from(bytes: &'a [u8]) -> std::result::Result<Self, Self::Error> {
         let header = EntryHeader::try_from(bytes)?;
         let Some(data) = bytes.get(HEADER_SIZE..HEADER_SIZE + header.data_len()) else {
-            return Err(Error::InvalidEntry { index: 0 });
+            return Err(Error::InvalidEntry { index: None });
         };
         Ok(Entry { header, data: data.into() })
     }
@@ -97,7 +126,7 @@ impl<'a> TryFrom<Option<&'a [u8]>> for Entry<'a> {
         bytes: Option<&'a [u8]>,
     ) -> std::result::Result<Self, Self::Error> {
         let Some(bytes) = bytes else {
-            return Err(Error::InvalidEntry { index: 0 });
+            return Err(Error::InvalidEntry { index: None });
         };
         Self::try_from(bytes)
     }
@@ -112,61 +141,45 @@ pub struct OwnedEntry {
 pub struct MemLog {
     entry_bytes: Vec<u8>,
     entry_cap: usize,
-    idxs: Vec<Option<NonZeroU32>>,
-    idx_cap: usize,
-    idx_head: usize,
-    idx_tail: usize,
-
-    head: AtomicUsize,
-    tail: AtomicUsize,
+    idxs: IndexList,
+    tail: usize,
 }
 
 impl MemLog {
     pub fn with_capacities(data_cap: usize, idx_cap: usize) -> Self {
-        let entry_bytes = vec![0; data_cap];
-        let idxs = vec![None; idx_cap];
-        // idxs[0] = NonZeroU32::new(1);
         Self {
-            entry_bytes,
+            entry_bytes: vec![0; data_cap],
             entry_cap: data_cap,
-            head: AtomicUsize::new(0),
-            tail: AtomicUsize::new(0),
-            idxs,
-            idx_cap,
-            idx_head: 0,
-            idx_tail: 0,
+            idxs: IndexList::with_capacity(idx_cap),
+            tail: 0,
         }
     }
 
-    pub fn head(&self) -> usize {
-        // self.head.load(Ordering::Acquire)
-        let Some(Some(data_idx)) = self.idxs.get(self.idx_head) else {
-            return 0;
-        };
-        data_idx.get() as usize - 1
+    pub fn head(&self) -> Option<usize> {
+        self.idxs.head()
     }
 
-    pub fn tail(&self) -> usize {
-        // self.tail.load(Ordering::Acquire)
-        let Some(Some(data_idx)) = self.idxs.get(self.idx_tail) else {
-            return 0;
-        };
-        data_idx.get() as usize - 1
+    pub fn tail(&self) -> Option<usize> {
+        self.idxs.tail()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.idxs.is_empty()
     }
 
     pub fn get_header(&self, idx: usize) -> Result<EntryHeader> {
         EntryHeader::try_from(self.entry_bytes.get(idx..))
-            .map_err(|_| Error::InvalidEntry { index: idx })
+            .map_err(|_| Error::InvalidEntry { index: Some(idx) })
     }
 
     pub fn get(&self, idx: usize) -> Result<Entry<'_>> {
         Entry::try_from(self.entry_bytes.get(idx..))
-            .map_err(|_| Error::InvalidEntry { index: idx })
+            .map_err(|_| Error::InvalidEntry { index: Some(idx) })
     }
 
     pub fn get_owned(&self, idx: usize) -> Result<OwnedEntry> {
         let entry = Entry::try_from(self.entry_bytes.get(idx..))
-            .map_err(|_| Error::InvalidEntry { index: idx })?;
+            .map_err(|_| Error::InvalidEntry { index: Some(idx) })?;
         Ok(OwnedEntry {
             header: entry.header,
             data: entry.data.as_ref().to_vec(),
@@ -174,70 +187,61 @@ impl MemLog {
     }
 
     pub fn pop(&mut self) -> Result<Option<OwnedEntry>> {
-        let Some(Some(data_idx)) = self.idxs.get(self.idx_head) else {
-            return Ok(None);
-        };
-        let data_idx = data_idx.get() as usize - 1;
-        let entry = self.get_owned(data_idx)?;
-        self.remove_head()?;
-        Ok(Some(entry))
+        let Some(indexed) = self.idxs.pop() else {return Ok(None)};
+        let index = indexed.index();
+        let popped_entry = self.get_owned(index)?;
+        self.entry_bytes[index..index + popped_entry.header.full_entry_len()]
+            .fill(0);
+        Ok(Some(popped_entry))
     }
 
-    pub fn remove_head(&mut self) -> Result<()> {
-        let idx_head = self.idx_head;
-        let Some(Some(data_idx)) = self.idxs.get(idx_head) else {
-            return Ok(());
-        };
-        let data_idx = data_idx.get() as usize - 1;
-        let header = self.get_header(data_idx)?;
-        self.entry_bytes[data_idx..data_idx + header.full_entry_len()].fill(0);
-        self.idxs[idx_head] = None;
-        self.idx_head += 1;
-        if self.idx_head >= self.idx_cap {
-            self.idx_head = 0;
+    pub fn occupied_space(&self) -> (Range<usize>, Range<usize>) {
+        if self.is_empty() {
+            return (0..0, 0..0);
         }
-        Ok(())
+        match (self.head(), self.tail()) {
+            (Some(h), Some(t)) if h < t => (h..t, 0..0),
+            (Some(h), Some(t)) => (0..t, h..self.entry_cap),
+            _ => (0..0, 0..0),
+        }
+    }
+
+    pub fn find_spot(&self, num_bytes: usize) -> Range<usize> {
+        let tail = self.tail();
+        let start = match (tail, num_bytes) {
+            (Some(tail), len) if tail + len >= self.entry_cap => 0,
+            (Some(tail), _) => tail,
+            _ => 0,
+        };
+        let end = start + num_bytes;
+        start..end
     }
 
     /// Append treats entry_bytes as a circular buffer.
-    pub fn append(&mut self, entry: Entry<'_>) -> Result<()> {
-        let mut set_head = false;
-        if entry.full_size() > self.entry_cap {
-            return Err(Error::EntryTooBig);
-        }
-        let head = self.head();
-        let tail = self.tail();
-        let write_idx = if tail + entry.full_size() >= self.entry_cap {
-            set_head = true;
-            0
-        } else {
-            tail
-        };
-        let new_tail = write_idx + entry.full_size();
-
-        set_head = set_head || (write_idx <= head && new_tail > head);
-        if set_head {
-            // let mut del_count = 0;
-            let mut end = new_tail;
-            for header in self.iter_headers() {
-                if header.span().contains(&new_tail) {
-                    // del_count += 1;
-                    end = header.span().end;
+    pub fn push(&mut self, entry: Entry<'_>) -> Result<()> {
+        let entry_len = entry.header.full_entry_len();
+        let entry_range = self.find_spot(entry_len);
+        if !self.idxs.is_empty() {
+            loop {
+                let head = self.head().unwrap();
+                if entry_range.contains(&head) {
+                    self.pop()?;
                 } else {
                     break;
                 }
             }
-            self.entry_bytes[head..end].fill(0);
-            let next_head = if end >= self.entry_cap { 0 } else { end };
-            self.head.store(next_head, Ordering::Release);
         }
 
-        self.entry_bytes[write_idx..write_idx + HEADER_SIZE]
-            .copy_from_slice(&entry.header.as_bytes());
-        self.entry_bytes
-            [write_idx + HEADER_SIZE..write_idx + entry.full_size()]
-            .copy_from_slice(&entry.data);
-        self.tail.store(new_tail, Ordering::Release);
+        let next_idx = match align_idx(entry_range.end) {
+            x if x >= self.entry_cap => 0,
+            x => x,
+        };
+        self.idxs.push(
+            entry.header.offset,
+            entry_range.start as u32,
+            next_idx as u32,
+        )?;
+        entry.copy_to(&mut self.entry_bytes[entry_range]);
         Ok(())
     }
 
@@ -246,7 +250,7 @@ impl MemLog {
     }
 
     pub fn iter_headers(&self) -> HeaderIter<'_> {
-        HeaderIter { log: self, idx: self.head() }
+        HeaderIter { log: self, idx_iter: self.idxs.iter() }
     }
 }
 
@@ -262,47 +266,39 @@ impl IndexedHeader {
 
 pub struct HeaderIter<'a> {
     log: &'a MemLog,
-    idx: usize,
+    idx_iter: IndexIter<'a>,
 }
 
 impl<'a> Iterator for HeaderIter<'a> {
     type Item = IndexedHeader;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let idx = self.idx;
-        let head = self.log.head();
-        let tail = self.log.tail();
-        if tail > head && idx > tail {
-            return None;
-        }
-        if tail <= head && idx > tail && idx >= head {
-            return None;
-        }
+        let idx = self.idx_iter.next()?.index();
         let header =
             EntryHeader::try_from(self.log.entry_bytes.get(idx..)).ok()?;
-        self.idx += HEADER_SIZE + header.data_len();
         Some(IndexedHeader(idx, header))
     }
 }
 
 pub struct Iter<'a> {
     log: &'a MemLog,
-    idx: usize,
+    idx: Option<usize>,
 }
 
 impl<'a> Iterator for Iter<'a> {
     type Item = Entry<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let entry = self.log.get(self.idx);
+        let idx = self.idx?;
+        let entry = self.log.get(idx);
         if let Ok(entry) = entry {
-            self.idx += entry.full_size();
+            self.idx = Some(idx + entry.header.full_entry_len());
             Some(entry)
         } else {
-            let tail = self.log.tail.load(Ordering::Acquire);
-            let head = self.log.head.load(Ordering::Acquire);
-            if tail < head && self.idx > head {
-                self.idx = 0;
+            let tail = self.log.tail()?;
+            let head = self.log.head()?;
+            if tail < head && idx > head {
+                self.idx = Some(0);
                 self.next()
             } else {
                 None
@@ -339,13 +335,13 @@ mod test_header_iter {
         assert!(headers == vec![]);
     }
 
-    // #[rstest]
+    #[rstest]
     fn it_returns_non_wrapping_headers() {
         let mut log = MemLog::with_capacities(150, 20);
         let entry = make_entry(0, 5);
-        log.append(entry.clone()).unwrap();
+        log.push(entry.clone()).unwrap();
         let entry = make_entry(1, 4);
-        log.append(entry.clone()).unwrap();
+        log.push(entry.clone()).unwrap();
         let headers: Vec<_> = log.iter_headers().collect();
         let expected = vec![
             IndexedHeader(0, EntryHeader { offset: 0, len: 5 }),
@@ -360,11 +356,11 @@ mod test_header_iter {
         let entries: Vec<_> =
             (0..15).map(|i| make_entry(i, i as usize + 1)).collect();
         for entry in entries.iter().take(10) {
-            log.append(entry.clone()).unwrap();
+            log.push(entry.clone()).unwrap();
         }
 
-        let headers = log.iter_headers().collect::<Vec<_>>();
-        assert!(headers != vec![]);
+        let idxs = log.iter_headers().map(|x| x.0).collect::<Vec<_>>();
+        assert!(idxs == vec![58, 75, 93, 112, 0, 21]);
     }
 }
 
@@ -374,6 +370,21 @@ mod test {
     use assert2::assert;
     use rstest::*;
 
+    const DATA: [u8; 128] = {
+        let mut data = [0u8; 128];
+        let mut i = 0;
+        while i < 128 {
+            data[i] = i as u8;
+            i += 1;
+        }
+        data
+    };
+
+    fn make_entry(i: u64, len: usize) -> Entry<'static> {
+        let data = Cow::Borrowed(&DATA[..len]);
+        Entry { header: EntryHeader { offset: i, len: len as u32 }, data }
+    }
+
     #[rstest]
     fn it_leaves_head_at_0_in_the_beginning() {
         let mut log = MemLog::with_capacities(256, 20);
@@ -381,8 +392,8 @@ mod test {
             header: EntryHeader { offset: 4567, len: 4 },
             data: Cow::Borrowed(&[1, 2, 3, 4]),
         };
-        log.append(entry).unwrap();
-        assert!(log.head() == 0);
+        log.push(entry).unwrap();
+        assert!(log.head() == Some(0));
     }
 
     #[rstest]
@@ -392,7 +403,7 @@ mod test {
             header: EntryHeader { offset: 4567, len: 4 },
             data: Cow::Borrowed(&[1, 2, 3, 4]),
         };
-        log.append(entry).unwrap();
+        log.push(entry).unwrap();
         assert!(
             &log.entry_bytes[0..HEADER_SIZE]
                 == &[215, 17, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0]
@@ -407,7 +418,7 @@ mod test {
             data: Cow::Borrowed(&[1, 2, 3, 4]),
         };
         let expected = entry.clone();
-        log.append(entry).unwrap();
+        log.push(entry).unwrap();
         assert!(
             &log.entry_bytes[HEADER_SIZE..HEADER_SIZE + 4] == &[1, 2, 3, 4]
         );
@@ -415,7 +426,7 @@ mod test {
         assert!(entry == expected);
     }
 
-    // #[rstest]
+    #[rstest]
     fn it_writes_multiple_entries() {
         let mut log = MemLog::with_capacities(256, 20);
         let entry1 = Entry {
@@ -428,60 +439,61 @@ mod test {
         };
         let expected1 = entry1.clone();
         let expected2 = entry2.clone();
-        log.append(entry1).unwrap();
-        log.append(entry2).unwrap();
+        log.push(entry1).unwrap();
+        log.push(entry2).unwrap();
         let entry1 = log.get(0).unwrap();
         let entry2 = log.get(16).unwrap();
         assert!(entry1 == expected1);
         assert!(entry2 == expected2);
     }
 
-    // #[rstest]
-    fn it_wraps_around() {
-        let data = (0u8..128).collect::<Vec<_>>();
+    #[rstest]
+    fn pop_moves_the_head_forward() {
         let mut log = MemLog::with_capacities(150, 20);
-        let make_entry = |i: u64| {
-            let len = i as u32 + 1;
-            let data = Cow::Borrowed(&data[..len as usize]);
-            Entry { header: EntryHeader { offset: i, len }, data }
-        };
-        let entries = (0..15).map(make_entry).collect::<Vec<_>>();
+        let entries: Vec<_> = (0..15).map(|i| make_entry(i, 4)).collect();
+        for entry in entries.iter().take(5) {
+            log.push(entry.clone()).unwrap();
+        }
+        assert!(log.head() == Some(0));
+        log.pop().unwrap();
+        assert!(log.head() == Some(16));
+        log.pop().unwrap();
+        assert!(log.head() == Some(32));
+    }
+
+    #[rstest]
+    fn it_wraps_around() {
+        let mut log = MemLog::with_capacities(150, 20);
+        let entries: Vec<_> =
+            (0..15).map(|i| make_entry(i, i as usize)).collect();
         for entry in entries.iter().take(10) {
-            log.append(entry.clone()).unwrap();
+            // dbg!(entry);
+            let res = log.push(entry.clone());
+            assert!(res != Err(Error::InvalidEntry { index: Some(0) }))
         }
         let entry = log.get(0).unwrap();
-        assert!(entry != entries[0]);
         assert!(entry == entries[8]);
-        assert!(log.get(entries[8].full_size()).unwrap() == entries[9]);
+
+        let entry = log.get(entries[8].header.full_entry_len()).unwrap();
+        assert!(entry == entries[9]);
         // assert!(
         //     log.get(entries[8].full_size() + entries[9].full_size()).unwrap()
         //         == entries[2]
         // );
         // assert!(log.head() == entries[8].full_size());
-        assert!(log.get(log.head()).unwrap() == entries[2]);
+        assert!(log.idxs.head() == Some(69));
+        assert!(log.get(log.head().unwrap()).unwrap() == entries[2]);
     }
 
     #[rstest]
     fn it_iterates_over_entries() {
-        let mut log = MemLog::with_capacities(256, 20);
-        let entries = [
-            Entry {
-                header: EntryHeader { offset: 4567, len: 4 },
-                data: Cow::Borrowed(&[1, 2, 3, 4]),
-            },
-            Entry {
-                header: EntryHeader { offset: 1234, len: 8 },
-                data: Cow::Borrowed(&[5, 6, 7, 8, 9, 10, 11, 12]),
-            },
-            Entry {
-                header: EntryHeader { offset: 5678, len: 4 },
-                data: Cow::Borrowed(&[13, 14, 15, 16]),
-            },
-        ];
-        log.append(entries[0].clone()).unwrap();
-        log.append(entries[1].clone()).unwrap();
-        log.append(entries[2].clone()).unwrap();
-        let collected_entries: Vec<Entry> = log.iter().collect();
-        // assert!(collected_entries.as_slice() == &entries[..]);
+        let mut log = MemLog::with_capacities(150, 20);
+        let entries: Vec<_> =
+            (0..15).map(|i| make_entry(i, i as usize)).collect();
+        for entry in entries.iter().take(10) {
+            log.push(entry.clone()).unwrap();
+        }
+        let collected: Vec<_> = log.iter().collect();
+        assert!(collected.as_slice() == &entries[..10]);
     }
 }

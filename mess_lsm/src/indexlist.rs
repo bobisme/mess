@@ -3,16 +3,23 @@ use crate::error::{Error, Result};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Item {
     global_position: u64,
-    idx: u32,
+    entry_idx: u32,
+    /// The index of the next free spot. It may include uninitialized space
+    /// for the sake of cache alignment.
+    next_idx: u32,
 }
 
 impl Item {
-    pub fn new(global_position: u64, idx: u32) -> Self {
-        Self { global_position, idx }
+    pub fn new(global_position: u64, entry_idx: u32, next_idx: u32) -> Self {
+        Self { global_position, entry_idx, next_idx }
     }
 
     pub fn index(&self) -> usize {
-        self.idx as usize
+        self.entry_idx as usize
+    }
+
+    pub fn next_index(&self) -> usize {
+        self.next_idx as usize
     }
 }
 
@@ -38,6 +45,17 @@ impl IndexList {
         self.head == self.tail && self.idxs[self.head].is_none()
     }
 
+    pub fn head(&self) -> Option<usize> {
+        self.idxs[self.head].map(|x| x.index())
+    }
+
+    pub fn tail(&self) -> Option<usize> {
+        if self.is_empty() {
+            return None;
+        }
+        self.idxs[self.prev(self.tail)].map(|x| x.next_index())
+    }
+
     pub fn next(&self, list_idx: usize) -> usize {
         match list_idx + 1 {
             x if x < self.cap => x,
@@ -52,11 +70,17 @@ impl IndexList {
         }
     }
 
-    pub fn push(&mut self, item: Item) -> Result<()> {
+    pub fn push(
+        &mut self,
+        global_position: u64,
+        entry_idx: u32,
+        next_idx: u32,
+    ) -> Result<()> {
         if self.is_full() {
             return Err(Error::ListFull);
         }
-        self.idxs[self.tail] = Some(item);
+        self.idxs[self.tail] =
+            Some(Item { global_position, entry_idx, next_idx });
         self.tail = self.next(self.tail);
         Ok(())
     }
@@ -121,11 +145,11 @@ mod test_index_list {
     #[rstest]
     fn it_pushes_from_the_beginning() {
         let mut list = IndexList::with_capacity(10);
-        list.push(Item::new(1, 1)).unwrap();
-        list.push(Item::new(2, 2)).unwrap();
+        list.push(1, 1, 1).unwrap();
+        list.push(2, 2, 2).unwrap();
         let mut expected = vec![None; 10];
-        expected[0] = Some(Item::new(1, 1));
-        expected[1] = Some(Item::new(2, 2));
+        expected[0] = Some(Item::new(1, 1, 1));
+        expected[1] = Some(Item::new(2, 2, 2));
         assert!(list.idxs == expected);
     }
 
@@ -135,10 +159,13 @@ mod test_index_list {
         list.head = 7;
         list.tail = 7;
         for i in 0..10 {
-            list.push(Item::new(i, i as u32)).unwrap();
+            list.push(i, i as u32, i as u32).unwrap();
         }
-        let expected: Vec<_> =
-            (3..10).chain(0..3).map(|i| Some(Item::new(i, i as u32))).collect();
+        let expected: Vec<_> = (3..10)
+            .chain(0..3)
+            .enumerate()
+            .map(|(_i, j)| Some(Item::new(j as u64, j as u32, j as u32)))
+            .collect();
         assert!(list.idxs == expected);
     }
 
@@ -146,7 +173,7 @@ mod test_index_list {
     fn is_empty_works() {
         let mut list = IndexList::with_capacity(10);
         assert!(list.is_empty() == true);
-        list.push(Item::new(1, 1)).unwrap();
+        list.push(1, 1, 1).unwrap();
         assert!(list.is_empty() == false);
         list.pop();
         assert!(list.is_empty() == true);
@@ -156,7 +183,7 @@ mod test_index_list {
     fn is_full_works() {
         let mut list = IndexList::with_capacity(10);
         assert!(list.is_full() == false);
-        (0..10).for_each(|i| list.push(Item::new(i, i as u32)).unwrap());
+        (0..10).for_each(|i| list.push(i, i as u32, i as u32).unwrap());
         assert!(list.is_full() == true);
     }
 
@@ -169,10 +196,10 @@ mod test_index_list {
     #[rstest]
     fn pop_returns_entry_index() {
         let mut list = IndexList::with_capacity(10);
-        list.push(Item::new(1, 1)).unwrap();
-        list.push(Item::new(2, 2)).unwrap();
-        assert!(list.pop() == Some(Item::new(1, 1)));
-        assert!(list.pop() == Some(Item::new(2, 2)));
+        list.push(1, 1, 0).unwrap();
+        list.push(2, 2, 0).unwrap();
+        assert!(list.pop() == Some(Item::new(1, 1, 0)));
+        assert!(list.pop() == Some(Item::new(2, 2, 0)));
         assert!(list.pop() == None);
     }
 
@@ -181,29 +208,31 @@ mod test_index_list {
         let mut list = IndexList::with_capacity(10);
         list.head = 8;
         list.tail = 8;
-        list.push(Item::new(8, 8)).unwrap();
-        list.push(Item::new(9, 9)).unwrap();
-        list.push(Item::new(1, 1)).unwrap();
-        assert!(list.pop() == Some(Item::new(8, 8)));
-        assert!(list.pop() == Some(Item::new(9, 9)));
-        assert!(list.pop() == Some(Item::new(1, 1)));
+        list.push(8, 8, 0).unwrap();
+        list.push(9, 9, 0).unwrap();
+        list.push(0, 0, 0).unwrap();
+        assert!(list.pop() == Some(Item::new(8, 8, 0)));
+        assert!(list.pop() == Some(Item::new(9, 9, 0)));
+        assert!(list.pop() == Some(Item::new(0, 0, 0)));
         assert!(list.pop() == None);
     }
 
     #[rstest]
     fn pop_clears_idx() {
         let mut list = IndexList::with_capacity(10);
-        list.push(Item::new(1, 1)).unwrap();
-        assert!(list.pop() == Some(Item::new(1, 1)));
+        list.push(1, 1, 0).unwrap();
+        assert!(list.pop() == Some(Item::new(1, 1, 0)));
         assert!(list.idxs == vec![None; 10]);
     }
 
     #[rstest]
     fn iterator_iterates() {
         let mut list = IndexList::with_capacity(10);
-        let items: Vec<_> = (0..5).map(|i| Item::new(i, i as u32)).collect();
+        let items: Vec<_> =
+            (0..5).map(|i| Item::new(i as u64, i as u32, i as u32)).collect();
         for item in items.clone() {
-            list.push(item).unwrap();
+            list.push(item.global_position, item.entry_idx, item.next_idx)
+                .unwrap();
         }
         let idxs: Vec<_> = list.iter().collect();
         assert!(idxs == items);
@@ -214,9 +243,14 @@ mod test_index_list {
         let mut list = IndexList::with_capacity(10);
         list.head = 7;
         list.tail = 7;
-        let items: Vec<_> = (0..10).map(|i| Item::new(i, i as u32)).collect();
+        let items: Vec<_> = (7..10)
+            .chain(0..7)
+            .enumerate()
+            .map(|(ord, _idx)| Item::new(ord as u64, ord as u32, ord as u32))
+            .collect();
         for item in items.clone() {
-            list.push(item).unwrap();
+            list.push(item.global_position, item.entry_idx, item.next_idx)
+                .unwrap();
         }
         let idxs: Vec<_> = list.iter().collect();
         assert!(idxs == items);
