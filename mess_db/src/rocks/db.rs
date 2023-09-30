@@ -4,6 +4,7 @@ use std::{
 };
 
 use rocksdb::{ColumnFamilyDescriptor, ColumnFamilyRef, Options};
+use tracing::debug;
 
 use crate::error::Result;
 
@@ -26,7 +27,7 @@ fn new_cf(name: &str) -> ColumnFamilyDescriptor {
 
 impl DB {
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
-        println!("DEBUG: open db at {:?}", path.as_ref());
+        debug!(path = %path.as_ref().to_string_lossy(), "opened db");
 
         let db_opts = opts();
         // let cf_opts = Options::default();

@@ -1,13 +1,18 @@
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, io::IsTerminal, sync::Arc};
 
+use bumpalo::Bump;
 use ident::Id;
 use mess::{
     db::{rocks::db::DB, svc::Connection, Message},
-    ecs::{streams::StreamName, ApplyEvents, Component, Entity, EventDB},
+    ecs::{
+        streams::StreamName, ApplyEvents, Component, ComponentStore, Entity,
+        EventDB,
+    },
 };
 use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, warn};
+use tracing::{debug, error, info, warn, Level};
 
 #[derive(Clone, Default, Debug, serde::Serialize, serde::Deserialize)]
 pub enum PostStatus {
@@ -77,21 +82,7 @@ impl mess::ecs::Event for Event {
     }
 }
 
-impl<'a> From<Message<'a>> for Event {
-    // fn from_msg(
-    //     msg: Message<'_>,
-    // ) -> Result<Option<Self>, Box<dyn std::error::Error>> {
-    //     match msg.message_type.as_ref() {
-    //         "posted" => Ok(Some(Event::Posted(serde_json::from_slice(
-    //             msg.data.as_ref(),
-    //         )?))),
-    //         _ => {
-    //             warn!("unknown message");
-    //             Ok(None)
-    //         }
-    //     }
-    // }
-    //
+impl From<Message<'_>> for Event {
     fn from(msg: Message) -> Self {
         let data = match serde_json::from_slice(&msg.data) {
             Ok(x) => x,
@@ -136,30 +127,69 @@ impl ApplyEvents for PostData {
 
 pub type Post = Component<PostData>;
 
-#[tokio::main]
-async fn main() {
-    static CONN: Lazy<Arc<Connection>> = Lazy::new(|| {
-        let db: DB = DB::new("xyz").expect("could not open xyz db");
-        let c = Arc::new(Connection::new(db));
-        c
-    });
-    let evt_conn = Arc::clone(&CONN);
+pub fn configure_logging() {
+    use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-    // let db: DB = DB::new("xyz").expect("could not open xyz db");
-    // let conn = Arc::new(Connection::new(db));
-    // let evt_conn = Arc::clone(&conn);
+    let reg =
+        tracing_subscriber::registry().with(EnvFilter::from_default_env());
+    let use_json = !std::io::stdout().is_terminal()
+        || matches!(
+            std::env::var("LOG_FMT").unwrap_or_default().as_str(),
+            "json" | "JSON"
+        );
+    match use_json {
+        true => reg.with(fmt::layer().json()).init(),
+        _ => reg.with(fmt::layer().pretty()).init(),
+    };
+}
+
+#[tokio::main]
+async fn main() -> ! {
+    configure_logging();
+
+    let bump = Bump::new();
+    // static BUMP: Lazy<Arc<Bump>> = Lazy::new(|| {
+    //     let bump = Bump::new();
+    //     Arc::new(bump)
+    // });
+    // let bump = BUMP.lock_arc();
+
+    // static CONN: Lazy<Arc<Connection>> = Lazy::new(|| {
+    //     let db: DB = DB::new("xyz").expect("could not open xyz db");
+    //     let c = Arc::new(Connection::new(db));
+    //     c
+    // });
+    // let bump_conn = bump.alloc(Connection::new(
+    //     DB::new(bump.alloc("xyz")).expect("could not open xyz db"),
+    // ));
+    let conn = Connection::new(DB::new(bump.alloc("xyz")).unwrap());
+    let boxed_conn = bumpalo::boxed::Box::new_in(conn, &bump);
+    let conn = Arc::new(boxed_conn);
+    let evt_conn = Arc::clone(&conn);
     //
     let tok = CancellationToken::new();
     let sub_token = tok.clone();
-    let jh = std::thread::spawn(|| CONN.handle_messages_thread(sub_token));
+    // let jh = std::thread::spawn(move || conn.handle_messages_thread(sub_token));
+    // let jh = bumpalo::boxed::Box::new_in(jh, &bump);
 
+    // let evdb = Arc::new(EventDB::new(evt_conn));
+    // let evdb = bump.alloc(EventDB::new(evt_conn));
     let evdb = EventDB::new(evt_conn);
-    // let post_store = ComponentStore::<PostData>::new(Arc::clone(&conn));
+    let evdb = bumpalo::boxed::Box::new_in(evdb, &bump);
+    let evdb = Arc::new(evdb);
+    // let e
+    let post_store =
+        ComponentStore::<PostData, _, _, _, _>::new(Arc::clone(&evdb));
     // let post_store =
     //     Arc::new(ComponentStore::<PostData>::new(Arc::clone(&conn)));
     let poster = Entity::new();
     let post = Entity::new();
-    let stream = StreamName::from_component_and_id("post", post.id(), None);
+    // let stream = StreamName::from_component_and_id("post", post.id(), None);
+    let stream = bump.alloc(StreamName::from_component_and_id(
+        &bump.alloc("post"),
+        post.id(),
+        None,
+    ));
     let event = Event::Posted(PostData {
         poster_id: poster.id(),
         body: "here is some stupid post".into(),
@@ -170,11 +200,13 @@ async fn main() {
         .put(stream.source(), &event, None)
         .await
         .expect("complete failure");
-    dbg!(position);
+    info!(?position, "wrote thing");
+
+    let post = post_store.fetch(post, stream.source()).await.unwrap();
+    info!(?post, "post");
 
     // shut down
     tok.cancel();
-    // tokio::time::sleep(Duration::from_millis(200)).await;
-    // let (_,) = tokio::join!(handle);
-    jh.join().unwrap();
+    loop {}
+    // jh.join();
 }

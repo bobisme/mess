@@ -110,7 +110,7 @@ pub struct Response<'iter, 'msg> {
 }
 
 const _: () = {
-    const fn takes_sync(_: &impl Sync) -> bool {
+    const fn is_sync(_: &impl Sync) -> bool {
         true
     }
     const U: &[u8] = &[];
@@ -124,19 +124,18 @@ const _: () = {
             expected_stream_position: None,
         }),
     };
-    assert!(takes_sync(&REQ));
+    assert!(is_sync(&REQ));
     const RES: Response = Response {
         body: ResponseBody::Write {
             pos: Ok(Position { global: 0, stream: StreamPos::Sequential(0) }),
         },
     };
-    assert!(takes_sync(&RES));
+    assert!(is_sync(&RES));
 };
 
 type QueueItem<'req, 'iter, 'msg> =
     (Request<'req>, Sender<Response<'iter, 'msg>>);
 
-// #[derive(Default)]
 pub struct Connection<'req, 'iter, 'msg> {
     db: DB,
     queue: SegQueue<QueueItem<'req, 'iter, 'msg>>,
@@ -223,7 +222,7 @@ impl<'req, 'iter, 'msg> Connection<'req, 'iter, 'msg> {
 
 async fn handle_messages_inner<'conn: 'iter, 'iter>(
     conn: &'conn Connection<'_, 'iter, '_>,
-    mut ser: &mut WriteSerializer,
+    ser: &mut WriteSerializer,
 ) {
     let popped = conn.queue.pop();
     let Some((req, resp_ch)) = popped else {
@@ -231,7 +230,7 @@ async fn handle_messages_inner<'conn: 'iter, 'iter>(
         return;
     };
     match req.body {
-        RequestBody::GetGlobalMessages { stream, global_pos, limit } => {
+        RequestBody::GetGlobalMessages { stream: _, global_pos, limit } => {
             let opts = GetMessages::default()
                 .from_global(global_pos)
                 .with_limit(limit);
@@ -243,10 +242,13 @@ async fn handle_messages_inner<'conn: 'iter, 'iter>(
             };
             resp_ch.send(resp).unwrap();
         }
-        RequestBody::GetStreamMessages { stream, stream_pos, limit } => {}
+        RequestBody::GetStreamMessages {
+            stream: _,
+            stream_pos: _,
+            limit: _,
+        } => {}
         RequestBody::Write(message) => {
-            let res =
-                crate::rocks::write::write_mess(&conn.db, message, &mut ser);
+            let res = crate::rocks::write::write_mess(&conn.db, message, ser);
             resp_ch
                 .send(Response { body: ResponseBody::Write { pos: res } })
                 .unwrap();
