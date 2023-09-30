@@ -103,6 +103,44 @@ pub struct Message<'a> {
     pub metadata: Option<Cow<'a, [u8]>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "sqlx", derive(::sqlx::FromRow))]
+pub struct OwnedMessage {
+    pub global_position: u64,
+    pub stream_position: StreamPos,
+    // time_ms: u64,
+    pub stream_name: String,
+    pub message_type: String,
+    pub data: Vec<u8>,
+    pub metadata: Option<Vec<u8>>,
+}
+
+impl From<Message<'_>> for OwnedMessage {
+    fn from(msg: Message<'_>) -> Self {
+        OwnedMessage {
+            stream_name: msg.stream_name.to_string(),
+            message_type: msg.message_type.to_string(),
+            data: msg.data.to_vec(),
+            metadata: msg.metadata.as_ref().map(|x| x.to_vec()),
+            global_position: msg.global_position,
+            stream_position: msg.stream_position,
+        }
+    }
+}
+
+impl From<OwnedMessage> for Message<'_> {
+    fn from(msg: OwnedMessage) -> Self {
+        Message {
+            global_position: msg.global_position,
+            stream_position: msg.stream_position,
+            stream_name: msg.stream_name.into(),
+            message_type: msg.message_type.into(),
+            data: msg.data.into(),
+            metadata: msg.metadata.map(|x| x.into()),
+        }
+    }
+}
+
 #[cfg(feature = "rusqlite")]
 impl TryFrom<&::rusqlite::Row<'_>> for Message<'_> {
     type Error = ::rusqlite::Error;

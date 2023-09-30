@@ -66,8 +66,14 @@ pub enum Error {
     #[error("error writing record: {0}")]
     WriteError(String),
 
+    #[error("failed to send response on channel")]
+    SendFailed,
+
     #[error("unexpected service response")]
     SvcResponse,
+
+    #[error("kill was triggered, so action cancelled")]
+    Cancelled,
 }
 
 impl Error {

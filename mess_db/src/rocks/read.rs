@@ -1,9 +1,10 @@
-use std::{borrow::Cow, marker::PhantomData};
+use std::marker::PhantomData;
 
-use super::keys::{GlobalKey, StreamKey, SEPARATOR, SEPARATOR_CHAR};
+use super::keys::{GlobalKey, StreamKey, SEPARATOR_CHAR};
 use crate::{
     error::{Error, Result},
-    Message, StreamPos,
+    read::{GetMessages, OptGlobalPos, OptStream, Unset},
+    Message,
 };
 
 use super::{
@@ -14,218 +15,71 @@ use super::{
 pub const LIMIT_MAX: usize = 10_000;
 pub const LIMIT_DEFAULT: usize = 1_000;
 
-// type states for GetMessages options
-#[derive(Default, Clone, Copy)]
-pub struct Unset;
-#[derive(Default, Clone)]
-pub struct OptStream<'a>(Cow<'a, str>);
-#[derive(Default, Clone, Copy)]
-pub struct OptGlobalPos(u64);
-#[derive(Clone, Copy)]
-pub struct OptStreamPos(StreamPos);
-
-#[derive(Clone, PartialEq, PartialOrd)]
-pub struct GetMessages<Strm, G, S> {
-    pub(crate) start_global_position: G,
-    pub(crate) start_stream_position: S,
-    pub(crate) limit: usize,
-    pub(crate) stream: Strm,
-}
-
-impl Default for GetMessages<Unset, Unset, Unset> {
-    fn default() -> Self {
-        Self {
-            start_global_position: Default::default(),
-            start_stream_position: Default::default(),
-            limit: LIMIT_DEFAULT,
-            stream: Default::default(),
-        }
-    }
-}
-
-impl GetMessages<Unset, Unset, Unset> {
-    #[must_use]
-    pub const fn new() -> Self {
-        GetMessages {
-            start_global_position: Unset,
-            start_stream_position: Unset,
-            limit: LIMIT_DEFAULT,
-            stream: Unset,
-        }
-    }
-}
-
-impl<P, G, S> GetMessages<P, G, S> {
-    pub const fn limit(mut self, limit: usize) -> Self {
-        self.limit = match limit {
-            x if x < 1 => 1,
-            x if x > LIMIT_MAX => LIMIT_MAX,
-            _ => limit,
-        };
-        self
-    }
-}
-
-impl<P, G, S> GetMessages<P, G, S> {
-    #[allow(clippy::missing_const_for_fn)]
-    pub fn from_global(self, position: u64) -> GetMessages<P, OptGlobalPos, S> {
-        GetMessages {
-            start_global_position: OptGlobalPos(position),
-            start_stream_position: self.start_stream_position,
-            limit: self.limit,
-            stream: self.stream,
-        }
-    }
-}
-
-impl<P, G, S> GetMessages<P, G, S> {
-    pub fn in_stream(self, name: &str) -> GetMessages<OptStream, G, S> {
-        GetMessages {
-            start_global_position: self.start_global_position,
-            start_stream_position: self.start_stream_position,
-            limit: self.limit,
-            stream: OptStream(format!("{name}{}", SEPARATOR).into()),
-        }
-    }
-}
+pub struct MessageIter<'msg, Iter: Iterator<Item = Result<Message<'msg>>>>(
+    Iter,
+);
 
 pub fn fetch_global<'iter, 'msg, 'db: 'iter>(
     db: &'db DB,
     pos: u64,
     limit: usize,
-) -> Result<impl 'iter + Iterator<Item = Result<Message<'msg>>>> {
+    // ) -> Result<impl 'iter + Iterator<Item = Result<Message<'msg>>>> {
+) -> impl 'iter + Iterator<Item = Result<Message<'msg>>> {
     let glob_key = pos.to_be_bytes();
     let cf = db.global();
     let iter = db.prefix_iterator_cf(cf, glob_key);
-    let iter = iter
-        .map(|res| {
-            let (k, v) =
-                res.as_ref().map_err(|e| Error::Other(e.to_string()))?;
-            let key = GlobalKey::from_bytes(k)?;
-            let rec = GlobalRecord::from_bytes(v)?;
-            Ok(rec.into_message(key.0))
-        })
-        .take(limit);
-    Ok(iter)
+    iter.map(|res| {
+        let (k, v) = res.as_ref().map_err(|e| Error::Other(e.to_string()))?;
+        let key = GlobalKey::from_bytes(k)?;
+        let rec = GlobalRecord::from_bytes(v)?;
+        Ok(rec.into_message(key.0))
+    })
+    .take(limit)
 }
 
 pub fn fetch_stream<'iter, 'msg, 'db: 'iter>(
     db: &'db DB,
     stream_name: impl AsRef<str> + 'iter,
     limit: usize,
-) -> Result<impl 'iter + Iterator<Item = Result<Message<'msg>>>> {
+) -> impl 'iter + Iterator<Item = Result<Message<'msg>>> {
     let mut search_key = stream_name.as_ref().to_owned();
     search_key.push(SEPARATOR_CHAR);
     let cf = db.stream();
     let iter = db.prefix_iterator_cf(cf, search_key);
-    let iter = iter
-        .map(|res| {
-            let (k, v) = res?;
-            let key = StreamKey::from_bytes(k)?;
-            let rec = StreamRecord::from_bytes(v)?;
-            Ok(rec.into_message(key.stream, key.position))
-        })
-        .take_while(move |res| match res {
-            Ok(msg) => msg.stream_name == stream_name.as_ref(),
-            Err(_) => true,
-        })
-        .take(limit);
-    Ok(iter)
+    iter.map(|res| {
+        let (k, v) = res?;
+        let key = StreamKey::from_bytes(k)?;
+        let rec = StreamRecord::from_bytes(v)?;
+        Ok(rec.into_message(key.stream, key.position))
+    })
+    .take_while(move |res| match res {
+        Ok(msg) => msg.stream_name == stream_name.as_ref(),
+        Err(_) => true,
+    })
+    .take(limit)
 }
 
-impl GetMessages<Unset, OptGlobalPos, Unset> {
-    pub fn fetch<'iter, 'msg, 'db: 'iter>(
-        self,
-        db: &'db DB,
-    ) -> Result<impl 'iter + Iterator<Item = Result<Message<'msg>>>> {
-        fetch_global(db, self.start_global_position.0, self.limit)
-    }
-}
-
-impl<'iter, 's: 'iter> GetMessages<OptStream<'s>, OptGlobalPos, Unset> {
-    pub fn fetch<'msg, 'db: 'iter>(
-        self,
-        db: &'db DB,
-    ) -> Result<impl 'iter + Iterator<Item = Result<Message<'msg>>>> {
-        let stream = self.stream.to_owned();
-        Ok(fetch_global(db, self.start_global_position.0, self.limit)?.filter(
-            move |res| {
-                match res {
-                    Ok(rec) => rec.stream_name == stream.0.as_ref(),
-                    // pass along all errors regardless of prefix
-                    Err(_) => true,
-                }
-            },
-        ))
-    }
-}
-
-impl<'iter, 'msg, 'db: 'iter, 's: 'iter>
-    GetMessages<OptStream<'s>, Unset, Unset>
-{
-    pub fn fetch(
-        self,
-        db: &'db DB,
-    ) -> Result<impl 'iter + Iterator<Item = Result<Message<'msg>>>> {
-        fetch_stream(db, self.stream.0, self.limit)
-    }
-}
-
-impl<'iter, 's: 'iter> GetMessages<OptStream<'s>, Unset, OptStreamPos> {
-    pub fn fetch<'msg, 'db: 'iter>(
-        self,
-        db: &'db DB,
-    ) -> Result<impl 'iter + Iterator<Item = Result<Message<'msg>>>> {
-        // let key = StreamKey::new(self.stream.0, self.start_stream_position.0);
-        fetch_stream(db, self.stream.0, self.limit)
-    }
-}
-
-// trait FetchTrait<'a, Strm, Gpos, Spos, MsgIter> {
-//     fn fetch(
-//         db: &'a DB,
-//         opts: GetMessages<Strm, Gpos, Spos>,
-//     ) -> Result<MsgIter>;
-// }
-//
 // pub struct Fetch;
-pub struct Fetch<Strm, Gpos, Spos> {
-    _s: PhantomData<Strm>,
-    _gp: PhantomData<Gpos>,
-    _sp: PhantomData<Spos>,
+pub struct Fetch<Param> {
+    _mark: PhantomData<Param>,
 }
 
-impl Fetch<crate::read::Unset, crate::read::OptGlobalPos, crate::read::Unset> {
+impl Fetch<OptGlobalPos> {
     pub fn fetch<'iter, 'msg, 'db: 'iter>(
         db: &'db DB,
-        opts: crate::read::GetMessages<
-            crate::read::Unset,
-            crate::read::OptGlobalPos,
-            crate::read::Unset,
-        >,
-    ) -> Result<impl 'iter + Iterator<Item = Result<Message<'msg>>>> {
+        opts: GetMessages<Unset, OptGlobalPos, Unset>,
+    ) -> impl 'iter + Iterator<Item = Result<Message<'msg>>> {
         fetch_global(db, opts.start_global_position.0, opts.limit)
     }
 }
 
-impl<'iter, 's: 'iter>
-    Fetch<
-        crate::read::OptStream<'s>,
-        crate::read::OptGlobalPos,
-        crate::read::Unset,
-    >
-{
+impl<'iter, 's: 'iter> Fetch<(OptStream<'s>, OptGlobalPos)> {
     pub fn fetch<'msg, 'db: 'iter>(
         db: &'db DB,
-        opts: crate::read::GetMessages<
-            crate::read::OptStream<'s>,
-            crate::read::OptGlobalPos,
-            crate::read::Unset,
-        >,
-        // ) -> Result<impl 'b + Iterator<Item = Result<Message<'a>>>> {
-    ) -> Result<impl 'iter + Iterator<Item = Result<Message<'msg>>>> {
+        opts: GetMessages<OptStream<'s>, OptGlobalPos, Unset>,
+    ) -> impl 'iter + Iterator<Item = Result<Message<'msg>>> {
         let stream = opts.stream.to_owned();
-        Ok(fetch_global(db, opts.start_global_position.0, opts.limit)?.filter(
+        fetch_global(db, opts.start_global_position.0, opts.limit).filter(
             move |res| {
                 match res {
                     Ok(rec) => rec.stream_name == stream.0.as_ref(),
@@ -233,7 +87,16 @@ impl<'iter, 's: 'iter>
                     Err(_) => true,
                 }
             },
-        ))
+        )
+    }
+}
+
+impl<'iter, 's: 'iter> Fetch<OptStream<'s>> {
+    pub fn fetch<'msg, 'db: 'iter>(
+        db: &'db DB,
+        opts: GetMessages<OptStream<'s>, Unset, Unset>,
+    ) -> impl 'iter + Iterator<Item = Result<Message<'msg>>> {
+        fetch_stream(db, opts.stream.0, opts.limit)
     }
 }
 
@@ -253,6 +116,7 @@ mod test {
             write::{write_mess, WriteSerializer},
         },
         write::WriteMessage,
+        StreamPos,
     };
 
     fn test_ser() -> WriteSerializer {
@@ -306,15 +170,16 @@ mod test {
     }
 
     mod test_get_messages {
+        use crate::StreamPos;
+
         use super::*;
         use assert2::assert;
 
         #[rstest]
         fn it_gets_messages_up_to_limit() {
             let db = test_db(5);
-            let messages =
-                GetMessages::new().from_global(0).limit(6).fetch(&db);
-            let messages = messages.unwrap();
+            let opts = GetMessages::default().from_global(0).with_limit(6);
+            let messages = Fetch::<OptGlobalPos>::fetch(&db, opts);
             let messages: Result<Vec<_>> = messages.collect();
             let messages = messages.unwrap();
             for msg in messages.iter() {
@@ -337,10 +202,8 @@ mod test {
         #[rstest]
         fn it_gets_messages_starting_from_given_pos() {
             let db = test_db(5);
-            let messages = GetMessages::new()
-                .from_global(5)
-                .fetch(&db)
-                .unwrap()
+            let opts = GetMessages::default().from_global(5);
+            let messages = Fetch::<OptGlobalPos>::fetch(&db, opts)
                 .collect::<Result<Vec<_>>>()
                 .unwrap();
             // assert!(messages.len() == 2);
@@ -359,17 +222,16 @@ mod test {
         #[rstest]
         fn it_returns_empty_iter_if_pos_too_high() {
             let db = test_db(5);
-            let iter = GetMessages::new().from_global(500).fetch(&db).unwrap();
+            let opts = GetMessages::default().from_global(500);
+            let iter = Fetch::<OptGlobalPos>::fetch(&db, opts);
             assert!(iter.count() == 0);
         }
 
         #[rstest]
         fn it_only_returns_messages_from_given_stream() {
             let db = test_db(5);
-            let messages = GetMessages::new()
-                .in_stream("stream1")
-                .fetch(&db)
-                .unwrap()
+            let opts = GetMessages::default().in_stream("stream1");
+            let messages = Fetch::<OptStream<'_>>::fetch(&db, opts)
                 .collect::<Result<Vec<_>>>()
                 .unwrap();
             for message in messages {

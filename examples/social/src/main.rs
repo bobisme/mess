@@ -1,18 +1,14 @@
-use std::{borrow::Cow, io::IsTerminal, sync::Arc};
+use std::{borrow::Cow, io::IsTerminal, sync::Arc, time::Duration};
 
-use bumpalo::Bump;
 use ident::Id;
 use mess::{
-    db::{rocks::db::DB, svc::Connection, Message},
+    db::{rocks::db::DB, svc::ActorHandle, Message},
     ecs::{
         streams::StreamName, ApplyEvents, Component, ComponentStore, Entity,
         EventDB,
     },
 };
-use once_cell::sync::Lazy;
-use parking_lot::Mutex;
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn, Level};
+use tracing::{error, info, warn};
 
 #[derive(Clone, Default, Debug, serde::Serialize, serde::Deserialize)]
 pub enum PostStatus {
@@ -144,58 +140,22 @@ pub fn configure_logging() {
 }
 
 #[tokio::main]
-async fn main() -> ! {
+async fn main() {
     configure_logging();
 
-    let bump = Bump::new();
-    // static BUMP: Lazy<Arc<Bump>> = Lazy::new(|| {
-    //     let bump = Bump::new();
-    //     Arc::new(bump)
-    // });
-    // let bump = BUMP.lock_arc();
-
-    // static CONN: Lazy<Arc<Connection>> = Lazy::new(|| {
-    //     let db: DB = DB::new("xyz").expect("could not open xyz db");
-    //     let c = Arc::new(Connection::new(db));
-    //     c
-    // });
-    // let bump_conn = bump.alloc(Connection::new(
-    //     DB::new(bump.alloc("xyz")).expect("could not open xyz db"),
-    // ));
-    let conn = Connection::new(DB::new(bump.alloc("xyz")).unwrap());
-    let boxed_conn = bumpalo::boxed::Box::new_in(conn, &bump);
-    let conn = Arc::new(boxed_conn);
-    let evt_conn = Arc::clone(&conn);
-    //
-    let tok = CancellationToken::new();
-    let sub_token = tok.clone();
-    // let jh = std::thread::spawn(move || conn.handle_messages_thread(sub_token));
-    // let jh = bumpalo::boxed::Box::new_in(jh, &bump);
-
-    // let evdb = Arc::new(EventDB::new(evt_conn));
-    // let evdb = bump.alloc(EventDB::new(evt_conn));
-    let evdb = EventDB::new(evt_conn);
-    let evdb = bumpalo::boxed::Box::new_in(evdb, &bump);
+    let db = DB::new("xyz").unwrap();
+    let handle = ActorHandle::new(db);
+    let evdb = EventDB::new(handle.clone());
     let evdb = Arc::new(evdb);
-    // let e
-    let post_store =
-        ComponentStore::<PostData, _, _, _, _>::new(Arc::clone(&evdb));
-    // let post_store =
-    //     Arc::new(ComponentStore::<PostData>::new(Arc::clone(&conn)));
+    let post_store = ComponentStore::<PostData, _>::new(Arc::clone(&evdb));
     let poster = Entity::new();
     let post = Entity::new();
-    // let stream = StreamName::from_component_and_id("post", post.id(), None);
-    let stream = bump.alloc(StreamName::from_component_and_id(
-        &bump.alloc("post"),
-        post.id(),
-        None,
-    ));
+    let stream = StreamName::from_component_and_id("post", post.id(), None);
     let event = Event::Posted(PostData {
         poster_id: poster.id(),
         body: "here is some stupid post".into(),
         status: PostStatus::Visible,
     });
-    // let ps = Arc::clone(&post_store);
     let position = evdb
         .put(stream.source(), &event, None)
         .await
@@ -206,7 +166,8 @@ async fn main() -> ! {
     info!(?post, "post");
 
     // shut down
-    tok.cancel();
-    loop {}
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    handle.kill();
+    // loop {}
     // jh.join();
 }

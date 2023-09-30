@@ -15,7 +15,7 @@ use std::{
 use crate::error::Error;
 use ident::Id;
 use mess_db::{
-    svc::Connection, write::WriteMessage, Message, Position, StreamPos,
+    svc::ActorHandle, write::WriteMessage, Message, Position, StreamPos,
 };
 use parking_lot::RwLock;
 use quick_cache::sync::Cache;
@@ -186,56 +186,15 @@ impl<Data> Deref for ComponentCache<Data> {
     }
 }
 
-pub trait DBRef<'req, 'iter, 'msg, X> {
-    fn db(&self) -> &Connection<'req, 'iter, 'msg>;
+pub struct EventDB {
+    db_actor: ActorHandle,
 }
 
-impl<'req, 'iter, 'msg, T> DBRef<'req, 'iter, 'msg, ()> for T
-where
-    T: Deref<Target = Connection<'req, 'iter, 'msg>>,
-{
-    #[inline]
-    fn db(&self) -> &Connection<'req, 'iter, 'msg> {
-        self
-    }
-}
-
-impl<'req, 'iter, 'msg, T> DBRef<'req, 'iter, 'msg, ((), ())> for T
-where
-    T: Deref,
-    <T as Deref>::Target: Deref<Target = Connection<'req, 'iter, 'msg>>,
-{
-    #[inline]
-    fn db(&self) -> &Connection<'req, 'iter, 'msg> {
-        self
-    }
-}
-
-pub struct EventDB<Db, Conn> {
-    db: Db,
-    _mark: PhantomData<Conn>,
-}
-
-impl<'req, 'iter, 'msg, X, Db, Conn> DBRef<'req, 'iter, 'msg, X>
-    for EventDB<Db, Conn>
-where
-    Db: DBRef<'req, 'iter, 'msg, X>,
-{
-    #[inline]
-    fn db(&self) -> &Connection<'req, 'iter, 'msg> {
-        self.db.db()
-    }
-}
-
-impl<'req, 'iter, 'msg, Db, Conn> EventDB<Db, Conn>
-where
-    Self: DBRef<'req, 'iter, 'msg, Conn>,
-    Db: DBRef<'req, 'iter, 'msg, Conn>,
-{
+impl EventDB {
     #[must_use]
     #[inline]
-    pub fn new(db: Db) -> Self {
-        Self { db, _mark: PhantomData }
+    pub fn new(db_actor: ActorHandle) -> Self {
+        Self { db_actor }
     }
 
     /// Write the given event as a message in the database.
@@ -264,71 +223,24 @@ where
             metadata,
             expected_stream_position: expected_version.map(Into::into),
         };
-        let put_res = self.db.db().put_message(req);
+        let put_res = self.db_actor.put_message(req);
         put_res.await.map_err(Error::from)
         // Ok(Position { global: 0, stream: StreamPos::Sequential(0) })
     }
 }
 
-// impl<'req, 'iter, 'msg, Data, Edb, Conn>
-//     EventDBThing<'req, 'iter, 'msg, Edb, Conn, ()>
-//     for
-// where
-//     Edb: DBRef<'req, 'iter, 'msg, Conn>,
-// {
-//     fn evdb(&self) -> &EventDB<Edb, Conn> {
-//         &self.db
-//     }
-// }
-
-pub trait EventDBThing<'req, 'iter, 'msg, Db, Conn, X> {
-    fn evdb(&self) -> &EventDB<Db, Conn>;
-}
-
-impl<'req, 'iter, 'msg, Edb, Conn, T>
-    EventDBThing<'req, 'iter, 'msg, Edb, Conn, ()> for T
-where
-    // Edb: DBRef<'req, 'iter, 'msg, Conn>,
-    T: Deref<Target = EventDB<Edb, Conn>>,
-{
-    #[inline]
-    fn evdb(&self) -> &EventDB<Edb, Conn> {
-        self
-    }
-}
-
-impl<'req, 'iter, 'msg, Edb, Conn, T>
-    EventDBThing<'req, 'iter, 'msg, Edb, Conn, ((), ())> for T
-where
-    // Edb: DBRef<'req, 'iter, 'msg, Conn>,
-    T: Deref,
-    <T as Deref>::Target: Deref<Target = EventDB<Edb, Conn>>,
-{
-    #[inline]
-    fn evdb(&self) -> &EventDB<Edb, Conn> {
-        self
-    }
-}
-
-// pub struct ComponentStore<'req, 'iter, 'msg, Data, Conn> {
-pub struct ComponentStore<Data, Db, Edb, Conn, E> {
+// pub struct ComponentStore<Data, Conn> {
+pub struct ComponentStore<Data, Db> {
     cache: ComponentCache<Data>,
-    // db: Arc<EventDB<'req, 'iter, 'msg>>,
-    db: Db,
-    _mark: PhantomData<(Edb, Conn, E)>,
+    event_db: Db,
 }
 
-impl<'req: 'iter + 'msg, 'iter: 'req, 'msg: 'req, Data, Db, Edb, Conn, E>
-    ComponentStore<Data, Db, Edb, Conn, E>
-where
-    Edb: DBRef<'req, 'iter, 'msg, Conn>,
-    Db: EventDBThing<'req, 'iter, 'msg, Edb, Conn, E>, // Edb: Send + Sync + DBRef<'req, 'iter, 'msg, Conn>,
-{
+impl<Data, Db: AsRef<EventDB>> ComponentStore<Data, Db> {
     #[must_use]
     #[inline]
     // pub fn new(db: Arc<EventDB<Conn>>) -> Self {
-    pub fn new(db: Db) -> Self {
-        Self { cache: ComponentCache::new(), db, _mark: PhantomData }
+    pub fn new(event_db: Db) -> Self {
+        Self { cache: ComponentCache::new(), event_db }
     }
     /// Fetch messages from the event store.
     ///
@@ -336,10 +248,10 @@ where
     ///
     /// This function will return an error if fetching messages errors.
     #[inline]
-    pub async fn fetch<'slf: 'req + 'iter + 'msg>(
-        &'slf self,
+    pub async fn fetch<'msg>(
+        &self,
         entity: Entity,
-        stream_name: &'iter str,
+        stream_name: &str,
     ) -> Result<Component<Data>, Error>
     where
         Component<Data>: ApplyMessages<'msg>,
@@ -349,15 +261,15 @@ where
             return Ok(Component { entity, data: cached });
         }
         let mut comp = Component::<Data>::new(entity);
-        let fetch = self.db.evdb().db().fetch_messages(
+        let fetch = self.event_db.as_ref().db_actor.fetch_messages(
             mess_db::read::GetMessages::default().in_stream(stream_name),
         );
         let messages = fetch.await?;
-        let messages = messages.filter_map(|res| {
+        let messages = messages.into_iter().filter_map(|res| {
             if let Err(err) = &res {
                 eprintln!("message error: {err:?}");
             }
-            res.ok()
+            res.map(Into::into).ok()
         });
         comp.apply_messages(messages);
         Ok(comp)

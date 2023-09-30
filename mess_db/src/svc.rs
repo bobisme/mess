@@ -1,112 +1,115 @@
-use std::borrow::Cow;
-
-use crossbeam_queue::SegQueue;
-use ident::Id;
-use tokio::{
-    sync::oneshot::{self, Sender},
-    task::JoinHandle,
-};
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
-use tracing::error;
+use tracing::{debug, error};
 
 use crate::{
     error::{Error, Result},
     read::{GetMessages, OptGlobalPos, OptStream, OptStreamPos, Unset},
     rocks::{db::DB, read::Fetch, write::WriteSerializer},
-    write::WriteMessage,
-    Message, Position, StreamPos,
+    write::{OwnedWriteMessage, WriteMessage},
+    Message, OwnedMessage, Position, StreamPos,
 };
 
-pub(crate) enum RequestBody<'a> {
+#[derive(Debug)]
+pub enum RequestBody {
     GetGlobalMessages {
-        stream: Option<Cow<'a, str>>,
+        stream: Option<String>,
         global_pos: u64,
         limit: usize,
     },
     GetStreamMessages {
-        stream: Cow<'a, str>,
+        stream: String,
         stream_pos: Option<StreamPos>,
         limit: usize,
     },
-    Write(WriteMessage<'a>),
+    Write(OwnedWriteMessage),
 }
 
-impl<'a> From<GetMessages<Unset, OptGlobalPos, Unset>> for Request<'a> {
+impl From<GetMessages<Unset, OptGlobalPos, Unset>> for RequestBody {
     fn from(val: GetMessages<Unset, OptGlobalPos, Unset>) -> Self {
-        Request {
-            body: RequestBody::GetGlobalMessages {
-                stream: None,
-                global_pos: val.start_global_position.0,
-                limit: val.limit,
-            },
+        RequestBody::GetGlobalMessages {
+            stream: None,
+            global_pos: val.start_global_position.0,
+            limit: val.limit,
         }
     }
 }
 
-impl<'a> From<GetMessages<OptStream<'a>, OptGlobalPos, Unset>> for Request<'a> {
-    fn from(val: GetMessages<OptStream<'a>, OptGlobalPos, Unset>) -> Self {
-        Request {
-            body: RequestBody::GetGlobalMessages {
-                stream: Some(val.stream.0),
-                global_pos: val.start_global_position.0,
-                limit: val.limit,
-            },
+impl From<GetMessages<OptStream<'_>, OptGlobalPos, Unset>> for RequestBody {
+    fn from(val: GetMessages<OptStream, OptGlobalPos, Unset>) -> Self {
+        RequestBody::GetGlobalMessages {
+            stream: Some(val.stream.0.to_string()),
+            global_pos: val.start_global_position.0,
+            limit: val.limit,
         }
     }
 }
 
-impl<'a> From<GetMessages<OptStream<'a>, Unset, Unset>> for Request<'a> {
-    fn from(val: GetMessages<OptStream<'a>, Unset, Unset>) -> Self {
-        Request {
-            body: RequestBody::GetStreamMessages {
-                stream: val.stream.0,
-                stream_pos: None,
-                limit: val.limit,
-            },
+impl From<GetMessages<OptStream<'_>, Unset, Unset>> for RequestBody {
+    fn from(val: GetMessages<OptStream, Unset, Unset>) -> Self {
+        RequestBody::GetStreamMessages {
+            stream: val.stream.0.to_string(),
+            stream_pos: None,
+            limit: val.limit,
         }
     }
 }
 
-impl<'a> From<GetMessages<OptStream<'a>, Unset, OptStreamPos>> for Request<'a> {
-    fn from(val: GetMessages<OptStream<'a>, Unset, OptStreamPos>) -> Self {
-        Request {
-            body: RequestBody::GetStreamMessages {
-                stream: val.stream.0,
-                stream_pos: Some(val.start_stream_position.0),
-                limit: val.limit,
-            },
-        }
-    }
-}
-pub struct Request<'a> {
-    pub(crate) body: RequestBody<'a>,
-}
-
-pub type DynMessageIter<'iter, 'msg> =
-    Box<dyn 'iter + Iterator<Item = Result<Message<'msg>>> + Send + Sync>;
-
-pub enum ResponseBody<'iter, 'msg> {
-    Messages { messages: DynMessageIter<'iter, 'msg> },
-    Write { pos: Result<Position> },
-}
-
-impl std::fmt::Debug for ResponseBody<'_, '_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Messages { messages: _ } => f
-                .debug_struct("Messages")
-                .field("messages", &"<...messages...>")
-                .finish(),
-            Self::Write { pos } => {
-                f.debug_struct("Write").field("pos", pos).finish()
-            }
+impl From<GetMessages<OptStream<'_>, Unset, OptStreamPos>> for RequestBody {
+    fn from(val: GetMessages<OptStream, Unset, OptStreamPos>) -> Self {
+        RequestBody::GetStreamMessages {
+            stream: val.stream.0.to_string(),
+            stream_pos: Some(val.start_stream_position.0),
+            limit: val.limit,
         }
     }
 }
 
 #[derive(Debug)]
-pub struct Response<'iter, 'msg> {
-    pub body: ResponseBody<'iter, 'msg>,
+pub struct Request {
+    pub(crate) body: RequestBody,
+    pub(crate) response_chan: oneshot::Sender<Response>,
+}
+
+impl Request {
+    fn new(
+        body: RequestBody,
+        response_chan: oneshot::Sender<Response>,
+    ) -> Request {
+        Request { body, response_chan }
+    }
+}
+
+pub type DynMessageIter<'iter, 'msg> =
+    Box<dyn 'iter + Iterator<Item = Result<Message<'msg>>> + Send + Sync>;
+
+pub type DynOwnedMessageIter =
+    Box<dyn Iterator<Item = Result<OwnedMessage>> + Send + Sync>;
+
+#[derive(Debug)]
+pub enum ResponseBody {
+    Messages { messages: Vec<Result<OwnedMessage>> },
+    Write { pos: Result<Position> },
+    Err,
+}
+
+// impl std::fmt::Debug for ResponseBody {
+//     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+//         match self {
+//             Self::Messages { messages: _ } => f
+//                 .debug_struct("Messages")
+//                 .field("messages", &"<...messages...>")
+//                 .finish(),
+//             Self::Write { pos } => {
+//                 f.debug_struct("Write").field("pos", pos).finish()
+//             }
+//         }
+//     }
+// }
+
+#[derive(Debug)]
+pub struct Response {
+    pub body: ResponseBody,
 }
 
 const _: () = {
@@ -114,64 +117,122 @@ const _: () = {
         true
     }
     const U: &[u8] = &[];
-    const REQ: Request = Request {
-        body: RequestBody::Write(WriteMessage {
-            id: Id::from_u128(1234),
-            stream_name: Cow::Borrowed(""),
-            message_type: Cow::Borrowed(""),
-            data: Cow::Borrowed(U),
-            metadata: Cow::Borrowed(U),
-            expected_stream_position: None,
-        }),
-    };
-    assert!(is_sync(&REQ));
-    const RES: Response = Response {
-        body: ResponseBody::Write {
-            pos: Ok(Position { global: 0, stream: StreamPos::Sequential(0) }),
-        },
-    };
-    assert!(is_sync(&RES));
+    // const REQ: Request = Request {
+    //     body: RequestBody::Write(WriteMessage {
+    //         id: Id::from_u128(1234),
+    //         stream_name: Cow::Borrowed(""),
+    //         message_type: Cow::Borrowed(""),
+    //         data: Cow::Borrowed(U),
+    //         metadata: Cow::Borrowed(U),
+    //         expected_stream_position: None,
+    //     }),
+    // };
+    // assert!(is_sync(&REQ));
+    // const RES: Response = Response {
+    //     body: ResponseBody::Write {
+    //         pos: Ok(Position { global: 0, stream: StreamPos::Sequential(0) }),
+    //     },
+    // };
+    // assert!(is_sync(&RES));
 };
 
-type QueueItem<'req, 'iter, 'msg> =
-    (Request<'req>, Sender<Response<'iter, 'msg>>);
-
-pub struct Connection<'req, 'iter, 'msg> {
+pub struct Actor {
+    inbox: mpsc::Receiver<Request>,
+    // Only the actor can touch the DB.
     db: DB,
-    queue: SegQueue<QueueItem<'req, 'iter, 'msg>>,
-    // task: tokio::runtime::Handle,
+    ser: WriteSerializer,
+    token: CancellationToken,
 }
 
-impl<'req, 'iter, 'msg> Connection<'req, 'iter, 'msg> {
-    #[must_use]
-    pub const fn new(db: DB) -> Self {
-        Self { queue: SegQueue::new(), db }
-    }
-
-    pub async fn fetch_messages<'conn: 'iter + 'msg>(
-        &'conn self,
-        req: impl Into<Request<'req>>,
-    ) -> Result<DynMessageIter<'iter, 'msg>> {
-        let (send, recv) = oneshot::channel();
-        self.queue.push((req.into(), send));
-        let res = recv.await.map_err(Error::from)?;
-        match res.body {
-            ResponseBody::Messages { messages } => Ok(messages),
-            resp => {
-                error!(?resp, "unexpected service response body");
-                Err(Error::SvcResponse)
-            }
+impl Actor {
+    async fn handle_req(&mut self, req: Request) -> Result<()> {
+        if self.token.is_cancelled() {
+            return Err(Error::Cancelled);
         }
+        let resp = match req.body {
+            RequestBody::GetGlobalMessages { stream, global_pos, limit } => {
+                let opts = GetMessages::default()
+                    .from_global(global_pos)
+                    .with_limit(limit);
+                let messages = Fetch::<OptGlobalPos>::fetch(&self.db, opts);
+                let messages: Vec<_> =
+                    messages.map(|res| res.map(|msg| msg.into())).collect();
+                Response { body: ResponseBody::Messages { messages } }
+            }
+            RequestBody::GetStreamMessages { stream, stream_pos, limit } => {
+                let opts =
+                    GetMessages::default().in_stream(&stream).with_limit(limit);
+                let messages = Fetch::<OptStream>::fetch(&self.db, opts);
+                let messages: Vec<_> =
+                    messages.map(|res| res.map(|msg| msg.into())).collect();
+                Response { body: ResponseBody::Messages { messages } }
+            }
+            RequestBody::Write(message) => {
+                let pos = crate::rocks::write::write_mess(
+                    &self.db,
+                    message.into(),
+                    &mut self.ser,
+                );
+                Response { body: ResponseBody::Write { pos } }
+            }
+        };
+        debug!(?resp, "responding with");
+        let _ = req.response_chan.send(resp);
+        Ok(())
+    }
+}
+
+async fn run_actor(mut actor: Actor) {
+    while let Some(req) = actor.inbox.recv().await {
+        debug!(?req, "got request");
+        if actor.token.is_cancelled() {
+            debug!("actor cancelled");
+            break;
+        }
+        actor.handle_req(req).await.unwrap();
+    }
+    debug!("actor killed");
+}
+
+#[derive(Clone)]
+pub struct ActorHandle<const S: usize = 4096> {
+    outbox: mpsc::Sender<Request>,
+    token: CancellationToken,
+}
+
+impl<const S: usize> ActorHandle<S> {
+    #[must_use]
+    pub fn new(db: DB) -> Self {
+        // TODO: REMOVE MAGIC NUMBER!
+        let (outbox, inbox) = mpsc::channel(S);
+        let token = CancellationToken::new();
+        let actor = Actor {
+            inbox,
+            db,
+            token: token.clone(),
+            ser: WriteSerializer::new(),
+        };
+        tokio::spawn(run_actor(actor));
+        Self { outbox, token }
     }
 
-    pub async fn put_message(
-        &self,
-        wm: WriteMessage<'req>,
-    ) -> Result<Position> {
-        let req = Request { body: RequestBody::Write(wm) };
+    pub fn kill(&self) {
+        self.token.cancel()
+    }
+
+    pub async fn put_message(&self, wm: WriteMessage<'_>) -> Result<Position> {
+        if self.token.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
         let (send, recv) = oneshot::channel();
-        self.queue.push((req, send));
-        let res = recv.await.map_err(Error::from)?;
+        let req = Request {
+            body: RequestBody::Write(wm.into()),
+            response_chan: send,
+        };
+        // Ignore send errors and handle it on the recv end below.
+        let _ = self.outbox.send(req).await;
+        let res = recv.await?;
+        debug!("put messages");
         match res.body {
             ResponseBody::Write { pos } => pos,
             resp => {
@@ -181,110 +242,23 @@ impl<'req, 'iter, 'msg> Connection<'req, 'iter, 'msg> {
         }
     }
 
-    pub fn handle_messages_tokio(
-        &'static self,
-        // conn: &'static Connection<'_, '_, '_>,
-        token: Option<CancellationToken>,
-    ) -> JoinHandle<()> {
-        tokio::spawn(async move {
-            let mut ser = WriteSerializer::<1024>::new();
-            while token.as_ref().filter(|t| t.is_cancelled()).is_none() {
-                handle_messages_inner(self, &mut ser).await;
+    pub async fn fetch_messages(
+        &self,
+        req_body: impl Into<RequestBody>,
+    ) -> Result<Vec<Result<OwnedMessage>>> {
+        let (send, recv) = oneshot::channel();
+        let req_body = req_body.into();
+        let req = Request::new(req_body, send);
+        // Ignore send errors and handle it on the recv end below.
+        let _ = self.outbox.send(req).await;
+        let resp = recv.await.unwrap();
+        debug!("fetch messages");
+        match resp.body {
+            ResponseBody::Messages { messages } => Ok(messages),
+            resp => {
+                error!(?resp, "unexpected service response body");
+                Err(Error::SvcResponse)
             }
-        })
-    }
-
-    pub fn handle_messages_thread<'slf: 'iter>(
-        &'slf self,
-        token: CancellationToken,
-    ) {
-        let mut ser = WriteSerializer::<1024>::new();
-        while !token.is_cancelled() {
-            handle_messages_inner_thread(self, &mut ser);
-        }
-    }
-}
-
-// pub fn handle_messages(
-//     conn: &'static Connection<'_, '_, '_>,
-//     token: CancellationToken,
-// ) -> JoinHandle<()> {
-//     tokio::spawn(async move {
-//         let mut ser = WriteSerializer::<1024>::new();
-//         loop {
-//             if token.is_cancelled() {
-//                 break;
-//             }
-//             handle_messages_inner(conn, &mut ser).await;
-//         }
-//     })
-// }
-
-async fn handle_messages_inner<'conn: 'iter, 'iter>(
-    conn: &'conn Connection<'_, 'iter, '_>,
-    ser: &mut WriteSerializer,
-) {
-    let popped = conn.queue.pop();
-    let Some((req, resp_ch)) = popped else {
-        tokio::task::yield_now().await;
-        return;
-    };
-    match req.body {
-        RequestBody::GetGlobalMessages { stream: _, global_pos, limit } => {
-            let opts = GetMessages::default()
-                .from_global(global_pos)
-                .with_limit(limit);
-            let messages =
-                Fetch::<Unset, OptGlobalPos, _>::fetch(&conn.db, opts);
-            let messages = messages.unwrap();
-            let resp = Response {
-                body: ResponseBody::Messages { messages: Box::new(messages) },
-            };
-            resp_ch.send(resp).unwrap();
-        }
-        RequestBody::GetStreamMessages {
-            stream: _,
-            stream_pos: _,
-            limit: _,
-        } => {}
-        RequestBody::Write(message) => {
-            let res = crate::rocks::write::write_mess(&conn.db, message, ser);
-            resp_ch
-                .send(Response { body: ResponseBody::Write { pos: res } })
-                .unwrap();
-        }
-    }
-}
-
-fn handle_messages_inner_thread<'conn: 'iter, 'iter>(
-    conn: &'conn Connection<'_, 'iter, '_>,
-    ser: &mut WriteSerializer,
-) {
-    let popped = conn.queue.pop();
-    let Some((req, resp_ch)) = popped else {
-        std::thread::yield_now();
-        // std::hint::spin_loop();
-        return;
-    };
-    match req.body {
-        RequestBody::GetGlobalMessages { stream, global_pos, limit } => {
-            let opts = GetMessages::default()
-                .from_global(global_pos)
-                .with_limit(limit);
-            let messages =
-                Fetch::<Unset, OptGlobalPos, _>::fetch(&conn.db, opts);
-            let messages = messages.unwrap();
-            let resp = Response {
-                body: ResponseBody::Messages { messages: Box::new(messages) },
-            };
-            resp_ch.send(resp).unwrap();
-        }
-        RequestBody::GetStreamMessages { stream, stream_pos, limit } => {}
-        RequestBody::Write(message) => {
-            let res = crate::rocks::write::write_mess(&conn.db, message, ser);
-            resp_ch
-                .send(Response { body: ResponseBody::Write { pos: res } })
-                .unwrap();
         }
     }
 }
