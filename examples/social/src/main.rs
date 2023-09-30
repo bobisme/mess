@@ -145,8 +145,7 @@ async fn main() {
 
     let db = DB::new("xyz").unwrap();
     let handle = ActorHandle::new(db);
-    let evdb = EventDB::new(handle.clone());
-    let evdb = Arc::new(evdb);
+    let evdb = Arc::new(EventDB::new(handle.clone()));
     let post_store = ComponentStore::<PostData, _>::new(Arc::clone(&evdb));
     let poster = Entity::new();
     let post = Entity::new();
