@@ -1,29 +1,29 @@
 use std::{
-    marker::PhantomData,
     ops::{Deref, DerefMut},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use crate::error::{Error, Result};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Item<T> {
     version: usize,
     item: Option<T>,
 }
 
-impl<T: Default> Default for Item<T> {
+impl<T> Default for Item<T> {
     fn default() -> Self {
         Self { version: 0, item: None }
     }
 }
 
 impl<T> Item<T> {
-    pub fn new(item: Option<T>) -> Self {
-        Self { version: 0, item }
+    pub fn new(item: T) -> Self {
+        Self { version: 1, item: Some(item) }
     }
-    pub fn update(&mut self, item: Option<T>) {
+    pub fn update(&mut self, item: T) {
         self.version += 1;
-        self.item = item
+        self.item = Some(item)
     }
     pub fn clear(&mut self) {
         self.item = None
@@ -55,34 +55,46 @@ impl<T> DerefMut for Item<T> {
 
 pub struct RingList<T, const N: usize> {
     items: Vec<Item<T>>,
-    cap: usize,
     /// Head is the beginning of the list.
-    head: usize,
+    head: AtomicUsize,
     /// Tail is the next free position.
-    tail: usize,
-    _mark: PhantomData<N>,
+    tail: AtomicUsize,
 }
 
-impl<T> RingList<T>
+impl<T, const N: usize> RingList<T, N>
 where
-    T: Clone + Default,
+    T: Clone,
 {
-    pub fn with_capacity(cap: usize) -> Self {
-        Self { items: vec![Item::default(); cap], cap, head: 0, tail: 0 }
+    pub fn new() -> Self {
+        Self {
+            items: vec![Item::default(); N],
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn head(&self) -> usize {
+        self.head.load(Ordering::Acquire)
+    }
+    pub fn tail(&self) -> usize {
+        self.tail.load(Ordering::Acquire)
     }
 
     pub fn is_full(&self) -> bool {
-        self.head == self.tail && self.items[self.head].is_some()
+        let head = self.head();
+        let tail = self.tail();
+        head == tail && self.items[head].is_some()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.head == self.tail && self.items[self.head].is_none()
+        let head = self.head();
+        let tail = self.tail();
+        head == tail && self.items[head].is_none()
     }
-    pub fn tail(&self) -> Option<usize> {}
 
     pub fn next(&self, list_idx: usize) -> usize {
         match list_idx + 1 {
-            x if x < self.cap => x,
+            x if x < N => x,
             _ => 0,
         }
     }
@@ -90,7 +102,7 @@ where
     pub fn prev(&self, list_idx: usize) -> usize {
         match list_idx {
             i if i > 0 => i - 1,
-            _ => self.cap - 1,
+            _ => N - 1,
         }
     }
 
@@ -98,8 +110,12 @@ where
         if self.is_full() {
             return Err(Error::ListFull);
         }
-        self.items[self.tail] = Some(item);
-        self.tail = self.next(self.tail);
+        let tail = self.tail();
+        match self.items.len() {
+            x if x < N - 1 => self.items.push(Item::new(item)),
+            _ => self.items[tail].update(item),
+        }
+        self.tail.store(self.next(tail), Ordering::Release);
         Ok(())
     }
 
@@ -107,31 +123,42 @@ where
         if self.is_empty() {
             return None;
         }
-        let Some(item) = self.items[self.head] else {
-            return None;
-        };
-        self.items[self.head] = None;
-        self.head = self.next(self.head);
+        let head = self.head();
+        let item = self.items[head].clone().item?;
+        self.items[head].clear();
+        self.head.store(self.next(head), Ordering::Release);
         Some(item)
     }
 
-    pub fn iter(&self) -> IndexIter<'_, T> {
-        IndexIter { list: self, list_idx: Some(self.head) }
+    pub fn iter(&self) -> RingIter<'_, T, N> {
+        let head = self.head();
+        let version = self.items[head].version;
+        RingIter { list: self, list_idx: Some(head), version }
     }
 }
 
-pub struct IndexIter<'a, T> {
-    list: &'a RingList<T>,
+pub struct RingIter<'a, T, const N: usize> {
+    list: &'a RingList<T, N>,
     list_idx: Option<usize>,
+    version: usize,
 }
 
-impl<'a, T> Iterator for IndexIter<'a, T> {
+impl<'a, T, const N: usize> Iterator for RingIter<'a, T, N>
+where
+    T: Clone,
+{
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
         let list_idx = self.list_idx?;
-        let item = self.list.items[list_idx]?;
-        self.list_idx = if self.list.next(list_idx) == self.list.tail {
+        let wrapper = self.list.items[list_idx].clone();
+        let item = wrapper.item?;
+        // Stop if no longer reading same version.
+        if wrapper.version != self.version {
+            self.list_idx = None;
+            return None;
+        }
+        self.list_idx = if self.list.next(list_idx) == self.list.tail() {
             None
         } else {
             Some(self.list.next(list_idx))
@@ -148,50 +175,50 @@ mod test_index_list {
 
     #[rstest]
     fn next_wraps() {
-        let list = RingList::with_capacity(10);
+        let list = RingList::<char, 10>::new();
         assert!(list.next(0) == 1);
         assert!(list.next(9) == 0);
     }
 
     #[rstest]
     fn prev_wraps() {
-        let list = RingList::with_capacity(10);
+        let list = RingList::<char, 10>::new();
         assert!(list.prev(1) == 0);
         assert!(list.prev(0) == 9);
     }
 
     #[rstest]
     fn it_pushes_from_the_beginning() {
-        let mut list = RingList::with_capacity(10);
-        list.push(1, 1, 1).unwrap();
-        list.push(2, 2, 2).unwrap();
-        let mut expected = vec![None; 10];
-        expected[0] = Some(Item::new(1, 1, 1));
-        expected[1] = Some(Item::new(2, 2, 2));
+        let mut list = RingList::<char, 10>::new();
+        list.push('a').unwrap();
+        list.push('b').unwrap();
+        let mut expected = vec![Item::default(); 10];
+        expected[0] = Item::new('a');
+        expected[1] = Item::new('b');
         assert!(list.items == expected);
     }
 
     #[rstest]
     fn push_wraps_around() {
-        let mut list = RingList::with_capacity(10);
-        list.head = 7;
-        list.tail = 7;
+        let mut list = RingList::<u32, 10>::new();
+        list.head.store(7, Ordering::Release);
+        list.tail.store(7, Ordering::Release);
         for i in 0..10 {
-            list.push(i, i as u32, i as u32).unwrap();
+            list.push(i as u32).unwrap();
         }
         let expected: Vec<_> = (3..10)
             .chain(0..3)
             .enumerate()
-            .map(|(_i, j)| Some(Item::new(j as u64, j as u32, j as u32)))
+            .map(|(_i, j)| Item::new(j as u32))
             .collect();
         assert!(list.items == expected);
     }
 
     #[rstest]
     fn is_empty_works() {
-        let mut list = RingList::with_capacity(10);
+        let mut list = RingList::<char, 10>::new();
         assert!(list.is_empty() == true);
-        list.push(1, 1, 1).unwrap();
+        list.push('a').unwrap();
         assert!(list.is_empty() == false);
         list.pop();
         assert!(list.is_empty() == true);
@@ -199,76 +226,71 @@ mod test_index_list {
 
     #[rstest]
     fn is_full_works() {
-        let mut list = RingList::with_capacity(10);
+        let mut list = RingList::<u32, 10>::new();
         assert!(list.is_full() == false);
-        (0..10).for_each(|i| list.push(i, i as u32, i as u32).unwrap());
+        (0..10).for_each(|i| list.push(i as u32).unwrap());
         assert!(list.is_full() == true);
     }
 
     #[rstest]
     fn pop_returns_none_if_empty() {
-        let mut list = RingList::with_capacity(10);
+        let mut list = RingList::<char, 10>::new();
         assert!(list.pop() == None);
     }
 
     #[rstest]
     fn pop_returns_entry_index() {
-        let mut list = RingList::with_capacity(10);
-        list.push(1, 1, 0).unwrap();
-        list.push(2, 2, 0).unwrap();
-        assert!(list.pop() == Some(Item::new(1, 1, 0)));
-        assert!(list.pop() == Some(Item::new(2, 2, 0)));
+        let mut list = RingList::<char, 10>::new();
+        list.push('a').unwrap();
+        list.push('b').unwrap();
+        assert!(list.pop() == Some('a'));
+        assert!(list.pop() == Some('b'));
         assert!(list.pop() == None);
     }
 
     #[rstest]
     fn pop_wraps_around() {
-        let mut list = RingList::with_capacity(10);
-        list.head = 8;
-        list.tail = 8;
-        list.push(8, 8, 0).unwrap();
-        list.push(9, 9, 0).unwrap();
-        list.push(0, 0, 0).unwrap();
-        assert!(list.pop() == Some(Item::new(8, 8, 0)));
-        assert!(list.pop() == Some(Item::new(9, 9, 0)));
-        assert!(list.pop() == Some(Item::new(0, 0, 0)));
+        let mut list = RingList::<_, 10>::new();
+        list.head.store(8, Ordering::Release);
+        list.tail.store(8, Ordering::Release);
+        list.push('h').unwrap();
+        list.push('i').unwrap();
+        list.push('a').unwrap();
+        assert!(list.pop() == Some('h'));
+        assert!(list.pop() == Some('i'));
+        assert!(list.pop() == Some('a'));
         assert!(list.pop() == None);
     }
 
     #[rstest]
     fn pop_clears_idx() {
-        let mut list = RingList::with_capacity(10);
-        list.push(1, 1, 0).unwrap();
-        assert!(list.pop() == Some(Item::new(1, 1, 0)));
-        assert!(list.items == vec![None; 10]);
+        let mut list = RingList::<char, 10>::new();
+        list.push('a').unwrap();
+        assert!(list.pop() == Some('a'));
+        let mut expected = vec![Item::default(); 10];
+        expected[0].version = 1;
+        assert!(list.items == expected);
     }
 
     #[rstest]
     fn iterator_iterates() {
-        let mut list = RingList::with_capacity(10);
-        let items: Vec<_> =
-            (0..5).map(|i| Item::new(i as u64, i as u32, i as u32)).collect();
+        let mut list = RingList::<u32, 10>::new();
+        let items: Vec<_> = (0..5).map(|i| i as u32).collect();
         for item in items.clone() {
-            list.push(item.global_position, item.entry_idx, item.next_idx)
-                .unwrap();
+            list.push(item).unwrap();
         }
         let idxs: Vec<_> = list.iter().collect();
-        assert!(idxs == items);
+        assert!(idxs == vec![0, 1, 2, 3, 4]);
     }
 
     #[rstest]
     fn iterator_wraps_around() {
-        let mut list = RingList::with_capacity(10);
-        list.head = 7;
-        list.tail = 7;
-        let items: Vec<_> = (7..10)
-            .chain(0..7)
-            .enumerate()
-            .map(|(ord, _idx)| Item::new(ord as u64, ord as u32, ord as u32))
-            .collect();
+        let mut list = RingList::<u32, 10>::new();
+        list.head.store(7, Ordering::Release);
+        list.tail.store(7, Ordering::Release);
+        let items: Vec<_> = (7u32..10).chain(0..7).collect();
         for item in items.clone() {
-            list.push(item.global_position, item.entry_idx, item.next_idx)
-                .unwrap();
+            list.push(item).unwrap();
         }
         let idxs: Vec<_> = list.iter().collect();
         assert!(idxs == items);
