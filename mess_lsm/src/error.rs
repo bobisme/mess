@@ -18,6 +18,12 @@ pub enum Error {
     EntryTooBig,
     #[error("list is full")]
     ListFull,
+    #[error("tried to push when bipbuffer region is full")]
+    RegionFull,
+    #[error("tried to pop when bipbuffer region is empty")]
+    RegionEmpty,
+    #[error("...inconceivable...")]
+    Inconceivable,
 }
 
 impl PartialEq for Error {

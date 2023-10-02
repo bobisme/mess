@@ -2,7 +2,7 @@ use std::{borrow::Cow, ops::Range};
 
 use crate::{
     error::{Error, Result},
-    indexlist::{IndexIter, IndexList},
+    ringlist::{IndexIter, RingList},
 };
 
 const HEADER_SIZE: usize = 4 + 8;
@@ -138,10 +138,33 @@ pub struct OwnedEntry {
     data: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct IndexItem {
+    global_position: u64,
+    entry_idx: u32,
+    /// The index of the next free spot. It may include uninitialized space
+    /// for the sake of cache alignment.
+    next_idx: u32,
+}
+
+impl IndexItem {
+    pub fn new(global_position: u64, entry_idx: u32, next_idx: u32) -> Self {
+        Self { global_position, entry_idx, next_idx }
+    }
+
+    pub fn index(&self) -> usize {
+        self.entry_idx as usize
+    }
+
+    pub fn next_index(&self) -> usize {
+        self.next_idx as usize
+    }
+}
+
 pub struct MemLog {
     entry_bytes: Vec<u8>,
     entry_cap: usize,
-    idxs: IndexList,
+    idxs: RingList<IndexItem>,
     tail: usize,
 }
 
@@ -150,7 +173,7 @@ impl MemLog {
         Self {
             entry_bytes: vec![0; data_cap],
             entry_cap: data_cap,
-            idxs: IndexList::with_capacity(idx_cap),
+            idxs: RingList::with_capacity(idx_cap),
             tail: 0,
         }
     }
@@ -236,11 +259,11 @@ impl MemLog {
             x if x >= self.entry_cap => 0,
             x => x,
         };
-        self.idxs.push(
-            entry.header.offset,
-            entry_range.start as u32,
-            next_idx as u32,
-        )?;
+        self.idxs.push(IndexItem {
+            global_position: entry.header.offset,
+            entry_idx: 0 as u32, // TODO: WHAT
+            next_idx: next_idx as u32,
+        })?;
         entry.copy_to(&mut self.entry_bytes[entry_range]);
         Ok(())
     }
@@ -266,7 +289,7 @@ impl IndexedHeader {
 
 pub struct HeaderIter<'a> {
     log: &'a MemLog,
-    idx_iter: IndexIter<'a>,
+    idx_iter: IndexIter<'a, IndexItem>,
 }
 
 impl<'a> Iterator for HeaderIter<'a> {

@@ -2,15 +2,16 @@
 name = "mess_lsm"
 version = "0.1.0"
 edition = "2021"
+workspace = "../"
 
 [dependencies]
-serde = { workpsace = true, features = ["derive"] }
-postcard = { workpsace = true }
-thiserror = { workpsace = true }
+serde = { workspace = true, features = ["derive"] }
+postcard = { workspace = true }
+thiserror = { workspace = true }
 zerovec = "0.10.0"
 bincode = "1.3.3"
 
 [dev-dependencies]
-assert2 = { workpsace = true }
+assert2 = { workspace = true }
 fastrand = "2.0.1"
-rstest = { workpsace = true }
+rstest = { workspace = true }
