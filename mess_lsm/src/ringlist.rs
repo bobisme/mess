@@ -28,15 +28,6 @@ impl<T> Item<T> {
     pub fn clear(&mut self) {
         self.item = None
     }
-    // pub fn is_some(&self) -> bool {
-    //     self.item.is_some()
-    // }
-    // pub fn is_none(&self) -> bool {
-    //     self.item.is_none()
-    // }
-    // pub fn take(&self) -> Option<T> {
-    //     self.item.take()
-    // }
 }
 
 impl<T> Deref for Item<T> {
