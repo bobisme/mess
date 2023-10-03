@@ -3,7 +3,7 @@ use std::{
     mem::MaybeUninit,
     ops::Range,
     slice::{from_raw_parts, from_raw_parts_mut},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use crate::error::{Error, Result};
@@ -43,9 +43,46 @@ impl<const N: usize> Region<N> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub enum RegionCount {
+pub enum Count {
     One,
     Two,
+}
+
+#[repr(transparent)]
+pub struct RegionCount(AtomicBool);
+
+impl RegionCount {
+    pub const fn new() -> Self {
+        Self(AtomicBool::new(false))
+    }
+
+    pub const fn one() -> Self {
+        Self(AtomicBool::new(false))
+    }
+
+    pub const fn two() -> Self {
+        Self(AtomicBool::new(true))
+    }
+
+    pub fn get(&self) -> Count {
+        match self.0.load(Ordering::Acquire) {
+            false => Count::One,
+            true => Count::Two,
+        }
+    }
+
+    pub fn set(&self, count: Count) {
+        match count {
+            Count::One => self.0.store(false, Ordering::Release),
+            Count::Two => self.0.store(true, Ordering::Release),
+        }
+    }
+}
+
+impl Default for RegionCount {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub enum RegionRefs<'a, const N: usize> {
@@ -62,7 +99,7 @@ impl<const N: usize> Regions<N> {
     pub const fn new() -> Self {
         Self {
             regions: (Region::new(), Region::new()),
-            count: RegionCount::One,
+            count: RegionCount::one(),
         }
     }
 }
@@ -74,9 +111,9 @@ impl<const N: usize> Default for Regions<N> {
 
 impl<const N: usize> Regions<N> {
     pub fn refs(&self) -> RegionRefs<N> {
-        match self.count {
-            RegionCount::One => RegionRefs::One(&self.regions.1),
-            RegionCount::Two => RegionRefs::Two {
+        match self.count.get() {
+            Count::One => RegionRefs::One(&self.regions.1),
+            Count::Two => RegionRefs::Two {
                 read: &self.regions.1,
                 write: &self.regions.0,
             },
@@ -92,32 +129,32 @@ impl<const N: usize> Regions<N> {
     }
 
     pub fn write(&self) -> &Region<N> {
-        match self.count {
-            RegionCount::One => &self.regions.1,
-            RegionCount::Two => &self.regions.0,
+        match self.count.get() {
+            Count::One => &self.regions.1,
+            Count::Two => &self.regions.0,
         }
     }
 
     pub fn write_mut(&mut self) -> &Region<N> {
-        match self.count {
-            RegionCount::One => &mut self.regions.1,
-            RegionCount::Two => &mut self.regions.0,
+        match self.count.get() {
+            Count::One => &mut self.regions.1,
+            Count::Two => &mut self.regions.0,
         }
     }
 
     pub fn split(&mut self) {
-        if self.count != RegionCount::One {
+        if self.count.get() != Count::One {
             return;
         }
-        self.count = RegionCount::Two;
+        self.count.set(Count::Two);
         self.regions.0.reset();
     }
 
     pub fn merge(&mut self) {
-        if self.count != RegionCount::Two {
+        if self.count.get() != Count::Two {
             return;
         }
-        self.count = RegionCount::One;
+        self.count.set(Count::One);
         self.regions.1.set_head(self.regions.0.head());
         self.regions.1.set_tail(self.regions.0.tail());
     }
@@ -142,9 +179,9 @@ impl<const N: usize> Regions<N> {
     }
 
     pub fn size(&self) -> usize {
-        match self.count {
-            RegionCount::One => self.regions.1.range().len(),
-            RegionCount::Two => {
+        match self.count.get() {
+            Count::One => self.regions.1.range().len(),
+            Count::Two => {
                 self.regions.0.range().len() + self.regions.1.range().len()
             }
         }
@@ -370,9 +407,9 @@ mod test_bip_buffer {
         for _ in 0..3 {
             assert!(buf.try_push(b"hey now!").is_ok());
         }
-        assert!(buf.regions.count == RegionCount::One);
+        assert!(buf.regions.count.get() == Count::One);
         let _ = buf.push(b"hey now!");
-        assert!(buf.regions.count == RegionCount::Two);
+        assert!(buf.regions.count.get() == Count::Two);
     }
 
     #[rstest]
@@ -440,10 +477,10 @@ mod test_bip_buffer {
             assert!(buf.try_push(b"hey now!").is_ok());
         }
         assert!(buf.push(b"hey now!").is_ok());
-        assert!(buf.regions.count == RegionCount::Two);
+        assert!(buf.regions.count.get() == Count::Two);
         assert!(buf.push(b"hey now!") == Ok(vec![LEN_SIZE + 8]));
         assert!(buf.push(b"hey now!") == Ok(vec![2 * (LEN_SIZE + 8)]));
-        assert!(buf.regions.count == RegionCount::One);
+        assert!(buf.regions.count.get() == Count::One);
     }
 
     #[rstest]
