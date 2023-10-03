@@ -215,19 +215,19 @@ impl Protector {
 pub struct BipBuffer<const N: usize> {
     regions: Regions<N>,
     buf: UnsafeCell<MaybeUninit<[u8; N]>>,
-    protectors: [AtomicUsize; PROTECT_N],
+    protectors: AtomicUsize,
     free_ratio: f32,
 }
 
-#[allow(clippy::declare_interior_mutable_const)]
-const ATOMIC_0: AtomicUsize = AtomicUsize::new(0);
+// #[allow(clippy::declare_interior_mutable_const)]
+// const ATOMIC_0: AtomicUsize = AtomicUsize::new(0);
 
 impl<const N: usize> BipBuffer<N> {
     pub const fn new() -> Self {
         Self {
             buf: UnsafeCell::new(MaybeUninit::uninit()),
             regions: Regions::new(),
-            protectors: [ATOMIC_0; PROTECT_N],
+            protectors: AtomicUsize::new(0),
             free_ratio: 0.1,
         }
     }
@@ -249,6 +249,11 @@ impl<const N: usize> BipBuffer<N> {
         usize::from_ne_bytes(
             len_bytes.try_into().expect("did not slice enough to read len"),
         )
+    }
+
+    pub fn read_at(&self, offset: usize) -> &[u8] {
+        let len = self.read_len_at(offset);
+        self.slice_buffer(LEN_SIZE + offset, len)
     }
 
     fn try_push(&mut self, val: &[u8]) -> Result<()> {
@@ -354,6 +359,47 @@ impl<const N: usize> BipBuffer<N> {
         // let data = self.slice_buffer(range.start + LEN_SIZE, len);
         self.regions.shrink(LEN_SIZE + len);
         Some(range.start)
+    }
+
+    pub fn iter(&self) -> Iter<N> {
+        Iter { bip: self, idx: Some(self.regions.read().head()) }
+    }
+}
+
+pub struct Iter<'a, const N: usize> {
+    bip: &'a BipBuffer<N>,
+    idx: Option<usize>,
+}
+impl<'a, const N: usize> Iterator for Iter<'a, N> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let idx = self.idx?;
+        let item = self.bip.read_at(idx);
+        if item.is_empty() {
+            self.idx = None;
+            return None;
+        }
+        let next = idx + LEN_SIZE + item.len();
+        self.idx = match self.bip.regions.refs() {
+            RegionRefs::One(reg) => {
+                let range = reg.range();
+                match next {
+                    n if range.contains(&n) => Some(n),
+                    _ => None,
+                }
+            }
+            RegionRefs::Two { read, write } => {
+                let read_range = read.range();
+                let write_range = write.range();
+                match next {
+                    n if read_range.contains(&n) => Some(n),
+                    n if write_range.contains(&n) => Some(n),
+                    _ => None,
+                }
+            }
+        };
+        Some(item)
     }
 }
 
