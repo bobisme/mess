@@ -1,7 +1,7 @@
-use std::{borrow::Cow, ops::Range};
+use std::{borrow::Cow};
 
 use crate::{
-    error::{Error, Result},
+    error::{Error},
     ringlist::{RingIter, RingList},
 };
 

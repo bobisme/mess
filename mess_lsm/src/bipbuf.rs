@@ -249,8 +249,7 @@ impl<const N: usize> BipBuffer<N> {
         }
     }
 
-    /// Push returns popped indexes.
-    pub fn push_one(&mut self, val: &[u8]) -> Result<Vec<usize>> {
+    fn push_one(&mut self, val: &[u8]) -> Result<Vec<usize>> {
         // Return on anythything _except_ region full.
         match self.try_push(val) {
             Ok(_) => return Ok(Vec::new()),
@@ -271,11 +270,15 @@ impl<const N: usize> BipBuffer<N> {
         Err(Error::Inconceivable)
     }
 
+    fn is_below_ratio(&self) -> bool {
+        let size = self.regions.size();
+        1.0 - ((size as f32) / (N as f32)) < self.free_ratio
+    }
+
     pub fn push(&mut self, val: &[u8]) -> Result<Vec<usize>> {
         let mut popped = Vec::new();
         popped.extend(&self.push_one(val)?);
-        let size = self.regions.size();
-        while (size as f32 / N as f32) < self.free_ratio {
+        while self.is_below_ratio() {
             if let Some(idx) = self.try_pop() {
                 popped.push(idx);
             } else {
@@ -293,8 +296,7 @@ impl<const N: usize> BipBuffer<N> {
         for val in vals {
             popped.extend(&self.push_one(val)?);
         }
-        let size = self.regions.size();
-        while (size as f32 / N as f32) < self.free_ratio {
+        while self.is_below_ratio() {
             if let Some(idx) = self.try_pop() {
                 popped.push(idx);
             } else {
@@ -401,6 +403,34 @@ mod test_bip_buffer {
         }
         assert!(buf.push(b"hey now!") == Ok(vec![0]));
         assert!(buf.regions.write().tail() == (LEN_SIZE + 8));
+    }
+
+    #[rstest]
+    fn is_below_ratio_works() {
+        let mut buf = BipBuffer::<100>::new();
+        buf.free_ratio = 0.1;
+        for _ in 0..8 {
+            assert!(buf.try_push(b"xo").is_ok());
+        }
+        assert!(buf.regions.size() == 80);
+        assert!(buf.is_below_ratio() == false);
+        let _ = buf.try_push(b"xox");
+        assert!(buf.regions.size() == 91);
+        assert!(buf.is_below_ratio() == true);
+    }
+
+    #[rstest]
+    fn push_will_automatically_free_if_below_ratio() {
+        let mut buf = BipBuffer::<100>::new();
+        buf.free_ratio = 0.1;
+        for _ in 0..8 {
+            assert!(buf.try_push(b"xo").is_ok());
+        }
+        assert!(buf.regions.size() == 80);
+        assert!(buf.regions.read().range().eq(0..80));
+        assert!(buf.push(b"xox") == Ok(vec![0]));
+        assert!(buf.regions.size() == 81);
+        assert!(buf.regions.read().range().eq(10..91));
     }
 
     #[rstest]
