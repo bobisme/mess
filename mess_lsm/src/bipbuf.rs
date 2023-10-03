@@ -140,18 +140,58 @@ impl<const N: usize> Regions<N> {
             self.merge();
         }
     }
+
+    pub fn size(&self) -> usize {
+        match self.count {
+            RegionCount::One => self.regions.1.range().len(),
+            RegionCount::Two => {
+                self.regions.0.range().len() + self.regions.1.range().len()
+            }
+        }
+    }
+}
+
+pub const PROTECT_N: usize = 8;
+
+pub struct Protector(AtomicUsize);
+
+impl Protector {
+    pub fn protect(&self) -> bool {
+        let mut val = self.0.load(Ordering::Acquire);
+        while val != usize::MAX {
+            let cex = self.0.compare_exchange(
+                val,
+                val + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            if cex.is_ok() {
+                return true;
+            }
+            val = cex.unwrap_err();
+            std::thread::yield_now();
+        }
+        false
+    }
 }
 
 pub struct BipBuffer<const N: usize> {
     regions: Regions<N>,
     buf: UnsafeCell<MaybeUninit<[u8; N]>>,
+    protectors: [AtomicUsize; PROTECT_N],
+    free_ratio: f32,
 }
+
+#[allow(clippy::declare_interior_mutable_const)]
+const ATOMIC_0: AtomicUsize = AtomicUsize::new(0);
 
 impl<const N: usize> BipBuffer<N> {
     pub const fn new() -> Self {
         Self {
             buf: UnsafeCell::new(MaybeUninit::uninit()),
             regions: Regions::new(),
+            protectors: [ATOMIC_0; PROTECT_N],
+            free_ratio: 0.1,
         }
     }
 
@@ -210,7 +250,7 @@ impl<const N: usize> BipBuffer<N> {
     }
 
     /// Push returns popped indexes.
-    pub fn push(&mut self, val: &[u8]) -> Result<Vec<usize>> {
+    pub fn push_one(&mut self, val: &[u8]) -> Result<Vec<usize>> {
         // Return on anythything _except_ region full.
         match self.try_push(val) {
             Ok(_) => return Ok(Vec::new()),
@@ -229,6 +269,39 @@ impl<const N: usize> BipBuffer<N> {
             }
         }
         Err(Error::Inconceivable)
+    }
+
+    pub fn push(&mut self, val: &[u8]) -> Result<Vec<usize>> {
+        let mut popped = Vec::new();
+        popped.extend(&self.push_one(val)?);
+        let size = self.regions.size();
+        while (size as f32 / N as f32) < self.free_ratio {
+            if let Some(idx) = self.try_pop() {
+                popped.push(idx);
+            } else {
+                return Ok(popped);
+            }
+        }
+        Ok(popped)
+    }
+
+    pub fn push_batch<'iter>(
+        &mut self,
+        vals: impl Iterator<Item = &'iter [u8]>,
+    ) -> Result<Vec<usize>> {
+        let mut popped = Vec::new();
+        for val in vals {
+            popped.extend(&self.push_one(val)?);
+        }
+        let size = self.regions.size();
+        while (size as f32 / N as f32) < self.free_ratio {
+            if let Some(idx) = self.try_pop() {
+                popped.push(idx);
+            } else {
+                return Ok(popped);
+            }
+        }
+        Ok(popped)
     }
 
     /// Returns popped index.
