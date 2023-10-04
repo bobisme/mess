@@ -102,6 +102,16 @@ impl<const N: usize> Regions<N> {
             count: RegionCount::one(),
         }
     }
+
+    pub fn is_index_valid(&self, index: usize) -> bool {
+        match self.count.get() {
+            Count::One => self.regions.1.range().contains(&index),
+            Count::Two => {
+                self.regions.1.range().contains(&index)
+                    && self.regions.0.range().contains(&index)
+            }
+        }
+    }
 }
 impl<const N: usize> Default for Regions<N> {
     fn default() -> Self {
@@ -364,7 +374,19 @@ impl<const N: usize> BipBuffer<N> {
     pub fn iter(&self) -> Iter<N> {
         Iter { bip: self, idx: Some(self.regions.read().head()) }
     }
+
+    pub fn iter_from(&self, start_index: usize) -> Iter<N> {
+        Iter { bip: self, idx: Some(start_index) }
+    }
 }
+
+const _: () = {
+    fn is_send<T: Send>() {}
+    fn is_sync<T: Sync>() {}
+
+    // is_send::<BipBuffer<1>>();
+    // is_sync::<BipBuffer<1>>();
+};
 
 pub struct Iter<'a, const N: usize> {
     bip: &'a BipBuffer<N>,
@@ -375,15 +397,17 @@ impl<'a, const N: usize> Iterator for Iter<'a, N> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let idx = self.idx?;
-        let item = self.bip.read_at(idx);
-        if item.is_empty() {
-            self.idx = None;
-            return None;
-        }
-        let next = idx + LEN_SIZE + item.len();
+        let item;
         self.idx = match self.bip.regions.refs() {
             RegionRefs::One(reg) => {
                 let range = reg.range();
+                if !range.contains(&idx) {
+                    self.idx = None;
+                    return None;
+                }
+                let data = self.bip.read_at(idx);
+                let next = idx + LEN_SIZE + data.len();
+                item = Some(data);
                 match next {
                     n if range.contains(&n) => Some(n),
                     _ => None,
@@ -392,14 +416,29 @@ impl<'a, const N: usize> Iterator for Iter<'a, N> {
             RegionRefs::Two { read, write } => {
                 let read_range = read.range();
                 let write_range = write.range();
-                match next {
-                    n if read_range.contains(&n) => Some(n),
-                    n if write_range.contains(&n) => Some(n),
+                let is_valid =
+                    read_range.contains(&idx) || write_range.contains(&idx);
+                if !is_valid {
+                    self.idx = None;
+                    return None;
+                }
+                let data = self.bip.read_at(idx);
+                let next = idx + LEN_SIZE + data.len();
+                item = Some(data);
+                match idx {
+                    i if read_range.contains(&i) => match next {
+                        n if n >= read_range.end => Some(write_range.start),
+                        n => Some(n),
+                    },
+                    i if write_range.contains(&i) => match next {
+                        n if n >= write_range.end => None,
+                        n => Some(n),
+                    },
                     _ => None,
                 }
             }
         };
-        Some(item)
+        item
     }
 }
 
@@ -537,5 +576,40 @@ mod test_bip_buffer {
         assert!(buf.try_pop() == Some(0));
         assert!(buf.try_pop() == Some(LEN_SIZE + 8));
         assert!(buf.try_pop() == None);
+    }
+}
+
+#[cfg(test)]
+mod test_iter {
+    use super::*;
+    use assert2::assert;
+    use rstest::*;
+
+    #[rstest]
+    fn it_works() {
+        let mut buf = BipBuffer::<60>::new();
+        assert!(buf.try_push(b"ab") == Ok(()));
+        assert!(buf.try_push(b"cd") == Ok(()));
+        assert!(buf.try_push(b"ef") == Ok(()));
+        let mut iter = buf.iter();
+        assert!(iter.next() == Some(b"ab".as_slice()));
+        assert!(iter.next() == Some(b"cd".as_slice()));
+        assert!(iter.next() == Some(b"ef".as_slice()));
+        assert!(iter.next() == None);
+    }
+
+    #[rstest]
+    fn it_wraps() {
+        let mut buf = BipBuffer::<30>::new();
+        buf.free_ratio = 0.0;
+        assert!(buf.push(b"ab") == Ok(vec![]));
+        assert!(buf.push(b"cd") == Ok(vec![]));
+        assert!(buf.push(b"ef") == Ok(vec![]));
+        assert!(buf.push(b"gh") == Ok(vec![0]));
+        let mut iter = buf.iter();
+        assert!(iter.next() == Some(b"cd".as_slice()));
+        assert!(iter.next() == Some(b"ef".as_slice()));
+        assert!(iter.next() == Some(b"gh".as_slice()));
+        assert!(iter.next() == None);
     }
 }
