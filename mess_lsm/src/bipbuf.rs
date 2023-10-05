@@ -2,6 +2,7 @@ use std::{
     cell::UnsafeCell,
     mem::MaybeUninit,
     ops::Range,
+    ptr::NonNull,
     slice::{from_raw_parts, from_raw_parts_mut},
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
@@ -233,13 +234,17 @@ pub struct BipBuffer<const N: usize> {
 // const ATOMIC_0: AtomicUsize = AtomicUsize::new(0);
 
 impl<const N: usize> BipBuffer<N> {
-    pub const fn new() -> Self {
-        Self {
+    pub fn new() -> Self {
+        let mut slf = Self {
             buf: UnsafeCell::new(MaybeUninit::uninit()),
             regions: Regions::new(),
             protectors: AtomicUsize::new(0),
             free_ratio: 0.1,
-        }
+        };
+        unsafe {
+            slf.buf_start().write_bytes(0u8, 1);
+        };
+        slf
     }
 
     fn buf_start(&self) -> *mut u8 {
@@ -378,6 +383,33 @@ impl<const N: usize> BipBuffer<N> {
     pub fn iter_from(&self, start_index: usize) -> Iter<N> {
         Iter { bip: self, idx: Some(start_index) }
     }
+
+    pub fn reader(&self) -> BipReader<N> {
+        loop {
+            let protectors = self.protectors.load(Ordering::Acquire);
+            if protectors == usize::MAX {
+                std::hint::spin_loop();
+                continue;
+            }
+            match self.protectors.compare_exchange(
+                protectors,
+                protectors + 1,
+                Ordering::Release,
+                Ordering::Acquire,
+            ) {
+                Err(_) => {
+                    std::hint::spin_loop();
+                    continue;
+                }
+                Ok(_) => {
+                    let bip_buffer = unsafe {
+                        NonNull::new_unchecked(self as *const _ as *mut _)
+                    };
+                    return BipReader { bip_buffer };
+                }
+            }
+        }
+    }
 }
 
 const _: () = {
@@ -440,6 +472,10 @@ impl<'a, const N: usize> Iterator for Iter<'a, N> {
         };
         item
     }
+}
+
+pub struct BipReader<const N: usize> {
+    bip_buffer: NonNull<BipBuffer<N>>,
 }
 
 #[cfg(test)]
