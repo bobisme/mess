@@ -6,8 +6,8 @@ pub enum Error {
     ZeroVecError(zerovec::ZeroVecError),
     #[error(transparent)]
     PostcardError(#[from] postcard::Error),
-    #[error(transparent)]
-    BincodeError(#[from] bincode::Error),
+    // #[error(transparent)]
+    // BincodeError(#[from] bincode::Error),
     #[error("invalid header")]
     InvalidHeader,
     #[error("invalid entry at index: {index:?}")]
@@ -22,6 +22,10 @@ pub enum Error {
     RegionFull,
     #[error("tried to pop when bipbuffer region is empty")]
     RegionEmpty,
+    #[error("could not create a new reader")]
+    ReaderBlocked,
+    #[error("could not create a new writer")]
+    WriterBlocked,
     #[error("...inconceivable...")]
     Inconceivable,
 }

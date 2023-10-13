@@ -1,10 +1,26 @@
+#[cfg(loom)]
+use loom::{
+    hint,
+    sync::atomic::{
+        AtomicBool, AtomicUsize,
+        Ordering::{AcqRel, Acquire, Release},
+    },
+};
 use std::{
     cell::UnsafeCell,
+    marker::PhantomData,
     mem::MaybeUninit,
     ops::Range,
     ptr::NonNull,
     slice::{from_raw_parts, from_raw_parts_mut},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+};
+#[cfg(not(loom))]
+use std::{
+    hint,
+    sync::atomic::{
+        AtomicBool, AtomicUsize,
+        Ordering::{AcqRel, Acquire, Release},
+    },
 };
 
 use crate::error::{Error, Result};
@@ -18,28 +34,34 @@ pub struct Region<const N: usize> {
 }
 
 impl<const N: usize> Region<N> {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self { head: AtomicUsize::new(0), tail: AtomicUsize::new(0) }
     }
 
     pub fn head(&self) -> usize {
-        self.head.load(Ordering::Acquire)
+        self.head.load(Acquire)
     }
     pub fn tail(&self) -> usize {
-        self.tail.load(Ordering::Acquire)
+        self.tail.load(Acquire)
     }
     pub fn set_head(&self, val: usize) {
-        self.head.store(val, Ordering::Release)
+        self.head.store(val, Release)
     }
     pub fn set_tail(&self, val: usize) {
-        self.tail.store(val, Ordering::Release)
+        self.tail.store(val, Release)
     }
     pub fn range(&self) -> Range<usize> {
         self.head()..self.tail()
     }
     pub fn reset(&self) {
-        self.head.store(0, Ordering::Release);
-        self.tail.store(0, Ordering::Release);
+        self.head.store(0, Release);
+        self.tail.store(0, Release);
+    }
+}
+
+impl<const N: usize> Default for Region<N> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -53,20 +75,20 @@ pub enum Count {
 pub struct RegionCount(AtomicBool);
 
 impl RegionCount {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self(AtomicBool::new(false))
     }
 
-    pub const fn one() -> Self {
+    pub fn one() -> Self {
         Self(AtomicBool::new(false))
     }
 
-    pub const fn two() -> Self {
+    pub fn two() -> Self {
         Self(AtomicBool::new(true))
     }
 
     pub fn get(&self) -> Count {
-        match self.0.load(Ordering::Acquire) {
+        match self.0.load(Acquire) {
             false => Count::One,
             true => Count::Two,
         }
@@ -74,8 +96,8 @@ impl RegionCount {
 
     pub fn set(&self, count: Count) {
         match count {
-            Count::One => self.0.store(false, Ordering::Release),
-            Count::Two => self.0.store(true, Ordering::Release),
+            Count::One => self.0.store(false, Release),
+            Count::Two => self.0.store(true, Release),
         }
     }
 }
@@ -97,7 +119,7 @@ pub struct Regions<const N: usize> {
 }
 
 impl<const N: usize> Regions<N> {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             regions: (Region::new(), Region::new()),
             count: RegionCount::one(),
@@ -175,7 +197,7 @@ impl<const N: usize> Regions<N> {
         let write = self.write_mut();
         let range = write.range();
         assert!(range.end + len <= N);
-        self.write_mut().tail.fetch_add(len, Ordering::AcqRel);
+        self.write_mut().tail.fetch_add(len, AcqRel);
     }
 
     /// NOTE: caller must check that the range is valid
@@ -183,7 +205,7 @@ impl<const N: usize> Regions<N> {
         let read = self.read_mut();
         let range = read.range();
         assert!(range.start + len <= range.end);
-        read.head.fetch_add(len, Ordering::AcqRel);
+        read.head.fetch_add(len, AcqRel);
         if read.range().is_empty() {
             self.merge();
         }
@@ -205,14 +227,9 @@ pub struct Protector(AtomicUsize);
 
 impl Protector {
     pub fn protect(&self) -> bool {
-        let mut val = self.0.load(Ordering::Acquire);
+        let mut val = self.0.load(Acquire);
         while val != usize::MAX {
-            let cex = self.0.compare_exchange(
-                val,
-                val + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
+            let cex = self.0.compare_exchange(val, val + 1, AcqRel, Acquire);
             if cex.is_ok() {
                 return true;
             }
@@ -233,18 +250,25 @@ pub struct BipBuffer<const N: usize> {
 // #[allow(clippy::declare_interior_mutable_const)]
 // const ATOMIC_0: AtomicUsize = AtomicUsize::new(0);
 
-impl<const N: usize> BipBuffer<N> {
+impl<'a, const N: usize> BipBuffer<N> {
     pub fn new() -> Self {
-        let mut slf = Self {
+        let slf = Self {
             buf: UnsafeCell::new(MaybeUninit::uninit()),
             regions: Regions::new(),
             protectors: AtomicUsize::new(0),
             free_ratio: 0.1,
         };
+        // Write a zero byte to avoid undefined behavior when
+        // handing out NonNull references.
         unsafe {
             slf.buf_start().write_bytes(0u8, 1);
         };
         slf
+    }
+
+    fn is_below_ratio(&self) -> bool {
+        let size = self.regions.size();
+        1.0 - ((size as f32) / (N as f32)) < self.free_ratio
     }
 
     fn buf_start(&self) -> *mut u8 {
@@ -271,173 +295,94 @@ impl<const N: usize> BipBuffer<N> {
         self.slice_buffer(LEN_SIZE + offset, len)
     }
 
-    fn try_push(&mut self, val: &[u8]) -> Result<()> {
-        let buf = self.try_reserve(LEN_SIZE + val.len())?;
-        let len_bytes = usize::to_ne_bytes(val.len());
-        let (len_buf, val_buf) = buf.split_at_mut(LEN_SIZE);
-        len_buf.copy_from_slice(&len_bytes);
-        val_buf.copy_from_slice(val);
-        self.regions.grow(LEN_SIZE + val.len());
-        Ok(())
+    pub fn try_reader(&'a self) -> Result<BipReader<'a, N>> {
+        self.protectors
+            .fetch_update(Release, Acquire, |protectors| match protectors {
+                usize::MAX => None,
+                x => Some(x + 1),
+            })
+            .map(|_| {
+                let bip_buffer = unsafe {
+                    NonNull::new_unchecked(self as *const _ as *mut _)
+                };
+                BipReader { bip_buffer, _mark: PhantomData }
+            })
+            .map_err(|_| Error::ReaderBlocked)
     }
 
-    fn try_reserve(&mut self, len: usize) -> Result<&mut [u8]> {
-        if len >= N {
-            return Err(Error::EntryTooBig);
-        }
-        match self.regions.refs() {
-            RegionRefs::One(reg) => {
-                let range = reg.range();
-                if range.end + len <= N {
-                    Ok(self.slice_buffer_mut(range.end, len))
-                } else {
-                    Err(Error::RegionFull)
-                }
-            }
-            RegionRefs::Two { read, write } => {
-                let write_range = write.range();
-                let read_range = read.range();
-                if write_range.end + len <= read_range.start {
-                    Ok(self.slice_buffer_mut(write_range.end, len))
-                } else {
-                    Err(Error::RegionFull)
-                }
-            }
-        }
-    }
-
-    fn push_one(&mut self, val: &[u8]) -> Result<Vec<usize>> {
-        // Return on anythything _except_ region full.
-        match self.try_push(val) {
-            Ok(_) => return Ok(Vec::new()),
-            Err(Error::RegionFull) => {}
-            Err(err) => return Err(err),
-        }
-        self.regions.split();
-        let mut out_idxs = Vec::new();
-        // pop enough stuff off to fit val
-        while let Some(idx) = self.try_pop() {
-            out_idxs.push(idx);
-            match self.try_push(val) {
-                Ok(_) => return Ok(out_idxs),
-                Err(Error::RegionFull) => {}
-                Err(err) => return Err(err),
-            }
-        }
-        Err(Error::Inconceivable)
-    }
-
-    fn is_below_ratio(&self) -> bool {
-        let size = self.regions.size();
-        1.0 - ((size as f32) / (N as f32)) < self.free_ratio
-    }
-
-    pub fn push(&mut self, val: &[u8]) -> Result<Vec<usize>> {
-        let mut popped = Vec::new();
-        popped.extend(&self.push_one(val)?);
-        while self.is_below_ratio() {
-            if let Some(idx) = self.try_pop() {
-                popped.push(idx);
-            } else {
-                return Ok(popped);
-            }
-        }
-        Ok(popped)
-    }
-
-    pub fn push_batch<'iter>(
-        &mut self,
-        vals: impl Iterator<Item = &'iter [u8]>,
-    ) -> Result<Vec<usize>> {
-        let mut popped = Vec::new();
-        for val in vals {
-            popped.extend(&self.push_one(val)?);
-        }
-        while self.is_below_ratio() {
-            if let Some(idx) = self.try_pop() {
-                popped.push(idx);
-            } else {
-                return Ok(popped);
-            }
-        }
-        Ok(popped)
-    }
-
-    /// Returns popped index.
-    pub fn try_pop(&mut self) -> Option<usize> {
-        let reg = self.regions.read();
-        let range = reg.range();
-        if range.is_empty() {
-            return None;
-        }
-        let len = self.read_len_at(range.start);
-        // let data = self.slice_buffer(range.start + LEN_SIZE, len);
-        self.regions.shrink(LEN_SIZE + len);
-        Some(range.start)
-    }
-
-    pub fn iter(&self) -> Iter<N> {
-        Iter { bip: self, idx: Some(self.regions.read().head()) }
-    }
-
-    pub fn iter_from(&self, start_index: usize) -> Iter<N> {
-        Iter { bip: self, idx: Some(start_index) }
-    }
-
-    pub fn reader(&self) -> BipReader<N> {
+    pub async fn reader(&'a self) -> BipReader<'a, N> {
         loop {
-            let protectors = self.protectors.load(Ordering::Acquire);
-            if protectors == usize::MAX {
-                std::hint::spin_loop();
-                continue;
-            }
-            match self.protectors.compare_exchange(
-                protectors,
-                protectors + 1,
-                Ordering::Release,
-                Ordering::Acquire,
-            ) {
-                Err(_) => {
-                    std::hint::spin_loop();
-                    continue;
+            match self.try_reader() {
+                Err(_) => hint::spin_loop(),
+                Ok(reader) => {
+                    return reader;
                 }
-                Ok(_) => {
-                    let bip_buffer = unsafe {
-                        NonNull::new_unchecked(self as *const _ as *mut _)
-                    };
-                    return BipReader { bip_buffer };
+            }
+        }
+    }
+
+    pub fn try_writer(&'a self) -> Result<BipWriter<'a, N>> {
+        self.protectors
+            .fetch_update(Release, Acquire, |protectors| match protectors {
+                0 => Some(usize::MAX),
+                _ => None,
+            })
+            .map(|_| {
+                let bip_buffer = unsafe {
+                    NonNull::new_unchecked(self as *const _ as *mut _)
+                };
+                BipWriter { bip_buffer, _mark: PhantomData }
+            })
+            .map_err(|_| Error::WriterBlocked)
+    }
+
+    pub async fn writer(&'a self) -> BipWriter<'a, N> {
+        loop {
+            match self.try_writer() {
+                Err(_) => hint::spin_loop(),
+                Ok(writer) => {
+                    return writer;
                 }
             }
         }
     }
 }
 
-const _: () = {
-    fn is_send<T: Send>() {}
-    fn is_sync<T: Sync>() {}
+impl<const N: usize> Default for BipBuffer<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
-    // is_send::<BipBuffer<1>>();
-    // is_sync::<BipBuffer<1>>();
+unsafe impl<const N: usize> Sync for BipBuffer<N> {}
+
+const _: () = {
+    const fn is_send<T: Send>() {}
+    const fn is_sync<T: Sync>() {}
+
+    is_send::<BipBuffer<1>>();
+    is_sync::<BipBuffer<1>>();
 };
 
 pub struct Iter<'a, const N: usize> {
-    bip: &'a BipBuffer<N>,
+    reader: &'a BipReader<'a, N>,
     idx: Option<usize>,
 }
+
 impl<'a, const N: usize> Iterator for Iter<'a, N> {
     type Item = &'a [u8];
 
     fn next(&mut self) -> Option<Self::Item> {
         let idx = self.idx?;
         let item;
-        self.idx = match self.bip.regions.refs() {
+        self.idx = match self.reader.region_refs() {
             RegionRefs::One(reg) => {
                 let range = reg.range();
                 if !range.contains(&idx) {
                     self.idx = None;
                     return None;
                 }
-                let data = self.bip.read_at(idx);
+                let data = self.reader.read_at(idx);
                 let next = idx + LEN_SIZE + data.len();
                 item = Some(data);
                 match next {
@@ -454,7 +399,7 @@ impl<'a, const N: usize> Iterator for Iter<'a, N> {
                     self.idx = None;
                     return None;
                 }
-                let data = self.bip.read_at(idx);
+                let data = self.reader.read_at(idx);
                 let next = idx + LEN_SIZE + data.len();
                 item = Some(data);
                 match idx {
@@ -474,14 +419,183 @@ impl<'a, const N: usize> Iterator for Iter<'a, N> {
     }
 }
 
-pub struct BipReader<const N: usize> {
+pub struct BipReader<'a, const N: usize> {
     bip_buffer: NonNull<BipBuffer<N>>,
+    _mark: PhantomData<&'a ()>,
+}
+
+impl<'a, const N: usize> BipReader<'a, N> {
+    pub fn bip(&self) -> &BipBuffer<N> {
+        // SAFETY: Since `self.bip_buffer` is a NonNull pointer, it's guaranteed to be valid.
+        unsafe { self.bip_buffer.as_ref() }
+    }
+
+    pub fn region_refs(&self) -> RegionRefs<'_, N> {
+        self.bip().regions.refs()
+    }
+
+    pub fn read_at(&self, offset: usize) -> &[u8] {
+        self.bip().read_at(offset)
+    }
+
+    pub fn iter(&self) -> Iter<N> {
+        Iter { reader: self, idx: Some(self.bip().regions.read().head()) }
+    }
+
+    pub fn iter_from(&self, start_index: usize) -> Iter<N> {
+        Iter { reader: self, idx: Some(start_index) }
+    }
+}
+
+impl<const N: usize> Drop for BipReader<'_, N> {
+    fn drop(&mut self) {
+        // SAFETY: Since `self.bip_buffer` is a NonNull pointer, it's guaranteed to be valid.
+        // However, proper synchronization is required to ensure that the `BipBuffer` instance is
+        // not dropped while this `BipReader` is still in use. This synchronization should be
+        // ensured by the rest of your program logic.
+        unsafe {
+            let bip_buffer = self.bip_buffer.as_ref();
+            bip_buffer.protectors.fetch_sub(1, AcqRel);
+        }
+    }
+}
+
+pub struct BipWriter<'a, const N: usize> {
+    bip_buffer: NonNull<BipBuffer<N>>,
+    _mark: PhantomData<&'a ()>,
+}
+
+impl<'a, const N: usize> BipWriter<'a, N> {
+    pub fn bip(&self) -> &BipBuffer<N> {
+        // SAFETY: Since `self.bip_buffer` is a NonNull pointer, it's guaranteed to be valid.
+        unsafe { self.bip_buffer.as_ref() }
+    }
+
+    pub fn bip_mut(&mut self) -> &mut BipBuffer<N> {
+        // SAFETY: Since `self.bip_buffer` is a NonNull pointer, it's guaranteed to be valid.
+        unsafe { self.bip_buffer.as_mut() }
+    }
+
+    fn try_push(&mut self, val: &[u8]) -> Result<()> {
+        let buf = self.try_reserve(LEN_SIZE + val.len())?;
+        let len_bytes = usize::to_ne_bytes(val.len());
+        let (len_buf, val_buf) = buf.split_at_mut(LEN_SIZE);
+        len_buf.copy_from_slice(&len_bytes);
+        val_buf.copy_from_slice(val);
+        self.bip_mut().regions.grow(LEN_SIZE + val.len());
+        Ok(())
+    }
+
+    fn try_reserve(&mut self, len: usize) -> Result<&mut [u8]> {
+        if len >= N {
+            return Err(Error::EntryTooBig);
+        }
+        match self.bip().regions.refs() {
+            RegionRefs::One(reg) => {
+                let range = reg.range();
+                if range.end + len <= N {
+                    Ok(self.bip_mut().slice_buffer_mut(range.end, len))
+                } else {
+                    Err(Error::RegionFull)
+                }
+            }
+            RegionRefs::Two { read, write } => {
+                let write_range = write.range();
+                let read_range = read.range();
+                if write_range.end + len <= read_range.start {
+                    Ok(self.bip_mut().slice_buffer_mut(write_range.end, len))
+                } else {
+                    Err(Error::RegionFull)
+                }
+            }
+        }
+    }
+
+    fn push_one(&mut self, val: &[u8]) -> Result<Vec<usize>> {
+        // Return on anythything _except_ region full.
+        match self.try_push(val) {
+            Ok(_) => return Ok(Vec::new()),
+            Err(Error::RegionFull) => {}
+            Err(err) => return Err(err),
+        }
+        self.bip_mut().regions.split();
+        let mut out_idxs = Vec::new();
+        // pop enough stuff off to fit val
+        while let Some(idx) = self.try_pop() {
+            out_idxs.push(idx);
+            match self.try_push(val) {
+                Ok(_) => return Ok(out_idxs),
+                Err(Error::RegionFull) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Err(Error::Inconceivable)
+    }
+
+    pub fn push(&mut self, val: &[u8]) -> Result<Vec<usize>> {
+        let mut popped = Vec::new();
+        popped.extend(&self.push_one(val)?);
+        while self.bip().is_below_ratio() {
+            if let Some(idx) = self.try_pop() {
+                popped.push(idx);
+            } else {
+                return Ok(popped);
+            }
+        }
+        Ok(popped)
+    }
+
+    pub fn push_batch<'iter>(
+        &mut self,
+        vals: impl Iterator<Item = &'iter [u8]>,
+    ) -> Result<Vec<usize>> {
+        let mut popped = Vec::new();
+        for val in vals {
+            popped.extend(&self.push_one(val)?);
+        }
+        while self.bip().is_below_ratio() {
+            if let Some(idx) = self.try_pop() {
+                popped.push(idx);
+            } else {
+                return Ok(popped);
+            }
+        }
+        Ok(popped)
+    }
+
+    /// Returns popped index.
+    pub fn try_pop(&mut self) -> Option<usize> {
+        let bip = self.bip();
+        let reg = bip.regions.read();
+        let range = reg.range();
+        if range.is_empty() {
+            return None;
+        }
+        let len = bip.read_len_at(range.start);
+        // let data = self.slice_buffer(range.start + LEN_SIZE, len);
+        self.bip_mut().regions.shrink(LEN_SIZE + len);
+        Some(range.start)
+    }
+}
+
+impl<const N: usize> Drop for BipWriter<'_, N> {
+    fn drop(&mut self) {
+        // SAFETY: Since `self.bip_buffer` is a NonNull pointer, it's guaranteed to be valid.
+        // However, proper synchronization is required to ensure that the `BipBuffer` instance is
+        // not dropped while this `BipWriter` is still in use. This synchronization should be
+        // ensured by the rest of your program logic.
+        unsafe {
+            let bip_buffer = self.bip_buffer.as_ref();
+            bip_buffer.protectors.store(0, Release);
+        }
+    }
 }
 
 #[cfg(test)]
 mod test_bip_buffer {
     use super::*;
     use assert2::assert;
+    use proptest::proptest;
     use rstest::*;
 
     #[rstest]
@@ -497,121 +611,174 @@ mod test_bip_buffer {
 
     #[rstest]
     fn try_push_does_not_change_read_head() {
-        let mut buf = BipBuffer::<1024>::new();
+        let bip = BipBuffer::<1024>::new();
+        let mut buf = bip.try_writer().unwrap();
         assert!(buf.try_push(b"hey now!").is_ok());
-        let read_region = buf.regions.read();
+        let read_region = bip.regions.read();
         assert!(read_region.head() == 0);
     }
 
     #[rstest]
     fn try_push_moves_read_tail_forward() {
-        let mut buf = BipBuffer::<1024>::new();
+        let bip = BipBuffer::<1024>::new();
+        let mut buf = bip.try_writer().unwrap();
         assert!(buf.try_push(b"hey now!").is_ok());
-        let read_region = buf.regions.read();
+        let read_region = bip.regions.read();
         assert!(read_region.tail() == LEN_SIZE + 8 /* hey now! */);
     }
 
     #[rstest]
     fn try_push_errors_if_full() {
-        let mut buf = BipBuffer::<60>::new();
+        let bip = BipBuffer::<60>::new();
+        let mut buf = bip.try_writer().unwrap();
         for _ in 0..3 {
             assert!(buf.try_push(b"hey now!").is_ok());
         }
         assert!(buf.try_push(b"hey now!") == Err(Error::RegionFull));
-        let read_region = buf.regions.read();
+        let read_region = bip.regions.read();
         assert!(read_region.tail() == 3 * (LEN_SIZE + 8));
     }
 
     #[rstest]
     fn push_on_full_splits_the_regions() {
-        let mut buf = BipBuffer::<60>::new();
+        let bip = BipBuffer::<60>::new();
+        let mut buf = bip.try_writer().unwrap();
         for _ in 0..3 {
             assert!(buf.try_push(b"hey now!").is_ok());
         }
-        assert!(buf.regions.count.get() == Count::One);
+        assert!(bip.regions.count.get() == Count::One);
         let _ = buf.push(b"hey now!");
-        assert!(buf.regions.count.get() == Count::Two);
+        assert!(bip.regions.count.get() == Count::Two);
     }
 
     #[rstest]
     fn push_on_full_pops_from_read_region() {
-        let mut buf = BipBuffer::<60>::new();
+        let bip = BipBuffer::<60>::new();
+        let mut buf = bip.try_writer().unwrap();
         for _ in 0..3 {
             assert!(buf.try_push(b"hey now!").is_ok());
         }
         let _ = buf.push(b"hey now!");
-        assert!(buf.regions.read().head() == LEN_SIZE + 8);
+        assert!(bip.regions.read().head() == LEN_SIZE + 8);
     }
 
     #[rstest]
     fn push_on_full_pops_more_than_once_if_needed() {
-        let mut buf = BipBuffer::<60>::new();
+        let bip = BipBuffer::<60>::new();
+        let mut buf = bip.try_writer().unwrap();
         for _ in 0..3 {
             assert!(buf.try_push(b"hey now!").is_ok());
         }
         let _ = buf.push(b"hey now now!");
-        assert!(buf.regions.read().head() == 2 * (LEN_SIZE + 8));
+        assert!(bip.regions.read().head() == 2 * (LEN_SIZE + 8));
     }
 
     #[rstest]
     fn push_on_full_appends_to_write_region() {
-        let mut buf = BipBuffer::<60>::new();
+        let bip = BipBuffer::<60>::new();
+        let mut buf = bip.try_writer().unwrap();
         for _ in 0..3 {
             assert!(buf.try_push(b"hey now!").is_ok());
         }
         assert!(buf.push(b"hey now!") == Ok(vec![0]));
-        assert!(buf.regions.write().tail() == (LEN_SIZE + 8));
+        assert!(bip.regions.write().tail() == (LEN_SIZE + 8));
     }
 
     #[rstest]
     fn is_below_ratio_works() {
-        let mut buf = BipBuffer::<100>::new();
-        buf.free_ratio = 0.1;
+        let mut bip = BipBuffer::<100>::new();
+        bip.free_ratio = 0.1;
+        let mut buf = bip.try_writer().unwrap();
         for _ in 0..8 {
             assert!(buf.try_push(b"xo").is_ok());
         }
-        assert!(buf.regions.size() == 80);
-        assert!(buf.is_below_ratio() == false);
+        assert!(bip.regions.size() == 80);
+        assert!(bip.is_below_ratio() == false);
         let _ = buf.try_push(b"xox");
-        assert!(buf.regions.size() == 91);
-        assert!(buf.is_below_ratio() == true);
+        assert!(bip.regions.size() == 91);
+        assert!(bip.is_below_ratio() == true);
     }
 
     #[rstest]
     fn push_will_automatically_free_if_below_ratio() {
-        let mut buf = BipBuffer::<100>::new();
-        buf.free_ratio = 0.1;
+        let mut bip = BipBuffer::<100>::new();
+        bip.free_ratio = 0.1;
+        let mut buf = bip.try_writer().unwrap();
         for _ in 0..8 {
             assert!(buf.try_push(b"xo").is_ok());
         }
-        assert!(buf.regions.size() == 80);
-        assert!(buf.regions.read().range().eq(0..80));
+        assert!(bip.regions.size() == 80);
+        assert!(bip.regions.read().range().eq(0..80));
         assert!(buf.push(b"xox") == Ok(vec![0]));
-        assert!(buf.regions.size() == 81);
-        assert!(buf.regions.read().range().eq(10..91));
+        assert!(bip.regions.size() == 81);
+        assert!(bip.regions.read().range().eq(10..91));
     }
 
     #[rstest]
     fn it_pushes_until_regions_merge() {
-        let mut buf = BipBuffer::<60>::new();
+        let bip = BipBuffer::<60>::new();
+        let mut buf = bip.try_writer().unwrap();
         for _ in 0..3 {
             assert!(buf.try_push(b"hey now!").is_ok());
         }
         assert!(buf.push(b"hey now!").is_ok());
-        assert!(buf.regions.count.get() == Count::Two);
+        assert!(bip.regions.count.get() == Count::Two);
         assert!(buf.push(b"hey now!") == Ok(vec![LEN_SIZE + 8]));
         assert!(buf.push(b"hey now!") == Ok(vec![2 * (LEN_SIZE + 8)]));
-        assert!(buf.regions.count.get() == Count::One);
+        assert!(bip.regions.count.get() == Count::One);
     }
 
     #[rstest]
     fn try_pop_works() {
-        let mut buf = BipBuffer::<1024>::new();
+        let bip = BipBuffer::<1024>::new();
+        let mut buf = bip.try_writer().unwrap();
         assert!(buf.try_push(b"hey now!").is_ok());
         assert!(buf.try_push(b"hey now?").is_ok());
         assert!(buf.try_pop() == Some(0));
         assert!(buf.try_pop() == Some(LEN_SIZE + 8));
         assert!(buf.try_pop() == None);
+    }
+
+    #[cfg(all(proptest))]
+    proptest! {
+        #[rstest]
+        fn try_push_proptest(s in "\\PC*") {
+            let bip = BipBuffer::<1024>::new();
+            let mut w = bip.try_writer().unwrap();
+            assert!(w.try_push(s.as_bytes()) == Ok(()));
+            drop(w);
+            let r = bip.try_reader().unwrap();
+            let data = r.iter().next();
+            assert!(data == Some(s.as_bytes()));
+        }
+    }
+
+    #[cfg(all(proptest))]
+    proptest! {
+        #[rstest]
+        fn push_one_proptest(s in "\\PC*") {
+            let bip = BipBuffer::<1024>::new();
+            let mut w = bip.try_writer().unwrap();
+            assert!(w.push_one(s.as_bytes()) == Ok(Vec::new()));
+            drop(w);
+            let r = bip.try_reader().unwrap();
+            let data = r.iter().next();
+            assert!(data == Some(s.as_bytes()));
+        }
+    }
+
+    #[cfg(all(proptest))]
+    proptest! {
+        #[rstest]
+        fn push_proptest(s in "\\PC*") {
+            let bip = BipBuffer::<1024>::new();
+            let mut w = bip.try_writer().unwrap();
+            assert!(w.push(s.as_bytes()) == Ok(Vec::new()));
+            drop(w);
+            let r = bip.try_reader().unwrap();
+            let data = r.iter().next();
+            assert!(data == Some(s.as_bytes()));
+        }
     }
 }
 
@@ -623,11 +790,14 @@ mod test_iter {
 
     #[rstest]
     fn it_works() {
-        let mut buf = BipBuffer::<60>::new();
-        assert!(buf.try_push(b"ab") == Ok(()));
-        assert!(buf.try_push(b"cd") == Ok(()));
-        assert!(buf.try_push(b"ef") == Ok(()));
-        let mut iter = buf.iter();
+        let buf = BipBuffer::<60>::new();
+        let mut w = buf.try_writer().unwrap();
+        assert!(w.try_push(b"ab") == Ok(()));
+        assert!(w.try_push(b"cd") == Ok(()));
+        assert!(w.try_push(b"ef") == Ok(()));
+        drop(w);
+        let reader = buf.try_reader().unwrap();
+        let mut iter = reader.iter();
         assert!(iter.next() == Some(b"ab".as_slice()));
         assert!(iter.next() == Some(b"cd".as_slice()));
         assert!(iter.next() == Some(b"ef".as_slice()));
@@ -638,14 +808,241 @@ mod test_iter {
     fn it_wraps() {
         let mut buf = BipBuffer::<30>::new();
         buf.free_ratio = 0.0;
-        assert!(buf.push(b"ab") == Ok(vec![]));
-        assert!(buf.push(b"cd") == Ok(vec![]));
-        assert!(buf.push(b"ef") == Ok(vec![]));
-        assert!(buf.push(b"gh") == Ok(vec![0]));
-        let mut iter = buf.iter();
+        let mut w = buf.try_writer().unwrap();
+        assert!(w.push(b"ab") == Ok(vec![]));
+        assert!(w.push(b"cd") == Ok(vec![]));
+        assert!(w.push(b"ef") == Ok(vec![]));
+        assert!(w.push(b"gh") == Ok(vec![0]));
+        drop(w);
+        let reader = buf.try_reader().unwrap();
+        let mut iter = reader.iter();
         assert!(iter.next() == Some(b"cd".as_slice()));
         assert!(iter.next() == Some(b"ef".as_slice()));
         assert!(iter.next() == Some(b"gh".as_slice()));
         assert!(iter.next() == None);
+    }
+}
+
+#[cfg(all(test, loom))]
+mod test_loom_bip {
+    use super::*;
+    use assert2::assert;
+    use loom::sync::Arc;
+    // use loom::thread;
+    use rstest::*;
+
+    #[rstest]
+    fn multiple_readers_can_be_acquired() {
+        loom::model(|| {
+            let buf = BipBuffer::<60>::new();
+            let buf = Arc::new(buf);
+
+            assert!(buf.protectors.load(Acquire) == 0);
+            let reader1 = buf.try_reader();
+            assert!(reader1.is_ok());
+            assert!(buf.protectors.load(Acquire) == 1);
+            let reader2 = buf.try_reader();
+            assert!(reader2.is_ok());
+            assert!(buf.protectors.load(Acquire) == 2);
+            drop(reader2);
+            assert!(buf.protectors.load(Acquire) == 1);
+            drop(reader1);
+            assert!(buf.protectors.load(Acquire) == 0);
+        });
+    }
+
+    #[rstest]
+    fn readers_block_writers() {
+        loom::model(|| {
+            let buf = BipBuffer::<60>::new();
+            let buf = Arc::new(buf);
+
+            let reader = buf.try_reader();
+            assert!(reader.is_ok());
+            let writer = buf.try_writer();
+            assert!(writer.is_err());
+            drop(reader);
+            let writer = buf.try_writer();
+            assert!(writer.is_ok());
+        });
+    }
+
+    #[rstest]
+    fn writers_block_readers() {
+        loom::model(|| {
+            let buf = BipBuffer::<60>::new();
+            let buf = Arc::new(buf);
+
+            let writer = buf.try_writer();
+            assert!(writer.is_ok());
+            let reader = buf.try_reader();
+            assert!(reader.is_err());
+            drop(writer);
+            let reader = buf.try_reader();
+            assert!(reader.is_ok());
+        });
+    }
+
+    #[rstest]
+    fn writers_block_writers() {
+        loom::model(|| {
+            let buf = BipBuffer::<60>::new();
+            let buf = Arc::new(buf);
+
+            let writer = buf.try_writer();
+            assert!(writer.is_ok());
+            let writer2 = buf.try_writer();
+            assert!(writer2.is_err());
+            drop(writer);
+            let writer2 = buf.try_writer();
+            assert!(writer2.is_ok());
+        });
+    }
+
+    #[rstest]
+    fn do_something() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        loom::model(move || {
+            rt.block_on(async {
+                let buf = BipBuffer::<60>::new();
+                let buf = Arc::new(buf);
+                let buf_1 = Arc::clone(&buf);
+                let wtask = tokio::task::spawn(async move {
+                    let mut writer = buf_1.writer().await;
+                    writer.push(b"fart1").unwrap();
+                    writer.push(b"fart2").unwrap();
+                    writer.push(b"fart3").unwrap();
+                });
+                let rtasks = (0..3).map(|_| {
+                    let buf = Arc::clone(&buf);
+                    tokio::task::spawn(async move {
+                        let reader = buf.reader().await;
+                        let items: Vec<_> = reader.iter().collect();
+                        assert!(items == vec![b"fart1", b"fart2", b"fart3"]);
+                    })
+                });
+                tokio::try_join!(wtask).unwrap();
+                for rtask in rtasks {
+                    tokio::try_join!(rtask).unwrap();
+                }
+            });
+        });
+    }
+}
+
+#[cfg(all(test, lincheck))]
+mod test_lincheck {
+    use super::*;
+
+    use assert2::assert;
+    use lincheck::{ConcurrentSpec, Lincheck, SequentialSpec};
+    use loom::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use proptest::prelude::*;
+    use rstest::*;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Op {
+        Push(String),
+        Read { count: usize },
+    }
+
+    impl Arbitrary for Op {
+        type Parameters = ();
+        type Strategy = BoxedStrategy<Self>;
+
+        fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
+            prop_oneof![
+                prop::string::string_regex("\\PC*").unwrap().prop_map(Op::Push),
+                prop::num::usize::ANY.prop_map(|x| Op::Read { count: x }),
+                // Just(Op::WriteX),
+                // Just(Op::WriteY),
+                // Just(Op::ReadX),
+                // Just(Op::ReadY),
+            ]
+            .boxed()
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum RetErr {
+        GetWriter,
+        GetReader,
+        Push,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Ret {
+        Pushed { popped: Vec<usize> },
+        Read { count: usize },
+        Error(RetErr),
+    }
+
+    #[derive(Default)]
+    struct SeqBip {
+        used_bytes: usize,
+        data: Vec<Vec<u8>>,
+    }
+
+    impl SequentialSpec for SeqBip {
+        type Op = Op;
+        type Ret = Ret;
+
+        fn exec(&mut self, op: Op) -> Self::Ret {
+            match op {
+                Op::Push(s) => {
+                    let bytes = s.as_bytes().to_vec();
+                    let bytes_len = bytes.len();
+                    self.data.push(bytes);
+                    self.used_bytes = bytes_len + 8;
+                    Ret::Pushed { popped: vec![] }
+                }
+                Op::Read { count } => {
+                    Ret::Read { count: self.data.iter().take(count).count() }
+                }
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct ParBip(BipBuffer<4096>);
+
+    impl ConcurrentSpec for ParBip {
+        type Seq = SeqBip;
+
+        fn exec(&self, op: Op) -> <Self::Seq as SequentialSpec>::Ret {
+            // let rt_handle = tokio::runtime::Handle::current();
+            // let _ = rt_handle.enter();
+            ::futures::executor::block_on(async {
+                match op {
+                    Op::Push(s) => {
+                        let mut w = self.0.writer().await;
+                        // let popped = match w.push(s.as_bytes()) {
+                        //     Ok(x) => x,
+                        //     Err(_) => return Ret::Error(RetErr::CantPush),
+                        // };
+                        // Ret::Pushed { popped }
+                        Ret::Pushed { popped: vec![] }
+                    }
+                    Op::Read { count } => {
+                        let r = self.0.reader().await;
+                        let iter = r.iter();
+                        Ret::Read { count: iter.count() }
+                    }
+                }
+            })
+        }
+    }
+    #[rstest]
+    fn two_slots() {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                Lincheck { num_threads: 2, num_ops: 5 }
+                    .verify_or_panic::<ParBip>()
+            });
     }
 }
