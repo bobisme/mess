@@ -128,6 +128,26 @@ where
     }
 }
 
+impl<T, const N: usize> Default for RingList<T, N>
+where
+    T: Clone,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+const _: () = {
+    fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
+
+    // RFC 2056
+    fn assert_all() {
+        assert_send::<RingList<usize, 1>>();
+        assert_sync::<RingList<usize, 1>>();
+    }
+};
+
 pub struct RingIter<'a, T, const N: usize> {
     list: &'a RingList<T, N>,
     list_idx: Option<usize>,
