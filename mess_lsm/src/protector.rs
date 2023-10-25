@@ -1,0 +1,224 @@
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+
+use parking_lot::{Condvar, Mutex};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Protection {
+    ProtectedFrom(usize),
+    Unprotected,
+}
+
+impl Protection {
+    pub fn is_unprotected(&self) -> bool {
+        matches!(self, Protection::Unprotected)
+    }
+
+    pub fn is_protected(&self) -> bool {
+        matches!(self, Protection::ProtectedFrom(_))
+    }
+}
+
+impl From<usize> for Protection {
+    fn from(value: usize) -> Self {
+        match value {
+            usize::MAX => Self::Unprotected,
+            index => Self::ProtectedFrom(index),
+        }
+    }
+}
+
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct Protector(AtomicUsize);
+
+impl Protector {
+    // Hack so this can be used in array initialization.
+    // There should be a test below to show this is sound.
+    #[allow(clippy::declare_interior_mutable_const)]
+    pub const NEW: Protector = Protector::new();
+
+    pub const fn new() -> Self {
+        Self(AtomicUsize::new(usize::MAX))
+    }
+
+    pub fn protect(&self, index: usize) {
+        self.0.store(index, Ordering::Release);
+    }
+
+    pub fn release(&self) {
+        self.0.store(usize::MAX, Ordering::Release);
+    }
+
+    pub fn state(&self) -> Protection {
+        Protection::from(self.0.load(Ordering::Acquire))
+    }
+}
+
+#[cfg(test)]
+mod test_protector {
+    use super::*;
+    use assert2::assert;
+    use rstest::*;
+
+    #[rstest]
+    fn new_const_doesnt_affect_other_protectors() {
+        let p1 = Protector::NEW;
+        let p2 = Protector::NEW;
+        p1.protect(69);
+        assert!(p1.state() == Protection::ProtectedFrom(69));
+        assert!(p2.state() != Protection::ProtectedFrom(69));
+    }
+}
+
+pub trait Release {
+    fn release(&self);
+}
+
+impl Release for Arc<(Mutex<bool>, Condvar)> {
+    fn release(&self) {
+        let (lock, cvar) = &**self;
+        *lock.lock() = true;
+        cvar.notify_one();
+    }
+}
+
+impl Release for () {
+    fn release(&self) {}
+}
+
+pub struct BorrowedProtector<'a, R: Release> {
+    protector: &'a Protector,
+    // released: Option<Arc<(Mutex<bool>, Condvar)>>,
+    released: R,
+}
+
+impl<'a, R: Release> BorrowedProtector<'a, R> {
+    pub fn new(protector: &'a Protector, released: R) -> Self {
+        protector.protect(0);
+        Self { protector, released }
+    }
+}
+
+impl<'a, R: Release> Drop for BorrowedProtector<'a, R> {
+    fn drop(&mut self) {
+        self.protector.release();
+        self.released.release();
+    }
+}
+
+#[derive(Debug)]
+pub struct ProtectorPool<R, const N: usize> {
+    protectors: [Protector; N],
+    // released: Option<Arc<(Mutex<bool>, Condvar)>>,
+    released: R,
+}
+
+impl<R, const N: usize> ProtectorPool<R, N>
+where
+    R: Release + Clone,
+{
+    // pub const fn new(released: Option<Arc<(Mutex<bool>, Condvar)>>) -> Self {
+    pub const fn new(released: R) -> Self {
+        Self { protectors: [Protector::NEW; N], released }
+    }
+
+    pub fn minimum_protected(&self) -> Protection {
+        let min = self.protectors.iter().map(|p| p.state()).min();
+        min.unwrap_or(Protection::Unprotected)
+    }
+
+    pub fn try_get(&self) -> Option<BorrowedProtector<R>> {
+        self.protectors
+            .iter()
+            .find(|p| p.state().is_unprotected())
+            .map(|p| BorrowedProtector::new(p, self.released.clone()))
+    }
+}
+
+impl<const N: usize> ProtectorPool<Arc<(Mutex<bool>, Condvar)>, N> {
+    pub fn blocking_get(
+        &self,
+    ) -> BorrowedProtector<Arc<(Mutex<bool>, Condvar)>> {
+        let protector = self.try_get();
+        if let Some(protector) = protector {
+            return protector;
+        }
+        let (lock, cvar) = &*self.released;
+        loop {
+            let mut released = lock.lock();
+            if !*released {
+                cvar.wait(&mut released);
+            }
+            let protector = self.try_get();
+            if let Some(protector) = protector {
+                return protector;
+            }
+        }
+        // let (lock, cvar) = &*self.released;
+    }
+}
+
+#[cfg(test)]
+mod test_protector_pool {
+    use super::*;
+    use assert2::assert;
+    use rstest::*;
+
+    #[rstest]
+    fn minimum_protected_picks_min_if_all_protected() {
+        let pool = ProtectorPool::<(), 4>::new(());
+        pool.protectors[0].protect(20);
+        pool.protectors[1].protect(10);
+        pool.protectors[2].protect(40);
+        pool.protectors[3].protect(30);
+        assert!(pool.minimum_protected() == Protection::ProtectedFrom(10));
+    }
+
+    #[rstest]
+    fn minimum_protected_picks_min_if_some_protected() {
+        let pool = ProtectorPool::<(), 4>::new(());
+        pool.protectors[0].protect(20);
+        pool.protectors[1].protect(10);
+        assert!(pool.minimum_protected() == Protection::ProtectedFrom(10));
+    }
+    #[rstest]
+    fn minimum_protected_returns_unprotected_if_none_protected() {
+        let pool = ProtectorPool::<(), 4>::new(());
+        assert!(pool.minimum_protected() == Protection::Unprotected);
+    }
+
+    #[rstest]
+    fn minimum_protected_returns_unprotected_if_array_empty() {
+        let pool = ProtectorPool::<(), 0>::new(());
+        assert!(pool.minimum_protected() == Protection::Unprotected);
+    }
+
+    #[rstest]
+    fn get_works_until_it_cant() {
+        let pool = ProtectorPool::<(), 3>::new(());
+        let p1 = pool.try_get();
+        assert!(p1.is_some());
+        let p2 = pool.try_get();
+        assert!(p2.is_some());
+        let p3 = pool.try_get();
+        assert!(p3.is_some());
+        let p4 = pool.try_get();
+        assert!(p4.is_none());
+    }
+
+    #[rstest]
+    fn releasing_and_getting_works() {
+        let pool = ProtectorPool::<(), 3>::new(());
+        let p1 = pool.try_get();
+        let _p2 = pool.try_get();
+        let _p3 = pool.try_get();
+        let p4 = pool.try_get();
+        assert!(p4.is_none());
+        drop(p1);
+        let p4 = pool.try_get();
+        assert!(p4.is_some());
+    }
+}
