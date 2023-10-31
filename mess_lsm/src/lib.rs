@@ -4,5 +4,6 @@ pub mod block;
 pub mod error;
 pub mod memlog;
 pub mod protector;
+pub mod ranges;
 pub mod ringlist;
 pub mod wal;
