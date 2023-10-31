@@ -8,6 +8,8 @@ pub enum Error {
     PostcardError(#[from] postcard::Error),
     // #[error(transparent)]
     // BincodeError(#[from] bincode::Error),
+    #[error("invalid block header")]
+    InvalidBlockHeader,
     #[error("invalid header")]
     InvalidHeader,
     #[error("invalid entry at index: {index:?}")]
@@ -18,6 +20,10 @@ pub enum Error {
     EntryTooBig,
     #[error("list is full")]
     ListFull,
+    #[error("tried to push when bipbuffer region is full")]
+    RangeFull,
+    #[error("tried to pop when bipbuffer region is empty")]
+    RangeEmpty,
     #[error("tried to push when bipbuffer region is full")]
     RegionFull,
     #[error("tried to pop when bipbuffer region is empty")]

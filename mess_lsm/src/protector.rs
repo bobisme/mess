@@ -1,3 +1,9 @@
+#[cfg(loom)]
+use loom::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+#[cfg(not(loom))]
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -38,9 +44,17 @@ impl Protector {
     // Hack so this can be used in array initialization.
     // There should be a test below to show this is sound.
     #[allow(clippy::declare_interior_mutable_const)]
+    #[cfg(not(loom))]
     pub const NEW: Protector = Protector::new();
 
+    #[cfg(not(loom))]
     pub const fn new() -> Self {
+        Self(AtomicUsize::new(usize::MAX))
+    }
+
+    #[cfg(loom)]
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
         Self(AtomicUsize::new(usize::MAX))
     }
 
@@ -57,7 +71,7 @@ impl Protector {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod test_protector {
     use super::*;
     use assert2::assert;
@@ -120,9 +134,13 @@ impl<R, const N: usize> ProtectorPool<R, N>
 where
     R: Release + Clone,
 {
-    // pub const fn new(released: Option<Arc<(Mutex<bool>, Condvar)>>) -> Self {
+    #[cfg(not(loom))]
     pub const fn new(released: R) -> Self {
         Self { protectors: [Protector::NEW; N], released }
+    }
+    #[cfg(loom)]
+    pub fn new(released: R) -> Self {
+        Self { protectors: std::array::from_fn(|_| Protector::new()), released }
     }
 
     pub fn minimum_protected(&self) -> Protection {

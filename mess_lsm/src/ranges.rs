@@ -17,7 +17,12 @@ impl Default for AtomicIndex {
 }
 
 impl AtomicIndex {
+    #[cfg(not(loom))]
     pub const fn new(index: usize) -> Self {
+        Self(AtomicUsize::new(index))
+    }
+    #[cfg(loom)]
+    pub fn new(index: usize) -> Self {
         Self(AtomicUsize::new(index))
     }
 
@@ -41,7 +46,12 @@ pub struct Range {
 }
 
 impl Range {
+    #[cfg(not(loom))]
     pub const fn new(head: usize, tail: usize) -> Self {
+        Self { head: AtomicIndex::new(head), tail: AtomicIndex::new(tail) }
+    }
+    #[cfg(loom)]
+    pub fn new(head: usize, tail: usize) -> Self {
         Self { head: AtomicIndex::new(head), tail: AtomicIndex::new(tail) }
     }
 
@@ -84,10 +94,17 @@ pub struct Ranges<const N: usize> {
 }
 
 impl<const N: usize> Ranges<N> {
+    #[cfg(not(loom))]
     pub const fn new() -> Self {
         Self { is_split: false, inner: (Range::new(0, 0), Range::new(0, 0)) }
     }
-    pub fn refs(&self) -> RangeRefs {
+    #[cfg(loom)]
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        Self { is_split: false, inner: (Range::new(0, 0), Range::new(0, 0)) }
+    }
+
+    pub const fn refs(&self) -> RangeRefs {
         match self.is_split {
             false => RangeRefs::One(&self.inner.1),
             true => {
@@ -96,7 +113,7 @@ impl<const N: usize> Ranges<N> {
         }
     }
 
-    pub fn read(&self) -> &Range {
+    pub const fn read(&self) -> &Range {
         &self.inner.1
     }
 
@@ -104,7 +121,7 @@ impl<const N: usize> Ranges<N> {
         &mut self.inner.1
     }
 
-    pub fn write(&self) -> &Range {
+    pub const fn write(&self) -> &Range {
         match self.is_split {
             false => &self.inner.1,
             true => &self.inner.0,
@@ -175,6 +192,21 @@ impl<const N: usize> Ranges<N> {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    mod atomic_index {
+        use super::*;
+        use assert2::assert;
+        use rstest::*;
+
+        #[rstest]
+        fn test_atomic_index() {
+            let atomic_index = AtomicIndex::new(10);
+            assert!(atomic_index.get() == 10);
+
+            atomic_index.set(20);
+            assert!(atomic_index.get() == 20);
+        }
+    }
 
     mod size {
         use super::*;
