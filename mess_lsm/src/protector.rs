@@ -1,3 +1,4 @@
+use core::ops;
 #[cfg(loom)]
 use loom::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -18,11 +19,11 @@ pub enum Protection {
 }
 
 impl Protection {
-    pub fn is_unprotected(&self) -> bool {
+    pub const fn is_unprotected(&self) -> bool {
         matches!(self, Protection::Unprotected)
     }
 
-    pub fn is_protected(&self) -> bool {
+    pub const fn is_protected(&self) -> bool {
         matches!(self, Protection::ProtectedFrom(_))
     }
 }
@@ -103,6 +104,7 @@ impl Release for () {
     fn release(&self) {}
 }
 
+#[derive(Debug)]
 pub struct BorrowedProtector<'a, R: Release> {
     protector: &'a Protector,
     // released: Option<Arc<(Mutex<bool>, Condvar)>>,
@@ -113,6 +115,14 @@ impl<'a, R: Release> BorrowedProtector<'a, R> {
     pub fn new(protector: &'a Protector, released: R) -> Self {
         protector.protect(0);
         Self { protector, released }
+    }
+}
+
+impl<'a, R: Release + ops::Deref> ops::Deref for BorrowedProtector<'a, R> {
+    type Target = Protector;
+
+    fn deref(&self) -> &Self::Target {
+        self.protector
     }
 }
 
@@ -143,8 +153,21 @@ where
         Self { protectors: std::array::from_fn(|_| Protector::new()), released }
     }
 
-    pub fn minimum_protected(&self) -> Protection {
-        let min = self.protectors.iter().map(|p| p.state()).min();
+    /// Get the minimum Protection in the given range.
+    /// Returns Protection::Unprotected if none in range.
+    pub fn minimum_protected(&self, range: ops::Range<usize>) -> Protection {
+        let min = self
+            .protectors
+            .iter()
+            .map(|p| p.state())
+            .filter_map(|s| match s {
+                p @ Protection::ProtectedFrom(idx) => match idx {
+                    i if range.contains(&i) => Some(p),
+                    _ => None,
+                },
+                Protection::Unprotected => None,
+            })
+            .min();
         min.unwrap_or(Protection::Unprotected)
     }
 
@@ -192,7 +215,19 @@ mod test_protector_pool {
         pool.protectors[1].protect(10);
         pool.protectors[2].protect(40);
         pool.protectors[3].protect(30);
-        assert!(pool.minimum_protected() == Protection::ProtectedFrom(10));
+        assert!(pool.minimum_protected(0..99) == Protection::ProtectedFrom(10));
+    }
+
+    #[rstest]
+    fn minimum_protected_if_in_range() {
+        let pool = ProtectorPool::<(), 4>::new(());
+        pool.protectors[0].protect(20);
+        pool.protectors[1].protect(10);
+        pool.protectors[2].protect(40);
+        pool.protectors[3].protect(30);
+        assert!(
+            pool.minimum_protected(25..99) == Protection::ProtectedFrom(30)
+        );
     }
 
     #[rstest]
@@ -200,18 +235,21 @@ mod test_protector_pool {
         let pool = ProtectorPool::<(), 4>::new(());
         pool.protectors[0].protect(20);
         pool.protectors[1].protect(10);
-        assert!(pool.minimum_protected() == Protection::ProtectedFrom(10));
+        assert!(pool.minimum_protected(0..99) == Protection::ProtectedFrom(10));
     }
+
     #[rstest]
-    fn minimum_protected_returns_unprotected_if_none_protected() {
+    fn minimum_protected_returns_unprotected_if_none_protected_in_range() {
         let pool = ProtectorPool::<(), 4>::new(());
-        assert!(pool.minimum_protected() == Protection::Unprotected);
+        pool.protectors[0].protect(20);
+        assert!(pool.minimum_protected(0..25) == Protection::ProtectedFrom(20));
+        assert!(pool.minimum_protected(25..99) == Protection::Unprotected);
     }
 
     #[rstest]
     fn minimum_protected_returns_unprotected_if_array_empty() {
         let pool = ProtectorPool::<(), 0>::new(());
-        assert!(pool.minimum_protected() == Protection::Unprotected);
+        assert!(pool.minimum_protected(0..99) == Protection::Unprotected);
     }
 
     #[rstest]
