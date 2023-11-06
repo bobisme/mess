@@ -68,7 +68,7 @@ pub struct BBPP<'a, const N: usize> {
     is_writer_leased: AtomicBool,
     ranges: Ranges<N>,
     free_ratio: f32,
-    initialized: bool,
+    initialized: AtomicBool,
     _mark: PhantomData<&'a ()>,
 }
 
@@ -82,13 +82,17 @@ impl<'a, const N: usize> BBPP<'a, N> {
             is_writer_leased: AtomicBool::new(false),
             ranges: Ranges::new(),
             free_ratio: 0.1,
-            initialized: false,
+            initialized: AtomicBool::new(false),
             _mark: PhantomData,
         }
     }
 
-    fn init(&mut self) {
-        if self.initialized {
+    fn initialized(&self) -> bool {
+        self.initialized.load(Ordering::Acquire)
+    }
+
+    fn init(&self) {
+        if self.initialized() {
             return;
         }
         // Write a zero byte to avoid undefined behavior when
@@ -97,7 +101,7 @@ impl<'a, const N: usize> BBPP<'a, N> {
         unsafe {
             buf_start.write_bytes(0u8, 1);
         };
-        self.initialized = true;
+        self.initialized.store(true, Ordering::Release);
     }
 
     pub fn protected_ranges(
@@ -114,10 +118,7 @@ impl<'a, const N: usize> BBPP<'a, N> {
     /// pool of protectors. It returns None if no reader available.
     /// use `new_reader_blocking` to block until a reader is available.
     pub fn new_reader(&'a self) -> Option<Reader<'a, N>> {
-        if !self.initialized {
-            return None;
-        }
-        // self.init();
+        self.init();
         let protector = self.protectors.try_get()?;
         let cached_ranges = self.ranges.ranges();
         let bbpp =
@@ -139,7 +140,7 @@ impl<'a, const N: usize> BBPP<'a, N> {
     /// Only 1 writer can exist at a time.
     /// `try_release_writer` _must_ be called to make future writers
     /// available.
-    pub fn try_writer(&mut self) -> Option<Writer<'a, N>> {
+    pub fn try_writer(&self) -> Option<Writer<'a, N>> {
         self.init();
         let res = self.is_writer_leased.compare_exchange(
             false,
@@ -418,7 +419,7 @@ impl<'a, const N: usize> Iterator for BBPPIterator<'a, N> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom), not(lincheck)))]
 mod test_slice_tools {
     use super::*;
     use assert2::assert;
@@ -484,7 +485,7 @@ mod test_slice_tools {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom), not(lincheck)))]
 mod test_bbpp {
     use super::*;
     use assert2::assert;
@@ -493,14 +494,15 @@ mod test_bbpp {
     fn test_new() {
         let bbpp: BBPP<1024> = BBPP::new();
         assert!(!bbpp.is_writer_leased.load(Ordering::Acquire));
-        assert!(!bbpp.initialized);
+        assert!(!bbpp.initialized());
     }
 
     #[test]
     fn test_init() {
-        let mut bbpp: BBPP<1024> = BBPP::new();
+        let bbpp: BBPP<1024> = BBPP::new();
+        assert!(!bbpp.initialized());
         bbpp.init();
-        assert!(bbpp.initialized);
+        assert!(bbpp.initialized());
     }
 
     #[test]
@@ -514,7 +516,6 @@ mod test_bbpp {
     #[test]
     fn test_new_reader() {
         let mut bbpp: BBPP<1024> = BBPP::new();
-        bbpp.init();
         bbpp.ranges = Ranges::new();
         bbpp.ranges.grow(20).unwrap();
         bbpp.ranges.shrink(10).unwrap();
@@ -522,6 +523,15 @@ mod test_bbpp {
         bbpp.ranges.grow(10).unwrap();
         let reader = bbpp.new_reader().unwrap();
         assert!(reader.cached_ranges == (Some(0..10), 10..20));
+    }
+
+    #[test]
+    fn test_multiple_readers() {
+        let mut bbpp: BBPP<1024> = BBPP::new();
+        let reader_1 = bbpp.new_reader();
+        let reader_2 = bbpp.new_reader();
+        assert!(reader_1.is_some());
+        assert!(reader_2.is_some());
     }
 
     // #[test]
@@ -558,7 +568,7 @@ mod test_bbpp {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom), not(lincheck)))]
 mod test_writer {
     use super::*;
     use assert2::assert;
@@ -627,40 +637,13 @@ mod test_writer {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom), not(lincheck)))]
 mod test_reader {
     use super::*;
     use assert2::assert;
 
-    #[test]
-    fn test_is_index_valid() {
-        let mut bbpp = BBPP::<100>::new();
-        bbpp.init();
-        let mut reader = bbpp.new_reader().unwrap();
-        reader.cached_ranges = (Some(0..10), 10..20);
-        assert!(reader.is_index_valid(5));
-        assert!(reader.is_index_valid(15));
-        assert!(!reader.is_index_valid(25));
-    }
-
-    #[test]
-    fn test_read_at() {
-        let mut bbpp = BBPP::<100>::new();
-        bbpp.init();
-        let slice = slice_buffer_mut(&mut bbpp.buf, 0, 20);
-        slice.copy_from_slice(&[
-            2, 0, 0, 0, 0, 0, 0, 0, 3, 4, 2, 0, 0, 0, 0, 0, 0, 0, 1, 2,
-        ]);
-        let mut reader = bbpp.new_reader().unwrap();
-        reader.cached_ranges = (Some(0..10), 10..20);
-        assert!(reader.read_at(10) == Some(&[1, 2][..]));
-        assert!(reader.read_at(0) == Some(&[3, 4][..]));
-        assert!(reader.read_at(25) == None);
-    }
-
-    #[test]
-    fn test_iter() {
-        let mut bbpp = BBPP::<100>::new();
+    fn preloaded_bbpp<'a>() -> BBPP<'a, 100> {
+        let mut bbpp = BBPP::new();
         bbpp.init();
         let slice = slice_buffer_mut(&mut bbpp.buf, 0, 20);
         slice.copy_from_slice(&[
@@ -672,29 +655,60 @@ mod test_reader {
         bbpp.ranges.shrink(10).unwrap();
         bbpp.ranges.split();
         bbpp.ranges.grow(10).unwrap();
+        bbpp
+    }
+
+    #[test]
+    fn test_is_index_valid() {
+        let bbpp = BBPP::<100>::new();
+        let mut reader = bbpp.new_reader().unwrap();
+        reader.cached_ranges = (Some(0..10), 10..20);
+        assert!(reader.is_index_valid(5));
+        assert!(reader.is_index_valid(15));
+        assert!(!reader.is_index_valid(25));
+    }
+
+    #[test]
+    fn test_read_at() {
+        let bbpp = preloaded_bbpp();
+        let reader = bbpp.new_reader().unwrap();
+        assert!(reader.read_at(10) == Some(&[1, 2][..]));
+        assert!(reader.read_at(0) == Some(&[3, 4][..]));
+        assert!(reader.read_at(25) == None);
+    }
+
+    #[test]
+    fn test_iter() {
+        let bbpp = preloaded_bbpp();
         let reader = bbpp.new_reader().unwrap();
         let iterator = reader.iter();
         assert!(iterator.idx == Some(10));
     }
 }
 
-#[cfg(test)]
-mod test_iter {
+#[cfg(all(test, not(loom), not(lincheck)))]
+mod test_iterator {
     use super::*;
 
-    #[test]
-    fn test_bbp_iterator() {
-        let mut bbpp = BBPP::<100>::new();
+    fn preloaded_bbpp<'a>() -> BBPP<'a, 100> {
+        let mut bbpp = BBPP::new();
         bbpp.init();
         let slice = slice_buffer_mut(&mut bbpp.buf, 0, 20);
         slice.copy_from_slice(&[
             2, 0, 0, 0, 0, 0, 0, 0, 3, 4, // 2 bytes = [3, 4]
             2, 0, 0, 0, 0, 0, 0, 0, 1, 2, // 2 bytes = [1, 2]
         ]);
+        bbpp.ranges = Ranges::new();
         bbpp.ranges.grow(20).unwrap();
         bbpp.ranges.shrink(10).unwrap();
         bbpp.ranges.split();
         bbpp.ranges.grow(10).unwrap();
+        bbpp
+    }
+
+    #[test]
+    fn test_bbp_iterator() {
+        let bbpp = preloaded_bbpp();
         let reader = bbpp.new_reader().unwrap();
         let mut iterator = reader.iter();
 
@@ -705,17 +719,7 @@ mod test_iter {
 
     #[test]
     fn test_bbp_iterator_end() {
-        let mut bbpp = BBPP::<100>::new();
-        bbpp.init();
-        let slice = slice_buffer_mut(&mut bbpp.buf, 0, 20);
-        bbpp.ranges.grow(20).unwrap();
-        bbpp.ranges.shrink(10).unwrap();
-        bbpp.ranges.split();
-        bbpp.ranges.grow(10).unwrap();
-        slice.copy_from_slice(&[
-            2, 0, 0, 0, 0, 0, 0, 0, 3, 4, // 2 bytes = [3, 4]
-            2, 0, 0, 0, 0, 0, 0, 0, 1, 2, // 2 bytes = [1, 2]
-        ]);
+        let bbpp = preloaded_bbpp();
         let reader = bbpp.new_reader().unwrap();
         let mut iterator = reader.iter();
 
@@ -725,8 +729,43 @@ mod test_iter {
     }
 }
 
-#[cfg(test)]
-mod tests {}
+#[cfg(all(test, loom))]
+mod test_loom {
+    use super::*;
+
+    // This takes over 4,500 seconds to run.
+    #[test]
+    fn it_works() {
+        loom::model(|| {
+            let bbpp: BBPP<1024> = BBPP::new();
+            let abbpp = Arc::new(bbpp);
+            let ths: Vec<_> = (0..2)
+                .map(|_| {
+                    let bbpp = Arc::clone(&abbpp);
+                    loom::thread::spawn(move || {
+                        let r = bbpp.new_reader().unwrap();
+                        let mut res: Vec<usize> = vec![];
+                        // for _ in 0..2 {
+                        let count = r.iter().count();
+                        res.push(count);
+                        // }
+                        res
+                    })
+                })
+                .collect();
+            let w_bbpp = Arc::clone(&abbpp);
+            let th = loom::thread::spawn(move || {
+                let mut w = w_bbpp.try_writer().unwrap();
+                w.push(&[1, 2, 3]).unwrap();
+                w_bbpp.release_writer(w).unwrap();
+            });
+            th.join().unwrap();
+            ths.into_iter().for_each(|th| {
+                let _ = th.join().unwrap();
+            });
+        });
+    }
+}
 
 // #[cfg(all(test, lincheck))]
 // mod test_lincheck {
@@ -774,7 +813,7 @@ mod tests {}
 //     #[derive(Debug, Clone, PartialEq, Eq)]
 //     enum Ret {
 //         Pushed { popped: Vec<usize> },
-//         Read { count: usize },
+//         DidRead { count: usize },
 //         Error(RetErr),
 //     }
 //
@@ -853,7 +892,9 @@ mod tests {}
 //                     let popped = self.push(s.as_bytes());
 //                     Ret::Pushed { popped }
 //                 }
-//                 Op::Read { count } => Ret::Read { count: self.iter().count() },
+//                 Op::Read { count } => {
+//                     Ret::DidRead { count: self.iter().take(count).count() }
+//                 }
 //             }
 //         }
 //     }
@@ -877,13 +918,13 @@ mod tests {}
 //                         Ok(x) => x,
 //                         Err(_) => return Ret::Error(RetErr::Push),
 //                     };
-//                     self.0.try_release_writer(w).unwrap();
+//                     self.0.release_writer(w).unwrap();
 //                     Ret::Pushed { popped }
 //                 }
 //                 Op::Read { count } => {
 //                     let reader = self.0.new_reader();
-//                     let iter = reader.iter();
-//                     Ret::Read { count: iter.count() }
+//                     let iter = reader.iter().take(count);
+//                     Ret::DidRead { count: iter.count() }
 //                 }
 //             }
 //         }
