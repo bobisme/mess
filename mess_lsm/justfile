@@ -1,0 +1,9 @@
+coverage:
+  mkdir -p ../target/coverage
+  env CARGO_INCREMENTAL=0 RUSTFLAGS='-Cinstrument-coverage' \
+    LLVM_PROFILE_FILE='cargo-test-%p-%m.profraw' \
+    cargo test
+  grcov . --binary-path ../target/debug/deps/ --source-dir . --output-types lcov \
+    --branch --ignore-not-existing --ignore '../*' --ignore "/*" \
+    --output-path ../target/coverage/mess_lsm_tests.lcov
+  rm cargo-test-*.profraw
