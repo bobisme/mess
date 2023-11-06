@@ -16,10 +16,12 @@ pub enum Error {
     InvalidEntry { index: Option<usize> },
     #[error("the block is full")]
     BlockFull,
-    #[error("the entry is too large")]
-    EntryTooBig,
+    #[error("the entry is larger than the buffer")]
+    EntryLargerThanBuffer,
     #[error("list is full")]
     ListFull,
+    #[error("failed to reserve {size} bytes at {index}")]
+    ReserveFailed { size: usize, index: usize },
     #[error("tried to push when bipbuffer region is full")]
     RangeFull,
     #[error("tried to pop when bipbuffer region is empty")]
@@ -32,6 +34,8 @@ pub enum Error {
     ReaderBlocked,
     #[error("could not create a new writer")]
     WriterBlocked,
+    #[error("can't release writer; not from this BBPP")]
+    NotOwnWriter,
     #[error("...inconceivable...")]
     Inconceivable,
 }

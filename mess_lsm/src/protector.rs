@@ -171,6 +171,17 @@ where
         min.unwrap_or(Protection::Unprotected)
     }
 
+    pub fn protected_range(
+        &self,
+        range: ops::Range<usize>,
+    ) -> Option<ops::Range<usize>> {
+        let min = self.minimum_protected(range.clone());
+        match min {
+            Protection::ProtectedFrom(idx) => Some(idx..range.end),
+            Protection::Unprotected => None,
+        }
+    }
+
     pub fn try_get(&self) -> Option<BorrowedProtector<R>> {
         self.protectors
             .iter()

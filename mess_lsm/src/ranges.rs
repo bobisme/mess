@@ -1,4 +1,5 @@
 #![warn(clippy::missing_const_for_fn)]
+use core::ops;
 #[cfg(loom)]
 use loom::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(not(loom))]
@@ -41,8 +42,8 @@ impl AtomicIndex {
 
 #[derive(Debug)]
 pub struct Range {
-    head: AtomicIndex,
-    tail: AtomicIndex,
+    pub head: AtomicIndex,
+    pub tail: AtomicIndex,
 }
 
 impl Range {
@@ -185,6 +186,13 @@ impl<const N: usize> Ranges<N> {
         match self.is_split {
             false => self.inner.1.range().len(),
             true => self.inner.0.range().len() + self.inner.1.range().len(),
+        }
+    }
+
+    pub fn ranges(&self) -> (Option<ops::Range<usize>>, ops::Range<usize>) {
+        match self.is_split {
+            false => (None, self.inner.1.range()),
+            true => (Some(self.inner.0.range()), self.inner.1.range()),
         }
     }
 }
