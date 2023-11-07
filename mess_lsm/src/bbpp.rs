@@ -30,10 +30,12 @@ const LEN_SIZE: usize = core::mem::size_of::<usize>();
 
 type InnerBuf<const N: usize> = UnsafeCell<MaybeUninit<[u8; N]>>;
 
+#[inline(always)]
 fn buf_start<const N: usize>(buf: &InnerBuf<N>) -> *mut u8 {
     buf.get().cast::<u8>()
 }
 
+#[inline(always)]
 fn slice_buffer_mut<const N: usize>(
     buf: &mut InnerBuf<N>,
     offset: usize,
@@ -42,6 +44,7 @@ fn slice_buffer_mut<const N: usize>(
     unsafe { from_raw_parts_mut(buf_start(buf).add(offset), len) }
 }
 
+#[inline(always)]
 fn slice_buffer<const N: usize>(
     buf: &InnerBuf<N>,
     offset: usize,
@@ -50,14 +53,16 @@ fn slice_buffer<const N: usize>(
     unsafe { from_raw_parts(buf_start(buf).add(offset), len) }
 }
 
-pub fn read_len_at<const N: usize>(buf: &InnerBuf<N>, offset: usize) -> usize {
+#[inline(always)]
+fn read_len_at<const N: usize>(buf: &InnerBuf<N>, offset: usize) -> usize {
     let len_bytes = slice_buffer(buf, offset, LEN_SIZE);
     usize::from_ne_bytes(
         len_bytes.try_into().expect("did not slice enough to read len"),
     )
 }
 
-pub fn read_at<const N: usize>(buf: &InnerBuf<N>, offset: usize) -> &[u8] {
+#[inline(always)]
+fn read_at<const N: usize>(buf: &InnerBuf<N>, offset: usize) -> &[u8] {
     let len = read_len_at(buf, offset);
     slice_buffer(buf, LEN_SIZE + offset, len)
 }
