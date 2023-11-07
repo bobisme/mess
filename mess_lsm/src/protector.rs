@@ -1,4 +1,5 @@
 use core::ops;
+use crossbeam_utils::CachePadded;
 #[cfg(loom)]
 use loom::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -39,7 +40,7 @@ impl From<usize> for Protection {
 
 #[derive(Debug)]
 #[repr(transparent)]
-pub struct Protector(AtomicUsize);
+pub struct Protector(CachePadded<AtomicUsize>);
 
 impl Protector {
     // Hack so this can be used in array initialization.
@@ -50,7 +51,7 @@ impl Protector {
 
     #[cfg(not(loom))]
     pub const fn new() -> Self {
-        Self(AtomicUsize::new(usize::MAX))
+        Self(CachePadded::new(AtomicUsize::new(usize::MAX)))
     }
 
     #[cfg(loom)]
@@ -112,13 +113,13 @@ pub struct BorrowedProtector<'a, R: Release> {
 }
 
 impl<'a, R: Release> BorrowedProtector<'a, R> {
-    pub fn new(protector: &'a Protector, released: R) -> Self {
-        protector.protect(0);
+    pub const fn new(protector: &'a Protector, released: R) -> Self {
+        // protector.protect(0);
         Self { protector, released }
     }
 }
 
-impl<'a, R: Release + ops::Deref> ops::Deref for BorrowedProtector<'a, R> {
+impl<'a, R: Release> ops::Deref for BorrowedProtector<'a, R> {
     type Target = Protector;
 
     fn deref(&self) -> &Self::Target {
@@ -136,7 +137,6 @@ impl<'a, R: Release> Drop for BorrowedProtector<'a, R> {
 #[derive(Debug)]
 pub struct ProtectorPool<R, const N: usize> {
     protectors: [Protector; N],
-    // released: Option<Arc<(Mutex<bool>, Condvar)>>,
     released: R,
 }
 
@@ -183,10 +183,18 @@ where
     }
 
     pub fn try_get(&self) -> Option<BorrowedProtector<R>> {
-        self.protectors
-            .iter()
-            .find(|p| p.state().is_unprotected())
-            .map(|p| BorrowedProtector::new(p, self.released.clone()))
+        for p in self.protectors.iter() {
+            let acquired = p.0.compare_exchange(
+                usize::MAX,
+                0,
+                Ordering::Release,
+                Ordering::Acquire,
+            );
+            if acquired.is_ok() {
+                return Some(BorrowedProtector::new(p, self.released.clone()));
+            }
+        }
+        None
     }
 }
 
