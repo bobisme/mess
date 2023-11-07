@@ -68,7 +68,6 @@ pub struct BBPP<'a, const N: usize> {
     is_writer_leased: AtomicBool,
     ranges: Ranges<N>,
     free_ratio: f32,
-    initialized: AtomicBool,
     _mark: PhantomData<&'a ()>,
 }
 
@@ -76,32 +75,19 @@ impl<'a, const N: usize> BBPP<'a, N> {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         let released = Arc::new((Mutex::new(false), Condvar::new()));
-        Self {
+        let slf = Self {
             buf: UnsafeCell::new(MaybeUninit::uninit()),
             protectors: ProtectorPool::new(released),
             is_writer_leased: AtomicBool::new(false),
             ranges: Ranges::new(),
             free_ratio: 0.1,
-            initialized: AtomicBool::new(false),
             _mark: PhantomData,
-        }
-    }
-
-    fn initialized(&self) -> bool {
-        self.initialized.load(Ordering::Acquire)
-    }
-
-    fn init(&self) {
-        if self.initialized() {
-            return;
-        }
-        // Write a zero byte to avoid undefined behavior when
-        // handing out NonNull references.
-        let buf_start = self.buf.get().cast::<u8>();
-        unsafe {
-            buf_start.write_bytes(0u8, 1);
         };
-        self.initialized.store(true, Ordering::Release);
+        let buf_start = slf.buf.get().cast::<u8>();
+        unsafe {
+            buf_start.write_bytes(0u8, LEN_SIZE);
+        };
+        slf
     }
 
     pub fn protected_ranges(
@@ -118,7 +104,6 @@ impl<'a, const N: usize> BBPP<'a, N> {
     /// pool of protectors. It returns None if no reader available.
     /// use `new_reader_blocking` to block until a reader is available.
     pub fn new_reader(&'a self) -> Option<Reader<'a, N>> {
-        self.init();
         let protector = self.protectors.try_get()?;
         let cached_ranges = self.ranges.ranges();
         let bbpp =
@@ -141,7 +126,6 @@ impl<'a, const N: usize> BBPP<'a, N> {
     /// `try_release_writer` _must_ be called to make future writers
     /// available.
     pub fn try_writer(&self) -> Option<Writer<'a, N>> {
-        self.init();
         let res = self.is_writer_leased.compare_exchange(
             false,
             true,
@@ -250,7 +234,7 @@ impl<'a, const N: usize> Writer<'a, N> {
         // Return on anythything _except_ region full.
         match self.try_push(val) {
             Ok(_) => return Ok(Vec::new()),
-            Err(Error::RangeFull) => {}
+            Err(Error::ReserveFailed { size: _, index: _ }) => {}
             Err(err) => return Err(err),
         }
         self.bbpp_mut().ranges.split();
@@ -260,11 +244,12 @@ impl<'a, const N: usize> Writer<'a, N> {
             out_idxs.push(idx);
             match self.try_push(val) {
                 Ok(_) => return Ok(out_idxs),
-                Err(Error::RangeFull) => {}
+                Err(Error::ReserveFailed { size: _, index: _ }) => {}
                 Err(err) => return Err(err),
             }
         }
-        Err(Error::Inconceivable)
+        // Err(Error::Inconceivable)
+        Ok(out_idxs)
     }
 
     pub fn push(&mut self, val: &[u8]) -> Result<Vec<usize>> {
@@ -352,13 +337,14 @@ impl<'a, const N: usize> Reader<'a, N> {
 
     pub fn iter(&'a self) -> BBPPIterator<'a, N> {
         let head = self.bbpp().ranges.read().head.get();
-        BBPPIterator { reader: self, idx: Some(head) }
+        BBPPIterator { reader: self, idx: Some(head), cnt: 0 }
     }
 }
 
 pub struct BBPPIterator<'a, const N: usize> {
     reader: &'a Reader<'a, N>,
     idx: Option<usize>,
+    cnt: usize,
 }
 
 impl<'a, const N: usize> BBPPIterator<'a, N> {
@@ -386,7 +372,10 @@ impl<'a, const N: usize> Iterator for BBPPIterator<'a, N> {
                 item = Some(data);
                 match next {
                     n if range.contains(&n) => {
+                        // self.cnt += 1;
+                        // if self.cnt % 4 == 0 {
                         self.reader.protector.protect(n);
+                        // }
                         Some(n)
                     }
                     _ => None,
@@ -424,61 +413,43 @@ mod test_slice_tools {
     use super::*;
     use assert2::assert;
 
+    fn buf_fixture() -> UnsafeCell<MaybeUninit<[u8; 12]>> {
+        let buf = UnsafeCell::new(MaybeUninit::<[u8; 12]>::uninit());
+        let slice = unsafe { from_raw_parts_mut(buf.get().cast::<u8>(), 12) };
+        slice[..LEN_SIZE].copy_from_slice(&usize::to_ne_bytes(4)[..]);
+        let buf_ptr = buf.get().cast::<u8>();
+        unsafe {
+            *buf_ptr.add(8) = 42;
+            *buf_ptr.add(9) = 43;
+            *buf_ptr.add(10) = 44;
+            *buf_ptr.add(11) = 45;
+        }
+        buf
+    }
+
     #[test]
     fn test_read_len_at() {
-        let buf = UnsafeCell::new(MaybeUninit::<[u8; 8]>::uninit());
-        let buf_ptr = buf.get().cast::<usize>();
-        unsafe {
-            *buf_ptr.add(0) = 1;
-        }
-        assert!(read_len_at(&buf, 0) == 1);
+        let mut buf = UnsafeCell::new(MaybeUninit::<[u8; 8]>::uninit());
+        buf.get_mut().write(usize::to_ne_bytes(42));
+        assert!(read_len_at(&buf, 0) == 42);
     }
 
     #[test]
     fn test_read_at() {
-        let buf = UnsafeCell::new(MaybeUninit::<[u8; 8]>::uninit());
-        let buf_ptr = buf.get().cast::<u64>();
-        unsafe {
-            *buf_ptr.add(0) = 1;
-        }
-        let buf_ptr = buf.get().cast::<u8>();
-        unsafe {
-            *buf_ptr.add(8) = 42;
-        }
-        assert!(read_at(&buf, 0) == &[42]);
+        let buf = buf_fixture();
+        assert!(read_at(&buf, 0) == &[42, 43, 44, 45]);
     }
-
-    // #[test]
-    // #[should_panic(expected = "did not slice enough to read len")]
-    // fn test_read_len_at_panic() {
-    //     let buf = UnsafeCell::new(MaybeUninit::<[u8; 2]>::uninit());
-    //     read_len_at(&buf, 0);
-    // }
 
     #[test]
     fn test_slice_buffer() {
-        let buf = UnsafeCell::new(MaybeUninit::<[u8; 8]>::uninit());
-        let buf_ptr = buf.get().cast::<u8>();
-        unsafe {
-            *buf_ptr.add(0) = 42;
-            *buf_ptr.add(1) = 43;
-            *buf_ptr.add(2) = 44;
-            *buf_ptr.add(3) = 45;
-        }
-        assert!(slice_buffer(&buf, 1, 2) == &[43, 44]);
+        let buf = buf_fixture();
+        assert!(slice_buffer(&buf, 9, 2) == &[43, 44]);
     }
 
     #[test]
     fn test_slice_buffer_mut() {
-        let mut buf = UnsafeCell::new(MaybeUninit::<[u8; 8]>::uninit());
-        let buf_ptr = buf.get().cast::<u8>();
-        unsafe {
-            *buf_ptr.add(0) = 42;
-            *buf_ptr.add(1) = 43;
-            *buf_ptr.add(2) = 44;
-            *buf_ptr.add(3) = 45;
-        }
-        let slice = slice_buffer_mut(&mut buf, 1, 2);
+        let mut buf = buf_fixture();
+        let slice = slice_buffer_mut(&mut buf, 9, 2);
         slice[0] = 46;
         slice[1] = 47;
         assert!(slice == &[46, 47]);
@@ -494,15 +465,6 @@ mod test_bbpp {
     fn test_new() {
         let bbpp: BBPP<1024> = BBPP::new();
         assert!(!bbpp.is_writer_leased.load(Ordering::Acquire));
-        assert!(!bbpp.initialized());
-    }
-
-    #[test]
-    fn test_init() {
-        let bbpp: BBPP<1024> = BBPP::new();
-        assert!(!bbpp.initialized());
-        bbpp.init();
-        assert!(bbpp.initialized());
     }
 
     #[test]
@@ -527,7 +489,7 @@ mod test_bbpp {
 
     #[test]
     fn test_multiple_readers() {
-        let mut bbpp: BBPP<1024> = BBPP::new();
+        let bbpp: BBPP<1024> = BBPP::new();
         let reader_1 = bbpp.new_reader();
         let reader_2 = bbpp.new_reader();
         assert!(reader_1.is_some());
@@ -543,7 +505,7 @@ mod test_bbpp {
 
     #[test]
     fn test_try_writer() {
-        let mut bbpp: BBPP<1024> = BBPP::new();
+        let bbpp: BBPP<1024> = BBPP::new();
         let writer = bbpp.try_writer();
         assert!(writer.is_some());
         assert!(bbpp.is_writer_leased.load(Ordering::Acquire));
@@ -551,7 +513,7 @@ mod test_bbpp {
 
     #[test]
     fn test_release_writer() {
-        let mut bbpp: BBPP<1024> = BBPP::new();
+        let bbpp: BBPP<1024> = BBPP::new();
         let writer = bbpp.try_writer().unwrap();
         let result = bbpp.release_writer(writer);
         assert!(result.is_ok());
@@ -575,7 +537,7 @@ mod test_writer {
 
     #[test]
     fn test_push_and_pop() {
-        let mut bbpp = BBPP::<100>::new();
+        let bbpp = BBPP::<100>::new();
         let writer = bbpp.try_writer();
         assert!(writer.is_some());
         let mut writer = writer.unwrap();
@@ -591,7 +553,7 @@ mod test_writer {
     #[test]
     fn test_push_large_data() {
         const N: usize = 100;
-        let mut bbpp = BBPP::<N>::new();
+        let bbpp = BBPP::<N>::new();
         let mut writer = bbpp.try_writer().unwrap();
 
         let data = vec![1; N + 1];
@@ -600,7 +562,7 @@ mod test_writer {
 
     #[test]
     fn test_push_and_pop_multiple() {
-        let mut bbpp = BBPP::<100>::new();
+        let bbpp = BBPP::<100>::new();
         let mut writer = bbpp.try_writer().unwrap();
 
         let data1 = vec![1, 2, 3, 4, 5];
@@ -620,7 +582,7 @@ mod test_writer {
     #[test]
     fn test_push_until_full() {
         const N: usize = (8 + 5) * 5;
-        let mut bbpp = BBPP::<N>::new();
+        let bbpp = BBPP::<N>::new();
         let mut writer = bbpp.try_writer().unwrap();
 
         let data = vec![1, 2, 3, 4, 5];
@@ -644,7 +606,6 @@ mod test_reader {
 
     fn preloaded_bbpp<'a>() -> BBPP<'a, 100> {
         let mut bbpp = BBPP::new();
-        bbpp.init();
         let slice = slice_buffer_mut(&mut bbpp.buf, 0, 20);
         slice.copy_from_slice(&[
             2, 0, 0, 0, 0, 0, 0, 0, 3, 4, // 2 bytes = [3, 4]
@@ -692,7 +653,6 @@ mod test_iterator {
 
     fn preloaded_bbpp<'a>() -> BBPP<'a, 100> {
         let mut bbpp = BBPP::new();
-        bbpp.init();
         let slice = slice_buffer_mut(&mut bbpp.buf, 0, 20);
         slice.copy_from_slice(&[
             2, 0, 0, 0, 0, 0, 0, 0, 3, 4, // 2 bytes = [3, 4]
