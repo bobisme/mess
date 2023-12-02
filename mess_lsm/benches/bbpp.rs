@@ -1,7 +1,8 @@
 use assert2::assert;
+use crossbeam_utils::atomic::AtomicConsume;
 use std::{
-    sync::{Arc, Barrier},
-    time::Instant,
+    sync::{atomic::Ordering, mpsc::channel, Arc, Barrier},
+    time::{Duration, Instant},
 };
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
@@ -71,47 +72,6 @@ pub fn bbpp_benchmark(c: &mut Criterion) {
         });
     }
 
-    // for count in [1, 2, availpar] {
-    //     group.bench_function(format!("read_at_{count}_concurrent"), |b| {
-    //         let bbpp: Arc<BBPP<4_000_000>> = BBPP::new().into();
-    //         let first_len;
-    //         {
-    //             let mut seed = 0;
-    //             let mut writer = bbpp.try_writer().unwrap();
-    //             let len = rand_len(&mut seed);
-    //             writer.push(&DATA[0..len]).unwrap();
-    //             first_len = len;
-    //             for _ in 0..10_000 {
-    //                 let len = rand_len(&mut seed);
-    //                 writer.push(&DATA[0..len]).unwrap();
-    //             }
-    //             bbpp.release_writer(writer).unwrap();
-    //         }
-    //
-    //         b.iter_custom(|iters| {
-    //             let start = Instant::now();
-    //             for _i in 0..iters {
-    //                 let barrier = Arc::new(Barrier::new(count));
-    //                 let ths = (0..count).map(|_| {
-    //                     let bbpp = Arc::clone(&bbpp);
-    //                     let bar = Arc::clone(&barrier);
-    //                     std::thread::spawn(move || {
-    //                         bar.wait();
-    //                         std::thread::sleep(
-    //                             core::time::Duration::from_millis(100),
-    //                         );
-    //                         let reader = bbpp.new_reader().unwrap();
-    //                         black_box(reader.read_at(0)).map(|x| x.to_vec());
-    //                     })
-    //                 });
-    //                 ths.for_each(|th| {
-    //                     th.join().unwrap();
-    //                 });
-    //             }
-    //             start.elapsed()
-    //         });
-    //     });
-    // }
     for n_entries in [1_000, 10_000, 100_000] {
         group.bench_function(
             format!("iter_{n_entries}_entries_main_thread"),
@@ -173,6 +133,7 @@ pub fn bbpp_benchmark(c: &mut Criterion) {
 
     group.finish();
 }
+
 pub fn read_at_bench(c: &mut Criterion) {
     let availpar = std::thread::available_parallelism().unwrap().get();
     let mut group = c.benchmark_group("BBPP_read_at");
@@ -215,5 +176,137 @@ pub fn read_at_bench(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, bbpp_benchmark, read_at_bench);
+#[derive(Debug)]
+enum Op {
+    Iterate { count: usize },
+    Write { bytes: usize },
+}
+
+pub fn under_read_write_contention(c: &mut Criterion) {
+    let availpar = std::thread::available_parallelism().unwrap().get();
+    let mut group = c.benchmark_group("BBPP_contention");
+
+    for n_threads in [1, 2, availpar] {
+        group.bench_function(
+            format!("contention_1_writer_{n_threads}_readers").as_str(),
+            move |b| {
+                let bbpp: Arc<BBPP<4_000_000>> = BBPP::new().into();
+                {
+                    let mut seed = 0;
+                    let mut writer = bbpp.try_writer().unwrap();
+                    let len = rand_len(&mut seed);
+                    writer.push(&DATA[0..len]).unwrap();
+                    for _ in 0..1_000 {
+                        let len = rand_len(&mut seed);
+                        writer.push(&DATA[0..len]).unwrap();
+                    }
+                    bbpp.release_writer(writer).unwrap();
+                }
+
+                b.iter_custom(|iters| {
+                    let nanos = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                    let (send, recv) = channel();
+                    for _ in 0..iters {
+                        // readers
+                        let mut ths: Vec<_> = (0..n_threads)
+                            .map(|_| {
+                                let bbpp = Arc::clone(&bbpp);
+                                let nanos = Arc::clone(&nanos);
+                                let send = send.clone();
+                                std::thread::spawn(move || {
+                                    let start = Instant::now();
+                                    for _ in 0..10 {
+                                        let reader = bbpp.new_reader().unwrap();
+                                        let count =
+                                            black_box(reader.iter().count());
+                                        send.send(Op::Iterate { count })
+                                            .unwrap();
+                                        std::thread::sleep(
+                                            Duration::from_micros(100),
+                                        );
+                                    }
+                                    nanos.fetch_add(
+                                        start.elapsed().as_nanos() as u64,
+                                        Ordering::Relaxed,
+                                    );
+                                })
+                            })
+                            .collect();
+                        // writers
+                        {
+                            let mut seed = 0;
+                            let bbpp = Arc::clone(&bbpp);
+                            let nanos = Arc::clone(&nanos);
+                            let send = send.clone();
+                            ths.push(std::thread::spawn(move || {
+                                for _ in 0..10 {
+                                    let start = Instant::now();
+                                    let mut writer = loop {
+                                        if let Some(writer) = bbpp.try_writer()
+                                        {
+                                            break writer;
+                                        };
+                                        std::hint::spin_loop();
+                                    };
+                                    for _ in 0..10 {
+                                        let len = rand_len(&mut seed);
+                                        writer
+                                            .push(black_box(&DATA[0..len]))
+                                            .unwrap();
+                                        send.send(Op::Write { bytes: len })
+                                            .unwrap();
+                                    }
+                                    bbpp.release_writer(writer).unwrap();
+                                    nanos.fetch_add(
+                                        start.elapsed().as_nanos() as u64,
+                                        Ordering::Relaxed,
+                                    );
+                                    std::thread::sleep(Duration::from_micros(
+                                        100,
+                                    ));
+                                }
+                            }));
+                        }
+                        for th in ths {
+                            th.join().unwrap();
+                        }
+                    }
+                    drop(send);
+                    let mut total_iters = 0;
+                    let mut total_iter_count = 0;
+                    let mut total_writes = 0;
+                    let mut total_writes_bytes = 0;
+                    for op in recv {
+                        match op {
+                            Op::Iterate { count } => {
+                                total_iters += 1;
+                                total_iter_count += count;
+                            }
+                            Op::Write { bytes } => {
+                                total_writes += 1;
+                                total_writes_bytes += bytes;
+                            }
+                        }
+                    }
+                    println!(
+                        r#"
+                    bench_iters={iters},
+                    total_iters={total_iters},
+                    total_iter_count={total_iter_count},
+                    total_writes={total_writes},
+                    total_writes_bytes={total_writes_bytes}"#
+                    );
+                    Duration::from_nanos(nanos.load_consume())
+                });
+            },
+        );
+    }
+}
+
+criterion_group!(
+    benches,
+    bbpp_benchmark,
+    read_at_bench,
+    under_read_write_contention
+);
 criterion_main!(benches);
