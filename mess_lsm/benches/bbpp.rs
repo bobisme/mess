@@ -29,20 +29,44 @@ fn rand_loop_count(seed: &mut u64) -> usize {
 
 pub fn bbpp_benchmark(c: &mut Criterion) {
     let availpar = std::thread::available_parallelism().unwrap().get();
-    let bbpp = BBPP::<1024>::new();
 
     let mut group = c.benchmark_group("BBPP");
 
-    for count in [1, 2, availpar] {
-        group.bench_function(format!("write_{count}"), |b| {
+    group.bench_function("push", |b| {
+        let bbpp = BBPP::<1024>::new();
+        let mut seed = 0;
+        b.iter(|| {
+            let mut writer = bbpp.try_writer().unwrap();
+            let len = rand_len(&mut seed);
+            writer.push(black_box(&DATA[0..len])).unwrap();
+            bbpp.release_writer(writer).unwrap();
+        });
+    });
+
+    for n_threads in [1, 2, availpar] {
+        group.bench_function(format!("push_{n_threads}_threads"), move |b| {
             let mut seed = 0;
             b.iter(|| {
-                let mut writer = bbpp.try_writer().unwrap();
-                for _ in 0..count {
-                    let len = rand_len(&mut seed);
-                    writer.push(black_box(&DATA[0..len])).unwrap();
+                let bbpp = Arc::new(BBPP::<1024>::new());
+                let ths: Vec<_> = (0..n_threads)
+                    .map(|_| {
+                        let bbpp = Arc::clone(&bbpp);
+                        std::thread::spawn(move || {
+                            let mut writer = loop {
+                                if let Some(writer) = bbpp.try_writer() {
+                                    break writer;
+                                };
+                                std::hint::spin_loop();
+                            };
+                            let len = rand_len(&mut seed);
+                            writer.push(black_box(&DATA[0..len])).unwrap();
+                            bbpp.release_writer(writer).unwrap();
+                        })
+                    })
+                    .collect();
+                for th in ths {
+                    th.join().unwrap();
                 }
-                bbpp.release_writer(writer).unwrap();
             });
         });
     }

@@ -225,7 +225,7 @@ where
         // Nothing we can really do about these checks, sadly.
         let required_cap =
             len.checked_add(additional).ok_or_else(capacity_overflow).unwrap();
-        if required_cap > N {
+        if len > N {
             return Err(Error::CapacityOverLimit {
                 cap: required_cap,
                 limit: N,
@@ -356,6 +356,7 @@ impl<'a, const N: usize> Writer<'a, N> {
             }
         }?;
         if start + len > cap {
+            // dbg!(start, len, cap);
             self.bbpp_mut().grow_amortized(cap, len)?;
         }
         let cap = self.bbpp().cap;
