@@ -11,9 +11,12 @@ use std::sync::{
 };
 //
 use std::{
+    alloc::{GlobalAlloc, Layout, LayoutError, System},
     cell::UnsafeCell,
+    cmp,
+    collections::TryReserveError,
     marker::PhantomData,
-    mem::MaybeUninit,
+    mem::{self, MaybeUninit},
     ptr::NonNull,
     slice::{from_raw_parts, from_raw_parts_mut},
 };
@@ -29,74 +32,125 @@ use crate::{
 const LEN_SIZE: usize = core::mem::size_of::<usize>();
 const FREE_RATIO: f32 = 0.1;
 
-type InnerBuf<const N: usize> = UnsafeCell<MaybeUninit<[u8; N]>>;
+type InnerBuf<const N: usize> = UnsafeCell<MaybeUninit<NonNull<u8>>>;
 type ArcMutCond = Arc<(Mutex<bool>, Condvar)>;
 
 #[inline(always)]
-fn buf_start<const N: usize>(buf: &InnerBuf<N>) -> *mut u8 {
-    buf.get().cast::<u8>()
+const fn buf_start(buf: &NonNull<u8>) -> *mut u8 {
+    buf.as_ptr()
 }
 
 #[inline(always)]
-fn slice_buffer_mut<const N: usize>(
-    buf: &mut InnerBuf<N>,
+fn slice_buffer_mut(
+    buf: &mut NonNull<u8>,
     offset: usize,
     len: usize,
+    cap: usize,
 ) -> &mut [u8] {
+    if offset + len > cap {
+        panic!("tried to get a mut slice beyond allocated memory");
+    }
     unsafe { from_raw_parts_mut(buf_start(buf).add(offset), len) }
 }
 
 #[inline(always)]
-fn slice_buffer<const N: usize>(
-    buf: &InnerBuf<N>,
+fn slice_buffer(
+    buf: &NonNull<u8>,
     offset: usize,
     len: usize,
+    cap: usize,
 ) -> &[u8] {
+    if offset + len > cap {
+        panic!("tried to get a slice beyond allocated memory");
+    }
     unsafe { from_raw_parts(buf_start(buf).add(offset), len) }
 }
 
 #[inline(always)]
-fn read_len_at<const N: usize>(buf: &InnerBuf<N>, offset: usize) -> usize {
-    let len_bytes = slice_buffer(buf, offset, LEN_SIZE);
+fn read_len_at(buf: &NonNull<u8>, offset: usize, cap: usize) -> usize {
+    let len_bytes = slice_buffer(buf, offset, LEN_SIZE, cap);
     usize::from_ne_bytes(
         len_bytes.try_into().expect("did not slice enough to read len"),
     )
 }
 
 #[inline(always)]
-fn read_at<const N: usize>(buf: &InnerBuf<N>, offset: usize) -> &[u8] {
-    let len = read_len_at(buf, offset);
-    slice_buffer(buf, LEN_SIZE + offset, len)
+fn read_at(buf: &NonNull<u8>, offset: usize, cap: usize) -> &[u8] {
+    let len = read_len_at(buf, offset, cap);
+    slice_buffer(buf, LEN_SIZE + offset, len, cap)
 }
 
-pub struct BBPP<'a, const N: usize> {
-    buf: UnsafeCell<MaybeUninit<[u8; N]>>,
+/// Panics.
+fn check_capacity(capacity: usize, max_capacity: usize) {
+    if capacity > max_capacity
+        || usize::BITS < 64 && capacity > isize::MAX as usize
+    {
+        capacity_overflow();
+    }
+}
+
+#[inline(never)]
+fn finish_grow<A>(
+    new_layout: core::result::Result<Layout, LayoutError>,
+    current_memory: Option<(NonNull<u8>, Layout)>,
+    max_capacity: usize,
+    alloc: &mut A,
+) -> core::result::Result<NonNull<u8>, TryReserveError>
+where
+    A: GlobalAlloc,
+{
+    // Check for the error here to minimize the size of `RawVec::grow_*`.
+    let new_layout = new_layout.unwrap_or_else(|_| capacity_overflow());
+    let new_size = new_layout.size();
+
+    check_capacity(new_size, max_capacity);
+
+    let memory = if let Some((ptr, old_layout)) = current_memory {
+        debug_assert_eq!(old_layout.align(), new_layout.align());
+        unsafe {
+            // The allocator checks for alignment equality
+            // core::intrinsics::assume(old_layout.align() == new_layout.align());
+            alloc.realloc(ptr.as_ptr(), new_layout, new_size)
+        }
+    } else {
+        unsafe { alloc.alloc(new_layout) }
+    };
+    Ok(NonNull::new(memory.cast()).expect("allocation error"))
+}
+
+#[cfg(not(no_global_oom_handling))]
+#[cfg_attr(not(feature = "panic_immediate_abort"), inline(never))]
+fn capacity_overflow() -> ! {
+    panic!("capacity overflow");
+}
+
+pub struct BBPP<'a, const N: usize, A: GlobalAlloc = System> {
+    ptr: NonNull<u8>,
+    cap: usize,
+    alloc: A,
     // protectors: ProtectorPool<ArcMutCond, 64>,
     protectors: ProtectorPool<(), 64>,
     is_writer_leased: AtomicBool,
     ranges: Ranges<N>,
     free_threshold: usize,
-    _mark: PhantomData<&'a ()>,
+    _mark: PhantomData<&'a A>,
 }
 
-impl<'a, const N: usize> BBPP<'a, N> {
+impl<'a, const N: usize> BBPP<'a, N, System> {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        // let released = Arc::new((Mutex::new(false), Condvar::new()));
-        let slf = Self {
-            buf: UnsafeCell::new(MaybeUninit::uninit()),
-            // protectors: ProtectorPool::new(released),
-            protectors: ProtectorPool::new(()),
-            is_writer_leased: AtomicBool::new(false),
-            ranges: Ranges::new(),
-            free_threshold: ((N as f32) * FREE_RATIO).round() as usize,
-            _mark: PhantomData,
-        };
-        let buf_start = slf.buf.get().cast::<u8>();
-        unsafe {
-            buf_start.write_bytes(0u8, LEN_SIZE);
-        };
-        slf
+        Self::allocate_in(8, System)
+    }
+}
+
+impl<'a, A, const N: usize> BBPP<'a, N, A>
+where
+    A: GlobalAlloc,
+{
+    const MIN_NON_ZERO_CAP: usize = 8;
+
+    pub fn new_in(alloc: A) -> Self {
+        Self::allocate_in(8, alloc)
     }
 
     pub fn protected_ranges(
@@ -163,9 +217,81 @@ impl<'a, const N: usize> BBPP<'a, N> {
     pub fn is_below_ratio(&self) -> bool {
         (N - self.ranges.size()) < self.free_threshold
     }
+
+    fn grow_amortized(&mut self, len: usize, additional: usize) -> Result<()> {
+        // This is ensured by the calling contexts.
+        debug_assert!(additional > 0);
+
+        // Nothing we can really do about these checks, sadly.
+        let required_cap =
+            len.checked_add(additional).ok_or_else(capacity_overflow).unwrap();
+        if required_cap > N {
+            return Err(Error::CapacityOverLimit {
+                cap: required_cap,
+                limit: N,
+            });
+        }
+
+        // This guarantees exponential growth. The doubling cannot overflow
+        // because `cap <= isize::MAX` and the type of `cap` is `usize`.
+        let cap = cmp::max(self.cap * 2, required_cap);
+        let cap = cmp::max(Self::MIN_NON_ZERO_CAP, cap);
+        let cap = cmp::min(N, cap);
+
+        let new_layout = Layout::array::<u8>(cap);
+
+        let ptr =
+            finish_grow(new_layout, self.current_memory(), N, &mut self.alloc)?;
+        self.set_ptr_and_cap(ptr, cap);
+        Ok(())
+    }
+
+    const fn current_memory(&self) -> Option<(NonNull<u8>, Layout)> {
+        if self.cap == 0 {
+            return None;
+        }
+        // We could use Layout::array here which ensures the absence of isize and usize overflows
+        // and could hypothetically handle differences between stride and size, but this memory
+        // has already been allocated so we know it can't overflow and currently rust does not
+        // support such types. So we can do better by skipping some checks and avoid an unwrap.
+        const _: () =
+            assert!(mem::size_of::<u8>() % mem::align_of::<u8>() == 0);
+        unsafe {
+            let align = mem::align_of::<u8>();
+            let size = mem::size_of::<u8>() * self.cap;
+            let layout = Layout::from_size_align_unchecked(size, align);
+            Some((self.ptr, layout))
+        }
+    }
+
+    fn set_ptr_and_cap(&mut self, ptr: NonNull<u8>, cap: usize) {
+        self.ptr = unsafe { NonNull::new_unchecked(ptr.cast().as_ptr()) };
+        self.cap = cap;
+    }
+
+    fn allocate_in(capacity: usize, alloc: A) -> Self {
+        let layout = match Layout::array::<u8>(capacity) {
+            Ok(layout) => layout,
+            Err(_) => capacity_overflow(),
+        };
+        check_capacity(capacity, N);
+        let ptr = unsafe { alloc.alloc(layout) };
+        Self {
+            ptr: NonNull::new(ptr).expect("could not allocate for BBPP"),
+            cap: 0,
+            alloc,
+            // protectors: ProtectorPool::new(released),
+            protectors: ProtectorPool::new(()),
+            is_writer_leased: AtomicBool::new(false),
+            ranges: Ranges::new(),
+            free_threshold: ((N as f32) * FREE_RATIO).round() as usize,
+            _mark: PhantomData,
+        }
+    }
 }
 
 unsafe impl<const N: usize> Sync for BBPP<'_, N> {}
+unsafe impl<const N: usize> Send for BBPP<'_, N> {}
 
 const _: () = {
     const fn is_send<T: Send>() {}
@@ -205,15 +331,12 @@ impl<'a, const N: usize> Writer<'a, N> {
         if len >= N {
             return Err(Error::EntryLargerThanBuffer);
         }
-        match self.bbpp().ranges.refs() {
+        let cap = self.bbpp().cap;
+        let start = match self.bbpp().ranges.refs() {
             RangeRefs::One(reg) => {
                 let range = reg.range();
                 match range.end + len {
-                    end if end <= N => Ok(slice_buffer_mut(
-                        &mut self.bbpp_mut().buf,
-                        range.end,
-                        len,
-                    )),
+                    end if end <= N => Ok(range.end),
                     _ => Err(Error::ReserveFailed {
                         size: len,
                         index: range.end,
@@ -224,18 +347,19 @@ impl<'a, const N: usize> Writer<'a, N> {
                 let write_range = write.range();
                 let read_range = read.range();
                 match write_range.end + len {
-                    end if end <= read_range.start => Ok(slice_buffer_mut(
-                        &mut self.bbpp_mut().buf,
-                        write_range.end,
-                        len,
-                    )),
+                    end if end <= read_range.start => Ok(write_range.end),
                     _ => Err(Error::ReserveFailed {
                         size: len,
                         index: write_range.end,
                     }),
                 }
             }
+        }?;
+        if start + len > cap {
+            self.bbpp_mut().grow_amortized(cap, len)?;
         }
+        let cap = self.bbpp().cap;
+        Ok(slice_buffer_mut(&mut self.bbpp_mut().ptr, start, len, cap))
     }
 
     fn push_one(&mut self, val: &[u8]) -> Result<Vec<usize>> {
@@ -275,12 +399,13 @@ impl<'a, const N: usize> Writer<'a, N> {
     /// Returns popped index.
     pub fn try_pop(&mut self) -> Option<usize> {
         let bip = self.bbpp();
+        let cap = bip.cap;
         let reg = bip.ranges.read();
         let range = reg.range();
         if range.is_empty() {
             return None;
         }
-        let len = read_len_at(&bip.buf, range.start);
+        let len = read_len_at(&bip.ptr, range.start, cap);
         // let data = self.slice_buffer(range.start + LEN_SIZE, len);
         self.bbpp_mut().ranges.shrink(LEN_SIZE + len).ok()?;
         Some(range.start)
@@ -288,12 +413,14 @@ impl<'a, const N: usize> Writer<'a, N> {
 
     pub fn pop_blocking(&mut self) -> Option<usize> {
         // let protected_ranges = bip.protected_ranges();
-        let reg = self.bbpp().ranges.read();
+        let bip = self.bbpp();
+        let reg = bip.ranges.read();
+        let cap = bip.cap;
         let range = reg.range();
         if range.is_empty() {
             return None;
         }
-        let len = read_len_at(&self.bbpp().buf, range.start);
+        let len = read_len_at(&self.bbpp().ptr, range.start, cap);
         let end_index = range.start + LEN_SIZE + len;
         self.bbpp_mut().ranges.shrink(LEN_SIZE + len).ok()?;
         while let Some(r) =
@@ -328,14 +455,28 @@ where
         unsafe { self.bbpp.as_ref() }
     }
 
-    pub fn is_index_valid(&self, index: usize) -> bool {
-        if self.cached_ranges.1.contains(&index) {
-            return true;
+    pub const fn cap(&self) -> usize {
+        self.bbpp().cap
+    }
+
+    pub fn check_index(&self, index: usize) -> Result<usize> {
+        let idx_len_end_idx = index + LEN_SIZE;
+        let cap = self.cap();
+        if idx_len_end_idx > cap {
+            return Err(Error::LengthBeyondCap { cap, idx: index });
+        }
+        let range_1 = &self.cached_ranges.1;
+        if range_1.contains(&index) && range_1.contains(&idx_len_end_idx) {
+            return Ok(index);
         }
         let Some(range) = &self.cached_ranges.0 else {
-            return false;
+            return Err(Error::Inconceivable);
         };
-        range.contains(&index)
+        if range.contains(&index) && range.contains(&idx_len_end_idx) {
+            Ok(index)
+        } else {
+            Err(Error::IndexOutOfRange { idx: index })
+        }
     }
 
     pub const fn range_refs(&'a self) -> RangeRefs<'a> {
@@ -343,10 +484,10 @@ where
     }
 
     pub fn read_at(&'a self, offset: usize) -> Option<&'a [u8]> {
-        if !self.is_index_valid(offset) {
-            return None;
-        }
-        Some(read_at(&self.bbpp().buf, offset))
+        self.check_index(offset).ok()?;
+        let bbpp = self.bbpp();
+        let cap = bbpp.cap;
+        Some(read_at(&bbpp.ptr, offset, cap))
     }
 
     pub const fn iter(&'a self) -> BBPPIterator<'a, R, N> {
@@ -367,6 +508,7 @@ impl<'a, R, const N: usize> BBPPIterator<'a, R, N>
 where
     R: Release,
 {
+    const UPDATE_INTERVAL: usize = 8;
     /// Convenience function that sets internal index to None
     /// and always returns None.
     fn end(&mut self) -> Option<<Self as Iterator>::Item> {
@@ -433,43 +575,51 @@ mod test_slice_tools {
     use super::*;
     use assert2::assert;
 
-    fn buf_fixture() -> UnsafeCell<MaybeUninit<[u8; 12]>> {
-        let buf = UnsafeCell::new(MaybeUninit::<[u8; 12]>::uninit());
-        let slice = unsafe { from_raw_parts_mut(buf.get().cast::<u8>(), 12) };
+    const FIXTURE_CAP: usize = 12;
+
+    fn buf_fixture() -> NonNull<u8> {
+        let layout = Layout::array::<u8>(FIXTURE_CAP).unwrap();
+        let ptr = unsafe { System.alloc(layout) };
+        let buf = NonNull::new(ptr).unwrap();
+        let slice = unsafe {
+            from_raw_parts_mut(buf.cast::<u8>().as_ptr(), FIXTURE_CAP)
+        };
         slice[..LEN_SIZE].copy_from_slice(&usize::to_ne_bytes(4)[..]);
-        let buf_ptr = buf.get().cast::<u8>();
+        let buf_ptr = buf.cast::<u8>();
         unsafe {
-            *buf_ptr.add(8) = 42;
-            *buf_ptr.add(9) = 43;
-            *buf_ptr.add(10) = 44;
-            *buf_ptr.add(11) = 45;
+            *buf_ptr.as_ptr().add(8) = 42;
+            *buf_ptr.as_ptr().add(9) = 43;
+            *buf_ptr.as_ptr().add(10) = 44;
+            *buf_ptr.as_ptr().add(11) = 45;
         }
         buf
     }
 
     #[test]
     fn test_read_len_at() {
-        let mut buf = UnsafeCell::new(MaybeUninit::<[u8; 8]>::uninit());
-        buf.get_mut().write(usize::to_ne_bytes(42));
-        assert!(read_len_at(&buf, 0) == 42);
+        let layout = Layout::array::<u8>(64).unwrap();
+        let ptr = unsafe { System.alloc(layout) };
+        let buf = NonNull::new(ptr).unwrap();
+        unsafe { buf.as_ptr().cast::<[u8; 8]>().write(usize::to_ne_bytes(42)) };
+        assert!(read_len_at(&buf, 0, 64) == 42);
     }
 
     #[test]
     fn test_read_at() {
         let buf = buf_fixture();
-        assert!(read_at(&buf, 0) == &[42, 43, 44, 45]);
+        assert!(read_at(&buf, 0, FIXTURE_CAP) == &[42, 43, 44, 45]);
     }
 
     #[test]
     fn test_slice_buffer() {
         let buf = buf_fixture();
-        assert!(slice_buffer(&buf, 9, 2) == &[43, 44]);
+        assert!(slice_buffer(&buf, 9, 2, FIXTURE_CAP) == &[43, 44]);
     }
 
     #[test]
     fn test_slice_buffer_mut() {
         let mut buf = buf_fixture();
-        let slice = slice_buffer_mut(&mut buf, 9, 2);
+        let slice = slice_buffer_mut(&mut buf, 9, 2, FIXTURE_CAP);
         slice[0] = 46;
         slice[1] = 47;
         assert!(slice == &[46, 47]);
@@ -628,7 +778,8 @@ mod test_reader {
 
     fn preloaded_bbpp<'a>() -> BBPP<'a, 100> {
         let mut bbpp = BBPP::new();
-        let slice = slice_buffer_mut(&mut bbpp.buf, 0, 20);
+        bbpp.grow_amortized(0, 20).unwrap();
+        let slice = slice_buffer_mut(&mut bbpp.ptr, 0, 20, 20);
         slice.copy_from_slice(&[
             2, 0, 0, 0, 0, 0, 0, 0, 3, 4, // 2 bytes = [3, 4]
             2, 0, 0, 0, 0, 0, 0, 0, 1, 2, // 2 bytes = [1, 2]
@@ -641,14 +792,50 @@ mod test_reader {
         bbpp
     }
 
-    #[test]
-    fn test_is_index_valid() {
-        let bbpp = BBPP::<100>::new();
-        let mut reader = bbpp.new_reader().unwrap();
-        reader.cached_ranges = (Some(0..10), 10..20);
-        assert!(reader.is_index_valid(5));
-        assert!(reader.is_index_valid(15));
-        assert!(!reader.is_index_valid(25));
+    #[cfg(test)]
+    mod check_index {
+        use super::*;
+        use assert2::assert;
+        use rstest::*;
+
+        #[rstest]
+        fn it_is_valid_if_within_ranges() {
+            let mut bbpp = BBPP::<100>::new();
+            bbpp.cap = 100;
+            let mut reader = bbpp.new_reader().unwrap();
+            reader.cached_ranges = (Some(0..20), 30..60);
+            assert!(reader.check_index(10) == Ok(10));
+        }
+
+        #[rstest]
+        fn the_index_and_len_bytes_must_be_in_range() {
+            let mut bbpp = BBPP::<100>::new();
+            bbpp.cap = 100;
+            let mut reader = bbpp.new_reader().unwrap();
+            reader.cached_ranges = (Some(0..20), 30..60);
+            assert!(reader.check_index(11) == Ok(11));
+            assert!(
+                reader.check_index(12)
+                    == Err(Error::IndexOutOfRange { idx: 12 })
+            );
+            assert!(
+                reader.check_index(29)
+                    == Err(Error::IndexOutOfRange { idx: 29 })
+            );
+        }
+
+        #[rstest]
+        fn it_is_invalid_if_len_larger_than_cap() {
+            let mut bbpp = BBPP::<100>::new();
+            bbpp.cap = 50;
+            let mut reader = bbpp.new_reader().unwrap();
+            reader.cached_ranges = (Some(0..10), 10..51);
+            assert!(reader.check_index(42) == Ok(42));
+            assert!(
+                reader.check_index(50)
+                    == Err(Error::LengthBeyondCap { cap: 50, idx: 50 })
+            );
+        }
     }
 
     #[test]
@@ -675,7 +862,8 @@ mod test_iterator {
 
     fn preloaded_bbpp<'a>() -> BBPP<'a, 100> {
         let mut bbpp = BBPP::new();
-        let slice = slice_buffer_mut(&mut bbpp.buf, 0, 20);
+        bbpp.grow_amortized(0, 20).unwrap();
+        let slice = slice_buffer_mut(&mut bbpp.ptr, 0, 20, 20);
         slice.copy_from_slice(&[
             2, 0, 0, 0, 0, 0, 0, 0, 3, 4, // 2 bytes = [3, 4]
             2, 0, 0, 0, 0, 0, 0, 0, 1, 2, // 2 bytes = [1, 2]
@@ -689,7 +877,7 @@ mod test_iterator {
     }
 
     #[test]
-    fn test_bbp_iterator() {
+    fn test_bbpp_iterator() {
         let bbpp = preloaded_bbpp();
         let reader = bbpp.new_reader().unwrap();
         let mut iterator = reader.iter();
@@ -700,7 +888,7 @@ mod test_iterator {
     }
 
     #[test]
-    fn test_bbp_iterator_end() {
+    fn test_bbpp_iterator_end() {
         let bbpp = preloaded_bbpp();
         let reader = bbpp.new_reader().unwrap();
         let mut iterator = reader.iter();

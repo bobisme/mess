@@ -33,7 +33,7 @@ pub fn bbpp_benchmark(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("BBPP");
 
-    for count in [1, 16, 32] {
+    for count in [1, 2, availpar] {
         group.bench_function(format!("write_{count}"), |b| {
             let mut seed = 0;
             b.iter(|| {
@@ -88,13 +88,35 @@ pub fn bbpp_benchmark(c: &mut Criterion) {
     //         });
     //     });
     // }
+    for n_entries in [1_000, 10_000, 100_000] {
+        group.bench_function(
+            format!("iter_{n_entries}_entries_main_thread"),
+            |b| {
+                let bbpp: Arc<BBPP<40_000_000>> = BBPP::new().into();
+                let instant = Instant::now();
+                let mut writer = bbpp.try_writer().unwrap();
+                let mut seed = instant.elapsed().as_nanos() as u64;
+                for _ in 0..n_entries {
+                    let len = rand_len(&mut seed);
+                    let popped = writer.push(&DATA[0..len]).unwrap();
+                    assert!(popped.len() == 0);
+                }
+                bbpp.release_writer(writer).unwrap();
+
+                b.iter(|| {
+                    let reader = bbpp.new_reader().unwrap();
+                    black_box(reader.iter().count())
+                });
+            },
+        );
+    }
 
     for n_threads in [1, 2, availpar] {
         for n_entries in [1_000, 10_000, 100_000] {
             group.bench_function(
                 format!("iter_{n_entries}_entries_{n_threads}_threads"),
                 |b| {
-                    let bbpp: Arc<BBPP<4_000_000>> = BBPP::new().into();
+                    let bbpp: Arc<BBPP<40_000_000>> = BBPP::new().into();
                     let instant = Instant::now();
                     let mut writer = bbpp.try_writer().unwrap();
                     let mut seed = instant.elapsed().as_nanos() as u64;
