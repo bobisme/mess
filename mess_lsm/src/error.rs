@@ -6,6 +6,8 @@ pub enum Error {
     ZeroVecError(zerovec::ZeroVecError),
     #[error(transparent)]
     PostcardError(#[from] postcard::Error),
+    #[error(transparent)]
+    TryReserveError(#[from] std::collections::TryReserveError),
     // #[error(transparent)]
     // BincodeError(#[from] bincode::Error),
     #[error("invalid block header")]
@@ -36,6 +38,14 @@ pub enum Error {
     WriterBlocked,
     #[error("can't release writer; not from this BBPP")]
     NotOwnWriter,
+    #[error("requested capacity overflows bounds")]
+    CapacityOverflow,
+    #[error("requested capacity over limit: requested={cap}, limit={limit}")]
+    CapacityOverLimit { cap: usize, limit: usize },
+    #[error("beyond capacity: index {idx} + 8 > capacity {cap}")]
+    LengthBeyondCap { cap: usize, idx: usize },
+    #[error("index {idx} not inside active ranges")]
+    IndexOutOfRange { idx: usize },
     #[error("...inconceivable...")]
     Inconceivable,
 }
