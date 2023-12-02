@@ -1,4 +1,8 @@
-use std::sync::Arc;
+use assert2::assert;
+use std::{
+    sync::{Arc, Barrier},
+    time::Instant,
+};
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
@@ -24,11 +28,12 @@ fn rand_loop_count(seed: &mut u64) -> usize {
 }
 
 pub fn bbpp_benchmark(c: &mut Criterion) {
+    let availpar = std::thread::available_parallelism().unwrap().get();
     let bbpp = BBPP::<1024>::new();
 
     let mut group = c.benchmark_group("BBPP");
 
-    for count in [1, 2 /*, 4, 8, 16*/] {
+    for count in [1, 16, 32] {
         group.bench_function(format!("write_{count}"), |b| {
             let mut seed = 0;
             b.iter(|| {
@@ -42,31 +47,127 @@ pub fn bbpp_benchmark(c: &mut Criterion) {
         });
     }
 
-    for count in [1, 2, 4] {
-        group.bench_function(format!("read_{count}_concurrent"), |b| {
-            let bbpp: Arc<BBPP<4_000_000>> = BBPP::new().into();
-            let mut seed = 0;
-            let mut writer = bbpp.try_writer().unwrap();
-            for _ in 0..10_000 {
-                let len = rand_len(&mut seed);
-                writer.push(black_box(&DATA[0..len])).unwrap();
-            }
-            bbpp.release_writer(writer).unwrap();
-            b.iter(|| {
-                let ths = (0..count).map(|_| {
-                    let bbpp = Arc::clone(&bbpp);
-                    std::thread::spawn(move || {
-                        let reader = bbpp.new_reader().unwrap();
-                        black_box(reader.iter().count())
-                    })
-                });
-                ths.for_each(|th| assert!(th.join().unwrap() == 10_000));
-            });
-        });
+    // for count in [1, 2, availpar] {
+    //     group.bench_function(format!("read_at_{count}_concurrent"), |b| {
+    //         let bbpp: Arc<BBPP<4_000_000>> = BBPP::new().into();
+    //         let first_len;
+    //         {
+    //             let mut seed = 0;
+    //             let mut writer = bbpp.try_writer().unwrap();
+    //             let len = rand_len(&mut seed);
+    //             writer.push(&DATA[0..len]).unwrap();
+    //             first_len = len;
+    //             for _ in 0..10_000 {
+    //                 let len = rand_len(&mut seed);
+    //                 writer.push(&DATA[0..len]).unwrap();
+    //             }
+    //             bbpp.release_writer(writer).unwrap();
+    //         }
+    //
+    //         b.iter_custom(|iters| {
+    //             let start = Instant::now();
+    //             for _i in 0..iters {
+    //                 let barrier = Arc::new(Barrier::new(count));
+    //                 let ths = (0..count).map(|_| {
+    //                     let bbpp = Arc::clone(&bbpp);
+    //                     let bar = Arc::clone(&barrier);
+    //                     std::thread::spawn(move || {
+    //                         bar.wait();
+    //                         std::thread::sleep(
+    //                             core::time::Duration::from_millis(100),
+    //                         );
+    //                         let reader = bbpp.new_reader().unwrap();
+    //                         black_box(reader.read_at(0)).map(|x| x.to_vec());
+    //                     })
+    //                 });
+    //                 ths.for_each(|th| {
+    //                     th.join().unwrap();
+    //                 });
+    //             }
+    //             start.elapsed()
+    //         });
+    //     });
+    // }
+
+    for n_threads in [1, 2, availpar] {
+        for n_entries in [1_000, 10_000, 100_000] {
+            group.bench_function(
+                format!("iter_{n_entries}_entries_{n_threads}_threads"),
+                |b| {
+                    let bbpp: Arc<BBPP<4_000_000>> = BBPP::new().into();
+                    let instant = Instant::now();
+                    let mut writer = bbpp.try_writer().unwrap();
+                    let mut seed = instant.elapsed().as_nanos() as u64;
+                    for _ in 0..n_entries {
+                        let len = rand_len(&mut seed);
+                        let popped = writer.push(&DATA[0..len]).unwrap();
+                        assert!(popped.len() == 0);
+                    }
+                    bbpp.release_writer(writer).unwrap();
+
+                    b.iter(|| {
+                        let ths: Vec<_> = (0..n_threads)
+                            .map(|_| {
+                                let bbpp = Arc::clone(&bbpp);
+                                std::thread::spawn(move || {
+                                    let reader = bbpp.new_reader().unwrap();
+                                    black_box(reader.iter().count())
+                                })
+                            })
+                            .collect();
+                        for th in ths {
+                            let result = th.join().unwrap();
+                            assert!(result == n_entries);
+                        }
+                    });
+                },
+            );
+        }
     }
 
     group.finish();
 }
+pub fn read_at_bench(c: &mut Criterion) {
+    let availpar = std::thread::available_parallelism().unwrap().get();
+    let mut group = c.benchmark_group("BBPP_read_at");
 
-criterion_group!(benches, bbpp_benchmark);
+    for n_threads in [1, 2, availpar] {
+        group.bench_function(
+            format!("read_at_{n_threads}_concurrent").as_str(),
+            move |b| {
+                let bbpp: Arc<BBPP<4_000_000>> = BBPP::new().into();
+                {
+                    let mut seed = 0;
+                    let mut writer = bbpp.try_writer().unwrap();
+                    let len = rand_len(&mut seed);
+                    writer.push(&DATA[0..len]).unwrap();
+                    // first_len = len;
+                    for _ in 0..10_000 {
+                        let len = rand_len(&mut seed);
+                        writer.push(&DATA[0..len]).unwrap();
+                    }
+                    bbpp.release_writer(writer).unwrap();
+                }
+
+                b.iter(|| {
+                    let ths: Vec<_> = (0..n_threads)
+                        .map(|_| {
+                            let bbpp = Arc::clone(&bbpp);
+                            std::thread::spawn(move || {
+                                let reader = bbpp.new_reader().unwrap();
+                                black_box(reader.read_at(0))
+                                    .map(|x| x.to_vec());
+                            })
+                        })
+                        .collect();
+                    for th in ths {
+                        th.join().unwrap();
+                    }
+                });
+            },
+        );
+    }
+}
+
+criterion_group!(benches, bbpp_benchmark, read_at_bench);
 criterion_main!(benches);

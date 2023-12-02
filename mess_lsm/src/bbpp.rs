@@ -22,13 +22,15 @@ use parking_lot::{Condvar, Mutex};
 
 use crate::{
     error::{Error, Result},
-    protector::{BorrowedProtector, ProtectorPool},
+    protector::{BorrowedProtector, ProtectorPool, Release},
     ranges::{RangeRefs, Ranges},
 };
 
 const LEN_SIZE: usize = core::mem::size_of::<usize>();
+const FREE_RATIO: f32 = 0.1;
 
 type InnerBuf<const N: usize> = UnsafeCell<MaybeUninit<[u8; N]>>;
+type ArcMutCond = Arc<(Mutex<bool>, Condvar)>;
 
 #[inline(always)]
 fn buf_start<const N: usize>(buf: &InnerBuf<N>) -> *mut u8 {
@@ -69,23 +71,25 @@ fn read_at<const N: usize>(buf: &InnerBuf<N>, offset: usize) -> &[u8] {
 
 pub struct BBPP<'a, const N: usize> {
     buf: UnsafeCell<MaybeUninit<[u8; N]>>,
-    protectors: ProtectorPool<Arc<(Mutex<bool>, Condvar)>, 64>,
+    // protectors: ProtectorPool<ArcMutCond, 64>,
+    protectors: ProtectorPool<(), 64>,
     is_writer_leased: AtomicBool,
     ranges: Ranges<N>,
-    free_ratio: f32,
+    free_threshold: usize,
     _mark: PhantomData<&'a ()>,
 }
 
 impl<'a, const N: usize> BBPP<'a, N> {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        let released = Arc::new((Mutex::new(false), Condvar::new()));
+        // let released = Arc::new((Mutex::new(false), Condvar::new()));
         let slf = Self {
             buf: UnsafeCell::new(MaybeUninit::uninit()),
-            protectors: ProtectorPool::new(released),
+            // protectors: ProtectorPool::new(released),
+            protectors: ProtectorPool::new(()),
             is_writer_leased: AtomicBool::new(false),
             ranges: Ranges::new(),
-            free_ratio: 0.1,
+            free_threshold: ((N as f32) * FREE_RATIO).round() as usize,
             _mark: PhantomData,
         };
         let buf_start = slf.buf.get().cast::<u8>();
@@ -108,7 +112,7 @@ impl<'a, const N: usize> BBPP<'a, N> {
     /// Try to get a new reader based on the available
     /// pool of protectors. It returns None if no reader available.
     /// use `new_reader_blocking` to block until a reader is available.
-    pub fn new_reader(&'a self) -> Option<Reader<'a, N>> {
+    pub fn new_reader(&'a self) -> Option<Reader<'a, (), N>> {
         let protector = self.protectors.try_get()?;
         let cached_ranges = self.ranges.ranges();
         let bbpp =
@@ -118,13 +122,13 @@ impl<'a, const N: usize> BBPP<'a, N> {
 
     /// Try to get a new reader based on the available
     /// pool of protectors. It will block until one is available.
-    pub fn new_reader_blocking(&'a self) -> Reader<'a, N> {
-        let protector = self.protectors.blocking_get();
-        let cached_ranges = self.ranges.ranges();
-        let bbpp =
-            unsafe { NonNull::new_unchecked(self as *const _ as *mut _) };
-        Reader { protector, bbpp, cached_ranges }
-    }
+    // pub fn new_reader_blocking(&'a self) -> Reader<'a, ArcMutCond, N> {
+    //     let protector = self.protectors.blocking_get();
+    //     let cached_ranges = self.ranges.ranges();
+    //     let bbpp =
+    //         unsafe { NonNull::new_unchecked(self as *const _ as *mut _) };
+    //     Reader { protector, bbpp, cached_ranges }
+    // }
 
     /// Try to get a writer if one has not already been provisioned.
     /// Only 1 writer can exist at a time.
@@ -156,9 +160,8 @@ impl<'a, const N: usize> BBPP<'a, N> {
         Ok(())
     }
 
-    fn is_below_ratio(&self) -> bool {
-        let size = self.ranges.size();
-        1.0 - ((size as f32) / (N as f32)) < self.free_ratio
+    pub fn is_below_ratio(&self) -> bool {
+        (N - self.ranges.size()) < self.free_threshold
     }
 }
 
@@ -258,8 +261,7 @@ impl<'a, const N: usize> Writer<'a, N> {
     }
 
     pub fn push(&mut self, val: &[u8]) -> Result<Vec<usize>> {
-        let mut popped = Vec::new();
-        popped.extend(&self.push_one(val)?);
+        let mut popped = self.push_one(val)?;
         while self.bbpp().is_below_ratio() {
             if let Some(idx) = self.try_pop() {
                 popped.push(idx);
@@ -307,13 +309,20 @@ impl<'a, const N: usize> Writer<'a, N> {
     }
 }
 
-pub struct Reader<'a, const N: usize> {
-    protector: BorrowedProtector<'a, Arc<(Mutex<bool>, Condvar)>>,
+pub struct Reader<'a, R, const N: usize>
+where
+    R: Release,
+{
+    // protector: BorrowedProtector<'a, ArcMutCond>,
+    protector: BorrowedProtector<'a, R>,
     bbpp: NonNull<BBPP<'a, N>>,
     cached_ranges: (Option<std::ops::Range<usize>>, std::ops::Range<usize>),
 }
 
-impl<'a, const N: usize> Reader<'a, N> {
+impl<'a, R, const N: usize> Reader<'a, R, N>
+where
+    R: Release,
+{
     pub const fn bbpp(&self) -> &BBPP<N> {
         // SAFETY: Since `self.bip_buffer` is a NonNull pointer, it's guaranteed to be valid.
         unsafe { self.bbpp.as_ref() }
@@ -340,19 +349,24 @@ impl<'a, const N: usize> Reader<'a, N> {
         Some(read_at(&self.bbpp().buf, offset))
     }
 
-    pub fn iter(&'a self) -> BBPPIterator<'a, N> {
-        let head = self.bbpp().ranges.read().head.get();
-        BBPPIterator { reader: self, idx: Some(head), cnt: 0 }
+    pub const fn iter(&'a self) -> BBPPIterator<'a, R, N> {
+        // let head = self.bbpp().ranges.read().head.get();
+        BBPPIterator { reader: self, idx: Some(self.cached_ranges.1.start) }
     }
 }
 
-pub struct BBPPIterator<'a, const N: usize> {
-    reader: &'a Reader<'a, N>,
+pub struct BBPPIterator<'a, R, const N: usize>
+where
+    R: Release,
+{
+    reader: &'a Reader<'a, R, N>,
     idx: Option<usize>,
-    cnt: usize,
 }
 
-impl<'a, const N: usize> BBPPIterator<'a, N> {
+impl<'a, R, const N: usize> BBPPIterator<'a, R, N>
+where
+    R: Release,
+{
     /// Convenience function that sets internal index to None
     /// and always returns None.
     fn end(&mut self) -> Option<<Self as Iterator>::Item> {
@@ -361,10 +375,14 @@ impl<'a, const N: usize> BBPPIterator<'a, N> {
     }
 }
 
-impl<'a, const N: usize> Iterator for BBPPIterator<'a, N> {
+impl<'a, R, const N: usize> Iterator for BBPPIterator<'a, R, N>
+where
+    R: Release,
+{
     type Item = &'a [u8];
 
     fn next(&mut self) -> Option<Self::Item> {
+        // std::thread::sleep(core::time::Duration::from_millis(1));
         let idx = self.idx?;
         let item;
         let (write_range, read_range) = &self.reader.cached_ranges;
@@ -377,10 +395,7 @@ impl<'a, const N: usize> Iterator for BBPPIterator<'a, N> {
                 item = Some(data);
                 match next {
                     n if range.contains(&n) => {
-                        // self.cnt += 1;
-                        // if self.cnt % 4 == 0 {
                         self.reader.protector.protect(n);
-                        // }
                         Some(n)
                     }
                     _ => None,
@@ -525,13 +540,17 @@ mod test_bbpp {
         assert!(!bbpp.is_writer_leased.load(Ordering::Acquire));
     }
 
-    #[test]
-    fn test_is_below_ratio() {
-        let mut bbpp: BBPP<30> = BBPP::new();
-        bbpp.free_ratio = 0.35;
-        assert!(!bbpp.is_below_ratio());
-        bbpp.ranges.grow(20).unwrap();
-        assert!(bbpp.is_below_ratio());
+    mod is_below_ratio {
+        use super::*;
+        use assert2::assert;
+        use rstest::*;
+
+        #[rstest]
+        fn it_should_be_false_on_new() {
+            let bbpp = BBPP::<1_000>::new();
+            assert!(bbpp.ranges.size() == 0);
+            assert!(bbpp.is_below_ratio() == false);
+        }
     }
 }
 
@@ -596,11 +615,9 @@ mod test_writer {
         assert!(writer.try_push(&data) == Ok(()));
         assert!(writer.try_push(&data) == Ok(()));
         assert!(writer.try_push(&data) == Ok(()));
+        let last_push = writer.try_push(&data);
 
-        assert!(
-            writer.push(&data)
-                == Err(Error::ReserveFailed { size: 13, index: 65 })
-        );
+        assert!(last_push == Err(Error::ReserveFailed { size: 13, index: 65 }));
     }
 }
 
@@ -691,6 +708,19 @@ mod test_iterator {
         assert_eq!(iterator.next(), Some(&[1, 2][..]));
         iterator.end();
         assert_eq!(iterator.next(), None);
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use assert2::assert;
+    use rstest::*;
+
+    #[rstest]
+    fn check_free_threshold() {
+        let bbpp = BBPP::<1_000>::new();
+        assert!(bbpp.free_threshold == 100);
     }
 }
 
