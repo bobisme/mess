@@ -90,14 +90,14 @@ pub struct BBPP<'a, const N: usize> {
 impl<'a, const N: usize> BBPP<'a, N> {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        eprintln!("DEBUG: BBPP::new");
-        eprintln!("DEBUG: buf");
+        // eprintln!("DEBUG: BBPP::new");
+        // eprintln!("DEBUG: buf");
         let buf = RawBuf::new();
-        eprintln!("DEBUG: protectors");
+        // eprintln!("DEBUG: protectors");
         let protectors = ProtectorPool::new(());
         // eprintln!("DEBUG: ranges");
         // let ranges = Ranges::new();
-        eprintln!("DEBUG: struct");
+        // eprintln!("DEBUG: struct");
         Self {
             buf,
             // protectors: ProtectorPool::new(()),
@@ -108,6 +108,22 @@ impl<'a, const N: usize> BBPP<'a, N> {
             free_threshold: ((N as f32) * FREE_RATIO).round() as usize,
             _mark: PhantomData,
         }
+    }
+
+    pub fn with_capacity(cap: usize) -> Self {
+        assert!(cap <= N);
+        Self {
+            buf: RawBuf::with_capacity(cap),
+            protectors: ProtectorPool::new(()),
+            is_writer_leased: AtomicBool::new(false),
+            ranges: Ranges::new(),
+            free_threshold: ((N as f32) * FREE_RATIO).round() as usize,
+            _mark: PhantomData,
+        }
+    }
+
+    pub fn with_full_capacity() -> Self {
+        Self::with_capacity(N)
     }
 
     pub fn protected_ranges(
@@ -219,10 +235,10 @@ impl<'a, const N: usize> Writer<'a, N> {
     }
 
     fn try_reserve(&mut self, len: usize) -> Result<&mut [u8]> {
-        if len >= N {
+        if len > N {
             return Err(Error::EntryLargerThanBuffer);
         }
-        let cap = self.bbpp().buf.cap();
+        let cap = self.bbpp().cap();
         let start = match self.bbpp().ranges.refs() {
             RangeRefs::One(reg) => {
                 let range = reg.range();
@@ -247,8 +263,12 @@ impl<'a, const N: usize> Writer<'a, N> {
             }
         }?;
         if start + len > cap {
+            let end = start + len;
+            if end > N {
+                return Err(Error::ReserveFailed { size: len, index: start });
+            }
             // dbg!(start, len, cap);
-            self.bbpp_mut().buf.grow_amortized(cap, len)?;
+            self.bbpp_mut().buf.grow(end - cap)?;
         }
         Ok(self.bbpp_mut().buf.index_mut(start..start + len))
     }
@@ -610,7 +630,7 @@ mod test_reader {
 
     fn preloaded_bbpp<'a>() -> BBPP<'a, 100> {
         let mut bbpp = BBPP::new();
-        bbpp.buf.grow_amortized(0, 100);
+        bbpp.buf.grow(100);
         bbpp.buf[0..20].copy_from_slice(&[
             2, 0, 0, 0, 0, 0, 0, 0, 3, 4, // 2 bytes = [3, 4]
             2, 0, 0, 0, 0, 0, 0, 0, 1, 2, // 2 bytes = [1, 2]
@@ -632,7 +652,7 @@ mod test_reader {
         #[rstest]
         fn it_is_valid_if_within_ranges() {
             let mut bbpp = BBPP::<100>::new();
-            bbpp.buf.grow_amortized(0, 100);
+            bbpp.buf.grow(100);
             let mut reader = bbpp.new_reader().unwrap();
             reader.cached_ranges = (Some(0..20), 30..60);
             assert!(reader.check_index(10) == Ok(10));
@@ -641,7 +661,7 @@ mod test_reader {
         #[rstest]
         fn the_index_and_len_bytes_must_be_in_range() {
             let mut bbpp = BBPP::<100>::new();
-            bbpp.buf.grow_amortized(0, 100);
+            bbpp.buf.grow(100);
             let mut reader = bbpp.new_reader().unwrap();
             reader.cached_ranges = (Some(0..20), 30..60);
             assert!(reader.check_index(11) == Ok(11));
@@ -658,7 +678,7 @@ mod test_reader {
         #[rstest]
         fn it_is_invalid_if_len_larger_than_cap() {
             let mut bbpp = BBPP::<100>::new();
-            bbpp.buf.grow_amortized(0, 50);
+            bbpp.buf.grow(50);
             let mut reader = bbpp.new_reader().unwrap();
             reader.cached_ranges = (Some(0..10), 10..51);
             assert!(reader.check_index(42) == Ok(42));
@@ -693,7 +713,7 @@ mod test_iterator {
 
     fn preloaded_bbpp<'a>() -> BBPP<'a, 100> {
         let mut bbpp = BBPP::new();
-        bbpp.buf.grow_amortized(0, 20).unwrap();
+        bbpp.buf.grow(20).unwrap();
         bbpp.buf[0..20].copy_from_slice(&[
             2, 0, 0, 0, 0, 0, 0, 0, 3, 4, // 2 bytes = [3, 4]
             2, 0, 0, 0, 0, 0, 0, 0, 1, 2, // 2 bytes = [1, 2]

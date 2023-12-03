@@ -39,12 +39,12 @@ fn finish_grow(
 
     check_capacity(new_size, max_capacity);
 
-    let memory = if let Some((ptr, old_layout)) = current_memory {
-        debug_assert_eq!(old_layout.align(), new_layout.align());
+    let memory = if let Some((old_ptr, old_layout)) = current_memory {
+        // debug_assert_eq!(old_layout.align(), new_layout.align());
         unsafe {
             // The allocator checks for alignment equality
             // core::intrinsics::assume(old_layout.align() == new_layout.align());
-            alloc::realloc(ptr.as_ptr(), new_layout, new_size)
+            alloc::realloc(old_ptr.as_ptr(), old_layout, new_size)
         }
     } else {
         unsafe { alloc::alloc(new_layout) }
@@ -66,7 +66,6 @@ impl<const N: usize> RawBuf<N> {
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
-        dbg!("RawBuf::allocate");
         let cap = cmp::max(capacity, Self::MIN_NON_ZERO_CAP);
         let layout = match Layout::array::<u8>(cap) {
             Ok(layout) => layout,
@@ -100,18 +99,12 @@ impl<const N: usize> RawBuf<N> {
         }
     }
 
-    pub(crate) fn grow_amortized(
-        &mut self,
-        len: usize,
-        additional: usize,
-    ) -> Result<()> {
-        // This is ensured by the calling contexts.
-        debug_assert!(additional > 0);
-
+    pub(crate) fn grow(&mut self, additional: usize) -> Result<()> {
         // Nothing we can really do about these checks, sadly.
-        let required_cap =
-            len.checked_add(additional).ok_or_else(capacity_overflow).unwrap();
-        if len > N {
+        let required_cap = self.cap.checked_add(additional).ok_or(
+            Error::CapacityOverLimit { cap: self.cap + additional, limit: N },
+        )?;
+        if required_cap > N {
             return Err(Error::CapacityOverLimit {
                 cap: required_cap,
                 limit: N,
@@ -120,14 +113,14 @@ impl<const N: usize> RawBuf<N> {
 
         // This guarantees exponential growth. The doubling cannot overflow
         // because `cap <= isize::MAX` and the type of `cap` is `usize`.
-        let cap = cmp::max(self.cap * 2, required_cap);
-        let cap = cmp::max(Self::MIN_NON_ZERO_CAP, cap);
-        let cap = cmp::min(N, cap);
+        let new_cap = cmp::max(self.cap * 2, required_cap);
+        let new_cap = cmp::max(Self::MIN_NON_ZERO_CAP, new_cap);
+        let new_cap = cmp::min(N, new_cap);
 
-        let new_layout = Layout::array::<u8>(cap);
+        let new_layout = Layout::array::<u8>(new_cap);
 
-        let ptr = finish_grow(new_layout, self.current_memory(), N)?;
-        self.set_ptr_and_cap(ptr, cap);
+        let new_ptr = finish_grow(new_layout, self.current_memory(), N)?;
+        self.set_ptr_and_cap(new_ptr, new_cap);
         Ok(())
     }
 
@@ -146,33 +139,12 @@ impl<const N: usize> RawBuf<N> {
 
     pub fn read(&self, index: usize) -> &[u8] {
         let len = self.len_at(index);
-        let range = index + LEN_SIZE..index + len;
-        self[range].try_into().unwrap()
+        let start = index + LEN_SIZE;
+        let end = start + len;
+        self[start..end].try_into().unwrap()
     }
 }
 
-// impl<const N: usize> std::ops::Index<usize> for RawBuf<N> {
-//     type Output = u8;
-//
-//     /// Panics if ptr is null.
-//     fn index(&self, index: usize) -> &Self::Output {
-//         if index > self.cap {
-//             panic!("index out of bounds");
-//         }
-//         let new_ptr = unsafe { self.ptr.as_ptr().add(index) };
-//         unsafe { new_ptr.as_ref().expect("buffer has not been initalized") }
-//     }
-// }
-//
-// impl<const N: usize> std::ops::IndexMut<usize> for RawBuf<N> {
-//     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-//         if index > self.cap {
-//             panic!("index out of bounds");
-//         }
-//         let new_ptr = unsafe { self.ptr.as_ptr().add(index) };
-//         unsafe { new_ptr.as_mut().expect("buffer has not been initalized") }
-//     }
-// }
 fn bounds_to_range<R: RangeBounds<usize>>(
     bounds: R,
     max_exclusive: usize,
@@ -190,33 +162,15 @@ fn bounds_to_range<R: RangeBounds<usize>>(
     start..end
 }
 
-fn bounds_in_range<R: RangeBounds<usize>>(
-    bounds: &R,
-    range: Range<usize>,
-) -> bool {
-    let start = match bounds.start_bound().cloned() {
-        Bound::Included(x) => x,
-        Bound::Excluded(x) => x + 1,
-        Bound::Unbounded => 0,
-    };
-    let end = match bounds.end_bound().cloned() {
-        Bound::Included(x) => x,
-        Bound::Excluded(x) => x - 1,
-        Bound::Unbounded => 0,
-    };
-    !(range.contains(&start) && range.contains(&end))
-}
-
-// impl<const N: usize> std::ops::Index<Range<usize>> for RawBuf<N> {
 impl<R: RangeBounds<usize>, const N: usize> std::ops::Index<R> for RawBuf<N> {
     type Output = [u8];
 
     /// Panics if ptr is null.
     fn index(&self, bounds: R) -> &Self::Output {
-        if !bounds_in_range(&bounds, 0..self.cap) {
+        let range = bounds_to_range(bounds, self.cap);
+        if !(range.start < self.cap && range.end <= self.cap) {
             panic!("index out of bounds");
         }
-        let range = bounds_to_range(bounds, self.cap);
         let new_ptr = unsafe { self.ptr.as_ptr().add(range.start) };
         unsafe { slice::from_raw_parts(new_ptr, range.end - range.start) }
     }
@@ -227,12 +181,27 @@ impl<R: RangeBounds<usize>, const N: usize> std::ops::IndexMut<R>
 {
     /// Panics if ptr is null.
     fn index_mut(&mut self, bounds: R) -> &mut Self::Output {
-        if !bounds_in_range(&bounds, 0..self.cap) {
+        let range = bounds_to_range(bounds, self.cap);
+        if !(range.start < self.cap && range.end <= self.cap) {
             panic!("index out of bounds");
         }
-        let range = bounds_to_range(bounds, self.cap);
         let new_ptr = unsafe { self.ptr.as_ptr().add(range.start) };
         unsafe { slice::from_raw_parts_mut(new_ptr, range.end - range.start) }
+    }
+}
+
+#[cfg(test)]
+mod test_bounds_utils {
+    use super::*;
+    use assert2::assert;
+    use rstest::*;
+
+    #[rstest]
+    fn check_bounds_to_range() {
+        assert!(bounds_to_range(1..10, 900) == (1..10));
+        assert!(bounds_to_range(..10, 900) == (0..10));
+        assert!(bounds_to_range(.., 900) == (0..900));
+        assert!(bounds_to_range(1.., 900) == (1..900));
     }
 }
 
@@ -243,23 +212,16 @@ mod test_slice_tools {
 
     const FIXTURE_CAP: usize = 12;
 
-    fn buf_fixture() -> RawBuf<FIXTURE_CAP> {
+    fn buf_fixture() -> RawBuf<1024> {
         let mut buf = RawBuf::with_capacity(FIXTURE_CAP);
         buf[..LEN_SIZE].copy_from_slice(&usize::to_ne_bytes(4)[..]);
-        // let buf_ptr = buf.cast::<u8>();
         buf[LEN_SIZE..12].copy_from_slice(&[42, 43, 44, 45][..]);
-        // unsafe {
-        //     bufllptr.as_ptr().add(8) = 42;
-        //     bufllptr.as_ptr().add(9) = 43;
-        //     bufllptr.as_ptr().add(10) = 44;
-        //     bufllptr.as_ptr().add(11) = 45;
-        // }
         buf
     }
 
     #[test]
     fn test_read_len_at() {
-        let mut buf = RawBuf::<FIXTURE_CAP>::with_capacity(FIXTURE_CAP);
+        let mut buf = RawBuf::<1024>::with_capacity(FIXTURE_CAP);
         buf[..LEN_SIZE].copy_from_slice(&usize::to_ne_bytes(42)[..]);
         assert!(buf.len_at(0) == 42);
     }
@@ -290,7 +252,20 @@ mod test {
     use assert2::assert;
 
     #[test]
-    fn it_works() {}
+    fn grow_sets_cap_and_new_ptr() {
+        let mut buf = RawBuf::<4096>::new();
+        let ptr = buf.ptr;
+        assert!(buf.cap == 0);
+        buf.grow(100).unwrap();
+        assert!(buf.cap == 100);
+        assert!(ptr != buf.ptr);
+    }
+
+    #[test]
+    fn with_capacity_pre_allocates_and_sets_cap() {
+        let buf = RawBuf::<4096>::with_capacity(200);
+        assert!(buf.cap == 200);
+    }
 }
 
 #[cfg(all(test, proptest))]
@@ -318,10 +293,10 @@ mod test_props {
 
     proptest! {
         #[test]
-        fn it_works((start, end, size) in boundies()) {
+        fn it_proptests((start, end, size) in boundies()) {
             let mut buf = RawBuf::<4096>::new();
-            buf.grow_amortized(0, size).unwrap();
-            assert!(buf.cap == size);
+            buf.grow(size).unwrap();
+            assert!(buf.cap == cmp::max(size, RawBuf::<0>::MIN_NON_ZERO_CAP));
             buf[start..end].fill(69u8);
         }
     }

@@ -34,7 +34,7 @@ pub fn bbpp_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("BBPP");
 
     group.bench_function("push", |b| {
-        let bbpp = BBPP::<1024>::new();
+        let bbpp = BBPP::<2048>::with_full_capacity();
         let mut seed = 0;
         b.iter(|| {
             let mut writer = bbpp.try_writer().unwrap();
@@ -288,14 +288,14 @@ pub fn under_read_write_contention(c: &mut Criterion) {
                             }
                         }
                     }
-                    println!(
-                        r#"
-                    bench_iters={iters},
-                    total_iters={total_iters},
-                    total_iter_count={total_iter_count},
-                    total_writes={total_writes},
-                    total_writes_bytes={total_writes_bytes}"#
-                    );
+                    // println!(
+                    //     r#"
+                    // bench_iters={iters},
+                    // total_iters={total_iters},
+                    // total_iter_count={total_iter_count},
+                    // total_writes={total_writes},
+                    // total_writes_bytes={total_writes_bytes}"#
+                    // );
                     Duration::from_nanos(nanos.load_consume())
                 });
             },
