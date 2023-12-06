@@ -77,9 +77,8 @@ impl Protector {
 mod test_protector {
     use super::*;
     use assert2::assert;
-    use rstest::*;
 
-    #[rstest]
+    #[test]
     fn new_const_doesnt_affect_other_protectors() {
         let p1 = Protector::NEW;
         let p2 = Protector::NEW;
@@ -221,13 +220,12 @@ impl<const N: usize> ProtectorPool<Arc<(Mutex<bool>, Condvar)>, N> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod test_protector_pool {
     use super::*;
     use assert2::assert;
-    use rstest::*;
 
-    #[rstest]
+    #[test]
     fn minimum_protected_picks_min_if_all_protected() {
         let pool = ProtectorPool::<(), 4>::new(());
         pool.protectors[0].protect(20);
@@ -237,7 +235,7 @@ mod test_protector_pool {
         assert!(pool.minimum_protected(0..99) == Protection::ProtectedFrom(10));
     }
 
-    #[rstest]
+    #[test]
     fn minimum_protected_if_in_range() {
         let pool = ProtectorPool::<(), 4>::new(());
         pool.protectors[0].protect(20);
@@ -249,7 +247,7 @@ mod test_protector_pool {
         );
     }
 
-    #[rstest]
+    #[test]
     fn minimum_protected_picks_min_if_some_protected() {
         let pool = ProtectorPool::<(), 4>::new(());
         pool.protectors[0].protect(20);
@@ -257,7 +255,7 @@ mod test_protector_pool {
         assert!(pool.minimum_protected(0..99) == Protection::ProtectedFrom(10));
     }
 
-    #[rstest]
+    #[test]
     fn minimum_protected_returns_unprotected_if_none_protected_in_range() {
         let pool = ProtectorPool::<(), 4>::new(());
         pool.protectors[0].protect(20);
@@ -265,13 +263,13 @@ mod test_protector_pool {
         assert!(pool.minimum_protected(25..99) == Protection::Unprotected);
     }
 
-    #[rstest]
+    #[test]
     fn minimum_protected_returns_unprotected_if_array_empty() {
         let pool = ProtectorPool::<(), 0>::new(());
         assert!(pool.minimum_protected(0..99) == Protection::Unprotected);
     }
 
-    #[rstest]
+    #[test]
     fn get_works_until_it_cant() {
         let pool = ProtectorPool::<(), 3>::new(());
         let p1 = pool.try_get();
@@ -284,7 +282,7 @@ mod test_protector_pool {
         assert!(p4.is_none());
     }
 
-    #[rstest]
+    #[test]
     fn releasing_and_getting_works() {
         let pool = ProtectorPool::<(), 3>::new(());
         let p1 = pool.try_get();

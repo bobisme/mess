@@ -25,10 +25,10 @@ use parking_lot::{Condvar, Mutex};
 
 use crate::{
     error::{Error, Result},
-    protector::{BorrowedProtector, ProtectorPool, Release},
     ranges::{RangeRefs, Ranges},
     raw_buf::RawBuf,
 };
+use mess_protector::{BorrowedProtector, ProtectorPool, Release};
 
 const LEN_SIZE: usize = core::mem::size_of::<usize>();
 const FREE_RATIO: f32 = 0.1;

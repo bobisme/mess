@@ -1,0 +1,31 @@
+[package]
+name = "mess_protector"
+version = "0.0.1"
+edition = "2021"
+workspace = "../"
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/bobisme/mess"
+repository = "https://github.com/bobisme/mess"
+readme = "README.md"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+crossbeam-utils = "0.8"
+
+[dev-dependencies]
+assert2 = "0.3"
+
+# [target.'cfg(proptest)'.dependencies]
+# proptest = "1.4"
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+proptest = "1.4"
+
+[target.'cfg(lincheck)'.dependencies]
+loom = "0.6"
+proptest = "1.1"
+lincheck = "0.2.1"
