@@ -57,7 +57,7 @@ impl Protector {
     #[cfg(loom)]
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        Self(AtomicUsize::new(usize::MAX))
+        Self(CachePadded::new(AtomicUsize::new(usize::MAX)))
     }
 
     pub fn protect(&self, index: usize) {
