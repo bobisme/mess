@@ -7,6 +7,7 @@ license = "MIT OR Apache-2.0"
 homepage = "https://github.com/bobisme/mess"
 repository = "https://github.com/bobisme/mess"
 readme = "README.md"
+description = "A Protector is like a less-formal hazard pointer. It is intended to mark a boundary in an array as protected so that it won't be overwritten."
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
