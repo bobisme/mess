@@ -1,0 +1,16 @@
+[package]
+name = "recovery_scale"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone spike: opt out of the repo's root workspace.
+[workspace]
+
+[dependencies]
+crc32fast = "1"
+crc32c = "0.6"
+blake3 = "1"
+libc = "0.2"
+
+[profile.release]
+debug = true

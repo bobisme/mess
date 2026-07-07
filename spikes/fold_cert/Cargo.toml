@@ -1,0 +1,18 @@
+[package]
+name = "fold_cert"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone spike: opt out of the repo's root workspace.
+[workspace]
+
+[features]
+# Deliberately-changed fold semantics, to demonstrate the fold-drift golden
+# test firing (see tests/golden.rs and REPORT.md).
+drift = []
+
+[dependencies]
+blake3 = "1"
+
+[profile.release]
+debug = true

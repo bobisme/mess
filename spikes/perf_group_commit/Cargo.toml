@@ -1,0 +1,15 @@
+[package]
+name = "perf_group_commit"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone spike: opt out of the repo's root workspace.
+[workspace]
+
+[dependencies]
+crc32fast = "1"
+libc = "0.2"
+rand = "0.10"
+
+[profile.release]
+lto = "thin"

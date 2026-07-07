@@ -1,0 +1,21 @@
+[package]
+name = "seal_pipeline"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone spike: opt out of the repo's root workspace.
+[workspace]
+
+[dependencies]
+crc32fast = "1"
+rand = "0.10"
+rand_distr = "0.6"
+zstd = "0.13"
+xorf = { version = "0.11", features = ["serde"] }
+serde = "1"
+postcard = { version = "1", features = ["alloc"] }
+lru = "0.12"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

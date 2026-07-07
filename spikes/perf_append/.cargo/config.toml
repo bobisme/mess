@@ -1,0 +1,10 @@
+# Override the repo root .cargo/config.toml, which forces -fuse-ld=lld;
+# lld is not installed on this machine. Default linker works fine for a spike.
+[target.x86_64-unknown-linux-gnu]
+linker = "cc"
+rustflags = []
+
+# rocksdb 8.1.1 (librocksdb-sys 0.11) predates GCC 13's stricter headers;
+# same workaround vertical_slice used to build it under GCC 16.
+[env]
+CXXFLAGS = "-include cstdint"

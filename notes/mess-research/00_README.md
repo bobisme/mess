@@ -34,6 +34,8 @@ projections should be modeled as typed folds over logs, not ad-hoc consumers.
 12. [12_convergence.md](./12_convergence.md) — **authoritative**: agreed design after review + response; supersedes 01–09 where they conflict.
 13. [13_spike_results.md](./13_spike_results.md) — measured spike results validating the convergence doc's bets.
 14. [14_spike_results_round2.md](./14_spike_results_round2.md) — round-2 spikes: composed vertical slice, torn-write reordering, subscription handoff.
+15. [15_spike_results_round3.md](./15_spike_results_round3.md) — round-3 spikes: seal pipeline (thesis flips post-seal), codec decision, fold certificates, recovery at scale.
+16. [16_spike_results_round4.md](./16_spike_results_round4.md) — round-4 performance spikes: measured envelope (363k durable ev/s, 95M ev/s replay, columnar 30.8 B/event); final D5/D6/D7 designs.
 
 ## High-level recommendation
 
