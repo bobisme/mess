@@ -154,17 +154,37 @@ impl Actor {
                 let opts = GetMessages::default()
                     .from_global(global_pos)
                     .with_limit(limit);
-                let messages = Fetch::<OptGlobalPos>::fetch(&self.db, opts);
-                let messages: Vec<_> =
-                    messages.map(|res| res.map(|msg| msg.into())).collect();
+                let messages: Vec<Result<OwnedMessage>> = match stream {
+                    Some(stream) => {
+                        let opts = opts.in_stream(&stream);
+                        Fetch::<(OptStream, OptGlobalPos)>::fetch(
+                            &self.db, opts,
+                        )
+                        .map(|res| res.map(|msg| msg.into()))
+                        .collect()
+                    }
+                    None => Fetch::<OptGlobalPos>::fetch(&self.db, opts)
+                        .map(|res| res.map(|msg| msg.into()))
+                        .collect(),
+                };
                 Response { body: ResponseBody::Messages { messages } }
             }
             RequestBody::GetStreamMessages { stream, stream_pos, limit } => {
                 let opts =
                     GetMessages::default().in_stream(&stream).with_limit(limit);
-                let messages = Fetch::<OptStream>::fetch(&self.db, opts);
-                let messages: Vec<_> =
-                    messages.map(|res| res.map(|msg| msg.into())).collect();
+                let messages: Vec<Result<OwnedMessage>> = match stream_pos {
+                    Some(pos) => {
+                        let opts = opts.from_stream_position(pos);
+                        Fetch::<(OptStream, OptStreamPos)>::fetch(
+                            &self.db, opts,
+                        )
+                        .map(|res| res.map(|msg| msg.into()))
+                        .collect()
+                    }
+                    None => Fetch::<OptStream>::fetch(&self.db, opts)
+                        .map(|res| res.map(|msg| msg.into()))
+                        .collect(),
+                };
                 Response { body: ResponseBody::Messages { messages } }
             }
             RequestBody::Write(message) => {
@@ -189,7 +209,11 @@ async fn run_actor(mut actor: Actor) {
             debug!("actor cancelled");
             break;
         }
-        actor.handle_req(req).await.unwrap();
+        // The actor must outlive any single failed request: log and keep
+        // serving. Per-request errors travel back on the response channel.
+        if let Err(err) = actor.handle_req(req).await {
+            error!(?err, "actor failed to handle request");
+        }
     }
     debug!("actor killed");
 }
@@ -246,12 +270,15 @@ impl<const S: usize> ActorHandle<S> {
         &self,
         req_body: impl Into<RequestBody>,
     ) -> Result<Vec<Result<OwnedMessage>>> {
+        if self.token.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
         let (send, recv) = oneshot::channel();
         let req_body = req_body.into();
         let req = Request::new(req_body, send);
         // Ignore send errors and handle it on the recv end below.
         let _ = self.outbox.send(req).await;
-        let resp = recv.await.unwrap();
+        let resp = recv.await?;
         debug!("fetch messages");
         match resp.body {
             ResponseBody::Messages { messages } => Ok(messages),
@@ -260,5 +287,137 @@ impl<const S: usize> ActorHandle<S> {
                 Err(Error::SvcResponse)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod test_actor {
+    use super::*;
+    use assert2::assert;
+    use ident::Id;
+
+    struct TmpHandle {
+        handle: ActorHandle,
+        path: std::path::PathBuf,
+    }
+
+    impl TmpHandle {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(Id::new().to_string());
+            let db = DB::new(&path).unwrap();
+            Self { handle: ActorHandle::new(db), path }
+        }
+
+        async fn cleanup(self) {
+            self.handle.kill();
+            drop(self.handle);
+            // Give the actor task a moment to drop the DB, then best-effort
+            // destroy the on-disk files.
+            tokio::task::yield_now().await;
+            let _ = ::rocksdb::DB::destroy(
+                &::rocksdb::Options::default(),
+                &self.path,
+            );
+        }
+    }
+
+    fn write_msg(
+        stream: &str,
+        expected: Option<StreamPos>,
+    ) -> WriteMessage<'static> {
+        WriteMessage {
+            id: Id::new(),
+            stream_name: stream.to_owned().into(),
+            message_type: "SomeType".to_owned().into(),
+            data: b"{\"a\": 1}".as_slice().into(),
+            metadata: [].as_slice().into(),
+            expected_stream_position: expected,
+        }
+    }
+
+    #[tokio::test]
+    async fn actor_survives_write_errors_and_keeps_serving() {
+        let h = TmpHandle::new();
+
+        // Unsupported relaxed write must come back as an error...
+        let res = h
+            .handle
+            .put_message(write_msg("s1", Some(StreamPos::Relaxed(0))))
+            .await;
+        assert!(let Err(Error::UnsupportedRelaxed) = res);
+
+        // ...and a wrong expected position as its typed error...
+        let res = h
+            .handle
+            .put_message(write_msg("s1", Some(StreamPos::Sequential(41))))
+            .await;
+        assert!(let Err(Error::WrongStreamPosition { .. }) = res);
+
+        // ...without killing the actor: a valid write still succeeds.
+        let pos = h.handle.put_message(write_msg("s1", None)).await.unwrap();
+        assert!(pos.global == 1);
+
+        h.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn stream_fetch_honors_start_position() {
+        let h = TmpHandle::new();
+        h.handle.put_message(write_msg("s1", None)).await.unwrap();
+        for v in 0..3 {
+            h.handle
+                .put_message(write_msg(
+                    "s1",
+                    Some(StreamPos::Sequential(v)),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let req = GetMessages::default()
+            .in_stream("s1")
+            .from_stream_position(StreamPos::Sequential(2));
+        let messages = h.handle.fetch_messages(req).await.unwrap();
+        let messages: Result<Vec<_>> = messages.into_iter().collect();
+        let messages = messages.unwrap();
+
+        assert!(messages.len() == 2);
+        assert!(messages[0].stream_position == StreamPos::Sequential(2));
+        assert!(messages[1].stream_position == StreamPos::Sequential(3));
+
+        h.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn global_fetch_honors_stream_filter() {
+        let h = TmpHandle::new();
+        h.handle.put_message(write_msg("s1", None)).await.unwrap();
+        h.handle.put_message(write_msg("s2", None)).await.unwrap();
+        h.handle
+            .put_message(write_msg("s1", Some(StreamPos::Sequential(0))))
+            .await
+            .unwrap();
+
+        let req = GetMessages::default().from_global(0).in_stream("s1");
+        let messages = h.handle.fetch_messages(req).await.unwrap();
+        let messages: Result<Vec<_>> = messages.into_iter().collect();
+        let messages = messages.unwrap();
+
+        assert!(messages.len() == 2);
+        assert!(messages.iter().all(|m| m.stream_name == "s1"));
+
+        h.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn handle_errors_instead_of_panicking_when_actor_gone() {
+        let h = TmpHandle::new();
+        h.handle.kill();
+        let res = h.handle.put_message(write_msg("s1", None)).await;
+        assert!(res.is_err());
+        let req = GetMessages::default().from_global(0);
+        let res = h.handle.fetch_messages(req).await;
+        assert!(res.is_err());
+        h.cleanup().await;
     }
 }

@@ -83,27 +83,48 @@ fn next_stream_pos<'a>(
     }
 }
 
+/// Reusable serialization buffers. `S` is the initial buffer size; buffers
+/// grow to fit the largest record seen, so payloads are not size-capped.
 pub struct WriteSerializer<const S: usize = 1024> {
-    global_buffer: [u8; S],
-    stream_buffer: [u8; S],
+    global_buffer: Vec<u8>,
+    stream_buffer: Vec<u8>,
 }
 
 impl<const S: usize> WriteSerializer<S> {
     #[must_use]
     pub const fn new() -> Self {
-        Self { global_buffer: [0u8; S], stream_buffer: [0u8; S] }
+        Self { global_buffer: Vec::new(), stream_buffer: Vec::new() }
     }
 
     pub fn serialize_global(&mut self, global: &GlobalRecord) -> Result<&[u8]> {
-        postcard::to_slice(global, &mut self.global_buffer)
-            .map(|x| &*x)
-            .map_err(|e| Error::SerError(format!("global: {e}")))
+        Self::serialize_into(&mut self.global_buffer, global, "global")
     }
 
     pub fn serialize_stream(&mut self, stream: &StreamRecord) -> Result<&[u8]> {
-        postcard::to_slice(stream, &mut self.stream_buffer)
-            .map(|x| &*x)
-            .map_err(|e| Error::SerError(format!("stream: {e}")))
+        Self::serialize_into(&mut self.stream_buffer, stream, "stream")
+    }
+
+    fn serialize_into<'a, T: serde::Serialize>(
+        buf: &'a mut Vec<u8>,
+        value: &T,
+        what: &'static str,
+    ) -> Result<&'a [u8]> {
+        if buf.is_empty() {
+            buf.resize(S.max(64), 0);
+        }
+        let len = loop {
+            match postcard::to_slice(value, buf.as_mut_slice()) {
+                Ok(used) => break used.len(),
+                Err(postcard::Error::SerializeBufferFull) => {
+                    let grown = buf.len().max(64).saturating_mul(2);
+                    buf.resize(grown, 0);
+                }
+                Err(e) => {
+                    return Err(Error::SerError(format!("{what}: {e}")))
+                }
+            }
+        };
+        Ok(&buf[..len])
     }
 }
 
@@ -125,18 +146,17 @@ fn write_records(
         StreamRecord::from_write_serial_message(&msg, next_global.0)?
             .set_global_position(next_global.0);
 
-    // let mut buf = [0u8; 1024];
-    // let mut buf2 = [0u8; 1024];
-    let global_bytes =
-        postcard::to_slice(&global_record, &mut ser.global_buffer)
-            .map_err(|e| Error::SerError(format!("global: {e}")))?;
-    let stream_bytes =
-        postcard::to_slice(&stream_record, &mut ser.stream_buffer)
-            .map_err(|e| Error::SerError(format!("stream: {e}")))?;
-
     let mut batch = rocksdb::WriteBatch::default();
-    batch.put_cf(db.global(), next_global.as_bytes(), &global_bytes);
-    batch.put_cf(db.stream(), next_stream.as_bytes(), &stream_bytes);
+    batch.put_cf(
+        db.global(),
+        next_global.as_bytes(),
+        ser.serialize_global(&global_record)?,
+    );
+    batch.put_cf(
+        db.stream(),
+        next_stream.as_bytes(),
+        ser.serialize_stream(&stream_record)?,
+    );
     db.write(batch)?;
     db.cached_global.fetch_max(next_global.0, Ordering::AcqRel);
 
@@ -151,7 +171,7 @@ pub fn write_mess(
         None | Some(StreamPos::Sequential(_)) => {
             write_serial_mess(db, msg.into(), ser)
         }
-        Some(StreamPos::Relaxed(_)) => todo!(),
+        Some(StreamPos::Relaxed(_)) => Err(Error::UnsupportedRelaxed),
     }
 }
 
@@ -176,7 +196,7 @@ pub async fn write_mess_async<'a>(
         None | Some(StreamPos::Sequential(_)) => {
             write_serial_mess_async(db, msg.into(), ser).await
         }
-        Some(StreamPos::Relaxed(_)) => todo!(),
+        Some(StreamPos::Relaxed(_)) => Err(Error::UnsupportedRelaxed),
     }
 }
 
@@ -358,6 +378,44 @@ mod test_write_mess {
 
         assert!(x.message_type == "someMsgType");
         assert!(x.global_position == 1);
+    }
+
+    #[rstest::rstest]
+    fn it_writes_payloads_larger_than_the_initial_buffer() {
+        let db = SelfDestructingDB::new_tmp();
+        let mut ser = ser();
+        let data = vec![7u8; 64 * 1024];
+        let msg = WriteMessage {
+            id: Id::new(),
+            stream_name: "big".into(),
+            message_type: "BigType".into(),
+            data: data.clone().into(),
+            metadata: Cow::Borrowed(b"{}"),
+            expected_stream_position: None,
+        };
+        write_mess(&db, msg, &mut ser).unwrap();
+
+        let bytes =
+            db.get_cf(db.global(), u64::to_be_bytes(1)).unwrap().unwrap();
+        let rec = GlobalRecord::from_bytes(&bytes).unwrap();
+        assert!(rec.data.len() == data.len());
+        assert!(rec.data[..] == data[..]);
+    }
+
+    #[rstest::rstest]
+    fn relaxed_writes_error_instead_of_panicking() {
+        let db = SelfDestructingDB::new_tmp();
+        let mut ser = ser();
+        let msg = WriteMessage {
+            id: Id::new(),
+            stream_name: "s1".into(),
+            message_type: "someMsgType".into(),
+            data: Cow::Borrowed(b"{}"),
+            metadata: Cow::Borrowed(b"{}"),
+            expected_stream_position: Some(StreamPos::Relaxed(0)),
+        };
+        let result = write_mess(&db, msg, &mut ser).unwrap_err();
+        assert!(let Error::UnsupportedRelaxed = result);
     }
 
     #[rstest::rstest]

@@ -3,8 +3,8 @@ use std::marker::PhantomData;
 use super::keys::{GlobalKey, StreamKey, SEPARATOR_CHAR};
 use crate::{
     error::{Error, Result},
-    read::{GetMessages, OptGlobalPos, OptStream, Unset},
-    Message,
+    read::{GetMessages, OptGlobalPos, OptStream, OptStreamPos, Unset},
+    Message, StreamPos,
 };
 
 use super::{
@@ -59,6 +59,33 @@ pub fn fetch_stream<'iter, 'msg, 'db: 'iter>(
     .take(limit)
 }
 
+/// Like [`fetch_stream`], but starts the scan at `from` instead of the
+/// stream's first position, enabling paged/tail reads.
+pub fn fetch_stream_from<'iter, 'msg, 'db: 'iter>(
+    db: &'db DB,
+    stream_name: impl AsRef<str> + 'iter,
+    from: StreamPos,
+    limit: usize,
+) -> impl 'iter + Iterator<Item = Result<Message<'msg>>> {
+    let mut search_key = stream_name.as_ref().to_owned();
+    search_key.push(SEPARATOR_CHAR);
+    let mut search_key = search_key.into_bytes();
+    search_key.extend_from_slice(&from.encode().to_be_bytes());
+    let cf = db.stream();
+    let iter = db.prefix_iterator_cf(cf, search_key);
+    iter.map(|res| {
+        let (k, v) = res?;
+        let key = StreamKey::from_bytes(k)?;
+        let rec = StreamRecord::from_bytes(v)?;
+        Ok(rec.into_message(key.stream, key.position))
+    })
+    .take_while(move |res| match res {
+        Ok(msg) => msg.stream_name == stream_name.as_ref(),
+        Err(_) => true,
+    })
+    .take(limit)
+}
+
 // pub struct Fetch;
 pub struct Fetch<Param> {
     _mark: PhantomData<Param>,
@@ -97,6 +124,20 @@ impl<'iter, 's: 'iter> Fetch<OptStream<'s>> {
         opts: GetMessages<OptStream<'s>, Unset, Unset>,
     ) -> impl 'iter + Iterator<Item = Result<Message<'msg>>> {
         fetch_stream(db, opts.stream.0, opts.limit)
+    }
+}
+
+impl<'iter, 's: 'iter> Fetch<(OptStream<'s>, OptStreamPos)> {
+    pub fn fetch<'msg, 'db: 'iter>(
+        db: &'db DB,
+        opts: GetMessages<OptStream<'s>, Unset, OptStreamPos>,
+    ) -> impl 'iter + Iterator<Item = Result<Message<'msg>>> {
+        fetch_stream_from(
+            db,
+            opts.stream.0,
+            opts.start_stream_position.0,
+            opts.limit,
+        )
     }
 }
 
@@ -237,6 +278,47 @@ mod test {
             for message in messages {
                 assert!(message.stream_name == "stream1");
             }
+        }
+
+        #[rstest]
+        fn it_gets_stream_messages_from_given_stream_pos() {
+            let db = test_db(5);
+            let opts = GetMessages::default()
+                .in_stream("stream1")
+                .from_stream_position(StreamPos::Sequential(2));
+            let messages =
+                Fetch::<(OptStream<'_>, crate::read::OptStreamPos)>::fetch(
+                    &db, opts,
+                )
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+
+            assert!(messages.len() == 3);
+            assert!(messages[0].stream_position == StreamPos::Sequential(2));
+            assert!(messages[0].stream_name == "stream1");
+            assert!(
+                messages.last().unwrap().stream_position
+                    == StreamPos::Sequential(4)
+            );
+        }
+
+        #[rstest]
+        fn stream_pos_fetch_does_not_leak_other_streams() {
+            let db = test_db(5);
+            let opts = GetMessages::default()
+                .in_stream("stream1")
+                .from_stream_position(StreamPos::Sequential(4));
+            let messages =
+                Fetch::<(OptStream<'_>, crate::read::OptStreamPos)>::fetch(
+                    &db, opts,
+                )
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+
+            // only the last message of stream1; never spills into stream2
+            assert!(messages.len() == 1);
+            assert!(messages[0].stream_name == "stream1");
+            assert!(messages[0].stream_position == StreamPos::Sequential(4));
         }
         //
         //     #[rstest]

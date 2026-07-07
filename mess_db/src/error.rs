@@ -74,6 +74,9 @@ pub enum Error {
 
     #[error("kill was triggered, so action cancelled")]
     Cancelled,
+
+    #[error("relaxed stream positions are not yet supported")]
+    UnsupportedRelaxed,
 }
 
 impl Error {

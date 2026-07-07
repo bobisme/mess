@@ -5,28 +5,16 @@ use crate::StreamPos;
 pub const LIMIT_MAX: usize = 10_000;
 pub const LIMIT_DEFAULT: usize = 1_000;
 
-/// # Default
+/// Typestate builder for read requests:
 ///
 /// ```
-/// use mess_db::read::ReadMessages;
-/// let read_messages = ReadMessages::default();
+/// use mess_db::read::GetMessages;
+/// use mess_db::StreamPos;
 ///
-/// assert_eq!(read_messages.global_position(), 0);
-/// assert_eq!(read_messages.stream_name(), None);
-/// assert_eq!(read_messages.limit(), 1000);
-/// ```
-///
-/// ```
-/// use mess_db::read::ReadMessages;
-/// let read_messages = ReadMessages::default()
-///     .from_global_position(200)
-///     .from_stream("some_stream_name")
-///     .with_limit(100);
-///
-/// assert_eq!(read_messages.global_position(), 200);
-/// assert!(matches!(read_messages.stream_name(), Some(_)));
-/// assert_eq!(read_messages.stream_name().unwrap(), "some_stream_name");
-/// assert_eq!(read_messages.limit(), 100);
+/// let global = GetMessages::default().from_global(200).with_limit(100);
+/// let stream = GetMessages::default()
+///     .in_stream("some_stream_name")
+///     .from_stream_position(StreamPos::Sequential(3));
 /// ```
 // type states for GetMessages options
 #[derive(Default, Debug, Clone, Copy, PartialEq)]
@@ -66,6 +54,21 @@ impl<Strm, Gpos, Spos> GetMessages<Strm, Gpos, Spos> {
         GetMessages {
             start_global_position: OptGlobalPos(position),
             start_stream_position: self.start_stream_position,
+            limit: self.limit,
+            stream: self.stream,
+        }
+    }
+}
+
+impl<Strm, Gpos, Spos> GetMessages<Strm, Gpos, Spos> {
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn from_stream_position(
+        self,
+        position: StreamPos,
+    ) -> GetMessages<Strm, Gpos, OptStreamPos> {
+        GetMessages {
+            start_global_position: self.start_global_position,
+            start_stream_position: OptStreamPos(position),
             limit: self.limit,
             stream: self.stream,
         }
