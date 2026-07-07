@@ -1,0 +1,16 @@
+[package]
+name = "ptr_index"
+version = "0.1.0"
+edition = "2021"
+
+# Opt out of the repo's root workspace.
+[workspace]
+
+[dependencies]
+redb = "4"
+fjall = "3"
+rand = "0.10"
+rand_distr = "0.6"
+
+[profile.release]
+lto = "thin"

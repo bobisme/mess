@@ -1,0 +1,20 @@
+[package]
+name = "dx_api"
+version = "0.1.0"
+edition = "2021"
+description = "Spike: north-star event-sourcing DX on top of the existing mess_db RocksDB actor"
+publish = false
+
+# Opt out of the repo's root workspace.
+[workspace]
+
+[dependencies]
+mess_db = { path = "../../mess_db" }
+# mess_db's WriteMessage requires an `ident::Id`; mess_db does not re-export it,
+# so we must depend on the exact same git dep. (Friction point — see REPORT.md.)
+ident = { git = "https://github.com/bobisme/ident" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]

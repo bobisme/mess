@@ -1,0 +1,7 @@
+# The repo-root .cargo/config.toml forces `-fuse-ld=lld`, which is not
+# installed on this machine. Cargo joins rustflags arrays from ancestor
+# configs with closer configs appended later, so appending `-fuse-ld=bfd`
+# here wins (clang honors the last -fuse-ld). Keeps plain
+# `cargo run --release` working for this standalone spike.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-Clink-arg=-fuse-ld=bfd"]

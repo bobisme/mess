@@ -1,0 +1,86 @@
+compression spike: zstd L3, 50000 events/category, block = 128 events
+dict training: 5000 samples (held out of evaluation)
+
+## Category: account-transactions
+eval events: 45000  raw: 15.64 MB  avg event: 348 B  (trained on 5000 held-out samples)
+dict (max 16 KiB): trained size 16384 B in 150 ms
+dict (max 64 KiB): trained size 65536 B in 140 ms
+
+strategy                   compressed   ratio    comp MB/s  decomp MB/s
+per-event  L3  no dict     12478614 B   1.25x           72          238
+per-event  L3  dict 16K     5600930 B   2.79x          161          688
+per-event  L3  dict 64K     5627446 B   2.78x          163          690
+block-128  L3  no dict      4276341 B   3.66x          343         1446
+block-128  L3  dict 16K     4227024 B   3.70x          202         1360
+block-128  L3  dict 64K     4272273 B   3.66x          164         1290
+
+random-read latency (decode one event, avg of 20000 reads):
+  per-event no dict          1.54 us
+  per-event dict 16K         0.57 us
+  per-event dict 64K         0.56 us
+  block-128 no dict         29.11 us
+  block-128 dict 16K        32.00 us
+  block-128 dict 64K        33.95 us
+
+## Category: social-posts
+eval events: 45000  raw: 26.58 MB  avg event: 591 B  (trained on 5000 held-out samples)
+dict (max 16 KiB): trained size 16384 B in 225 ms
+dict (max 64 KiB): trained size 65536 B in 209 ms
+
+strategy                   compressed   ratio    comp MB/s  decomp MB/s
+per-event  L3  no dict     19211345 B   1.38x           96          329
+per-event  L3  dict 16K     9360625 B   2.84x          166          554
+per-event  L3  dict 64K     9116976 B   2.92x          184          594
+block-128  L3  no dict      8134486 B   3.27x          261          996
+block-128  L3  dict 16K     7839822 B   3.39x          198          894
+block-128  L3  dict 64K     7738880 B   3.44x          188          852
+
+random-read latency (decode one event, avg of 20000 reads):
+  per-event no dict          1.93 us
+  per-event dict 16K         1.10 us
+  per-event dict 64K         1.01 us
+  block-128 no dict         75.14 us
+  block-128 dict 16K        84.30 us
+  block-128 dict 64K        88.74 us
+
+## Category: order-lifecycle
+eval events: 45000  raw: 19.49 MB  avg event: 433 B  (trained on 5000 held-out samples)
+dict (max 16 KiB): trained size 16384 B in 169 ms
+dict (max 64 KiB): trained size 65536 B in 148 ms
+
+strategy                   compressed   ratio    comp MB/s  decomp MB/s
+per-event  L3  no dict     14489974 B   1.35x           86          271
+per-event  L3  dict 16K     5676039 B   3.43x          212          723
+per-event  L3  dict 64K     5690560 B   3.43x          210          722
+block-128  L3  no dict      4375525 B   4.45x          437         1416
+block-128  L3  dict 16K     4256746 B   4.58x          257         1279
+block-128  L3  dict 64K     4319911 B   4.51x          224         1231
+
+random-read latency (decode one event, avg of 20000 reads):
+  per-event no dict          1.68 us
+  per-event dict 16K         0.62 us
+  per-event dict 64K         0.60 us
+  block-128 no dict         38.36 us
+  block-128 dict 16K        41.92 us
+  block-128 dict 64K        43.92 us
+
+## Category: iot-sensor-readings
+eval events: 45000  raw: 8.89 MB  avg event: 198 B  (trained on 5000 held-out samples)
+dict (max 16 KiB): trained size 16384 B in 61 ms
+dict (max 64 KiB): trained size 65536 B in 64 ms
+
+strategy                   compressed   ratio    comp MB/s  decomp MB/s
+per-event  L3  no dict      7549458 B   1.18x           56          127
+per-event  L3  dict 16K     2548420 B   3.49x          189          614
+per-event  L3  dict 64K     2425638 B   3.67x          198          648
+block-128  L3  no dict      1454773 B   6.11x          422         1229
+block-128  L3  dict 16K     1461130 B   6.09x          299         1061
+block-128  L3  dict 64K     1406731 B   6.32x          294         1156
+
+random-read latency (decode one event, avg of 20000 reads):
+  per-event no dict          1.64 us
+  per-event dict 16K         0.33 us
+  per-event dict 64K         0.37 us
+  block-128 no dict         19.88 us
+  block-128 dict 16K        22.96 us
+  block-128 dict 64K        21.34 us

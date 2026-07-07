@@ -1,0 +1,11 @@
+# The repo root .cargo/config.toml forces clang with -fuse-ld=lld and
+# -Wl,--no-rosegment; lld is not installed here, and cargo merges rustflags
+# arrays from parent configs (they cannot be removed at this level). Point the
+# linker at a shim that strips the lld-specific flags. See ld-shim.sh.
+[target.x86_64-unknown-linux-gnu]
+linker = "./ld-shim.sh"
+
+[env]
+# librocksdb-sys 0.11 vendors RocksDB 8.1.1, whose headers are missing
+# `#include <cstdint>` and fail to compile under GCC 13+. Force-include it.
+CXXFLAGS = "-include cstdint"
