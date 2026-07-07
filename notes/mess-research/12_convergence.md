@@ -9,6 +9,11 @@ Updated 2026-07-07: four spikes validated the quantitative bets in this document
 [13_spike_results.md](./13_spike_results.md). Corrections from the spikes are folded in below
 and marked "(spike)".
 
+Updated 2026-07-07 (round 2): three further spikes — the composed vertical slice, the
+torn-write/reordering harness, and the subscription-handoff protocol — see
+[14_spike_results_round2.md](./14_spike_results_round2.md). They added rules A9–A12 to D2,
+amended D5/D6/D7, and added D11.
+
 ## Debate status
 
 ```text
@@ -114,6 +119,28 @@ A7: segment boundaries align with batch boundaries; recovery scans from the
 A8: batches never span segments.
 ```
 
+Additional rules (spike — torn_write; 24,000 sector-reordering crash cases, ALICE-style):
+
+```text
+A9 MANDATORY: the segment epoch / generation in BatchHeader is upgraded from
+    defense-in-depth to REQUIRED before any segment recycling. Demonstrated:
+    a recycled segment holding a stale prior-generation batch at a coincident
+    first_global_pos, with zero new sectors persisted (legal under
+    reordering), passes every other check including A1 contiguity and
+    resurrects deleted data.
+A10: recovery must NEVER resynchronize past a hole — the scan stops at the
+    first invalid batch, full stop, even if fully-valid batches exist beyond
+    it (the harness left 1,248 valid "resync bait" batches past stop points).
+A11: BatchHeader does NOT require single-sector alignment; safety under
+    straddled/torn headers comes from the A2 length cap + CRC, not layout.
+    Stated to preempt alignment "optimizations".
+A12: no CRC-off recovery fast path may ever exist. With the batch-CRC check
+    disabled, 348 corrupt batches were wrongly accepted across 24,000 cases;
+    in 7.8% of cases the CRC was the only rejecting check (header + marker
+    sectors persisted, a frame sector did not — structurally invisible
+    without it). A4 is empirically confirmed.
+```
+
 ## D3. Registry is event-sourced into the log
 
 Interned IDs (`stream_id`, `category_id`, `event_type_id`) are assigned by the single writer at
@@ -209,6 +236,20 @@ lifecycle above are confirmed. **Backend pick: fjall for the active index** (264
 34k appends/s at journal-buffered durability, which is legitimate here because the active index
 is rebuildable from the log); redb only draws even under forced fsync-per-commit.
 
+Composed-slice corrections (spike — vertical_slice, 1M events end-to-end):
+
+```text
+- active-index inserts MUST be batched per commit, not issued per event:
+  10 synchronous fjall inserts per batch made the index — not the log — the
+  append bottleneck (log alone ~224k ev/s; composed buffered path 175k vs.
+  RocksDB's 532k). (F1)
+- until seal-time packed blocks + read coalescing exist, stream replay via
+  per-event pointer chasing LOSES to an LSM prefix scan by 1.7× (one pread
+  per pointer vs. locality). Packed blocks (78-95× hot-replay win, above)
+  and segment-order pread coalescing (F7) are what close this — they are
+  required for the thesis, not optional acceleration.
+```
+
 ## D6. Compression
 
 Table stakes, not exotic. Frame format carries `codec_id`, `compression_id`,
@@ -222,6 +263,12 @@ v2: per-category (or per-event-type) zstd dictionaries trained at seal;
 measured win (spike): 3–6x on realistic-variance JSON — still larger than
     the entire filter/learned-index program. 10x is unreachable at L3.
 ```
+
+Status upgrade (spike — vertical_slice): compression is **load-bearing for the thesis, not a
+v2 luxury**. The uncompressed v1 slice LOSES the disk-footprint comparison to RocksDB by 1.31×
+(232.6 vs. 305.5 B/event) because SST block compression beats payload deduplication on raw
+JSON. With the measured 3–6× sealed-block compression applied, the comparison flips to roughly
+a 2.5–3× win for the custom log. Sealed-segment recompression moves up the roadmap accordingly.
 
 Format decisions (spike — compression):
 
@@ -248,6 +295,13 @@ enum Durability {
 
 Log-as-authority collapses the old data-durable/index-durable distinction: **marker durable =
 ack**. One fewer state; keep it.
+
+Group-commit amendment (spike — vertical_slice, F2): fixed-delay `Group { max_delay }` is
+**strictly worse than sync-per-batch at low writer concurrency** — measured on both engines:
+1 ms ≈ 4k ev/s (a tie with sync-per-batch), 5 ms ≈ 2.7k, 25 ms ≈ 950. The window must close
+early when every in-flight writer is already waiting on it (`max_delay` is the cap, not the
+target); with that rule, group commit degrades gracefully to sync-per-batch when there is
+nothing to group.
 
 Required consequence the spec must own: under `Process` (and inside a `Group` window),
 visibility precedes durability, so a subscriber can hold a cursor pointing past the post-crash
@@ -298,6 +352,61 @@ hot append path: NEVER
 
 Research note in doc 07 stays; roadmap commitment is removed. Benchmarks earn admission.
 
+## D11. Subscription handoff (catch-up → live)
+
+Added from the sub_handoff spike (5,600 randomized scenarios, 10,617 subscriber sequences
+verified gapless and duplicate-free; full protocol in `spikes/sub_handoff/REPORT.md`).
+
+A subscription created at cursor `c` delivers exactly the committed positions `c+1, c+2, …` in
+order — no gaps, no duplicates — regardless of concurrent appends, consumer speed, or repeated
+falls from live back to catch-up.
+
+```text
+sources:
+  history   = paged read_from(cursor, limit), serving only positions <= the
+              D7 committed watermark. AUTHORITATIVE.
+  live feed = bounded per-subscriber buffer fed by the committing writer.
+              An optimization; carries ZERO correctness weight.
+
+writer obligation (the invariant everything rests on):
+  for every committed position p: advance the committed watermark to >= p
+  BEFORE offering p to any live buffer, and live-feed order == position
+  order. A batch's positions become visible together: watermark to batch
+  end, then publish the batch's positions in order. A refactor that
+  publishes outside the commit critical section breaks gapless delivery
+  undetectably.
+
+protocol:
+  states: CatchUp -> Switching -> Live; {Switching, Live} --overflow--> CatchUp
+  subscribe(c):   attach to live feed FIRST, then CatchUp with last := c
+  CatchUp:        page read_from(last); deliver; empty page -> Switching
+  Switching/Live: next live event p:
+                    p <= last   -> drop  (overlap dedupe — MUST be <=, not ==:
+                                          post-regression the buffer holds
+                                          arbitrarily stale positions)
+                    p == last+1 -> deliver (Switching becomes Live)
+                    overflow    -> back to CatchUp from last
+```
+
+Consequences:
+
+```text
+- overflow is lossy-but-loud: dropping a slow subscriber's buffered events
+  is required (bounded memory); dropping them silently is forbidden.
+- no flapping is possible: a persistently slow subscriber takes one
+  overflow and settles in CatchUp; the switch condition (empty page) is
+  itself the proof of having caught up.
+- live-buffer sizing tracks COMMIT BATCH SIZE, not throughput: one burst
+  larger than the buffer sends even a fast subscriber through history.
+- expose watermark - cursor as the lag metric; the protocol tolerates
+  unbounded lag silently (bounded memory, unbounded delivery debt).
+- CursorRegressed (D7) propagates to the consumer; it must not be silently
+  absorbed by auto-resubscribe — delivered-but-revoked history is an
+  application-level fact.
+- rejected alternative: catch-up-first-then-subscribe lost events in
+  291/300 seeded races; kept as an executable counterexample in the spike.
+```
+
 ## Revised roadmap (final)
 
 The author's reordering is adopted with one correction: **the crash/fault harness had been
@@ -344,8 +453,10 @@ Phase 3 — Custom log  [co-requisite: crash harness]
 
 Phase 4 — Index/cache engine
   per-event active indexes -> sealed variable-length pointer blocks (D5)
+  active-index writes batched per commit (vertical-slice F1)
   active index backend: fjall at journal-buffered durability (spike pick)
   snapshot_head; registry replay; projection checkpoints
+  subscription runtime per D11 (validated protocol; property tests come with it)
   EXIT GATE: benchmark pointer-block design vs. per-event-key baseline
     (spike ptr_index answered this for the strategy — 55x write amp for
     RMW — re-verify on the real implementation, not just the model)

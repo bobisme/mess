@@ -1,0 +1,20 @@
+[package]
+name = "vertical_slice"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone spike: opt out of the repo's root workspace.
+[workspace]
+
+[dependencies]
+crc32fast = "1"
+fjall = "3"
+rocksdb = { version = "0.21", features = ["zstd"] } # same pin as mess_db
+postcard = { version = "1", features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }
+rand = "0.10"
+rand_distr = "0.6"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+[profile.release]
+lto = "thin"

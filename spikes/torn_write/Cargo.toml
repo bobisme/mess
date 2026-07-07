@@ -1,0 +1,11 @@
+[package]
+name = "torn_write"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone spike: opt out of the repo's root workspace.
+[workspace]
+
+[dependencies]
+crc32fast = "1"
+rand = "0.8"

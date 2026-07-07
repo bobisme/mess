@@ -1,0 +1,13 @@
+[package]
+name = "sub_handoff"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone spike: opt out of the repo's root workspace.
+[workspace]
+
+[dependencies]
+tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros", "time"] }
+
+[dev-dependencies]
+rand = "0.8"

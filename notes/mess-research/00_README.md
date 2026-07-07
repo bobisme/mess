@@ -33,6 +33,7 @@ projections should be modeled as typed folds over logs, not ad-hoc consumers.
 11. [11_review.md](./11_review.md) — independent review: citation audit, correctness holes, omissions.
 12. [12_convergence.md](./12_convergence.md) — **authoritative**: agreed design after review + response; supersedes 01–09 where they conflict.
 13. [13_spike_results.md](./13_spike_results.md) — measured spike results validating the convergence doc's bets.
+14. [14_spike_results_round2.md](./14_spike_results_round2.md) — round-2 spikes: composed vertical slice, torn-write reordering, subscription handoff.
 
 ## High-level recommendation
 
