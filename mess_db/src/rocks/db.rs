@@ -1,6 +1,7 @@
 use std::{
     ops::{Deref, DerefMut},
     path::Path,
+    sync::atomic::AtomicU64,
 };
 
 use rocksdb::{ColumnFamilyDescriptor, ColumnFamilyRef, Options};
@@ -10,6 +11,9 @@ use crate::error::Result;
 
 pub struct DB {
     db: ::rocksdb::DB,
+    /// Last written global position. 0 = unknown; lazily filled by scanning
+    /// the global CF, advanced on every successful write.
+    pub(crate) cached_global: AtomicU64,
 }
 
 fn opts() -> Options {
@@ -36,7 +40,7 @@ impl DB {
             path,
             vec![new_cf("global"), new_cf("stream")],
         )?;
-        Ok(Self { db })
+        Ok(Self { db, cached_global: AtomicU64::new(0) })
     }
 
     #[must_use]

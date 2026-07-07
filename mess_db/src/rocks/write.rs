@@ -1,7 +1,4 @@
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
-};
+use std::sync::{atomic::Ordering, Arc};
 
 use super::{
     db::DB,
@@ -15,10 +12,8 @@ use crate::{
 };
 use rocksdb::{IteratorMode, ReadOptions};
 
-static mut CACHED_GLOBAL: AtomicU64 = AtomicU64::new(0);
-
 pub fn get_last_global_position(db: &DB) -> Result<GlobalKey> {
-    let cached = unsafe { CACHED_GLOBAL.load(Ordering::SeqCst) };
+    let cached = db.cached_global.load(Ordering::Acquire);
     if cached != 0 {
         return Ok(GlobalKey(cached));
     }
@@ -35,9 +30,7 @@ pub fn get_last_global_position(db: &DB) -> Result<GlobalKey> {
         .map_err(|e| Error::ReadError(e.to_string()))?
         .map_err(|e| Error::ReadError(e.to_string()));
     if let Ok(key) = result.as_ref() {
-        unsafe {
-            CACHED_GLOBAL.store(key.0, Ordering::Release);
-        }
+        db.cached_global.fetch_max(key.0, Ordering::AcqRel);
     }
     result
 }
@@ -145,6 +138,7 @@ fn write_records(
     batch.put_cf(db.global(), next_global.as_bytes(), &global_bytes);
     batch.put_cf(db.stream(), next_stream.as_bytes(), &stream_bytes);
     db.write(batch)?;
+    db.cached_global.fetch_max(next_global.0, Ordering::AcqRel);
 
     Ok(Position { global: next_global.0, stream: next_stream.position })
 }
@@ -171,13 +165,7 @@ pub fn write_serial_mess(
     let stream_name = msg.stream_name.clone();
     let next_stream =
         next_stream_pos(msg.expected_position, &stream_name, last_stream)?;
-    let res = write_records(db, msg, next_global, next_stream, ser);
-    if let Ok(position) = res.as_ref() {
-        unsafe {
-            CACHED_GLOBAL.store(position.global, Ordering::SeqCst);
-        }
-    }
-    res
+    write_records(db, msg, next_global, next_stream, ser)
 }
 pub async fn write_mess_async<'a>(
     db: Arc<DB>,
@@ -370,6 +358,26 @@ mod test_write_mess {
 
         assert!(x.message_type == "someMsgType");
         assert!(x.global_position == 1);
+    }
+
+    #[rstest::rstest]
+    fn global_position_does_not_leak_across_db_instances() {
+        // Regression: the last-global cache used to be a process-wide
+        // `static mut`, so a fresh DB inherited another instance's position.
+        let db1 = setup();
+        let db2 = SelfDestructingDB::new_tmp();
+        let msg = WriteMessage {
+            id: Id::new(),
+            stream_name: "stream1".into(),
+            message_type: "someMsgType".into(),
+            data: Cow::Borrowed(b"{\"a\": 1}"),
+            metadata: Cow::Borrowed(b"{\"b\": 2}"),
+            expected_stream_position: None,
+        };
+        let mut ser = ser();
+        let pos = write_mess(&db2, msg, &mut ser).unwrap();
+        assert!(pos.global == 1);
+        drop(db1);
     }
 
     #[rstest::rstest]
