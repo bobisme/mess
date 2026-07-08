@@ -30,3 +30,7 @@ Cargo.lock
 flamegraph.svg
 perf.data*
 .tla/
+# maw admin tree (consolidated layout) — runtime/admin only
+/.maw/
+/.manifold/
+/repo.git/
