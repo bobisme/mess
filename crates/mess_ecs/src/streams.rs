@@ -204,17 +204,16 @@ impl<'a> StreamName<'a> {
 
 // compile time tests
 const _: () = {
-    use konst::option::unwrap;
     let split = splits("stream-1234");
-    assert!(unwrap!(split.0) == 6 && split.1.is_none());
+    assert!(split.0.unwrap() == 6 && split.1.is_none());
     let split = splits("stream-1234:whatever");
-    assert!(unwrap!(split.0) == 6 && unwrap!(split.1) == 11);
+    assert!(split.0.unwrap() == 6 && split.1.unwrap() == 11);
     let split = splits("stream");
     assert!(split.0.is_none() && split.1.is_none());
     let split = splits("stream2:whatever");
-    assert!(split.0.is_none() && unwrap!(split.1) == 7);
+    assert!(split.0.is_none() && split.1.unwrap() == 7);
     let split = splits("stream2:what-ever");
-    assert!(split.0.is_none() && unwrap!(split.1) == 7);
+    assert!(split.0.is_none() && split.1.unwrap() == 7);
 };
 
 #[cfg(test)]

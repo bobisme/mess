@@ -1,7 +1,7 @@
 [package]
 name = "mess-testkit"
 version = "0.0.0"
-edition = "2021"
+edition = "2024"
 description = "mess v1: test harness and deterministic-simulation-testing (DST) utilities"
 
 [dependencies]

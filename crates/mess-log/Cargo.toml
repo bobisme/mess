@@ -1,6 +1,6 @@
 [package]
 name = "mess-log"
-edition = "2021"
+edition = "2024"
 version = "0.1.0"
 description = "mess append-only batch log (D1/D2): commit-authority acceptance kernel + formal protocol model"
 

@@ -160,7 +160,6 @@ impl From<GetMessages<Unset, OptGlobalPos, Unset>> for GetMessagesOptions<'_> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use rstest::*;
 
     mod test_get_messages {
         use super::*;
@@ -169,13 +168,13 @@ mod test {
             use super::*;
             use pretty_assertions::assert_eq;
 
-            #[rstest]
+            #[tokio::test]
             async fn default_is_none() {
                 let get = GetMessages::default();
                 assert_eq!(get.stream, Unset);
             }
 
-            #[rstest]
+            #[tokio::test]
             async fn sets_some_stream() {
                 let get = GetMessages::default().in_stream("a-stream");
                 assert_eq!(get.stream, OptStream("a-stream".into()));
@@ -186,13 +185,13 @@ mod test {
             use super::*;
             use pretty_assertions::assert_eq;
 
-            #[rstest]
+            #[tokio::test]
             async fn default_is_zero() {
                 let get = GetMessages::default();
                 assert_eq!(get.start_global_position, Unset);
             }
 
-            #[rstest]
+            #[tokio::test]
             async fn it_sets_given_position() {
                 let get = GetMessages::default().from_global(42);
                 assert_eq!(get.start_global_position, OptGlobalPos(42));
@@ -203,19 +202,19 @@ mod test {
             use super::*;
             use pretty_assertions::assert_eq;
 
-            #[rstest]
+            #[tokio::test]
             async fn it_sets_the_given_limit() {
                 let get = GetMessages::default().with_limit(500);
                 assert_eq!(get.limit, 500);
             }
 
-            #[rstest]
+            #[tokio::test]
             async fn min_limit_is_1() {
                 let get = GetMessages::default().with_limit(0);
                 assert_eq!(get.limit, 1);
             }
 
-            #[rstest]
+            #[tokio::test]
             async fn max_limit_is_limit_max() {
                 let get = GetMessages::default().with_limit(usize::MAX);
                 assert_eq!(get.limit, LIMIT_MAX);

@@ -1,17 +1,23 @@
 [workspace]
 resolver = "2"
+# Naming (bn-2gq): legacy pre-v1 crates keep their underscore names
+# (mess_db, mess_ecs) to avoid churning every `use` path in code that
+# dies once Phase 3 retires them. New v1 crates use dashes (mess-log,
+# mess-core, mess-index, mess-store, mess-derive, mess-testkit), matching
+# the crates.io convention. Stay consistent with whichever bucket a new
+# crate belongs to.
 members = [
-    "crates/mess",
-    "crates/mess_ecs",
-    "crates/mess_db",
-    "crates/mess-log",
-    "crates/mess-core",
-    "crates/mess-index",
-    "crates/mess-store",
-    "crates/mess-derive",
-    "crates/mess-testkit",
-    "examples/social",
-    "xtask",
+  "crates/mess",
+  "crates/mess_ecs",
+  "crates/mess_db",
+  "crates/mess-log",
+  "crates/mess-core",
+  "crates/mess-index",
+  "crates/mess-store",
+  "crates/mess-derive",
+  "crates/mess-testkit",
+  "examples/social",
+  "xtask",
 ]
 
 # The bn-13s formal model runs an exhaustive state-space search as a cargo
@@ -35,13 +41,13 @@ mess-derive = { path = "crates/mess-derive" }
 mess-testkit = { path = "crates/mess-testkit" }
 #
 ident = { git = "https://github.com/bobisme/ident" }
-konst = "0.3.6"
-parking_lot = { version = "0.12.1", features = ["arc_lock"] }
-quick_cache = "0.4.0"
-thiserror = "1.0.44"
-tokio = { version = "1.32", features = ["full"] }
-tokio-util = "0.7.8"
-tracing = "0.1.37"
+konst = "0.4.3"
+parking_lot = { version = "0.12.5", features = ["arc_lock"] }
+quick_cache = "0.7.0"
+thiserror = "2.0.18"
+tokio = { version = "1.52", features = ["full"] }
+tokio-util = "0.7.18"
+tracing = "0.1.44"
 # dev
-assert2 = "0.3.11"
-rstest = "0.18.2"
+assert2 = "0.4.0"
+rstest = "0.26.1"
