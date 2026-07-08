@@ -97,8 +97,8 @@ differential, and it guards against the theorem passing vacuously.
   - bn-21c (spec doc): state explicitly that dead space is dead by
     *acceptance rules*, not by erasure, and that discarded unacked
     batches may resurface across a later crash exactly like other A6
-    duplicates — dedupe (D5's window) is the mechanism that must absorb
-    them.
+    duplicates — the dedupe window (an A6/D7 concern; see 02-recovery.md
+    and 03-durability.md §7) is the mechanism that must absorb them.
   - bn-39n (scanner) / bn-11m (committer): if resurfacing is ever
     unacceptable, the fix is physically stamping/truncating at the safe
     offset before the first post-recovery ack — a policy choice, not a
