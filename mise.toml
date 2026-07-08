@@ -1,0 +1,55 @@
+# Toolchain for the formal-model work (bn-13s): TLA+ (TLC), Apalache, optional Lean 4.
+#
+# - java: runtime for both TLC and Apalache (Apalache requires JDK 17)
+# - lean4: optional deepening for bn-13s (via ubi backend from GitHub releases)
+# - TLC and Apalache ship as OS-independent JVM archives that mise's ubi backend
+#   can't match (no OS in asset names), so they're pinned + fetched by mise tasks
+#   into .tla/ (gitignored). Run `mise run fetch-formal` once, then
+#   `mise run tlc -- Spec.tla` / `mise run apalache -- check Spec.tla`.
+
+[tools]
+java = "temurin-17"
+"ubi:leanprover/lean4" = { version = "4.31.0", extract_all = "true", bin_path = "bin" }
+
+[vars]
+tla_tools_version = "1.8.0"
+apalache_version = "0.58.2"
+
+[tasks.fetch-tla]
+description = "Download tla2tools.jar (TLC + SANY) into .tla/"
+run = """
+mkdir -p .tla
+test -f .tla/tla2tools.jar || curl -fsSL -o .tla/tla2tools.jar \
+  "https://github.com/tlaplus/tlaplus/releases/download/v{{vars.tla_tools_version}}/tla2tools.jar"
+# TLC's -h exits 1 by design; verify by output instead
+java -cp .tla/tla2tools.jar tlc2.TLC -h 2>&1 | grep -Eqi "usage|TLC" && echo "tla2tools.jar {{vars.tla_tools_version}} OK"
+"""
+
+[tasks.fetch-apalache]
+description = "Download and unpack Apalache into .tla/apalache/"
+run = """
+mkdir -p .tla
+if [ ! -x .tla/apalache/bin/apalache-mc ]; then
+  curl -fsSL -o .tla/apalache.tgz \
+    "https://github.com/apalache-mc/apalache/releases/download/v{{vars.apalache_version}}/apalache-{{vars.apalache_version}}.tgz"
+  rm -rf .tla/apalache && mkdir -p .tla/apalache
+  tar -xzf .tla/apalache.tgz -C .tla/apalache --strip-components=1
+  rm .tla/apalache.tgz
+fi
+.tla/apalache/bin/apalache-mc version && echo "apalache OK"
+"""
+
+[tasks.fetch-formal]
+description = "Fetch the whole formal-methods toolchain"
+depends = ["fetch-tla", "fetch-apalache"]
+run = "echo formal toolchain ready"
+
+[tasks.tlc]
+description = "Run TLC model checker: mise run tlc -- <Spec.tla> [args]"
+depends = ["fetch-tla"]
+run = "java -XX:+UseParallelGC -cp .tla/tla2tools.jar tlc2.TLC"
+
+[tasks.apalache]
+description = "Run Apalache: mise run apalache -- check <Spec.tla>"
+depends = ["fetch-apalache"]
+run = ".tla/apalache/bin/apalache-mc"
