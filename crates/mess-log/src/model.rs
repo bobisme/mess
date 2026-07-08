@@ -6,7 +6,7 @@
 //! accept/stop decisions are made by a pluggable [`Kernel`] — in the
 //! checker, the PRODUCTION [`acceptance`] kernel.
 //!
-//! `mess_log/tests/stateright.rs` wraps this in stateright and
+//! `tests/stateright.rs` wraps this in stateright and
 //! exhaustively explores every interleaving within bounds. The types
 //! here are deliberately stateright-free so the DST harness (bn-3kn)
 //! can drive the same model as its in-memory reference.

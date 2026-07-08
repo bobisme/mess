@@ -8,10 +8,18 @@ xtask = "run --package xtask --"
 # is retired for the v1 engine. Harmless for other C++ deps.
 CXXFLAGS = "-include cstdint"
 
-[target.x86_64-unknown-linux-gnu]
-linker = "/usr/bin/clang"
-rustflags = [
-  "-Ctarget-cpu=native",
-  "-Clink-arg=-fuse-ld=lld",
-  "-Clink-arg=-Wl,--no-rosegment",
-]
+# No [target.*] linker override here on purpose: a fresh clone must build
+# with whatever default linker the platform's `cc` picks, without clang or
+# lld installed. If you have clang+lld available locally and want faster
+# links, add the block below to your *personal, untracked* cargo config
+# (e.g. ~/.cargo/config.toml, or a gitignored .cargo/config.toml.local
+# merged in via `CARGO_HOME`/extra `--config` flags) rather than checking
+# it into this repo:
+#
+#   [target.x86_64-unknown-linux-gnu]
+#   linker = "/usr/bin/clang"
+#   rustflags = [
+#     "-Ctarget-cpu=native",
+#     "-Clink-arg=-fuse-ld=lld",
+#     "-Clink-arg=-Wl,--no-rosegment",
+#   ]

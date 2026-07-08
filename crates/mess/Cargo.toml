@@ -1,0 +1,21 @@
+[package]
+name = "mess"
+version = "0.0.1-placeholder"
+edition = "2021"
+authors = ["Bob <bob@standardinput.co>"]
+description = "placeholder for a prototype message storage lib"
+repository = "https://github.com/bobisme/mess"
+homepage = "https://github.com/bobisme/mess"
+documentation = "https://github.com/bobisme/mess"
+readme = "../../README.md"
+
+[features]
+xtest = []
+proptest = []
+
+[lib]
+name = "mess"
+
+[dependencies]
+mess_db = { workspace = true }
+mess_ecs = { workspace = true }

@@ -28,7 +28,7 @@
 //!
 //! The production recovery scanner MUST route every accept/stop decision
 //! through [`AcceptState::step`] (or the [`accepted_prefix`] fold built
-//! on it). The stateright model (`mess_log/tests/stateright.rs`)
+//! on it). The stateright model (`tests/stateright.rs`)
 //! exhaustively checks THIS function against a reordering-disk
 //! abstraction; that guarantee transfers to production only if the
 //! scanner calls it rather than re-implementing the rules.

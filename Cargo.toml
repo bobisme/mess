@@ -1,42 +1,38 @@
-[package]
-name = "mess"
-version = "0.0.1-placeholder"
-edition = "2021"
-authors = ["Bob <bob@standardinput.co>"]
-description = "placeholder for a prototype message storage lib"
-repository = "https://github.com/bobisme/mess"
-homepage = "https://github.com/bobisme/mess"
-documentation = "https://github.com/bobisme/mess"
-readme = "README.md"
-
-[features]
-xtest = []
-proptest = []
-
 [workspace]
-members = [".", "mess_ecs", "mess_db", "mess_log", "examples/social", "xtask"]
+resolver = "2"
+members = [
+    "crates/mess",
+    "crates/mess_ecs",
+    "crates/mess_db",
+    "crates/mess-log",
+    "crates/mess-core",
+    "crates/mess-index",
+    "crates/mess-store",
+    "crates/mess-derive",
+    "crates/mess-testkit",
+    "examples/social",
+    "xtask",
+]
 
 # The bn-13s formal model runs an exhaustive state-space search as a cargo
 # test; optimize just those packages so the check stays fast in CI.
 [profile.dev.package.stateright]
 opt-level = 2
-[profile.dev.package.mess_log]
+[profile.dev.package.mess-log]
 opt-level = 2
-[profile.test.package.mess_log]
+[profile.test.package.mess-log]
 opt-level = 2
-
-[lib]
-name = "mess"
-
-[dependencies]
-mess_db = { workspace = true }
-mess_ecs = { workspace = true }
 
 [workspace.dependencies]
-mess = { path = "." }
-mess_db = { path = "mess_db" }
-mess_ecs = { path = "mess_ecs" }
-mess_log = { path = "mess_log" }
+mess = { path = "crates/mess" }
+mess_db = { path = "crates/mess_db" }
+mess_ecs = { path = "crates/mess_ecs" }
+mess-log = { path = "crates/mess-log" }
+mess-core = { path = "crates/mess-core" }
+mess-index = { path = "crates/mess-index" }
+mess-store = { path = "crates/mess-store" }
+mess-derive = { path = "crates/mess-derive" }
+mess-testkit = { path = "crates/mess-testkit" }
 #
 ident = { git = "https://github.com/bobisme/ident" }
 konst = "0.3.6"

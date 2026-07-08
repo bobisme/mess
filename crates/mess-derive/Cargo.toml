@@ -1,0 +1,10 @@
+[package]
+name = "mess-derive"
+version = "0.0.0"
+edition = "2021"
+description = "mess v1: proc-macros"
+
+[lib]
+proc-macro = true
+
+[dependencies]

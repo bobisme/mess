@@ -5,7 +5,7 @@ kernel, with one spec observation (Z1 below). Checked 2026-07-08.
 
 ## What exists
 
-- `mess_log/src/acceptance.rs` — the **production batch-acceptance
+- `crates/mess-log/src/acceptance.rs` — the **production batch-acceptance
   kernel**: a pure fold making every accept/stop decision of recovery
   (D1 commit authority) over byte-validated candidates. Rules owned by
   the kernel: A5 (no empty batches), A9 (segment epoch), A1 (position
@@ -14,14 +14,14 @@ kernel, with one spec observation (Z1 below). Checked 2026-07-08.
   (A2/A3/A4/A11/A12) belong to the scanner's decoder and were proven
   empirically by `spikes/torn_write` (24k randomized sector-reordering
   crashes).
-- `mess_log/src/model.rs` — an abstract single-segment protocol model:
+- `crates/mess-log/src/model.rs` — an abstract single-segment protocol model:
   writer appends, fsync barriers, sector-reordering crashes (each
   un-fsynced header/body/marker part independently kept, persisted, or
   torn), segment recycling without zeroing (A9's precondition), and
   recovery whose guard is a pluggable kernel. Stateright-free on
   purpose: it is intended as the shared in-memory reference for the DST
   harness (bn-3kn).
-- `mess_log/tests/stateright.rs` — the exhaustive check, run as a
+- `crates/mess-log/tests/stateright.rs` — the exhaustive check, run as a
   normal cargo test.
 
 ## The key move
@@ -119,10 +119,10 @@ differential, and it guards against the theorem passing vacuously.
 ## Running it
 
 ```sh
-cargo test -p mess_log                  # kernel units + model + checker
-cargo test -p mess_log --test stateright -- --nocapture  # state counts
+cargo test -p mess-log                  # kernel units + model + checker
+cargo test -p mess-log --test stateright -- --nocapture  # state counts
 ```
 
-Bounds live in `mess_log/tests/stateright.rs` (`BOUNDS`). Cost scaling
+Bounds live in `crates/mess-log/tests/stateright.rs` (`BOUNDS`). Cost scaling
 for the curious: appends=6 explores 11.4M states (~11 s, ~9.5 GiB RSS)
 with no new findings; the committed bounds keep CI at ~2 s / ~1.8 GiB.

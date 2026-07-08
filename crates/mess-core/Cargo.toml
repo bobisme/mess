@@ -1,0 +1,7 @@
+[package]
+name = "mess-core"
+version = "0.0.0"
+edition = "2021"
+description = "mess v1: shared types and semantics used across the workspace"
+
+[dependencies]
