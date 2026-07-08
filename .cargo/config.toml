@@ -1,6 +1,13 @@
 [alias]
 xtask = "run --package xtask --"
 
+[env]
+# rocksdb 8.x (via mess_db -> rocksdb 0.21) predates the GCC 13 header
+# cleanup and fails with "'uint64_t' has not been declared" on modern
+# GCC; force the include until the rocksdb crate is bumped or mess_db
+# is retired for the v1 engine. Harmless for other C++ deps.
+CXXFLAGS = "-include cstdint"
+
 [target.x86_64-unknown-linux-gnu]
 linker = "/usr/bin/clang"
 rustflags = [

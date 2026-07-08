@@ -1,15 +1,17 @@
-# Toolchain for the formal-model work (bn-13s): TLA+ (TLC), Apalache, optional Lean 4.
+# Toolchain for the formal-model work (bn-13s): TLA+ (TLC), Apalache.
 #
 # - java: runtime for both TLC and Apalache (Apalache requires JDK 17)
-# - lean4: optional deepening for bn-13s (via ubi backend from GitHub releases)
 # - TLC and Apalache ship as OS-independent JVM archives that mise's ubi backend
 #   can't match (no OS in asset names), so they're pinned + fetched by mise tasks
 #   into .tla/ (gitignored). Run `mise run fetch-formal` once, then
 #   `mise run tlc -- Spec.tla` / `mise run apalache -- check Spec.tla`.
+# - Lean 4 is deliberately NOT pinned here: its bundled clang/ld.lld shadow the
+#   system toolchain on PATH and break bindgen builds (zstd-sys: "stddef.h not
+#   found" — Lean's clang ships no header resource dir). If wanted on demand:
+#   `mise x "ubi:leanprover/lean4[extract_all=true,bin_path=bin]@4.31.0" -- lean`
 
 [tools]
 java = "temurin-17"
-"ubi:leanprover/lean4" = { version = "4.31.0", extract_all = "true", bin_path = "bin" }
 
 [vars]
 tla_tools_version = "1.8.0"
