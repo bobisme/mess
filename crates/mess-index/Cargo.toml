@@ -5,3 +5,8 @@ edition = "2024"
 description = "mess v1: metadata and pointer index"
 
 [dependencies]
+mess-log = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+mess-log = { workspace = true }
