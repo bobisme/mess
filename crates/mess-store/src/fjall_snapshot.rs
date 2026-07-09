@@ -242,16 +242,32 @@ fn checksum(bytes: &[u8]) -> u64 {
     h
 }
 
+/// On-disk format tag for the opaque `snapshot_ref` bytes (§9 back-compat).
+///
+/// Every record this binary writes is prefixed with this byte, so the decoder
+/// can tell "a v1 record whose `fold_version` I can trust" from "a record from
+/// a format I do not understand". Any record lacking this exact tag — a shorter
+/// legacy record written before `fold_version` was stored, a future format, or
+/// a garbled head — is decoded as **unknown** and treated as no usable
+/// snapshot, which self-heals to a full replay (§9: old records → invalidate).
+/// Bump this tag on any incompatible change to the byte layout below.
+const REF_FORMAT_V1: u8 = 0x01;
+/// Byte length of a well-formed v1 record: `tag(1) || fold_version(4) ||
+/// flags(1) || snapshot_ptr(8)`.
+const REF_V1_LEN: usize = 1 + 4 + 1 + 8;
+
 /// Encode the opaque `snapshot_ref` bytes the fjall [`SnapshotHead`] carries
 /// verbatim: everything about a [`SnapshotRef`] that the head's own fields
 /// (`covered_version`, `global_position`) do not already hold.
 ///
-/// Layout: `fold_version(4 LE) || flags(1) || snapshot_ptr(8 LE)`.
-/// `flags` bit 0 = `covers_empty_prefix`. The interned `stream_id`,
-/// `stream_version`, and the reserved hashes are all recovered without being
-/// stored (id from the stream name, version from the head, hashes are `None`).
+/// Layout: `tag(1) || fold_version(4 LE) || flags(1) || snapshot_ptr(8 LE)`.
+/// The leading `tag` is [`REF_FORMAT_V1`]; `flags` bit 0 = `covers_empty_prefix`.
+/// The interned `stream_id`, `stream_version`, and the reserved hashes are all
+/// recovered without being stored (id from the stream name, version from the
+/// head, hashes are `None`).
 fn encode_ref(snap: &SnapshotRef) -> Vec<u8> {
-    let mut out = Vec::with_capacity(13);
+    let mut out = Vec::with_capacity(REF_V1_LEN);
+    out.push(REF_FORMAT_V1);
     out.extend_from_slice(&snap.fold_version.to_le_bytes());
     out.push(u8::from(snap.covers_empty_prefix));
     out.extend_from_slice(&snap.snapshot_ptr.0.to_le_bytes());
@@ -260,13 +276,19 @@ fn encode_ref(snap: &SnapshotRef) -> Vec<u8> {
 
 /// Reconstruct the parts of a [`SnapshotRef`] stored in the opaque head bytes.
 /// Returns `(fold_version, covers_empty_prefix, snapshot_ptr)`.
+///
+/// `None` means the record is **not** a format this binary understands — a
+/// legacy record predating the `fold_version` field, a future tag, or a garbled
+/// head. The caller treats that as no usable snapshot and self-heals by full
+/// replay, which is exactly the §9 "old record → unknown → invalidate" story:
+/// a record whose fold provenance cannot be trusted is never trusted.
 fn decode_ref(bytes: &[u8]) -> Option<(u32, bool, u64)> {
-    if bytes.len() < 13 {
+    if bytes.len() != REF_V1_LEN || bytes[0] != REF_FORMAT_V1 {
         return None;
     }
-    let fold_version = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
-    let covers_empty_prefix = bytes[4] != 0;
-    let snapshot_ptr = u64::from_le_bytes(bytes[5..13].try_into().ok()?);
+    let fold_version = u32::from_le_bytes(bytes[1..5].try_into().ok()?);
+    let covers_empty_prefix = bytes[5] != 0;
+    let snapshot_ptr = u64::from_le_bytes(bytes[6..14].try_into().ok()?);
     Some((fold_version, covers_empty_prefix, snapshot_ptr))
 }
 
@@ -419,10 +441,50 @@ mod tests {
             state_hash: None,
             snapshot_ptr: BlobPtr(0xdead_beef),
         };
-        let (fv, empty, ptr) = decode_ref(&encode_ref(&snap)).unwrap();
+        let encoded = encode_ref(&snap);
+        assert_eq!(encoded.len(), REF_V1_LEN);
+        assert_eq!(encoded[0], REF_FORMAT_V1, "record must carry the format tag");
+        let (fv, empty, ptr) = decode_ref(&encoded).unwrap();
         assert_eq!(fv, 3);
         assert!(empty);
         assert_eq!(ptr, 0xdead_beef);
-        assert_eq!(decode_ref(&[0u8; 4]), None);
+    }
+
+    /// §9 back-compat: a record this binary does not understand — a legacy
+    /// record predating the `fold_version` field, a foreign/future tag, an
+    /// empty or truncated head — decodes to `None` (unknown → not usable →
+    /// self-heal by full replay). Its fold provenance cannot be trusted, so it
+    /// is never trusted.
+    #[test]
+    fn legacy_and_garbled_records_decode_as_unknown() {
+        // Empty / too short.
+        assert_eq!(decode_ref(&[]), None);
+        assert_eq!(decode_ref(&[REF_FORMAT_V1]), None);
+
+        // A plausible LEGACY layout: the pre-tag `fold_version(4) || flags(1) ||
+        // ptr(8)` = 13 bytes, with no format tag. It must NOT be trusted just
+        // because it is 13 bytes of the right general shape.
+        let legacy = {
+            let mut v = Vec::new();
+            v.extend_from_slice(&7u32.to_le_bytes());
+            v.push(1);
+            v.extend_from_slice(&0xdead_beefu64.to_le_bytes());
+            v
+        };
+        assert_eq!(legacy.len(), 13);
+        assert_eq!(decode_ref(&legacy), None, "untagged legacy record → unknown");
+
+        // Right length, wrong tag (a future/foreign format).
+        let mut wrong_tag = encode_ref(&SnapshotRef {
+            stream_id: 1,
+            stream_version: 0,
+            fold_version: 2,
+            covers_empty_prefix: false,
+            event_prefix_hash: None,
+            state_hash: None,
+            snapshot_ptr: BlobPtr(0),
+        });
+        wrong_tag[0] = 0xff;
+        assert_eq!(decode_ref(&wrong_tag), None, "unknown tag → unknown");
     }
 }

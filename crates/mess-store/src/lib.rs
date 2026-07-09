@@ -57,7 +57,9 @@ pub use snapshot::{
     BlobPtr, Hash256, SnapshotRef, SnapshotStore, Snapshottable,
     StateCodecError, StoredSnapshot, interim_stream_id,
 };
-pub use store::{Commit, DEFAULT_PAGE_SIZE, EventStore, Loaded, StoreError};
+pub use store::{
+    Commit, DEFAULT_PAGE_SIZE, EventStore, Loaded, SnapshotMetrics, StoreError,
+};
 pub use version::Version;
 
 // Re-export the core command error the facade returns so callers need not

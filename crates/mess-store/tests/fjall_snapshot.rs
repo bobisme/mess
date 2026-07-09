@@ -13,8 +13,8 @@ use std::time::Instant;
 
 use mess_core::{Aggregate, CodecError, Event};
 use mess_store::{
-    EventStore, FjallSnapshotBackend, Loaded, LogEngine, Snapshottable,
-    StateCodecError, Version,
+    EventStore, FjallSnapshotBackend, Loaded, LogEngine, SnapshotStore,
+    Snapshottable, StateCodecError, Version,
 };
 
 // ---------------------------------------------------------------------------
@@ -83,6 +83,30 @@ impl Snapshottable for Counter {
             StateCodecError(format!("expected 8 bytes, got {}", bytes.len()))
         })?;
         Ok(Counter { total: i64::from_le_bytes(b) })
+    }
+}
+
+/// v2 of the SAME aggregate over the SAME blob layout — a `fold_version` bump
+/// with an unchanged fold, so a v1 snapshot is decodable by v2 and the only
+/// thing that rejects it is the version check. Used for the persisted
+/// invalidation-on-deploy round-trip.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct CounterV2(Counter);
+
+impl Aggregate for CounterV2 {
+    type Event = CounterEvent;
+    fn apply(&mut self, event: &CounterEvent) {
+        self.0.apply(event);
+    }
+}
+
+impl Snapshottable for CounterV2 {
+    const FOLD_VERSION: u32 = 2;
+    fn encode_state(&self) -> Result<Vec<u8>, StateCodecError> {
+        self.0.encode_state()
+    }
+    fn decode_state(bytes: &[u8]) -> Result<Self, StateCodecError> {
+        Counter::decode_state(bytes).map(CounterV2)
     }
 }
 
@@ -367,6 +391,77 @@ async fn corrupt_blob_falls_back_to_full_replay() {
         loaded.events_replayed,
         events.len(),
         "corrupt blob => fall back to full replay"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Invalidation on deploy (§9), on the PERSISTED path: a persisted v1 snapshot
+// is invalidated by a v2 load, rebuilt by full replay, counted once, and the
+// on-disk head is replaced with a v2 snapshot — a genuine fjall round-trip.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn fold_version_bump_invalidates_and_replaces_persisted_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    let stream = "deploy-fjall";
+
+    let events: Vec<CounterEvent> =
+        (1..=6).map(CounterEvent::Added).collect();
+    let expected = fold(&events);
+
+    // Old binary (v1): snapshot the whole stream and flush it to disk.
+    store.append(stream, Version::NoStream, &events).await.unwrap();
+    let v1 = store.save_snapshot::<Counter>(stream).await.unwrap();
+    assert_eq!(v1.fold_version, 1);
+    store.backend().persist().unwrap();
+    assert_eq!(store.snapshot_metrics().invalidated(), 0);
+
+    // Deploy: load the same stream as v2. The persisted v1 head must be
+    // invalidated (never used) and rebuilt by a full replay off the log.
+    let loaded = store.load_cached::<CounterV2>(stream).await.unwrap();
+    assert_eq!(loaded.state.0, expected, "rebuild must yield the correct state");
+    assert_eq!(
+        loaded.events_replayed,
+        events.len(),
+        "persisted stale snapshot must be skipped: full replay"
+    );
+    assert_eq!(
+        store.snapshot_metrics().invalidated(),
+        1,
+        "the persisted v1 snapshot is invalidated exactly once"
+    );
+
+    // The on-disk head was replaced with a v2 snapshot (round-trips through
+    // fjall: encode_ref → head → decode_ref).
+    let replaced = store
+        .backend()
+        .load_snapshot(stream)
+        .await
+        .unwrap()
+        .expect("head still present after rebuild");
+    assert_eq!(
+        replaced.snapshot_ref.fold_version, 2,
+        "the replacement persisted snapshot carries the new fold_version"
+    );
+
+    // A following v2 load uses the replaced snapshot: append a tail and confirm
+    // only the tail is folded, and the counter does not climb again.
+    let tail: Vec<CounterEvent> = vec![CounterEvent::Added(100)];
+    store
+        .append(stream, Version::At((events.len() - 1) as u64), &tail)
+        .await
+        .unwrap();
+    let again = store.load_cached::<CounterV2>(stream).await.unwrap();
+    assert_eq!(
+        again.events_replayed,
+        tail.len(),
+        "the replacement v2 snapshot accelerates the next load"
+    );
+    assert_eq!(
+        store.snapshot_metrics().invalidated(),
+        1,
+        "rebuild happened exactly once across the deploy"
     );
 }
 

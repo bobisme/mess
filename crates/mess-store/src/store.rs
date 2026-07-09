@@ -1,6 +1,9 @@
 //! [`EventStore`]: the DX-first facade — `load` / `append` / `command` with
 //! bounded, jittered optimistic retry.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use mess_core::{Aggregate, CodecError, CommandError, Decide, Event};
 
 use crate::backend::{AppendError, Backend, RecordToAppend};
@@ -81,6 +84,61 @@ pub struct Commit {
     pub attempts: u32,
 }
 
+/// Observability counters for the snapshot-accelerated load path — the deploy
+/// story of `docs/spec/05-fold-certificates.md` §9.
+///
+/// A `fold_version` bump is a deploy-time event: every snapshot written by the
+/// old binary is now stale and must be rebuilt. This counter makes that
+/// rebuild wave **observable** — an operator watching `invalidated()` climb
+/// right after a deploy is watching the snapshot store re-warm itself, exactly
+/// once per stale stream (each stale snapshot is rebuilt by full replay and
+/// then *replaced* with a fresh one carrying the new `fold_version`, so it is
+/// counted at most once).
+///
+/// Shared across clones of an [`EventStore`] (the counter lives behind an
+/// `Arc`), so a read on any clone observes increments from all of them — the
+/// same clone-is-share contract as the [`StateCache`].
+#[derive(Debug, Clone, Default)]
+pub struct SnapshotMetrics {
+    invalidated: Arc<AtomicU64>,
+}
+
+impl SnapshotMetrics {
+    /// How many stored snapshots have been invalidated by a `fold_version`
+    /// mismatch and rebuilt by full replay (§9). This is the deploy-observability
+    /// counter: it climbs once per stale stream after a `fold_version` bump and
+    /// then stops, because the rebuilt state is persisted with the new version.
+    #[must_use]
+    pub fn invalidated(&self) -> u64 {
+        self.invalidated.load(Ordering::Relaxed)
+    }
+
+    /// Record one `fold_version`-mismatch invalidation.
+    fn record_invalidation(&self) {
+        self.invalidated.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The outcome of consulting the snapshot store on the accelerated load path.
+///
+/// Separating "no snapshot to use" from "a snapshot existed but its
+/// `fold_version` is stale" is what lets [`load_cached`](EventStore::load_cached)
+/// treat the deploy case specially: count it, and *replace* the stale snapshot
+/// after the rebuild — without turning an ordinary snapshot-less load into an
+/// (unwanted) implicit `save_snapshot`.
+enum SnapshotOutcome<A> {
+    /// A valid snapshot was found and folded forward; this is the answer.
+    Used(Loaded<A>),
+    /// No usable snapshot for a reason that is *not* a fold bump — absent,
+    /// past-head, an undecodable/garbled record, or a corrupt blob. The load
+    /// falls back to a plain full replay and writes nothing back.
+    NoSnapshot,
+    /// A snapshot existed but its `fold_version` no longer matches the current
+    /// [`Snapshottable::FOLD_VERSION`] (§9). The load rebuilds by full replay,
+    /// counts the invalidation, and replaces the stale snapshot.
+    Invalidated,
+}
+
 /// The event-store facade over any [`Backend`].
 ///
 /// Cloning is cheap when the backend is cheap to clone (e.g. an `Arc`-backed
@@ -97,6 +155,9 @@ pub struct EventStore<B> {
     /// existing test — is unchanged until a caller opts in with
     /// [`with_cache_capacity`](Self::with_cache_capacity).
     cache: StateCache,
+    /// Snapshot-path observability (the `fold_version` invalidation counter,
+    /// §9). Shared across clones via its internal `Arc`.
+    metrics: SnapshotMetrics,
 }
 
 impl<B: Backend> EventStore<B> {
@@ -109,6 +170,7 @@ impl<B: Backend> EventStore<B> {
             policy: RetryPolicy::default(),
             page_size: DEFAULT_PAGE_SIZE,
             cache: StateCache::disabled(),
+            metrics: SnapshotMetrics::default(),
         }
     }
 
@@ -138,6 +200,14 @@ impl<B: Backend> EventStore<B> {
     #[must_use]
     pub fn cache(&self) -> &StateCache {
         &self.cache
+    }
+
+    /// Borrow the snapshot-path observability metrics — chiefly the
+    /// `fold_version` invalidation counter that makes the deploy-time rebuild
+    /// wave visible (§9). Shared across clones.
+    #[must_use]
+    pub fn snapshot_metrics(&self) -> &SnapshotMetrics {
+        &self.metrics
     }
 
     /// Replace the optimistic-retry policy.
@@ -339,10 +409,26 @@ impl<B: SnapshotStore> EventStore<B> {
         stream_id: &str,
     ) -> Result<SnapshotRef, StoreError<B::Error>> {
         let loaded = self.load::<A>(stream_id).await?;
-        let state_blob = loaded.state.encode_state()?;
+        self.persist_snapshot::<A>(stream_id, &loaded.state, loaded.version)
+            .await
+    }
 
-        let covers_empty_prefix = loaded.version == Version::NoStream;
-        let stream_version = loaded.version.position().unwrap_or(0);
+    /// Persist a snapshot for `stream_id` from an **already-folded** `state`
+    /// covering `version`, stamping the current [`Snapshottable::FOLD_VERSION`].
+    ///
+    /// Factored out of [`save_snapshot`](Self::save_snapshot) so the
+    /// invalidation-on-deploy path can *replace* a stale snapshot from the
+    /// state it just rebuilt — without paying for a second full replay.
+    async fn persist_snapshot<A: Snapshottable>(
+        &self,
+        stream_id: &str,
+        state: &A,
+        version: Version,
+    ) -> Result<SnapshotRef, StoreError<B::Error>> {
+        let state_blob = state.encode_state()?;
+
+        let covers_empty_prefix = version == Version::NoStream;
+        let stream_version = version.position().unwrap_or(0);
         let interim_id = interim_stream_id(stream_id);
 
         let snapshot_ref = SnapshotRef {
@@ -391,40 +477,76 @@ impl<B: SnapshotStore> EventStore<B> {
     ///
     /// Any failure of these is silently treated as "no usable snapshot" and the
     /// load degrades to a correct full replay.
+    ///
+    /// # Invalidation on deploy (§9)
+    ///
+    /// The one case handled specially is a **stale `fold_version`**: a snapshot
+    /// written by a prior binary whose fold this one no longer implements. That
+    /// is the deploy story. The stale snapshot is *never used*; the state is
+    /// rebuilt by full replay; the invalidation is counted in
+    /// [`snapshot_metrics`](Self::snapshot_metrics); and the stale record is
+    /// **replaced** with a fresh snapshot stamped with the current
+    /// `fold_version`, so a following load of the same stream is fast again and
+    /// the invalidation is counted **exactly once** per stale stream. The
+    /// replace is best-effort: the rebuilt state is already correct and
+    /// returned regardless of whether the write-back succeeds.
     pub async fn load_cached<A: Snapshottable>(
         &self,
         stream_id: &str,
     ) -> Result<Loaded<A>, StoreError<B::Error>> {
-        if let Some(loaded) =
-            self.try_load_from_snapshot::<A>(stream_id).await?
-        {
-            return Ok(loaded);
+        match self.try_load_from_snapshot::<A>(stream_id).await? {
+            SnapshotOutcome::Used(loaded) => Ok(loaded),
+            // No usable snapshot for a non-deploy reason: full replay is always
+            // correct, and we deliberately do NOT write a snapshot back (an
+            // ordinary snapshot-less load must not become an implicit save).
+            SnapshotOutcome::NoSnapshot => self.load::<A>(stream_id).await,
+            // Stale fold: count it, rebuild by full replay, then replace the
+            // stale snapshot so the next load is fast and this is counted once.
+            SnapshotOutcome::Invalidated => {
+                self.metrics.record_invalidation();
+                let loaded = self.load::<A>(stream_id).await?;
+                // Best-effort replace: a failed write-back never fails a load
+                // that already holds the correct state — the snapshot store is
+                // throwaway (correctness comes from the log), and a miss just
+                // means the next load re-invalidates and retries the replace.
+                let _ = self
+                    .persist_snapshot::<A>(
+                        stream_id,
+                        &loaded.state,
+                        loaded.version,
+                    )
+                    .await;
+                Ok(loaded)
+            }
         }
-        // No usable snapshot: full replay is always correct.
-        self.load::<A>(stream_id).await
     }
 
-    /// Attempt the snapshot-accelerated path; `Ok(None)` means "no usable
-    /// snapshot, fall back to full replay". Only a genuine backend error
-    /// short-circuits with `Err`.
+    /// Consult the snapshot store on the accelerated path. Distinguishes a
+    /// deploy-time [`Invalidated`](SnapshotOutcome::Invalidated) snapshot
+    /// (stale `fold_version`) from an ordinary
+    /// [`NoSnapshot`](SnapshotOutcome::NoSnapshot) miss, so the caller can count
+    /// and replace the former. Only a genuine backend error short-circuits with
+    /// `Err`.
     async fn try_load_from_snapshot<A: Snapshottable>(
         &self,
         stream_id: &str,
-    ) -> Result<Option<Loaded<A>>, StoreError<B::Error>> {
+    ) -> Result<SnapshotOutcome<A>, StoreError<B::Error>> {
         let Some(stored) = self
             .backend
             .load_snapshot(stream_id)
             .await
             .map_err(StoreError::Backend)?
         else {
-            return Ok(None);
+            return Ok(SnapshotOutcome::NoSnapshot);
         };
         let snap = &stored.snapshot_ref;
 
         // Stale fold: the snapshot summarizes a fold this binary no longer
-        // implements. Invalidate and rebuild by full replay (§9).
+        // implements (a `fold_version` bump on deploy, or an old record whose
+        // version could not be recovered and decoded to a non-matching value —
+        // §9). Rebuild by full replay and replace; never surfaced as an error.
         if snap.fold_version != A::FOLD_VERSION {
-            return Ok(None);
+            return Ok(SnapshotOutcome::Invalidated);
         }
 
         // Where does the tail resume? An empty-prefix snapshot summarizes
@@ -444,21 +566,25 @@ impl<B: SnapshotStore> EventStore<B> {
                 Some(head_idx) if snap.stream_version <= head_idx => {
                     Version::At(snap.stream_version)
                 }
-                _ => return Ok(None),
+                _ => return Ok(SnapshotOutcome::NoSnapshot),
             }
         };
 
         // Deserialize the snapshotted state; a bad blob is another reason to
         // fall back rather than fail.
         let Ok(state) = A::decode_state(&stored.state_blob) else {
-            return Ok(None);
+            return Ok(SnapshotOutcome::NoSnapshot);
         };
 
         // Fold the tail on top of the snapshot state.
         let (state, version, tail_len) =
             self.replay_tail::<A>(stream_id, state, resume_from).await?;
 
-        Ok(Some(Loaded { state, version, events_replayed: tail_len }))
+        Ok(SnapshotOutcome::Used(Loaded {
+            state,
+            version,
+            events_replayed: tail_len,
+        }))
     }
 
     /// Page through `stream_id` strictly after `from`, folding each event into
