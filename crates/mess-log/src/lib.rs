@@ -19,6 +19,9 @@
 //! - [`committer`] — the single committer thread: group commit, the
 //!   `Durability::{Process, Os, Group}` modes, and watermark-gated acks
 //!   (bn-11m, `docs/spec/03-durability.md`).
+//! - [`scanner`] — the recovery scanner (bn-39n,
+//!   `docs/spec/02-recovery.md`): full A-rule acceptance via the
+//!   [`acceptance`] kernel, typed stop reasons, safe-truncation offset.
 
 pub mod acceptance;
 pub mod committer;
@@ -28,5 +31,6 @@ pub mod format;
 pub mod lock;
 pub mod model;
 pub mod runtime;
+pub mod scanner;
 pub mod watermark;
 pub mod writer;
