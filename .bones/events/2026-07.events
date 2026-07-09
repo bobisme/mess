@@ -356,3 +356,7 @@
 1783633901890871	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExuwM		item.assign	bn-1s0	{"action":"assign","agent":"mess-dev"}	blake3:s42-j8OWYGBvBV_YiIk6TBFy69dOXmi9VKlStLgQPrQ
 1783633901914306	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExvAM		item.move	bn-303	{"state":"doing"}	blake3:st3SGSWArf4x5UzZB8g6p-GZet8ynEjVFTX9tq4GDjc
 1783633901922774	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExvQM		item.assign	bn-303	{"action":"assign","agent":"mess-dev"}	blake3:kSt_oAfdTnXTOWVccY3zY5zS7UmPaWz76EwAfDW2CHE
+1783633983942142	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExvgM		item.comment	bn-1l6	{"body":"wave-15 dispatched: worker+adversarial-review workflow wf_e3569ef4-25a; workspace .maw/workspaces/bn-1l6"}	blake3:CLSObkhjWaS9N6EhylbKtay0u5iwv59zkFh8eqCv6Rk
+1783633983981626	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExvwM		item.comment	bn-1vu	{"body":"wave-15 dispatched: worker+adversarial-review workflow wf_e3569ef4-25a; workspace .maw/workspaces/bn-1vu"}	blake3:M9GFQBKkqSWTU69M6CY3aE6Rg2tdytrvQyl1GuQ5TAI
+1783633984011410	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExwAM		item.comment	bn-1s0	{"body":"wave-15 dispatched: worker+adversarial-review workflow wf_e3569ef4-25a; workspace .maw/workspaces/bn-1s0"}	blake3:8GdbB30tokeUjWCcT9aiZO20NMsfQ4sdvjnE71FdXio
+1783633984041182	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExwQM		item.comment	bn-303	{"body":"wave-15 dispatched: worker+adversarial-review workflow wf_e3569ef4-25a; workspace .maw/workspaces/bn-303"}	blake3:ewnNbakxPLSXvmNVUmMJe7_erC7yujTMAG--twnxtvw
