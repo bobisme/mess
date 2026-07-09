@@ -335,11 +335,12 @@ fn kernel_resync_past_holes(
     let mut accepted: Vec<Candidate> = Vec::new();
     let mut expected = base_pos;
     for st in statuses {
-        if let CandidateStatus::ByteValid(c) = st {
-            if c.frame_count > 0 && c.epoch == epoch {
-                expected = c.first_global_pos + u64::from(c.frame_count);
-                accepted.push(*c);
-            }
+        if let CandidateStatus::ByteValid(c) = st
+            && c.frame_count > 0
+            && c.epoch == epoch
+        {
+            expected = c.first_global_pos + u64::from(c.frame_count);
+            accepted.push(*c);
         }
         // invalid slot: keep scanning — the bug under test
     }

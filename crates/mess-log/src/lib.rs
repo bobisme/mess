@@ -8,6 +8,10 @@
 //! - [`model`] — the abstract commit/recovery protocol model checked
 //!   exhaustively by stateright (`tests/stateright.rs`) and reusable as
 //!   the DST in-memory reference (bn-3kn).
+//! - [`runtime`] — the sim-capable Clock/Fs/Spawn abstraction (bn-z98)
+//!   the segment writer + committer are generic over; real (std) and sim
+//!   (virtual time + fault-injecting in-memory fs) impls.
 
 pub mod acceptance;
 pub mod model;
+pub mod runtime;
