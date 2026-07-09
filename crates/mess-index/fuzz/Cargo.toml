@@ -1,0 +1,46 @@
+[package]
+name = "mess-index-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde = { version = "1", features = ["derive"] }
+rmp-serde = "1"
+
+[dependencies.mess-index]
+path = ".."
+
+# The fuzz crate is deliberately its own workspace (see `[workspace]` below):
+# cargo-fuzz recompiles with `-Z sanitizer=address` and nightly-only libFuzzer
+# flags that must not leak into the main workspace's stable build, and
+# `cargo test`/`cargo clippy --workspace` at the repo root must never need to
+# resolve libfuzzer-sys. Same reasoning as crates/mess-log/fuzz.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "fuzz_reassemble_block"
+path = "fuzz_targets/fuzz_reassemble_block.rs"
+test = false
+doc = false
+bench = false
+
+# Not a fuzz target — a one-shot corpus-seed generator (`cargo run --bin
+# gen_corpus`), kept in-crate so the seeds are real `encode_block` output
+# (bn-1bn's shredder) over payload shapes mirroring
+# `spikes/perf_compress/src/workload.rs` / `src/columnar/tests.rs`'s corpus,
+# not hand-copied hex. See fuzz_targets/gen_corpus.rs.
+[[bin]]
+name = "gen_corpus"
+path = "fuzz_targets/gen_corpus.rs"
+test = false
+doc = false
+bench = false

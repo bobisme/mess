@@ -536,6 +536,70 @@ fn decode_rejects_bad_header() {
     ));
 }
 
+/// Regression (bn-meo fuzzing, `fuzz_reassemble_block` crash
+/// `crash-c4d78dac2593fedadf4d3d484c82cb4ec520e741`): a raw-fallback
+/// block's offset table validated only the *last* offset against the
+/// payload region. A non-monotonic table — some interior offset far past
+/// the buffer while the final offset still looks in-bounds — slipped
+/// through `decode_raw` and then panicked slicing `buf` in
+/// `reassemble_range` ("range end index ... out of range for slice").
+#[test]
+fn decode_raw_rejects_non_monotonic_offsets() {
+    // Raw block body: u32 ulen, then a zstd frame of the row image
+    // (u16 n, (n+1) u32 offsets, payload bytes). n = 2 events, 3 offsets:
+    // [0, 0xFFFF_FFFF, 4] — offsets[1] is huge but offsets[2] (the last)
+    // is small and in-bounds, so only checking the last offset misses it.
+    let mut image = Vec::new();
+    image.extend_from_slice(&2u16.to_le_bytes()); // n = 2 events
+    image.extend_from_slice(&0u32.to_le_bytes()); // off[0]
+    image.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // off[1] -- bogus
+    image.extend_from_slice(&4u32.to_le_bytes()); // off[2] -- looks fine alone
+    image.extend_from_slice(&[1, 2, 3, 4]); // 4 bytes of "payload"
+
+    let compressed = zstd::bulk::compress(&image, 3).unwrap();
+    let mut body = Vec::new();
+    body.extend_from_slice(&(image.len() as u32).to_le_bytes());
+    body.extend_from_slice(&compressed);
+
+    let mut block = vec![COLUMNAR_VERSION, 0]; // FLAG_COLUMNAR clear = raw block
+    block.extend_from_slice(&body);
+
+    // Must fail loudly at decode, never panic downstream in reassembly.
+    assert_eq!(Block::decode(&block).unwrap_err(), CodecError::Truncated);
+}
+
+/// Regression (bn-meo fuzzing): a per-column block's directory has one
+/// `ulen` per column (up to `n_cols`, a u16), unlike the whole-block/raw
+/// layouts' single `ulen` field. Before the fix, only each column's
+/// individual `ulen` was capped at `MAX_ULEN` (64 MiB) — nothing capped the
+/// *sum* across columns, so a directory naming a handful of columns each
+/// claiming a large `ulen` (in practice backed by tiny, highly-compressible
+/// zstd frames, e.g. all-zero data) could force allocating far more memory
+/// than the ~38-byte input here would suggest. This hand-built directory
+/// never even reaches a real zstd frame — `clen` is 0 for every column — so
+/// the aggregate check must reject it purely from the header numbers, before
+/// any decompression is attempted.
+#[test]
+fn decode_percol_rejects_aggregate_ulen_bomb() {
+    let mut body = Vec::new();
+    body.extend_from_slice(&0u16.to_le_bytes()); // n events
+    body.extend_from_slice(&0u16.to_le_bytes()); // n_skels
+    body.extend_from_slice(&3u16.to_le_bytes()); // n_cols
+    // 3 columns, each claiming a 30_000_000-byte `ulen` (sum 90_000_000 >
+    // MAX_ULEN's 64 MiB) with 0 compressed bytes (clen = 0) — the aggregate
+    // check must fire before any of these clen=0 "columns" are read.
+    for _ in 0..3 {
+        body.push(K_INT);
+        body.push(ENC_RAW);
+        body.extend_from_slice(&0u32.to_le_bytes()); // clen
+        body.extend_from_slice(&30_000_000u32.to_le_bytes()); // ulen
+    }
+    let mut block = vec![COLUMNAR_VERSION, FLAG_COLUMNAR | FLAG_PERCOL];
+    block.extend_from_slice(&body);
+    assert_eq!(block.len(), 38);
+    assert_eq!(Block::decode(&block).unwrap_err(), CodecError::TotalUlenExceeded);
+}
+
 #[test]
 #[cfg_attr(miri, ignore)]
 fn decode_truncated_body_is_error_not_panic() {

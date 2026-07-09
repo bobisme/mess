@@ -14,6 +14,138 @@ use serde::de::DeserializeOwned;
 
 use super::error::CodecError;
 
+/// Nesting depth cap enforced by [`check_msgpack_depth`] before any payload
+/// reaches `rmp_serde`. Generous relative to any real event shape (deeply
+/// nested `Option<Vec<Struct>>` chains in hand-written domain events don't
+/// come close), tight enough that the worst case — `MAX_MSGPACK_DEPTH`
+/// levels of native recursion inside `serde`'s `IgnoredAny` skip or a
+/// container visitor — cannot threaten an 8 MiB thread stack.
+pub const MAX_MSGPACK_DEPTH: usize = 64;
+
+/// Walk `data` as a single top-level msgpack value, computing its maximum
+/// container nesting depth **without native recursion** (an explicit
+/// `Vec`-backed stack stands in for the call stack), and fail loudly if it
+/// exceeds [`MAX_MSGPACK_DEPTH`] instead of letting a later recursive
+/// decode step (`rmp_serde::from_slice`, and specifically `serde`'s
+/// `IgnoredAny` skip of unknown/extra map fields) overflow the native call
+/// stack — a SIGABRT/SIGSEGV no `Result` can report.
+///
+/// This is deliberately *not* a full msgpack validator: on truncated or
+/// otherwise malformed bytes it returns `Ok(())` as soon as it runs out of
+/// bytes to walk, leaving every other failure mode (truncation, bad
+/// markers, wrong types for the target struct, …) to `rmp_serde` — the
+/// real decoder — to report with its own proper error. This function's
+/// only job is the one check that a fully-recursive decoder cannot safely
+/// make on its own: bounding depth *before* recursing.
+pub(crate) fn check_msgpack_depth(data: &[u8], max_depth: usize) -> Result<(), CodecError> {
+    // Each stack entry is "how many more sibling values remain to be read
+    // at this nesting level, including the one about to be read next".
+    // Depth at any point is `stack.len()`. Seeded with 1: we need to walk
+    // exactly one top-level value.
+    // u64, not u32: a map32/array32 length is a u32 element count, and a
+    // map's *pair* count (what this walker tracks) doubles that — up to
+    // ~8.6 billion, which would silently wrap in a u32.
+    let mut stack: Vec<u64> = vec![1];
+    let mut pos = 0usize;
+
+    // Bounds-checked big-endian length-prefix reads. `None` means "not
+    // enough bytes" — the caller (the loop below) treats that as "stop
+    // walking, let rmp_serde report the truncation".
+    fn read_u8(data: &[u8], pos: &mut usize) -> Option<usize> {
+        let b = *data.get(*pos)?;
+        *pos += 1;
+        Some(b as usize)
+    }
+    fn read_u16(data: &[u8], pos: &mut usize) -> Option<usize> {
+        let s = data.get(*pos..*pos + 2)?;
+        *pos += 2;
+        Some(u16::from_be_bytes(s.try_into().unwrap()) as usize)
+    }
+    fn read_u32(data: &[u8], pos: &mut usize) -> Option<usize> {
+        let s = data.get(*pos..*pos + 4)?;
+        *pos += 4;
+        Some(u32::from_be_bytes(s.try_into().unwrap()) as usize)
+    }
+
+    'walk: while let Some(&top) = stack.last() {
+        if top == 0 {
+            stack.pop();
+            continue;
+        }
+        // About to consume one value at the current level.
+        *stack.last_mut().unwrap() -= 1;
+
+        let Some(marker) = data.get(pos).copied() else { break };
+        pos += 1;
+
+        // Extra data-byte length for scalar/leaf markers (0 for markers
+        // with no trailing bytes at all, e.g. nil/bool/fixint).
+        let extra: Option<usize> = match marker {
+            0x00..=0x7f | 0xe0..=0xff => Some(0), // fixint
+            0xc0 | 0xc2 | 0xc3 => Some(0),        // nil, false, true
+            0xc1 => Some(0),                      // reserved/unused marker
+            0xa0..=0xbf => Some((marker & 0x1f) as usize), // fixstr
+            0xc4 => read_u8(data, &mut pos),      // bin8
+            0xc5 => read_u16(data, &mut pos),     // bin16
+            0xc6 => read_u32(data, &mut pos),     // bin32
+            0xc7 => read_u8(data, &mut pos).map(|n| n + 1), // ext8 (+type byte)
+            0xc8 => read_u16(data, &mut pos).map(|n| n + 1), // ext16
+            0xc9 => read_u32(data, &mut pos).map(|n| n + 1), // ext32
+            0xca => Some(4),                      // f32
+            0xcb => Some(8),                      // f64
+            0xcc => Some(1),                      // u8
+            0xcd => Some(2),                      // u16
+            0xce => Some(4),                      // u32
+            0xcf => Some(8),                      // u64
+            0xd0 => Some(1),                      // i8
+            0xd1 => Some(2),                      // i16
+            0xd2 => Some(4),                      // i32
+            0xd3 => Some(8),                      // i64
+            0xd4 => Some(2),                      // fixext1 (type + 1)
+            0xd5 => Some(3),                      // fixext2
+            0xd6 => Some(5),                      // fixext4
+            0xd7 => Some(9),                      // fixext8
+            0xd8 => Some(17),                     // fixext16
+            0xd9 => read_u8(data, &mut pos),      // str8
+            0xda => read_u16(data, &mut pos),     // str16
+            0xdb => read_u32(data, &mut pos),     // str32
+            _ => None, // container marker, or unreachable — handled below
+        };
+
+        if let Some(extra) = extra {
+            // Leaf value: skip its data bytes (bounds-checked; running out
+            // just stops the walk, per the truncation contract above).
+            match data.get(pos..pos + extra) {
+                Some(_) => pos += extra,
+                None => break 'walk,
+            }
+            continue;
+        }
+
+        // Container markers: push a new frame for their children and
+        // check the depth this introduces.
+        let children: Option<usize> = match marker {
+            0x80..=0x8f => Some(2 * (marker & 0x0f) as usize), // fixmap
+            0x90..=0x9f => Some((marker & 0x0f) as usize),     // fixarray
+            0xdc => read_u16(data, &mut pos),                  // array16
+            0xdd => read_u32(data, &mut pos),                  // array32
+            0xde => read_u16(data, &mut pos).map(|n| 2 * n),   // map16
+            0xdf => read_u32(data, &mut pos).map(|n| 2 * n),   // map32
+            _ => Some(0), // marker byte alone was the whole value (shouldn't
+                          // happen given the match above is exhaustive over
+                          // every byte value, but stay conservative)
+        };
+        let Some(children) = children else { break 'walk };
+        if children > 0 {
+            stack.push(children as u64);
+            if stack.len() > max_depth {
+                return Err(CodecError::TooDeeplyNested { max: max_depth });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `codec_id` reserved for the bootstrap codec (frozen forever, owned by
 /// the registry — see docs/spec/04-registry.md §2-3). This codec layer
 /// does not implement it; [`decode_payload`]/[`encode_payload`] report
@@ -58,6 +190,10 @@ impl Codec for MsgpackNamed {
     }
 
     fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecError> {
+        // Depth-check before recursing: see `check_msgpack_depth`'s doc for
+        // why `rmp_serde::from_slice` alone cannot safely reject this on
+        // its own (unknown-field skipping recurses natively).
+        check_msgpack_depth(bytes, MAX_MSGPACK_DEPTH)?;
         rmp_serde::from_slice(bytes).map_err(CodecError::Decode)
     }
 }
@@ -146,5 +282,80 @@ mod tests {
             decode_payload::<Sample>(CODEC_ID_MSGPACK_NAMED, &[0xff, 0x01])
                 .unwrap_err();
         assert!(matches!(err, CodecError::Decode(_)));
+    }
+
+    fn deep_nested_array(depth: usize) -> Vec<u8> {
+        let mut v = vec![0x91u8; depth]; // depth x fixarray, len 1
+        v.push(0x00); // fixint 0
+        v
+    }
+
+    /// Regression (bn-meo fuzzing): before `check_msgpack_depth` existed, a
+    /// struct payload with an unknown/extra map field whose value was
+    /// nested hundreds of thousands of arrays deep crashed the process with
+    /// a native stack overflow (SIGABRT) inside `serde`'s `IgnoredAny` skip
+    /// of that field — no `Result` was ever returned. `depth = 200_000`
+    /// reproduces that crash pre-fix; post-fix it must come back as a typed
+    /// `CodecError::TooDeeplyNested`, not a crash.
+    #[test]
+    fn deeply_nested_unknown_field_fails_loudly_not_crash() {
+        let mut payload = Vec::new();
+        payload.push(0x82); // fixmap, 2 entries: known + unknown
+        payload.extend_from_slice(&[0xa2, b'i', b'd']);
+        payload.push(0x01); // id: 1
+        payload.extend_from_slice(&[0xa5]);
+        payload.extend_from_slice(b"extra");
+        payload.extend_from_slice(&deep_nested_array(200_000));
+
+        let err = decode_payload::<Sample>(CODEC_ID_MSGPACK_NAMED, &payload).unwrap_err();
+        assert!(
+            matches!(err, CodecError::TooDeeplyNested { max } if max == MAX_MSGPACK_DEPTH),
+            "expected TooDeeplyNested, got {err:?}"
+        );
+    }
+
+    /// A payload nested right up to (but not past) the cap must still
+    /// decode/fail on its own merits (here: not the target shape), not on
+    /// depth — the cap must not be off-by-one against real, merely-complex
+    /// payloads. `deep_nested_array(n)` nests `n` arrays around a scalar,
+    /// which walks to stack depth `n + 1` (the top-level value's own
+    /// frame, plus one push per array) — so `MAX_MSGPACK_DEPTH - 1` arrays
+    /// is exactly the deepest nesting `check_msgpack_depth` accepts.
+    #[test]
+    fn nesting_at_the_cap_is_not_rejected_for_depth() {
+        let payload = deep_nested_array(MAX_MSGPACK_DEPTH - 1);
+        let err = decode_payload::<Sample>(CODEC_ID_MSGPACK_NAMED, &payload).unwrap_err();
+        assert!(!matches!(err, CodecError::TooDeeplyNested { .. }), "got {err:?}");
+
+        // One level deeper must be the first depth rejected.
+        let too_deep = deep_nested_array(MAX_MSGPACK_DEPTH);
+        let err = decode_payload::<Sample>(CODEC_ID_MSGPACK_NAMED, &too_deep).unwrap_err();
+        assert!(matches!(err, CodecError::TooDeeplyNested { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn check_msgpack_depth_accepts_shallow_and_rejects_deep() {
+        assert!(check_msgpack_depth(&deep_nested_array(10), MAX_MSGPACK_DEPTH).is_ok());
+        assert!(matches!(
+            check_msgpack_depth(&deep_nested_array(1000), MAX_MSGPACK_DEPTH),
+            Err(CodecError::TooDeeplyNested { max }) if max == MAX_MSGPACK_DEPTH
+        ));
+    }
+
+    /// Truncated/malformed bytes must not confuse the depth walker into a
+    /// panic or hang -- it stops and lets `rmp_serde` report the real
+    /// error.
+    #[test]
+    fn check_msgpack_depth_never_panics_on_truncated_or_random_bytes() {
+        for len in 0..64 {
+            let mut buf = vec![0u8; len];
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = ((i * 37 + 11) % 256) as u8;
+            }
+            let _ = check_msgpack_depth(&buf, MAX_MSGPACK_DEPTH);
+        }
+        // A container header claiming far more data than exists.
+        assert!(check_msgpack_depth(&[0xdf, 0xff, 0xff, 0xff, 0xff], MAX_MSGPACK_DEPTH).is_ok());
+        assert!(check_msgpack_depth(&[0xdb, 0xff, 0xff, 0xff, 0xff], MAX_MSGPACK_DEPTH).is_ok());
     }
 }

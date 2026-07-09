@@ -39,6 +39,24 @@ pub enum CodecError {
     /// `rmp_serde::from_slice` failed (includes truncated/corrupt payloads).
     #[error("msgpack-named decode failed: {0}")]
     Decode(#[source] rmp_serde::decode::Error),
+
+    /// The payload's msgpack nesting depth exceeds `MAX_MSGPACK_DEPTH`
+    /// (checked *before* handing the bytes to `rmp_serde`). Without this
+    /// check, an adversarial payload — in practice an unknown/extra map
+    /// field whose value serde's default `#[serde(deny_unknown_fields)]`-less
+    /// struct decoding must still fully skip via `IgnoredAny`, recursing
+    /// once per nesting level — can overflow the native call stack: a
+    /// SIGABRT/SIGSEGV that no `Result` can report, not a panic `catch_unwind`
+    /// can catch. See `codec::msgpack::check_msgpack_depth`.
+    #[error(
+        "msgpack payload nesting depth exceeds the {max} level cap (bn-meo: \
+         unbounded nesting can stack-overflow the recursive decoder rather \
+         than fail loudly)"
+    )]
+    TooDeeplyNested {
+        /// The cap that was exceeded.
+        max: usize,
+    },
 }
 
 /// Errors from the upcaster dispatch layer (`event_versions!`-generated

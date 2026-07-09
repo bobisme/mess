@@ -43,6 +43,15 @@ pub enum CodecError {
     /// A column ran dry mid-reassembly (corrupt column data).
     #[error("corrupt column data")]
     CorruptColumn,
+    /// A per-column block's directory `ulen` fields summed past
+    /// [`MAX_ULEN`] — the whole-block/raw layouts cap total decompressed
+    /// size via one `ulen` field, but the per-column layout has one `ulen`
+    /// per column (up to `n_cols` of them); without this check a block with
+    /// many columns, each a tiny (highly compressible, e.g. all-zero) zstd
+    /// frame claiming a large `ulen`, could force allocating far more memory
+    /// in aggregate than the input bytes justify.
+    #[error("per-column block's aggregate decompressed size exceeds the block cap")]
+    TotalUlenExceeded,
 }
 
 /// A decoded skeleton op. `Lit` ranges point into the block's structural
@@ -218,7 +227,18 @@ impl Block {
             offsets.push(ri.u32()?);
         }
         let base = ri.p;
-        // Validate the payload region covers the last offset.
+        // Every offset must be non-decreasing, and the payload region must
+        // cover the last one. Both checks are required for memory safety:
+        // `reassemble_range` slices `buf[base + offsets[e]..base +
+        // offsets[e + 1]]` for every consecutive pair with no further
+        // bounds-checking, trusting this decode step. Checking only the
+        // *last* offset (as this used to) is not enough — a corrupt table
+        // can set some interior offset arbitrarily large (or the sequence
+        // non-monotonic) while the last entry still looks in-bounds, and
+        // slicing then panics instead of failing loudly.
+        if offsets.windows(2).any(|w| w[0] > w[1]) {
+            return Err(CodecError::Truncated);
+        }
         let last = *offsets.last().unwrap() as usize;
         if base + last > buf.len() {
             return Err(CodecError::Truncated);
@@ -266,11 +286,21 @@ impl Block {
         let skels = parse_skeletons(&mut r, n_skels)?;
         let skel_ids = parse_skel_ids(&mut r, n)?;
         let mut dir = Vec::with_capacity(n_cols);
+        // Aggregate `ulen` budget across every column (see
+        // `CodecError::TotalUlenExceeded`): each column's `ulen` is checked
+        // individually against MAX_ULEN by `decompress`, but that alone
+        // doesn't bound the *sum* over up to `n_cols` (u16::MAX) columns —
+        // cap the running total here, before any column is decompressed.
+        let mut total_ulen: usize = 0;
         for _ in 0..n_cols {
             let kind = r.u8()?;
             let enc = r.u8()?;
             let clen = r.u32()? as usize;
             let ulen = r.u32()? as usize;
+            total_ulen = total_ulen.checked_add(ulen).ok_or(CodecError::TotalUlenExceeded)?;
+            if total_ulen > MAX_ULEN {
+                return Err(CodecError::TotalUlenExceeded);
+            }
             dir.push((kind, enc, clen, ulen));
         }
         let mut cols = Vec::with_capacity(n_cols);

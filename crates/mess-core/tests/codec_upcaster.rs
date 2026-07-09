@@ -68,7 +68,21 @@ impl Upcast<TripCompletedV2> for TripCompletedV3 {
             trip_id: v2.trip_id,
             driver_name: v2.driver_name,
             distance_m: v2.distance_miles * METERS_PER_MILE, // unit change
-            completed_at_ms: v2.completed_at * 1000,         // unit change
+            // Regression (bn-meo fuzzing): a plain `*` here panicked
+            // ("attempt to multiply with overflow") on an old-version
+            // event whose `completed_at` (an attacker/corruption-supplied
+            // i64, decoded straight off an untrusted historical payload --
+            // this Upcast impl has no say over what value showed up) was
+            // large enough that `* 1000` overflows i64. An `Upcast` impl
+            // is ordinary Rust code once the payload has decoded to a
+            // typed struct, so this isn't the codec layer's job to
+            // validate -- but it must still never panic on adversarial
+            // *values* within a well-typed field, the same "loud typed
+            // failure or a well-defined answer, never a crash" bar as the
+            // rest of this pipeline. Saturating is the well-defined answer
+            // here: for every value this multiplication does NOT overflow
+            // for (all real timestamps), it's bit-for-bit identical to `*`.
+            completed_at_ms: v2.completed_at.saturating_mul(1000),
             rating: None,
         }
     }
@@ -170,6 +184,26 @@ fn round_trip_through_every_version() {
     assert_eq!(out.driver_name, "ana");
     assert!((out.distance_m - METERS_PER_MILE).abs() < 1e-9);
     assert_eq!(out.completed_at_ms, 1_700_000_000_000);
+}
+
+/// Regression (bn-meo fuzzing, `fuzz_upcast_stored_event` crash
+/// `crash-a77ecf4a124ca7b8d5f7c8022e8d4ffdaf075bb7`): a V2 event whose
+/// `completed_at` is large enough that the V2->V3 `Upcast`'s `* 1000`
+/// unit conversion overflows i64 used to panic ("attempt to multiply with
+/// overflow") instead of returning a well-defined answer. The value is
+/// decoded straight off an untrusted stored payload, so an old event with
+/// a corrupted or adversarial `completed_at` must not crash the process.
+#[test]
+fn old_version_event_with_overflowing_field_does_not_panic() {
+    let v2 = TripCompletedV2 {
+        trip_id: 1,
+        driver_name: "x".to_string(),
+        distance_miles: 1.0,
+        completed_at: i64::MAX / 2, // * 1000 overflows i64
+    };
+    let ev = StoredEvent::encode("trip.completed", 2, &v2).unwrap();
+    let out = decode_trip_completed(&ev).unwrap();
+    assert_eq!(out.completed_at_ms, i64::MAX); // saturated, not panicked
 }
 
 #[test]

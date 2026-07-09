@@ -1,0 +1,12 @@
+target
+artifacts
+coverage
+fuzz-*.log
+
+# corpus/ is deliberately NOT ignored (unlike cargo-fuzz's default
+# scaffold): the small, hand-picked seed corpus under corpus/ IS committed
+# (bn-gux protocol, carried over from crates/mess-log/fuzz — "small seeds
+# only"). Anything libFuzzer discovers beyond those committed seeds during a
+# local run stays untracked; prune it back to the committed set before
+# committing (or just `git status` and `git add` only the files you mean to
+# add — never `git add -A` in here).
