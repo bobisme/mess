@@ -228,3 +228,15 @@
 1783570259407549	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExuwI		item.move	bn-2iq	{"state":"done"}	blake3:8aAkUwbqiMQGeNi5cGa1YkFvcng0lZISvUqZiKbfi3k
 1783570259424352	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExvAI		item.move	bn-py3	{"state":"done"}	blake3:50_4hyZxDvvroK0X8TMpTQrN51iWNiiqjbQ4EKUCOdo
 1783570259442643	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExvQI		item.move	bn-y0b	{"state":"done"}	blake3:u_sVU2CAXAnpMyPKh-bmt8VdSBIdDzGUxNpftAk58tA
+1783570287652720	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExvgI		item.move	bn-sbt	{"state":"doing"}	blake3:eIeqvce7BLZzw_D0P5OMCTWzo0zCWcp2flr6imFB56s
+1783570287658812	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExvwI		item.assign	bn-sbt	{"action":"assign","agent":"mess-dev"}	blake3:CcwdHoDFMASeDnaArsIyNQk2bEJaJ-N1bMf3-9dqOxo
+1783570287674297	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExwAI		item.move	bn-1gx	{"state":"doing"}	blake3:Yp4mdSE9gyDHj5R_5SZEzEulH4G4etPPjWR1M9aq4VI
+1783570287679473	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExwQI		item.assign	bn-1gx	{"action":"assign","agent":"mess-dev"}	blake3:5oRYRQbSXyeYRp8U2OmLWwpB5wJSjjmZYeM2Cn1qTYU
+1783570287694647	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExwgI		item.move	bn-25e	{"state":"doing"}	blake3:oDv7yKCeHQSKEZr6lfvF7mAHORZw1RzMGWUO8ycGl5k
+1783570287698237	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExwwI		item.assign	bn-25e	{"action":"assign","agent":"mess-dev"}	blake3:57_Ygqh94u87aLP-lWjyXIUN_NlRxl625tOlC2qYqgM
+1783570287714203	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExxAI		item.move	bn-gux	{"state":"doing"}	blake3:d8xInzxCJPeT_FP7fDkeHWCA4__9hYoxyPKP2YoYPPI
+1783570287717447	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExxQI		item.assign	bn-gux	{"action":"assign","agent":"mess-dev"}	blake3:6hqqrilFQdjBgPmawsJyIkpc1gnF32f3eP8HCkwMXQw
+1783570287731670	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExxgI		item.move	bn-2m1	{"state":"doing"}	blake3:FLV7m6TB7DruhhVA24kPJm1-phQoxk8CCtBxfsAbmnI
+1783570287735602	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExxwI		item.assign	bn-2m1	{"action":"assign","agent":"mess-dev"}	blake3:EEc4ahSMvnzhB0-yLBdACjzNqnS5gmNKq-nwGo4nh1s
+1783570287750187	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExyAI		item.link	bn-2m1	{"link_type":"blocks","target":"bn-sbt"}	blake3:QDz-G5h7tJIoj7zJVXnss5Zx_ousZb4Q0Mh6y6FBaJA
+1783570287767907	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExyQI		item.link	bn-2m1	{"link_type":"blocks","target":"bn-25e"}	blake3:j6IbGy5q5nlgsHDYAjNRbtKfyWMYc6CeMHzdlNmlYXk
