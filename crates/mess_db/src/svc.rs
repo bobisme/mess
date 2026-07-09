@@ -516,4 +516,112 @@ mod test_actor {
 
         h.cleanup().await;
     }
+
+    /// bn-3ps: the svc/actor read handlers must not silently truncate a
+    /// stream to one page. A caller (e.g. `EventStore::load`) drives paging
+    /// by looping `fetch_messages`, advancing the cursor to
+    /// `last.next()`, until a page comes back shorter than requested — the
+    /// same protocol `mess-store`'s `Backend::read_stream` documents. This
+    /// exercises that loop through the full actor round-trip (not just the
+    /// bare `Fetch` primitives), including the exact-multiple-of-page-size
+    /// case, which requires one extra, empty round-trip to detect the end.
+    #[tokio::test]
+    async fn actor_pages_a_stream_beyond_a_single_page() {
+        let h = TmpHandle::new();
+        const N: usize = 120;
+        const PAGE: usize = 20;
+
+        h.handle
+            .put_message(write_msg("s1", crate::ExpectedVersion::NoStream))
+            .await
+            .unwrap();
+        for v in 0..(N as u64 - 1) {
+            h.handle
+                .put_message(write_msg(
+                    "s1",
+                    crate::ExpectedVersion::Exact(StreamPos::new(v)),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let mut all = Vec::new();
+        let mut next_pos = StreamPos::new(0);
+        loop {
+            let req = GetMessages::default()
+                .in_stream("s1")
+                .from_stream_position(next_pos)
+                .with_limit(PAGE);
+            let page: Result<Vec<_>> =
+                h.handle.fetch_messages(req).await.unwrap().into_iter().collect();
+            let page = page.unwrap();
+            assert!(page.len() <= PAGE);
+            let page_len = page.len();
+            if let Some(last) = page.last() {
+                next_pos = last.stream_position.next();
+            }
+            all.extend(page);
+            if page_len < PAGE {
+                break;
+            }
+        }
+
+        assert!(all.len() == N);
+        for (i, m) in all.iter().enumerate() {
+            assert!(m.stream_position == StreamPos::new(i as u64));
+            assert!(m.stream_name == "s1");
+        }
+
+        h.cleanup().await;
+    }
+
+    /// Same paging loop, but over `GetGlobalMessages` across multiple
+    /// streams — the other svc read path that must not assume one page is
+    /// the whole story.
+    #[tokio::test]
+    async fn actor_pages_global_reads_beyond_a_single_page() {
+        let h = TmpHandle::new();
+        const N: usize = 120;
+        const PAGE: usize = 20;
+
+        let mut next_expected: std::collections::HashMap<&str, Option<StreamPos>> =
+            std::collections::HashMap::new();
+        for i in 0..N {
+            let stream = if i % 2 == 0 { "s1" } else { "s2" };
+            let expected = *next_expected.entry(stream).or_insert(None);
+            h.handle
+                .put_message(write_msg(stream, expected.into()))
+                .await
+                .unwrap();
+            next_expected.insert(
+                stream,
+                Some(expected.map_or(StreamPos::new(0), StreamPos::next)),
+            );
+        }
+
+        let mut all = Vec::new();
+        let mut next_pos = 0u64;
+        loop {
+            let req = GetMessages::default().from_global(next_pos).with_limit(PAGE);
+            let page: Result<Vec<_>> =
+                h.handle.fetch_messages(req).await.unwrap().into_iter().collect();
+            let page = page.unwrap();
+            assert!(page.len() <= PAGE);
+            let page_len = page.len();
+            if let Some(last) = page.last() {
+                next_pos = last.global_position + 1;
+            }
+            all.extend(page);
+            if page_len < PAGE {
+                break;
+            }
+        }
+
+        assert!(all.len() == N);
+        let unique: std::collections::HashSet<u64> =
+            all.iter().map(|m| m.global_position).collect();
+        assert!(unique.len() == N);
+
+        h.cleanup().await;
+    }
 }

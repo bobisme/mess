@@ -12,8 +12,12 @@ use super::{
     record::{GlobalRecord, StreamRecord},
 };
 
-pub const LIMIT_MAX: usize = 10_000;
-pub const LIMIT_DEFAULT: usize = 1_000;
+// NOTE: `LIMIT_MAX` / `LIMIT_DEFAULT` have a single source of truth in
+// `crate::read` (that's what `GetMessages::with_limit` actually clamps
+// against). This module intentionally does not shadow them with a local
+// copy — tests and callers here should reference `crate::read::LIMIT_MAX`
+// directly so they can never drift from the constant that governs
+// production behavior.
 
 pub struct MessageIter<'msg, Iter: Iterator<Item = Result<Message<'msg>>>>(
     Iter,
@@ -395,5 +399,157 @@ mod test {
         //             get_latest_stream_position(&conn, "null-stream").unwrap();
         //         assert!(position == None);
         //     }
+    }
+
+    /// Acceptance coverage for bn-3ps: the backend paged-read path must
+    /// recover a stream in full regardless of how it compares to
+    /// [`crate::read::LIMIT_MAX`] — the single real constant that
+    /// `GetMessages::with_limit` clamps against (see the `NOTE` at the top
+    /// of this module: there is deliberately no local shadow of it here),
+    /// by looping pages the same way `mess-store`'s `EventStore::load` and
+    /// `MockBackend::read_stream` do: keep fetching from
+    /// `last_seen.next()` until a page comes back shorter than the
+    /// requested page size.
+    ///
+    /// SCOPE NOTE (open question for the lead, not resolved here): the
+    /// bone's stated acceptance criterion is "a 50,000-event stream loads
+    /// correctly through `EventStore::load`". As of this commit,
+    /// `mess-store` has no dependency on / `Backend` impl for `mess_db` at
+    /// all (`crates/mess-store/Cargo.toml` depends only on `mess-core`), so
+    /// that AC cannot literally be exercised from a test living in
+    /// `mess_db` — this bone's owned scope. The tests below instead drive
+    /// `mess_db`'s own paged-read primitives (`Fetch::fetch` +
+    /// `GetMessages`) with a hand-rolled loop that mirrors the paging
+    /// contract `EventStore::load` will need once that dependency exists.
+    /// That is real coverage of the backend paging behavior this bone
+    /// owns, but it is not the same thing as the AC as literally worded,
+    /// and closing the AC for real requires either wiring mess-store to
+    /// mess_db (out of this bone's scope) or rewording the AC. Flagging
+    /// this explicitly rather than presenting the AC as closed.
+    mod paging {
+        use super::*;
+        use crate::read::{GetMessages, LIMIT_MAX, OptStreamPos};
+        use assert2::assert;
+        use ident::Id;
+
+        /// Write `n` sequential events into `stream` on a fresh temp DB.
+        fn write_stream(stream: &str, n: usize) -> SelfDestructingDB {
+            let db = SelfDestructingDB::new_tmp();
+            let mut ser = test_ser();
+            let data = [7u8; 32];
+            for i in 0..n {
+                let expected = if i == 0 {
+                    None
+                } else {
+                    Some(StreamPos::new((i - 1) as u64))
+                };
+                let msg = WriteMessage {
+                    id: Id::new(),
+                    stream_name: stream.into(),
+                    message_type: "PagingTestEvent".into(),
+                    data: data[..].into(),
+                    metadata: [][..].into(),
+                    expected_version: expected.into(),
+                };
+                write_mess(&db, msg, &mut ser).unwrap();
+            }
+            db
+        }
+
+        /// Page through `stream` in `page_size` chunks, exactly like a
+        /// caller (`EventStore::load`) would: advance the cursor to
+        /// `last.next()` and stop once a page returns fewer than
+        /// `page_size` records. Asserts no page ever exceeds `page_size`
+        /// (the LIMIT_MAX-enforcement contract) along the way.
+        fn page_through_stream(
+            db: &SelfDestructingDB,
+            stream: &str,
+            page_size: usize,
+        ) -> Vec<crate::OwnedMessage> {
+            let mut all = Vec::new();
+            let mut next_pos = StreamPos::new(0);
+            loop {
+                let opts = GetMessages::default()
+                    .in_stream(stream)
+                    .from_stream_position(next_pos)
+                    .with_limit(page_size);
+                let page: Vec<_> =
+                    Fetch::<(OptStream<'_>, OptStreamPos)>::fetch(db, opts)
+                        .collect::<Result<Vec<_>>>()
+                        .unwrap()
+                        .into_iter()
+                        .map(crate::OwnedMessage::from)
+                        .collect();
+                assert!(page.len() <= page_size);
+                let page_len = page.len();
+                if let Some(last) = page.last() {
+                    next_pos = last.stream_position.next();
+                }
+                all.extend(page);
+                if page_len < page_size {
+                    break;
+                }
+            }
+            all
+        }
+
+        fn assert_full_recovery(
+            messages: &[crate::OwnedMessage],
+            stream: &str,
+            expected_count: usize,
+        ) {
+            assert!(messages.len() == expected_count);
+            for (i, m) in messages.iter().enumerate() {
+                assert!(m.stream_name == stream);
+                assert!(m.stream_position == StreamPos::new(i as u64));
+            }
+            // No duplicates: positions are strictly increasing, so a set of
+            // them has the same cardinality as the list.
+            let unique: std::collections::HashSet<u64> = messages
+                .iter()
+                .map(|m| m.stream_position.position())
+                .collect();
+            assert!(unique.len() == expected_count);
+        }
+
+        #[test]
+        fn a_50_000_event_stream_loads_correctly_through_paged_reads() {
+            let stream = "stream-50k";
+            let db = write_stream(stream, 50_000);
+            let messages = page_through_stream(&db, stream, LIMIT_MAX);
+            assert_full_recovery(&messages, stream, 50_000);
+        }
+
+        #[rstest::rstest]
+        #[case::one_under_limit_max(LIMIT_MAX - 1)]
+        #[case::exactly_limit_max(LIMIT_MAX)]
+        #[case::one_over_limit_max(LIMIT_MAX + 1)]
+        fn paged_reads_recover_every_event_at_the_limit_max_boundary(
+            #[case] count: usize,
+        ) {
+            let stream = "stream-boundary";
+            let db = write_stream(stream, count);
+            let messages = page_through_stream(&db, stream, LIMIT_MAX);
+            assert_full_recovery(&messages, stream, count);
+        }
+
+        /// A single oversized request (limit > LIMIT_MAX) must still only
+        /// return one page's worth: `with_limit` clamps, it never silently
+        /// truncates a *paged* read to one page — that's the caller's job,
+        /// driven by "page came back shorter than requested".
+        #[test]
+        fn a_single_request_never_returns_more_than_limit_max() {
+            let stream = "stream-clamp";
+            let db = write_stream(stream, LIMIT_MAX + 500);
+            let opts = GetMessages::default()
+                .in_stream(stream)
+                .from_stream_position(StreamPos::new(0))
+                .with_limit(usize::MAX);
+            let page: Vec<_> =
+                Fetch::<(OptStream<'_>, OptStreamPos)>::fetch(&db, opts)
+                    .collect::<Result<Vec<_>>>()
+                    .unwrap();
+            assert!(page.len() == LIMIT_MAX);
+        }
     }
 }
