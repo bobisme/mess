@@ -18,11 +18,14 @@
 //!   `mess-log`'s own `block_on`/OS-thread runtime, the append crosses the
 //!   seam via [`spawn_blocking`](tokio::task::spawn_blocking) — the minimal
 //!   adapter between the two executors.
-//! - **Exact-version gate** — a store-wide async mutex serialises the
-//!   check-head → append → apply critical section, so two writers that loaded
-//!   the same [`Version`] genuinely race and exactly one wins with a
-//!   [`AppendError::Conflict`]. (The committer already serialises writes
-//!   globally; this mutex just makes the version check atomic with the append.)
+//! - **Exact-version gate** — a per-stream sharded async mutex ([`AppendGate`],
+//!   bn-1s0) serialises the check-head → append → apply critical section **per
+//!   stream**, so two writers that loaded the same [`Version`] on the *same*
+//!   stream genuinely race and exactly one wins with a
+//!   [`AppendError::Conflict`], while writers on *different* streams no
+//!   longer queue behind one store-wide lock. (The committer still serialises
+//!   the durable write itself across all streams; the gate's job is only to
+//!   make the version check atomic with the append, per stream.)
 //! - **Hot reads** — committed batches are applied to a `mess-index`
 //!   [`ActiveIndex`] via `apply_committed`, and their payloads are written into
 //!   the record book, **only after the committer acks** the durable append
@@ -247,6 +250,111 @@ impl Book {
     }
 }
 
+/// Number of shards in the per-stream append gate (bn-1s0). A fixed-size
+/// array — it never grows, so a store is never on the hook for one lock per
+/// stream it has ever seen; only for whether two streams alias onto the same
+/// shard, which costs extra serialisation, never correctness.
+const APPEND_GATE_SHARDS: usize = 256;
+
+/// Per-stream exact-version gate (bn-1s0 — replaces the store-wide mutex).
+///
+/// Serialises the check-head → reserve critical section **per stream**, so
+/// appends to different streams no longer queue behind one lock while an
+/// `Exact(v)` race on the *same* stream still resolves to exactly one
+/// winner.
+///
+/// Design: a fixed array of `APPEND_GATE_SHARDS` async mutexes, indexed by
+/// `stream_id % APPEND_GATE_SHARDS`, chosen over a keyed map (e.g. a dashmap
+/// of `Arc<Mutex<()>>` per stream id) for two reasons:
+/// - **No unbounded growth.** A store that has ever seen a million distinct
+///   streams still costs exactly `APPEND_GATE_SHARDS` mutexes — a keyed map
+///   would need its own eviction/GC policy (or leak one entry per stream
+///   forever) to avoid the same hazard.
+/// - **No hashing needed.** Stream ids are dense `u64`s minted by the book's
+///   interner (1, 2, 3, …), so `% N` already spreads consecutive ids
+///   round-robin across shards.
+///
+/// Two distinct streams that alias onto the same shard serialise against
+/// each other unnecessarily — a bounded throughput cost, never a
+/// correctness hazard: the version check inside the shard still reads the
+/// true per-stream head from the book.
+struct AppendGate {
+    shards: [tokio::sync::Mutex<()>; APPEND_GATE_SHARDS],
+}
+
+impl AppendGate {
+    fn new() -> Self {
+        AppendGate { shards: std::array::from_fn(|_| tokio::sync::Mutex::new(())) }
+    }
+
+    /// Acquire the shard guarding `stream_id`'s check-and-reserve section.
+    async fn lock_for(&self, stream_id: u64) -> tokio::sync::MutexGuard<'_, ()> {
+        let idx = (stream_id as usize) % APPEND_GATE_SHARDS;
+        self.shards[idx].lock().await
+    }
+}
+
+/// Orders the post-ack publish step (record book + active index + meta head)
+/// across concurrently-committing streams (bn-1s0).
+///
+/// The durable committer assigns each accepted batch a dense, globally
+/// unique position range, but once distinct streams can have appends in
+/// flight at the same time — the whole point of the per-stream
+/// [`AppendGate`] — their `spawn_blocking` acks can resolve to the async
+/// executor in ANY order, not necessarily the order the committer assigned
+/// positions in. `Book::payloads` requires strictly increasing-by-position
+/// pushes (dense rehydration), and `ActiveIndex::apply_committed` /
+/// `MetaStore::apply_group` carry their own out-of-order asserts — so every
+/// publish must wait its turn here before touching any of them.
+///
+/// This only ever guards the in-memory publish step (a handful of
+/// `Vec`/`HashMap` writes) — never the slow durable write itself, which the
+/// committer already serialises regardless. So it does not reintroduce the
+/// store-wide throughput ceiling this bone removes; it just re-serialises a
+/// microseconds-long tail, in position order instead of ack-arrival order.
+struct PublishSequencer {
+    /// The global position a publish must match to go next. Readers
+    /// `wait_for` their turn; the publisher advances it via
+    /// [`PublishTurn`]'s `Drop`.
+    next: tokio::sync::watch::Sender<u64>,
+}
+
+impl PublishSequencer {
+    /// `start` is the first position a publish is allowed to claim — the
+    /// book's recovered dense length on open (0 for a fresh store).
+    fn new_at(start: u64) -> Self {
+        let (next, _rx) = tokio::sync::watch::channel(start);
+        PublishSequencer { next }
+    }
+
+    /// Wait until `first_global` is next in line, then hold the turn: the
+    /// returned guard advances the sequence to `watermark` when dropped —
+    /// on ANY exit path (success or error), since the durable committer has
+    /// already permanently assigned this position range regardless of
+    /// whether the local book/index/meta publish fully succeeds. Failing to
+    /// advance on an error path would deadlock every higher-positioned
+    /// publish behind this one forever.
+    async fn turn(&self, first_global: u64, watermark: u64) -> PublishTurn<'_> {
+        let mut rx = self.next.subscribe();
+        rx.wait_for(|&n| n == first_global)
+            .await
+            .expect("PublishSequencer's Sender outlives all receivers (owned by Inner)");
+        PublishTurn { seq: self, watermark }
+    }
+}
+
+/// RAII hold on [`PublishSequencer`]'s turn; see [`PublishSequencer::turn`].
+struct PublishTurn<'a> {
+    seq: &'a PublishSequencer,
+    watermark: u64,
+}
+
+impl Drop for PublishTurn<'_> {
+    fn drop(&mut self) {
+        self.seq.next.send_modify(|n| *n = self.watermark);
+    }
+}
+
 /// How [`LogEngine::recover`] resolved the active segment: continue an existing
 /// one in place, or start fresh.
 enum ResumePlan {
@@ -285,8 +393,11 @@ struct Inner {
     block_cache: BlockCache,
     meta: MetaStore,
     book: Mutex<Book>,
-    /// Serialises the exact-version critical section across appends.
-    append_gate: tokio::sync::Mutex<()>,
+    /// Serialises the exact-version critical section, per stream (bn-1s0).
+    append_gate: AppendGate,
+    /// Orders the post-ack book/index/meta publish step by global position
+    /// across concurrently-committing streams (bn-1s0).
+    publish_seq: PublishSequencer,
     /// The store root (sealed sidecars live under `dir/sealed`).
     dir: PathBuf,
 }
@@ -395,6 +506,13 @@ impl LogEngine {
         let committer = Committer::spawn(&rt, writer, opts.durability);
         let appender = committer.appender();
 
+        // The publish sequencer's turn-order starts wherever recovery left
+        // the book's dense prefix — 0 on a fresh store, or the recovered
+        // event count on a reopen — never a hardcoded 0, or the first
+        // post-reopen publish would wait forever for a position that was
+        // already durably assigned in a previous process lifetime.
+        let recovered_len = book.payloads.len() as u64;
+
         Ok(LogEngine {
             inner: Arc::new(Inner {
                 rt,
@@ -406,7 +524,8 @@ impl LogEngine {
                 block_cache: BlockCache::disabled(),
                 meta,
                 book: Mutex::new(book),
-                append_gate: tokio::sync::Mutex::new(()),
+                append_gate: AppendGate::new(),
+                publish_seq: PublishSequencer::new_at(recovered_len),
                 dir: dir.to_path_buf(),
             }),
         })
@@ -718,20 +837,39 @@ impl Backend for LogEngine {
         expected: Version,
         records: &[RecordToAppend],
     ) -> Result<Appended, AppendError<Self::Error>> {
-        // Serialise the exact-version critical section.
-        let _gate = self.inner.append_gate.lock().await;
-
-        // Intern + check the expected version under the book lock, capturing
-        // any newly-assigned interner names, then drop the lock (we must not
-        // hold a std mutex across the append await, nor across fjall I/O).
-        let (pre, new_stream, new_types) = {
+        // Intern the stream name to a stable numeric id FIRST, outside any
+        // append gate. Interning only touches the book's own interner maps
+        // (never the head/version state), and the book's std mutex already
+        // serialises concurrent inserts of the same new name — so this is
+        // safe ahead of the per-stream gate below, and it is *required*
+        // ahead of it: the gate is keyed by `sid`, which doesn't exist until
+        // the name is interned.
+        let (sid, new_stream) = {
             let mut book = self.inner.book.lock().expect("book lock");
-            let mut new_stream: Option<(u64, String)> = None;
-            let mut new_types: Vec<(u32, String)> = Vec::new();
             let (sid, sid_new) = book.intern_stream(stream_id);
-            if sid_new {
-                new_stream = Some((sid, stream_id.to_string()));
-            }
+            let new_stream = sid_new.then(|| (sid, stream_id.to_string()));
+            (sid, new_stream)
+        };
+        // Persist a newly-interned stream name durably (buffered) so a
+        // reopen can resolve it, even on a path that goes on to conflict —
+        // the id was assigned in-process regardless, and the interner is
+        // dense, so a later successful append to this stream must find its
+        // name persisted.
+        self.persist_new_names(new_stream, &[])
+            .map_err(|e| AppendError::Backend(EngineError::Meta(e.to_string())))?;
+
+        // Serialise the exact-version critical section PER STREAM (bn-1s0):
+        // two appenders racing `Exact(v)` on the SAME stream still resolve to
+        // exactly one winner; appenders on DIFFERENT streams no longer queue
+        // behind one store-wide lock.
+        let _gate = self.inner.append_gate.lock_for(sid).await;
+
+        // Check the expected version under the book lock, capturing any
+        // newly-assigned type names, then drop the lock (we must not hold a
+        // std mutex across the append await, nor across fjall I/O).
+        let (pre, new_types) = {
+            let mut book = self.inner.book.lock().expect("book lock");
+            let mut new_types: Vec<(u32, String)> = Vec::new();
             let actual = book.head(sid);
             let pre = if actual != expected {
                 Pre::Conflict(actual)
@@ -751,16 +889,11 @@ impl Backend for LogEngine {
                     .collect();
                 Pre::Proceed { sid, events, first_stream_pos: expected.next_position() }
             };
-            (pre, new_stream, new_types)
+            (pre, new_types)
         };
 
-        // Persist any newly-interned id→name mappings durably (buffered) so a
-        // reopen can resolve them. This happens even on a conflict/empty path:
-        // the id was assigned in-process regardless, and the interner is dense,
-        // so a later successful append to this stream must find its name
-        // persisted (a first-touch that conflicts — e.g. a stale-expected
-        // append to a fresh stream — still interns the name).
-        self.persist_new_names(new_stream, &new_types)
+        // Persist any newly-interned type names the same way (see above).
+        self.persist_new_names(None, &new_types)
             .map_err(|e| AppendError::Backend(EngineError::Meta(e.to_string())))?;
 
         let (sid, events, first_stream_pos) = match pre {
@@ -811,6 +944,13 @@ impl Backend for LogEngine {
         let frame_count = (last_global - first_global + 1) as u32;
         let watermark = last_global + 1;
         let last_stream_pos = first_stream_pos + u64::from(frame_count) - 1;
+
+        // Wait this batch's turn to publish (bn-1s0): concurrent
+        // distinct-stream commits can ack out of position order, but the
+        // book/index/meta below all require strictly increasing-by-position
+        // writes. `_turn`'s `Drop` advances the sequence past `watermark` on
+        // every exit path below, success or error.
+        let _turn = self.inner.publish_seq.turn(first_global, watermark).await;
 
         // Publish: record book, active index (watermark-gated), meta head.
         {
