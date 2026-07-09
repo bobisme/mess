@@ -1,0 +1,74 @@
+name: phase3-exit-gate
+
+# bn-2m1 (Phase 3 EXIT GATE): the quantitative gate from doc 12's roadmap —
+# "all three harnesses green at full profiles in ONE CI run." The individual
+# nightly lanes (crash-harness.yml / torn-matrix.yml / sigkill.yml) each run a
+# single full profile on its own schedule and PR-path triggers; this composite
+# lane runs ALL THREE full profiles back-to-back in one job so a single green
+# run is the standing proof of the exit gate, and appends nothing new to the
+# per-PR critical path.
+#
+# Full profiles exercised (see docs/perf/envelope.md for the recorded case
+# counts + wall times of the local stand-in run):
+#   * crash_harness  randomized_crash_recovery_loop_full  (12,000 cases)
+#   * torn_matrix    torn_matrix_full                     (24,000 cases)
+#   * sigkill        sigkill_nightly_{process,os,group}   (45 real-kill rounds)
+#
+# Release build throughout, mirroring the local exit-gate run: the sigkill
+# child writer must move real volume within its kill window, and the crash /
+# torn sweeps are cheap either way. Measured local wall (Ryzen 9 3900X, ext4):
+# crash ~0.2s, torn ~0.8s, sigkill ~59s — comfortably nightly-feasible in one
+# job.
+
+on:
+  schedule:
+    # 05:07 UTC daily — off-peak, staggered off the single-profile lanes
+    # (crash 04:23, torn/sigkill 03:41) and the sanitizer lane (03:17) so the
+    # composite never contends with them for a runner.
+    - cron: "7 5 * * *"
+  workflow_dispatch: {}
+  # Nightly + manual only — deliberately NO pull_request trigger. The composite
+  # includes the ~59 s real-SIGKILL profile, which the split (sigkill.yml)
+  # keeps off the per-PR critical path on purpose; per-change regression catch
+  # stays with crash-harness.yml's own `pull_request` lane. This lane's job is
+  # the standing "all three green in one run" exit-gate proof.
+
+concurrency:
+  group: phase3-exit-gate-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  all-three-full-profiles:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: phase3-exit-gate
+
+      # Compile all three harness binaries once up front so a build failure is
+      # reported distinctly from a test failure.
+      - name: build harness binaries (release)
+        run: |
+          cargo test -p mess-log --release \
+            --test crash_harness --test torn_matrix --test sigkill_harness \
+            --no-run
+
+      - name: crash_harness full profile (12k cases)
+        run: |
+          cargo test -p mess-log --release --test crash_harness \
+            randomized_crash_recovery_loop_full -- --ignored --nocapture
+
+      - name: torn_matrix full profile (24k cases)
+        run: |
+          cargo test -p mess-log --release --test torn_matrix \
+            torn_matrix_full -- --ignored --nocapture
+
+      - name: sigkill nightly rounds (45 real-kill rounds, all modes)
+        run: |
+          cargo test -p mess-log --release --test sigkill_harness \
+            -- --ignored --test-threads=1 --nocapture
