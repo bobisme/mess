@@ -5,8 +5,16 @@ edition = "2024"
 description = "mess v1: metadata and pointer index"
 
 [dependencies]
+# bn-1ku: exact-KV metadata tables (stream/snapshot heads, projection
+# checkpoints, recent-dedupe window) live on fjall — a pure-Rust LSM the
+# ptr_index spike selected. Journal-buffered durability is sufficient because
+# every table is rebuildable from the log (I5); see src/meta/mod.rs.
+fjall = "3.1.6"
 mess-log = { workspace = true }
 parking_lot = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 mess-log = { workspace = true }
+# bn-1ku: real-fs scratch dirs for the fjall round-trip / crash-lag tests.
+tempfile = "3"
