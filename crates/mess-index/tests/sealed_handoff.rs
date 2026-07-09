@@ -54,7 +54,7 @@ fn build(
         .map(|s| SealStream { stream_id: s, batches: seal_batches[s as usize].clone() })
         .collect();
     streams.extend(streams_vec);
-    (active, SealInput { segment_id, base_pos: 0, streams })
+    (active, SealInput { segment_id, base_pos: 0, streams, payloads: None })
 }
 
 #[test]

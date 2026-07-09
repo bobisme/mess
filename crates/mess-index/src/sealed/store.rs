@@ -217,6 +217,7 @@ mod tests {
                     offset: off,
                 }],
             }],
+            payloads: None,
         };
         Arc::new(SealedSegmentIndex::from_bytes(encode_sidecar(&input)).unwrap())
     }
@@ -287,7 +288,7 @@ mod tests {
                 batches: vec![SealBatch { first_version: 0, frame_count: 1, first_global_pos: id, offset: 1000 + id }],
             })
             .collect();
-        let input1 = SealInput { segment_id: 1, base_pos: 0, streams: streams1 };
+        let input1 = SealInput { segment_id: 1, base_pos: 0, streams: streams1, payloads: None };
         let filter1 = SegmentFilter::build(1, &ids).unwrap();
         let mut idx1 = SealedSegmentIndex::from_bytes(encode_sidecar(&input1)).unwrap();
         idx1.attach_filter(filter1);

@@ -91,6 +91,7 @@
 
 use crate::active::{GlobalEntry, StreamEntry};
 use crate::sealed::block_cache::BlockCache;
+use crate::sealed::payload::{DictResolver, PayloadError};
 use crate::sealed::ptr_block::DecodeError;
 use crate::sealed::segment::SealedSegmentRef;
 
@@ -301,6 +302,98 @@ impl ReplaySet {
         }
         Ok(out)
     }
+
+    // -- payload reads (D6 `.pcol`, bn-zge) --------------------------------
+
+    /// Whether **every** segment in the set carries an attached D6 payload
+    /// sidecar (`.pcol`) — i.e. the whole sealed history can be replayed
+    /// payload-side ([`Self::payload_scan`]) without touching the raw log. A
+    /// pointer-only seal (no payloads handed to the sealer) leaves a segment
+    /// without one, and the caller falls back to the raw segment for it.
+    pub fn all_have_payloads(&self) -> bool {
+        self.segments.iter().all(|s| s.has_payload())
+    }
+
+    /// The index of the segment whose contiguous A1 range
+    /// `[base_pos, base_pos + event_count)` contains `global_pos`, or `None`
+    /// when `global_pos` is past the sealed history. Segments are `base_pos`
+    /// ordered and disjoint, so this is a binary search.
+    fn segment_for_global(&self, global_pos: u64) -> Option<usize> {
+        let mut lo = 0usize;
+        let mut hi = self.segments.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let s = &self.segments[mid];
+            let base = s.base_pos();
+            if global_pos < base {
+                hi = mid;
+            } else if global_pos >= base + s.event_count() {
+                lo = mid + 1;
+            } else {
+                return Some(mid);
+            }
+        }
+        None
+    }
+
+    /// **Payload point read** through the D6 payload sidecar: reassemble the
+    /// event at global position `global_pos` byte-exact, dispatching to whichever
+    /// segment covers it and through `resolver` for a row-fallback dictionary
+    /// block. Works uniformly for columnar and row-fallback blocks (the block
+    /// kind is internal to the segment's `.pcol`). Returns:
+    ///
+    /// - `Ok(Some(bytes))` — reassembled from the covering segment's `.pcol`;
+    /// - `Ok(None)` — `global_pos` is past the sealed history, **or** the
+    ///   covering segment has no `.pcol` attached (pointer-only seal — the caller
+    ///   reads the payload from the raw log instead);
+    /// - `Err(_)` — a block decode / dictionary-resolution failure.
+    pub fn payload_at(
+        &self,
+        global_pos: u64,
+        resolver: &impl DictResolver,
+    ) -> Result<Option<Vec<u8>>, PayloadError> {
+        let Some(si) = self.segment_for_global(global_pos) else {
+            return Ok(None);
+        };
+        let seg = &self.segments[si];
+        let local = global_pos - seg.base_pos();
+        seg.reassemble_payload(local, resolver)
+    }
+
+    /// **Payload global replay**: reassemble every sealed payload in global (A1)
+    /// order across the whole set, byte-exact, appending bytes to `out` and
+    /// `event_count + 1` boundaries to `offs`. Because segments hold disjoint,
+    /// contiguous A1 ranges, concatenating each segment's `.pcol` reassembly in
+    /// `base_pos` order is already globally ordered — this is the payload-side
+    /// analogue of [`global_scan`](Self::global_scan), and it handles **mixed
+    /// segments** (columnar + row-fallback blocks) through the one path.
+    ///
+    /// Requires every segment to carry a `.pcol` ([`Self::all_have_payloads`]);
+    /// a segment without one returns [`PayloadError::Corrupt`] rather than
+    /// silently skipping events (a global replay must be complete).
+    pub fn payload_scan(
+        &self,
+        resolver: &impl DictResolver,
+        out: &mut Vec<u8>,
+        offs: &mut Vec<u32>,
+    ) -> Result<(), PayloadError> {
+        out.clear();
+        offs.clear();
+        for (i, seg) in self.segments.iter().enumerate() {
+            let payload = seg
+                .payload_index()
+                .ok_or(PayloadError::Corrupt("segment in payload_scan has no .pcol sidecar"))?;
+            payload.reassemble_all(resolver, out, offs)?;
+            // reassemble_all appends this segment's boundaries plus a trailing
+            // `out.len()`. Drop that duplicate between segments so the next
+            // segment's first boundary (also `out.len()`) is not repeated; the
+            // final segment keeps its trailing boundary.
+            if i + 1 < self.segments.len() {
+                offs.pop();
+            }
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -374,7 +467,7 @@ mod tests {
                 SealStream { stream_id: sid, batches }
             })
             .collect();
-        let input = SealInput { segment_id, base_pos: base, streams };
+        let input = SealInput { segment_id, base_pos: base, streams, payloads: None };
         Arc::new(SealedSegmentIndex::from_bytes(encode_sidecar(&input)).unwrap())
     }
 
@@ -505,5 +598,140 @@ mod tests {
         assert!(set.is_empty());
         assert!(set.stream_replay(1, &cache).unwrap().is_empty());
         assert!(set.global_scan().unwrap().is_empty());
+    }
+
+    // -- payload reads through the ReplaySet (D6 `.pcol`, bn-zge) -----------
+
+    use crate::columnar::{emit_int, emit_str};
+    use crate::sealed::payload::{
+        BlockKind, NoDicts, PayloadSealOpts, SealedPayloadIndex, encode_payload_sidecar,
+    };
+
+    /// A shreddable msgpack map (columnar) at sequence `seq`.
+    fn msgpack(seq: u64) -> Vec<u8> {
+        let mut m = vec![0x82];
+        emit_str(&mut m, b"seq");
+        emit_int(&mut m, seq as i64);
+        emit_str(&mut m, b"kind");
+        emit_str(&mut m, b"demo");
+        m
+    }
+
+    /// A build of a sealed segment carrying an attached `.pcol` whose blocks are
+    /// a MIX of columnar and row-fallback (small block size over alternating
+    /// msgpack/binary runs). `base` is the segment's A1 base; the segment holds
+    /// `payloads` at global positions `base..base + payloads.len()`.
+    fn segment_with_payloads(segment_id: u64, base: u64, payloads: &[Vec<u8>]) -> SealedSegmentRef {
+        use crate::sealed::segment::{SealBatch, SealInput, SealStream, encode_sidecar};
+        use crate::sealed::segment::SealedSegmentIndex;
+        // A single stream/batch whose frame_count == event count fixes the
+        // segment's event_count and base_pos for the global→local mapping.
+        let input = SealInput {
+            segment_id,
+            base_pos: base,
+            streams: vec![SealStream {
+                stream_id: 1,
+                batches: vec![SealBatch {
+                    first_version: 0,
+                    frame_count: payloads.len() as u32,
+                    first_global_pos: base,
+                    offset: 4096,
+                }],
+            }],
+            payloads: None,
+        };
+        let mut idx = SealedSegmentIndex::from_bytes(encode_sidecar(&input)).unwrap();
+        let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
+        let opts = PayloadSealOpts { block_events: 4, ..Default::default() };
+        let bytes = encode_payload_sidecar(segment_id, &refs, &opts).unwrap();
+        idx.attach_payload(SealedPayloadIndex::from_bytes(bytes).unwrap());
+        std::sync::Arc::new(idx)
+    }
+
+    /// A mixed corpus for one segment: alternating short runs of msgpack
+    /// (columnar) and binary (row fallback) so a 4-event block size yields both.
+    fn mixed(seed: u64) -> Vec<Vec<u8>> {
+        let mut v = Vec::new();
+        for r in 0..3u64 {
+            for i in 0..6 {
+                v.push(msgpack(seed * 100 + r * 6 + i));
+            }
+            for i in 0..5u8 {
+                v.push(vec![0xff, 0x00, (seed as u8).wrapping_add(i), 0x99]);
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn payload_scan_reassembles_mixed_segments_in_global_order() {
+        // Three segments tiling the A1 axis, each with mixed columnar/row blocks.
+        let p1 = mixed(1);
+        let p2 = mixed(2);
+        let p3 = mixed(3);
+        let b1 = 0u64;
+        let b2 = b1 + p1.len() as u64;
+        let b3 = b2 + p2.len() as u64;
+        // Deliberately out of order to exercise the base_pos sort.
+        let set = ReplaySet::from_segments([
+            segment_with_payloads(3, b3, &p3),
+            segment_with_payloads(1, b1, &p1),
+            segment_with_payloads(2, b2, &p2),
+        ]);
+        assert!(set.all_have_payloads());
+
+        // Each segment must actually be mixed (both block kinds present).
+        for seg in set.segments() {
+            let kinds: Vec<BlockKind> =
+                seg.payload_index().unwrap().blocks().iter().map(|b| b.kind).collect();
+            assert!(kinds.contains(&BlockKind::Columnar), "expected columnar block");
+            assert!(kinds.contains(&BlockKind::Row), "expected row-fallback block");
+        }
+
+        // The expected global-order concatenation.
+        let mut expect: Vec<Vec<u8>> = Vec::new();
+        expect.extend(p1.iter().cloned());
+        expect.extend(p2.iter().cloned());
+        expect.extend(p3.iter().cloned());
+
+        // Full global payload replay is byte-exact across the mixed segments.
+        let mut out = Vec::new();
+        let mut offs = Vec::new();
+        set.payload_scan(&NoDicts, &mut out, &mut offs).unwrap();
+        assert_eq!(offs.len(), expect.len() + 1, "one boundary per event + tail");
+        for (i, w) in offs.windows(2).enumerate() {
+            assert_eq!(&out[w[0] as usize..w[1] as usize], expect[i].as_slice(), "scan mismatch at {i}");
+        }
+
+        // Point reads by GLOBAL position dispatch to the right segment + block.
+        for gp in 0..expect.len() as u64 {
+            assert_eq!(
+                set.payload_at(gp, &NoDicts).unwrap().as_deref(),
+                Some(expect[gp as usize].as_slice()),
+                "payload_at mismatch at global {gp}",
+            );
+        }
+        // Past the sealed history: a clean None, not a panic.
+        assert_eq!(set.payload_at(expect.len() as u64, &NoDicts).unwrap(), None);
+    }
+
+    #[test]
+    fn payload_scan_requires_every_segment_to_have_a_pcol() {
+        // One payload-backed segment + one pointer-only segment ⇒ scan refuses.
+        let p1 = mixed(1);
+        let seg_payload = segment_with_payloads(1, 0, &p1);
+        let seg_pointer = segment(2, p1.len() as u64, &[(1, 0, 1)]);
+        let set = ReplaySet::from_segments([seg_payload, seg_pointer]);
+        assert!(!set.all_have_payloads());
+        let mut out = Vec::new();
+        let mut offs = Vec::new();
+        assert!(matches!(
+            set.payload_scan(&NoDicts, &mut out, &mut offs),
+            Err(crate::sealed::payload::PayloadError::Corrupt(_))
+        ));
+        // But payload_at still works for the covered range, and returns None
+        // (fall back to raw) for the pointer-only segment's range.
+        assert_eq!(set.payload_at(0, &NoDicts).unwrap().as_deref(), Some(p1[0].as_slice()));
+        assert_eq!(set.payload_at(p1.len() as u64, &NoDicts).unwrap(), None);
     }
 }

@@ -46,6 +46,7 @@
 pub mod block_cache;
 pub mod driver;
 pub mod filter;
+pub mod payload;
 pub mod ptr_block;
 pub mod replay;
 pub mod segment;
@@ -54,6 +55,10 @@ pub mod store;
 pub use block_cache::{BlockCache, CachedBlock};
 pub use driver::{BackgroundSealer, FinalizeFn, SealDriver, SealError};
 pub use filter::{FilterError, SegmentFilter};
+pub use payload::{
+    BlockEntry, BlockKind, DictResolver, NoDicts, PayloadError, PayloadSealOpts,
+    SealedPayloadIndex, encode_payload_sidecar, verify_reassembly,
+};
 pub use ptr_block::{BatchPtr, DecodeError, SKIP_K};
 pub use replay::{ReplaySet, global_checksum, stream_checksum};
 pub use segment::{

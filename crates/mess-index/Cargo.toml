@@ -30,7 +30,10 @@ xorf = "0.12"
 # 128-event blocks / zstd-9 / no dicts = 30.8 B/event). Whole-block and
 # per-column framing both live in `src/columnar`. Builds here only with the
 # system clang (mise.toml pins CLANG_PATH for zstd-sys bindgen).
-zstd = "0.13"
+# `experimental` exposes the frame-format parameter (magicless zstd framing)
+# the row-fallback dictionary tier uses (bn-zge / D6): a magic-stripped frame
+# per row block saves the 4-byte magic on the rare fallback tier.
+zstd = { version = "0.13", features = ["experimental"] }
 
 # bn-20e: `#[cfg(kani)]` ptr-block round-trip proofs are compiled only by
 # `cargo kani`; teach the normal `cargo` build the cfg so it is not flagged

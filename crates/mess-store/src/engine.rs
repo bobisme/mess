@@ -537,6 +537,23 @@ impl LogEngine {
         if input.streams.is_empty() {
             return Ok(());
         }
+        // bn-zge / D6: hand the sealer the segment's payloads in stored
+        // (global-position) order so the seal emits the columnar `.pcol`
+        // payload sidecar alongside the pointer sidecar and attaches it to the
+        // installed segment (the sealed read path can then reassemble payloads
+        // without touching the raw log). base_pos is 0 for the single interim
+        // active segment, so a global position is exactly the dense book index.
+        let event_count = input.event_count() as usize;
+        let input = {
+            let book = self.inner.book.lock().expect("book lock");
+            if book.payloads.len() >= event_count {
+                let payloads: Vec<Vec<u8>> =
+                    book.payloads[..event_count].iter().map(|p| p.data.to_vec()).collect();
+                input.with_payloads(payloads)
+            } else {
+                input
+            }
+        };
         let driver =
             SealDriver::new(Arc::clone(&self.inner.sealed), self.inner.dir.join("sealed"));
         std::fs::create_dir_all(self.inner.dir.join("sealed"))

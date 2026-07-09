@@ -67,7 +67,7 @@ fn build_big(segment_id: u64) -> (Arc<ActiveIndex>, SealInput) {
         .filter(|&s| !seal_batches[s as usize].is_empty())
         .map(|s| SealStream { stream_id: s, batches: seal_batches[s as usize].clone() })
         .collect();
-    (Arc::new(active), SealInput { segment_id, base_pos: 0, streams })
+    (Arc::new(active), SealInput { segment_id, base_pos: 0, streams, payloads: None })
 }
 
 fn percentile(sorted: &[Duration], q: f64) -> Duration {

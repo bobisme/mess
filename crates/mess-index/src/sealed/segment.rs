@@ -85,6 +85,7 @@ use std::sync::Arc;
 
 use crate::active::{EventPtr, GlobalEntry, StreamEntry};
 use crate::sealed::filter::SegmentFilter;
+use crate::sealed::payload::{DictResolver, PayloadError, SealedPayloadIndex};
 use crate::sealed::ptr_block::{
     self, BatchPtr, DecodeError, SkipEntry, encode_ptr_block, encode_skips,
 };
@@ -153,6 +154,17 @@ pub struct SealInput {
     pub base_pos: u64,
     /// Per-stream batch lists, ascending by `stream_id`.
     pub streams: Vec<SealStream>,
+    /// The segment's event **payloads** in stored / global-position order:
+    /// index `i` is the payload of the event at global position
+    /// `base_pos + i`. When `Some`, [`crate::sealed::driver::SealDriver::seal`]
+    /// also emits the D6 payload-block sidecar (`.pcol`) — columnar by default,
+    /// row fallback where the codec cannot shred, verify-on-seal — and attaches
+    /// the resulting [`crate::sealed::payload::SealedPayloadIndex`] to the
+    /// installed segment so the sealed read path
+    /// ([`ReplaySet`](crate::sealed::replay::ReplaySet)) can reassemble payloads
+    /// without touching the raw log. `None` seals the pointer sidecar only (the
+    /// caller has no payload bytes in hand — e.g. a pointer-only rebuild).
+    pub payloads: Option<Vec<Vec<u8>>>,
 }
 
 impl SealInput {
@@ -163,6 +175,16 @@ impl SealInput {
             .flat_map(|s| s.batches.iter())
             .map(|b| u64::from(b.frame_count))
             .sum()
+    }
+
+    /// Attach the segment's payloads in stored / global-position order (builder
+    /// form), so [`crate::sealed::driver::SealDriver::seal`] emits the `.pcol`
+    /// payload sidecar alongside the pointer sidecar. See
+    /// [`SealInput::payloads`] for the ordering contract.
+    #[must_use]
+    pub fn with_payloads(mut self, payloads: Vec<Vec<u8>>) -> Self {
+        self.payloads = Some(payloads);
+        self
     }
 
     /// Build the seal input for `segment_id` from a committed
@@ -192,7 +214,7 @@ impl SealInput {
                 streams.push(SealStream { stream_id, batches });
             }
         }
-        SealInput { segment_id, base_pos, streams }
+        SealInput { segment_id, base_pos, streams, payloads: None }
     }
 }
 
@@ -221,6 +243,15 @@ pub enum SidecarError {
 /// [`SealedSegmentIndex::open`] (read) so the two files can never drift.
 pub fn filter_path_for(sidecar_path: &Path) -> std::path::PathBuf {
     sidecar_path.with_extension("filter")
+}
+
+/// The D6 payload-block sidecar (`.pcol`) path for a given pointer-sidecar path
+/// (bn-zge): same directory and stem, `.pcol` extension in place of `.pidx`.
+/// The single source of truth for the pairing, used by both
+/// [`crate::sealed::driver::SealDriver`] (write) and [`SealedSegmentIndex::open`]
+/// (re-attach) so the two files can never drift.
+pub fn payload_path_for(sidecar_path: &Path) -> std::path::PathBuf {
+    sidecar_path.with_extension("pcol")
 }
 
 fn put_u32(buf: &mut Vec<u8>, v: u32) {
@@ -365,6 +396,12 @@ pub struct SealedSegmentIndex {
     /// disk; callers must treat that exactly like a filter that always
     /// answers "maybe" (I5 — never a wrong answer, only lost skip-ahead).
     filter: Option<SegmentFilter>,
+    /// The D6 payload-block sidecar (`.pcol`) for this segment (bn-zge), if one
+    /// was emitted at seal and attached here (or re-attached by [`Self::open`]
+    /// from the sibling file). `None` for a pointer-only seal. When present, the
+    /// sealed read path reassembles payloads from it
+    /// ([`Self::reassemble_payload`]) instead of the raw log.
+    payload: Option<SealedPayloadIndex>,
 }
 
 impl SealedSegmentIndex {
@@ -456,6 +493,7 @@ impl SealedSegmentIndex {
             dir,
             stream_ids,
             filter: None,
+            payload: None,
         })
     }
 
@@ -473,6 +511,18 @@ impl SealedSegmentIndex {
         {
             index.filter = Some(filter);
         }
+        // bn-zge: opportunistically re-attach the sibling `.pcol` payload
+        // sidecar. Like the filter, this is best-effort at open — a missing,
+        // corrupt, or wrong-segment `.pcol` is silently dropped and the sealed
+        // read path simply reports no columnar payload for this segment (the
+        // raw log remains the payload authority, D1). The driver attaches the
+        // in-memory index directly at seal, so this path matters only for a
+        // fresh reopen from disk.
+        if let Ok(Ok(payload)) = SealedPayloadIndex::open(&payload_path_for(path))
+            && payload.segment_id() == index.segment_id
+        {
+            index.payload = Some(payload);
+        }
         Ok(index)
     }
 
@@ -482,6 +532,47 @@ impl SealedSegmentIndex {
     /// by [`Self::open`] when a valid sibling `.filter` file is found.
     pub fn attach_filter(&mut self, filter: SegmentFilter) {
         self.filter = Some(filter);
+    }
+
+    /// Attach the D6 payload-block sidecar for this segment (bn-zge). Called by
+    /// [`crate::sealed::driver::SealDriver::seal`] right after it durably writes
+    /// the `.pcol`, and by [`Self::open`] when a valid sibling `.pcol` is found.
+    /// The attached index is what the sealed read path reassembles payloads
+    /// from ([`Self::reassemble_payload`] /
+    /// [`ReplaySet`](crate::sealed::replay::ReplaySet)).
+    pub fn attach_payload(&mut self, payload: SealedPayloadIndex) {
+        self.payload = Some(payload);
+    }
+
+    /// Whether a D6 payload sidecar (`.pcol`) is attached to this segment — i.e.
+    /// the sealed read path can reassemble this segment's payloads columnar-side
+    /// rather than from the raw log.
+    #[inline]
+    pub fn has_payload(&self) -> bool {
+        self.payload.is_some()
+    }
+
+    /// The attached payload-block index, if any.
+    #[inline]
+    pub fn payload_index(&self) -> Option<&SealedPayloadIndex> {
+        self.payload.as_ref()
+    }
+
+    /// Reassemble the payload of the event at **segment-local** stored index
+    /// `local_idx` (global position `base_pos + local_idx`) from the attached
+    /// `.pcol`, byte-exact, dispatching through `resolver` for a row-fallback
+    /// dictionary block. `Ok(None)` when no payload sidecar is attached (the
+    /// caller falls back to the raw log); `Err` on an out-of-range index or a
+    /// block decode/dict failure.
+    pub fn reassemble_payload(
+        &self,
+        local_idx: u64,
+        resolver: &impl DictResolver,
+    ) -> Result<Option<Vec<u8>>, PayloadError> {
+        match &self.payload {
+            Some(p) => p.reassemble_event(local_idx, resolver).map(Some),
+            None => Ok(None),
+        }
     }
 
     /// Advisory pre-check consulting this segment's `BinaryFuse16` stream-id
@@ -609,6 +700,7 @@ mod tests {
                 seal_stream(20, &[(0, 1, 1005, 12288)]),
                 seal_stream(30, &[(0, 5, 1006, 16384), (5, 5, 1011, 20480)]),
             ],
+            payloads: None,
         }
     }
 
@@ -750,7 +842,7 @@ mod tests {
         let streams: Vec<SealStream> = (0..n_streams)
             .map(|i| seal_stream(i * 2, &[(0, 3, i, 4096 + i)])) // even ids only
             .collect();
-        let input = SealInput { segment_id: 1, base_pos: 0, streams };
+        let input = SealInput { segment_id: 1, base_pos: 0, streams, payloads: None };
         let stream_ids: Vec<u64> = input.streams.iter().map(|s| s.stream_id).collect();
         let filter = crate::sealed::filter::SegmentFilter::build(1, &stream_ids).unwrap();
 

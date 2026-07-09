@@ -49,6 +49,9 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::JoinHandle;
 
 use crate::sealed::filter::SegmentFilter;
+use crate::sealed::payload::{
+    self, PayloadError, PayloadSealOpts, SealedPayloadIndex,
+};
 use crate::sealed::segment::{
     SealInput, SealedSegmentIndex, SealedSegmentRef, SidecarError, encode_sidecar, filter_path_for,
 };
@@ -66,6 +69,11 @@ pub enum SealError {
     /// The caller's footer-finalize step (mess-log seal) failed.
     #[error("footer finalize: {0}")]
     Finalize(io::Error),
+    /// Encoding the payload sidecar failed — including a **verify-on-seal**
+    /// byte-exactness mismatch ([`PayloadError::VerifyMismatch`]), which aborts
+    /// the seal rather than write an unverifiable payload.
+    #[error("payload sidecar: {0}")]
+    Payload(#[from] PayloadError),
 }
 
 /// Seal orchestration for one store + sidecar directory. Cheap to clone
@@ -99,6 +107,52 @@ impl SealDriver {
         filter_path_for(&self.sidecar_path(segment_id))
     }
 
+    /// The payload-block sidecar path for `segment_id` (bn-zge / D6):
+    /// `<dir>/seg-<id>.pcol`, a sibling of [`Self::sidecar_path`].
+    pub fn payload_sidecar_path(&self, segment_id: u64) -> PathBuf {
+        self.sidecar_path(segment_id).with_extension("pcol")
+    }
+
+    /// Seal a segment's **payloads** into the D6 payload-block sidecar
+    /// (`.pcol`): columnar by default, row fallback where the codec cannot
+    /// shred, an optional row-fallback dictionary tier. `events` are the raw
+    /// payloads in stored (global-position) order.
+    ///
+    /// [`encode_payload_sidecar`](payload::encode_payload_sidecar) runs the
+    /// **permanent verify-on-seal**: every block is reassembled and byte-compared
+    /// against `events` before the bytes are written; a mismatch returns
+    /// [`SealError::Payload`] and writes nothing. On success the sidecar is
+    /// written crash-atomically and the parsed index returned.
+    ///
+    /// This is a separate artifact from the pointer sidecar
+    /// ([`Self::seal`]); a caller that has the payload bytes in hand seals both.
+    pub fn seal_payload(
+        &self,
+        segment_id: u64,
+        events: &[&[u8]],
+        opts: &PayloadSealOpts,
+    ) -> Result<SealedPayloadIndex, SealError> {
+        self.encode_and_write_payload(segment_id, events, opts)
+    }
+
+    /// Encode the D6 payload sidecar (running verify-on-seal), durably write it
+    /// to the segment's `.pcol` path, and return the parsed index. Shared by
+    /// [`Self::seal_payload`] and [`Self::seal`] (the run-loop path that emits
+    /// `.pcol` when [`SealInput::payloads`](crate::sealed::segment::SealInput::payloads)
+    /// is present). A verify-on-seal mismatch returns [`SealError::Payload`] and
+    /// writes nothing.
+    fn encode_and_write_payload(
+        &self,
+        segment_id: u64,
+        events: &[&[u8]],
+        opts: &PayloadSealOpts,
+    ) -> Result<SealedPayloadIndex, SealError> {
+        let bytes = payload::encode_payload_sidecar(segment_id, events, opts)?;
+        let path = self.payload_sidecar_path(segment_id);
+        write_durable(&path, &bytes).map_err(SealError::Write)?;
+        Ok(SealedPayloadIndex::from_bytes(bytes)?)
+    }
+
     /// Seal one segment synchronously (the four steps in the module docs,
     /// plus the bn-1i7 filter build folded into step 1–2). `finalize`
     /// finalizes the segment footer (mess-log's seal). On success the sealed
@@ -130,6 +184,26 @@ impl SealDriver {
             let _ = write_durable(&self.filter_path(segment_id), &f.to_bytes());
         }
 
+        // bn-zge / D6: if the caller handed us the segment's payloads, emit the
+        // columnar-by-default payload-block sidecar (`.pcol`) alongside the
+        // pointer sidecar and attach it to the installed index, so the sealed
+        // read path reassembles payloads from it. This runs the PERMANENT
+        // verify-on-seal inside `encode_payload_sidecar`: a byte-exactness
+        // mismatch returns `SealError::Payload` and aborts the whole seal
+        // (before finalize/install) rather than ship an unverifiable payload.
+        // `None` payloads seal the pointer sidecar only.
+        let payload_index = match &input.payloads {
+            Some(payloads) => {
+                let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
+                Some(self.encode_and_write_payload(
+                    segment_id,
+                    &refs,
+                    &PayloadSealOpts::default(),
+                )?)
+            }
+            None => None,
+        };
+
         // 3: finalize the footer (mess-log's single seal fsync).
         finalize().map_err(SealError::Finalize)?;
 
@@ -138,6 +212,9 @@ impl SealDriver {
         let mut index = SealedSegmentIndex::from_bytes(bytes)?;
         if let Some(f) = filter {
             index.attach_filter(f);
+        }
+        if let Some(p) = payload_index {
+            index.attach_payload(p);
         }
         let index: SealedSegmentRef = Arc::new(index);
 
@@ -153,7 +230,11 @@ impl SealDriver {
 /// complete new one, never a torn sidecar.
 fn write_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
-    let tmp = path.with_extension("pidx.tmp");
+    // Temp name derived from the real file name (not a fixed `.pidx.tmp`), so
+    // the pointer (`.pidx`) and payload (`.pcol`) sidecars never share a temp.
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
     {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(bytes)?;
@@ -273,6 +354,7 @@ mod tests {
                     offset: 4096,
                 }],
             }],
+            payloads: None,
         }
     }
 
@@ -364,6 +446,183 @@ mod tests {
         assert!(matches!(r, Err(SealError::Finalize(_))));
         assert!(store.get(7).is_none(), "not installed on finalize failure");
         assert!(!store.is_evicted(7));
+    }
+
+    /// bn-zge / D6: `seal_payload` writes a `.pcol` sidecar next to the `.pidx`,
+    /// runs verify-on-seal, and the reopened index reassembles byte-exact across
+    /// a mixed (columnar + row-fallback) segment.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn seal_payload_writes_verified_pcol_sidecar() {
+        use crate::columnar::{emit_int, emit_str};
+        use crate::sealed::payload::{BlockKind, NoDicts, SealedPayloadIndex};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SealedStore::new());
+        let driver = SealDriver::new(store.clone(), dir.path());
+
+        // Mixed corpus: shreddable msgpack maps interleaved with binary blobs.
+        let mut evs: Vec<Vec<u8>> = Vec::new();
+        for i in 0..64u64 {
+            let mut m = vec![0x82];
+            emit_str(&mut m, b"seq");
+            emit_int(&mut m, i as i64);
+            emit_str(&mut m, b"kind");
+            emit_str(&mut m, b"demo");
+            evs.push(m);
+        }
+        for i in 0..40u8 {
+            evs.push(vec![0xff, 0x00, i, 0xca, 0x99]); // unshreddable
+        }
+        let refs: Vec<&[u8]> = evs.iter().map(Vec::as_slice).collect();
+
+        let opts = PayloadSealOpts { block_events: 16, ..Default::default() };
+        let idx = driver.seal_payload(9, &refs, &opts).unwrap();
+        assert!(driver.payload_sidecar_path(9).exists(), "pcol written");
+        assert_eq!(idx.event_count() as usize, evs.len());
+        let kinds: Vec<BlockKind> = idx.blocks().iter().map(|b| b.kind).collect();
+        assert!(kinds.contains(&BlockKind::Columnar) && kinds.contains(&BlockKind::Row));
+
+        // Reopen from disk and reassemble byte-exact.
+        let reopened =
+            SealedPayloadIndex::open(&driver.payload_sidecar_path(9)).unwrap().unwrap();
+        for (i, ev) in evs.iter().enumerate() {
+            assert_eq!(&reopened.reassemble_event(i as u64, &NoDicts).unwrap(), ev);
+        }
+    }
+
+    /// bn-zge / D6 pipeline wiring: a **real** `driver.seal()` (the run-loop
+    /// path, not `seal_payload` directly) emits the `.pcol` sidecar when the
+    /// `SealInput` carries payloads, attaches the parsed payload index to the
+    /// installed segment, and the installed segment reassembles a mixed
+    /// (columnar + row-fallback) corpus byte-exact — proving the columnar
+    /// payload path is connected to the live seal, not just standalone.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn seal_emits_and_attaches_pcol_when_payloads_present() {
+        use crate::columnar::{emit_int, emit_str};
+        use crate::sealed::payload::{BlockKind, NoDicts};
+        use crate::sealed::segment::SealStream;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SealedStore::new());
+        let driver = SealDriver::new(store.clone(), dir.path());
+
+        // 260 events at global positions 0..260 in one stream: 130 shreddable
+        // msgpack maps then 130 unshreddable blobs. Since one unshreddable event
+        // routes a whole 128-event block to raw, this clustered layout yields a
+        // MIX under the default block size — the first block columnar, the later
+        // blocks row-fallback — exercising both reassembly paths through the
+        // installed segment.
+        let mut payloads: Vec<Vec<u8>> = Vec::new();
+        for i in 0..130u64 {
+            let mut m = vec![0x82];
+            emit_str(&mut m, b"seq");
+            emit_int(&mut m, i as i64);
+            emit_str(&mut m, b"kind");
+            emit_str(&mut m, b"demo");
+            payloads.push(m);
+        }
+        for i in 0..130u16 {
+            payloads.push(vec![0xff, 0x00, i as u8, (i >> 8) as u8, 0xca, 0x99]);
+        }
+        let input = SealInput {
+            segment_id: 5,
+            base_pos: 0,
+            streams: vec![SealStream {
+                stream_id: 1,
+                batches: vec![SealBatch {
+                    first_version: 0,
+                    frame_count: payloads.len() as u32,
+                    first_global_pos: 0,
+                    offset: 4096,
+                }],
+            }],
+            payloads: Some(payloads.clone()),
+        };
+
+        // Seal through the normal live path (`driver.seal`, the same call
+        // `BackgroundSealer::run` makes).
+        let idx = driver.seal(input, || Ok(())).unwrap();
+
+        // The `.pcol` sidecar was written next to the `.pidx`.
+        assert!(driver.payload_sidecar_path(5).exists(), ".pcol emitted by seal()");
+        // The installed segment carries the attached payload index.
+        assert!(idx.has_payload(), "seal attached the payload index");
+        let pidx = idx.payload_index().unwrap();
+        assert_eq!(pidx.event_count() as usize, payloads.len());
+        let kinds: Vec<BlockKind> = pidx.blocks().iter().map(|b| b.kind).collect();
+        assert!(kinds.contains(&BlockKind::Columnar), "expected a columnar block");
+        assert!(kinds.contains(&BlockKind::Row), "expected a row-fallback block");
+
+        // The installed segment reassembles every payload byte-exact.
+        for (i, ev) in payloads.iter().enumerate() {
+            assert_eq!(
+                idx.reassemble_payload(i as u64, &NoDicts).unwrap().as_deref(),
+                Some(ev.as_slice()),
+                "payload {i} mismatch through installed segment",
+            );
+        }
+
+        // A fresh reopen from disk re-attaches the sibling `.pcol`.
+        let reopened = SealedSegmentIndex::open(&driver.sidecar_path(5)).unwrap();
+        assert!(reopened.has_payload(), "open() re-attached the .pcol");
+        assert_eq!(
+            reopened.reassemble_payload(0, &NoDicts).unwrap().as_deref(),
+            Some(payloads[0].as_slice()),
+        );
+    }
+
+    /// A pointer-only seal (no payloads) emits no `.pcol` and attaches none —
+    /// the additive nature of the payload sidecar.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn seal_without_payloads_emits_no_pcol() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SealedStore::new());
+        let driver = SealDriver::new(store.clone(), dir.path());
+        let idx = driver.seal(input(7), || Ok(())).unwrap();
+        assert!(!driver.payload_sidecar_path(7).exists(), "no .pcol for pointer-only seal");
+        assert!(!idx.has_payload());
+    }
+
+    /// The background thread path (`BackgroundSealer::run` → `driver.seal`) also
+    /// emits and attaches the `.pcol` when payloads are present.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn background_sealer_emits_pcol() {
+        use crate::sealed::payload::NoDicts;
+        use crate::sealed::segment::SealStream;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SealedStore::new());
+        let driver = SealDriver::new(store.clone(), dir.path());
+        let sealer = BackgroundSealer::spawn(driver.clone());
+
+        let payloads: Vec<Vec<u8>> = (0..8u8).map(|i| vec![0xde, 0xad, i]).collect();
+        let input = SealInput {
+            segment_id: 4,
+            base_pos: 0,
+            streams: vec![SealStream {
+                stream_id: 1,
+                batches: vec![SealBatch {
+                    first_version: 0,
+                    frame_count: 8,
+                    first_global_pos: 0,
+                    offset: 4096,
+                }],
+            }],
+            payloads: Some(payloads.clone()),
+        };
+        let rx = sealer.submit(input, || Ok(()));
+        let idx = rx.recv().unwrap().unwrap();
+        assert!(driver.payload_sidecar_path(4).exists(), "bg seal emitted .pcol");
+        assert!(idx.has_payload());
+        assert_eq!(
+            idx.reassemble_payload(3, &NoDicts).unwrap().as_deref(),
+            Some(payloads[3].as_slice()),
+        );
+        sealer.shutdown();
     }
 
     #[test]
