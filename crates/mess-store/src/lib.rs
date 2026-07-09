@@ -35,6 +35,7 @@
 pub mod backend;
 pub mod cache;
 pub mod mock;
+pub mod registry;
 pub mod retry;
 pub mod snapshot;
 pub mod store;
