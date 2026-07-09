@@ -291,3 +291,6 @@
 1783581098710579	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAEx-gI		item.comment	bn-1hx	{"body":"Wave 12: opus — coalesced stream replay + parallel global scan + block LRU over sealed sidecars, benched, envelope rows."}	blake3:uDqPFNbXZJRhSH_a0lwzX3z3WkA3iE6ecr5B5FhHKJE
 1783581098739400	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAEx-wI		item.comment	bn-2en	{"body":"Wave 12: opus — whole-log recovery orchestrator (R1 parallel unsealed scan + R2 advisory manifest + §8.1 stitch + §8.4 equivalence)."}	blake3:K_HvhMwFzcb5w1iMoIe3XWpNzC5ySaFVKC1Qq0jslQw
 1783581098764478	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAEx_AI		item.comment	bn-1i7	{"body":"Wave 12: sonnet — BinaryFuse16 seal-time filters via xorf, no-false-negatives property, fallback on corrupt/missing."}	blake3:SnCJIEttXHL1JPjiSOQGvCTj6CPNz9nq7jsykJYt86g
+1783582785382264	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAEx_QI		item.move	bn-1hx	{"state":"done"}	blake3:bRpO_XGj_AXq09D4EyWnaKMT-_BeThMvGRbtE2MlSlc
+1783582785407388	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAEx_gI		item.move	bn-2en	{"state":"done"}	blake3:_Atf12k2vAVaolJEVk97JXYB4Qy5asNS-CMPdwZHla4
+1783582785423804	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAEx_wI		item.move	bn-1i7	{"state":"done"}	blake3:jD6Jp1RABWgR9tlWIxgwtOosSmAtwmXEkfdISDo3V90
