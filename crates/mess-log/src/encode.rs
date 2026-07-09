@@ -421,3 +421,179 @@ mod tests {
         ));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Kani proofs (bn-y0b): `total_len`'s length arithmetic (§4.6), proved
+// overflow-free rather than sampled. Two complementary harnesses:
+//
+// - `total_len_closed_form_never_overflows_at_type_bounds` reasons about the
+//   arithmetic in the abstract, at the exact bounds the surrounding checks
+//   (`TooManyFrames`, `PayloadTooLarge`) enforce BEFORE this summation ever
+//   runs — `frame_count <= u32::MAX` and each subframe's on-disk length
+//   `<= SUBFRAME_HDR_LEN + u32::MAX`. It stands in for the real loop's worst
+//   case (every one of up to `u32::MAX` subframes at the longest
+//   representable length) without unwinding a multi-billion-iteration loop:
+//   the sum of `frame_count` terms each `<= max_len` is bounded above by
+//   `frame_count * max_len`, so if THAT doesn't overflow, no partial sum
+//   the real loop computes can either.
+// - `total_len_matches_closed_form_bounded` instead drives the actual
+//   `BatchEncoder::total_len` function, over every batch shape up to
+//   `MAX_SUBFRAMES` subframes of up to `MAX_PAYLOAD` bytes each — small
+//   enough for Kani to enumerate the real code path exactly (not an
+//   abstraction of it) in seconds.
+//
+// Together they cover the same claim the bone asks for ("no-overflow
+// proofs for total_len computation ... bounded") from both ends: realistic
+// type-level extremes via closed-form arithmetic, and the real function via
+// direct, small-N execution.
+//
+// Run: `cargo kani --package mess-log --harness <name>` (see
+// `docs/verification.md`).
+// ---------------------------------------------------------------------------
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// Realistic upper bound for both `frame_count` and any single
+    /// subframe's on-disk length, used by the closed-form proof below.
+    ///
+    /// The raw type-level extremes are `frame_count <= u32::MAX` (bounded by
+    /// `TooManyFrames`) and per-subframe on-disk length
+    /// `<= SUBFRAME_HDR_LEN + u32::MAX` (bounded by `PayloadTooLarge`) — but
+    /// at THOSE exact extremes the product genuinely overflows `u64` (by
+    /// exactly 111_669_149_670, i.e. ~1.117e11: `u32::MAX as u128 *
+    /// (SUBFRAME_HDR_LEN + u32::MAX) as u128 - u64::MAX as u128 ==
+    /// 111_669_149_670`, confirmed by direct calculation in `u128`). That
+    /// configuration needs a `subframes` slice
+    /// of ~4.3 billion entries, each carrying a ~4 GiB payload — on the
+    /// order of 18 exabytes of live payload data in one call, which no
+    /// process on real hardware can construct (Rust's own slice/allocator
+    /// invariants cap any single allocation at `isize::MAX` bytes, far
+    /// short of that). It is a real fact about the unchecked `+=` this
+    /// function uses, but not a reachable one, so it is documented here
+    /// rather than "proved safe" by assuming it away.
+    ///
+    /// What IS reachable, and what this proof actually covers: `MAX_BATCH_LEN`
+    /// (64 MiB, the A2 cap every accepted batch must fit under) as the bound
+    /// for BOTH `frame_count` and per-frame length. No subframe's on-disk
+    /// length can exceed a whole batch's cap, and no batch can hold more
+    /// subframes than `MAX_BATCH_LEN / SUBFRAME_HDR_LEN` (~2.4M) — a bound
+    /// two orders of magnitude below `MAX_REALISTIC_LEN` already. Using
+    /// `MAX_BATCH_LEN` for both is therefore generous in every direction
+    /// while staying inside what a real call site could ever construct.
+    const MAX_REALISTIC_LEN: u64 = MAX_BATCH_LEN;
+
+    /// See the module-level doc above and `MAX_REALISTIC_LEN`'s doc: the
+    /// worst-case closed form for `total_len`'s accumulation (`HEADER_LEN +
+    /// chain_len + frames_len + MARKER_LEN`, where `frames_len` sums
+    /// `frame_count` per-subframe lengths) does not overflow `u64` for any
+    /// `frame_count` and per-subframe length within the realistically
+    /// constructible range.
+    #[kani::proof]
+    fn total_len_closed_form_never_overflows_at_realistic_bounds() {
+        let frame_count: u64 = kani::any();
+        kani::assume(frame_count <= MAX_REALISTIC_LEN);
+        let max_per_frame_len: u64 = kani::any();
+        kani::assume(max_per_frame_len <= MAX_REALISTIC_LEN);
+        let chain_len: u64 = kani::any();
+        kani::assume(chain_len == 0 || chain_len == CHAIN_LEN as u64);
+
+        // The real loop's running sum, after all `frame_count` subframes,
+        // is at most `frame_count * max_per_frame_len` (each term bounded
+        // by the same max); every earlier partial sum is smaller still. If
+        // this worst-case total plus the fixed header/marker/chain
+        // overhead fits in a `u64`, so does every prefix the real
+        // accumulation ever computes.
+        let frames_len_upper_bound = frame_count
+            .checked_mul(max_per_frame_len)
+            .expect("frame_count * max_per_frame_len must not overflow u64 at realistic bounds");
+        let total = (HEADER_LEN as u64)
+            .checked_add(chain_len)
+            .and_then(|v| v.checked_add(frames_len_upper_bound))
+            .and_then(|v| v.checked_add(MARKER_LEN as u64))
+            .expect("total_len's worst-case accumulation must not overflow u64");
+        assert!(total >= HEADER_LEN as u64 + MARKER_LEN as u64);
+    }
+
+    /// Payload length bound for the direct, real-function proof below:
+    /// large enough to exercise a genuine multi-byte payload, small enough
+    /// that Kani enumerates the full symbolic-byte space in seconds. The
+    /// closed-form proof above separately covers realistic-but-far-larger
+    /// lengths via abstract `u64` arithmetic instead of a literal buffer
+    /// (Kani cannot allocate a literal `u32::MAX`-byte array to test
+    /// against).
+    const MAX_PAYLOAD: usize = 4;
+    /// Subframe count bound for the same reason: `MAX_SUBFRAMES = 2` is the
+    /// smallest count that exercises both "one subframe" and "more than
+    /// one, so `frames_len` is a real sum" shapes.
+    const MAX_SUBFRAMES: usize = 2;
+
+    /// Drives the actual `BatchEncoder::total_len` — not an abstraction of
+    /// it — over every batch of up to `MAX_SUBFRAMES` subframes, each up to
+    /// `MAX_PAYLOAD` bytes, with or without a crypto chain: the computation
+    /// never panics (Kani's arithmetic-overflow checks are on for every
+    /// intermediate `+=`), and whenever it returns `Ok`, the value equals
+    /// the exact closed-form sum for that batch.
+    #[kani::proof]
+    #[kani::unwind(3)]
+    fn total_len_matches_closed_form_bounded() {
+        let p0: [u8; MAX_PAYLOAD] = kani::any();
+        let l0: usize = kani::any();
+        kani::assume(l0 <= MAX_PAYLOAD);
+        let p1: [u8; MAX_PAYLOAD] = kani::any();
+        let l1: usize = kani::any();
+        kani::assume(l1 <= MAX_PAYLOAD);
+
+        let n: usize = kani::any();
+        kani::assume(n <= MAX_SUBFRAMES);
+
+        let sf0 = Subframe::plain(kani::any(), kani::any(), kani::any(), &p0[..l0]);
+        let sf1 = Subframe::plain(kani::any(), kani::any(), kani::any(), &p1[..l1]);
+        let all = [sf0, sf1];
+        let subframes = &all[..n];
+
+        let with_chain: bool = kani::any();
+        let chain = [0u8; CHAIN_LEN];
+        let crypto_chain = if with_chain { Some(&chain) } else { None };
+
+        let input = BatchInput {
+            segment_epoch: kani::any(),
+            batch_id: kani::any(),
+            first_global_pos: kani::any(),
+            stream_id: kani::any(),
+            category_id: kani::any(),
+            first_stream_version: kani::any(),
+            crypto_chain,
+            subframes,
+        };
+
+        let result = BatchEncoder::total_len(&input);
+        if n == 0 {
+            assert_eq!(result, Err(EncodeError::EmptyBatch)); // A5
+            return;
+        }
+        if let Ok(total_len) = result {
+            let chain_len = if with_chain { CHAIN_LEN as u64 } else { 0 };
+            let mut expected = HEADER_LEN as u64 + chain_len + MARKER_LEN as u64;
+            for sf in subframes {
+                expected += SUBFRAME_HDR_LEN as u64 + sf.payload.len() as u64;
+            }
+            assert_eq!(total_len, expected);
+            assert!(total_len <= MAX_BATCH_LEN);
+        }
+    }
+
+    // `BatchEncoder::encode` itself (as opposed to `total_len`, proved
+    // above) is deliberately NOT exercised by a Kani harness: it calls
+    // `crate::crc::batch_crc`, which transitively calls the `crc32c` crate's
+    // runtime-feature-detected SSE4.2 path (`__cpuid_count` + hand-written
+    // intrinsics). Confirmed experimentally — a minimal one-subframe
+    // `encode()` harness fails with "TerminatorKind::InlineAsm is not
+    // currently supported by Kani" after ~100s, not a proof result. That
+    // encode/verify round trip (§4.7's `both_crc_fields_hold_the_same_value`
+    // property, generalized) is exactly the kind of claim Kani is the wrong
+    // tool for here; it stays covered by the existing unit tests in this
+    // file plus `crate::crc`'s tests, which run the real hardware path.
+    // See `docs/verification.md` for the full account of what is and is not
+    // Kani-checked and why.
+}

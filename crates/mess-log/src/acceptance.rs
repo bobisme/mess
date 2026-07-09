@@ -287,3 +287,196 @@ mod tests {
         assert_eq!(out.stop, StopReason::EndOfScan);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Kani proofs (bn-y0b): the acceptance predicate proved as an invariant over
+// the FULL input domain (up to the documented bounds), not sampled examples.
+// `cargo test -p mess-log` above already covers the example shapes pulled
+// from `spikes/torn_write`; these harnesses instead ask "does any input
+// exist that both passes `AcceptState::step` and violates A1/A5/A9/A10?"
+// and let Kani's model checker search the whole space for a counterexample.
+//
+// Run: `cargo kani --package mess-log --harness <name>` (see
+// `docs/verification.md` for the full list and expected run times).
+// ---------------------------------------------------------------------------
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    fn any_candidate() -> Candidate {
+        Candidate {
+            epoch: kani::any(),
+            batch_id: kani::any(),
+            first_global_pos: kani::any(),
+            frame_count: kani::any(),
+        }
+    }
+
+    fn any_status() -> CandidateStatus {
+        if kani::any() {
+            CandidateStatus::ByteValid(any_candidate())
+        } else {
+            CandidateStatus::ByteInvalid
+        }
+    }
+
+    fn any_stop_reason() -> StopReason {
+        match kani::any::<u8>() % 5 {
+            0 => StopReason::EndOfScan,
+            1 => StopReason::ByteFault,
+            2 => StopReason::EmptyBatch,
+            3 => StopReason::EpochMismatch,
+            _ => StopReason::PositionDiscontinuity,
+        }
+    }
+
+    /// A1/A5/A9, as ONE invariant over a single [`AcceptState::step`]: for
+    /// every pre-step state and every candidate, IF the step accepts, THEN
+    /// the accepted candidate has nonzero `frame_count` (A5), an `epoch`
+    /// equal to the state's `expected_epoch` (A9), and a `first_global_pos`
+    /// equal to the state's `expected_pos` (A1). Equivalently: no input can
+    /// both pass acceptance and violate contiguity or the empty-batch rule.
+    /// `expected_epoch`/every `Candidate` field ranges over its full
+    /// `u64`/`u32` domain; `expected_pos` is bounded to `POSITION_BOUND`
+    /// (defined below, alongside the dedicated no-overflow proof) so that
+    /// this contiguity property — which has nothing to do with overflow —
+    /// isn't entangled with the separate, deliberately-bounded overflow
+    /// claim `step_position_advance_no_overflow_bounded` makes.
+    #[kani::proof]
+    fn step_accept_implies_contiguous_and_nonempty() {
+        let expected_pos: u64 = kani::any();
+        kani::assume(expected_pos <= POSITION_BOUND);
+        let mut state =
+            AcceptState { expected_epoch: kani::any(), expected_pos, stopped: None };
+        let pre_epoch = state.expected_epoch;
+        let pre_pos = state.expected_pos;
+
+        let result = state.step(any_status());
+
+        if let Step::Accept(c) = result {
+            assert_ne!(c.frame_count, 0, "A5: accepted an empty batch");
+            assert_eq!(c.epoch, pre_epoch, "A9: accepted a mismatched-epoch batch");
+            assert_eq!(c.first_global_pos, pre_pos, "A1: accepted a discontinuous batch");
+        }
+    }
+
+    /// The converse direction of the same invariant: a byte-valid candidate
+    /// that violates A1, A5, or A9 is NEVER accepted (`step` stops instead).
+    /// Together with `step_accept_implies_contiguous_and_nonempty`, this
+    /// pins `step` as implementing exactly the A1/A5/A9 predicate rather
+    /// than something merely consistent with it on one side.
+    #[kani::proof]
+    fn step_rejects_every_a1_a5_a9_violation() {
+        let expected_epoch: u64 = kani::any();
+        let expected_pos: u64 = kani::any();
+        // Bounded per the module doc on `POSITION_BOUND`: a non-violating
+        // candidate takes the accept path, which advances `expected_pos`;
+        // that arithmetic's overflow-freedom is `POSITION_BOUND`'s job, not
+        // this rejection-focused proof's.
+        kani::assume(expected_pos <= POSITION_BOUND);
+        let mut state = AcceptState { expected_epoch, expected_pos, stopped: None };
+
+        let cand = any_candidate();
+        let violates = cand.frame_count == 0
+            || cand.epoch != expected_epoch
+            || cand.first_global_pos != expected_pos;
+
+        let result = state.step(CandidateStatus::ByteValid(cand));
+        if violates {
+            assert!(matches!(result, Step::Stopped(_)));
+        }
+    }
+
+    /// A10: a latched stop is TERMINAL. Once `stopped` is `Some(reason)`,
+    /// every subsequent `step` — for ANY candidate, including a byte-valid,
+    /// position-and-epoch-contiguous "bait" batch (the `spikes/torn_write`
+    /// resync-bait shape, generalized here to every possible bait rather
+    /// than the one example `cargo test` pins) — returns the SAME stop and
+    /// never advances `expected_pos`. Resynchronization is impossible by
+    /// construction, proved rather than spot-checked.
+    #[kani::proof]
+    fn a10_stop_is_terminal_for_any_bait() {
+        let reason = any_stop_reason();
+        let expected_epoch: u64 = kani::any();
+        let expected_pos: u64 = kani::any();
+        let mut state = AcceptState { expected_epoch, expected_pos, stopped: Some(reason) };
+
+        let bait = any_status();
+        let result = state.step(bait);
+
+        assert_eq!(result, Step::Stopped(reason));
+        assert_eq!(state.expected_pos, expected_pos, "a latched stop must never advance position");
+        assert_eq!(state.stopped, Some(reason));
+    }
+
+    /// Position-advance no-overflow (A1's arithmetic): `expected_pos +=
+    /// frame_count` on an accepted step never overflows `u64`. Bound:
+    /// `expected_pos <= POSITION_BOUND` (2^40 ~= 1.1e12 events — at a
+    /// sustained 1M events/sec that is ~35 years of continuous writes, far
+    /// past any real deployment's lifetime); `frame_count` ranges over its
+    /// full type maximum (`u32::MAX`), the largest a single batch header can
+    /// declare. Documented bound, not the full `u64` range, so the proof
+    /// finishes in seconds rather than needing an inductive argument for
+    /// positions no real log will ever reach.
+    const POSITION_BOUND: u64 = 1 << 40;
+
+    #[kani::proof]
+    fn step_position_advance_no_overflow_bounded() {
+        let expected_epoch: u64 = kani::any();
+        let expected_pos: u64 = kani::any();
+        kani::assume(expected_pos <= POSITION_BOUND);
+        let mut state = AcceptState { expected_epoch, expected_pos, stopped: None };
+
+        let frame_count: u32 = kani::any();
+        let cand = Candidate {
+            epoch: expected_epoch,
+            batch_id: kani::any(),
+            first_global_pos: expected_pos,
+            frame_count,
+        };
+
+        let result = state.step(CandidateStatus::ByteValid(cand));
+        if let Step::Accept(_) = result {
+            // No panic above (Kani's overflow checks are on) is itself part
+            // of the proof; this pins the resulting value too.
+            assert_eq!(state.expected_pos, expected_pos + u64::from(frame_count));
+        }
+    }
+
+    /// The whole-scan shape of the invariant, folded by hand over three
+    /// candidates (the loop-free equivalent of [`accepted_prefix`], which
+    /// allocates a `Vec` — avoided here so the harness stays allocation-free
+    /// and fast). For every three-candidate sequence: every accepted
+    /// candidate has nonzero `frame_count` (A5); the first accepted's
+    /// `epoch`/`first_global_pos` match the segment's; every later
+    /// accepted's `first_global_pos` continues exactly where the previous
+    /// one left off (A1); and nothing is ever accepted after a stop (A10).
+    /// Three steps is the smallest bound that exercises "accept, stop,
+    /// bait" in one run; going further multiplies run time without adding
+    /// a new shape the single-step proofs above don't already cover.
+    #[kani::proof]
+    fn three_step_fold_is_contiguous_and_terminal() {
+        let segment_epoch: u64 = kani::any();
+        let segment_base_pos: u64 = kani::any();
+        kani::assume(segment_base_pos <= POSITION_BOUND);
+
+        let mut state = AcceptState::new(segment_epoch, segment_base_pos);
+        let mut expected_next = segment_base_pos;
+        let mut seen_stop = false;
+
+        for _ in 0..3 {
+            match state.step(any_status()) {
+                Step::Accept(c) => {
+                    assert!(!seen_stop, "A10: accepted after a stop");
+                    assert_ne!(c.frame_count, 0, "A5");
+                    assert_eq!(c.epoch, segment_epoch, "A9");
+                    assert_eq!(c.first_global_pos, expected_next, "A1");
+                    expected_next += u64::from(c.frame_count);
+                }
+                Step::Stopped(_) => {
+                    seen_stop = true;
+                }
+            }
+        }
+    }
+}

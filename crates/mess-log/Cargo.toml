@@ -10,3 +10,11 @@ crc32c = "0.6"
 
 [dev-dependencies]
 stateright = "0.31"
+
+# `#[cfg(kani)]` proof modules (bn-y0b) are compiled only by the `cargo-kani`
+# driver, which sets this cfg itself; it is never a real Cargo feature.
+# Registering it here keeps `--all-targets -D warnings` clean under normal
+# rustc/clippy, which otherwise flag it as an unexpected cfg (Rust 1.80+
+# `unexpected_cfgs` lint).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
