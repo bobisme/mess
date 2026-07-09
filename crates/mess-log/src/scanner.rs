@@ -210,7 +210,14 @@ fn read_segment_through_fs<F: Fs>(fs: &F, path: &Path) -> io::Result<Vec<u8>> {
 /// The pure scan over an in-memory segment image. Separated so it is trivially
 /// deterministic and idempotent (property 4): a pure function of the durable
 /// bytes. All callers reach it only after reading those bytes through the Fs.
-fn scan_image(img: &[u8], anchor: Option<EpochAnchor>) -> Recovery {
+///
+/// `pub` (bn-gux, widened from private): this is the cleanest byte-slice scan
+/// entry point for `fuzz/fuzz_targets/fuzz_scanner.rs` — arbitrary bytes in,
+/// typed `Recovery`/`ScanStop` out, no `Fs`/sim-disk plumbing needed to
+/// exercise the byte layer (§2.1 steps 1–6) plus the acceptance kernel. No
+/// behavior changed; every existing caller already went through this
+/// function via [`recover_segment_anchored`].
+pub fn scan_image(img: &[u8], anchor: Option<EpochAnchor>) -> Recovery {
     let Some(header) = decode_segment_header(img) else {
         return Recovery {
             header: None,
@@ -330,7 +337,13 @@ fn map_stop(kernel: KernelStop, byte_reason: Option<ScanStop>) -> ScanStop {
 }
 
 /// The protocol-relevant fields decoded from a byte-valid batch.
-struct Decoded {
+///
+/// `pub` (bn-gux, widened from private): only so [`decode_batch`]'s `Result`
+/// can name it across the crate boundary from `fuzz/fuzz_targets/
+/// fuzz_batch_decode.rs` (Rust forbids a public fn returning a private type,
+/// E0446). Fields stay private/unnamed — the fuzz target never inspects them,
+/// only checks `decode_batch` never panics.
+pub struct Decoded {
     total_len: u64,
     frame_count: u32,
     batch_id: u64,
@@ -346,7 +359,15 @@ struct Decoded {
 /// decoded protocol fields on success, or the specific byte fault. The A4 CRC
 /// (step 5) is **always** computed — there is no path through this function
 /// that skips it (A12).
-fn decode_batch(img: &[u8], off: usize) -> Result<Decoded, ScanStop> {
+///
+/// `pub` (bn-gux, widened from private): the batch-header/subframe decode
+/// entry point for `fuzz/fuzz_targets/fuzz_batch_decode.rs`. Precondition
+/// carried over from the sole production call site ([`scan_batches`]): `off <
+/// img.len()` (the scan loop never calls this once `off >= img.len()`). The
+/// fuzz harness respects that precondition (it always fuzzes `off == 0`)
+/// rather than this function gaining a new, never-exercised-in-production
+/// bounds check purely to humor an out-of-contract fuzz input.
+pub fn decode_batch(img: &[u8], off: usize) -> Result<Decoded, ScanStop> {
     let rem = img.len() - off;
     if rem < HEADER_LEN {
         return Err(ScanStop::TornHeader); // A11

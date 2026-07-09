@@ -1,0 +1,71 @@
+name: fuzz
+
+# bn-gux: coverage-guided (libFuzzer via cargo-fuzz) fuzzing of the two
+# untrusted-bytes decode surfaces that exist so far in mess-log —
+# `scanner::scan_image` (whole-segment recovery scan) and
+# `scanner::decode_batch` (single-batch header + subframe decode). Both are
+# pure functions of `&[u8]`, so this needs no real fs/threads and no `-Z
+# build-std`, but cargo-fuzz's ASan instrumentation does need the nightly
+# toolchain (same split rationale as miri.yml/sanitizers.yml).
+#
+# This lane runs BRIEFLY (~2 min per target) on a nightly schedule — long
+# enough to catch a regression against the committed seed corpus plus a
+# little fresh mutation, not a substitute for a real multi-hour local fuzz
+# campaign (see `crates/mess-log/fuzz/README.md` for how to run one). The
+# corpus this job discovers is cached and fed back in as next run's seeds,
+# so coverage accumulates across nightly runs instead of restarting from the
+# committed corpus every time.
+#
+# Two more targets are planned once their decode entry points exist
+# (`decode_cursor`, `decode_ptr_block` — blocked on bn-25d); see the fuzz
+# crate's README.
+
+on:
+  schedule:
+    # 03:41 UTC daily — off-peak, staggered off the sanitizer (03:17) and
+    # crash-harness (04:23) nightly lanes.
+    - cron: "41 3 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: fuzz-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [fuzz_scanner, fuzz_batch_decode]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fuzz-${{ matrix.target }}
+          workspaces: crates/mess-log/fuzz -> target
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version ^0.13
+
+      # Discovered inputs accumulate here across nightly runs, on top of the
+      # small corpus committed to the repo (`crates/mess-log/fuzz/corpus/`).
+      # Cache miss just means "start from the committed seeds only" — never
+      # a failure.
+      - name: Restore discovered corpus
+        uses: actions/cache@v4
+        with:
+          path: crates/mess-log/fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
+      - name: cargo fuzz run ${{ matrix.target }} (~2 min)
+        working-directory: crates/mess-log/fuzz
+        run: |
+          cargo fuzz run ${{ matrix.target }} -- \
+            -max_total_time=120 -timeout=10 -rss_limit_mb=4096
