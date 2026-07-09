@@ -13,6 +13,12 @@
 [tools]
 java = "temurin-17"
 
+[env]
+# Force bindgen (zstd-sys et al.) to the system clang: a globally-pinned Lean 4
+# puts its header-less bundled clang on PATH, which breaks bindgen with
+# "stddef.h not found". See the Lean note above.
+CLANG_PATH = "/usr/bin/clang"
+
 [vars]
 tla_tools_version = "1.8.0"
 apalache_version = "0.58.2"
