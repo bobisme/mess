@@ -35,6 +35,7 @@ pub mod reader;
 pub mod runtime;
 pub mod scanner;
 pub mod sealer;
+pub mod subscription;
 pub mod watermark;
 pub mod writer;
 
