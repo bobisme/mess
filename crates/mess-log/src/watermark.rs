@@ -269,3 +269,130 @@ mod tests {
         assert_eq!(Box::pin(wm.await_past(u64::MAX)).as_mut().poll(&mut cx), Poll::Ready(()));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Kani proofs (bn-y0b follow-up): `Watermark::advance` proved as an
+// invariant over the full `u64` domain of `(initial, to)`, not the two
+// example transitions `cargo test` above exercises. These exercise the REAL
+// `Watermark::new` / `advance` / `get` (not a reimplementation of the
+// comparison in `advance`'s body), the same convention `acceptance.rs`'s
+// harnesses use. `WaitFor::poll` itself is NOT harnessed here: it drives a
+// `Waker`, and Kani's `kani::any::<Waker>()` has no meaningful arbitrary
+// instantiation (a `Waker` wraps an unsafe hand-rolled vtable) — the same
+// "wrong tool" call `docs/verification.md` already makes for
+// `crc32c`'s inline-asm path. Instead, the "await-past" predicate `poll`
+// implements (`st.value >= self.threshold`, watermark.rs:107) is proved
+// directly against `advance`'s postcondition below, using the identical
+// `>=` comparison so the two are provably the same predicate, not merely
+// visually similar.
+//
+// Run: `cargo kani --package mess-log --harness <name>` (see
+// `docs/verification.md`).
+// ---------------------------------------------------------------------------
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// Monotonicity (module doc: "advance is monotone... a reader that has
+    /// observed `value >= p` never later observes it regress"): for ANY
+    /// starting value and ANY target, the value after one `advance` call is
+    /// never less than the value before it. Full `u64` domain on both
+    /// `initial` and `to` — no bound needed, `advance` is O(1) comparison
+    /// work per call so the proof is cheap without narrowing the input
+    /// space.
+    #[kani::proof]
+    fn advance_never_decreases_value() {
+        let initial: u64 = kani::any();
+        let to: u64 = kani::any();
+
+        let wm = Watermark::new(initial);
+        wm.advance(to);
+
+        assert!(wm.get() >= initial, "advance must never regress the watermark");
+    }
+
+    /// Exact semantics, not just the inequality above: `advance(to)` sets
+    /// the value to `max(initial, to)` — the "no-op if not greater" rule
+    /// (watermark.rs:77 `if to <= st.value { return }`) composed with the
+    /// "else assign" rule (watermark.rs:80 `st.value = to`). This is also
+    /// where a "no-overflow" claim would live if `advance` did arithmetic
+    /// — it doesn't: unlike `AcceptState::step`'s `expected_pos +=
+    /// frame_count` (acceptance.rs), `advance` never adds to the current
+    /// value, it only compares and (conditionally) assigns the caller's
+    /// already-computed `to`. Assignment of a `u64` cannot overflow, so
+    /// there is no `checked_add`/bound to prove here; this harness instead
+    /// pins that fact against the real code (over the full `u64` domain of
+    /// both operands, no narrowing) so a future refactor that turns
+    /// `advance` into an accumulating delta (which WOULD need an overflow
+    /// proof) trips this proof first.
+    #[kani::proof]
+    fn advance_sets_value_to_max_no_overflow() {
+        let initial: u64 = kani::any();
+        let to: u64 = kani::any();
+
+        let wm = Watermark::new(initial);
+        wm.advance(to);
+
+        let expected = if to > initial { to } else { initial };
+        assert_eq!(wm.get(), expected, "advance must set value to max(initial, to)");
+    }
+
+    /// Await-past semantics predicate: `WaitFor::poll` resolves a waiter
+    /// with `threshold` the instant `st.value >= threshold` (watermark.rs
+    /// line 107). This proves the postcondition `advance` establishes for
+    /// that exact predicate applied to its own argument: after
+    /// `advance(to)` returns, `get() >= to` always holds — i.e. a
+    /// `wait_for(to)` polled immediately after `advance(to)` returns is
+    /// guaranteed `Ready`, whether this call was the one that moved the
+    /// value (to > initial) or a no-op because some earlier call already
+    /// covered `to` (to <= initial). Same `>=` operator as `poll`'s
+    /// `st.value >= self.threshold`, not a restated inequality, so this is
+    /// literally the predicate `poll` evaluates, not an analog of it.
+    #[kani::proof]
+    fn advance_establishes_await_past_threshold() {
+        let initial: u64 = kani::any();
+        let to: u64 = kani::any();
+
+        let wm = Watermark::new(initial);
+        wm.advance(to);
+
+        assert!(wm.get() >= to, "advance(to) must leave a waiter on `to` immediately satisfiable");
+    }
+
+    /// Monotonicity across a SEQUENCE of advances, not just one call: the
+    /// whole-scan-shaped counterpart to the single-step proof above
+    /// (mirrors `acceptance.rs`'s `three_step_fold_is_contiguous_and_terminal`
+    /// convention of folding a few steps by hand rather than looping over
+    /// a `Vec` Kani doesn't need to reason about). Three arbitrary targets,
+    /// applied in order, including targets that are smaller than — or equal
+    /// to — the running value (exercising the no-op path repeatedly): the
+    /// value never decreases at any of the three observation points, and
+    /// the final value is always `>=` every target offered, including ones
+    /// that arrived out of order.
+    #[kani::proof]
+    fn advance_three_step_fold_is_monotone() {
+        let initial: u64 = kani::any();
+        let t1: u64 = kani::any();
+        let t2: u64 = kani::any();
+        let t3: u64 = kani::any();
+
+        let wm = Watermark::new(initial);
+        let v0 = wm.get();
+        assert_eq!(v0, initial);
+
+        wm.advance(t1);
+        let v1 = wm.get();
+        assert!(v1 >= v0, "step 1 must not regress");
+        assert!(v1 >= t1, "step 1 must clear its own target (await-past)");
+
+        wm.advance(t2);
+        let v2 = wm.get();
+        assert!(v2 >= v1, "step 2 must not regress");
+        assert!(v2 >= t1 && v2 >= t2, "step 2 must still clear every target offered so far");
+
+        wm.advance(t3);
+        let v3 = wm.get();
+        assert!(v3 >= v2, "step 3 must not regress");
+        assert!(v3 >= t1 && v3 >= t2 && v3 >= t3, "final value must clear every target offered");
+    }
+}

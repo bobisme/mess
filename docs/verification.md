@@ -23,40 +23,42 @@ bn-y0b's acceptance criteria list three checkboxes. As of this commit:
   `step_accept_implies_contiguous_and_nonempty` /
   `step_rejects_every_a1_a5_a9_violation` below.
 - **No-overflow proofs: position arithmetic, watermark advance** —
-  **partially met**. Position arithmetic is proved
-  (`step_position_advance_no_overflow_bounded`). Watermark-advance
-  arithmetic is **not proved here**: the committer/watermark code this
-  would verify is concurrent work in bn-11m's separate workspace and does
-  not exist in this workspace yet.
+  **met**. Position arithmetic is proved
+  (`step_position_advance_no_overflow_bounded`). Watermark-advance is now
+  proved too (`watermark::kani_proofs`, below): monotonicity
+  (`advance_never_decreases_value`, folded across a sequence in
+  `advance_three_step_fold_is_monotone`), the exact `max(initial, to)`
+  semantics that stands in for a no-overflow claim
+  (`advance_sets_value_to_max_no_overflow` — `advance` does no arithmetic,
+  see that harness's doc comment for why), and the await-past predicate
+  `WaitFor::poll` evaluates (`advance_establishes_await_past_threshold`).
+  bn-11m landed the watermark module on trunk since this bone's first
+  commit, unblocking this half of the criterion.
 - **Round-trip proofs: ptr delta encode/decode, cursor encode/decode** —
-  **not met (0%)**. The `mess-index` kernels these would verify don't
-  exist yet; that crate is Phase 4 work tracked as bn-25d, which is still
-  open. Writing speculative kernels here to have something to prove
-  against was judged out of scope for this bone.
+  **not met (0%), explicitly out of scope for this follow-up**. The
+  `mess-index` kernels these would verify don't exist yet; that crate is
+  Phase 4 work tracked as bn-25d, which is still open. Writing speculative
+  kernels here to have something to prove against remains out of scope.
 
 This is a bone-sequencing gap (bn-y0b was scoped/dispatched before its two
 prerequisite kernels — bn-25d's mess-index encoders, bn-11m's
-committer/watermark code — existed), not an omission in this commit. Per
-the acceptance criteria as literally written, **this bone cannot be marked
-fully done from this commit alone.** Before closing bn-y0b, the lead
-should either:
-
-1. Split the bone: land the acceptance-predicate + position no-overflow
-   work now (this commit), and re-file the ptr/cursor and watermark
-   proofs as follow-on bones gated on bn-25d and bn-11m landing; or
-2. Explicitly amend bn-y0b's acceptance criteria to match what's
-   achievable today.
+committer/watermark code — existed), not an omission in this commit. Two
+of the three criteria are now met; the ptr/cursor round-trip proofs stay
+split to a bone gated on bn-25d landing (per the prior commit's option 1)
+— **this bone still cannot be marked fully done until bn-25d lands and
+that follow-on bone completes.**
 
 ## Running the proofs
 
 ```sh
-# Everything in mess-log (~10s wall clock with a warm target/kani build
-# cache; a cold-cache run — e.g. first CI invocation, before CBMC/goto
-# compilation artifacts exist — is noticeably slower):
+# Everything in mess-log — 11 harnesses (~2-10s wall clock with a warm
+# target/kani build cache; a cold-cache run — e.g. first CI invocation,
+# before CBMC/goto compilation artifacts exist — is noticeably slower):
 cargo kani --package mess-log
 
 # One harness at a time (useful while iterating — each is independently fast):
 cargo kani --package mess-log --harness step_accept_implies_contiguous_and_nonempty
+cargo kani --package mess-log --harness advance_never_decreases_value
 ```
 
 `cargo kani` requires `cargo-kani` on `PATH` (installed via `cargo install
@@ -124,6 +126,51 @@ Two harnesses in `encode::kani_proofs`:
   exact closed-form sum. Small bound chosen so Kani enumerates the real
   code path exactly rather than approximating it.
 
+### `watermark.rs` — the position-ordered durable watermark (D7)
+
+Four harnesses in `watermark::kani_proofs`, all sub-second, all driving the
+real `Watermark::new` / `advance` / `get` (not a reimplementation of the
+comparison inside `advance`'s body) over the full `u64` domain of both the
+starting value and the target — no bound needed, since each call is O(1)
+comparison-and-assign work:
+
+- `advance_never_decreases_value` — for any `initial` and any `to`, the
+  value after one `advance(to)` call is never less than `initial`. Proves
+  the monotonicity the module doc claims ("a reader that has observed
+  `value >= p` never later observes it regress while the store is live").
+- `advance_sets_value_to_max_no_overflow` — the exact semantics, not just
+  the inequality above: `advance(to)` sets the value to
+  `max(initial, to)`. This stands in for a no-overflow proof:
+  `advance` does no arithmetic at all (unlike `AcceptState::step`'s
+  `expected_pos += frame_count`, it never adds to the current value — it
+  only compares, then conditionally assigns the caller's already-computed
+  `to`), so there is no `checked_add`/bound to prove; this harness pins
+  that fact against the real code so a future refactor that turns
+  `advance` into an accumulating delta (which *would* need an overflow
+  proof) trips this proof first.
+- `advance_establishes_await_past_threshold` — the await-past semantics
+  predicate: `WaitFor::poll` resolves a waiter with `threshold` the
+  instant `st.value >= threshold` (watermark.rs, `poll`'s body). This
+  proves `advance`'s postcondition against that *exact* `>=` predicate
+  (not a restated inequality): after `advance(to)` returns, `get() >= to`
+  always holds, so a `wait_for(to)` polled immediately afterward is
+  guaranteed `Ready` — whether this call moved the value or was a no-op
+  because an earlier call already covered `to`.
+- `advance_three_step_fold_is_monotone` — the whole-scan-shaped
+  counterpart (mirrors `acceptance.rs`'s `three_step_fold_...` convention
+  of folding a few steps by hand rather than looping over a `Vec` Kani
+  doesn't need to reason about): three arbitrary targets applied in
+  sequence, including targets smaller than the running value (exercising
+  the no-op path repeatedly) — the value never decreases at any
+  observation point, and after each step the value has cleared every
+  target offered so far, not just the most recent one.
+
+`WaitFor::poll` itself is not harnessed directly: it drives a `Waker`, and
+`kani::any::<Waker>()` has no meaningful arbitrary instantiation (a
+`Waker` wraps an unsafe hand-rolled vtable) — the same "wrong tool" call
+made below for `crc32c`'s inline-asm path. The predicate `poll` evaluates
+is proved instead, against `advance`'s postcondition, as described above.
+
 ## A real edge case Kani found (and why it's not fixed)
 
 The first version of the closed-form `total_len` proof used the raw
@@ -175,14 +222,10 @@ narrowed bound can be revisited.
   by a parallel worker on the same crate).
 - **ptr-delta / cursor / skip-table round-trips** — named in the parent bone
   as a proof target, but the kernels they'd verify (`mess-index`'s encoding)
-  do not exist yet; that crate is Phase 4 (bn-25d). Recorded here as
-  planned, blocked on bn-25d landing the kernel — writing speculative
-  kernels to have something to prove against is out of scope for this bone.
-- **Watermark advance arithmetic** — also named in the parent bone; being
-  built concurrently by a parallel worker (bn-11m) in this same crate.
-  Recorded here as planned rather than raced: proving it now would mean
-  proving code that doesn't exist yet in this workspace, or duplicating
-  work bn-11m is already doing.
+  do not exist yet; that crate is Phase 4 (bn-25d), still open. Recorded
+  here as planned, blocked on bn-25d landing the kernel — writing
+  speculative kernels to have something to prove against is out of scope
+  for this bone and its follow-up.
 - **A full segment-header encode/decode round trip**
   (`writer::encode_segment_header` / `writer::read_segment_header_epoch`) —
   a genuine pure round-trip pair exists today, but it lives in `writer.rs`,
