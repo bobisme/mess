@@ -111,6 +111,12 @@ impl SealedStore {
     /// installed segments (O(installed); production cross-segment routing is
     /// mess-store's job). Returns the first match's [`EventPtr`]. A corrupt
     /// sidecar (a decode error) is skipped, not fatal — the log stays truth.
+    ///
+    /// bn-1i7: each segment's `BinaryFuse16` stream-id filter is consulted
+    /// **before** its directory (`stream_head`) — a segment the filter says
+    /// definitely lacks `stream` is skipped without touching the directory
+    /// at all. A missing/corrupt filter (`might_contain_stream` always
+    /// `true`) falls back to exactly today's behavior for that segment.
     pub fn resolve_sealed(&self, stream: u64, version: u64) -> Option<EventPtr> {
         let inner = self.inner.read();
         Self::resolve_sealed_locked(&inner, stream, version)
@@ -118,6 +124,11 @@ impl SealedStore {
 
     fn resolve_sealed_locked(inner: &Inner, stream: u64, version: u64) -> Option<EventPtr> {
         for index in inner.segments.values() {
+            // bn-1i7: filter says "no" -> definitely absent, skip the
+            // directory/pointer-block lookup for this segment entirely.
+            if !index.might_contain_stream(stream) {
+                continue;
+            }
             // Cheap reject on the stream's version range, then point-read.
             if let Some(head) = index.stream_head(stream)
                 && version <= head
@@ -127,6 +138,22 @@ impl SealedStore {
             }
         }
         None
+    }
+
+    /// The installed sealed segments that (per directory, not just the
+    /// filter) actually contain `stream` — the stream-replay-planning
+    /// building block a caller (mess-store) walks further (bn-1i7). Segments
+    /// whose filter definitely excludes `stream` are skipped without a
+    /// directory lookup; a missing/corrupt filter costs only the skip, never
+    /// a wrong answer — the directory check after it remains authoritative.
+    pub fn segments_for_stream(&self, stream: u64) -> Vec<SealedSegmentRef> {
+        let inner = self.inner.read();
+        inner
+            .segments
+            .values()
+            .filter(|index| index.might_contain_stream(stream) && index.stream_head(stream).is_some())
+            .cloned()
+            .collect()
     }
 
     /// The **combined resolver** under a single consistent store snapshot —
@@ -220,6 +247,64 @@ mod tests {
         assert_eq!(resolve(&active, &store, 10, 1).unwrap().offset, 999);
         // A version not in any sealed or live-active segment: miss.
         assert_eq!(resolve(&active, &store, 10, 9), None);
+    }
+
+    /// bn-1i7: `segments_for_stream` returns exactly the installed segments
+    /// that actually hold the stream, whether or not each has a filter
+    /// attached — the filter only ever narrows which segments get a
+    /// directory lookup at all, never the final answer.
+    #[test]
+    fn segments_for_stream_matches_directory_membership() {
+        let store = SealedStore::new();
+        store.install(sealed_seg(1, 10, 100)); // has stream 10
+        store.install(sealed_seg(2, 20, 200)); // has stream 20 only
+
+        let for_10 = store.segments_for_stream(10);
+        assert_eq!(for_10.len(), 1);
+        assert_eq!(for_10[0].segment_id(), 1);
+
+        let for_20 = store.segments_for_stream(20);
+        assert_eq!(for_20.len(), 1);
+        assert_eq!(for_20[0].segment_id(), 2);
+
+        assert!(store.segments_for_stream(999).is_empty());
+    }
+
+    /// bn-1i7: a real `BinaryFuse16` filter attached to a segment that lacks
+    /// the queried stream must not change `resolve`'s answer — only skip the
+    /// directory lookup for that segment. Two installed segments, only one
+    /// (with a filter) actually holds the stream being resolved.
+    #[test]
+    fn resolve_with_real_filter_skips_unrelated_segment_correctly() {
+        use crate::sealed::filter::SegmentFilter;
+
+        // Segment 1: streams 100..100+2000 (even spacing), filtered.
+        let ids: Vec<u64> = (0..2000u64).map(|i| i * 5).collect();
+        let streams1: Vec<SealStream> = ids
+            .iter()
+            .map(|&id| SealStream {
+                stream_id: id,
+                batches: vec![SealBatch { first_version: 0, frame_count: 1, first_global_pos: id, offset: 1000 + id }],
+            })
+            .collect();
+        let input1 = SealInput { segment_id: 1, base_pos: 0, streams: streams1 };
+        let filter1 = SegmentFilter::build(1, &ids).unwrap();
+        let mut idx1 = SealedSegmentIndex::from_bytes(encode_sidecar(&input1)).unwrap();
+        idx1.attach_filter(filter1);
+
+        // Segment 2: just stream 777 (never present in segment 1's id set).
+        let idx2 = sealed_seg(2, 777, 999);
+
+        let store = SealedStore::new();
+        store.install(Arc::new(idx1));
+        store.install(idx2);
+
+        // 777 must resolve from segment 2 regardless of segment 1's filter.
+        assert_eq!(store.resolve_sealed(777, 0).unwrap().offset, 999);
+        // A present stream in segment 1 still resolves correctly too.
+        assert_eq!(store.resolve_sealed(0, 0).unwrap().offset, 1000);
+        // A genuinely absent stream resolves to nothing from either segment.
+        assert_eq!(store.resolve_sealed(4_000_003, 0), None);
     }
 
     #[test]

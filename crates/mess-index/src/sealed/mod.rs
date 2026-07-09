@@ -27,6 +27,11 @@
 //!   byte-identity gate ([`ReplaySet`]).
 //! - [`block_cache`] — a bounded-bytes LRU of decoded pointer blocks wired into
 //!   stream replay and bypassed for point reads ([`BlockCache`]).
+//! - [`filter`] — the seal-time `BinaryFuse16` membership filter over a
+//!   segment's `stream_id`s (bn-1i7): consulted before the pointer index so a
+//!   segment definitely lacking a stream is skipped without a directory
+//!   lookup. Persisted as a sibling `.filter` file, independently
+//!   rebuildable (I5).
 //!
 //! # Staged passes (Phase 5 seam)
 //!
@@ -40,6 +45,7 @@
 
 pub mod block_cache;
 pub mod driver;
+pub mod filter;
 pub mod ptr_block;
 pub mod replay;
 pub mod segment;
@@ -47,10 +53,11 @@ pub mod store;
 
 pub use block_cache::{BlockCache, CachedBlock};
 pub use driver::{BackgroundSealer, FinalizeFn, SealDriver, SealError};
+pub use filter::{FilterError, SegmentFilter};
 pub use ptr_block::{BatchPtr, DecodeError, SKIP_K};
 pub use replay::{ReplaySet, global_checksum, stream_checksum};
 pub use segment::{
     SealBatch, SealInput, SealStream, SealedSegmentIndex, SealedSegmentRef, SidecarError,
-    encode_sidecar,
+    encode_sidecar, filter_path_for,
 };
 pub use store::{SealedStore, resolve};

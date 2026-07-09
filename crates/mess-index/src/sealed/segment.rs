@@ -84,6 +84,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::active::{EventPtr, GlobalEntry, StreamEntry};
+use crate::sealed::filter::SegmentFilter;
 use crate::sealed::ptr_block::{
     self, BatchPtr, DecodeError, SkipEntry, encode_ptr_block, encode_skips,
 };
@@ -211,6 +212,15 @@ pub enum SidecarError {
     /// A pointer block or skip table failed to decode.
     #[error("sidecar decode: {0}")]
     Decode(#[from] DecodeError),
+}
+
+/// The seal-time membership filter's path for a given sidecar path (bn-1i7):
+/// same directory and stem, `.filter` extension in place of `.pidx`. The
+/// single source of truth for the pairing, used by both
+/// [`crate::sealed::driver::SealDriver`] (write) and
+/// [`SealedSegmentIndex::open`] (read) so the two files can never drift.
+pub fn filter_path_for(sidecar_path: &Path) -> std::path::PathBuf {
+    sidecar_path.with_extension("filter")
 }
 
 fn put_u32(buf: &mut Vec<u8>, v: u32) {
@@ -349,6 +359,12 @@ pub struct SealedSegmentIndex {
     dir: HashMap<u64, DirEntry>,
     /// Stream ids ascending — for global replay and deterministic iteration.
     stream_ids: Vec<u64>,
+    /// The seal-time `BinaryFuse16` stream-id membership filter (bn-1i7), if
+    /// one is attached — see [`Self::might_contain_stream`]. `None` when no
+    /// filter was built (e.g. an empty segment) or none was found/valid on
+    /// disk; callers must treat that exactly like a filter that always
+    /// answers "maybe" (I5 — never a wrong answer, only lost skip-ahead).
+    filter: Option<SegmentFilter>,
 }
 
 impl SealedSegmentIndex {
@@ -439,13 +455,50 @@ impl SealedSegmentIndex {
             bytes,
             dir,
             stream_ids,
+            filter: None,
         })
     }
 
-    /// Read and parse a sidecar from `path`.
+    /// Read and parse a sidecar from `path`, opportunistically attaching the
+    /// sibling `.filter` file ([`filter_path_for`]) if one exists, parses,
+    /// and cross-checks by `segment_id` (bn-1i7). A missing, corrupt, or
+    /// mismatched filter is silently dropped — the sidecar open still
+    /// succeeds and [`Self::might_contain_stream`] degrades to always `true`
+    /// (I5: the filter is advisory and independently rebuildable).
     pub fn open(path: &Path) -> Result<Self, SidecarError> {
         let bytes = std::fs::read(path)?;
-        Self::from_bytes(bytes)
+        let mut index = Self::from_bytes(bytes)?;
+        if let Ok(filter) = SegmentFilter::open(&filter_path_for(path))
+            && filter.segment_id() == index.segment_id
+        {
+            index.filter = Some(filter);
+        }
+        Ok(index)
+    }
+
+    /// Attach a seal-time membership filter built for this segment (bn-1i7).
+    /// Normally called by [`crate::sealed::driver::SealDriver::seal`] right
+    /// after a successful [`crate::sealed::filter::SegmentFilter::build`], or
+    /// by [`Self::open`] when a valid sibling `.filter` file is found.
+    pub fn attach_filter(&mut self, filter: SegmentFilter) {
+        self.filter = Some(filter);
+    }
+
+    /// Advisory pre-check consulting this segment's `BinaryFuse16` stream-id
+    /// filter (bn-1i7), if one is attached. `false` means `stream_id` is
+    /// **definitely absent** from this segment — safe to skip
+    /// [`Self::resolve`]/[`Self::stream_head`]/[`Self::stream_entries`]
+    /// entirely without touching the directory. `true` means "maybe": either
+    /// the filter says so, or no filter is attached (missing/corrupt
+    /// degrades to always-`true`, i.e. unfiltered — I5, never a wrong
+    /// answer). Callers that skip on `false` MUST NOT skip on `true` — the
+    /// directory remains the source of truth.
+    #[inline]
+    pub fn might_contain_stream(&self, stream_id: u64) -> bool {
+        match &self.filter {
+            Some(f) => f.might_contain(stream_id),
+            None => true,
+        }
     }
 
     #[inline]
@@ -674,5 +727,47 @@ mod tests {
         let sidx = SealedSegmentIndex::from_bytes(encode_sidecar(&seg2)).unwrap();
         assert_eq!(sidx.resolve(10, 4).unwrap().unwrap().offset, 200);
         assert_eq!(sidx.resolve(20, 1).unwrap().unwrap().offset, 300);
+    }
+
+    /// bn-1i7: no filter attached (the plain `from_bytes` path) degrades to
+    /// always-`true` — `might_contain_stream` must never cause a skip when
+    /// there is nothing to consult.
+    #[test]
+    fn no_filter_attached_is_always_maybe() {
+        let idx = SealedSegmentIndex::from_bytes(encode_sidecar(&sample_input())).unwrap();
+        assert!(idx.might_contain_stream(10));
+        assert!(idx.might_contain_stream(999), "absent stream is still \"maybe\" without a filter");
+    }
+
+    /// bn-1i7 acceptance: with a real filter attached, every present stream
+    /// answers "maybe" (zero false negatives) and the vast majority of a
+    /// large absent-key sample answers "no" — i.e. filtering actually skips
+    /// segments in stream-replay planning, at the FPR the round-3 spike
+    /// measured (~0.002%), well under the 1% sanity band.
+    #[test]
+    fn filter_skips_most_absent_streams_with_no_false_negatives() {
+        let n_streams = 4_000u64;
+        let streams: Vec<SealStream> = (0..n_streams)
+            .map(|i| seal_stream(i * 2, &[(0, 3, i, 4096 + i)])) // even ids only
+            .collect();
+        let input = SealInput { segment_id: 1, base_pos: 0, streams };
+        let stream_ids: Vec<u64> = input.streams.iter().map(|s| s.stream_id).collect();
+        let filter = crate::sealed::filter::SegmentFilter::build(1, &stream_ids).unwrap();
+
+        let mut idx = SealedSegmentIndex::from_bytes(encode_sidecar(&input)).unwrap();
+        idx.attach_filter(filter);
+
+        for &id in &stream_ids {
+            assert!(idx.might_contain_stream(id), "false negative for present stream {id}");
+        }
+
+        // Odd ids were never inserted -- definitely absent.
+        let absent: Vec<u64> = (0..n_streams).map(|i| i * 2 + 1).collect();
+        let skipped = absent.iter().filter(|&&id| !idx.might_contain_stream(id)).count();
+        let skip_rate = skipped as f64 / absent.len() as f64;
+        assert!(
+            skip_rate > 0.99,
+            "filter should skip the overwhelming majority of absent streams: {skip_rate}"
+        );
     }
 }

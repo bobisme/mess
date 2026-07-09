@@ -21,6 +21,11 @@ crc32c = "0.6"
 # the sealed reader parallelizes with std scoped threads, no rayon. The `stats`
 # feature exposes the hit/miss counters the cache-hit-rate metric reports.
 quick_cache = { workspace = true, features = ["stats"] }
+# bn-1i7: seal-time BinaryFuse16 membership filters over a segment's stream
+# ids (round-3 spike pick: 0.002% FPR, 3.61 B/key, ~4ns query, zero false
+# negatives). Default features only (`binary-fuse`, `uniform-random`); see
+# `sealed::filter`.
+xorf = "0.12"
 
 # bn-20e: `#[cfg(kani)]` ptr-block round-trip proofs are compiled only by
 # `cargo kani`; teach the normal `cargo` build the cfg so it is not flagged

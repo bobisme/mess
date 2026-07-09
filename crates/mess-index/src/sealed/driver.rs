@@ -48,8 +48,9 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::JoinHandle;
 
+use crate::sealed::filter::SegmentFilter;
 use crate::sealed::segment::{
-    SealInput, SealedSegmentIndex, SealedSegmentRef, SidecarError, encode_sidecar,
+    SealInput, SealedSegmentIndex, SealedSegmentRef, SidecarError, encode_sidecar, filter_path_for,
 };
 use crate::sealed::store::SealedStore;
 
@@ -91,12 +92,20 @@ impl SealDriver {
         self.dir.join(format!("seg-{segment_id:020}.pidx"))
     }
 
-    /// Seal one segment synchronously (the four steps in the module docs).
-    /// `finalize` finalizes the segment footer (mess-log's seal). On success
-    /// the sealed index is installed and the segment's active entries are
-    /// marked evicted; returns the installed index. **Ordering guarantee:**
-    /// install precedes eviction, so readers using
-    /// [`crate::sealed::store::resolve`] never see a gap.
+    /// The seal-time membership filter path for `segment_id` (bn-1i7):
+    /// `<dir>/seg-<id>.filter`, paired with [`Self::sidecar_path`] via
+    /// [`filter_path_for`].
+    pub fn filter_path(&self, segment_id: u64) -> PathBuf {
+        filter_path_for(&self.sidecar_path(segment_id))
+    }
+
+    /// Seal one segment synchronously (the four steps in the module docs,
+    /// plus the bn-1i7 filter build folded into step 1–2). `finalize`
+    /// finalizes the segment footer (mess-log's seal). On success the sealed
+    /// index is installed and the segment's active entries are marked
+    /// evicted; returns the installed index. **Ordering guarantee:** install
+    /// precedes eviction, so readers using [`crate::sealed::store::resolve`]
+    /// never see a gap.
     pub fn seal<Fin>(&self, input: SealInput, finalize: Fin) -> Result<SealedSegmentRef, SealError>
     where
         Fin: FnOnce() -> io::Result<()>,
@@ -108,12 +117,29 @@ impl SealDriver {
         let path = self.sidecar_path(segment_id);
         write_durable(&path, &bytes).map_err(SealError::Write)?;
 
+        // bn-1i7: build the seal-time stream-id membership filter and write
+        // it durably too. Best-effort by design (I5): a build or write
+        // failure here must never fail the seal itself — the segment is
+        // still fully durable and correct without a filter, just without the
+        // skip-ahead optimization (`might_contain_stream` degrades to
+        // always-`true`). Built over the segment's *distinct* stream ids —
+        // one key per `SealStream`, already deduplicated by construction.
+        let stream_ids: Vec<u64> = input.streams.iter().map(|s| s.stream_id).collect();
+        let filter = SegmentFilter::build(segment_id, &stream_ids);
+        if let Some(f) = &filter {
+            let _ = write_durable(&self.filter_path(segment_id), &f.to_bytes());
+        }
+
         // 3: finalize the footer (mess-log's single seal fsync).
         finalize().map_err(SealError::Finalize)?;
 
         // Parse back the bytes we just wrote (validates our own encoding; the
         // reader owns the same bytes without a re-read).
-        let index: SealedSegmentRef = Arc::new(SealedSegmentIndex::from_bytes(bytes)?);
+        let mut index = SealedSegmentIndex::from_bytes(bytes)?;
+        if let Some(f) = filter {
+            index.attach_filter(f);
+        }
+        let index: SealedSegmentRef = Arc::new(index);
 
         // 4: install (publish) THEN evict — the gapless handoff.
         self.store.install(index.clone());
@@ -274,6 +300,58 @@ mod tests {
         // Reopen from disk round-trips.
         let reopened = SealedSegmentIndex::open(&driver.sidecar_path(7)).unwrap();
         assert_eq!(reopened.resolve(10, 2).unwrap().unwrap().offset, 4096);
+    }
+
+    /// bn-1i7: `seal` builds and durably writes a `.filter` file alongside the
+    /// sidecar, attaches it to the in-memory index, and a fresh `open` from
+    /// disk re-attaches it too.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn seal_builds_and_persists_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SealedStore::new());
+        let driver = SealDriver::new(store.clone(), dir.path());
+
+        let idx = driver.seal(input(7), || Ok(())).unwrap();
+
+        assert!(driver.filter_path(7).exists(), "filter file written");
+        assert!(idx.might_contain_stream(10), "present stream must never be a false negative");
+
+        let reopened = SealedSegmentIndex::open(&driver.sidecar_path(7)).unwrap();
+        assert!(
+            reopened.might_contain_stream(10),
+            "reopened index must re-attach the filter and answer correctly"
+        );
+    }
+
+    /// bn-1i7 / I5: a missing or corrupt `.filter` file must never break
+    /// opening the sidecar, and `resolve` must still be exactly correct —
+    /// the filter degrades to always-`true` (unfiltered), never a wrong
+    /// answer.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn missing_or_corrupt_filter_falls_back_to_unfiltered() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SealedStore::new());
+        let driver = SealDriver::new(store.clone(), dir.path());
+        driver.seal(input(7), || Ok(())).unwrap();
+
+        // Missing filter file.
+        std::fs::remove_file(driver.filter_path(7)).unwrap();
+        let reopened = SealedSegmentIndex::open(&driver.sidecar_path(7)).unwrap();
+        assert!(reopened.might_contain_stream(10), "missing filter degrades to always-maybe");
+        assert_eq!(reopened.resolve(10, 1).unwrap().unwrap().offset, 4096, "resolve still correct");
+        assert_eq!(reopened.resolve(10, 99).unwrap(), None, "absent version still correctly absent");
+
+        // Corrupt filter file (seal again to recreate it, then flip a byte).
+        driver.seal(input(8), || Ok(())).unwrap();
+        let fp = driver.filter_path(8);
+        let mut bytes = std::fs::read(&fp).unwrap();
+        bytes[0] ^= 0xff;
+        std::fs::write(&fp, &bytes).unwrap();
+        let reopened8 = SealedSegmentIndex::open(&driver.sidecar_path(8)).unwrap();
+        assert!(reopened8.might_contain_stream(10), "corrupt filter degrades to always-maybe");
+        assert_eq!(reopened8.resolve(10, 1).unwrap().unwrap().offset, 4096, "resolve still correct");
     }
 
     #[test]
