@@ -716,6 +716,16 @@ fn commit_group<R: Runtime, F: Fs>(
             Err(WriteError::ShortWrite { .. }) | Err(WriteError::Io(_)) => {
                 Ok(AppendOutcome::Indeterminate)
             }
+            // bn-221: `InvalidResume` is only ever constructed by
+            // `SegmentWriter::resume` (rejecting a bogus resumed offset before
+            // any append is possible); `append` itself never produces it. Kept
+            // as an explicit arm (not folded into a wildcard) so a future
+            // `WriteError` variant added to `append`'s real error surface
+            // still trips this match at compile time instead of silently
+            // falling through here.
+            Err(WriteError::InvalidResume { .. }) => {
+                unreachable!("InvalidResume is only returned by SegmentWriter::resume")
+            }
         };
         acks.push((req.ack.clone(), res));
     }

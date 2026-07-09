@@ -464,7 +464,15 @@ impl LogEngine {
             let stream_name = book.stream_name_opt(sid).ok_or_else(|| {
                 EngineError::Meta(format!("recover: no interned name for stream_id {sid}"))
             })?;
-            for (k, frame) in b.frames(&image).enumerate() {
+            // bn-221: `frames` is fallible (misuse-resistant against a wrong
+            // image) but this caller always passes the exact image `b` was
+            // recovered from, so the error path is unreachable in practice —
+            // still propagated rather than unwrapped so a future refactor
+            // that breaks that invariant fails loudly instead of panicking.
+            let frames = b
+                .frames(&image)
+                .map_err(|e| EngineError::Open(format!("recover: {e}")))?;
+            for (k, frame) in frames.enumerate() {
                 let gp = b.first_global_pos + k as u64;
                 debug_assert_eq!(book.payloads.len() as u64, gp, "dense rehydration");
                 let message_type =

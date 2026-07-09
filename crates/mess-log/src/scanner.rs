@@ -136,17 +136,78 @@ impl AcceptedBatch {
     /// from (the exact bytes [`recover_segment_with_image`] returns alongside
     /// the [`Recovery`]); `self.offset .. self.offset + self.total_len` indexes
     /// this batch within it. Because the batch already byte-validated (its
-    /// subframes tile exactly, [`decode_batch`] proved it), the walk is
-    /// infallible and allocation-free — each yielded [`RecoveredFrame`] borrows
-    /// its payload straight out of `segment_image`.
-    pub fn frames<'a>(&self, segment_image: &'a [u8]) -> Frames<'a> {
+    /// subframes tile exactly, [`decode_batch`] proved it) **against the
+    /// correct image**, the walk over that image is allocation-free — each
+    /// yielded [`RecoveredFrame`] borrows its payload straight out of
+    /// `segment_image`.
+    ///
+    /// # Misuse resistance (bn-221)
+    ///
+    /// A caller can pass the wrong image (a different segment's bytes, a
+    /// truncated/reallocated buffer, or anything else that is not the exact
+    /// image this batch was recovered from). This method never panics on
+    /// that input: it re-validates the batch's byte range against
+    /// `segment_image` and re-runs the same subframe-tiling check
+    /// [`decode_batch`] used, returning [`WrongSegmentImage`] instead of
+    /// slicing out of bounds or handing back an iterator that could panic on
+    /// `next()`. On the correct image this re-validation always succeeds (it
+    /// is the same image the original tiling proof was over) and costs one
+    /// extra O(`frame_count`) pass with no allocation.
+    pub fn frames<'a>(&self, segment_image: &'a [u8]) -> Result<Frames<'a>, WrongSegmentImage> {
+        let wrong_image = || WrongSegmentImage {
+            batch_offset: self.offset,
+            batch_total_len: self.total_len,
+            image_len: segment_image.len(),
+        };
+        let end = self.offset.checked_add(self.total_len).ok_or_else(wrong_image)?;
+        if end > segment_image.len() as u64 {
+            return Err(wrong_image());
+        }
+        // Sound: `self.offset <= end <= segment_image.len()`, and
+        // `segment_image.len()` is itself a valid `usize`, so neither cast
+        // below can wrap or truncate.
         let start = self.offset as usize;
-        let end = start + self.total_len as usize;
+        let end = end as usize;
         let batch = &segment_image[start..end];
+        if !subframes_tile(batch, self.frame_count, self.has_crypto_chain) {
+            return Err(wrong_image());
+        }
         let pos = HEADER_LEN + if self.has_crypto_chain { CHAIN_LEN } else { 0 };
-        Frames { batch, pos, remaining: self.frame_count }
+        Ok(Frames { batch, pos, remaining: self.frame_count })
     }
 }
+
+/// Why [`AcceptedBatch::frames`] could not materialize this batch's events
+/// from a given `segment_image` (bn-221): the image is not the one the batch
+/// was recovered from — either too short to contain the batch's byte range,
+/// or a same-or-different-length image whose bytes at this offset do not
+/// byte-validate as this batch's subframe tiling. This is a **misuse**
+/// signal, not a corruption finding: on the correct image (the one actually
+/// returned alongside this batch's [`Recovery`]) `frames` cannot fail, since
+/// the tiling this re-checks is exactly what [`decode_batch`] already proved
+/// during recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WrongSegmentImage {
+    /// The batch's byte offset within its segment.
+    pub batch_offset: u64,
+    /// The batch's on-disk length (§4.6).
+    pub batch_total_len: u64,
+    /// The length of the `segment_image` actually supplied.
+    pub image_len: usize,
+}
+
+impl std::fmt::Display for WrongSegmentImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "AcceptedBatch::frames: segment_image (len {}) is not the image this batch \
+             (offset {}, total_len {}) was recovered from",
+            self.image_len, self.batch_offset, self.batch_total_len
+        )
+    }
+}
+
+impl std::error::Error for WrongSegmentImage {}
 
 /// One recovered event's read-side materialization (bn-20b): the interned
 /// event-type id (`04-registry.md`) and the on-disk payload bytes, borrowed
@@ -176,6 +237,7 @@ pub struct RecoveredFrame<'a> {
 /// Iterator over an [`AcceptedBatch`]'s recovered event frames (bn-20b). Walks
 /// the `EventSubframe`s (§4.3) of a byte-validated batch, so it never fails and
 /// never allocates. See [`AcceptedBatch::frames`].
+#[derive(Debug)]
 pub struct Frames<'a> {
     /// The whole batch slice `[header(+chain) .. marker]`.
     batch: &'a [u8],
@@ -693,7 +755,7 @@ mod frame_tests {
             assert_eq!(batch.first_global_pos, expected_global);
             assert_eq!(batch.frame_count as usize, input.events.len());
 
-            let frames: Vec<RecoveredFrame> = batch.frames(&image).collect();
+            let frames: Vec<RecoveredFrame> = batch.frames(&image).unwrap().collect();
             assert_eq!(frames.len(), input.events.len());
             for (frame, (etid, payload)) in frames.iter().zip(&input.events) {
                 assert_eq!(frame.event_type_id, *etid, "event_type_id must round-trip");
@@ -703,5 +765,91 @@ mod frame_tests {
             expected_global += input.events.len() as u64;
         }
         assert_eq!(recovery.next_pos, expected_global);
+    }
+
+    /// bn-221: `frames` must never panic on a wrong/short `segment_image` — it
+    /// used to slice `segment_image[start..end]` (and the iterator then sliced
+    /// per-subframe payloads) with no bounds check at all, so a caller error
+    /// (wrong image, or an image truncated/reallocated after recovery) was an
+    /// out-of-bounds-slice panic. It must now return [`WrongSegmentImage`] in
+    /// every misuse shape: too-short image, empty image, a same-length image
+    /// whose bytes at this offset are simply wrong (corrupted subframe tiling),
+    /// and an entirely different (but long-enough) segment's image.
+    #[test]
+    fn frames_rejects_wrong_or_short_image() {
+        let rt = SimRuntime::new(11);
+        let fs = rt.fs();
+
+        let path_a = std::path::Path::new("/seg-a");
+        let mut writer_a =
+            SegmentWriter::create(&fs, path_a, SegmentParams::new(1, 0, 1, 0)).unwrap();
+        writer_a
+            .append(&BatchSpec {
+                stream_id: 1,
+                category_id: 0,
+                first_stream_version: 0,
+                crypto_chain: None,
+                subframes: &[Subframe::plain(1, 0, 0, b"hello")],
+            })
+            .unwrap();
+        writer_a.close().unwrap();
+        let (recovery_a, image_a) = recover_segment_with_image(&fs, path_a).unwrap();
+        assert_eq!(recovery_a.accepted.len(), 1);
+        let batch_a = recovery_a.accepted[0];
+
+        // Sanity: the correct image always decodes without error.
+        assert!(batch_a.frames(&image_a).is_ok());
+
+        // 1. Too-short image: even one byte truncated off the correct image
+        // makes the batch's own byte range fall outside it.
+        let short = &image_a[..image_a.len() - 1];
+        let err = batch_a.frames(short).unwrap_err();
+        assert_eq!(err.image_len, short.len());
+        assert_eq!(err.batch_offset, batch_a.offset);
+        assert_eq!(err.batch_total_len, batch_a.total_len);
+
+        // 2. Empty image.
+        assert!(batch_a.frames(&[]).is_err());
+
+        // 3. A same-length image whose bytes are simply wrong: corrupt the
+        // single subframe's `compressed_len` field to a huge value. The batch
+        // byte range still fits inside the image (length unchanged), so only
+        // the re-run subframe-tiling check catches it — this is exactly the
+        // shape that used to reach the iterator and panic on an
+        // out-of-bounds subframe-payload slice.
+        let mut corrupted = image_a.clone();
+        let cl_off = batch_a.offset as usize + HEADER_LEN + SF_COMPRESSED_LEN_OFF;
+        corrupted[cl_off..cl_off + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let err = batch_a.frames(&corrupted).unwrap_err();
+        assert_eq!(err.image_len, corrupted.len());
+        assert_eq!(err.batch_offset, batch_a.offset);
+        assert_eq!(err.batch_total_len, batch_a.total_len);
+
+        // 4. An entirely different segment's (long-enough) image: the batch's
+        // byte range fits, but the bytes there belong to a differently-shaped
+        // batch (different frame_count/payloads) and do not tile as batch_a.
+        let path_b = std::path::Path::new("/seg-b");
+        let mut writer_b =
+            SegmentWriter::create(&fs, path_b, SegmentParams::new(2, 0, 1, 0)).unwrap();
+        writer_b
+            .append(&BatchSpec {
+                stream_id: 2,
+                category_id: 0,
+                first_stream_version: 0,
+                crypto_chain: None,
+                subframes: &[
+                    Subframe::plain(9, 0, 0, b"a differently shaped batch payload here"),
+                    Subframe::plain(9, 0, 0, b"second frame payload"),
+                ],
+            })
+            .unwrap();
+        writer_b.close().unwrap();
+        let (_recovery_b, image_b) = recover_segment_with_image(&fs, path_b).unwrap();
+        assert!(
+            image_b.len() >= image_a.len(),
+            "fixture must give a same-or-longer wrong image so the failure is \
+             tiling, not the earlier length check"
+        );
+        assert!(batch_a.frames(&image_b).is_err());
     }
 }

@@ -211,6 +211,19 @@ pub enum WriteError {
     /// Underlying filesystem I/O error.
     #[error("io: {0}")]
     Io(#[from] io::Error),
+    /// bn-221: [`SegmentWriter::resume`]'s `write_off` named a position that
+    /// cannot be a real recovered batch boundary of `path` — either before
+    /// the fixed segment header (batches never start there) or past the
+    /// file's own on-disk length (the scan that produced `write_off` can
+    /// never advance past bytes the file does not contain). Resuming there
+    /// would place subsequent appends at the wrong offset — inside the
+    /// header, or leaving an unaccounted gap — so it is rejected rather than
+    /// silently corrupting the segment.
+    #[error(
+        "invalid resume: write_off {write_off} is not a valid batch boundary \
+         (segment header ends at {header_len}, file len is {file_len})"
+    )]
+    InvalidResume { write_off: u64, header_len: u64, file_len: u64 },
 }
 
 /// Whether `e` is an `ENOSPC` (disk-full). The sim fs injects an error carrying
@@ -311,6 +324,34 @@ impl<F: Fs> SegmentWriter<F> {
     /// case.)
     pub fn resume(fs: &F, path: &Path, params: ResumeParams) -> Result<Self, WriteError> {
         let file = fs.open(path, OpenOpts::create_rw())?;
+
+        // bn-221: `write_off` MUST be a real recovered batch boundary of this
+        // exact file — it came from `Recovery::safe_offset`, which by
+        // construction can never name a position before the fixed segment
+        // header (batches start at `SEGMENT_HEADER_LEN`) or past the bytes
+        // the scan actually read (`safe_offset <= file len` at scan time; the
+        // file is never truncated between recovery and resume). A `write_off`
+        // violating either bound cannot have come from a real recovery of
+        // `path` — resuming there would silently place new appends inside the
+        // header or past a gap of unaccounted bytes. Checked unconditionally
+        // (not just `debug_assert!`) because `write_off` crosses a public API
+        // boundary from a caller-supplied `ResumeParams`, not a value this
+        // function derived itself.
+        let file_len = file.len()?;
+        let valid_boundary = is_valid_resume_boundary(params.write_off, file_len);
+        debug_assert!(
+            valid_boundary,
+            "resume write_off {} is not a valid batch boundary (header_len={}, file_len={})",
+            params.write_off, SEGMENT_HEADER_LEN, file_len
+        );
+        if !valid_boundary {
+            return Err(WriteError::InvalidResume {
+                write_off: params.write_off,
+                header_len: SEGMENT_HEADER_LEN as u64,
+                file_len,
+            });
+        }
+
         // Re-reserve the segment's blocks so a post-reopen append cannot hit
         // ENOSPC mid-commit (bn-36y). Idempotent on an already-allocated file.
         if let Err(e) = file.allocate(params.segment_size) {
@@ -606,6 +647,17 @@ fn put_u64(buf: &mut [u8], off: usize, v: u64) {
     buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
 }
 
+/// bn-221: whether `write_off` is a position [`SegmentWriter::resume`] could
+/// legitimately resume at for a file of `file_len` bytes — i.e. one a real
+/// `Recovery::safe_offset` could actually have produced: not before the fixed
+/// segment header (batches never start there, §3.2) and not past the file's
+/// own on-disk length (a scan can never advance past bytes the file does not
+/// contain). Pulled out of [`SegmentWriter::resume`] so the predicate itself
+/// is unit-testable independent of `debug_assert!`'s build-profile gating.
+fn is_valid_resume_boundary(write_off: u64, file_len: u64) -> bool {
+    write_off >= SEGMENT_HEADER_LEN as u64 && write_off <= file_len
+}
+
 /// `pwrite` the whole buffer at `off`, looping on short writes. Returns a
 /// typed [`WriteError::ShortWrite`] only if the file handle makes no progress.
 fn write_all_at<H: FileHandle>(file: &H, off: u64, mut buf: &[u8]) -> Result<(), WriteError> {
@@ -641,4 +693,97 @@ pub fn read_segment_header_epoch(image: &[u8]) -> Option<u64> {
         return None;
     }
     Some(u64::from_le_bytes(image[SH_EPOCH_OFF..SH_EPOCH_OFF + 8].try_into().ok()?))
+}
+
+#[cfg(test)]
+mod resume_tests {
+    //! bn-221: `resume`'s `write_off` must be a real recovered batch boundary
+    //! of the file being resumed. Before this bone a bogus `write_off` (a
+    //! caller bug, not a real `Recovery::safe_offset`) was accepted silently
+    //! and would land subsequent appends at the wrong offset.
+    use super::*;
+    use crate::encode::Subframe;
+    use crate::runtime::{Runtime, SimRuntime};
+
+    /// The pure boundary predicate, independent of `debug_assert!`'s
+    /// build-profile gating (a normal `cargo test` binary has
+    /// `debug_assertions` on, which makes the `resume` `Err` path below
+    /// unreachable through the public API — this covers that logic directly).
+    #[test]
+    fn valid_resume_boundary_rejects_before_header_and_past_file_len() {
+        let header = SEGMENT_HEADER_LEN as u64;
+        assert!(!is_valid_resume_boundary(0, 1_000));
+        assert!(!is_valid_resume_boundary(header - 1, 1_000));
+        assert!(!is_valid_resume_boundary(1_001, 1_000));
+        assert!(is_valid_resume_boundary(header, header)); // empty-but-headered segment
+        assert!(is_valid_resume_boundary(500, 1_000)); // mid-file, still <= file_len
+        assert!(is_valid_resume_boundary(1_000, 1_000)); // exactly EOF
+    }
+
+    /// Write a tiny one-batch segment and return its handoff summary — the
+    /// exact shape a real `Recovery` would resume from.
+    fn seed_segment<F: Fs>(fs: &F, path: &Path) -> SegmentSummary {
+        let mut writer = SegmentWriter::create(fs, path, SegmentParams::new(1, 0, 1, 0)).unwrap();
+        let subs = vec![Subframe::plain(1, 0, 0, b"hello")];
+        writer
+            .append(&BatchSpec {
+                stream_id: 1,
+                category_id: 0,
+                first_stream_version: 0,
+                crypto_chain: None,
+                subframes: &subs,
+            })
+            .unwrap();
+        writer.close().unwrap()
+    }
+
+    /// The `ResumeParams` a real recovery of `seed_segment`'s output would
+    /// hand back: `write_off == content_len` (the file has no torn tail).
+    fn real_resume_params(summary: &SegmentSummary) -> ResumeParams {
+        ResumeParams {
+            segment_id: summary.segment_id,
+            base_pos: summary.base_pos,
+            epoch: summary.epoch,
+            segment_size: SEGMENT_SIZE,
+            write_off: summary.content_len,
+            next_batch_id: summary.batch_count,
+            next_pos: summary.end_pos,
+            batch_count: summary.batch_count,
+            event_count: summary.event_count,
+        }
+    }
+
+    #[test]
+    fn resume_accepts_the_real_recovered_boundary() {
+        let rt = SimRuntime::new(3);
+        let fs = rt.fs();
+        let path = Path::new("/seg-resume-ok");
+        let summary = seed_segment(&fs, path);
+        let params = real_resume_params(&summary);
+        SegmentWriter::resume(&fs, path, params).expect("the real safe_offset must resume cleanly");
+    }
+
+    #[test]
+    #[should_panic(expected = "not a valid batch boundary")]
+    fn resume_rejects_write_off_past_file_len() {
+        let rt = SimRuntime::new(5);
+        let fs = rt.fs();
+        let path = Path::new("/seg-resume-past-eof");
+        let summary = seed_segment(&fs, path);
+        let mut params = real_resume_params(&summary);
+        params.write_off = summary.content_len + 1_000_000; // far past the file's own bytes
+        let _ = SegmentWriter::resume(&fs, path, params);
+    }
+
+    #[test]
+    #[should_panic(expected = "not a valid batch boundary")]
+    fn resume_rejects_write_off_before_header() {
+        let rt = SimRuntime::new(9);
+        let fs = rt.fs();
+        let path = Path::new("/seg-resume-in-header");
+        let summary = seed_segment(&fs, path);
+        let mut params = real_resume_params(&summary);
+        params.write_off = 4; // inside the fixed SegmentHeader, before any batch
+        let _ = SegmentWriter::resume(&fs, path, params);
+    }
 }
