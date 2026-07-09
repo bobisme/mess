@@ -26,6 +26,7 @@
 pub mod acceptance;
 pub mod committer;
 pub mod crc;
+pub mod degraded;
 pub mod encode;
 pub mod format;
 pub mod lock;

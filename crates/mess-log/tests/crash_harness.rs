@@ -49,7 +49,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use mess_log::committer::{
-    AppendOutcome, AppendRequest, Committer, Durability, EventInput,
+    AppendError, AppendOutcome, AppendRequest, Committer, Durability, EventInput,
 };
 use mess_log::format::{SEGMENT_HEADER_LEN, SEGMENT_SIZE};
 use mess_log::runtime::{
@@ -388,6 +388,13 @@ fn run_case(seed: u64) -> CaseStats {
                             acked.lock().unwrap().push((first_position, last_position));
                         }
                         Ok(AppendOutcome::Indeterminate) => {}
+                        // D8 (bn-25e): after a barrier fault poisons the store,
+                        // every later append fails fast with StorePoisoned —
+                        // exactly this harness's "once one barrier fails every
+                        // later group fails too" model, now surfaced as a typed
+                        // error instead of Indeterminate. Both are non-acks, so
+                        // the acked-prefix invariant below is unchanged.
+                        Err(AppendError::StorePoisoned) => {}
                         Err(e) => panic!("seed {seed}: valid batch rejected pre-flight: {e}"),
                     }
                 }

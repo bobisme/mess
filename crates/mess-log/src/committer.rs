@@ -46,11 +46,13 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::degraded::{Degraded, PoisonCause};
 use crate::encode::{BatchEncoder, BatchInput, EncodeError, Subframe};
 use crate::runtime::{Fs, Runtime};
 use crate::watermark::Watermark;
 use crate::writer::{BatchSpec, SegmentWriter, WriteError};
 
+pub use crate::degraded::{Degraded as StoreDegraded, PoisonCause as BarrierPoisonCause};
 pub use crate::watermark::Watermark as DurableWatermark;
 
 // ---------------------------------------------------------------------------
@@ -176,11 +178,19 @@ pub enum AppendError {
     /// today — but surfaced here so the client boundary is typed.
     #[error("store full")]
     StoreFull,
-    /// The store is poisoned: a prior barrier failed with `ENOSPC`, so the
-    /// segment's durable state is unknowable (`bn-36y`, the D8 shape of
-    /// `docs/spec/03-durability.md` §2.6). Reopen and recover. The barrier that
-    /// tripped the poison surfaced its own group as [`AppendOutcome::Indeterminate`];
-    /// every append after it fails fast with this typed error.
+    /// The store is poisoned: a prior durability barrier (`fdatasync`) failed —
+    /// with `EIO`, `ENOSPC`, or anything else — so the segment's durable state
+    /// is unknowable (the full D8 policy, `bn-25e`,
+    /// `docs/spec/03-durability.md` §2.6; see [`crate::degraded`]). The barrier
+    /// that tripped the poison surfaced its own group as
+    /// [`AppendOutcome::Indeterminate`] and was **never retried** (retrying
+    /// `fdatasync` after `EIO` is the classic fsyncgate corruption); every
+    /// write after it — through *any* entry point — fails fast with this typed
+    /// error. The poison is sticky for the committer's lifetime with no reset:
+    /// **reopen and recover** ([`docs/spec/02-recovery.md`]) is the only exit.
+    /// Reads remain permitted meanwhile, clamped to the now-frozen watermark
+    /// (degraded reads); query [`Committer::is_degraded`] /
+    /// [`Appender::is_degraded`] to detect the mode.
     #[error("store poisoned")]
     StorePoisoned,
 }
@@ -596,6 +606,7 @@ fn commit_group<R: Runtime, F: Fs>(
     policy: &Policy,
     watermark: &Watermark,
     metrics: &Metrics,
+    degraded: &Degraded,
 ) {
     // Steps 2–3: assign positions centrally + write each batch. `next_pos`
     // advances only for successfully written batches.
@@ -637,15 +648,23 @@ fn commit_group<R: Runtime, F: Fs>(
     }
 
     // Step 4: the barrier. One `fdatasync` covers every `pwrite` above
-    // (Process: none). A barrier fault poisons only the ack strength of
-    // *this* group; store-wide EIO poisoning is D8's policy (§2.6), not
-    // restated here.
+    // (Process: none). The FULL D8 policy (`bn-25e`, §2.6): ANY barrier
+    // failure — `EIO`, `ENOSPC`, or other — means the durable state is
+    // unknowable, so we **poison the whole store**, sticky for the
+    // committer's lifetime. This group is downgraded to `Indeterminate`
+    // (below), the watermark is frozen (Step 5), and every later write fails
+    // fast (`committer_loop`). The failed barrier is NEVER retried — retrying
+    // `fdatasync` after `EIO` is the classic fsyncgate corruption (§2.6) — so
+    // no later `commit_group` runs and no `close()` re-issues it.
     let mut barrier_ok = true;
     if policy.barrier && wrote_any {
         let t0 = rt.now();
         match writer.sync() {
             Ok(()) => metrics.record(rt.now().saturating_duration_since(t0)),
-            Err(_) => barrier_ok = false,
+            Err(e) => {
+                barrier_ok = false;
+                degraded.poison(PoisonCause::classify(&e));
+            }
         }
     }
 
@@ -683,6 +702,7 @@ async fn committer_loop<R: Runtime, F: Fs>(
     gate: Arc<Gate>,
     watermark: Watermark,
     metrics: Arc<Metrics>,
+    degraded: Degraded,
     done: Done,
 ) {
     // The expected convoy width, seeded at 1 (so the first group and the
@@ -692,12 +712,31 @@ async fn committer_loop<R: Runtime, F: Fs>(
     while let Some(first) = rx.recv().await {
         let group = gather(&rt, &rx, first, &policy, &gate, target).await;
         target = group.len().max(1);
-        commit_group(&rt, &mut writer, group, &policy, &watermark, &metrics);
+        // D8 sticky poison (`bn-25e`, §2.6): once a barrier has failed, the
+        // durable state is unknowable. NEVER write atop it and NEVER re-issue
+        // the barrier — fail every gathered batch fast with `StorePoisoned`.
+        // A request already in the channel when the poison tripped (the
+        // `submit` fast-path could not catch it) is caught here, so no batch
+        // is ever written after the poison. The watermark stays frozen because
+        // no `commit_group` runs.
+        if degraded.is_poisoned() {
+            for req in group {
+                fulfill(&req.ack, Err(AppendError::StorePoisoned));
+            }
+            continue;
+        }
+        commit_group(&rt, &mut writer, group, &policy, &watermark, &metrics, &degraded);
     }
-    // Shutdown: make the handoff durable (a `Process`-mode tail may be
-    // unsynced). Best-effort — a barrier fault here has already surfaced to
-    // its group as Indeterminate.
-    let _ = writer.close();
+    // Shutdown. On a healthy store, make the handoff durable (a `Process`-mode
+    // tail may be unsynced). On a POISONED store, drop the writer WITHOUT a
+    // final `fdatasync`: `close()` would re-issue the barrier that just failed,
+    // which is exactly the fsyncgate retry §2.6 forbids. Recovery on restart
+    // re-establishes the committed prefix — that is the only exit.
+    if degraded.is_poisoned() {
+        drop(writer);
+    } else {
+        let _ = writer.close();
+    }
     signal_done(&done);
 }
 
@@ -711,8 +750,18 @@ async fn committer_loop<R: Runtime, F: Fs>(
 async fn submit(
     tx: &Sender<CommitReq>,
     gate: &Gate,
+    degraded: &Degraded,
     req: AppendRequest,
 ) -> Result<AppendOutcome, AppendError> {
+    // D8 fail-fast (`bn-25e`, §2.6): a poisoned store rejects every write at
+    // the entry point, before any gate accounting or encoding — no append
+    // must be built atop an indeterminate durable state. This is the fast
+    // path; the narrow race where the poison trips AFTER this check but before
+    // the committer processes the request is closed by the loop's own poison
+    // guard, which fails such a request `StorePoisoned` too.
+    if degraded.is_poisoned() {
+        return Err(AppendError::StorePoisoned);
+    }
     // §2.2 early-close accounting: mark in-flight at the VERY START of the
     // call — before any encoding — and unmark right after submission. This
     // matches the reference's "writers between append() entry and their
@@ -779,18 +828,40 @@ pub struct Appender {
     tx: Sender<CommitReq>,
     gate: Arc<Gate>,
     watermark: Watermark,
+    degraded: Degraded,
 }
 
 impl Appender {
     /// Durably append one batch and await its outcome (see
-    /// [`Committer::append`]).
+    /// [`Committer::append`]). Fails fast with
+    /// [`AppendError::StorePoisoned`] if the store has been poisoned by a
+    /// prior barrier failure (D8, §2.6).
     pub async fn append(&self, req: AppendRequest) -> Result<AppendOutcome, AppendError> {
-        submit(&self.tx, &self.gate, req).await
+        submit(&self.tx, &self.gate, &self.degraded, req).await
     }
 
-    /// A clone of the durable watermark this committer advances.
+    /// A clone of the durable watermark this committer advances. After a
+    /// barrier poisons the store the committer stops advancing it, so a reader
+    /// holding this watermark can still serve the pre-poison committed prefix
+    /// (degraded reads) but never anything past the last known-durable
+    /// position.
     pub fn watermark(&self) -> Watermark {
         self.watermark.clone()
+    }
+
+    /// Whether the store is poisoned/degraded (D8, §2.6): a prior barrier
+    /// failed, writes now fail fast, and reads are clamped to the frozen
+    /// watermark. Sticky for the committer's lifetime — restart + recovery is
+    /// the only exit.
+    pub fn is_degraded(&self) -> bool {
+        self.degraded.is_poisoned()
+    }
+
+    /// A clone of the shared [`Degraded`] flag, so a reader built from this
+    /// appender's [`watermark`](Appender::watermark) can *observe* that it is
+    /// reading a degraded store rather than a live one.
+    pub fn degraded(&self) -> Degraded {
+        self.degraded.clone()
     }
 }
 
@@ -805,6 +876,7 @@ pub struct Committer<R: Runtime> {
     gate: Arc<Gate>,
     watermark: Watermark,
     metrics: Arc<Metrics>,
+    degraded: Degraded,
     done: Done,
     _rt: std::marker::PhantomData<R>,
 }
@@ -823,6 +895,7 @@ impl<R: Runtime> Committer<R> {
         let gate = Gate::new();
         let watermark = Watermark::new(writer.next_pos());
         let metrics = Arc::new(Metrics::default());
+        let degraded = Degraded::new();
         let done = new_done();
 
         // Fire-and-forget: the spawned task runs to completion regardless of
@@ -836,6 +909,7 @@ impl<R: Runtime> Committer<R> {
             gate.clone(),
             watermark.clone(),
             metrics.clone(),
+            degraded.clone(),
             done.clone(),
         )));
 
@@ -844,6 +918,7 @@ impl<R: Runtime> Committer<R> {
             gate,
             watermark,
             metrics,
+            degraded,
             done,
             _rt: std::marker::PhantomData,
         }
@@ -858,13 +933,42 @@ impl<R: Runtime> Committer<R> {
             tx: self.tx.as_ref().expect("committer is live").clone(),
             gate: self.gate.clone(),
             watermark: self.watermark.clone(),
+            degraded: self.degraded.clone(),
         }
     }
 
     /// A clone of the durable watermark ([`crate::watermark`]) this
-    /// committer advances — the object D11 subscriptions will read.
+    /// committer advances — the object D11 subscriptions will read. After a
+    /// barrier poisons the store the committer stops advancing it (D8, §2.6),
+    /// so it stays frozen at the last known-durable position and reads clamp
+    /// there.
     pub fn watermark(&self) -> Watermark {
         self.watermark.clone()
+    }
+
+    /// Whether the store is poisoned/degraded (D8, §2.6): a prior barrier
+    /// (`fdatasync`) failed — with `EIO`, `ENOSPC`, or other — so the durable
+    /// state is unknowable. Writes now fail fast with
+    /// [`AppendError::StorePoisoned`]; reads remain permitted but are clamped
+    /// to the frozen [`watermark`](Committer::watermark). Sticky for the
+    /// committer's lifetime with no reset — the only exit is process restart +
+    /// recovery ([`docs/spec/02-recovery.md`]).
+    pub fn is_degraded(&self) -> bool {
+        self.degraded.is_poisoned()
+    }
+
+    /// The [`PoisonCause`] if the store is degraded, else `None`. Diagnostics
+    /// only: every cause carries the identical permanent policy.
+    pub fn poison_cause(&self) -> Option<PoisonCause> {
+        self.degraded.cause()
+    }
+
+    /// A clone of the shared [`Degraded`] flag. Hand it to a
+    /// [`ReadView`](crate::reader::ReadView) built from this committer's
+    /// [`watermark`](Committer::watermark) so the reader can *observe* it is
+    /// serving a degraded store (the flag readers query, D8, §2.6).
+    pub fn degraded(&self) -> Degraded {
+        self.degraded.clone()
     }
 
     /// Number of `fdatasync` barriers issued so far (§2.6 metric; the
@@ -887,7 +991,7 @@ impl<R: Runtime> Committer<R> {
     /// advances past this batch (`Process` mode: after the write, §1.1).
     pub async fn append(&self, req: AppendRequest) -> Result<AppendOutcome, AppendError> {
         match &self.tx {
-            Some(tx) => submit(tx, &self.gate, req).await,
+            Some(tx) => submit(tx, &self.gate, &self.degraded, req).await,
             None => Err(AppendError::Closed),
         }
     }
@@ -905,11 +1009,11 @@ impl<R: Runtime> Committer<R> {
 mod tests {
     use super::*;
     use crate::runtime::{FileHandle, OpenOpts, RealRuntime, SimFs, SimRuntime};
-    use crate::runtime::{CrashPlan, Fault, TailPlan};
+    use crate::runtime::{CrashPlan, EnospcSite, Fault, TailPlan};
     use crate::writer::SegmentParams;
     use std::io;
     use std::path::Path;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicI32};
 
     fn req(stream: u64, version: u64, n_events: usize) -> AppendRequest {
         AppendRequest {
@@ -1148,6 +1252,269 @@ mod tests {
         }
         fn len(&self) -> io::Result<u64> {
             self.inner.len()
+        }
+    }
+
+    // -- D8: fsync-EIO/ENOSPC poisoning + degraded reads (bn-25e) ---------
+    //
+    // The full D8 policy (docs/spec/03 §2.6): ANY barrier failure => the
+    // durable state is unknowable => permanent, sticky poison. A
+    // `BarrierFaultFs` wraps the sim fs and returns a CHOSEN errno from
+    // `fdatasync` once armed, without promoting shadow → durable (a real
+    // barrier that reports failure having flushed nothing). It also COUNTS
+    // every `fdatasync` attempt, so a test can prove the failed barrier is
+    // never retried — not at the next append, not at shutdown/close (the
+    // fsyncgate discipline: retrying `fdatasync` after EIO is the classic
+    // corruption).
+
+    #[derive(Clone)]
+    struct BarrierFaultFs {
+        inner: SimFs,
+        /// `0` = healthy; otherwise the raw errno `fdatasync` returns.
+        errno: Arc<AtomicI32>,
+        /// Total `fdatasync` attempts across every handle to this fs.
+        syncs: Arc<AtomicUsize>,
+    }
+    #[derive(Clone)]
+    struct BarrierFaultFile {
+        inner: <SimFs as Fs>::File,
+        errno: Arc<AtomicI32>,
+        syncs: Arc<AtomicUsize>,
+    }
+
+    impl Fs for BarrierFaultFs {
+        type File = BarrierFaultFile;
+        fn open(&self, path: &Path, opts: OpenOpts) -> io::Result<BarrierFaultFile> {
+            Ok(BarrierFaultFile {
+                inner: self.inner.open(path, opts)?,
+                errno: self.errno.clone(),
+                syncs: self.syncs.clone(),
+            })
+        }
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            self.inner.rename(from, to)
+        }
+        fn remove(&self, path: &Path) -> io::Result<()> {
+            self.inner.remove(path)
+        }
+    }
+
+    impl FileHandle for BarrierFaultFile {
+        fn pwrite(&self, off: u64, buf: &[u8]) -> io::Result<usize> {
+            self.inner.pwrite(off, buf)
+        }
+        fn pread(&self, off: u64, buf: &mut [u8]) -> io::Result<usize> {
+            self.inner.pread(off, buf)
+        }
+        fn fdatasync(&self) -> io::Result<()> {
+            self.syncs.fetch_add(1, Ordering::SeqCst);
+            let errno = self.errno.load(Ordering::SeqCst);
+            if errno != 0 {
+                // Barrier fault: bytes are NOT promoted to durable.
+                Err(io::Error::from_raw_os_error(errno))
+            } else {
+                self.inner.fdatasync()
+            }
+        }
+        fn len(&self) -> io::Result<u64> {
+            self.inner.len()
+        }
+        fn allocate(&self, len: u64) -> io::Result<()> {
+            self.inner.allocate(len)
+        }
+    }
+
+    /// One good `Os`-mode append (barrier succeeds), then a second whose
+    /// barrier fails with EIO: assert the FULL D8 policy in one shot — the
+    /// failed group is `Indeterminate` (never acked), the store is poisoned
+    /// (cause EIO), the watermark is frozen at the last known-durable
+    /// position, every subsequent write fails fast typed, the degraded flag
+    /// is readable, and the failed barrier is never retried (no extra
+    /// `fdatasync`, at the poisoning append or at shutdown).
+    #[test]
+    fn barrier_eio_poisons_store_full_d8_policy() {
+        let rt = SimRuntime::new(5);
+        let sim_fs = SimFs::new(Fault::Tail);
+        let errno = Arc::new(AtomicI32::new(0));
+        let syncs = Arc::new(AtomicUsize::new(0));
+        let bfs = BarrierFaultFs { inner: sim_fs, errno: errno.clone(), syncs: syncs.clone() };
+        let path = Path::new("/seg-eio");
+        let writer = seg(&bfs, path);
+
+        let r = rt.block_on(async {
+            let c = Committer::spawn(&rt, writer, Durability::Os);
+            let wm = c.watermark();
+
+            let o1 = c.append(req(1, 0, 3)).await.unwrap(); // real barrier → Acked
+            assert!(!c.is_degraded(), "healthy after a good barrier");
+            let wm_good = wm.get();
+
+            // Arm EIO on the NEXT barrier.
+            errno.store(libc::EIO, Ordering::SeqCst);
+            let o2 = c.append(req(1, 3, 4)).await.unwrap(); // written, barrier EIO
+            let degraded = c.is_degraded();
+            let cause = c.poison_cause();
+            let wm_frozen = wm.get();
+            let syncs_at_poison = syncs.load(Ordering::SeqCst);
+
+            // Every later write fails fast, and the store stays poisoned no
+            // matter how many attempts (sticky, no reset).
+            let mut later = Vec::new();
+            for v in [7u64, 9, 11] {
+                later.push(c.append(req(1, v, 2)).await);
+                assert!(c.is_degraded(), "poison is sticky across the lifetime");
+            }
+
+            c.shutdown().await;
+            let syncs_after_shutdown = syncs.load(Ordering::SeqCst);
+            (o1, o2, degraded, cause, wm_good, wm_frozen, later, syncs_at_poison, syncs_after_shutdown)
+        });
+        let (o1, o2, degraded, cause, wm_good, wm_frozen, later, syncs_at_poison, syncs_after) = r;
+
+        assert!(
+            matches!(o1, AppendOutcome::Acked { first_position: 0, last_position: 2 }),
+            "batch 1 earned a real barrier: {o1:?}"
+        );
+        assert_eq!(wm_good, 3, "watermark covers the acked prefix [0,3)");
+        assert_eq!(
+            o2,
+            AppendOutcome::Indeterminate,
+            "the failed barrier's group is Indeterminate, never Acked (fsyncgate)"
+        );
+        assert!(degraded, "an EIO barrier poisons the whole store");
+        assert_eq!(cause, Some(PoisonCause::Eio), "cause is retained for diagnostics");
+        assert_eq!(wm_frozen, 3, "watermark is FROZEN at the last known-durable position");
+        assert!(
+            later.iter().all(|r| *r == Err(AppendError::StorePoisoned)),
+            "every write after poison fails fast with a typed StorePoisoned: {later:?}"
+        );
+        // header(1) + o1 barrier(1) + o2 faulted barrier(1) = 3, and NOTHING
+        // after: the failed barrier is never retried, not by a later append
+        // (they fail before the writer) nor by close() at shutdown.
+        assert_eq!(syncs_at_poison, 3, "one barrier per: header, o1, o2's fault");
+        assert_eq!(syncs_after, 3, "poisoned shutdown drops the writer WITHOUT re-issuing fdatasync");
+    }
+
+    /// The SAME policy via the `ENOSPC`-at-barrier path, injected through the
+    /// sim fs's own fault set (`EnospcSite::Fdatasync`): poison, frozen
+    /// watermark, fail-fast writes, cause `Enospc`.
+    #[test]
+    fn barrier_enospc_poisons_store_full_d8_policy() {
+        let rt = SimRuntime::new(9);
+        let sim_fs = SimFs::new(Fault::Tail);
+        let path = Path::new("/seg-enospc");
+        let writer = seg(&sim_fs, path);
+
+        let (o2, degraded, cause, wm_frozen, o3) = rt.block_on(async {
+            let c = Committer::spawn(&rt, writer, Durability::Os);
+            let wm = c.watermark();
+            let _o1 = c.append(req(1, 0, 3)).await.unwrap(); // good barrier, wm → 3
+
+            // Arm ENOSPC on the next fdatasync (one-shot, FIFO).
+            sim_fs.inject_enospc(path, EnospcSite::Fdatasync);
+            let o2 = c.append(req(1, 3, 4)).await.unwrap(); // barrier ENOSPC
+            let degraded = c.is_degraded();
+            let cause = c.poison_cause();
+            let wm_frozen = wm.get();
+            let o3 = c.append(req(1, 7, 2)).await; // fail fast
+            c.shutdown().await;
+            (o2, degraded, cause, wm_frozen, o3)
+        });
+
+        assert_eq!(o2, AppendOutcome::Indeterminate, "ENOSPC barrier group is Indeterminate");
+        assert!(degraded, "an ENOSPC barrier poisons the store, same policy as EIO");
+        assert_eq!(cause, Some(PoisonCause::Enospc));
+        assert_eq!(wm_frozen, 3, "watermark frozen at the durable prefix");
+        assert_eq!(o3, Err(AppendError::StorePoisoned), "writes fail fast after ENOSPC poison");
+    }
+
+    /// Degraded reads: after a barrier poisons the store, a `ReadView` on the
+    /// same segment still serves — but only the pre-poison committed prefix,
+    /// because the watermark it snapshots is frozen. The never-durable bytes
+    /// of the poisoning batch sit in the medium yet are clamped away. The
+    /// reader can also OBSERVE the store is degraded via the shared flag.
+    #[test]
+    fn degraded_reads_serve_only_the_pre_poison_prefix() {
+        use crate::reader::ReadView;
+
+        let rt = SimRuntime::new(3);
+        let sim_fs = SimFs::new(Fault::Tail);
+        let errno = Arc::new(AtomicI32::new(0));
+        let syncs = Arc::new(AtomicUsize::new(0));
+        let bfs = BarrierFaultFs { inner: sim_fs, errno: errno.clone(), syncs };
+        let path = Path::new("/seg-degraded-read");
+        let writer = seg(&bfs, path);
+
+        let (prefix, degraded_flag) = rt.block_on(async {
+            let c = Committer::spawn(&rt, writer, Durability::Os);
+            // Two durable batches (3 + 2 events → positions [0,5)).
+            c.append(req(1, 0, 3)).await.unwrap();
+            c.append(req(1, 3, 2)).await.unwrap();
+
+            // Poison on the next barrier.
+            errno.store(libc::EIO, Ordering::SeqCst);
+            let o = c.append(req(1, 5, 4)).await.unwrap();
+            assert_eq!(o, AppendOutcome::Indeterminate);
+            assert!(c.is_degraded());
+
+            // A reader built from the committer's (now-frozen) watermark and
+            // the shared degraded flag.
+            let view = ReadView::new(bfs.clone(), path, c.watermark());
+            let flag = c.degraded();
+            let prefix = view.read_committed().unwrap();
+            let degraded_flag = flag.is_poisoned();
+            c.shutdown().await;
+            (prefix, degraded_flag)
+        });
+
+        assert_eq!(prefix.watermark, 5, "clamped to the frozen durable end");
+        assert_eq!(prefix.next_pos(), 5, "reads reach exactly the last durable position");
+        assert_eq!(prefix.event_count(), 5, "only the two pre-poison batches (3+2 events)");
+        assert_eq!(prefix.len(), 2, "the never-durable third batch is NOT served");
+        assert!(degraded_flag, "a reader can query the degraded flag");
+    }
+
+    /// Group mode: a barrier failure poisons the store the same way, and the
+    /// entire coalesced group that shared the failed barrier is downgraded to
+    /// `Indeterminate` (none of its batches is acked), with the poison sticky
+    /// for the whole convoy.
+    #[test]
+    fn group_barrier_eio_poisons_whole_group() {
+        let rt = SimRuntime::new(2);
+        let sim_fs = SimFs::new(Fault::Tail);
+        let errno = Arc::new(AtomicI32::new(0));
+        let syncs = Arc::new(AtomicUsize::new(0));
+        let bfs = BarrierFaultFs { inner: sim_fs, errno: errno.clone(), syncs };
+        let path = Path::new("/seg-grp-eio");
+        let writer = seg(&bfs, path);
+
+        let outcomes = rt.block_on(async {
+            // Arm EIO before any append: the FIRST group's barrier fails, so
+            // every batch coalesced into it must be Indeterminate.
+            errno.store(libc::EIO, Ordering::SeqCst);
+            let c = Committer::spawn(&rt, writer, Durability::group_default());
+            let mut joins = Vec::new();
+            for w in 0..4u64 {
+                let ap = c.appender();
+                joins.push(rt.spawn(async move { ap.append(req(w, 0, 3)).await }));
+            }
+            let mut outs = Vec::new();
+            for j in joins {
+                outs.push(j.await);
+            }
+            let degraded = c.is_degraded();
+            c.shutdown().await;
+            (outs, degraded)
+        });
+        let (outs, degraded) = outcomes;
+        assert!(degraded, "the group's failed barrier poisons the store");
+        // Every writer either shared the failed barrier (Indeterminate) or
+        // arrived after the poison tripped (StorePoisoned) — none is Acked.
+        for o in &outs {
+            match o {
+                Ok(AppendOutcome::Indeterminate) | Err(AppendError::StorePoisoned) => {}
+                other => panic!("no batch may be acked after a failed barrier: {other:?}"),
+            }
         }
     }
 
