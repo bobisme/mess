@@ -68,6 +68,28 @@ pin as `mess_db`), 4 writers x 10-event batches, 1M events, ~257 B payloads.
 | mess_log.vs_interim.buffered.speedup | 4.5 | mess-log buffered 4x10 (2.04M) / RocksDB 4x10 (453k), same batch, same machine | 2026-07-09 | derived from the two rows above |
 | composed_engine_a.buffered.ev_per_s | 1710000 | full composed Engine A (log + pointer index, index off the append path); 4 writers x 10; buffered; cited | 2026-07-08 | `spikes/perf_append/REPORT.md` |
 
+## Sealed read paths (mess-index, bn-1hx)
+
+Read paths across many sealed segments: coalesced per-stream replay, a parallel
+global scan (both `std::thread::scope`, no rayon), and a bounded-bytes LRU of
+decoded pointer blocks. Corpus: 24 segments tiling the A1 axis, 2,000 streams in
+every segment, 5 batches/stream/segment, 10 frames/batch = **2.4M events**, ~48k
+pointer blocks. **Blocks are uncompressed until Phase 5**, so these are pointer-
+index decode rates (varint decode + assembly, no zstd) — the Phase-5 decompress
+stage slots into the same staged path (`locate → materialize → decode →
+assemble`) and will pull them toward `perf_replay`'s 95M / 24.6M ev/s. Best-of-5
+wall; the byte-identity gate (parallel result == single-threaded reference,
+order-independent checksum) ran on every measured pass.
+
+| metric | value | conditions | date | source command |
+|---|---|---|---|---|
+| sealed.global_scan.ev_per_s | 1197000000 | 24-way parallel per-segment decode, concatenated in base_pos order; 2.4M events; byte-identical to sequential | 2026-07-09 | `cargo test -p mess-index --release --test sealed_read_paths bench -- --ignored --nocapture` |
+| sealed.stream_replay.ev_per_s | 1376000000 | coalesced replay of 1,000 random streams x 24 segments (1.2M events), batched across the working set; byte-identical to sequential | 2026-07-09 | as above |
+| sealed.stream_replay.floor | 2500000 | acceptance floor (>=2.5M ev/s stream replay) — PASS (~550x) | 2026-07-09 | as above |
+| sealed.block_cache.hit_rate | 0.602 | repeat replay of the same 1,000-stream set (two passes); 19,104 unique blocks, 4.8 MiB resident; bounded by decoded byte weight | 2026-07-09 | as above |
+| sealed.read.byte_identity | true | parallel == single-threaded reference on every run (stream + global), splitmix64 order-independent checksum | 2026-07-09 | as above |
+| sealed.read.sigbus_stance | typed-error | truncated sidecar => typed SidecarError at open (no mmap, no SIGBUS surface); survivors replay exact | 2026-07-09 | `cargo test -p mess-index --test sealed_read_paths truncated -- --nocapture` |
+
 ## Gate summary
 
 | metric | value |

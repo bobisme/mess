@@ -16,6 +16,11 @@ thiserror = { workspace = true }
 # bn-20e: crc32c over the sealed sidecar's content (same crate/algorithm as
 # mess-log's batch/footer CRCs, so the whole store speaks one checksum).
 crc32c = "0.6"
+# bn-1hx: bounded-bytes LRU of decoded pointer blocks for sealed stream replay
+# (the sealed read paths' decompressed-block cache). Already a workspace dep;
+# the sealed reader parallelizes with std scoped threads, no rayon. The `stats`
+# feature exposes the hit/miss counters the cache-hit-rate metric reports.
+quick_cache = { workspace = true, features = ["stats"] }
 
 # bn-20e: `#[cfg(kani)]` ptr-block round-trip proofs are compiled only by
 # `cargo kani`; teach the normal `cargo` build the cfg so it is not flagged

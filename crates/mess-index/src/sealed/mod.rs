@@ -22,6 +22,11 @@
 //!   gapless swap that lets the sealer evict a segment's active entries.
 //! - [`driver`] — the [`SealDriver`] and [`BackgroundSealer`] thread that runs
 //!   the seal off the append path.
+//! - [`replay`] — the read paths *across many* sealed segments (bn-1hx):
+//!   coalesced per-stream replay, the parallel global scan, and the always-on
+//!   byte-identity gate ([`ReplaySet`]).
+//! - [`block_cache`] — a bounded-bytes LRU of decoded pointer blocks wired into
+//!   stream replay and bypassed for point reads ([`BlockCache`]).
 //!
 //! # Staged passes (Phase 5 seam)
 //!
@@ -33,13 +38,17 @@
 //! columnar blocks alongside these pointer blocks; the pointer-block and
 //! handoff machinery here is unchanged by it.
 
+pub mod block_cache;
 pub mod driver;
 pub mod ptr_block;
+pub mod replay;
 pub mod segment;
 pub mod store;
 
+pub use block_cache::{BlockCache, CachedBlock};
 pub use driver::{BackgroundSealer, FinalizeFn, SealDriver, SealError};
 pub use ptr_block::{BatchPtr, DecodeError, SKIP_K};
+pub use replay::{ReplaySet, global_checksum, stream_checksum};
 pub use segment::{
     SealBatch, SealInput, SealStream, SealedSegmentIndex, SealedSegmentRef, SidecarError,
     encode_sidecar,
