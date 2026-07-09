@@ -1,0 +1,33 @@
+name: torn-matrix
+
+# bn-py3: the full A4 torn-write/sector-reorder conformance sweep
+# (`crates/mess-log/tests/torn_matrix.rs`), ported from
+# `spikes/torn_write/REPORT.md` to run against the PRODUCTION writer +
+# scanner. `torn_matrix_fast` (~1k cases) already runs on every PR as part
+# of the ordinary `cargo test -p mess-log` gate; `torn_matrix_full` is the
+# >=20,000-case sweep (6 configs x 4,000 iterations = 24,000 cases,
+# `#[ignore]`d in-source) that only runs here, nightly. Measured locally
+# (2026-07-08): ~1.7s in a debug build — cheap enough that this workflow
+# stays a plain `cargo test`, no release build needed.
+
+on:
+  schedule:
+    # 03:41 UTC daily — off-peak, staggered from sanitizers.yml's 03:17.
+    - cron: "41 3 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  torn-matrix-full:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: torn-matrix
+
+      - name: cargo test -p mess-log --test torn_matrix -- --ignored (full A4 matrix)
+        run: |
+          cargo test -p mess-log --test torn_matrix -- --ignored --nocapture

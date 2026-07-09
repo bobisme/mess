@@ -38,3 +38,10 @@ alias wt := watch-test
 # BFS checker) — see the bn-25j bone summary for the invocation history.
 @tsan *args='':
 	env RUSTFLAGS="-Zsanitizer=thread" cargo +nightly test -p mess-log --target x86_64-unknown-linux-gnu -Z build-std --tests "$@"
+
+# bn-py3: the full A4 torn-write/sector-reorder matrix (>=20k cases,
+# `#[ignore]`d in-source; the ~1k-case `torn_matrix_fast` already runs in the
+# ordinary `just test` / `cargo test -p mess-log` gate). Also runs nightly
+# via .github/workflows/torn-matrix.yml. Measured locally: ~1.7s debug.
+@torn-matrix-full *args='':
+	cargo test -p mess-log --test torn_matrix -- --ignored --nocapture "$@"
