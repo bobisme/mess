@@ -206,3 +206,13 @@
 1783567879911512	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExpQI		item.comment	bn-y0b	{"body":"Merged partial (acceptance-predicate + position-arithmetic proofs, 7/7 harnesses verify). Remaining: watermark-advance no-overflow proof (watermark.rs just landed via bn-11m — follow-up dispatched) and ptr/cursor round-trips (split to a new bone blocked on bn-25d)."}	blake3:303rbzl4D4AFa4GtEt6SRRrvxe_ZZpuBLHhnb-0Dv3Y
 1783567903186930	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExpgI		item.move	bn-y0b	{"state":"doing"}	blake3:ScGdGTBACZv_fERkPz97Rt-FWrYwYFbSJvyUFdsL8e8
 1783567903327628	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExpwI		item.assign	bn-y0b	{"action":"assign","agent":"mess-dev"}	blake3:z9dDAE2cbjlJgusqHgFCo9lcWruZPaLl_5LDuBasYo4
+1783567935385834	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExqAI		item.move	bn-12d	{"state":"doing"}	blake3:bRL0xE_TfWA-gqmCmkv_zozhJLl1N30TJLi8COlfbNA
+1783567935404371	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExqQI		item.assign	bn-12d	{"action":"assign","agent":"mess-dev"}	blake3:n3zjKwAUZIlZ4OwelIql63H4GVfsNLHFzxCWwYdCdOM
+1783567935428537	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExqgI		item.move	bn-36y	{"state":"doing"}	blake3:BckSjrFrGSwfXNAGJzGDSGjkdX33M_MzyEF2MUea6IY
+1783567935438955	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExqwI		item.assign	bn-36y	{"action":"assign","agent":"mess-dev"}	blake3:t7CBVq--Z-fH62SLrQJU9Ml4vnqqWYNs1JIH4I3WDa0
+1783567935471504	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExrAI		item.move	bn-3jg	{"state":"doing"}	blake3:R3ipIAjZWKkL1JZxpcawiKcopcZXQhVMtnx3soFxwLw
+1783567935479269	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExrQI		item.assign	bn-3jg	{"action":"assign","agent":"mess-dev"}	blake3:nytOJb_KZdT40uoY8sXF_t3wyshp40Gw49goWGV0UHA
+1783567935500185	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExrgI		item.move	bn-2iq	{"state":"doing"}	blake3:T9Ghg8mQn9Si-RkvZRatnf-1j0r4GQL0mogTN8rd7lU
+1783567935507048	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExrwI		item.assign	bn-2iq	{"action":"assign","agent":"mess-dev"}	blake3:oY6Po3vyKpHkmsw-JFxqDK31HZNuPVr61rzo6nty3fo
+1783567935534478	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExsAI		item.move	bn-py3	{"state":"doing"}	blake3:4askQuaAlQU0jHAP8kiuzWYRLRSVmzy8SuOuDR91NVE
+1783567935548983	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExsQI		item.assign	bn-py3	{"action":"assign","agent":"mess-dev"}	blake3:EIIhMpJ2rcv9wkJbY_ST9LWGYflMbKvsMXfbtzi-ApE
