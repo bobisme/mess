@@ -4,6 +4,7 @@
 use mess_core::{Aggregate, CodecError, CommandError, Decide, Event};
 
 use crate::backend::{AppendError, Backend, RecordToAppend};
+use crate::cache::StateCache;
 use crate::retry::RetryPolicy;
 use crate::snapshot::{
     BlobPtr, SnapshotRef, SnapshotStore, Snapshottable, StateCodecError,
@@ -83,22 +84,60 @@ pub struct Commit {
 /// The event-store facade over any [`Backend`].
 ///
 /// Cloning is cheap when the backend is cheap to clone (e.g. an `Arc`-backed
-/// handle); each clone shares the same backend and retry configuration.
+/// handle); each clone shares the same backend, retry configuration, and — when
+/// enabled — the same hot-aggregate [`StateCache`] (its entries live behind an
+/// `Arc`), so warm state is shared across clones and across concurrent writers.
 #[derive(Debug, Clone)]
 pub struct EventStore<B> {
     backend: B,
     policy: RetryPolicy,
     page_size: usize,
+    /// Hot-aggregate state cache (doc-02). Disabled by default, so the base
+    /// [`load`](Self::load)/[`command`](Self::command) behavior — and every
+    /// existing test — is unchanged until a caller opts in with
+    /// [`with_cache_capacity`](Self::with_cache_capacity).
+    cache: StateCache,
 }
 
 impl<B: Backend> EventStore<B> {
-    /// Wrap `backend` with the default retry policy and page size.
+    /// Wrap `backend` with the default retry policy and page size, and **no**
+    /// state cache (the cache is opt-in via
+    /// [`with_cache_capacity`](Self::with_cache_capacity)).
     pub fn new(backend: B) -> Self {
         Self {
             backend,
             policy: RetryPolicy::default(),
             page_size: DEFAULT_PAGE_SIZE,
+            cache: StateCache::disabled(),
         }
+    }
+
+    /// Enable the hot-aggregate [`StateCache`] with room for `capacity` streams.
+    ///
+    /// This is the on-switch for the warm command/read path
+    /// ([`command_cached`](Self::command_cached) / [`load_hot`](Self::load_hot)).
+    /// Off (the default) those methods still work — they simply run the
+    /// cache-miss fallthrough on every call, which is the *identical* code path,
+    /// so the cache changes performance, never results.
+    #[must_use]
+    pub fn with_cache_capacity(mut self, capacity: usize) -> Self {
+        self.cache = StateCache::with_capacity(capacity);
+        self
+    }
+
+    /// Install a pre-built [`StateCache`] (e.g. a shared or explicitly disabled
+    /// one). See [`with_cache_capacity`](Self::with_cache_capacity) for the
+    /// common case.
+    #[must_use]
+    pub fn with_cache(mut self, cache: StateCache) -> Self {
+        self.cache = cache;
+        self
+    }
+
+    /// Borrow the hot-aggregate state cache (for inspection / tests).
+    #[must_use]
+    pub fn cache(&self) -> &StateCache {
+        &self.cache
     }
 
     /// Replace the optimistic-retry policy.
@@ -452,6 +491,187 @@ impl<B: SnapshotStore> EventStore<B> {
             }
         }
         Ok((state, version, replayed))
+    }
+
+    /// The warm-path north star: `version-check → decide → append` with **no
+    /// replay and no fold** when the aggregate is cached, a write-through fold
+    /// on success, and O(events-you-lost-the-race-to) **delta catch-up** on a
+    /// version conflict.
+    ///
+    /// Semantically identical to [`command`](Self::command) — same optimistic
+    /// retry, same [`Commit`], same error taxonomy. The only difference is
+    /// *cost*:
+    ///
+    /// - **Warm hit:** start from the cached `(version, state)` and go straight
+    ///   to `decide → append`. The version is proven by the append itself (the
+    ///   check it does anyway), so the warm path reads **zero events**.
+    /// - **Success:** the caller already holds the events it wrote, so it folds
+    ///   them into the cached state (write-through) — no re-read, no
+    ///   invalidation protocol.
+    /// - **Conflict:** fetch only the events appended since the cached version
+    ///   and fold them in (via [`replay_tail`](Self::replay_tail)), then retry —
+    ///   so a lost race costs O(events lost), not a full reload.
+    /// - **Miss / cache disabled:** fall through to the snapshot + tail
+    ///   [`load_cached`](Self::load_cached) — the *same* code path either way,
+    ///   so the cache changes performance, never results.
+    ///
+    /// `A: Clone` because the write-through fold and the delta catch-up build a
+    /// new cached state from the one in hand; `A: Snapshottable` because the
+    /// miss path is the snapshot-accelerated load.
+    ///
+    /// # Backoff under contention
+    ///
+    /// The delta catch-up makes a conflict retry *cheap* — but that cheapness is
+    /// a double-edged sword under genuine multi-writer contention on one hot
+    /// stream: cheap retries collide back-to-back, where the uncached full
+    /// reload incidentally spaces writers out. So `command_cached` needs a
+    /// [`RetryPolicy`](crate::RetryPolicy) with **real jittered backoff** (the
+    /// [default](crate::RetryPolicy::default)) under contention; a
+    /// `no_backoff` policy is for deterministic single-threaded tests only and
+    /// can let a thundering herd starve one writer into conflict exhaustion.
+    /// The backoff is still honored on every conflict here regardless.
+    pub async fn command_cached<A, C>(
+        &self,
+        stream_id: &str,
+        cmd: C,
+    ) -> Result<
+        Commit,
+        CommandError<<A as Decide<C>>::Rejection, StoreError<B::Error>>,
+    >
+    where
+        A: Snapshottable + Decide<C> + Clone,
+        C: Clone,
+    {
+        let mut attempt: u32 = 0;
+        // Warm hit -> start from cached (version, state), reading nothing.
+        // Miss / off -> `None`, filled by the snapshot + tail load below.
+        // INVARIANT maintained throughout the loop: `state` is folded to
+        // exactly `version`, so a delta catch-up from `version` is correct.
+        let mut current: Option<(Version, A)> = self.cache.get::<A>(stream_id);
+        loop {
+            attempt += 1;
+            let (version, state) = match current.take() {
+                Some(warm) => warm,
+                None => {
+                    let loaded = self
+                        .load_cached::<A>(stream_id)
+                        .await
+                        .map_err(CommandError::Store)?;
+                    (loaded.version, loaded.state)
+                }
+            };
+            let events =
+                state.decide(cmd.clone()).map_err(CommandError::Domain)?;
+            if events.is_empty() {
+                // Nothing written, so no fresh version proof — but record the
+                // state we hold so a following command stays warm.
+                self.cache.put::<A>(stream_id, version, state);
+                return Ok(Commit {
+                    version,
+                    last_global_position: None,
+                    events_appended: 0,
+                    attempts: attempt,
+                });
+            }
+            let records = encode_events(&events)
+                .map_err(|e| CommandError::Store(StoreError::Codec(e)))?;
+            match self.backend.append_batch(stream_id, version, &records).await
+            {
+                Ok(appended) => {
+                    // Write-through fold: fold the events we just wrote into the
+                    // cached state instead of re-reading them.
+                    let mut folded = state;
+                    for e in &events {
+                        folded.apply(e);
+                    }
+                    self.cache.put::<A>(stream_id, appended.version, folded);
+                    return Ok(Commit {
+                        version: appended.version,
+                        last_global_position: Some(
+                            appended.last_global_position,
+                        ),
+                        events_appended: events.len(),
+                        attempts: attempt,
+                    });
+                }
+                Err(AppendError::Conflict { .. }) => {
+                    if attempt >= self.policy.max_attempts {
+                        // Give up: our optimistic state lost the race for good;
+                        // drop it so the next caller reloads clean.
+                        self.cache.invalidate(stream_id);
+                        return Err(CommandError::Conflict {
+                            stream: stream_id.to_string(),
+                            attempts: attempt,
+                        });
+                    }
+                    let backoff = self.policy.backoff_for(attempt);
+                    if !backoff.is_zero() {
+                        tokio::time::sleep(backoff).await;
+                    }
+                    // Delta catch-up: fold ONLY the events appended since our
+                    // stale `version` — O(events lost), not a full reload — then
+                    // retry against the caught-up state.
+                    let (caught, caught_version, _delta) = self
+                        .replay_tail::<A>(stream_id, state, version)
+                        .await
+                        .map_err(CommandError::Store)?;
+                    self.cache.put::<A>(
+                        stream_id,
+                        caught_version,
+                        caught.clone(),
+                    );
+                    current = Some((caught_version, caught));
+                }
+                Err(AppendError::Backend(e)) => {
+                    return Err(CommandError::Store(StoreError::Backend(e)));
+                }
+            }
+        }
+    }
+
+    /// The warm-path read: return the hot aggregate for `stream_id`, folding at
+    /// most the delta since the cache last saw it.
+    ///
+    /// - **Warm hit:** one [`head`](Backend::head) check (cheap metadata,
+    ///   **zero event reads**). If the stream has not moved, the cached state is
+    ///   returned untouched; if it has, only the delta events are folded in and
+    ///   the cache is refreshed.
+    /// - **Miss / cache disabled:** the snapshot + tail
+    ///   [`load_cached`](Self::load_cached), then the result warms the cache —
+    ///   the same code path as an uncached [`load_cached`](Self::load_cached).
+    ///
+    /// [`Loaded::events_replayed`] counts only what *this* call folded: `0` on a
+    /// fully-warm hit, the delta length on a catch-up, the tail length on a
+    /// miss — so a test can prove the warm read touched no events. The returned
+    /// state is always byte-identical to what [`load`](Self::load) would yield.
+    pub async fn load_hot<A: Snapshottable + Clone>(
+        &self,
+        stream_id: &str,
+    ) -> Result<Loaded<A>, StoreError<B::Error>> {
+        if let Some((version, state)) = self.cache.get::<A>(stream_id) {
+            let head = self
+                .backend
+                .head(stream_id)
+                .await
+                .map_err(StoreError::Backend)?;
+            if head == version {
+                // Fully warm: nothing new to fold, no events read.
+                return Ok(Loaded { state, version, events_replayed: 0 });
+            }
+            // Behind: fold only the delta since the cached version.
+            let (caught, caught_version, delta) =
+                self.replay_tail::<A>(stream_id, state, version).await?;
+            self.cache.put::<A>(stream_id, caught_version, caught.clone());
+            return Ok(Loaded {
+                state: caught,
+                version: caught_version,
+                events_replayed: delta,
+            });
+        }
+        // Miss / disabled: snapshot + tail, then warm the cache.
+        let loaded = self.load_cached::<A>(stream_id).await?;
+        self.cache.put::<A>(stream_id, loaded.version, loaded.state.clone());
+        Ok(loaded)
     }
 }
 
