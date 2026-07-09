@@ -1,0 +1,49 @@
+name: dst
+
+# bn-3kn: the full 2k+-scenario whole-store DST profile
+# (crates/mess-log/tests/dst_scenarios.rs::dst_full_profile). The fast
+# ~200-scenario profile (`dst_fast_profile`) runs in the ordinary
+# `cargo test` gate on every PR; this lane runs the `#[ignore]`d full profile
+# on a nightly schedule, alongside crash-harness.yml/torn-matrix.yml, so the
+# heavier sweep does not sit on the per-PR critical path.
+#
+# The harness is fully deterministic and in-memory (SimRuntime + the sim
+# fault fs), so it needs no real device, no threads, and no `-Z build-std`:
+# a plain nightly `cargo test -- --ignored` reproduces every case, and a
+# failure prints the offending seed for a one-line local repro.
+
+on:
+  schedule:
+    # 04:47 UTC daily — off-peak, staggered off crash-harness.yml (04:23)
+    # and torn-matrix.yml/sigkill.yml (03:41) and sanitizers.yml (03:17).
+    - cron: "47 4 * * *"
+  workflow_dispatch: {}
+  # Also run when the harness or the log crate's durability/recovery/reader
+  # code changes, so a regression is caught at merge rather than the next
+  # night.
+  pull_request:
+    paths:
+      - "crates/mess-log/**"
+      - ".github/workflows/dst.yml"
+
+concurrency:
+  group: dst-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  full-profile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: dst
+
+      - name: full 2k+-scenario DST profile
+        run: |
+          cargo test -p mess-log --test dst_scenarios \
+            dst_full_profile -- --ignored --nocapture
