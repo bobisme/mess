@@ -24,7 +24,7 @@ impl<'a> GlobalRecord<'a> {
         let stream_position = msg
             .expected_position
             .map(|x| x.next())
-            .unwrap_or(StreamPos::Sequential(0))
+            .unwrap_or(StreamPos::new(0))
             .encode();
         Ok(Self {
             id: msg.id.to_string().into(),

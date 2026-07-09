@@ -173,7 +173,7 @@ mod test {
         let meta = [99u8; 100];
 
         let rows = std::iter::once(None).chain((0u64..).map(Some)).map(|x| {
-            let expected_stream_position = x.map(StreamPos::Sequential);
+            let expected_stream_position = x.map(StreamPos::new);
             let i = match x {
                 Some(x) => x + 1,
                 None => 0,
@@ -230,7 +230,7 @@ mod test {
             assert!(messages.len() == 6);
             let m = &messages[0];
             assert!(m.global_position == 1);
-            assert!(m.stream_position == StreamPos::Sequential(0));
+            assert!(m.stream_position == StreamPos::new(0));
             // assert_ne!(m.time_ms, 0);
             assert!(m.stream_name == "stream1");
             assert!(m.message_type == "MessageType");
@@ -250,7 +250,7 @@ mod test {
             // assert!(messages.len() == 2);
             let m = &messages[0];
             assert!(m.global_position == 5);
-            assert!(m.stream_position == StreamPos::Sequential(2));
+            assert!(m.stream_position == StreamPos::new(2));
             // assert_ne!(m.time_ms, 0);
             assert!(m.stream_name == "stream1");
             assert!(m.message_type == "MessageType");
@@ -285,7 +285,7 @@ mod test {
             let db = test_db(5);
             let opts = GetMessages::default()
                 .in_stream("stream1")
-                .from_stream_position(StreamPos::Sequential(2));
+                .from_stream_position(StreamPos::new(2));
             let messages =
                 Fetch::<(OptStream<'_>, crate::read::OptStreamPos)>::fetch(
                     &db, opts,
@@ -294,11 +294,11 @@ mod test {
                 .unwrap();
 
             assert!(messages.len() == 3);
-            assert!(messages[0].stream_position == StreamPos::Sequential(2));
+            assert!(messages[0].stream_position == StreamPos::new(2));
             assert!(messages[0].stream_name == "stream1");
             assert!(
                 messages.last().unwrap().stream_position
-                    == StreamPos::Sequential(4)
+                    == StreamPos::new(4)
             );
         }
 
@@ -307,7 +307,7 @@ mod test {
             let db = test_db(5);
             let opts = GetMessages::default()
                 .in_stream("stream1")
-                .from_stream_position(StreamPos::Sequential(4));
+                .from_stream_position(StreamPos::new(4));
             let messages =
                 Fetch::<(OptStream<'_>, crate::read::OptStreamPos)>::fetch(
                     &db, opts,
@@ -318,7 +318,7 @@ mod test {
             // only the last message of stream1; never spills into stream2
             assert!(messages.len() == 1);
             assert!(messages[0].stream_name == "stream1");
-            assert!(messages[0].stream_position == StreamPos::Sequential(4));
+            assert!(messages[0].stream_position == StreamPos::new(4));
         }
         //
         //     #[rstest]

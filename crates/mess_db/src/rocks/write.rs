@@ -72,7 +72,7 @@ fn next_stream_pos<'a>(
 ) -> Result<StreamKey<'a>> {
     match (expected_position, last_stream) {
         (None, None) => {
-            Ok(StreamKey::new(stream_name.into(), StreamPos::Sequential(0)))
+            Ok(StreamKey::new(stream_name.into(), StreamPos::new(0)))
         }
         (Some(a), Some(key)) if a == key.position => Ok(key.next()),
         (expected, key) => Err(Error::WrongStreamPosition {
@@ -167,12 +167,7 @@ pub fn write_mess(
     msg: WriteMessage,
     ser: &mut WriteSerializer,
 ) -> Result<Position> {
-    match msg.expected_stream_position {
-        None | Some(StreamPos::Sequential(_)) => {
-            write_serial_mess(db, msg.into(), ser)
-        }
-        Some(StreamPos::Relaxed(_)) => Err(Error::UnsupportedRelaxed),
-    }
+    write_serial_mess(db, msg.into(), ser)
 }
 
 pub fn write_serial_mess(
@@ -192,12 +187,7 @@ pub async fn write_mess_async<'a>(
     msg: WriteMessage<'a>,
     ser: &mut WriteSerializer,
 ) -> Result<Position> {
-    match msg.expected_stream_position {
-        None | Some(StreamPos::Sequential(_)) => {
-            write_serial_mess_async(db, msg.into(), ser).await
-        }
-        Some(StreamPos::Relaxed(_)) => Err(Error::UnsupportedRelaxed),
-    }
+    write_serial_mess_async(db, msg.into(), ser).await
 }
 
 pub async fn write_serial_mess_async<'a>(
@@ -332,7 +322,7 @@ mod test_write_mess {
             message_type: "someMsgType".into(),
             data: Cow::Borrowed(b"{\"a\": 1})"),
             metadata: Cow::Borrowed(b"{\"b\": 2}"),
-            expected_stream_position: Some(StreamPos::Sequential(0)),
+            expected_stream_position: Some(StreamPos::new(0)),
         };
         write_mess(&db, msg, &mut ser).unwrap();
         let msg = WriteMessage {
@@ -341,7 +331,7 @@ mod test_write_mess {
             message_type: "someMsgType".into(),
             data: Cow::Borrowed(b"{\"a\": 1})"),
             metadata: Cow::Borrowed(b"{\"b\": 2}"),
-            expected_stream_position: Some(StreamPos::Sequential(0)),
+            expected_stream_position: Some(StreamPos::new(0)),
         };
         write_mess(&db, msg, &mut ser).unwrap();
         db
@@ -367,7 +357,7 @@ mod test_write_mess {
         let bytes = db
             .get_cf(
                 db.stream(),
-                StreamKey::new("stream1".into(), StreamPos::Sequential(0))
+                StreamKey::new("stream1".into(), StreamPos::new(0))
                     .as_bytes(),
             )
             .unwrap()
@@ -403,22 +393,6 @@ mod test_write_mess {
     }
 
     #[rstest::rstest]
-    fn relaxed_writes_error_instead_of_panicking() {
-        let db = SelfDestructingDB::new_tmp();
-        let mut ser = ser();
-        let msg = WriteMessage {
-            id: Id::new(),
-            stream_name: "s1".into(),
-            message_type: "someMsgType".into(),
-            data: Cow::Borrowed(b"{}"),
-            metadata: Cow::Borrowed(b"{}"),
-            expected_stream_position: Some(StreamPos::Relaxed(0)),
-        };
-        let result = write_mess(&db, msg, &mut ser).unwrap_err();
-        assert!(let Error::UnsupportedRelaxed = result);
-    }
-
-    #[rstest::rstest]
     fn global_position_does_not_leak_across_db_instances() {
         // Regression: the last-global cache used to be a process-wide
         // `static mut`, so a fresh DB inherited another instance's position.
@@ -450,9 +424,9 @@ mod test_write_mess {
             expected_stream_position: None,
         };
         let mut msg2 = msg1.clone();
-        msg2.expected_stream_position = Some(StreamPos::Sequential(0));
+        msg2.expected_stream_position = Some(StreamPos::new(0));
         let mut msg3 = msg1.clone();
-        msg3.expected_stream_position = Some(StreamPos::Sequential(2));
+        msg3.expected_stream_position = Some(StreamPos::new(2));
 
         let mut ser = ser();
         write_mess(&db, msg1, &mut ser).unwrap();

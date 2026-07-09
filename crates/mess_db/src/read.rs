@@ -14,7 +14,7 @@ pub const LIMIT_DEFAULT: usize = 1_000;
 /// let global = GetMessages::default().from_global(200).with_limit(100);
 /// let stream = GetMessages::default()
 ///     .in_stream("some_stream_name")
-///     .from_stream_position(StreamPos::Sequential(3));
+///     .from_stream_position(StreamPos::new(3));
 /// ```
 // type states for GetMessages options
 #[derive(Default, Debug, Clone, Copy, PartialEq)]
@@ -76,7 +76,7 @@ impl<Strm, Gpos, Spos> GetMessages<Strm, Gpos, Spos> {
 }
 
 impl<Strm, Gpos, Spos> GetMessages<Strm, Gpos, Spos> {
-    pub fn in_stream(self, name: &str) -> GetMessages<OptStream, Gpos, Spos> {
+    pub fn in_stream(self, name: &str) -> GetMessages<OptStream<'_>, Gpos, Spos> {
         let name = name.to_string();
         GetMessages {
             start_global_position: self.start_global_position,
@@ -97,65 +97,6 @@ impl Default for GetMessages<Unset, Unset, Unset> {
         }
     }
 }
-
-pub(crate) enum GetMessagesOptions<'a> {
-    Global {
-        start_position: u64,
-        limit: usize,
-    },
-    Stream {
-        stream: Cow<'a, str>,
-        global_position: Option<u64>,
-        stream_position: Option<StreamPos>,
-        limit: usize,
-    },
-}
-
-impl From<GetMessages<Unset, OptGlobalPos, Unset>> for GetMessagesOptions<'_> {
-    fn from(value: GetMessages<Unset, OptGlobalPos, Unset>) -> Self {
-        Self::Global {
-            start_position: value.start_global_position.0,
-            limit: value.limit,
-        }
-    }
-}
-
-// impl From<GetMessages<OptStream<'_>, OptGlobalPos, Unset>>
-//     for GetMessagesOptions<'_>
-// {
-//     fn from(value: GetMessages<OptStream, OptGlobalPos, Unset>) -> Self {
-//         Self::Stream {
-//             stream: value.stream.0,
-//             global_position: Some(value.start_global_position.0),
-//             stream_position: None,
-//             limit: value.limit,
-//         }
-//     }
-// }
-//
-// impl From<GetMessages<OptStream<'_>, Unset, Unset>> for GetMessagesOptions<'_> {
-//     fn from(value: GetMessages<OptStream, Unset, Unset>) -> Self {
-//         Self::Stream {
-//             stream: value.stream.0,
-//             global_position: None,
-//             stream_position: None,
-//             limit: value.limit,
-//         }
-//     }
-// }
-//
-// impl From<GetMessages<OptStream<'_>, Unset, OptStreamPos>>
-//     for GetMessagesOptions<'_>
-// {
-//     fn from(value: GetMessages<OptStream, Unset, OptStreamPos>) -> Self {
-//         Self::Stream {
-//             stream: value.stream.0,
-//             global_position: None,
-//             stream_position: Some(value.start_stream_position.0),
-//             limit: value.limit,
-//         }
-//     }
-// }
 
 #[cfg(test)]
 mod test {

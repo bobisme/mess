@@ -87,9 +87,10 @@ pub enum Version {
 impl From<Version> for StreamPos {
     #[inline]
     fn from(value: Version) -> Self {
+        // `StreamPos` is a plain u64 in v1 (see mess_db ADR 0001); relaxed
+        // ordering is unavailable, so both variants collapse to the position.
         match value {
-            Version::Sequential(x) => Self::Sequential(x),
-            Version::Relaxed(x) => Self::Relaxed(x),
+            Version::Sequential(x) | Version::Relaxed(x) => Self::new(x),
         }
     }
 }
@@ -97,10 +98,7 @@ impl From<Version> for StreamPos {
 impl From<StreamPos> for Version {
     #[inline]
     fn from(value: StreamPos) -> Self {
-        match value {
-            StreamPos::Sequential(x) => Self::Sequential(x),
-            StreamPos::Relaxed(x) => Self::Relaxed(x),
-        }
+        Self::Sequential(value.position())
     }
 }
 

@@ -72,7 +72,7 @@ pub struct Request {
 }
 
 impl Request {
-    fn new(
+    const fn new(
         body: RequestBody,
         response_chan: oneshot::Sender<Response>,
     ) -> Request {
@@ -112,29 +112,6 @@ pub struct Response {
     pub body: ResponseBody,
 }
 
-const _: () = {
-    const fn is_sync(_: &impl Sync) -> bool {
-        true
-    }
-    const U: &[u8] = &[];
-    // const REQ: Request = Request {
-    //     body: RequestBody::Write(WriteMessage {
-    //         id: Id::from_u128(1234),
-    //         stream_name: Cow::Borrowed(""),
-    //         message_type: Cow::Borrowed(""),
-    //         data: Cow::Borrowed(U),
-    //         metadata: Cow::Borrowed(U),
-    //         expected_stream_position: None,
-    //     }),
-    // };
-    // assert!(is_sync(&REQ));
-    // const RES: Response = Response {
-    //     body: ResponseBody::Write {
-    //         pos: Ok(Position { global: 0, stream: StreamPos::Sequential(0) }),
-    //     },
-    // };
-    // assert!(is_sync(&RES));
-};
 
 pub struct Actor {
     inbox: mpsc::Receiver<Request>,
@@ -339,17 +316,10 @@ mod test_actor {
     async fn actor_survives_write_errors_and_keeps_serving() {
         let h = TmpHandle::new();
 
-        // Unsupported relaxed write must come back as an error...
+        // A wrong expected position comes back as its typed error...
         let res = h
             .handle
-            .put_message(write_msg("s1", Some(StreamPos::Relaxed(0))))
-            .await;
-        assert!(let Err(Error::UnsupportedRelaxed) = res);
-
-        // ...and a wrong expected position as its typed error...
-        let res = h
-            .handle
-            .put_message(write_msg("s1", Some(StreamPos::Sequential(41))))
+            .put_message(write_msg("s1", Some(StreamPos::new(41))))
             .await;
         assert!(let Err(Error::WrongStreamPosition { .. }) = res);
 
@@ -368,7 +338,7 @@ mod test_actor {
             h.handle
                 .put_message(write_msg(
                     "s1",
-                    Some(StreamPos::Sequential(v)),
+                    Some(StreamPos::new(v)),
                 ))
                 .await
                 .unwrap();
@@ -376,14 +346,14 @@ mod test_actor {
 
         let req = GetMessages::default()
             .in_stream("s1")
-            .from_stream_position(StreamPos::Sequential(2));
+            .from_stream_position(StreamPos::new(2));
         let messages = h.handle.fetch_messages(req).await.unwrap();
         let messages: Result<Vec<_>> = messages.into_iter().collect();
         let messages = messages.unwrap();
 
         assert!(messages.len() == 2);
-        assert!(messages[0].stream_position == StreamPos::Sequential(2));
-        assert!(messages[1].stream_position == StreamPos::Sequential(3));
+        assert!(messages[0].stream_position == StreamPos::new(2));
+        assert!(messages[1].stream_position == StreamPos::new(3));
 
         h.cleanup().await;
     }
@@ -394,7 +364,7 @@ mod test_actor {
         h.handle.put_message(write_msg("s1", None)).await.unwrap();
         h.handle.put_message(write_msg("s2", None)).await.unwrap();
         h.handle
-            .put_message(write_msg("s1", Some(StreamPos::Sequential(0))))
+            .put_message(write_msg("s1", Some(StreamPos::new(0))))
             .await
             .unwrap();
 

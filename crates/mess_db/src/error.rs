@@ -14,19 +14,12 @@ pub enum Error {
     // #[error(transparent)]
     // External(#[from] Box<dyn std::error::Error>),
     #[error(transparent)]
-    #[cfg(feature = "rusqlite")]
-    RusqliteError(#[from] ::rusqlite::Error),
-
-    #[error(transparent)]
     #[cfg(feature = "rocksdb")]
     RocksDbError(#[from] ::rocksdb::Error),
 
     #[error("could not parse key to int")]
     #[cfg(feature = "rocksdb")]
     ParseKeyError,
-
-    #[error("database migration {0} failed: {1}")]
-    MigrationFailed(i32, String),
 
     #[error(transparent)]
     JSONError(#[from] serde_json::Error),
@@ -51,9 +44,6 @@ pub enum Error {
     // InvalidHeader { expected: String, found: String },
     // #[error("unknown data store error")]
     // Unknown,
-    #[error("could not get prepared statement {}", key)]
-    PreparedStmtError { key: usize },
-
     #[error("record serialization: {0}")]
     SerError(String),
 
@@ -74,9 +64,6 @@ pub enum Error {
 
     #[error("kill was triggered, so action cancelled")]
     Cancelled,
-
-    #[error("relaxed stream positions are not yet supported")]
-    UnsupportedRelaxed,
 }
 
 impl Error {

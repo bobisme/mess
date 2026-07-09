@@ -30,11 +30,6 @@ version = "0.21"
 features = ["zstd"]
 optional = true
 
-[dependencies.rusqlite]
-version = "0.29.0"
-features = ["serde_json"]
-optional = true
-
 [dependencies.serde]
 version = "1.0.175"
 features = ["derive"]
@@ -60,12 +55,6 @@ features = ["env-filter"]
 [features]
 default = ["rocksdb"]
 rocksdb = ["dep:rocksdb"]
-rusqlite = ["dep:rusqlite"]
-
-[[bench]]
-name = "write_sqlite_rusqlite"
-harness = false
-required-features = ["rusqlite"]
 
 [[bench]]
 name = "write_rocksdb"

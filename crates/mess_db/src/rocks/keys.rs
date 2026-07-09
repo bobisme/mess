@@ -48,7 +48,7 @@ impl<'a> StreamKey<'a> {
 
     #[must_use]
     pub const fn max(stream: Cow<'a, str>) -> Self {
-        Self { stream, position: StreamPos::Relaxed(u64::MAX) }
+        Self { stream, position: StreamPos::new(u64::MAX) }
     }
 
     #[must_use]
@@ -129,10 +129,10 @@ mod test_stream_key {
 
     #[test]
     fn test_as_bytes() {
-        let key =
-            StreamKey::new("somestream".into(), StreamPos::Sequential(13));
+        // Plain-u64 identity encoding (ADR 0001): position 13 -> 0x0D.
+        let key = StreamKey::new("somestream".into(), StreamPos::new(13));
         let bytes = key.as_bytes();
-        assert!(bytes == b"somestream|\x00\x00\x00\x00\x00\x00\x00\x1A");
+        assert!(bytes == b"somestream|\x00\x00\x00\x00\x00\x00\x00\x0D");
     }
 
     mod from_bytes {
@@ -142,10 +142,10 @@ mod test_stream_key {
         #[test]
         fn it_works() {
             // Test case 1: Valid input
-            let bytes = b"test_stream|\x00\x00\x00\x00\x00\x00\x00\x1A";
+            let bytes = b"test_stream|\x00\x00\x00\x00\x00\x00\x00\x0D";
             let expected_result = StreamKey {
                 stream: "test_stream".into(),
-                position: StreamPos::Sequential(13),
+                position: StreamPos::new(13),
             };
             assert!(StreamKey::from_bytes(bytes).unwrap() == expected_result);
         }
