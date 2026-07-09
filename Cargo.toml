@@ -16,6 +16,7 @@ members = [
   "crates/mess-store",
   "crates/mess-derive",
   "crates/mess-testkit",
+  "examples/bank",
   "examples/social",
   "xtask",
 ]

@@ -1,3 +1,28 @@
+//! # Deprecated (bn-3p5)
+//!
+//! This is the pre-v1 ECS-flavored prototype (Entity / Component /
+//! `ComponentStore` / `EventDB`). It has been superseded by the v1 API —
+//! `mess-core` (`Event` / `Aggregate` / `Decide`), `mess-store`
+//! (`EventStore`), and `mess-derive` (`#[derive(Event)]` /
+//! `#[derive(Aggregate)]`) — per the Phase 0 rename in
+//! `notes/mess-research/09_implementation_plan.md`.
+//!
+//! `examples/social`, the last remaining consumer of this crate's
+//! vocabulary, has been ported off it onto the v1 API (bn-3p5). Grepping
+//! the workspace at that point turned up exactly one other reference: the
+//! `crates/mess` facade crate re-exports this crate as `mess::ecs`.
+//! Deleting this crate therefore also requires editing `crates/mess`
+//! (removing its `pub mod ecs` re-export and `mess_ecs` dependency), which
+//! is out of this bone's scope (`crates/mess` is otherwise-finished trunk
+//! code owned elsewhere). This crate is left in place, deprecated, so the
+//! workspace keeps building; deleting it (and `crates/mess`'s re-export
+//! together) is a small, self-contained follow-up.
+#![deprecated(
+    note = "superseded by mess-core/mess-store/mess-derive (the v1 API); \
+            see the module docs for why this crate was kept rather than \
+            deleted"
+)]
+#![allow(deprecated)]
 #![warn(
     clippy::pedantic,
     // clippy::nursery,

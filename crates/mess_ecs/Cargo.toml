@@ -2,6 +2,7 @@
 name = "mess_ecs"
 version = "0.1.0"
 edition = "2024"
+description = "DEPRECATED (bn-3p5): pre-v1 ECS-flavored prototype, superseded by mess-core/mess-store/mess-derive. Kept only because crates/mess re-exports it as `mess::ecs`; see src/lib.rs module docs."
 
 [dependencies]
 mess_db = { workspace = true }

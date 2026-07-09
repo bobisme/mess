@@ -1,22 +1,23 @@
 [package]
-name = "social"
+name = "bank"
 version = "0.1.0"
 edition = "2024"
-workspace = "../../"
+publish = false
+description = "mess v1 showcase: a bank-account domain on #[derive(Event)]/#[derive(Aggregate)] + EventStore"
 
 [lib]
-name = "social"
+name = "bank"
 path = "src/lib.rs"
 
 [dependencies]
 mess-core = { workspace = true }
 mess-derive = { workspace = true }
 mess-store = { workspace = true }
-ident = { workspace = true, features = ["serde"] }
 # The `#[derive(Event)]` expansion emits `#[derive(::serde::Serialize)]` /
 # `Deserialize` wrapper structs for each variant's payload, so any crate
-# using the derive needs `serde` as a direct dependency.
-serde = { version = "1.0.188", features = ["derive"] }
+# using the derive needs `serde` as a direct dependency (see
+# crates/mess-derive's own dev-dependencies for the same reason).
+serde = { version = "1", features = ["derive"] }
 tokio = { workspace = true }
 
 [dev-dependencies]
