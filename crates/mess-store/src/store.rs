@@ -5,6 +5,10 @@ use mess_core::{Aggregate, CodecError, CommandError, Decide, Event};
 
 use crate::backend::{AppendError, Backend, RecordToAppend};
 use crate::retry::RetryPolicy;
+use crate::snapshot::{
+    BlobPtr, SnapshotRef, SnapshotStore, Snapshottable, StateCodecError,
+    StoredSnapshot, interim_stream_id,
+};
 use crate::version::Version;
 
 /// The default page size for the [`load`](EventStore::load) replay loop.
@@ -26,11 +30,25 @@ pub enum StoreError<E> {
     /// An event payload failed to encode or decode.
     #[error("codec error: {0}")]
     Codec(#[source] CodecError),
+    /// An aggregate **state** blob failed to (de)serialize for the interim
+    /// snapshot store. Distinct from [`Codec`](StoreError::Codec), which is
+    /// about event payloads. A `load`-side failure here never reaches a
+    /// caller who uses the base [`load`](EventStore::load): it can only arise
+    /// on the snapshot-accelerated path, which treats it as a reason to fall
+    /// back to full replay.
+    #[error("state codec error: {0}")]
+    State(#[source] StateCodecError),
 }
 
 impl<E> From<CodecError> for StoreError<E> {
     fn from(e: CodecError) -> Self {
         StoreError::Codec(e)
+    }
+}
+
+impl<E> From<StateCodecError> for StoreError<E> {
+    fn from(e: StateCodecError) -> Self {
+        StoreError::State(e)
     }
 }
 
@@ -260,6 +278,180 @@ impl<B: Backend> EventStore<B> {
                 }
             }
         }
+    }
+}
+
+impl<B: SnapshotStore> EventStore<B> {
+    /// Fold the current stream into aggregate state and persist a snapshot
+    /// (state blob + [`SnapshotRef`]) to the interim keyspace.
+    ///
+    /// The state is built by a full replay ([`load`](Self::load)); the
+    /// snapshot's [`fold_version`](SnapshotRef::fold_version) is stamped from
+    /// [`Snapshottable::FOLD_VERSION`] so a later deploy that bumps it
+    /// invalidates this snapshot. Returns the [`SnapshotRef`] that was stored.
+    ///
+    /// This is the interim, throwaway store. Correctness of a later
+    /// [`load_cached`](Self::load_cached) does **not** rest on this blob being
+    /// trustworthy — it rests on the snapshot-equivalence law (see the
+    /// `snapshot_law` test); the Phase 5 fold certificate is what will make the
+    /// stored blob *verifiable*.
+    pub async fn save_snapshot<A: Snapshottable>(
+        &self,
+        stream_id: &str,
+    ) -> Result<SnapshotRef, StoreError<B::Error>> {
+        let loaded = self.load::<A>(stream_id).await?;
+        let state_blob = loaded.state.encode_state()?;
+
+        let covers_empty_prefix = loaded.version == Version::NoStream;
+        let stream_version = loaded.version.position().unwrap_or(0);
+        let interim_id = interim_stream_id(stream_id);
+
+        let snapshot_ref = SnapshotRef {
+            stream_id: interim_id,
+            stream_version,
+            fold_version: A::FOLD_VERSION,
+            covers_empty_prefix,
+            // Reserved until the Phase 5 fold-chain machinery lands.
+            event_prefix_hash: None,
+            state_hash: None,
+            snapshot_ptr: BlobPtr(interim_id),
+        };
+
+        self.backend
+            .save_snapshot(
+                stream_id,
+                StoredSnapshot {
+                    snapshot_ref: snapshot_ref.clone(),
+                    state_blob,
+                },
+            )
+            .await
+            .map_err(StoreError::Backend)?;
+
+        Ok(snapshot_ref)
+    }
+
+    /// Load an aggregate, transparently using `snapshot + tail` when a valid
+    /// snapshot exists and falling back to full replay otherwise.
+    ///
+    /// The result is a [`Loaded<A>`] **byte-identical** to what
+    /// [`load`](Self::load) would return — the only difference is *how* the
+    /// state was reconstructed. That equivalence is the whole point (and the
+    /// acceptance law): user code sees the same `Loaded<A>` shape whether the
+    /// engine underneath does full replay today or snapshot-accelerated replay
+    /// tomorrow, so `load`'s and `command`'s signatures never change. This is
+    /// the interim spelling; when the Phase 4 engine makes snapshots always-on
+    /// it folds into `load` itself with no change to this contract.
+    ///
+    /// A snapshot is used only when it is **valid**:
+    /// - its [`fold_version`](SnapshotRef::fold_version) equals
+    ///   [`Snapshottable::FOLD_VERSION`] (else it is a stale fold — §9), and
+    /// - it does not claim to summarize past the stream head
+    ///   (`SnapshotBeyondHead`), and
+    /// - its state blob deserializes.
+    ///
+    /// Any failure of these is silently treated as "no usable snapshot" and the
+    /// load degrades to a correct full replay.
+    pub async fn load_cached<A: Snapshottable>(
+        &self,
+        stream_id: &str,
+    ) -> Result<Loaded<A>, StoreError<B::Error>> {
+        if let Some(loaded) =
+            self.try_load_from_snapshot::<A>(stream_id).await?
+        {
+            return Ok(loaded);
+        }
+        // No usable snapshot: full replay is always correct.
+        self.load::<A>(stream_id).await
+    }
+
+    /// Attempt the snapshot-accelerated path; `Ok(None)` means "no usable
+    /// snapshot, fall back to full replay". Only a genuine backend error
+    /// short-circuits with `Err`.
+    async fn try_load_from_snapshot<A: Snapshottable>(
+        &self,
+        stream_id: &str,
+    ) -> Result<Option<Loaded<A>>, StoreError<B::Error>> {
+        let Some(stored) = self
+            .backend
+            .load_snapshot(stream_id)
+            .await
+            .map_err(StoreError::Backend)?
+        else {
+            return Ok(None);
+        };
+        let snap = &stored.snapshot_ref;
+
+        // Stale fold: the snapshot summarizes a fold this binary no longer
+        // implements. Invalidate and rebuild by full replay (§9).
+        if snap.fold_version != A::FOLD_VERSION {
+            return Ok(None);
+        }
+
+        // Where does the tail resume? An empty-prefix snapshot summarizes
+        // nothing, so the whole log is the tail; otherwise resume strictly
+        // after the last summarized index.
+        let resume_from = if snap.covers_empty_prefix {
+            Version::NoStream
+        } else {
+            // Guard against a snapshot that claims to be past the head
+            // (`SnapshotBeyondHead`, §7): fall back rather than trust it.
+            let head = self
+                .backend
+                .head(stream_id)
+                .await
+                .map_err(StoreError::Backend)?;
+            match head.position() {
+                Some(head_idx) if snap.stream_version <= head_idx => {
+                    Version::At(snap.stream_version)
+                }
+                _ => return Ok(None),
+            }
+        };
+
+        // Deserialize the snapshotted state; a bad blob is another reason to
+        // fall back rather than fail.
+        let Ok(state) = A::decode_state(&stored.state_blob) else {
+            return Ok(None);
+        };
+
+        // Fold the tail on top of the snapshot state.
+        let (state, version, tail_len) =
+            self.replay_tail::<A>(stream_id, state, resume_from).await?;
+
+        Ok(Some(Loaded { state, version, events_replayed: tail_len }))
+    }
+
+    /// Page through `stream_id` strictly after `from`, folding each event into
+    /// `state`. Returns the folded state, the final version, and how many
+    /// events were replayed — the same paging loop [`load`](Self::load) uses.
+    async fn replay_tail<A: Aggregate>(
+        &self,
+        stream_id: &str,
+        mut state: A,
+        from: Version,
+    ) -> Result<(A, Version, usize), StoreError<B::Error>> {
+        let mut version = from;
+        let mut replayed = 0;
+        loop {
+            let page = self
+                .backend
+                .read_stream(stream_id, version, self.page_size)
+                .await
+                .map_err(StoreError::Backend)?;
+            let page_len = page.len();
+            for rec in &page {
+                let event =
+                    <A::Event as Event>::decode(&rec.message_type, &rec.data)?;
+                state.apply(&event);
+                version = Version::At(rec.stream_position);
+            }
+            replayed += page_len;
+            if page_len < self.page_size {
+                break;
+            }
+        }
+        Ok((state, version, replayed))
     }
 }
 

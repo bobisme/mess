@@ -35,6 +35,7 @@
 pub mod backend;
 pub mod mock;
 pub mod retry;
+pub mod snapshot;
 pub mod store;
 pub mod version;
 
@@ -43,6 +44,10 @@ pub use backend::{
 };
 pub use mock::MockBackend;
 pub use retry::{DEFAULT_MAX_ATTEMPTS, RetryPolicy};
+pub use snapshot::{
+    BlobPtr, Hash256, SnapshotRef, SnapshotStore, Snapshottable,
+    StateCodecError, StoredSnapshot, interim_stream_id,
+};
 pub use store::{Commit, DEFAULT_PAGE_SIZE, EventStore, Loaded, StoreError};
 pub use version::Version;
 

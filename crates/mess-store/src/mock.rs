@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use crate::backend::{
     AppendError, Appended, Backend, RecordToAppend, StoredRecord,
 };
+use crate::snapshot::{SnapshotStore, StoredSnapshot};
 use crate::version::Version;
 
 #[derive(Default)]
@@ -27,6 +28,10 @@ struct Inner {
     streams: HashMap<String, Vec<StoredRecord>>,
     /// Every event across all streams, in global order.
     global: Vec<StoredRecord>,
+    /// The throwaway snapshot keyspace: at most one snapshot per stream. This
+    /// is a plain map keyed by stream name — explicitly *not* part of the
+    /// commit authority, wiped whenever this backend is dropped.
+    snapshots: HashMap<String, StoredSnapshot>,
 }
 
 impl Inner {
@@ -158,5 +163,33 @@ impl Backend for MockBackend {
         inner.global.extend(committed);
 
         Ok(Appended { version, last_global_position: last_global })
+    }
+}
+
+impl SnapshotStore for MockBackend {
+    async fn save_snapshot(
+        &self,
+        stream_id: &str,
+        snapshot: StoredSnapshot,
+    ) -> Result<(), Self::Error> {
+        self.inner
+            .lock()
+            .expect("mock lock poisoned")
+            .snapshots
+            .insert(stream_id.to_string(), snapshot);
+        Ok(())
+    }
+
+    async fn load_snapshot(
+        &self,
+        stream_id: &str,
+    ) -> Result<Option<StoredSnapshot>, Self::Error> {
+        Ok(self
+            .inner
+            .lock()
+            .expect("mock lock poisoned")
+            .snapshots
+            .get(stream_id)
+            .cloned())
     }
 }
