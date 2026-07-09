@@ -1,0 +1,40 @@
+name: sigkill
+
+# bn-2iq: the real-process SIGKILL child-writer harness
+# (crates/mess-log/tests/sigkill_harness.rs +
+# crates/mess-log/src/bin/sigkill_child.rs). Real kills catch kernel-
+# buffering surprises a simulated fault layer cannot; `cargo test -p
+# mess-log` already runs a 3-round smoke pass per `Durability` mode
+# (`sigkill_smoke_{process,os,group}`) as part of the crate's normal test
+# gate (unignored, no special wiring needed), so this workflow exists only
+# for the 15-round-per-mode `#[ignore]`d nightly profile
+# (`sigkill_nightly_{process,os,group}`),
+# matching the miri (per-PR) / sanitizers (nightly) split in this
+# directory: heavier, slower real-fs+real-process coverage that would
+# make every PR pay ~60s it doesn't need.
+#
+# Requires stable Rust only — no nightly toolchain, no `-Z build-std`,
+# unlike the sanitizer lanes.
+
+on:
+  schedule:
+    # 03:41 UTC daily — off-peak, deliberately not top-of-hour, staggered
+    # against sanitizers.yml's 03:17 so both don't contend for the runner.
+    - cron: "41 3 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  sigkill:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: sigkill
+
+      - name: cargo test -p mess-log --test sigkill_harness -- --ignored
+        run: |
+          cargo test -p mess-log --test sigkill_harness -- --ignored --test-threads=1
