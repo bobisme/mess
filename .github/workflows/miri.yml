@@ -1,0 +1,45 @@
+name: miri
+
+# bn-25j: Miri over the mess-log / mess-core encode/decode/codec subset.
+# Fast enough (~20s for mess-log, ~15s for mess-core locally) to run on
+# every PR, unlike the sanitizer lanes (sanitizers.yml), which need real
+# fs/threads and a `-Z build-std` recompile and run on a nightly schedule
+# instead.
+#
+# Tests that need real filesystem I/O, real multi-threaded exhaustive
+# search, or hot-path timing are excluded from this subset in-source via
+# `#[cfg_attr(miri, ignore)]` (Miri's isolation blocks real `open`/
+# `create_dir_all`; see the comments on those tests in mess-log for the
+# full rationale). Everything else — the batch encoder, the CRC32C split
+# coverage, the acceptance kernel, the msgpack codec, the golden-file
+# fixtures, the in-memory SimFs writer suite — runs for real under Miri.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: miri-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly + miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: miri
+
+      - name: cargo miri test -p mess-log
+        run: cargo miri test -p mess-log
+
+      - name: cargo miri test -p mess-core
+        run: cargo miri test -p mess-core

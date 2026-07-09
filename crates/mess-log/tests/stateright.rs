@@ -216,7 +216,16 @@ fn check(model: ProtocolModel) -> impl Checker<Formal> {
 /// The theorem: within BOUNDS, the production kernel loses no acked
 /// batch, accepts nothing inauthentic/stale/discontiguous, and every
 /// adversarial shape is present in the explored space.
+// bn-25j: `check()` spawns a real OS-thread pool (`.threads(..).spawn_bfs()`)
+// to exhaustively BFS-explore the model; under Miri's interpreter this is
+// many orders of magnitude too slow to finish in a CI-sized budget (a
+// single-threaded partial run of `production_kernel_is_safe_within_bounds`
+// alone did not reach state 1's completion in 200s under Miri; native
+// `cargo test` finishes all four of this file's tests in ~5.6s). Excluded
+// from the Miri lane — it is real-thread, real-CPU-bound BFS search, not a
+// decode/encode/codec unit.
 #[test]
+#[cfg_attr(miri, ignore)]
 fn production_kernel_is_safe_within_bounds() {
     let checker =
         check(ProtocolModel { bounds: BOUNDS, kernel: production_kernel });
@@ -277,7 +286,9 @@ fn kernel_no_epoch_check(
     ScanOutcome { accepted, next_pos: expected, stop }
 }
 
+// bn-25j: same exhaustive-BFS-under-Miri issue as above.
 #[test]
+#[cfg_attr(miri, ignore)]
 fn teeth_kernel_without_epoch_check_fails() {
     assert_finds_violation(
         kernel_no_epoch_check,
@@ -317,7 +328,9 @@ fn kernel_no_contiguity_check(
     ScanOutcome { accepted, next_pos: expected, stop }
 }
 
+// bn-25j: same exhaustive-BFS-under-Miri issue as above.
 #[test]
+#[cfg_attr(miri, ignore)]
 fn teeth_kernel_without_contiguity_check_fails() {
     assert_finds_violation(
         kernel_no_contiguity_check,
@@ -347,7 +360,9 @@ fn kernel_resync_past_holes(
     ScanOutcome { accepted, next_pos: expected, stop: StopReason::EndOfScan }
 }
 
+// bn-25j: same exhaustive-BFS-under-Miri issue as above.
 #[test]
+#[cfg_attr(miri, ignore)]
 fn teeth_kernel_resyncing_past_holes_fails() {
     assert_finds_violation(
         kernel_resync_past_holes,

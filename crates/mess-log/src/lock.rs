@@ -247,7 +247,12 @@ mod tests {
         fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
     }
 
+    // bn-25j: touches the real OS filesystem (`TestDir` + `StoreLock`'s
+    // `std::fs::File`/`OpenOptions`); Miri's isolation blocks real `open`
+    // (`unsupported operation: \`open\` not available when isolation is
+    // enabled`), so this is excluded from the Miri lane.
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn first_open_succeeds_and_writes_lock_file() {
         let dir = TestDir::new("first-open");
         let lock = StoreLock::acquire(dir.path()).expect("first open");
@@ -255,7 +260,9 @@ mod tests {
         assert!(lock.path().exists());
     }
 
+    // bn-25j: real fs (see note above).
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn second_open_of_same_dir_fails_typed_and_names_dir_and_pid() {
         let dir = TestDir::new("second-open");
         let _first = StoreLock::acquire(dir.path()).expect("first open");
@@ -279,7 +286,9 @@ mod tests {
         assert!(msg.contains(&std::process::id().to_string()));
     }
 
+    // bn-25j: real fs (see note above).
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn clean_close_releases_the_lock_for_a_new_acquire() {
         let dir = TestDir::new("clean-close");
         let lock = StoreLock::acquire(dir.path()).expect("first open");
@@ -293,7 +302,9 @@ mod tests {
         drop(second);
     }
 
+    // bn-25j: real fs (see note above).
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn reacquire_after_drop_can_repeat_indefinitely() {
         // Not just once: acquire/release must be repeatable, since a
         // real store dir is opened and closed many times over its
@@ -305,7 +316,9 @@ mod tests {
         }
     }
 
+    // bn-25j: real fs (see note above).
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn stale_lock_file_from_dead_holder_does_not_block_reacquire() {
         // Approximates a SIGKILL'd holder: a second, independent file
         // handle to the SAME lock path is opened and locked in this
@@ -349,7 +362,9 @@ mod tests {
         );
     }
 
+    // bn-25j: real fs (see note above).
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn concurrent_live_holder_still_blocks_even_with_stale_bytes_present() {
         // Companion to the stale-file test: prove we are not
         // accidentally keying off file *content* or *existence* by

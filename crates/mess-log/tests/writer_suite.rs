@@ -201,28 +201,40 @@ fn tmp(name: &str) -> PathBuf {
     p
 }
 
+// bn-25j: real fs (`RealRuntime` over `std::fs`); Miri's isolation blocks
+// real `open` (`unsupported operation: \`open\` not available when
+// isolation is enabled`), so the `real_*` entry points are excluded from
+// the Miri lane. The `sim_*` entry points below run the same checks
+// through the in-memory `SimRuntime` and stay in the lane.
 #[test]
+#[cfg_attr(miri, ignore)]
 fn real_writer_header_and_batch_golden() {
     let p = tmp("golden");
     let _c = Cleanup(vec![p.clone()]);
     writer_header_and_batch_golden(&RealRuntime::new(), &p);
 }
 
+// bn-25j: real fs (see note above).
 #[test]
+#[cfg_attr(miri, ignore)]
 fn real_writer_rejects_empty_batch() {
     let p = tmp("empty");
     let _c = Cleanup(vec![p.clone()]);
     writer_rejects_empty_batch(&RealRuntime::new(), &p);
 }
 
+// bn-25j: real fs (see note above).
 #[test]
+#[cfg_attr(miri, ignore)]
 fn real_writer_position_accounting() {
     let p = tmp("pos");
     let _c = Cleanup(vec![p.clone()]);
     writer_position_accounting(&RealRuntime::new(), &p);
 }
 
+// bn-25j: real fs (see note above).
 #[test]
+#[cfg_attr(miri, ignore)]
 fn real_writer_rolls_on_segment_full() {
     let p0 = tmp("roll-0");
     let p1 = tmp("roll-1");
@@ -230,7 +242,9 @@ fn real_writer_rolls_on_segment_full() {
     writer_rolls_on_segment_full(&RealRuntime::new(), &p0, &p1);
 }
 
+// bn-25j: real fs (see note above).
 #[test]
+#[cfg_attr(miri, ignore)]
 fn real_writer_close_leaves_unsealed() {
     let p = tmp("unsealed");
     let _c = Cleanup(vec![p.clone()]);

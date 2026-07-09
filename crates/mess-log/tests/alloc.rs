@@ -53,7 +53,13 @@ fn allocs() -> usize {
     ALLOCS.load(Ordering::Relaxed)
 }
 
+// bn-25j: the writer half of this test opens a real segment file via
+// `RealRuntime` (`std::env::temp_dir()` + `std::fs`); Miri's isolation
+// blocks real `open`, and a 20_000-iteration hot-path timing test is also
+// far too slow interpreted under Miri regardless. Excluded from the Miri
+// lane.
 #[test]
+#[cfg_attr(miri, ignore)]
 fn zero_allocs_per_event_on_the_hot_path() {
     const N: u64 = 20_000;
 

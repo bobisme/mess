@@ -1,0 +1,67 @@
+name: sanitizers
+
+# bn-25j: ASan + TSan over mess-log's full test binary set (unit +
+# integration tests; doctests excluded — see the `--tests` note below).
+# These need real fs/threads (unlike miri.yml's subset) and a `-Z
+# build-std` recompile of std against the sanitizer, so they run on a
+# nightly schedule rather than per-PR. Both lanes were verified green
+# locally before wiring this in (see the bn-25j bone summary for the
+# invocation history and a planted-use-after-free sanity check of the ASan
+# lane).
+#
+# Doctests are skipped with `--tests`: rustdoc does not thread the
+# sanitizer RUSTFLAGS into the doctest binary the same way `cargo test`
+# does, which produces a false-positive "-Zsanitizer ABI mismatch" error
+# unrelated to any real bug. mess-log has zero doctests today, so nothing
+# is lost; if that changes, doctests need their own `cargo test --doc`
+# step run without `-Z build-std` (or with the mismatch silenced) rather
+# than folding them into this invocation.
+
+on:
+  schedule:
+    # 03:17 UTC daily — off-peak, deliberately not top-of-hour.
+    - cron: "17 3 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  asan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly + rust-src + llvm-tools
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src, llvm-tools
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: asan
+
+      - name: cargo test -p mess-log (AddressSanitizer)
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+        run: |
+          cargo test -p mess-log \
+            --target x86_64-unknown-linux-gnu -Z build-std --tests
+
+  tsan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly + rust-src + llvm-tools
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src, llvm-tools
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: tsan
+
+      - name: cargo test -p mess-log (ThreadSanitizer)
+        env:
+          RUSTFLAGS: -Zsanitizer=thread
+        run: |
+          cargo test -p mess-log \
+            --target x86_64-unknown-linux-gnu -Z build-std --tests

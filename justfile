@@ -14,3 +14,27 @@ set positional-arguments
 	env CLICOLOR_FORCE=1 cargo watch -x "nextest run --workspace --failure-output=final $@"
 
 alias wt := watch-test
+
+# bn-25j: Miri over the mess-log/mess-core encode/decode/codec unit +
+# integration subset. Real-fs, real-thread-BFS, and hot-path-timing tests
+# are excluded in-source via #[cfg_attr(miri, ignore)] (Miri cannot do real
+# fs I/O; see the notes on those tests). Requires: rustup component add
+# miri --toolchain nightly.
+@miri *args='':
+	cargo +nightly miri test -p mess-log "$@"
+	cargo +nightly miri test -p mess-core "$@"
+
+# bn-25j: AddressSanitizer over mess-log's full test binary set (unit +
+# integration; doctests excluded with --tests because rustdoc does not
+# thread sanitizer RUSTFLAGS into the doctest binary the same way cargo
+# does, causing a false-positive ABI-mismatch error — mess-log has zero
+# doctests today so nothing is lost). Requires: rustup component add
+# rust-src llvm-tools --toolchain nightly.
+@asan *args='':
+	env RUSTFLAGS="-Zsanitizer=address" cargo +nightly test -p mess-log --target x86_64-unknown-linux-gnu -Z build-std --tests "$@"
+
+# bn-25j: ThreadSanitizer, same scope/caveats as `asan` above. Verified
+# green locally (full mess-log suite, including the real-thread stateright
+# BFS checker) — see the bn-25j bone summary for the invocation history.
+@tsan *args='':
+	env RUSTFLAGS="-Zsanitizer=thread" cargo +nightly test -p mess-log --target x86_64-unknown-linux-gnu -Z build-std --tests "$@"

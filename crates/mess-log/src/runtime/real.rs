@@ -210,14 +210,20 @@ mod tests {
         }
     }
 
+    // bn-25j: real fs (`std::fs::File::open`/`create`); Miri's isolation
+    // blocks real `open` (`unsupported operation: \`open\` not available
+    // when isolation is enabled`), so this is excluded from the Miri lane.
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn real_fs_roundtrip() {
         let p = tmp("roundtrip");
         let _c = Cleanup(vec![p.clone()]);
         testsuite::fs_roundtrip(&RealRuntime::new(), &p);
     }
 
+    // bn-25j: real fs (see note above).
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn real_fs_rename() {
         let from = tmp("rename-from");
         let to = tmp("rename-to");
@@ -230,7 +236,9 @@ mod tests {
         testsuite::clock_advances(&RealRuntime::new());
     }
 
+    // bn-25j: real fs (see note above).
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn real_three_actors_share_a_segment() {
         let p = tmp("three-actors");
         let _c = Cleanup(vec![p.clone()]);
