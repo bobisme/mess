@@ -204,3 +204,5 @@
 1783567879875265	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExowI		item.move	bn-39n	{"state":"done"}	blake3:pqmq3oNAYCaGVLzGKvpp5cKJzwKeik16FxRgbR3JkV4
 1783567879892913	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExpAI		item.move	bn-25j	{"state":"done"}	blake3:RKtX-8-B08Jyi0tRMgr1AZNW8QJE26UEeLsk2SYov4w
 1783567879911512	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExpQI		item.comment	bn-y0b	{"body":"Merged partial (acceptance-predicate + position-arithmetic proofs, 7/7 harnesses verify). Remaining: watermark-advance no-overflow proof (watermark.rs just landed via bn-11m — follow-up dispatched) and ptr/cursor round-trips (split to a new bone blocked on bn-25d)."}	blake3:303rbzl4D4AFa4GtEt6SRRrvxe_ZZpuBLHhnb-0Dv3Y
+1783567903186930	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExpgI		item.move	bn-y0b	{"state":"doing"}	blake3:ScGdGTBACZv_fERkPz97Rt-FWrYwYFbSJvyUFdsL8e8
+1783567903327628	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExpwI		item.assign	bn-y0b	{"action":"assign","agent":"mess-dev"}	blake3:z9dDAE2cbjlJgusqHgFCo9lcWruZPaLl_5LDuBasYo4
