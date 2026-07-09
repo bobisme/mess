@@ -294,3 +294,5 @@
 1783582785382264	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAEx_QI		item.move	bn-1hx	{"state":"done"}	blake3:bRpO_XGj_AXq09D4EyWnaKMT-_BeThMvGRbtE2MlSlc
 1783582785407388	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAEx_gI		item.move	bn-2en	{"state":"done"}	blake3:_Atf12k2vAVaolJEVk97JXYB4Qy5asNS-CMPdwZHla4
 1783582785423804	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAEx_wI		item.move	bn-1i7	{"state":"done"}	blake3:jD6Jp1RABWgR9tlWIxgwtOosSmAtwmXEkfdISDo3V90
+1783582797466930	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExgAM		item.move	bn-20b	{"state":"doing"}	blake3:682Jcf4wWRsSNDYlMIzDkvmNLFnfGVOAxzNLmVH9tN8
+1783582797746277	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExgQM		item.assign	bn-20b	{"action":"assign","agent":"mess-dev"}	blake3:s0Wvq3Bp9qiLVUgvXl1Fu2YHIoSdUNrBfb2BVTGzaZw
