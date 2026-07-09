@@ -32,6 +32,11 @@
 //!   segment definitely lacking a stream is skipped without a directory
 //!   lookup. Persisted as a sibling `.filter` file, independently
 //!   rebuildable (I5).
+//! - [`retention`] — the retention-blocking rule (bn-2ug,
+//!   `docs/spec/05-fold-certificates.md` §8.2): a segment MUST NOT be deleted
+//!   while it holds a live snapshot's certification frame (`v`/`v+1`) unless a
+//!   durable `SnapshotAnchor` (Path C) discharges it. Pure decision function
+//!   plus the wiring seam for the (currently unbuilt) retention executor.
 //!
 //! # Staged passes (Phase 5 seam)
 //!
@@ -49,6 +54,7 @@ pub mod filter;
 pub mod payload;
 pub mod ptr_block;
 pub mod replay;
+pub mod retention;
 pub mod segment;
 pub mod store;
 
@@ -61,6 +67,10 @@ pub use payload::{
 };
 pub use ptr_block::{BatchPtr, DecodeError, SKIP_K};
 pub use replay::{ReplaySet, global_checksum, stream_checksum};
+pub use retention::{
+    BlockingReason, CertFrame, LiveSnapshotRef, RetentionDecision, SegmentStreamSpan,
+    decide_segment, segment_retention_decision, spans_for_segment,
+};
 pub use segment::{
     SealBatch, SealInput, SealStream, SealedSegmentIndex, SealedSegmentRef, SidecarError,
     encode_sidecar, filter_path_for,

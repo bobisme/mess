@@ -422,6 +422,21 @@ impl SealedSegmentIndex {
         self.stream_ids.len()
     }
 
+    /// The stream ids present in this segment, ascending (bn-2ug's retention
+    /// rule walks these to build a segment's per-stream frame spans).
+    pub fn stream_ids(&self) -> &[u64] {
+        &self.stream_ids
+    }
+
+    /// `(first_version, last_version)` — the inclusive committed version range
+    /// of `stream_id`'s frames within this segment, or `None` if the stream is
+    /// absent. This is the "segment frame-range" the bn-2ug retention rule
+    /// (`docs/spec/05-fold-certificates.md` §8.2) checks a live snapshot's
+    /// certification frames against.
+    pub fn stream_range(&self, stream_id: u64) -> Option<(u64, u64)> {
+        self.dir.get(&stream_id).map(|e| (e.first_version, e.last_version))
+    }
+
     /// Parse a sidecar byte image, validating magic, version, and CRC. The
     /// bytes are moved in and retained.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, SidecarError> {
