@@ -1,0 +1,56 @@
+name: differential-store
+
+# bn-3az: the full 5k-seed x 2-cache-config store-level differential profile
+# (crates/mess-store/tests/differential_model.rs::differential_full_profile —
+# 10,000 sequences, `#[ignore]`d in-source). The fast ~1k-sequence profile
+# (`differential_fast_profile`, 500 seeds x 2 cache configs) already runs in
+# the ordinary `cargo test -p mess-store` gate on every PR; this lane runs the
+# full profile on a nightly schedule, mirroring dst.yml / crash-harness.yml's
+# split so the heavier sweep does not sit on the per-PR critical path.
+#
+# The harness is fully deterministic and in-memory (a real EventStore over
+# MockBackend vs a trivially-correct in-memory model, compared op-by-op), so
+# it needs no real device, no threads, and no `-Z build-std`: a plain nightly
+# `cargo test -- --ignored` reproduces every case, and a failure prints the
+# offending seed, cache-on/off config, and the minimal failing op prefix
+# (see `differential_support::DivergenceReport`).
+#
+# Measured locally (2026-07-09, debug build, this exact invocation): 10,000
+# sequences green in ~5.4s — see differential_model.rs's doc comment.
+
+on:
+  schedule:
+    # 05:31 UTC daily — off-peak, staggered off every other nightly lane
+    # (sanitizers 03:17, fuzz/torn-matrix/sigkill 03:41, crash-harness 04:23,
+    # dst 04:47, phase3-exit-gate 05:07).
+    - cron: "31 5 * * *"
+  workflow_dispatch: {}
+  # Also run when the store crate or this workflow changes, so a regression
+  # is caught at merge rather than the next night.
+  pull_request:
+    paths:
+      - "crates/mess-store/**"
+      - "crates/mess-core/**"
+      - ".github/workflows/differential-store.yml"
+
+concurrency:
+  group: differential-store-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  full-profile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: differential-store
+
+      - name: full 5k-seed x 2-cache-config differential profile
+        run: |
+          cargo test -p mess-store --test differential_model \
+            differential_full_profile -- --ignored --nocapture
