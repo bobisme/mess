@@ -26,6 +26,11 @@ quick_cache = { workspace = true, features = ["stats"] }
 # negatives). Default features only (`binary-fuse`, `uniform-random`); see
 # `sealed::filter`.
 xorf = "0.12"
+# bn-1bn: zstd for the columnar sealed-tier codec (round-4 default: columnar /
+# 128-event blocks / zstd-9 / no dicts = 30.8 B/event). Whole-block and
+# per-column framing both live in `src/columnar`. Builds here only with the
+# system clang (mise.toml pins CLANG_PATH for zstd-sys bindgen).
+zstd = "0.13"
 
 # bn-20e: `#[cfg(kani)]` ptr-block round-trip proofs are compiled only by
 # `cargo kani`; teach the normal `cargo` build the cfg so it is not flagged
@@ -37,3 +42,11 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
 mess-log = { workspace = true }
 # bn-1ku: real-fs scratch dirs for the fjall round-trip / crash-lag tests.
 tempfile = "3"
+# bn-1bn: the columnar codec's byte-exact corpus mirrors the perf_compress
+# spike's — real rmp-serde named-mode payloads (the actual Phase-1 bytes) and a
+# Zipf stream/field workload — so the reassembly proof runs against the same
+# shapes the sealer will see. Test-only.
+rmp-serde = "1.3"
+serde = { version = "1", features = ["derive"] }
+rand = "0.10"
+rand_distr = "0.6"

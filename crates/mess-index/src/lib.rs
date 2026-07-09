@@ -38,6 +38,13 @@
 pub mod active;
 pub mod rebuild;
 
+// bn-1bn: the columnar payload codec for the sealed tier (round-4 default:
+// columnar / 128-event blocks / zstd-9 / no dicts). A standalone shred +
+// byte-exact reassembly stage that lives beside the sealed pointer index it
+// will feed; the sealer wiring (bn-zge) is a separate bone. Owns the columnar
+// block byte format (version + flags) documented in `columnar`.
+pub mod columnar;
+
 // bn-20e: the sealed pointer index — packed varint-delta pointer blocks + skip
 // tables, the background sealer, and the sealed-or-active handoff (D5). This is
 // the documented seam left by `rebuild` (F6 rebuilds unsealed segments; sealed
