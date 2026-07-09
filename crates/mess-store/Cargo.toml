@@ -5,3 +5,9 @@ edition = "2024"
 description = "mess v1: EventStore API surface"
 
 [dependencies]
+mess-core = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
