@@ -91,6 +91,25 @@ impl Watermark {
     pub fn wait_for(&self, threshold: u64) -> WaitFor {
         WaitFor { inner: self.inner.clone(), threshold }
     }
+
+    /// Resolve once **position** `position` has become durable — i.e. once
+    /// the watermark has advanced strictly *past* it (`value > position`,
+    /// equivalently `value >= position + 1`). This is the position-indexed
+    /// face of [`wait_for`](Watermark::wait_for) and the primitive a D11
+    /// subscription (`docs/spec/06-subscriptions.md`) awaits: a subscriber
+    /// parked on `await_past(p)` wakes exactly when `p` joins the committed
+    /// prefix `read_from`/the read view may serve — never earlier (the
+    /// exclusive-durable-end meaning of the value is documented on the
+    /// module), and, because [`advance`](Watermark::advance) is monotone,
+    /// never spuriously before the crossing.
+    ///
+    /// Position-ordered by construction: `await_past(a)` resolves no later
+    /// than `await_past(b)` for `a <= b`, since one monotone value gates
+    /// both. `position == u64::MAX` saturates to waiting for
+    /// `value == u64::MAX` (the log can hold no position past it).
+    pub fn await_past(&self, position: u64) -> WaitFor {
+        self.wait_for(position.saturating_add(1))
+    }
 }
 
 /// The future returned by [`Watermark::wait_for`].
@@ -165,5 +184,88 @@ mod tests {
         assert!(w.0.swap(false, Ordering::SeqCst));
         assert_eq!(f.as_mut().poll(&mut cx), Poll::Ready(()));
         assert_eq!(wm.get(), 4);
+    }
+
+    // -- await_past: position semantics (D11 subscription primitive) ------
+
+    #[test]
+    fn await_past_wakes_exactly_when_the_watermark_crosses_the_position() {
+        // Position 2 is served once the exclusive durable end passes it,
+        // i.e. value >= 3 (positions 0,1,2 durable). value == 2 (only 0,1
+        // durable) must NOT resolve await_past(2).
+        let wm = Watermark::new(0);
+        let w = Arc::new(Noop(AtomicBool::new(false)));
+        let waker = Waker::from(w.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        let mut f = Box::pin(wm.await_past(2));
+        assert_eq!(f.as_mut().poll(&mut cx), Poll::Pending);
+
+        // value reaching exactly `position` is not "past" it: position 2 is
+        // still in-flight when the exclusive end is 2.
+        wm.advance(2);
+        assert!(w.0.swap(false, Ordering::SeqCst), "advance wakes waiters");
+        assert_eq!(
+            f.as_mut().poll(&mut cx),
+            Poll::Pending,
+            "value == position is not past it (position still in-flight)"
+        );
+
+        // Crossing (value > position) resolves.
+        wm.advance(3);
+        assert!(w.0.swap(false, Ordering::SeqCst));
+        assert_eq!(f.as_mut().poll(&mut cx), Poll::Ready(()));
+    }
+
+    #[test]
+    fn await_past_is_ready_when_already_crossed() {
+        let wm = Watermark::new(10);
+        let w = Arc::new(Noop(AtomicBool::new(false)));
+        let waker = Waker::from(w.clone());
+        let mut cx = Context::from_waker(&waker);
+        // Positions 0..10 are durable (exclusive end 10), so every position
+        // < 9 is already past; position 9 needs value >= 10 — satisfied.
+        assert_eq!(Box::pin(wm.await_past(9)).as_mut().poll(&mut cx), Poll::Ready(()));
+        assert_eq!(Box::pin(wm.await_past(0)).as_mut().poll(&mut cx), Poll::Ready(()));
+        // Position 10 needs value >= 11 — not yet.
+        assert_eq!(Box::pin(wm.await_past(10)).as_mut().poll(&mut cx), Poll::Pending);
+    }
+
+    #[test]
+    fn await_past_is_position_ordered() {
+        // One monotone value gates every position: a single advance can
+        // satisfy a run of await_past(p) in ascending p, and never satisfies
+        // a larger p before a smaller one.
+        let wm = Watermark::new(0);
+        let w = Arc::new(Noop(AtomicBool::new(false)));
+        let waker = Waker::from(w.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        let mut lo = Box::pin(wm.await_past(1)); // needs value >= 2
+        let mut hi = Box::pin(wm.await_past(4)); // needs value >= 5
+        assert_eq!(lo.as_mut().poll(&mut cx), Poll::Pending);
+        assert_eq!(hi.as_mut().poll(&mut cx), Poll::Pending);
+
+        wm.advance(3); // crosses position 1, not position 4
+        assert_eq!(lo.as_mut().poll(&mut cx), Poll::Ready(()));
+        assert_eq!(
+            hi.as_mut().poll(&mut cx),
+            Poll::Pending,
+            "a larger position must not resolve before the value reaches it"
+        );
+
+        wm.advance(5);
+        assert_eq!(hi.as_mut().poll(&mut cx), Poll::Ready(()));
+    }
+
+    #[test]
+    fn await_past_saturates_at_u64_max() {
+        // No off-by-one panic at the top of the range: await_past(MAX) folds
+        // to wait_for(MAX), satisfied only at the maximal value.
+        let wm = Watermark::new(u64::MAX);
+        let w = Arc::new(Noop(AtomicBool::new(false)));
+        let waker = Waker::from(w.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert_eq!(Box::pin(wm.await_past(u64::MAX)).as_mut().poll(&mut cx), Poll::Ready(()));
     }
 }

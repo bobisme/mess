@@ -30,6 +30,7 @@ pub mod encode;
 pub mod format;
 pub mod lock;
 pub mod model;
+pub mod reader;
 pub mod runtime;
 pub mod scanner;
 pub mod watermark;
