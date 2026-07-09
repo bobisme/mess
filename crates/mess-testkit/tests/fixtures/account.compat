@@ -1,0 +1,17 @@
+# mess fixture-compat golden fixture (bn-3ui) — DO NOT EDIT BY HAND.
+# Committed old bytes MUST decode forever. Regenerate only with UPDATE_FIXTURES=1.
+---
+label: account.opened#0
+wire: account.opened
+payload_hex: 81a56f776e6572a5616c696365
+decoded: Opened { owner: "alice" }
+---
+label: account.deposited#0
+wire: account.deposited
+payload_hex: 81a6616d6f756e7464
+decoded: Deposited { amount: 100 }
+---
+label: account.withdrawn#0
+wire: account.withdrawn
+payload_hex: 81a6616d6f756e7428
+decoded: Withdrawn { amount: 40 }

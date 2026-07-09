@@ -1,0 +1,6 @@
+# mess fold-drift golden fixture (bn-3ui) — DO NOT EDIT BY HAND.
+# Regenerate with `UPDATE_FIXTURES=1`; a bump must re-pin here.
+aggregate: Account
+fold_version: 1
+---
+Account { open: true, balance: 107, withdrawals: 2 }

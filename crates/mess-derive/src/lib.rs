@@ -51,6 +51,15 @@
 //! generates `impl mess_core::Aggregate for Account { type Event =
 //! AccountEvent; fn apply(..) { Account::apply(self, event) } }`, forwarding
 //! to the inherent `apply`.
+//!
+//! An optional `#[aggregate(event = ..., fold_version = N)]` key declares the
+//! aggregate's **fold version** (spec `05-fold-certificates.md` §9, decision
+//! record D4): the explicit, human-bumped `u32` that identifies the fold's
+//! semantics. It expands to `impl Account { pub const FOLD_VERSION: u32 = N;
+//! }` (defaulting to `1` when omitted). Snapshots carry this value, and
+//! `mess-testkit`'s generated fold-drift golden test asserts it stays pinned
+//! so any change to `apply` semantics forces a deliberate bump instead of
+//! silently invalidating stored snapshots at runtime.
 
 mod aggregate;
 mod event;

@@ -33,6 +33,13 @@ use std::fmt::Debug;
 
 use mess_core::{Aggregate, Decide};
 
+pub mod fixture;
+
+pub use fixture::{
+    FixtureError, UPDATE_ENV, assert_fixture_compat, assert_fold_drift,
+    check_fixture_compat, check_fold_drift, fold,
+};
+
 /// Arrange: prior events for the aggregate under test.
 ///
 /// Generic over the aggregate `A` only — not over any concrete command or

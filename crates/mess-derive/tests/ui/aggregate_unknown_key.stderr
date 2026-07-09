@@ -1,0 +1,5 @@
+error: unknown `#[aggregate(...)]` key: expected `event` or `fold_version`
+  --> tests/ui/aggregate_unknown_key.rs:10:35
+   |
+10 | #[aggregate(event = AccountEvent, snapshot = true)]
+   |                                   ^^^^^^^^

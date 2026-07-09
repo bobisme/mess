@@ -7,10 +7,20 @@
 
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::{DeriveInput, Type};
+use syn::{DeriveInput, LitInt, Type};
+
+/// Parsed `#[aggregate(event = Type, fold_version = N)]` attribute.
+struct AggregateAttr {
+    event_ty: Type,
+    /// The `u32` semantic fold version (D4 / spec `05-fold-certificates.md`
+    /// §9). Optional; defaults to `1`, matching `#[event(version = N)]`.
+    fold_version: u32,
+}
 
 pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
-    let event_ty = parse_event_type(&input)?;
+    let attr = parse_aggregate_attr(&input)?;
+    let event_ty = &attr.event_ty;
+    let fold_version = attr.fold_version;
     let ident = &input.ident;
     let (impl_generics, ty_generics, where_clause) =
         input.generics.split_for_impl();
@@ -30,11 +40,22 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
                 #ident::apply(self, event)
             }
         }
+
+        #[automatically_derived]
+        impl #impl_generics #ident #ty_generics #where_clause {
+            /// Explicit, human-bumped semantic version of this aggregate's
+            /// fold, declared via `#[aggregate(fold_version = N)]`
+            /// (spec `05-fold-certificates.md` §9). Snapshots carry this
+            /// value; the generated fold-drift golden test asserts it stays
+            /// pinned so an `apply` semantic change forces a deliberate bump.
+            pub const FOLD_VERSION: u32 = #fold_version;
+        }
     })
 }
 
-/// Parse the required `#[aggregate(event = Type)]` attribute.
-fn parse_event_type(input: &DeriveInput) -> syn::Result<Type> {
+/// Parse `#[aggregate(event = Type, fold_version = N)]`. `event` is required;
+/// `fold_version` is optional and defaults to `1`.
+fn parse_aggregate_attr(input: &DeriveInput) -> syn::Result<AggregateAttr> {
     let attr = input.attrs.iter().find(|a| a.path().is_ident("aggregate"));
     let Some(attr) = attr else {
         return Err(syn::Error::new_spanned(
@@ -46,22 +67,41 @@ fn parse_event_type(input: &DeriveInput) -> syn::Result<Type> {
     };
 
     let mut event_ty: Option<Type> = None;
+    let mut fold_version: Option<u32> = None;
     attr.parse_nested_meta(|meta| {
         if meta.path.is_ident("event") {
             event_ty = Some(meta.value()?.parse()?);
             Ok(())
+        } else if meta.path.is_ident("fold_version") {
+            let lit: LitInt = meta.value()?.parse().map_err(|_| {
+                meta.error(
+                    "`fold_version` must be an integer literal, e.g. \
+                     `fold_version = 1`",
+                )
+            })?;
+            let v: u32 = lit.base10_parse().map_err(|_| {
+                syn::Error::new_spanned(
+                    &lit,
+                    "`fold_version` must fit in a u32 (0..=4294967295)",
+                )
+            })?;
+            fold_version = Some(v);
+            Ok(())
         } else {
             Err(meta.error(
-                "unknown `#[aggregate(...)]` key: expected `event`",
+                "unknown `#[aggregate(...)]` key: expected `event` or \
+                 `fold_version`",
             ))
         }
     })?;
 
-    event_ty.ok_or_else(|| {
-        syn::Error::new_spanned(
+    let Some(event_ty) = event_ty else {
+        return Err(syn::Error::new_spanned(
             attr,
             "#[aggregate(...)] is missing the required `event = Type` key, \
              e.g. `#[aggregate(event = AccountEvent)]`",
-        )
-    })
+        ));
+    };
+
+    Ok(AggregateAttr { event_ty, fold_version: fold_version.unwrap_or(1) })
 }

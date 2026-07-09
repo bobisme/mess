@@ -6,3 +6,18 @@ description = "mess v1: test harness and deterministic-simulation-testing (DST) 
 
 [dependencies]
 mess-core = { workspace = true }
+
+[dev-dependencies]
+# The golden-fixture acceptance tests define aggregates/events with the real
+# derives to exercise `#[aggregate(fold_version = N)]` -> `A::FOLD_VERSION`.
+# One-directional: mess-derive does NOT depend on mess-testkit, so there is no
+# dev-dependency cycle.
+mess-derive = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+
+[features]
+# Mirrors the `spikes/fold_cert` cfg-flagged drift demo: builds an aggregate
+# whose `apply` charges an extra fee, so `cargo test -p mess-testkit
+# --features drift` makes the fold-drift golden fail with the bump-or-fix
+# message. Off by default; the default suite stays green.
+drift = []

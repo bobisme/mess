@@ -1,0 +1,5 @@
+error: `fold_version` must be an integer literal, e.g. `fold_version = 1`
+  --> tests/ui/aggregate_bad_fold_version.rs:10:35
+   |
+10 | #[aggregate(event = AccountEvent, fold_version = "oops")]
+   |                                   ^^^^^^^^^^^^^^^^^^^^^
