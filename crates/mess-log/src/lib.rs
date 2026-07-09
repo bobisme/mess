@@ -13,12 +13,20 @@
 //!   (virtual time + fault-injecting in-memory fs) impls.
 //! - [`lock`] — `StoreLock`, the D9 single-writer-process OS lock file
 //!   (bn-gke).
+//! - [`watermark`] — the position-ordered durable watermark (D7): a
+//!   watch-channel-like value the committer advances and D11 subscriptions
+//!   will await (bn-11m).
+//! - [`committer`] — the single committer thread: group commit, the
+//!   `Durability::{Process, Os, Group}` modes, and watermark-gated acks
+//!   (bn-11m, `docs/spec/03-durability.md`).
 
 pub mod acceptance;
+pub mod committer;
 pub mod crc;
 pub mod encode;
 pub mod format;
 pub mod lock;
 pub mod model;
 pub mod runtime;
+pub mod watermark;
 pub mod writer;
