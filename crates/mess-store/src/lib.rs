@@ -34,6 +34,7 @@
 
 pub mod backend;
 pub mod cache;
+pub mod fjall_snapshot;
 pub mod mock;
 pub mod registry;
 pub mod retry;
@@ -45,6 +46,7 @@ pub use backend::{
     AppendError, Appended, Backend, RecordToAppend, StoredRecord,
 };
 pub use cache::StateCache;
+pub use fjall_snapshot::{FjallSnapshotBackend, SnapshotBackendError};
 pub use mock::MockBackend;
 pub use retry::{DEFAULT_MAX_ATTEMPTS, RetryPolicy};
 pub use snapshot::{

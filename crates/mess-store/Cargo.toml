@@ -6,9 +6,17 @@ description = "mess v1: EventStore API surface"
 
 [dependencies]
 mess-core = { workspace = true }
+# bn-fdv: the production snapshot path stores its snapshot *heads* in
+# mess-index's fjall-backed `meta::SnapshotHeads` table (O(1) point lookup,
+# rebuildable per I5). Blobs live in a plain content-addressed dir alongside,
+# so `mess-store` takes no direct fjall/serialization dep of its own.
+mess-index = { workspace = true }
 quick_cache = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+# bn-fdv: real-fs scratch dirs for the fjall-backed snapshot reopen / wiped-meta
+# fallback tests (mirrors mess-index's own test setup).
+tempfile = "3"
