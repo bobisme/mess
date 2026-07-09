@@ -6,6 +6,7 @@ description = "mess append-only batch log (D1/D2): commit-authority acceptance k
 
 [dependencies]
 thiserror = { workspace = true }
+crc32c = "0.6"
 
 [dev-dependencies]
 stateright = "0.31"
