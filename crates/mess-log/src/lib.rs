@@ -22,6 +22,14 @@
 //! - [`scanner`] — the recovery scanner (bn-39n,
 //!   `docs/spec/02-recovery.md`): full A-rule acceptance via the
 //!   [`acceptance`] kernel, typed stop reasons, safe-truncation offset.
+//! - [`recover_all`] — whole-log recovery (bn-2en, spec 02 §8): the
+//!   orchestrator that recovers every segment (serially or on the R1
+//!   per-segment parallel fan-out) and stitches them into one committed
+//!   prefix, enforcing the §8.1 cross-segment A1/A9 chain; hosts the R2
+//!   fast path (footer/manifest-seeded) and the §8.4 full/fast equivalence.
+//! - [`manifest`] — the advisory manifest / segment catalog (bn-2en,
+//!   spec 02 §8.3, R2): a small, rebuildable, never-authoritative cache of
+//!   the sealed-segment footer trailers.
 
 pub mod acceptance;
 pub mod committer;
@@ -30,8 +38,10 @@ pub mod degraded;
 pub mod encode;
 pub mod format;
 pub mod lock;
+pub mod manifest;
 pub mod model;
 pub mod reader;
+pub mod recover_all;
 pub mod runtime;
 pub mod scanner;
 pub mod sealer;

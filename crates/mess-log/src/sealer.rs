@@ -318,7 +318,12 @@ pub fn recover_fast<F: Fs>(fs: &F, path: &Path) -> io::Result<FastRecovery> {
 /// Read + validate just the `SegmentHeader` (§3.2) through the Fs seam, for the
 /// fast path's header/trailer cross-check. `None` if it is torn / wrong-magic /
 /// fails `header_crc`.
-fn read_segment_header<F: Fs>(
+///
+/// `pub` (bn-2en): whole-log recovery ([`crate::recover_all`]) reads the header
+/// once per segment to cross-check the manifest/footer catalog seed against it,
+/// reusing this exact validated decode rather than duplicating the 52-byte
+/// header parse.
+pub fn read_segment_header<F: Fs>(
     fs: &F,
     path: &Path,
 ) -> io::Result<Option<scanner::SegmentHeaderInfo>> {
