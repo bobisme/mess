@@ -59,6 +59,37 @@ const _: () = {
     qed::const_assert!(StreamPos::new(0b111).next().position() == 0b1000);
 };
 
+/// Optimistic-concurrency precondition for an append.
+///
+/// Replaces the old `Option<StreamPos>` convention (`None` = "stream must be
+/// empty", `Some(v)` = "stream head is exactly `v`"), which had no way to
+/// express an unconditional append and forced a read-before-write on every
+/// call. See dx_api friction #3.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpectedVersion {
+    /// The stream must not exist yet (no records). Equivalent to the old
+    /// `expected_stream_position: None`.
+    NoStream,
+    /// The stream head must be exactly this position. Equivalent to the old
+    /// `Some(v)`.
+    Exact(StreamPos),
+    /// Append unconditionally: skip the head read entirely and take whatever
+    /// the current head is. No `WrongStreamPosition` is ever returned.
+    Any,
+}
+
+impl From<Option<StreamPos>> for ExpectedVersion {
+    /// Bridges the retired `Option<StreamPos>` convention: `None` becomes
+    /// [`ExpectedVersion::NoStream`], `Some(v)` becomes
+    /// [`ExpectedVersion::Exact`].
+    fn from(opt: Option<StreamPos>) -> Self {
+        match opt {
+            None => Self::NoStream,
+            Some(v) => Self::Exact(v),
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Position {
     pub global: u64,

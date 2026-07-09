@@ -173,7 +173,8 @@ mod test {
         let meta = [99u8; 100];
 
         let rows = std::iter::once(None).chain((0u64..).map(Some)).map(|x| {
-            let expected_stream_position = x.map(StreamPos::new);
+            let expected_version =
+                crate::ExpectedVersion::from(x.map(StreamPos::new));
             let i = match x {
                 Some(x) => x + 1,
                 None => 0,
@@ -188,7 +189,7 @@ mod test {
                     message_type: "MessageType".into(),
                     data: data[..].into(),
                     metadata: meta[..].into(),
-                    expected_stream_position,
+                    expected_version,
                 },
                 WriteMessage {
                     id: Id::from_str(
@@ -199,7 +200,7 @@ mod test {
                     message_type: "MessageType".into(),
                     data: data[..].into(),
                     metadata: [][..].into(),
-                    expected_stream_position,
+                    expected_version,
                 },
             ]
         });

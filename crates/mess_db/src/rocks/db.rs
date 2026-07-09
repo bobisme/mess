@@ -1,7 +1,8 @@
 use std::{
+    collections::HashMap,
     ops::{Deref, DerefMut},
     path::Path,
-    sync::atomic::AtomicU64,
+    sync::{atomic::AtomicU64, Mutex},
 };
 
 use rocksdb::{ColumnFamilyDescriptor, ColumnFamilyRef, Options};
@@ -14,6 +15,17 @@ pub struct DB {
     /// Last written global position. 0 = unknown; lazily filled by scanning
     /// the global CF, advanced on every successful write.
     pub(crate) cached_global: AtomicU64,
+    /// Authoritative in-memory last-written stream position per stream, keyed
+    /// by stream name. The actor is the sole writer for this DB's lifetime, so
+    /// this map is complete for every stream this process has written to. It
+    /// lets `ExpectedVersion::Any` appends assign the next stream position
+    /// without a disk head read (dx_api friction #3). Absence means "no event
+    /// written to this stream yet" (empty stream).
+    pub(crate) stream_heads: Mutex<HashMap<String, u64>>,
+    /// Count of disk stream-head reads (`get_last_stream_position`). Real
+    /// instrumentation, not a comment: the write-path tests assert an
+    /// `ExpectedVersion::Any` append performs zero of these.
+    pub(crate) stream_head_reads: AtomicU64,
 }
 
 fn opts() -> Options {
@@ -40,7 +52,12 @@ impl DB {
             path,
             vec![new_cf("global"), new_cf("stream")],
         )?;
-        Ok(Self { db, cached_global: AtomicU64::new(0) })
+        Ok(Self {
+            db,
+            cached_global: AtomicU64::new(0),
+            stream_heads: Mutex::new(HashMap::new()),
+            stream_head_reads: AtomicU64::new(0),
+        })
     }
 
     #[must_use]
@@ -51,6 +68,30 @@ impl DB {
     #[must_use]
     pub fn stream(&self) -> ColumnFamilyRef<'_> {
         self.db.cf_handle("stream").expect("no stream column family")
+    }
+
+    /// Last-written stream position for `stream` from the in-memory cache, or
+    /// `None` if this process has not written to it (treated as empty).
+    /// Performs no disk I/O.
+    pub(crate) fn cached_stream_head(&self, stream: &str) -> Option<u64> {
+        self.stream_heads.lock().unwrap().get(stream).copied()
+    }
+
+    /// Record `pos` as the stream's last-written position. Monotonic: never
+    /// moves a stream's head backwards.
+    pub(crate) fn set_stream_head(&self, stream: &str, pos: u64) {
+        let mut heads = self.stream_heads.lock().unwrap();
+        heads
+            .entry(stream.to_string())
+            .and_modify(|h| *h = (*h).max(pos))
+            .or_insert(pos);
+    }
+
+    /// Number of disk stream-head reads performed so far (test instrumentation).
+    #[cfg(test)]
+    pub(crate) fn stream_head_reads(&self) -> u64 {
+        self.stream_head_reads
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 }
 

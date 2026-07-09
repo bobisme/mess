@@ -244,7 +244,9 @@ impl EventDB {
             message_type: event.name(),
             data,
             metadata,
-            expected_stream_position: expected_version.map(Into::into),
+            expected_version: mess_db::ExpectedVersion::from(
+                expected_version.map(StreamPos::from),
+            ),
         };
         let put_res = self.db_actor.put_message(req);
         put_res.await.map_err(Error::from)

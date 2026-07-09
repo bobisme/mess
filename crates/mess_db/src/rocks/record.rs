@@ -1,8 +1,9 @@
 use std::borrow::Cow;
 
+use ident::Id;
+
 use crate::{
     error::{Error, Result},
-    write::WriteSerialMessage,
     Message, StreamPos,
 };
 
@@ -18,23 +19,26 @@ pub struct GlobalRecord<'a> {
 }
 
 impl<'a> GlobalRecord<'a> {
-    pub(crate) fn from_write_serial_message(
-        msg: &'a WriteSerialMessage,
-    ) -> Result<Self> {
-        let stream_position = msg
-            .expected_position
-            .map(|x| x.next())
-            .unwrap_or(StreamPos::new(0))
-            .encode();
-        Ok(Self {
-            id: msg.id.to_string().into(),
-            stream_name: msg.stream_name.as_ref().into(),
+    /// Build a global-CF record for one event at an explicit stream position.
+    /// Positions are assigned by the batch writer, not derived from the
+    /// expected version, so each event in a multi-event append gets its own.
+    pub(crate) fn build(
+        id: &Id,
+        stream_name: &'a str,
+        stream_position: u64,
+        message_type: &'a str,
+        data: &'a [u8],
+        metadata: &'a [u8],
+    ) -> Self {
+        Self {
+            id: id.to_string().into(),
+            stream_name: stream_name.into(),
             stream_position,
-            message_type: msg.message_type.as_ref().into(),
-            data: msg.data.as_ref().into(),
-            metadata: msg.metadata.as_ref().into(),
+            message_type: message_type.into(),
+            data: data.into(),
+            metadata: metadata.into(),
             ord: 0,
-        })
+        }
     }
 
     pub(crate) fn from_bytes<B: AsRef<[u8]>>(bytes: B) -> Result<Self> {
@@ -69,24 +73,22 @@ pub struct StreamRecord<'a> {
 }
 
 impl<'a> StreamRecord<'a> {
-    #[allow(clippy::missing_const_for_fn)]
-    pub(crate) fn set_global_position(mut self, pos: u64) -> Self {
-        self.global_position = pos;
-        self
-    }
-
-    pub(crate) fn from_write_serial_message(
-        msg: &'a WriteSerialMessage,
+    /// Build a stream-CF record for one event at an explicit global position.
+    pub(crate) fn build(
+        id: &Id,
         global_position: u64,
-    ) -> Result<Self> {
-        Ok(Self {
-            id: msg.id.to_string().into(),
+        message_type: &'a str,
+        data: &'a [u8],
+        metadata: &'a [u8],
+    ) -> Self {
+        Self {
+            id: id.to_string().into(),
             global_position,
-            message_type: msg.message_type.as_ref().into(),
-            data: msg.data.as_ref().into(),
-            metadata: msg.metadata.as_ref().into(),
+            message_type: message_type.into(),
+            data: data.into(),
+            metadata: metadata.into(),
             ord: 0,
-        })
+        }
     }
 
     pub(crate) fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self> {

@@ -6,7 +6,7 @@ use crate::{
     error::{Error, Result},
     read::{GetMessages, OptGlobalPos, OptStream, OptStreamPos, Unset},
     rocks::{db::DB, read::Fetch, write::WriteSerializer},
-    write::{OwnedWriteMessage, WriteMessage},
+    write::{OwnedWriteMessages, WriteMessage, WriteMessages},
     Message, OwnedMessage, Position, StreamPos,
 };
 
@@ -22,7 +22,7 @@ pub enum RequestBody {
         stream_pos: Option<StreamPos>,
         limit: usize,
     },
-    Write(OwnedWriteMessage),
+    Write(OwnedWriteMessages),
 }
 
 impl From<GetMessages<Unset, OptGlobalPos, Unset>> for RequestBody {
@@ -164,10 +164,10 @@ impl Actor {
                 };
                 Response { body: ResponseBody::Messages { messages } }
             }
-            RequestBody::Write(message) => {
-                let pos = crate::rocks::write::write_mess(
+            RequestBody::Write(batch) => {
+                let pos = crate::rocks::write::write_messages(
                     &self.db,
-                    message.into(),
+                    batch.into(),
                     &mut self.ser,
                 );
                 Response { body: ResponseBody::Write { pos } }
@@ -221,13 +221,24 @@ impl<const S: usize> ActorHandle<S> {
         self.token.cancel()
     }
 
+    /// Append a single event. Convenience wrapper over [`Self::put_messages`].
     pub async fn put_message(&self, wm: WriteMessage<'_>) -> Result<Position> {
+        self.put_messages(wm.into()).await
+    }
+
+    /// Atomically append a batch of events to one stream: one expected-version
+    /// check, N records, one write batch. Returns the [`Position`] of the last
+    /// event. No concurrent append can interleave records within the batch.
+    pub async fn put_messages(
+        &self,
+        batch: WriteMessages<'_>,
+    ) -> Result<Position> {
         if self.token.is_cancelled() {
             return Err(Error::Cancelled);
         }
         let (send, recv) = oneshot::channel();
         let req = Request {
-            body: RequestBody::Write(wm.into()),
+            body: RequestBody::Write(batch.into()),
             response_chan: send,
         };
         // Ignore send errors and handle it on the recv end below.
@@ -270,6 +281,7 @@ impl<const S: usize> ActorHandle<S> {
 #[cfg(test)]
 mod test_actor {
     use super::*;
+    use crate::ExpectedVersion;
     use assert2::assert;
     use ident::Id;
 
@@ -300,7 +312,7 @@ mod test_actor {
 
     fn write_msg(
         stream: &str,
-        expected: Option<StreamPos>,
+        expected: crate::ExpectedVersion,
     ) -> WriteMessage<'static> {
         WriteMessage {
             id: Id::new(),
@@ -308,7 +320,28 @@ mod test_actor {
             message_type: "SomeType".to_owned().into(),
             data: b"{\"a\": 1}".as_slice().into(),
             metadata: [].as_slice().into(),
-            expected_stream_position: expected,
+            expected_version: expected,
+        }
+    }
+
+    fn batch_of(
+        stream: &str,
+        expected: crate::ExpectedVersion,
+        message_type: &str,
+        n: usize,
+    ) -> WriteMessages<'static> {
+        use crate::write::WriteEvent;
+        WriteMessages {
+            stream_name: stream.to_owned().into(),
+            expected_version: expected,
+            events: (0..n)
+                .map(|i| WriteEvent {
+                    id: Id::new(),
+                    message_type: message_type.to_owned().into(),
+                    data: (i as u64).to_be_bytes().to_vec().into(),
+                    metadata: Vec::new().into(),
+                })
+                .collect(),
         }
     }
 
@@ -319,12 +352,19 @@ mod test_actor {
         // A wrong expected position comes back as its typed error...
         let res = h
             .handle
-            .put_message(write_msg("s1", Some(StreamPos::new(41))))
+            .put_message(write_msg(
+                "s1",
+                ExpectedVersion::Exact(StreamPos::new(41)),
+            ))
             .await;
         assert!(let Err(Error::WrongStreamPosition { .. }) = res);
 
         // ...without killing the actor: a valid write still succeeds.
-        let pos = h.handle.put_message(write_msg("s1", None)).await.unwrap();
+        let pos = h
+            .handle
+            .put_message(write_msg("s1", ExpectedVersion::NoStream))
+            .await
+            .unwrap();
         assert!(pos.global == 1);
 
         h.cleanup().await;
@@ -333,12 +373,15 @@ mod test_actor {
     #[tokio::test]
     async fn stream_fetch_honors_start_position() {
         let h = TmpHandle::new();
-        h.handle.put_message(write_msg("s1", None)).await.unwrap();
+        h.handle
+            .put_message(write_msg("s1", ExpectedVersion::NoStream))
+            .await
+            .unwrap();
         for v in 0..3 {
             h.handle
                 .put_message(write_msg(
                     "s1",
-                    Some(StreamPos::new(v)),
+                    ExpectedVersion::Exact(StreamPos::new(v)),
                 ))
                 .await
                 .unwrap();
@@ -361,10 +404,19 @@ mod test_actor {
     #[tokio::test]
     async fn global_fetch_honors_stream_filter() {
         let h = TmpHandle::new();
-        h.handle.put_message(write_msg("s1", None)).await.unwrap();
-        h.handle.put_message(write_msg("s2", None)).await.unwrap();
         h.handle
-            .put_message(write_msg("s1", Some(StreamPos::new(0))))
+            .put_message(write_msg("s1", ExpectedVersion::NoStream))
+            .await
+            .unwrap();
+        h.handle
+            .put_message(write_msg("s2", ExpectedVersion::NoStream))
+            .await
+            .unwrap();
+        h.handle
+            .put_message(write_msg(
+                "s1",
+                ExpectedVersion::Exact(StreamPos::new(0)),
+            ))
             .await
             .unwrap();
 
@@ -383,11 +435,85 @@ mod test_actor {
     async fn handle_errors_instead_of_panicking_when_actor_gone() {
         let h = TmpHandle::new();
         h.handle.kill();
-        let res = h.handle.put_message(write_msg("s1", None)).await;
+        let res = h
+            .handle
+            .put_message(write_msg("s1", ExpectedVersion::NoStream))
+            .await;
         assert!(res.is_err());
         let req = GetMessages::default().from_global(0);
         let res = h.handle.fetch_messages(req).await;
         assert!(res.is_err());
+        h.cleanup().await;
+    }
+
+    /// Acceptance (bn-b2r): racing multi-event commands must never interleave
+    /// within a batch. We fire many concurrent multi-event `Any` appends at one
+    /// stream and assert each batch's records are contiguous in BOTH
+    /// stream-version and global order — proof that no other batch's events
+    /// landed inside this one.
+    #[tokio::test]
+    async fn concurrent_multi_event_batches_never_interleave() {
+        const BATCHES: usize = 8;
+        const EVENTS_PER_BATCH: usize = 5;
+        const TOTAL: usize = BATCHES * EVENTS_PER_BATCH;
+
+        let h = TmpHandle::new();
+
+        let mut tasks = Vec::new();
+        for i in 0..BATCHES {
+            let handle = h.handle.clone();
+            tasks.push(tokio::spawn(async move {
+                let batch = batch_of(
+                    "s1",
+                    ExpectedVersion::Any,
+                    &format!("batch-{i}"),
+                    EVENTS_PER_BATCH,
+                );
+                handle.put_messages(batch).await
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap().unwrap();
+        }
+
+        // Read every event on the stream.
+        let req =
+            GetMessages::default().in_stream("s1").with_limit(TOTAL + 8);
+        let messages = h.handle.fetch_messages(req).await.unwrap();
+        let messages: Result<Vec<_>> = messages.into_iter().collect();
+        let messages = messages.unwrap();
+        assert!(messages.len() == TOTAL);
+
+        // Group by the per-batch message-type tag; each batch's stream and
+        // global positions must each form a gap-free contiguous run.
+        use std::collections::BTreeMap;
+        let mut by_batch: BTreeMap<String, Vec<(u64, u64)>> = BTreeMap::new();
+        for m in &messages {
+            by_batch
+                .entry(m.message_type.clone())
+                .or_default()
+                .push((m.stream_position.position(), m.global_position));
+        }
+        assert!(by_batch.len() == BATCHES);
+        for (_tag, mut positions) in by_batch {
+            assert!(positions.len() == EVENTS_PER_BATCH);
+            positions.sort();
+            for w in positions.windows(2) {
+                // contiguous stream positions
+                assert!(w[1].0 == w[0].0 + 1);
+                // contiguous global positions
+                assert!(w[1].1 == w[0].1 + 1);
+            }
+        }
+
+        // Overall the stream is a dense 0..TOTAL with no gaps or duplicates.
+        let mut stream_positions: Vec<u64> =
+            messages.iter().map(|m| m.stream_position.position()).collect();
+        stream_positions.sort_unstable();
+        for (i, p) in stream_positions.iter().enumerate() {
+            assert!(*p == i as u64);
+        }
+
         h.cleanup().await;
     }
 }

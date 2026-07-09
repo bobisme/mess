@@ -59,7 +59,9 @@ fn msg_to_write(expect: Option<u64>) -> WriteMessage<'static> {
         message_type: "someMsgType".into(),
         data: Cow::Borrowed(data),
         metadata: Cow::Borrowed(metadata),
-        expected_stream_position: expect.map(mess_db::StreamPos::new),
+        expected_version: mess_db::ExpectedVersion::from(
+            expect.map(mess_db::StreamPos::new),
+        ),
     }
 }
 
