@@ -30,12 +30,25 @@
 //! - [`manifest`] — the advisory manifest / segment catalog (bn-2en,
 //!   spec 02 §8.3, R2): a small, rebuildable, never-authoritative cache of
 //!   the sealed-segment footer trailers.
+//! - [`fold_chain`] — the BLAKE3 fold-chain constructions (bn-1d0,
+//!   `docs/spec/05-fold-certificates.md` §3, §6): genesis / frame_hash /
+//!   chain_step, the append-side [`fold_chain::ChainHead`] that materializes the
+//!   per-batch `crypto_chain`, and the read-side intra-batch recompute.
+//! - [`footer_ext`] — the sealed-footer extension encode/decode (bn-1d0,
+//!   spec 01 §3.3.2): the durable Tier-1 `StreamHeadTable` head anchor (G6) and
+//!   the Path-C `SnapshotAnchorList` retention certificates.
+//! - [`certificates`] — fold certificates and `load_verified` (bn-1d0,
+//!   spec 05 §7): the batch-granular verification algorithm with typed outcomes,
+//!   Paths A/B/C, tail replay, and the head-anchor truncation check.
 
 pub mod acceptance;
+pub mod certificates;
 pub mod committer;
 pub mod crc;
 pub mod degraded;
 pub mod encode;
+pub mod fold_chain;
+pub mod footer_ext;
 pub mod format;
 pub mod lock;
 pub mod manifest;
