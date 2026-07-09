@@ -270,3 +270,9 @@
 1783575286944653	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAEx5QI		item.move	bn-2py	{"state":"done"}	blake3:0jaUydjw9tkxmBs7gmDLnM1oGzmLgs7vlC16H4l9Idc
 1783575286973713	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAEx5gI		item.move	bn-3kn	{"state":"done"}	blake3:3a1L4b22peoyf3-9vO7qbfeopGU9dico3cpnUb1hnjw
 1783575286992381	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAEx5wI		item.comment	bn-25d	{"body":"Note: composed >=1M ev/s bench criterion deferred to bn-20b (Phase 4 exit gate) per reviewer + lead agreement — the apply path is the spike-validated O(1) design; end-to-end number needs the wired committer."}	blake3:jjgTY9C8Tm-3p0kWfqA3uOK7MJNt-EwWLQN3pXtzBrI
+1783575302690461	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAEx6AI		item.move	bn-20e	{"state":"doing"}	blake3:tnFJkGSwrhDq5xFTqdBvnQSIafZfN8MEZkJx53_ESIg
+1783575302697404	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAEx6QI		item.assign	bn-20e	{"action":"assign","agent":"mess-dev"}	blake3:TI4Z3GIg8s4cBmy2ZXvsAURPhJgCvh2L9tFKvPNnjFU
+1783575302715596	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAEx6gI		item.move	bn-fdv	{"state":"doing"}	blake3:wJZWeH7NV4lzxSNN-x46ckFOihqlRj53oGpfBw_su9o
+1783575302719039	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAEx6wI		item.assign	bn-fdv	{"action":"assign","agent":"mess-dev"}	blake3:t9nqZutzxHzv6qTrAeW88tyHA1pbcfNzB0kQY2B1h_8
+1783575302735141	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAEx7AI		item.move	bn-3az	{"state":"doing"}	blake3:F9pa0McdNjVf7HpHJpgAvp9PeFmNUtnRWxLJF2zc7GE
+1783575302740016	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAEx7QI		item.assign	bn-3az	{"action":"assign","agent":"mess-dev"}	blake3:bXqU75zlT-5aNn-81BlQP6L_dc0OX0Ph-1x0K2KGIK8
