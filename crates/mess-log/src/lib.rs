@@ -37,3 +37,9 @@ pub mod scanner;
 pub mod sealer;
 pub mod watermark;
 pub mod writer;
+
+// bn-1gx: loom memory-ordering interleaving models for the cross-thread
+// atomic protocols (watermark publish/wakeup, committer group handoff).
+// Compiled only under `--cfg loom` during `cargo test`; see `just loom`.
+#[cfg(all(loom, test))]
+mod loom_tests;

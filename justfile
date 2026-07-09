@@ -45,3 +45,14 @@ alias wt := watch-test
 # via .github/workflows/torn-matrix.yml. Measured locally: ~1.7s debug.
 @torn-matrix-full *args='':
 	cargo test -p mess-log --test torn_matrix -- --ignored --nocapture "$@"
+
+# bn-1gx: loom memory-ordering interleaving models (src/loom_tests.rs) for the
+# cross-thread atomic protocols — watermark publish/wakeup + committer group
+# handoff. loom replaces std::sync, so the module is gated on `--cfg loom` and
+# only compiled here. Release build (checked models are slow in debug);
+# LOOM_MAX_PREEMPTIONS=3 bounds the search (every model fully explores at that
+# bound — see each test's printed interleaving count). The `loom_` filter runs
+# only the loom tests (the rest of the suite is skipped, not rebuilt away).
+# Also runs in CI via .github/workflows/loom.yml.
+@loom *args='':
+	env RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 cargo test -p mess-log --release --lib -- --nocapture loom_ "$@"

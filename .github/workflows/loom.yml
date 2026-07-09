@@ -1,0 +1,38 @@
+name: loom
+
+# bn-1gx: loom memory-ordering interleaving models (mess-log/src/loom_tests.rs)
+# for the cross-thread atomic protocols the other verification layers cannot
+# reach — the watermark publish/wakeup ordering (06-subscriptions.md W1,
+# 03-durability.md §3) and the committer group-handoff gate (§2.2). loom
+# replaces std::sync under `--cfg loom`; the models are small (2–3 threads,
+# 2–3 ops) and fully explored at LOOM_MAX_PREEMPTIONS=3, so this is fast enough
+# to run on every PR alongside miri.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: loom-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  loom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: loom
+
+      # Release build: loom's checked models are slow in debug. The `loom_`
+      # filter selects only the loom tests. Same invocation as `just loom`.
+      - name: cargo test -p mess-log (loom models)
+        run: cargo test -p mess-log --release --lib -- --nocapture loom_
+        env:
+          RUSTFLAGS: "--cfg loom"
+          LOOM_MAX_PREEMPTIONS: "3"

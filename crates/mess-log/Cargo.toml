@@ -15,6 +15,13 @@ libc = "0.2"
 stateright = "0.31"
 # bn-36y: the ENOSPC injection tests assert on `libc::ENOSPC`.
 libc = "0.2"
+# bn-1gx: loom drives the memory-ordering interleaving models in
+# `src/loom_tests.rs`. Only used when built with `--cfg loom` (`just loom`);
+# the module is `#[cfg(all(loom, test))]`, so a normal `cargo test` never
+# touches it. Left as an ordinary dev-dep (not `[target.'cfg(loom)']`) because
+# cargo does not reliably evaluate a bare `--cfg loom` from RUSTFLAGS in a
+# `[target.'cfg(...)']` table — the standard loom setup.
+loom = "0.7"
 
 # `#[cfg(kani)]` proof modules (bn-y0b) are compiled only by the `cargo-kani`
 # driver, which sets this cfg itself; it is never a real Cargo feature.
@@ -22,4 +29,4 @@ libc = "0.2"
 # rustc/clippy, which otherwise flag it as an unexpected cfg (Rust 1.80+
 # `unexpected_cfgs` lint).
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)", "cfg(loom)"] }
