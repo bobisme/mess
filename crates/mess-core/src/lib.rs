@@ -30,3 +30,5 @@ pub mod event;
 pub use aggregate::{Aggregate, Decide};
 pub use error::{CodecError, CommandError};
 pub use event::Event;
+
+pub mod codec;
