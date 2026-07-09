@@ -42,7 +42,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -168,7 +168,13 @@ pub enum AppendError {
         /// Bytes left before `segment_size`.
         remaining: u64,
     },
-    /// The committer has shut down; no more appends can be accepted.
+    /// The committer has shut down (explicitly via
+    /// [`Committer::shutdown`], or implicitly by dropping the
+    /// [`Committer`], `bn-3da`); no more appends can be accepted. Surfaced
+    /// both for a new append attempted after shutdown and for one already
+    /// queued/racing in when shutdown was signalled and never gathered —
+    /// callers get this typed error instead of hanging forever on an ack
+    /// that will never be fulfilled.
     #[error("committer is closed")]
     Closed,
     /// The store is full: preallocating a new segment failed with `ENOSPC`
@@ -240,25 +246,6 @@ fn fulfill(ack: &Ack, outcome: Result<AppendOutcome, AppendError>) {
     }
 }
 
-/// The future an appender awaits for its batch's durability verdict.
-struct AckWait {
-    ack: Ack,
-}
-
-impl Future for AckWait {
-    type Output = Result<AppendOutcome, AppendError>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
-        let mut st = self.ack.lock().unwrap();
-        if let Some(out) = st.outcome.take() {
-            std::task::Poll::Ready(out)
-        } else {
-            st.waker = Some(cx.waker().clone());
-            std::task::Poll::Pending
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Completion signal (committer → shutdown), sidestepping the non-`'static`
 // RPITIT join handle from `Runtime::spawn`
@@ -266,19 +253,25 @@ impl Future for AckWait {
 
 struct DoneState {
     done: bool,
-    waker: Option<std::task::Waker>,
+    /// Every waiter currently parked on this signal. Plural — unlike a
+    /// single-shot `shutdown()`/`Drop` join (the original, sole use of this
+    /// signal), [`AckOrClosed`] below also races an arbitrary number of
+    /// concurrently in-flight appends against it (`bn-3da`), so a single
+    /// `Option<Waker>` slot would silently drop all but the last registrant
+    /// and leave the others parked forever.
+    wakers: Vec<std::task::Waker>,
 }
 
 type Done = Arc<Mutex<DoneState>>;
 
 fn new_done() -> Done {
-    Arc::new(Mutex::new(DoneState { done: false, waker: None }))
+    Arc::new(Mutex::new(DoneState { done: false, wakers: Vec::new() }))
 }
 
 fn signal_done(done: &Done) {
     let mut st = done.lock().unwrap();
     st.done = true;
-    if let Some(w) = st.waker.take() {
+    for w in st.wakers.drain(..) {
         w.wake();
     }
 }
@@ -297,9 +290,47 @@ impl Future for DoneWait {
         if st.done {
             std::task::Poll::Ready(())
         } else {
-            st.waker = Some(cx.waker().clone());
+            st.wakers.push(cx.waker().clone());
             std::task::Poll::Pending
         }
+    }
+}
+
+/// Waits for an append's durability verdict, but resolves early with
+/// [`AppendError::Closed`] if the committer's task exits (the completion
+/// signal fires) before ever fulfilling this ack — the backstop for a
+/// request submitted to (or already queued for) a committer that has since
+/// been force-closed (`bn-3da`, [`Committer::drop`]/[`Committer::shutdown`]).
+///
+/// Checking `ack` before `done` is load-bearing: any request the committer
+/// actually gathers into a group has its ack fulfilled
+/// (`commit_group`'s step 6, unconditionally — success, `Indeterminate`, or
+/// a typed error) strictly before the loop can advance to exit and signal
+/// `done` (`committer_loop` is a single sequential task), so a real outcome
+/// always wins the race; only a request the loop never got to gather at all
+/// ever observes `done` first.
+struct AckOrClosed {
+    ack: Ack,
+    done: Done,
+}
+
+impl Future for AckOrClosed {
+    type Output = Result<AppendOutcome, AppendError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        {
+            let mut st = self.ack.lock().unwrap();
+            if let Some(out) = st.outcome.take() {
+                return std::task::Poll::Ready(out);
+            }
+            st.waker = Some(cx.waker().clone());
+        }
+        let mut st = self.done.lock().unwrap();
+        if st.done {
+            return std::task::Poll::Ready(Err(AppendError::Closed));
+        }
+        st.wakers.push(cx.waker().clone());
+        std::task::Poll::Pending
     }
 }
 
@@ -383,6 +414,19 @@ impl<T> Sender<T> {
     fn send(&self, v: T) {
         let mut st = self.inner.lock().unwrap();
         st.queue.push_back(v);
+        if let Some(w) = st.recv_waker.take() {
+            w.wake();
+        }
+    }
+
+    /// Force a re-poll of a parked receiver without touching the queue or
+    /// the sender count — used by forced shutdown (`bn-3da`) to wake
+    /// [`recv_unless_closed`] promptly right after flipping `closed`,
+    /// instead of waiting on the next real send or the ordinary
+    /// last-sender-drops wake (which may never come while an [`Appender`]
+    /// outlives the [`Committer`]).
+    fn wake_receiver(&self) {
+        let mut st = self.inner.lock().unwrap();
         if let Some(w) = st.recv_waker.take() {
             w.wake();
         }
@@ -490,6 +534,35 @@ fn subframes_of(events: &[EventInput]) -> Vec<Subframe<'_>> {
         .iter()
         .map(|e| Subframe::plain(e.event_type_id, e.schema_version, e.codec_id, &e.payload))
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Forced-shutdown-aware receive (`bn-3da`)
+// ---------------------------------------------------------------------------
+
+/// `rx.recv()`, but also resolves to `None` — without waiting for every
+/// [`Sender`] to drop — once `closed` is observed set (forced shutdown:
+/// [`Committer::drop`]/[`Committer::shutdown`]). Polls `recv` FIRST on every
+/// wake, so a request already queued (or one racing in concurrently with the
+/// close) is always picked up and gathered as an ordinary group before the
+/// close is honored — the same register-then-check discipline `gather`'s
+/// early-close uses to close the set-then-signal race. This is how "drain
+/// what's already gathering, reject what isn't" (the policy documented on
+/// [`Committer`]'s `Drop` impl) is actually implemented: nothing here ever
+/// discards a request out of the queue, it just stops picking up NEW ones
+/// once closed.
+async fn recv_unless_closed(rx: &Receiver<CommitReq>, closed: &AtomicBool) -> Option<CommitReq> {
+    std::future::poll_fn(|cx| {
+        let mut recv = std::pin::pin!(rx.recv());
+        if let std::task::Poll::Ready(v) = recv.as_mut().poll(cx) {
+            return std::task::Poll::Ready(v);
+        }
+        if closed.load(Ordering::Acquire) {
+            return std::task::Poll::Ready(None);
+        }
+        std::task::Poll::Pending
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -703,13 +776,14 @@ async fn committer_loop<R: Runtime, F: Fs>(
     watermark: Watermark,
     metrics: Arc<Metrics>,
     degraded: Degraded,
+    closed: Arc<AtomicBool>,
     done: Done,
 ) {
     // The expected convoy width, seeded at 1 (so the first group and the
     // one-writer case both close immediately) and tracking the last group's
     // size thereafter.
     let mut target = 1usize;
-    while let Some(first) = rx.recv().await {
+    while let Some(first) = recv_unless_closed(&rx, &closed).await {
         let group = gather(&rt, &rx, first, &policy, &gate, target).await;
         target = group.len().max(1);
         // D8 sticky poison (`bn-25e`, §2.6): once a barrier has failed, the
@@ -751,6 +825,8 @@ async fn submit(
     tx: &Sender<CommitReq>,
     gate: &Gate,
     degraded: &Degraded,
+    closed: &Arc<AtomicBool>,
+    done: &Done,
     req: AppendRequest,
 ) -> Result<AppendOutcome, AppendError> {
     // D8 fail-fast (`bn-25e`, §2.6): a poisoned store rejects every write at
@@ -761,6 +837,16 @@ async fn submit(
     // guard, which fails such a request `StorePoisoned` too.
     if degraded.is_poisoned() {
         return Err(AppendError::StorePoisoned);
+    }
+    // Forced-shutdown fast path (`bn-3da`): `closed` is set by
+    // `Committer::drop`/`shutdown` before the loop necessarily notices, so a
+    // new append attempted after (or racing with) shutdown fails fast
+    // instead of queuing into a committer that may already be gone. This is
+    // an optimization, not the correctness boundary — the narrow race where
+    // `closed` trips just AFTER this check is closed below by racing the ack
+    // against the completion signal (`AckOrClosed`), never a hang.
+    if closed.load(Ordering::Acquire) {
+        return Err(AppendError::Closed);
     }
     // §2.2 early-close accounting: mark in-flight at the VERY START of the
     // call — before any encoding — and unmark right after submission. This
@@ -814,30 +900,39 @@ async fn submit(
     tx.send(creq);
     gate.leave();
 
-    AckWait { ack }.await
+    AckOrClosed { ack, done: done.clone() }.await
 }
 
 /// A cheap-to-clone, `Send + Sync` submit-side handle to a running
 /// committer — the object appender tasks hold. Unlike [`Committer`] (which
 /// owns the committer's join handle and is not itself shareable across
 /// tasks), an `Appender` can be cloned into any number of spawned writers.
-/// Each live clone keeps the committer running; when the last `Appender`
-/// and the [`Committer`] both drop their senders, the committer shuts down.
+///
+/// An `Appender` does **not** keep the committer alive on its own (`bn-3da`):
+/// the owning [`Committer`] is authoritative over the task's lifecycle, and
+/// dropping it deterministically stops and joins the committer task even
+/// while `Appender` clones still exist — see [`Committer`]'s `Drop` impl for
+/// the exact policy. An `Appender` outlived by its `Committer` simply starts
+/// getting [`AppendError::Closed`] from [`append`](Appender::append) instead
+/// of hanging.
 #[derive(Clone)]
 pub struct Appender {
     tx: Sender<CommitReq>,
     gate: Arc<Gate>,
     watermark: Watermark,
     degraded: Degraded,
+    closed: Arc<AtomicBool>,
+    done: Done,
 }
 
 impl Appender {
     /// Durably append one batch and await its outcome (see
     /// [`Committer::append`]). Fails fast with
     /// [`AppendError::StorePoisoned`] if the store has been poisoned by a
-    /// prior barrier failure (D8, §2.6).
+    /// prior barrier failure (D8, §2.6), or with [`AppendError::Closed`] if
+    /// the owning [`Committer`] has shut down (`bn-3da`) — never hangs.
     pub async fn append(&self, req: AppendRequest) -> Result<AppendOutcome, AppendError> {
-        submit(&self.tx, &self.gate, &self.degraded, req).await
+        submit(&self.tx, &self.gate, &self.degraded, &self.closed, &self.done, req).await
     }
 
     /// A clone of the durable watermark this committer advances. After a
@@ -877,8 +972,22 @@ pub struct Committer<R: Runtime> {
     watermark: Watermark,
     metrics: Arc<Metrics>,
     degraded: Degraded,
+    /// Forced-shutdown flag (`bn-3da`): set by [`Drop`]/[`shutdown`]
+    /// (`begin_shutdown`) so the committer loop and any in-flight/future
+    /// [`Appender::append`] observe closure deterministically, independent
+    /// of how many `Appender` clones are still alive (plain sender
+    /// ref-counting alone cannot express "the owner says stop").
+    closed: Arc<AtomicBool>,
     done: Done,
-    _rt: std::marker::PhantomData<R>,
+    /// Owned so [`Drop`] can call [`Runtime::block_on`] to join the
+    /// committer task synchronously — correct on both runtimes: on
+    /// [`crate::runtime::real::RealRuntime`] the task runs on its own OS
+    /// thread already, so this just parks; on
+    /// [`crate::runtime::sim::SimRuntime`] tasks only make progress while
+    /// *something* steps the shared single-threaded executor, so `Drop`
+    /// must drive it itself rather than block-parking a thread nothing else
+    /// will ever wake.
+    rt: R,
 }
 
 impl<R: Runtime> Committer<R> {
@@ -896,11 +1005,13 @@ impl<R: Runtime> Committer<R> {
         let watermark = Watermark::new(writer.next_pos());
         let metrics = Arc::new(Metrics::default());
         let degraded = Degraded::new();
+        let closed = Arc::new(AtomicBool::new(false));
         let done = new_done();
 
         // Fire-and-forget: the spawned task runs to completion regardless of
         // its join handle (which `Runtime::spawn` returns as a non-`'static`
-        // RPITIT we cannot store). Shutdown awaits `done` instead.
+        // RPITIT we cannot store). `Drop`/`shutdown` await `done` instead
+        // (`bn-3da`).
         drop(rt.spawn(committer_loop(
             rt.clone(),
             writer,
@@ -910,6 +1021,7 @@ impl<R: Runtime> Committer<R> {
             watermark.clone(),
             metrics.clone(),
             degraded.clone(),
+            closed.clone(),
             done.clone(),
         )));
 
@@ -919,8 +1031,9 @@ impl<R: Runtime> Committer<R> {
             watermark,
             metrics,
             degraded,
+            closed,
             done,
-            _rt: std::marker::PhantomData,
+            rt: rt.clone(),
         }
     }
 
@@ -929,11 +1042,13 @@ impl<R: Runtime> Committer<R> {
     pub fn appender(&self) -> Appender {
         Appender {
             // `tx` is `Some` for the whole life of a live `Committer`; it is
-            // only cleared by `shutdown`, which consumes `self`.
+            // only cleared by `shutdown`/`Drop` (`begin_shutdown`).
             tx: self.tx.as_ref().expect("committer is live").clone(),
             gate: self.gate.clone(),
             watermark: self.watermark.clone(),
             degraded: self.degraded.clone(),
+            closed: self.closed.clone(),
+            done: self.done.clone(),
         }
     }
 
@@ -991,17 +1106,81 @@ impl<R: Runtime> Committer<R> {
     /// advances past this batch (`Process` mode: after the write, §1.1).
     pub async fn append(&self, req: AppendRequest) -> Result<AppendOutcome, AppendError> {
         match &self.tx {
-            Some(tx) => submit(tx, &self.gate, &self.degraded, req).await,
+            Some(tx) => submit(tx, &self.gate, &self.degraded, &self.closed, &self.done, req).await,
             None => Err(AppendError::Closed),
         }
     }
 
+    /// Signal forced shutdown (`bn-3da`) and return the completion future to
+    /// await ([`shutdown`](Committer::shutdown)) or block on
+    /// ([`Drop`](Committer::drop)). Sets `closed` (observed by
+    /// [`recv_unless_closed`] in the committer loop and by the fast path in
+    /// [`submit`], so every live [`Appender`] — not just this handle — stops
+    /// getting new work gathered), drops this handle's own [`Sender`] (the
+    /// ordinary last-sender-closes-the-channel path, still exercised
+    /// whenever no `Appender` outlives the `Committer`), and wakes a parked
+    /// receiver so the forced close is noticed promptly rather than waiting
+    /// on the next real send.
+    ///
+    /// Idempotent: calling this a second time (e.g. the `Drop` that runs
+    /// immediately after `shutdown()` returns, since `shutdown` consumes
+    /// `self`) is a cheap no-op — `tx` is already `None` and `done` is
+    /// already `true`, so the returned [`DoneWait`] resolves on its first
+    /// poll without blocking.
+    fn begin_shutdown(&mut self) -> DoneWait {
+        self.closed.store(true, Ordering::Release);
+        if let Some(tx) = self.tx.take() {
+            tx.wake_receiver();
+        }
+        DoneWait { done: self.done.clone() }
+    }
+
     /// Close the gather channel and await the committer's shutdown (its
-    /// final durable handoff). Call once every in-flight
-    /// [`append`](Committer::append) has resolved.
+    /// final durable handoff). Unlike plain [`drop`], this is the
+    /// async-friendly form for a caller already inside an executor —
+    /// dropping the `Committer` (see the `Drop` impl) has the identical
+    /// effect but blocks the calling thread to join.
     pub async fn shutdown(mut self) {
-        self.tx = None; // drop the last Sender → committer observes close
-        DoneWait { done: self.done.clone() }.await;
+        self.begin_shutdown().await;
+    }
+}
+
+impl<R: Runtime> Drop for Committer<R> {
+    /// Deterministically stop and join the committer task (`bn-3da`).
+    /// Closing only the gather channel — the original behaviour, still
+    /// exercised here whenever no [`Appender`] outlives this `Committer` —
+    /// is not enough on its own: nothing then confirmed the task had
+    /// actually finished, so an in-process reopen of the same segment could
+    /// race the still-running commit thread's own tail write/close. And if
+    /// an `Appender` clone DOES outlive the `Committer`, plain sender
+    /// ref-counting never closes the channel at all — the task, and the
+    /// thread holding it (`RealRuntime`), would leak for the rest of the
+    /// process.
+    ///
+    /// **Policy — reject, not drain, for anything not already gathering.**
+    /// The bone requires picking one and documenting it: a request the loop
+    /// has already gathered into a commit group runs to completion
+    /// unaffected by this drop — its ack carries a real durability verdict,
+    /// because [`recv_unless_closed`] always lets an already-queued or
+    /// concurrently-racing-in request through as an ordinary group before it
+    /// honors `closed`. Anything not yet gathered by the time `closed` is
+    /// observed is never gathered afterward: a live [`Appender`]'s next
+    /// [`append`](Appender::append) gets a typed [`AppendError::Closed`]
+    /// (the `submit` fast path), and a request that already raced into the
+    /// channel gets the same typed error via [`AckOrClosed`] racing its ack
+    /// against the completion signal — never a hang.
+    ///
+    /// Joining blocks the calling thread via [`Runtime::block_on`] (not a
+    /// bespoke thread-park): on [`RealRuntime`](crate::runtime::real::RealRuntime)
+    /// the committer already runs on its own OS thread, so this just parks
+    /// until it signals done; on
+    /// [`SimRuntime`](crate::runtime::sim::SimRuntime) — a single-threaded
+    /// cooperative executor with no independent progress of its own — a
+    /// bare park would deadlock (nothing left to step the committer task to
+    /// its `signal_done`), so `block_on` drives the shared executor itself.
+    fn drop(&mut self) {
+        let wait = self.begin_shutdown();
+        self.rt.block_on(wait);
     }
 }
 
@@ -1678,6 +1857,113 @@ mod tests {
         assert!(
             best_ev_per_s >= 100_000.0,
             "expected >=100k durable ev/s on a settled device, got {best_ev_per_s:.0}"
+        );
+    }
+
+    // -- bn-3da: Drop deterministically stops and joins the committer -----
+    //
+    // Before this bone, dropping a `Committer` only closed the gather
+    // channel (via `Sender`/`Option` ref-counting): nothing confirmed the
+    // task had actually finished, and an `Appender` clone that outlived the
+    // `Committer` kept the channel open (and the task/thread alive)
+    // forever. Both tests below bound every blocking call so a regression
+    // back to that behaviour FAILS the test instead of hanging it.
+
+    /// `RealRuntime`: the committer runs on its own OS thread
+    /// (`std::thread::spawn` in `runtime::real`). Dropping the `Committer`
+    /// while a cloned `Appender` is still alive must still join that thread
+    /// promptly (no leak), and the lingering `Appender`'s next append must
+    /// come back as a typed `Closed` error, not hang.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn drop_joins_the_real_thread_and_closes_lingering_appenders() {
+        let rt = RealRuntime::new();
+        let fs = rt.fs();
+        let path = real_tmp("drop-join");
+        let _cleanup = Cleanup(path.clone());
+        let writer = SegmentWriter::create(&fs, &path, SegmentParams::new(0, 0, 1, 0)).unwrap();
+
+        let c = Committer::spawn(&rt, writer, Durability::Os);
+        let ap = c.appender();
+
+        // Prove the store is live, and leave the group's ack racing the
+        // drop below (not awaited here) — the "pending append" the bone
+        // asks for.
+        let pending = {
+            let rt2 = rt.clone();
+            let ap2 = ap.clone();
+            std::thread::spawn(move || rt2.block_on(ap2.append(req(1, 0, 2))))
+        };
+        let out = pending.join().unwrap().unwrap();
+        assert!(matches!(out, AppendOutcome::Acked { .. }), "store must be live before the drop");
+
+        // Drop the Committer on its own thread while `ap` is STILL ALIVE.
+        // Bounded: if `Drop` regressed to "only closes the channel", `ap`
+        // being alive means sender ref-counting never reaches zero and the
+        // join would hang forever instead of returning.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(c);
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("Committer::drop must join the committer thread promptly, not hang");
+
+        // The committer is gone. The lingering `Appender` clone did NOT
+        // keep it alive (bn-3da): its next append must fail typed and
+        // fast — never silently hang awaiting an ack that will never be
+        // fulfilled.
+        let (err_tx, err_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let r = rt.block_on(ap.append(req(1, 2, 1)));
+            let _ = err_tx.send(r);
+        });
+        let err = err_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a lingering Appender's append after Committer::drop must return, not hang");
+        assert_eq!(
+            err,
+            Err(AppendError::Closed),
+            "post-drop append on a lingering Appender must be a typed Closed error"
+        );
+    }
+
+    /// `SimRuntime`: a single-threaded, cooperative executor with NO
+    /// independent progress of its own — tasks only advance while
+    /// something calls `core.step()`. Dropping the `Committer` from
+    /// *inside* `rt.block_on(...)` (so `Drop` must reentrantly drive the
+    /// very same executor to join the committer task) is the scenario a
+    /// naive thread-park `Drop` would deadlock: nothing else could ever
+    /// step the committer task to its completion signal. `SimRuntime`'s own
+    /// `block_on` panics loudly on a genuine deadlock ("sim runtime
+    /// deadlock: ...") rather than hanging, so a regression here fails
+    /// fast.
+    #[test]
+    fn drop_inside_the_sim_executor_does_not_deadlock() {
+        let rt = SimRuntime::new(11);
+        let fs = rt.fs();
+        let path = Path::new("/seg-drop-sim");
+        let writer = seg(&fs, path);
+
+        let (out, closed_err) = rt.block_on(async {
+            let c = Committer::spawn(&rt, writer, Durability::Os);
+            let ap = c.appender();
+            let out = ap.append(req(1, 0, 2)).await.unwrap();
+
+            // Drop while `ap` is still alive, from within the executor's
+            // own `block_on` — the reentrant-`block_on` path (`bn-3da`).
+            drop(c);
+
+            let closed_err = ap.append(req(1, 2, 1)).await;
+            (out, closed_err)
+        });
+
+        assert!(matches!(out, AppendOutcome::Acked { .. }));
+        assert_eq!(
+            closed_err,
+            Err(AppendError::Closed),
+            "a lingering Appender's append after Committer::drop must be a typed Closed error"
         );
     }
 }
