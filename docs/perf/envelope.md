@@ -90,10 +90,38 @@ order-independent checksum) ran on every measured pass.
 | sealed.read.byte_identity | true | parallel == single-threaded reference on every run (stream + global), splitmix64 order-independent checksum | 2026-07-09 | as above |
 | sealed.read.sigbus_stance | typed-error | truncated sidecar => typed SidecarError at open (no mmap, no SIGBUS surface); survivors replay exact | 2026-07-09 | `cargo test -p mess-index --test sealed_read_paths truncated -- --nocapture` |
 
+## Phase 4 exit gate — composed engine swap (bn-20b)
+
+The moment EventStore's default backend becomes the composed `mess-log` +
+`mess-index` engine (`mess_store::engine::LogEngine`). These rows are measured
+through the **full engine** (the `Backend`/`EventStore` seam), not the isolated
+log or index paths above — so they include the append gate's committer bridge
+and the sealed read's payload materialisation, the true end-to-end cost the
+facade pays. Recorded on the bn-20b workspace host (Linux 7.0.12-arch1-1, ext4
+scratch under `$HOME/.cache/mess-bn20b-bench`, `--release`, single measured
+run). Reproduce: `CLANG_PATH=/usr/bin/clang cargo bench -p mess-store --bench
+engine_envelope`.
+
+| metric | value | conditions | date | source command |
+|---|---|---|---|---|
+| engine.buffered.ev_per_s | 2960000 | full composed engine append path (`LogEngine::append_batch` through the real `mess-log` committer, `Durability::Process`); 400 x 5,000-event batches = 2M events; ~24 B payload; ext4 scratch; single run | 2026-07-09 | `cargo bench -p mess-store --bench engine_envelope` |
+| engine.buffered.gate | 1000000 | acceptance floor (>=1M ev/s buffered through the composed engine) — PASS (2.96x) | 2026-07-09 | as above |
+| engine.sealed_replay.ev_per_s | 3460000 | `EventStore` load of a 2M-event sealed corpus: `read_stream` routes through the real `mess-index` `ReplaySet` cold path, then materialises `StoredRecord`s (message_type + payload) from the record book; single stream; single run | 2026-07-09 | as above |
+| engine.sealed_replay.gate | 2500000 | acceptance floor (>=2.5M ev/s sealed replay through EventStore load) — PASS (1.38x) | 2026-07-09 | as above |
+| engine.recovery_fast.s | 0.00014 | **`mess-log` recovery in ISOLATION** (not the engine open path): `recover_whole_log` fast path + advisory manifest over a realistic sealed corpus — 32 sealed segments, 3.2M events (200 batches/seg x 500 frames); manifest-seeded, trailer cross-check. Measures only stitching the committed prefix from footers; it does NOT decode payloads or rebuild the record book — see `engine.open_rehydrate.*` for the engine's true reopen cost | 2026-07-09 | as above |
+| engine.recovery_fast.gate | 0.5 | acceptance ceiling (<=0.5s recovery fast path) — PASS (~3,500x margin) | 2026-07-09 | as above |
+| engine.open_rehydrate.ev_per_s | 3476813 | **engine open-WITH-rehydration** (bn-20b), the true `LogEngine::open` reopen wall time over a populated single active segment: scans the durable log, decodes every frame's payload via `mess-log`'s `AcceptedBatch::frames`, and rebuilds the record book + active index + interner (from the meta name tables). 1,000,000 events (200 streams x 100 batches x 50 frames, ~8 B payloads); 0.2876 s; ext4 scratch; single run | 2026-07-09 | `cargo test -p mess-store --release --test engine_reopen measure_open_with_rehydration_wall_time -- --ignored --nocapture` |
+| engine.open_rehydrate.s | 0.2876 | same run: 1M-event reopen wall time (book fully rehydrated, `total_events == 1_000_000` asserted). Unlike the isolation row above this pays the payload-materialisation + book-build cost the `Backend` reads depend on | 2026-07-09 | as above |
+| engine.zero_api_changes | true | all Phase 1/2 mess-store suites (bank_account, cache, snapshot_law, differential_model, registry, fjall_snapshot) green on `LogEngine` with no `Backend`/facade API change; differential oracle green vs the engine across 192 randomized sequences with 198 **GENUINE** crash-reopens (drop engine, release `StoreLock`, fresh `LogEngine::open`, book rehydrated from the log — no shared `Arc`); plus the `engine_reopen` regression probe | 2026-07-09 | `cargo test -p mess-store` |
+
 ## Gate summary
 
 | metric | value |
 |---|---|
+| phase4.exit_gate.buffered_gate | PASS (2.96M >= 1M ev/s, composed engine append path) |
+| phase4.exit_gate.sealed_replay_gate | PASS (3.46M >= 2.5M ev/s, EventStore load of sealed corpus) |
+| phase4.exit_gate.recovery_gate | PASS (0.14 ms <= 0.5 s, recover_all + manifest, 3.2M ev / 32 segs) |
+| phase4.exit_gate.zero_api_changes | PASS (all Phase 1/2 suites + examples green on LogEngine; interim MockBackend demoted to the `mock` feature) |
 | phase3.exit_gate.harnesses_green | 3 of 3 (crash 12k, torn 24k, sigkill 45 rounds) |
 | phase3.exit_gate.durable_gate | PASS (148k >= 100k ev/s @ 4x100) |
 | phase3.exit_gate.buffered_gate | PASS (4.71M >= 1M ev/s) |

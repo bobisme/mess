@@ -34,10 +34,20 @@
 #[path = "differential_support/mod.rs"]
 mod differential_support;
 
-use differential_support::{Op, first_divergence, plan_ops, run_sequence};
+mod common;
+
+use common::TestSnapshotBackend;
+use differential_support::{
+    Op, first_divergence, plan_ops, run_sequence, run_sequence_with,
+};
 
 const FAST_SEEDS: u64 = 500;
 const FAST_OPS: usize = 40;
+/// bn-20b: the composed engine opens a real committer thread + fjall stores per
+/// sequence, so the engine differential profile uses a representative seed
+/// budget (still exercising CrashReopen / conflicts / snapshots across every
+/// op kind) rather than the full 500.
+const ENGINE_SEEDS: u64 = 96;
 const FULL_SEEDS: u64 = 5_000;
 const FULL_OPS: usize = 40;
 const N_STREAMS: usize = 3;
@@ -84,6 +94,47 @@ async fn differential_fast_profile() {
         conflicts_seen > 0,
         "fast profile never hit a deliberately-stale AppendRaw op"
     );
+}
+
+/// bn-20b engine swap: the identical differential suite driven against the
+/// **composed production engine** (`FjallSnapshotBackend<LogEngine>`), proving
+/// the engine matches the same Model oracle — the payoff of API-first. Every
+/// op kind (including `CrashReopen`, stale-`AppendRaw` conflicts, and
+/// `SaveSnapshot`) is exercised across `ENGINE_SEEDS` seeds x 2 cache configs.
+#[tokio::test]
+async fn differential_profile_on_engine() {
+    let mut crash_reopens_seen = 0u64;
+    let mut conflicts_seen = 0u64;
+    for seed in 0..ENGINE_SEEDS {
+        for cache_on in [false, true] {
+            if let Err(report) = run_sequence_with(
+                TestSnapshotBackend::new(),
+                seed,
+                cache_on,
+                FAST_OPS,
+                N_STREAMS,
+            )
+            .await
+            {
+                panic!("engine differential divergence: {report}");
+            }
+        }
+        for op in plan_ops(seed, FAST_OPS, N_STREAMS) {
+            match op {
+                Op::CrashReopen => crash_reopens_seen += 1,
+                Op::AppendRaw { stale: true, .. } => conflicts_seen += 1,
+                _ => {}
+            }
+        }
+    }
+    println!(
+        "differential ON ENGINE: {ENGINE_SEEDS} seeds x {FAST_OPS} ops x 2 \
+         cache configs = {} sequences green against LogEngine; \
+         {crash_reopens_seen} CrashReopen ops, {conflicts_seen} stale AppendRaw",
+        ENGINE_SEEDS * 2
+    );
+    assert!(crash_reopens_seen > 0, "engine profile never hit a CrashReopen op");
+    assert!(conflicts_seen > 0, "engine profile never hit a stale AppendRaw op");
 }
 
 /// The full 5k-seed profile. `#[ignore]`d by default; the nightly

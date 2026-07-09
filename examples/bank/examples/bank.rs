@@ -12,17 +12,18 @@
 
 use bank::{Account, AccountError, Deposit, Open, Withdraw};
 use mess_core::CommandError;
-use mess_store::{EventStore, MockBackend, Version};
+use mess_store::{EventStore, LogEngine, Version};
 
 #[tokio::main]
 async fn main() {
     // `EventStore` is the north-star facade: `load` / `append` / `command`
-    // over any `Backend`. `MockBackend` is an in-memory, in-process backend
-    // with real optimistic-concurrency semantics — the "temp store" this
-    // example (and the crate's own tests) runs against. Production code
-    // swaps in a durable backend (the RocksDB-backed actor, once its
-    // `Backend` impl lands) without changing a line below this point.
-    let store = EventStore::new(MockBackend::new());
+    // over any `Backend`. The default backend is now the composed production
+    // engine (`LogEngine`): `mess-log` (durable append log + recovery) +
+    // `mess-index` (hot/sealed index + fjall meta tables). The interim
+    // in-memory backend is behind mess-store's `mock` feature. Nothing below
+    // this line changes with the backend — that is the API-first payoff.
+    let dir = std::env::temp_dir().join(format!("mess-bank-{}", std::process::id()));
+    let store = EventStore::new(LogEngine::open(&dir).expect("open engine"));
     let stream = "account-alice";
 
     // `command()` is the north-star call: `load -> decide -> append`, with

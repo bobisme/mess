@@ -4,8 +4,22 @@ version = "0.0.0"
 edition = "2024"
 description = "mess v1: EventStore API surface"
 
+[features]
+# bn-20b engine swap: the composed `mess-log` + `mess-index` engine
+# (`engine::LogEngine`) is the production default backend and is always
+# compiled. The interim in-memory `MockBackend` is demoted to this
+# feature — kept on by default only because the differential + facade-retry
+# harnesses (`differential_model`, `cache`) exercise the facade against it.
+# Production consumers can `--no-default-features` to drop it entirely; no
+# path pulls in the pre-v1 `mess_db` crate.
+default = ["mock"]
+mock = []
+
 [dependencies]
 mess-core = { workspace = true }
+# bn-20b: the composed production backend is built on the log (durability,
+# ordering, recovery, sealing) ...
+mess-log = { workspace = true }
 # bn-fdv: the production snapshot path stores its snapshot *heads* in
 # mess-index's fjall-backed `meta::SnapshotHeads` table (O(1) point lookup,
 # rebuildable per I5). Blobs live in a plain content-addressed dir alongside,
@@ -17,6 +31,10 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
-# bn-fdv: real-fs scratch dirs for the fjall-backed snapshot reopen / wiped-meta
-# fallback tests (mirrors mess-index's own test setup).
+# bn-fdv / bn-20b: real-fs scratch dirs for the fjall-backed snapshot reopen
+# tests and the composed-engine suites/benches.
 tempfile = "3"
+
+[[bench]]
+name = "engine_envelope"
+harness = false

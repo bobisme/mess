@@ -85,6 +85,24 @@ const P_CHECKPOINTS: &str = "checkpoints";
 const P_DEDUPE: &str = "dedupe";
 const P_DEDUPE_ORDER: &str = "dedupe_order";
 const P_HW: &str = "hw";
+// bn-20b: interner bijections. The append-only log stores only interned
+// numeric ids (a `stream_id u64` per batch, an `event_type_id u32` per event) —
+// never their names — so a materializing reader that must return
+// `(stream_name, message_type)` bytes cannot reconstruct names from the log
+// alone. These two tables persist the id→name maps the engine's in-process
+// interner assigns, so a fresh open over a populated dir resolves names again.
+//
+// Unlike the other meta tables (derived caches, rebuildable from the log by
+// I5), these are the durable *source of truth* for the name↔id bijection —
+// exactly the role `$registry` plays in the full design, kept here as the
+// smallest durable surface for the engine's lightweight interner. They live in
+// the meta store because that is already the store's durable derived-metadata
+// home, opened at the same journal-buffered durability (a clean reopen sees
+// the buffered tail; only a power-loss crash could lose names whose events are
+// nonetheless durable — an acceptable, documented limit shared with every
+// other buffered meta table).
+const P_STREAM_NAMES: &str = "stream_names";
+const P_TYPE_NAMES: &str = "type_names";
 
 // High-water keys inside the `hw` partition. Checkpoints need no entry here:
 // a projection's checkpoint value *is* its high-water.
@@ -187,6 +205,8 @@ pub struct MetaStore {
     dedupe: Keyspace,
     dedupe_order: Keyspace,
     hw: Keyspace,
+    stream_names: Keyspace,
+    type_names: Keyspace,
     dedupe_bounds: Mutex<DedupeBounds>,
     dedupe_capacity: usize,
 }
@@ -214,6 +234,8 @@ impl MetaStore {
         let dedupe = db.keyspace(P_DEDUPE, KeyspaceCreateOptions::default)?;
         let dedupe_order = db.keyspace(P_DEDUPE_ORDER, KeyspaceCreateOptions::default)?;
         let hw = db.keyspace(P_HW, KeyspaceCreateOptions::default)?;
+        let stream_names = db.keyspace(P_STREAM_NAMES, KeyspaceCreateOptions::default)?;
+        let type_names = db.keyspace(P_TYPE_NAMES, KeyspaceCreateOptions::default)?;
 
         // Recover the FIFO seq bounds from the order index: the window's live
         // seqs are the contiguous range [first_key, last_key].
@@ -239,6 +261,8 @@ impl MetaStore {
             dedupe,
             dedupe_order,
             hw,
+            stream_names,
+            type_names,
             dedupe_bounds: Mutex::new(bounds),
             dedupe_capacity,
         })
@@ -300,6 +324,64 @@ impl MetaStore {
 
         batch.commit()?; // durability None => journal-buffered, no fsync
         Ok(())
+    }
+
+    // ---- interner bijections (bn-20b) --------------------------------
+
+    /// Persist a `stream_id → name` interner mapping (idempotent — the same id
+    /// always maps to the same name; re-writing is a no-op-shaped overwrite).
+    /// Called by the engine the first time a stream name is interned, so a
+    /// later reopen can resolve the name the log's numeric `stream_id` stands
+    /// for.
+    pub fn put_stream_name(&self, stream_id: u64, name: &str) -> Result<(), MetaError> {
+        self.stream_names.insert(stream_id.to_be_bytes(), name.as_bytes())?;
+        Ok(())
+    }
+
+    /// Persist an `event_type_id → name` interner mapping (see
+    /// [`put_stream_name`](Self::put_stream_name)).
+    pub fn put_type_name(&self, event_type_id: u32, name: &str) -> Result<(), MetaError> {
+        self.type_names.insert(event_type_id.to_be_bytes(), name.as_bytes())?;
+        Ok(())
+    }
+
+    /// Every persisted `(stream_id, name)` interner mapping, for rebuilding the
+    /// engine's interner on reopen. Order is unspecified (the caller sorts by
+    /// id to reconstruct the dense assignment).
+    pub fn stream_names(&self) -> Result<Vec<(u64, String)>, MetaError> {
+        let mut out = Vec::new();
+        for kv in self.stream_names.iter() {
+            let (k, v) = kv.into_inner()?;
+            let id = u64::from_be_bytes(
+                k.as_ref().try_into().map_err(|_| {
+                    DecodeError::Corrupt { table: P_STREAM_NAMES, reason: "stream-name key must be 8 bytes".into() }
+                })?,
+            );
+            let name = String::from_utf8(v.to_vec()).map_err(|e| {
+                DecodeError::Corrupt { table: P_STREAM_NAMES, reason: format!("name not utf-8: {e}") }
+            })?;
+            out.push((id, name));
+        }
+        Ok(out)
+    }
+
+    /// Every persisted `(event_type_id, name)` interner mapping (see
+    /// [`stream_names`](Self::stream_names)).
+    pub fn type_names(&self) -> Result<Vec<(u32, String)>, MetaError> {
+        let mut out = Vec::new();
+        for kv in self.type_names.iter() {
+            let (k, v) = kv.into_inner()?;
+            let id = u32::from_be_bytes(
+                k.as_ref().try_into().map_err(|_| {
+                    DecodeError::Corrupt { table: P_TYPE_NAMES, reason: "type-name key must be 4 bytes".into() }
+                })?,
+            );
+            let name = String::from_utf8(v.to_vec()).map_err(|e| {
+                DecodeError::Corrupt { table: P_TYPE_NAMES, reason: format!("name not utf-8: {e}") }
+            })?;
+            out.push((id, name));
+        }
+        Ok(out)
     }
 
     /// Record a projection's checkpoint (the exclusive log position it has

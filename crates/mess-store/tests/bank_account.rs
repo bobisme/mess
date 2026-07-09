@@ -11,7 +11,10 @@ use mess_core::{Aggregate, CodecError, Decide, Event};
 use mess_store::backend::{
     AppendError, Appended, Backend, RecordToAppend, StoredRecord,
 };
-use mess_store::{CommandError, EventStore, MockBackend, RetryPolicy, Version};
+use mess_store::{CommandError, EventStore, RetryPolicy, Version};
+
+mod common;
+use common::TestBackend;
 
 // ---------------------------------------------------------------------------
 // Domain (all hand-written — the shape a `#[derive]` layer would generate).
@@ -180,8 +183,8 @@ impl Decide<Withdraw> for Account {
     }
 }
 
-fn store() -> EventStore<MockBackend> {
-    EventStore::new(MockBackend::new())
+fn store() -> EventStore<TestBackend> {
+    EventStore::new(TestBackend::new())
 }
 
 // ---------------------------------------------------------------------------

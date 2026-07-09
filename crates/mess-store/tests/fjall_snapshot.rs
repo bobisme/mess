@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use mess_core::{Aggregate, CodecError, Event};
 use mess_store::{
-    EventStore, FjallSnapshotBackend, Loaded, MockBackend, Snapshottable,
+    EventStore, FjallSnapshotBackend, Loaded, LogEngine, Snapshottable,
     StateCodecError, Version,
 };
 
@@ -86,7 +86,7 @@ impl Snapshottable for Counter {
     }
 }
 
-type Store = EventStore<FjallSnapshotBackend<MockBackend>>;
+type Store = EventStore<FjallSnapshotBackend<LogEngine>>;
 
 fn fold(events: &[CounterEvent]) -> Counter {
     let mut s = Counter::default();
@@ -97,8 +97,15 @@ fn fold(events: &[CounterEvent]) -> Counter {
 }
 
 fn open(root: &std::path::Path) -> Store {
-    let backend =
-        FjallSnapshotBackend::open(MockBackend::new(), root).expect("open");
+    // The composed engine's event log is intentionally given a *fresh* dir on
+    // every open — this suite exercises snapshot-head persistence across a
+    // reopen while the event log is rehydrated by hand (see `rehydrate` below;
+    // "the durable log's job, out of this bone's scope"). The production
+    // snapshot heads + blobs persist at the fixed `root`.
+    let events = tempfile::tempdir().expect("event dir");
+    let engine = LogEngine::open(events.path()).expect("open engine");
+    std::mem::forget(events); // keep the fresh event dir for this store's life
+    let backend = FjallSnapshotBackend::open(engine, root).expect("open");
     EventStore::new(backend)
 }
 

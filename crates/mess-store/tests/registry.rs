@@ -24,7 +24,10 @@ use mess_store::registry::{
     RegistryRecord, TARGET_KIND_CATEGORY, TARGET_KIND_EVENT_TYPE,
     TARGET_KIND_STREAM,
 };
-use mess_store::{MockBackend, Version};
+use mess_store::Version;
+
+mod common;
+use common::TestBackend;
 
 // ---------------------------------------------------------------------------
 // Reserved IDs (REG1) resolve with no log records at all.
@@ -32,7 +35,7 @@ use mess_store::{MockBackend, Version};
 
 #[tokio::test]
 async fn bootstrap_from_empty_log_resolves_reserved_names() {
-    let backend = MockBackend::new();
+    let backend = TestBackend::new();
     let registry = Registry::bootstrap(backend)
         .await
         .expect("empty $registry bootstraps trivially");
@@ -69,7 +72,7 @@ async fn bootstrap_from_empty_log_resolves_reserved_names() {
 
 #[tokio::test]
 async fn restore_from_bytes_alone_resolves_everything() {
-    let backend = MockBackend::new();
+    let backend = TestBackend::new();
     let mut writer =
         Registry::bootstrap(backend.clone()).await.expect("bootstrap empty");
 
@@ -155,7 +158,7 @@ async fn restore_from_bytes_alone_resolves_everything() {
 
 #[tokio::test]
 async fn bootstrap_from_hand_encoded_bytes_needs_no_prior_registry() {
-    let backend = MockBackend::new();
+    let backend = TestBackend::new();
 
     // Hand-build the exact §3.9 worked example bytes and append them
     // directly — simulating a log that was written by some other process
@@ -203,7 +206,7 @@ async fn bootstrap_from_hand_encoded_bytes_needs_no_prior_registry() {
 #[tokio::test]
 async fn rename_produces_alias_event_old_name_still_resolves() {
     let mut registry =
-        Registry::bootstrap(MockBackend::new()).await.expect("bootstrap");
+        Registry::bootstrap(TestBackend::new()).await.expect("bootstrap");
     let cat = registry.register_category("payments").await.unwrap();
     let stream = registry.register_stream("payments-1", cat).await.unwrap();
 
@@ -225,7 +228,7 @@ async fn rename_produces_alias_event_old_name_still_resolves() {
 #[tokio::test]
 async fn category_and_event_type_alias_also_preserve_old_names() {
     let mut registry =
-        Registry::bootstrap(MockBackend::new()).await.expect("bootstrap");
+        Registry::bootstrap(TestBackend::new()).await.expect("bootstrap");
     let cat = registry.register_category("billing").await.unwrap();
     registry.alias_category(cat, "billing-v2").await.unwrap();
     assert_eq!(registry.state().category_id("billing"), Some(cat));
@@ -247,7 +250,7 @@ async fn category_and_event_type_alias_also_preserve_old_names() {
 #[tokio::test]
 async fn stream_referencing_unregistered_category_is_rejected() {
     let mut registry =
-        Registry::bootstrap(MockBackend::new()).await.expect("bootstrap");
+        Registry::bootstrap(TestBackend::new()).await.expect("bootstrap");
     let err = registry
         .register_stream("orphan", 999)
         .await
@@ -261,7 +264,7 @@ async fn stream_referencing_unregistered_category_is_rejected() {
 #[tokio::test]
 async fn stream_may_reference_reserved_system_category() {
     let mut registry =
-        Registry::bootstrap(MockBackend::new()).await.expect("bootstrap");
+        Registry::bootstrap(TestBackend::new()).await.expect("bootstrap");
     let stream = registry
         .register_stream("sys-stream", RESERVED_CATEGORY_ID)
         .await
@@ -272,7 +275,7 @@ async fn stream_may_reference_reserved_system_category() {
 #[tokio::test]
 async fn dict_referencing_unregistered_scope_is_rejected() {
     let mut registry =
-        Registry::bootstrap(MockBackend::new()).await.expect("bootstrap");
+        Registry::bootstrap(TestBackend::new()).await.expect("bootstrap");
     let err = registry
         .register_dict(TARGET_KIND_CATEGORY, 42, 1, vec![1, 2, 3])
         .await
@@ -286,7 +289,7 @@ async fn dict_referencing_unregistered_scope_is_rejected() {
 #[tokio::test]
 async fn alias_of_unregistered_stream_is_rejected() {
     let mut registry =
-        Registry::bootstrap(MockBackend::new()).await.expect("bootstrap");
+        Registry::bootstrap(TestBackend::new()).await.expect("bootstrap");
     let err = registry
         .alias_stream(12345, "ghost")
         .await
@@ -304,7 +307,7 @@ async fn alias_of_unregistered_stream_is_rejected() {
 #[tokio::test]
 async fn aliasing_reserved_stream_id_is_rejected() {
     let mut registry =
-        Registry::bootstrap(MockBackend::new()).await.expect("bootstrap");
+        Registry::bootstrap(TestBackend::new()).await.expect("bootstrap");
     let err = registry
         .alias_stream(RESERVED_STREAM_ID, "nope")
         .await
@@ -315,7 +318,7 @@ async fn aliasing_reserved_stream_id_is_rejected() {
 #[tokio::test]
 async fn aliasing_reserved_category_id_is_rejected() {
     let mut registry =
-        Registry::bootstrap(MockBackend::new()).await.expect("bootstrap");
+        Registry::bootstrap(TestBackend::new()).await.expect("bootstrap");
     let err = registry
         .alias_category(RESERVED_CATEGORY_ID, "nope")
         .await
@@ -329,7 +332,7 @@ async fn aliasing_reserved_category_id_is_rejected() {
 #[tokio::test]
 async fn aliasing_reserved_event_type_id_is_rejected() {
     let mut registry =
-        Registry::bootstrap(MockBackend::new()).await.expect("bootstrap");
+        Registry::bootstrap(TestBackend::new()).await.expect("bootstrap");
     let err = registry
         .alias_event_type(RESERVED_EVENT_TYPE_ID, "nope")
         .await
@@ -347,7 +350,7 @@ async fn aliasing_reserved_event_type_id_is_rejected() {
 #[tokio::test]
 async fn event_type_alias_with_nonzero_high_bits_is_rejected() {
     let mut registry =
-        Registry::bootstrap(MockBackend::new()).await.expect("bootstrap");
+        Registry::bootstrap(TestBackend::new()).await.expect("bootstrap");
     let et = registry
         .register_event_type("t", 1, [0u8; 32])
         .await
@@ -417,7 +420,7 @@ async fn double_registration_of_same_category_id_is_corruption() {
 #[tokio::test]
 async fn rebinding_a_name_to_a_different_id_is_rejected() {
     let mut registry =
-        Registry::bootstrap(MockBackend::new()).await.expect("bootstrap");
+        Registry::bootstrap(TestBackend::new()).await.expect("bootstrap");
     let a = registry.register_category("alpha").await.unwrap();
     let _b = registry.register_category("beta").await.unwrap();
 
@@ -446,7 +449,7 @@ async fn rebinding_a_name_to_a_different_id_is_rejected() {
 #[tokio::test]
 async fn event_type_with_reserved_codec_id_is_rejected() {
     let mut registry =
-        Registry::bootstrap(MockBackend::new()).await.expect("bootstrap");
+        Registry::bootstrap(TestBackend::new()).await.expect("bootstrap");
     let err = registry
         .register_event_type("bad", 0, [0u8; 32])
         .await
@@ -457,7 +460,7 @@ async fn event_type_with_reserved_codec_id_is_rejected() {
 #[tokio::test]
 async fn dict_with_reserved_codec_id_is_rejected() {
     let mut registry =
-        Registry::bootstrap(MockBackend::new()).await.expect("bootstrap");
+        Registry::bootstrap(TestBackend::new()).await.expect("bootstrap");
     let cat = registry.register_category("c").await.unwrap();
     let err = registry
         .register_dict(TARGET_KIND_CATEGORY, cat, 0, vec![1])
@@ -474,7 +477,7 @@ async fn dict_with_reserved_codec_id_is_rejected() {
 #[tokio::test]
 async fn allocation_is_sequential_per_namespace_from_one() {
     let mut registry =
-        Registry::bootstrap(MockBackend::new()).await.expect("bootstrap");
+        Registry::bootstrap(TestBackend::new()).await.expect("bootstrap");
     let c1 = registry.register_category("a").await.unwrap();
     let c2 = registry.register_category("b").await.unwrap();
     let c3 = registry.register_category("c").await.unwrap();
@@ -499,7 +502,7 @@ async fn allocation_is_sequential_per_namespace_from_one() {
 #[tokio::test]
 async fn registered_dict_resolves_forever_no_deletion_path_exists() {
     let mut registry =
-        Registry::bootstrap(MockBackend::new()).await.expect("bootstrap");
+        Registry::bootstrap(TestBackend::new()).await.expect("bootstrap");
     let et =
         registry.register_event_type("t.Event", 1, [1u8; 32]).await.unwrap();
     let dict_id = registry
@@ -516,7 +519,7 @@ async fn dict_scope_stream_is_rejected() {
     // §3.8: scope_kind 1 (stream) is deliberately not a legal dictionary
     // scope; only category (2) and event_type (3).
     let mut registry =
-        Registry::bootstrap(MockBackend::new()).await.expect("bootstrap");
+        Registry::bootstrap(TestBackend::new()).await.expect("bootstrap");
     let cat = registry.register_category("c").await.unwrap();
     let stream = registry.register_stream("s", cat).await.unwrap();
     let err = registry
@@ -535,7 +538,7 @@ async fn dict_scope_stream_is_rejected() {
 async fn rejected_registration_never_touches_the_backend_and_never_desyncs_head()
  {
     let mut registry =
-        Registry::bootstrap(MockBackend::new()).await.expect("bootstrap");
+        Registry::bootstrap(TestBackend::new()).await.expect("bootstrap");
 
     let head_before = registry
         .backend()

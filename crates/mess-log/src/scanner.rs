@@ -117,7 +117,98 @@ impl AcceptedBatch {
     pub fn last_stream_version(&self) -> u64 {
         self.first_stream_version + u64::from(self.frame_count) - 1
     }
+
+    /// The read-side materialization seam (bn-20b): decode this recovered
+    /// batch's `frame_count` events back to `(event_type_id, payload)` from the
+    /// segment image the batch was recovered from.
+    ///
+    /// This is the ONLY public path from a recovered batch to its payload
+    /// bytes. The recovery scanner is a byte-*validator* — it proves the batch
+    /// is a marker-terminated, CRC-valid, exactly-tiling committed batch and
+    /// records its position/identity ([`AcceptedBatch`]) — but it does not
+    /// return payloads, because the log tier is pointer-only (§module docs of
+    /// `mess-store`'s engine). A materializing reader (the composed engine's
+    /// record-book rehydration on reopen) needs the bytes back; it recovers a
+    /// segment, then calls `frames(&image)` on each [`AcceptedBatch`] to obtain
+    /// per-event `(event_type_id, schema_version, codec_id, payload)`.
+    ///
+    /// `segment_image` MUST be the same durable image the batch was recovered
+    /// from (the exact bytes [`recover_segment_with_image`] returns alongside
+    /// the [`Recovery`]); `self.offset .. self.offset + self.total_len` indexes
+    /// this batch within it. Because the batch already byte-validated (its
+    /// subframes tile exactly, [`decode_batch`] proved it), the walk is
+    /// infallible and allocation-free — each yielded [`RecoveredFrame`] borrows
+    /// its payload straight out of `segment_image`.
+    pub fn frames<'a>(&self, segment_image: &'a [u8]) -> Frames<'a> {
+        let start = self.offset as usize;
+        let end = start + self.total_len as usize;
+        let batch = &segment_image[start..end];
+        let pos = HEADER_LEN + if self.has_crypto_chain { CHAIN_LEN } else { 0 };
+        Frames { batch, pos, remaining: self.frame_count }
+    }
 }
+
+/// One recovered event's read-side materialization (bn-20b): the interned
+/// event-type id (`04-registry.md`) and the on-disk payload bytes, borrowed
+/// from the segment image the containing batch was recovered from. Yielded by
+/// [`AcceptedBatch::frames`] in on-disk (stream) order.
+///
+/// The batch-level identity a materializing caller also needs — `stream_id`,
+/// `first_stream_version`, `first_global_pos`, `segment_epoch` — lives on the
+/// [`AcceptedBatch`] itself; a frame's stream version is
+/// `first_stream_version + frame index`, its global position
+/// `first_global_pos + frame index`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveredFrame<'a> {
+    /// Interned event type id (§4.3). Resolves to the message-type name through
+    /// the caller's own id→name mapping (the log stores only the id).
+    pub event_type_id: u32,
+    /// Schema version of the event type at write time (§4.3).
+    pub schema_version: u16,
+    /// Interned payload codec id (`0` = bootstrap, verbatim payload) (§4.3).
+    pub codec_id: u16,
+    /// The on-disk payload bytes — exactly `compressed_len` bytes, borrowed
+    /// from the segment image. For a `codec_id`/`compression_id == 0` frame
+    /// (the common uncompressed shape) these are the verbatim event bytes.
+    pub payload: &'a [u8],
+}
+
+/// Iterator over an [`AcceptedBatch`]'s recovered event frames (bn-20b). Walks
+/// the `EventSubframe`s (§4.3) of a byte-validated batch, so it never fails and
+/// never allocates. See [`AcceptedBatch::frames`].
+pub struct Frames<'a> {
+    /// The whole batch slice `[header(+chain) .. marker]`.
+    batch: &'a [u8],
+    /// Offset of the next subframe within `batch`.
+    pos: usize,
+    /// Frames not yet yielded.
+    remaining: u32,
+}
+
+impl<'a> Iterator for Frames<'a> {
+    type Item = RecoveredFrame<'a>;
+
+    fn next(&mut self) -> Option<RecoveredFrame<'a>> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let p = self.pos;
+        let event_type_id = rd_u32(self.batch, p + SF_EVENT_TYPE_ID_OFF);
+        let schema_version = rd_u16(self.batch, p + SF_SCHEMA_VERSION_OFF);
+        let codec_id = rd_u16(self.batch, p + SF_CODEC_ID_OFF);
+        let compressed_len = rd_u32(self.batch, p + SF_COMPRESSED_LEN_OFF) as usize;
+        let payload = &self.batch[p + SUBFRAME_HDR_LEN..p + SUBFRAME_HDR_LEN + compressed_len];
+        self.pos = p + SUBFRAME_HDR_LEN + compressed_len;
+        self.remaining -= 1;
+        Some(RecoveredFrame { event_type_id, schema_version, codec_id, payload })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining as usize, Some(self.remaining as usize))
+    }
+}
+
+impl ExactSizeIterator for Frames<'_> {}
 
 /// The validated `SegmentHeader` fields the scan seeded from (§3.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,6 +277,24 @@ pub fn recover_segment_anchored<F: Fs>(
 ) -> io::Result<Recovery> {
     let bytes = read_segment_through_fs(fs, path)?;
     Ok(scan_image(&bytes, anchor))
+}
+
+/// Recover a segment **and** return the durable image it was recovered from,
+/// so a materializing caller can decode per-frame payloads via
+/// [`AcceptedBatch::frames`] (bn-20b — the read-side materialization seam).
+///
+/// Reads the whole segment through the [`Fs`] seam exactly once (the same read
+/// [`recover_segment`] does) and hands the buffer back alongside the
+/// [`Recovery`]: `recovery.accepted[i].frames(&image)` then yields batch *i*'s
+/// events. The engine's record-book rehydration on reopen is the sole caller;
+/// the pure byte scan ([`scan_image`]) and its recovered offsets are unchanged.
+pub fn recover_segment_with_image<F: Fs>(
+    fs: &F,
+    path: &Path,
+) -> io::Result<(Recovery, Vec<u8>)> {
+    let bytes = read_segment_through_fs(fs, path)?;
+    let recovery = scan_image(&bytes, None);
+    Ok((recovery, bytes))
 }
 
 /// Read the whole segment through [`FileHandle::pread`] — the only I/O this
@@ -503,4 +612,96 @@ fn rd_u32(d: &[u8], o: usize) -> u32 {
 #[inline]
 fn rd_u64(d: &[u8], o: usize) -> u64 {
     u64::from_le_bytes(d[o..o + 8].try_into().unwrap())
+}
+
+#[cfg(test)]
+mod frame_tests {
+    //! bn-20b: the read-side materialization round trip. Encode real batches
+    //! through the canonical write path ([`SegmentWriter`], which encodes via
+    //! [`crate::encode::BatchEncoder`]), recover the segment, and prove
+    //! [`AcceptedBatch::frames`] yields back the exact `(event_type_id,
+    //! payload)` of every event — the property the engine's book rehydration
+    //! rests on.
+    use super::*;
+    use crate::encode::Subframe;
+    use crate::runtime::{Runtime, SimRuntime};
+    use crate::writer::{BatchSpec, SegmentParams, SegmentWriter};
+
+    /// One input batch: stream id, its first stream version, and each event's
+    /// `(event_type_id, payload)`.
+    struct InBatch {
+        stream_id: u64,
+        first_stream_version: u64,
+        events: Vec<(u32, Vec<u8>)>,
+    }
+
+    #[test]
+    fn frames_round_trip_exact_payloads_and_type_ids() {
+        let rt = SimRuntime::new(7);
+        let fs = rt.fs();
+        let path = std::path::Path::new("/seg-frames");
+
+        // Three single-stream batches with distinct event-type ids, frame
+        // counts, and per-event payloads — the exact shapes the engine writes.
+        let batches = vec![
+            InBatch {
+                stream_id: 10,
+                first_stream_version: 0,
+                events: vec![(1, b"open-alice".to_vec()), (2, vec![0xAB; 8])],
+            },
+            InBatch {
+                stream_id: 10,
+                first_stream_version: 2,
+                events: vec![(2, 100i64.to_le_bytes().to_vec())],
+            },
+            InBatch {
+                stream_id: 77,
+                first_stream_version: 0,
+                events: vec![(3, b"".to_vec()), (3, b"other-stream".to_vec()), (1, vec![9; 3])],
+            },
+        ];
+
+        let mut writer =
+            SegmentWriter::create(&fs, path, SegmentParams::new(1, 0, 1, 0)).unwrap();
+        for b in &batches {
+            let subs: Vec<Subframe> = b
+                .events
+                .iter()
+                .map(|(etid, payload)| Subframe::plain(*etid, 0, 0, payload))
+                .collect();
+            writer
+                .append(&BatchSpec {
+                    stream_id: b.stream_id,
+                    category_id: 0,
+                    first_stream_version: b.first_stream_version,
+                    crypto_chain: None,
+                    subframes: &subs,
+                })
+                .unwrap();
+        }
+        writer.close().unwrap();
+
+        let (recovery, image) = recover_segment_with_image(&fs, path).unwrap();
+        assert_eq!(recovery.stop, ScanStop::EndOfSegment);
+        assert_eq!(recovery.accepted.len(), batches.len());
+
+        // Every accepted batch's frames decode back to the exact input.
+        let mut expected_global = 0u64;
+        for (batch, input) in recovery.accepted.iter().zip(&batches) {
+            assert_eq!(batch.stream_id, input.stream_id);
+            assert_eq!(batch.first_stream_version, input.first_stream_version);
+            assert_eq!(batch.first_global_pos, expected_global);
+            assert_eq!(batch.frame_count as usize, input.events.len());
+
+            let frames: Vec<RecoveredFrame> = batch.frames(&image).collect();
+            assert_eq!(frames.len(), input.events.len());
+            for (frame, (etid, payload)) in frames.iter().zip(&input.events) {
+                assert_eq!(frame.event_type_id, *etid, "event_type_id must round-trip");
+                assert_eq!(frame.payload, &payload[..], "payload bytes must round-trip");
+                assert_eq!(frame.codec_id, 0);
+            }
+            expected_global += input.events.len() as u64;
+        }
+        assert_eq!(recovery.next_pos, expected_global);
+    }
 }

@@ -78,7 +78,6 @@
 //!   the contract promises).
 
 use std::collections::HashMap;
-use std::convert::Infallible;
 use std::fmt;
 
 use mess_core::{Aggregate, CodecError, CommandError, Decide, Event};
@@ -689,10 +688,10 @@ pub enum Outcome {
     Reopened,
 }
 
-fn map_command_result(
+fn map_command_result<E: std::error::Error>(
     res: Result<
         mess_store::Commit,
-        CommandError<AccountError, StoreError<Infallible>>,
+        CommandError<AccountError, StoreError<E>>,
     >,
 ) -> Outcome {
     match res {
@@ -713,8 +712,8 @@ fn map_command_result(
     }
 }
 
-fn map_append_result(
-    res: Result<mess_store::Commit, AppendError<StoreError<Infallible>>>,
+fn map_append_result<E: std::error::Error>(
+    res: Result<mess_store::Commit, AppendError<StoreError<E>>>,
 ) -> Outcome {
     match res {
         Ok(c) => Outcome::Commit {
@@ -810,9 +809,8 @@ fn apply_model(
     }
 }
 
-async fn apply_real(
-    store: &mut EventStore<MockBackend>,
-    backend: &MockBackend,
+async fn apply_real<B: mess_store::snapshot::SnapshotStore + Clone>(
+    store: &mut EventStore<B>,
     cache_on: bool,
     streams: &[String],
     op: &Op,
@@ -902,14 +900,42 @@ async fn apply_real(
             Outcome::SnapshotOk
         }
         Op::CrashReopen => {
-            let mut fresh = EventStore::new(backend.clone());
-            if cache_on {
-                fresh = fresh.with_cache_capacity(64);
-            }
-            *store = fresh;
-            Outcome::Reopened
+            // A genuine reopen consumes the backend (dropping the engine and
+            // releasing its lock), so it cannot run behind `&mut store` here —
+            // the driver loop ([`run_sequence_with`]) intercepts `CrashReopen`
+            // and reopens the backend + store itself.
+            unreachable!("CrashReopen is handled by the run_sequence_with driver loop")
         }
     }
+}
+
+/// Build a fresh [`EventStore`] over `backend` (a clone), cache on iff
+/// `cache_on`.
+fn build_store<B: mess_store::snapshot::SnapshotStore + Clone>(
+    backend: &B,
+    cache_on: bool,
+) -> EventStore<B> {
+    let mut store = EventStore::new(backend.clone());
+    if cache_on {
+        store = store.with_cache_capacity(64);
+    }
+    store
+}
+
+/// The genuine crash-reopen: drop the current store (releasing its backend
+/// handle) FIRST, then reopen the backend over its own durable state, then
+/// rebuild the store. Returns the reopened `(store, backend)`.
+fn crash_reopen<B>(
+    store: EventStore<B>,
+    backend: B,
+    cache_on: bool,
+) -> (EventStore<B>, B)
+where
+    B: mess_store::snapshot::SnapshotStore + Clone + crate::common::Reopen,
+{
+    drop(store);
+    let backend = backend.reopen();
+    (build_store(&backend, cache_on), backend)
 }
 
 // ===========================================================================
@@ -963,16 +989,30 @@ pub async fn run_sequence(
     n_ops: usize,
     n_streams: usize,
 ) -> Result<(), DivergenceReport> {
+    // The interim in-memory backend: kept for differential testing (bn-20b).
+    run_sequence_with(MockBackend::new(), seed, cache_on, n_ops, n_streams).await
+}
+
+/// The same differential sequence, driven against an arbitrary supplied
+/// backend (bn-20b: run the identical Phase-1/2 differential suite against the
+/// composed production engine as well as the interim `MockBackend`).
+pub async fn run_sequence_with<B>(
+    backend: B,
+    seed: u64,
+    cache_on: bool,
+    n_ops: usize,
+    n_streams: usize,
+) -> Result<(), DivergenceReport>
+where
+    B: mess_store::snapshot::SnapshotStore + Clone + crate::common::Reopen,
+{
     let plan = plan_ops(seed, n_ops, n_streams);
     let streams: Vec<String> =
         (0..n_streams).map(|i| format!("acct-{i}")).collect();
 
     let mut model = Model::default();
-    let backend = MockBackend::new();
-    let mut store = EventStore::new(backend.clone());
-    if cache_on {
-        store = store.with_cache_capacity(64);
-    }
+    let mut backend = backend;
+    let mut store = build_store(&backend, cache_on);
 
     for (idx, op) in plan.iter().enumerate() {
         let resolved_expected = match op {
@@ -985,15 +1025,17 @@ pub async fn run_sequence(
 
         let model_outcome =
             apply_model(&mut model, cache_on, &streams, op, resolved_expected);
-        let real_outcome = apply_real(
-            &mut store,
-            &backend,
-            cache_on,
-            &streams,
-            op,
-            resolved_expected,
-        )
-        .await;
+        let real_outcome = if matches!(op, Op::CrashReopen) {
+            // Genuine crash-reopen: drop the store + engine and re-open the
+            // durable directory fresh (for the composed engine; a no-op handle
+            // for the in-memory mock). The book is rehydrated from the log.
+            let (s, b) = crash_reopen(store, backend, cache_on);
+            store = s;
+            backend = b;
+            Outcome::Reopened
+        } else {
+            apply_real(&mut store, cache_on, &streams, op, resolved_expected).await
+        };
 
         if model_outcome != real_outcome {
             return Err(DivergenceReport {

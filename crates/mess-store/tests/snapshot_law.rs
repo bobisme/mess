@@ -19,9 +19,12 @@
 
 use mess_core::{Aggregate, CodecError, Event};
 use mess_store::{
-    EventStore, Loaded, MockBackend, SnapshotStore, Snapshottable,
+    EventStore, Loaded, SnapshotStore, Snapshottable,
     StateCodecError, StoredSnapshot, Version,
 };
+
+mod common;
+use common::TestSnapshotBackend;
 
 // ---------------------------------------------------------------------------
 // A small aggregate whose fold is order-sensitive, so a wrong tail split shows.
@@ -199,7 +202,7 @@ fn fold<A: Aggregate>(events: &[A::Event]) -> A {
 }
 
 async fn append_all(
-    store: &EventStore<MockBackend>,
+    store: &EventStore<TestSnapshotBackend>,
     stream: &str,
     events: &[CounterEvent],
 ) {
@@ -238,7 +241,7 @@ async fn snapshot_plus_tail_equals_full_replay() {
         let expected = fold::<Counter>(&events);
 
         // Append the prefix, snapshot it, append the tail.
-        let store = EventStore::new(MockBackend::new());
+        let store = EventStore::new(TestSnapshotBackend::new());
         append_all(&store, &stream, &events[..p]).await;
         let snap_ref = store.save_snapshot::<Counter>(&stream).await.unwrap();
         // The snapshot summarizes exactly the prefix we appended.
@@ -304,7 +307,7 @@ async fn snapshot_plus_tail_equals_full_replay() {
 /// blob would have decoded to a WRONG state.
 #[tokio::test]
 async fn stale_fold_version_falls_back_to_full_replay() {
-    let store = EventStore::new(MockBackend::new());
+    let store = EventStore::new(TestSnapshotBackend::new());
     let stream = "counter-versioned";
 
     // A stream that includes `Marked` events — v1 ignores them, v2 counts them.
@@ -356,7 +359,7 @@ async fn stale_fold_version_falls_back_to_full_replay() {
 /// used (short tail), so the mismatch test above is meaningful.
 #[tokio::test]
 async fn matching_fold_version_uses_snapshot() {
-    let store = EventStore::new(MockBackend::new());
+    let store = EventStore::new(TestSnapshotBackend::new());
     let stream = "counter-fresh";
 
     let head = [CounterEvent::Added(10), CounterEvent::Scaled(2)];
@@ -380,7 +383,7 @@ async fn matching_fold_version_uses_snapshot() {
 /// by full replay.
 #[tokio::test]
 async fn load_cached_without_snapshot_is_full_replay() {
-    let store = EventStore::new(MockBackend::new());
+    let store = EventStore::new(TestSnapshotBackend::new());
     let stream = "counter-nosnap";
     let events = [CounterEvent::Added(3), CounterEvent::Scaled(4)];
     store.append(stream, Version::NoStream, &events).await.unwrap();

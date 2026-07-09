@@ -85,6 +85,35 @@ impl SegmentParams {
     }
 }
 
+/// Parameters to [`resume`](SegmentWriter::resume) an existing segment after
+/// recovery (bn-20b). Every field comes straight from a
+/// [`scanner::Recovery`](crate::scanner::Recovery) of the segment: the header
+/// (`segment_id`/`base_pos`/`epoch`), `safe_offset` (→ `write_off`), `next_pos`,
+/// `next_batch_id`, and the accepted-prefix counts.
+#[derive(Debug, Clone, Copy)]
+pub struct ResumeParams {
+    /// The existing segment's id (from its `SegmentHeader`).
+    pub segment_id: u64,
+    /// The existing segment's `base_pos` (unchanged — the header is not
+    /// rewritten).
+    pub base_pos: u64,
+    /// The existing segment's `epoch` (unchanged — not recycled, not bumped).
+    pub epoch: u64,
+    /// Logical segment size, re-reserved on resume.
+    pub segment_size: u64,
+    /// Recovery `safe_offset`: the first byte past the committed prefix, where
+    /// new appends resume.
+    pub write_off: u64,
+    /// Recovery `next_batch_id`: the per-segment id the next append stamps.
+    pub next_batch_id: u64,
+    /// Recovery `next_pos`: the running A1 global position to resume at.
+    pub next_pos: u64,
+    /// Accepted batches so far (the trailer/summary `batch_count`).
+    pub batch_count: u64,
+    /// Accepted events so far (the trailer/summary `event_count`).
+    pub event_count: u64,
+}
+
 /// One batch to append. The writer stamps `segment_epoch`, `batch_id`, and
 /// `first_global_pos`; the caller supplies the stream-level fields.
 #[derive(Debug, Clone, Copy)]
@@ -254,6 +283,55 @@ impl<F: Fs> SegmentWriter<F> {
             next_pos: params.base_pos,
             batch_count: 0,
             event_count: 0,
+            encoder: BatchEncoder::new(),
+            poisoned: false,
+        })
+    }
+
+    /// **Resume** appending into an EXISTING segment after recovery (bn-20b —
+    /// the engine's reopen path).
+    ///
+    /// Unlike [`create`](SegmentWriter::create), this writes **no** fresh
+    /// `SegmentHeader` (the segment keeps its original `base_pos`/`epoch`) and
+    /// does not truncate. It opens the file read+write, re-reserves its blocks
+    /// (idempotent — the segment was preallocated at create; keeps the bn-36y
+    /// "ENOSPC only at a recoverable point" invariant across reopen), and seeds
+    /// the write cursor from the recovery result: `write_off` at the recovery
+    /// `safe_offset` (the first byte past the committed prefix), `next_pos` /
+    /// `next_batch_id` / counts where recovery left off. New appends land at
+    /// `write_off`, overwriting any torn/uncommitted tail (A10: never
+    /// committed) and extending the committed prefix **in place**, so a later
+    /// recovery re-derives the identical, now-longer prefix.
+    ///
+    /// No epoch bump: the segment is *continued*, not recycled — every batch
+    /// (old and newly appended) carries the same `epoch`, so A9 has nothing to
+    /// distinguish and recovery accepts the whole contiguous chain. (The
+    /// spec's "fresh larger epoch on open" discipline, §6, guards *recycled*
+    /// files; resuming the same live segment is the distinct, non-recycling
+    /// case.)
+    pub fn resume(fs: &F, path: &Path, params: ResumeParams) -> Result<Self, WriteError> {
+        let file = fs.open(path, OpenOpts::create_rw())?;
+        // Re-reserve the segment's blocks so a post-reopen append cannot hit
+        // ENOSPC mid-commit (bn-36y). Idempotent on an already-allocated file.
+        if let Err(e) = file.allocate(params.segment_size) {
+            return Err(if is_enospc(&e) {
+                WriteError::StoreFull { requested: params.segment_size }
+            } else {
+                WriteError::Io(e)
+            });
+        }
+        Ok(SegmentWriter {
+            fs: fs.clone(),
+            file,
+            segment_id: params.segment_id,
+            epoch: params.epoch,
+            base_pos: params.base_pos,
+            segment_size: params.segment_size,
+            write_off: params.write_off,
+            next_batch_id: params.next_batch_id,
+            next_pos: params.next_pos,
+            batch_count: params.batch_count,
+            event_count: params.event_count,
             encoder: BatchEncoder::new(),
             poisoned: false,
         })

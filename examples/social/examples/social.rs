@@ -12,16 +12,17 @@
 
 use ident::Id;
 use mess_core::CommandError;
-use mess_store::{EventStore, MockBackend};
+use mess_store::{EventStore, LogEngine};
 use social::{HideByModerator, HideByPoster, Post, PostError, Publish};
 
 #[tokio::main]
 async fn main() {
-    // `EventStore` over `MockBackend`: an in-memory, in-process temp store
-    // with real optimistic-concurrency semantics — see `examples/bank`'s
-    // `examples/bank.rs` for the full explanation. Production code swaps in
-    // a durable backend without touching any of the code below.
-    let store = EventStore::new(MockBackend::new());
+    // `EventStore` over the composed production engine (`LogEngine`:
+    // `mess-log` + `mess-index`), the default backend — see `examples/bank`'s
+    // `examples/bank.rs` for the full explanation. The interim in-memory
+    // backend is behind mess-store's `mock` feature; nothing below changes.
+    let dir = std::env::temp_dir().join(format!("mess-social-{}", std::process::id()));
+    let store = EventStore::new(LogEngine::open(&dir).expect("open engine"));
 
     let alice = Id::new();
 

@@ -25,9 +25,12 @@ use mess_store::backend::{
 };
 use mess_store::snapshot::{SnapshotStore, StoredSnapshot};
 use mess_store::{
-    EventStore, MockBackend, RetryPolicy, StateCache, StateCodecError,
+    EventStore, RetryPolicy, StateCache, StateCodecError,
     Snapshottable, Version,
 };
+
+mod common;
+use common::TestSnapshotBackend;
 
 // ===========================================================================
 // Counting backend decorator: wraps any `SnapshotStore` and tallies the events
@@ -312,7 +315,7 @@ impl Decide<Withdraw> for Account {
 /// one writer into exhausting its whole budget. The 8-writer bench therefore
 /// builds its store via [`counting_store_with_policy`] with real jittered
 /// backoff (see [`eight_writer_bench`]).
-fn counting_store(cache_on: bool) -> (EventStore<Counting<MockBackend>>, Counting<MockBackend>) {
+fn counting_store(cache_on: bool) -> (EventStore<Counting<TestSnapshotBackend>>, Counting<TestSnapshotBackend>) {
     counting_store_with_policy(cache_on, RetryPolicy::no_backoff(64))
 }
 
@@ -322,8 +325,8 @@ fn counting_store(cache_on: bool) -> (EventStore<Counting<MockBackend>>, Countin
 fn counting_store_with_policy(
     cache_on: bool,
     policy: RetryPolicy,
-) -> (EventStore<Counting<MockBackend>>, Counting<MockBackend>) {
-    let backend = Counting::new(MockBackend::new());
+) -> (EventStore<Counting<TestSnapshotBackend>>, Counting<TestSnapshotBackend>) {
+    let backend = Counting::new(TestSnapshotBackend::new());
     let mut store = EventStore::new(backend.clone()).with_retry_policy(policy);
     if cache_on {
         store = store.with_cache_capacity(1_024);
@@ -383,7 +386,7 @@ async fn warm_command_reads_zero_events() {
 async fn conflict_retry_fetches_only_the_delta() {
     // One backend, two independent stores, each with its own cache. `writer`
     // is our subject; `other` races in events behind its back.
-    let backend = Counting::new(MockBackend::new());
+    let backend = Counting::new(TestSnapshotBackend::new());
     let writer = EventStore::new(backend.clone())
         .with_retry_policy(RetryPolicy::no_backoff(64))
         .with_cache_capacity(16);

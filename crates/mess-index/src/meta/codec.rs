@@ -55,6 +55,15 @@ pub enum DecodeError {
         /// Byte length actually present.
         got: usize,
     },
+    /// A stored key or value was structurally invalid (bn-20b: a malformed
+    /// interner key/name — a wrong-width id key, or a name that is not UTF-8).
+    #[error("metadata corrupt: table {table}: {reason}")]
+    Corrupt {
+        /// Which table's entry failed to decode.
+        table: &'static str,
+        /// What was wrong.
+        reason: String,
+    },
 }
 
 // ---- keys -------------------------------------------------------------
