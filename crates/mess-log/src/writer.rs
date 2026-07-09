@@ -26,17 +26,21 @@
 //!   caller batches syncs (group commit). [`sync`](SegmentWriter::sync) exposes
 //!   the barrier, and [`close`](SegmentWriter::close) syncs once so the handoff
 //!   is durable.
-//! - **Sealing is Phase 4** (`bn-25j`). This writer does **not** write a
-//!   `SegmentFooter`. On [`close`](SegmentWriter::close)/[`roll`] the segment is
-//!   left **trailer-less**, i.e. *unsealed*. Per `02-recovery.md` §8.3, a
+//! - **Sealing** (`bn-sbt`, §3.3/§6): [`seal`](SegmentWriter::seal) appends the
+//!   `SegmentFooter` (a Phase-3 *empty* extension region + the fixed 100-byte
+//!   trailer at `content_len`) and `fdatasync`s it durable in the single seal
+//!   barrier, so recovery's R2 fast path can trust the segment via its trailer
+//!   without scanning its body (§8.3). The footer bytes are encoded by
+//!   [`crate::sealer`]. [`roll_sealed`](SegmentWriter::roll_sealed) seals then
+//!   opens the next segment, continuing the A1/A9 chain.
+//! - **Unsealed handoff.** [`close`](SegmentWriter::close)/[`roll`] leave the
+//!   segment **trailer-less**, i.e. *unsealed*. Per `02-recovery.md` §8.3, a
 //!   segment with no valid trailer "is treated as **not sealed**: it MUST be
 //!   fully scanned exactly as the active segment is." Leaving no trailer is the
-//!   spec-sanctioned partial state; writing a bogus/partial trailer would be
-//!   strictly worse (a reader would treat any `footer_crc` mismatch as unsealed
-//!   anyway). So the writer deliberately writes nothing at close beyond the
-//!   final data sync, and hands the sealer a [`SegmentSummary`] carrying every
-//!   fixed-trailer field it will need (`ext_offset == content_len`, counts,
-//!   `epoch`, `base_pos`, `end_pos`).
+//!   spec-sanctioned partial state; a torn/partial trailer is no worse (a reader
+//!   treats any `footer_crc` mismatch as unsealed anyway). Either way the handed
+//!   [`SegmentSummary`] carries every fixed-trailer field
+//!   (`ext_offset == content_len`, counts, `epoch`, `base_pos`, `end_pos`).
 
 use std::io;
 use std::path::Path;
@@ -380,6 +384,78 @@ impl<F: Fs> SegmentWriter<F> {
     pub fn close(self) -> io::Result<SegmentSummary> {
         self.file.fdatasync()?;
         Ok(self.summary())
+    }
+
+    /// **Seal** this segment (bn-sbt, §3.3, §6): append the `SegmentFooter` and
+    /// make it durable in one seal `fdatasync`, so recovery's R2 fast path can
+    /// trust the segment via its trailer without scanning its body (§8.3). The
+    /// footer is the (Phase-3 empty) extension region followed by the fixed
+    /// 100-byte trailer at `content_len`; the sealed file is therefore
+    /// `content_len + SEGMENT_TRAILER_LEN` bytes long, and the trailer occupies
+    /// the final [`SEGMENT_TRAILER_LEN`] bytes (R2 pread-from-EOF). Returns the
+    /// [`SegmentSummary`]; the `F::File` handle is dropped.
+    ///
+    /// Ordering (§6): every batch is already durable (the committer synced each
+    /// group) — the seal `fdatasync` here makes the *footer* durable. A crash
+    /// before this returns leaves the segment trailer-less, i.e. unsealed, which
+    /// recovery fully scans exactly as the active segment (§8.3); no committed
+    /// batch is lost either way.
+    ///
+    /// `bn-36y`: a poisoned writer (a prior barrier `ENOSPC`) refuses to seal
+    /// with [`WriteError::StorePoisoned`] rather than write a footer atop an
+    /// indeterminate durable state.
+    pub fn seal(self) -> Result<SegmentSummary, WriteError> {
+        if self.poisoned {
+            return Err(WriteError::StorePoisoned);
+        }
+        let summary = self.summary();
+        // Phase 3: empty extension region ⇒ the trailer begins at content_len
+        // (== ext_offset), and the whole footer is just the fixed trailer.
+        let fields = crate::sealer::TrailerFields::phase3(
+            summary.segment_id,
+            summary.epoch,
+            summary.base_pos,
+            summary.batch_count,
+            summary.event_count,
+            summary.content_len,
+        );
+        let trailer = crate::sealer::encode_trailer(&fields);
+        write_all_at(&self.file, summary.content_len, &trailer)?;
+        self.file.fdatasync()?; // the single seal fsync (§6)
+        Ok(summary)
+    }
+
+    /// Roll to the next segment, **sealing** the current one first (§3.1, §3.3):
+    /// [`seal`](SegmentWriter::seal) this segment (write + fsync its footer),
+    /// then [`create`](SegmentWriter::create) the next at `next_path` continuing
+    /// the A1 chain (`base_pos = end_pos`) and the A9 chain
+    /// (`prev_segment_epoch = this epoch`). `next_epoch` MUST be strictly larger
+    /// than this segment's epoch (A9). This is the sealing counterpart of
+    /// [`roll`](SegmentWriter::roll), which leaves the old segment unsealed.
+    ///
+    /// # Panics (debug)
+    ///
+    /// Debug-asserts `next_epoch > self.epoch`.
+    pub fn roll_sealed(
+        self,
+        next_path: &Path,
+        next_segment_id: u64,
+        next_epoch: u64,
+        created_unix_nanos: u64,
+    ) -> Result<SegmentWriter<F>, WriteError> {
+        debug_assert!(next_epoch > self.epoch, "A9: a rolled segment needs a strictly larger epoch");
+        let fs = self.fs.clone();
+        let prev_epoch = self.epoch;
+        let summary = self.seal()?;
+        let params = SegmentParams {
+            segment_id: next_segment_id,
+            base_pos: summary.end_pos,
+            epoch: next_epoch,
+            prev_segment_epoch: prev_epoch,
+            created_unix_nanos,
+            segment_size: SEGMENT_SIZE,
+        };
+        SegmentWriter::create(&fs, next_path, params)
     }
 
     /// Roll to the next segment (§3.1): close this one (unsealed) and

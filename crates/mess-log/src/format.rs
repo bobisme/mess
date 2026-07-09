@@ -134,3 +134,81 @@ pub const MAX_BATCH_LEN: u64 = 64 * 1024 * 1024;
 /// `SEGMENT_SIZE` = 256 MiB (§3.1). A batch MUST NOT be placed such that it
 /// would extend beyond this (A8). Configurable per-writer for tests.
 pub const SEGMENT_SIZE: u64 = 256 * 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// SegmentFooter trailer (§3.3.1) — fixed 100 bytes at end-of-file (bn-sbt)
+// ---------------------------------------------------------------------------
+//
+// The trailer is the fixed part of the seal: it occupies the final
+// `SEGMENT_TRAILER_LEN` bytes of a sealed segment so a fast-path reader
+// `pread`s exactly these bytes from EOF without first knowing the file length
+// (R2, §02 §8.3). Its `footer_crc` covers only `[0, 96)`; the variable-length
+// extension region that precedes it (§3.3.2) is covered separately by
+// `ext_crc` so the fast path can validate and use the catalog fields without
+// reading the extension. In Phase 3 the extension is always empty
+// (`ext_len == 0`, `ext_crc == 0`); the `StreamHeadTable` is Phase 5.
+
+/// `SEGMENT_TRAILER_LEN` (§3.3.1): the fixed trailer occupies the final 100
+/// bytes of a sealed segment file (R2 pread-from-EOF).
+pub const SEGMENT_TRAILER_LEN: usize = 100;
+
+/// Byte offset of the trailer's `footer_crc`; its coverage is the single range
+/// `[0, 96)` (nothing follows it — §5.2).
+pub const SEGMENT_FOOTER_CRC_OFF: usize = 96;
+
+// SegmentFooter trailer field offsets, relative to the trailer's first byte
+// (§3.3.1 table).
+pub(crate) const FT_MAGIC_OFF: usize = 0;
+pub(crate) const FT_FORMAT_VERSION_OFF: usize = 4;
+pub(crate) const FT_FLAGS_OFF: usize = 6;
+pub(crate) const FT_SEGMENT_ID_OFF: usize = 8;
+pub(crate) const FT_EPOCH_OFF: usize = 16;
+pub(crate) const FT_BASE_POS_OFF: usize = 24;
+pub(crate) const FT_BATCH_COUNT_OFF: usize = 32;
+pub(crate) const FT_EVENT_COUNT_OFF: usize = 40;
+pub(crate) const FT_END_POS_OFF: usize = 48;
+pub(crate) const FT_SEALED_LEN_OFF: usize = 56;
+pub(crate) const FT_EXT_OFFSET_OFF: usize = 64;
+pub(crate) const FT_EXT_LEN_OFF: usize = 72;
+pub(crate) const FT_EXT_CRC_OFF: usize = 80;
+pub(crate) const FT_REPAIR_SIDECAR_KIND_OFF: usize = 84;
+pub(crate) const FT_RESERVED_OFF: usize = 86;
+pub(crate) const FT_REPAIR_SIDECAR_REF_OFF: usize = 88;
+
+// ---------------------------------------------------------------------------
+// SegmentFooter extension region — typed sections (§3.3.2) (bn-sbt)
+// ---------------------------------------------------------------------------
+//
+// The extension region is a sequence of self-delimiting typed sections. In
+// Phase 3 the writer emits none (`ext_len == 0`), but the section-header layout
+// and the known section kinds are interned here so the format is complete and
+// forward-compatible: a reader walks sections by hopping `EXT_SECTION_HDR_LEN +
+// payload_len` and MUST advisory-skip any unknown `kind` (§3.3.2).
+
+/// `EXT_SECTION_HDR_LEN` (§3.3.2): the fixed section-header length that precedes
+/// each extension section's payload.
+pub const EXT_SECTION_HDR_LEN: usize = 16;
+
+// Extension section-header field offsets, relative to the section's first byte
+// (§3.3.2 table). `pub` because this crate owns the extension byte layout
+// (§3.3.2) and Phase 5 (`StreamHeadTable`, bn-fold) writes/reads sections
+// through these; nothing in Phase 3 emits a section (`ext_len == 0`).
+
+/// Offset of a section header's `kind` (§3.3.2). `0` is reserved.
+pub const EXT_KIND_OFF: usize = 0;
+/// Offset of a section header's `section_flags` (§3.3.2; MUST be `0` in v3).
+pub const EXT_SECTION_FLAGS_OFF: usize = 2;
+/// Offset of a section header's `entry_count` (§3.3.2).
+pub const EXT_ENTRY_COUNT_OFF: usize = 4;
+/// Offset of a section header's `payload_len` (§3.3.2). The next section begins
+/// `payload_len` bytes past the end of this header.
+pub const EXT_PAYLOAD_LEN_OFF: usize = 8;
+
+/// Extension section kind `1` — `StreamHeadTable` (§3.3.2). Not written in
+/// Phase 3 (Phase 5). Entry size is 48 bytes.
+pub const EXT_KIND_STREAM_HEAD_TABLE: u16 = 1;
+/// Extension section kind `2` — `SnapshotAnchorList` (§3.3.2). Not written in
+/// Phase 3 (Phase 5). Entry size is 48 bytes.
+pub const EXT_KIND_SNAPSHOT_ANCHOR_LIST: u16 = 2;
+/// Entry size (bytes) of both known extension section kinds (§3.3.2).
+pub const EXT_ENTRY_LEN: usize = 48;
