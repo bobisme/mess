@@ -5,6 +5,7 @@ version = "0.1.0"
 description = "mess append-only batch log (D1/D2): commit-authority acceptance kernel + formal protocol model"
 
 [dependencies]
+thiserror = { workspace = true }
 
 [dev-dependencies]
 stateright = "0.31"

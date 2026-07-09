@@ -11,7 +11,10 @@
 //! - [`runtime`] — the sim-capable Clock/Fs/Spawn abstraction (bn-z98)
 //!   the segment writer + committer are generic over; real (std) and sim
 //!   (virtual time + fault-injecting in-memory fs) impls.
+//! - [`lock`] — `StoreLock`, the D9 single-writer-process OS lock file
+//!   (bn-gke).
 
 pub mod acceptance;
+pub mod lock;
 pub mod model;
 pub mod runtime;
