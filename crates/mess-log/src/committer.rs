@@ -169,6 +169,20 @@ pub enum AppendError {
     /// The committer has shut down; no more appends can be accepted.
     #[error("committer is closed")]
     Closed,
+    /// The store is full: preallocating a new segment failed with `ENOSPC`
+    /// (`bn-36y`, `WriteError::StoreFull`). The committed prefix stays durable
+    /// and readable; disk-full struck at the single recoverable point (segment
+    /// roll). Reached only through a roll — not the committer's own append path
+    /// today — but surfaced here so the client boundary is typed.
+    #[error("store full")]
+    StoreFull,
+    /// The store is poisoned: a prior barrier failed with `ENOSPC`, so the
+    /// segment's durable state is unknowable (`bn-36y`, the D8 shape of
+    /// `docs/spec/03-durability.md` §2.6). Reopen and recover. The barrier that
+    /// tripped the poison surfaced its own group as [`AppendOutcome::Indeterminate`];
+    /// every append after it fails fast with this typed error.
+    #[error("store poisoned")]
+    StorePoisoned,
 }
 
 // ---------------------------------------------------------------------------
@@ -607,6 +621,11 @@ fn commit_group<R: Runtime, F: Fs>(
             Err(WriteError::SegmentFull { needed, remaining }) => {
                 Err(AppendError::SegmentFull { needed, remaining })
             }
+            // bn-36y typed disk-full states. StoreFull only arises from a roll
+            // (the committer does not roll today) but is mapped for exhaustiveness;
+            // StorePoisoned fails fast on every append after a barrier ENOSPC.
+            Err(WriteError::StoreFull { .. }) => Err(AppendError::StoreFull),
+            Err(WriteError::StorePoisoned) => Err(AppendError::StorePoisoned),
             // A durable-path I/O fault mid-write: the batch's durability is
             // unknown → Indeterminate, and (below) the barrier is treated as
             // failed so the watermark does not advance past this group.

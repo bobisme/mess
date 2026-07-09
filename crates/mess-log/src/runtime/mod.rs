@@ -20,8 +20,13 @@
 //! one **`fdatasync`** barrier, `pread`s during recovery (and the
 //! trailer-from-EOF R2 fast path needs the file length), and `rename`s
 //! for atomic publish. That is the whole surface. Deliberately no
-//! `read_dir`/`remove`/`truncate` — the writer does not call them, and
-//! `bn-z98`'s brief is "cover exactly that, do not over-abstract."
+//! `read_dir`/`truncate` — the writer does not call them, and `bn-z98`'s
+//! brief is "cover exactly that, do not over-abstract." Two methods were
+//! added by `bn-36y` for the ENOSPC discipline: [`FileHandle::allocate`]
+//! (segment preallocation at roll — the single point disk-full may strike)
+//! and [`Fs::remove`] (cleaning up a segment whose preallocation failed, so
+//! a failed roll leaves no husk). Both carry default impls so the rest of
+//! the seam is untouched.
 //!
 //! # Zero-cost: generics, not `dyn`
 //!
@@ -52,7 +57,7 @@ mod testsuite;
 
 pub use real::RealRuntime;
 pub use sim::{Rng, SimRuntime};
-pub use sim_fs::{CrashPlan, Fault, SectorPlan, SimFs, TailPlan};
+pub use sim_fs::{CrashPlan, EnospcSite, Fault, SectorPlan, SimFs, TailPlan};
 
 /// A monotonic instant, measured in nanoseconds since a runtime-defined
 /// origin (real: process-relative; sim: virtual-time zero). Comparable and
@@ -138,6 +143,22 @@ pub trait Fs: Clone {
 
     /// Atomically rename `from` to `to` (segment publish / manifest swap).
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+
+    /// Remove the file at `path`. The committer/writer surface deliberately
+    /// avoids `remove` on the hot path; this exists for exactly ONE cleanup
+    /// (`bn-36y`): a segment whose preallocation ([`FileHandle::allocate`])
+    /// failed with `ENOSPC` at roll time must not be left behind as a
+    /// zero-length husk, so [`SegmentWriter::create`](crate::writer::SegmentWriter::create)
+    /// removes the never-headered file it just opened. The default returns
+    /// `Unsupported`; [`RealFs`] and the sim fs override it. Callers of the
+    /// cleanup path treat any error as best-effort (the husk carries no
+    /// committed bytes, so recovery ignores it regardless).
+    fn remove(&self, _path: &Path) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "remove not supported by this Fs",
+        ))
+    }
 }
 
 /// An open file. Positioned I/O (`pwrite`/`pread`) plus the durability
@@ -164,6 +185,25 @@ pub trait FileHandle {
 
     /// Current file length in bytes (R2: trailer `pread`-from-EOF).
     fn len(&self) -> io::Result<u64>;
+
+    /// Preallocate `len` bytes of backing store for this file WITHOUT changing
+    /// its logical length — real impl: `fallocate(2)` with
+    /// `FALLOC_FL_KEEP_SIZE`, which reserves blocks but leaves `st_size` (and
+    /// therefore [`len`](FileHandle::len) and every recovery `pread`)
+    /// untouched. The point (`bn-36y`, `docs/spec/03-durability.md` §2.6): a
+    /// segment is preallocated in full at roll time so a subsequent
+    /// positioned write inside `[0, len)` cannot fail with `ENOSPC`
+    /// mid-commit. Disk-full is thereby forced to strike at ONE predictable,
+    /// recoverable point — the `allocate` call at roll — rather than
+    /// scattered across the commit path.
+    ///
+    /// Returns an `ENOSPC` [`io::Error`] (`raw_os_error() == Some(ENOSPC)`)
+    /// when the reservation cannot be satisfied. The default is a no-op
+    /// (`Ok(())`) for handles that do not model space exhaustion; [`RealFile`]
+    /// and the sim fs override it (the sim as a fault-injection point).
+    fn allocate(&self, _len: u64) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// A whole runtime: a [`Clock`], a way to [`spawn`](Runtime::spawn) actor

@@ -43,6 +43,10 @@ impl Fs for RealFs {
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         std::fs::rename(from, to)
     }
+
+    fn remove(&self, path: &Path) -> io::Result<()> {
+        std::fs::remove_file(path)
+    }
 }
 
 /// An open production file. `Arc<File>` so a segment handle can be shared
@@ -67,6 +71,30 @@ impl FileHandle for RealFile {
 
     fn len(&self) -> io::Result<u64> {
         Ok(self.file.metadata()?.len())
+    }
+
+    /// `fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, len)` (`bn-36y`): reserve `len`
+    /// bytes of blocks WITHOUT extending `st_size`, so a segment preallocated
+    /// in full at roll time never `ENOSPC`s mid-commit, while
+    /// [`len`](FileHandle::len) and recovery still see only written content.
+    /// On a filesystem that cannot honor the request (e.g. genuinely out of
+    /// space) this returns the underlying `ENOSPC` error.
+    fn allocate(&self, len: u64) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        if len == 0 {
+            return Ok(());
+        }
+        let len = i64::try_from(len)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "allocate len overflow"))?;
+        // SAFETY: `self.file` owns a valid, open fd for the duration of this
+        // call; `fallocate` reads no user memory. Errors are read via errno.
+        let ret =
+            unsafe { libc::fallocate(self.file.as_raw_fd(), libc::FALLOC_FL_KEEP_SIZE, 0, len) };
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
     }
 }
 

@@ -69,6 +69,26 @@ pub enum CrashPlan {
     Tail(TailPlan),
 }
 
+/// A one-shot `ENOSPC` fault armed on a sim file (`bn-36y`), consumed the next
+/// time the matching I/O site executes. Arming these is the sim's disk-full
+/// **injection point**: because every write/sync/allocate site goes through the
+/// [`Fs`]/[`FileHandle`] seam, disk-full can be injected at exactly the site
+/// class under test and the store's typed-error + no-corruption response
+/// asserted deterministically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnospcSite {
+    /// [`FileHandle::allocate`] — segment preallocation at roll (the intended,
+    /// single point disk-full should strike).
+    Allocate,
+    /// [`FileHandle::pwrite`] — a positioned batch write (adversarial: with
+    /// preallocation this should not happen mid-commit, but the harness proves
+    /// the store still refuses to corrupt if it does).
+    Pwrite,
+    /// [`FileHandle::fdatasync`] — the durability barrier (the D8 poisoning
+    /// trigger, `docs/spec/03-durability.md` §2.6).
+    Fdatasync,
+}
+
 // ---------------------------------------------------------------------------
 // SectorDisk — ported from spikes/torn_write
 // ---------------------------------------------------------------------------
@@ -294,7 +314,40 @@ impl Medium {
 // SimFs / SimFile — the Fs trait impl
 // ---------------------------------------------------------------------------
 
-type Inode = Arc<Mutex<Medium>>;
+/// Per-file sim state: the fault medium plus any armed one-shot `ENOSPC`
+/// faults ([`EnospcSite`], `bn-36y`).
+#[derive(Debug)]
+struct FileState {
+    medium: Medium,
+    /// Armed one-shot `ENOSPC` faults, consumed FIFO as their site executes.
+    enospc: Vec<EnospcSite>,
+}
+
+impl FileState {
+    fn new(fault: Fault, background: Vec<u8>) -> Self {
+        FileState { medium: Medium::new(fault, background), enospc: Vec::new() }
+    }
+
+    /// If a fault for `site` is armed, consume it and return `true` — the
+    /// caller then returns an `ENOSPC` error WITHOUT mutating the medium (so an
+    /// injected write/allocate never lands partial bytes: no corruption).
+    fn take_enospc(&mut self, site: EnospcSite) -> bool {
+        if let Some(pos) = self.enospc.iter().position(|&s| s == site) {
+            self.enospc.remove(pos);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+type Inode = Arc<Mutex<FileState>>;
+
+/// The sim's `ENOSPC` [`io::Error`], carrying `raw_os_error() == Some(ENOSPC)`
+/// so the writer classifies it exactly as it would a real one.
+fn enospc() -> io::Error {
+    io::Error::from_raw_os_error(libc::ENOSPC)
+}
 
 /// An in-memory filesystem whose files inject the spike fault models.
 ///
@@ -334,8 +387,26 @@ impl SimFs {
         fault: Fault,
         background: Vec<u8>,
     ) {
-        let inode = Arc::new(Mutex::new(Medium::new(fault, background)));
+        let inode = Arc::new(Mutex::new(FileState::new(fault, background)));
         self.inner.lock().unwrap().files.insert(path.into(), inode);
+    }
+
+    /// Arm a one-shot [`EnospcSite`] fault on `path` (`bn-36y`): the next time
+    /// that site runs on any handle to the file it returns `ENOSPC` and is
+    /// disarmed. Creates the file (empty, default fault) if it does not exist
+    /// yet, so an `Allocate` fault can be armed BEFORE
+    /// [`SegmentWriter::create`](crate::writer::SegmentWriter) opens the
+    /// segment (`create` reopens the pre-armed inode, since `create_rw` does
+    /// not truncate). Multiple faults on one site fire in arm order.
+    pub fn inject_enospc(&self, path: impl Into<PathBuf>, site: EnospcSite) {
+        let path = path.into();
+        let mut inner = self.inner.lock().unwrap();
+        let default_fault = inner.default_fault;
+        let inode = inner
+            .files
+            .entry(path)
+            .or_insert_with(|| Arc::new(Mutex::new(FileState::new(default_fault, Vec::new()))));
+        inode.lock().unwrap().enospc.push(site);
     }
 
     /// Crash `path`, materializing its post-crash on-disk image per `plan`.
@@ -344,7 +415,7 @@ impl SimFs {
         let inode = self.inode(path).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "no such sim file")
         })?;
-        inode.lock().unwrap().crash(&plan)
+        inode.lock().unwrap().medium.crash(&plan)
     }
 
     /// Roll a random-but-seeded [`SectorPlan`] over `path`'s currently
@@ -363,7 +434,7 @@ impl SimFs {
             io::Error::new(io::ErrorKind::NotFound, "no such sim file")
         })?;
         let mut guard = inode.lock().unwrap();
-        let Medium::Sector(disk) = &*guard else {
+        let Medium::Sector(disk) = &guard.medium else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "crash_random is sector-model only",
@@ -380,7 +451,7 @@ impl SimFs {
             None
         };
         let plan = SectorPlan { persist, tear };
-        guard.crash(&CrashPlan::Sector(plan.clone()))?;
+        guard.medium.crash(&CrashPlan::Sector(plan.clone()))?;
         Ok(plan)
     }
 }
@@ -400,7 +471,7 @@ impl Fs for SimFs {
                         "no such sim file",
                     ));
                 }
-                let inode = Arc::new(Mutex::new(Medium::new(
+                let inode = Arc::new(Mutex::new(FileState::new(
                     default_fault,
                     Vec::new(),
                 )));
@@ -409,7 +480,7 @@ impl Fs for SimFs {
             }
         };
         if opts.truncate {
-            *inode.lock().unwrap() = Medium::new(default_fault, Vec::new());
+            inode.lock().unwrap().medium = Medium::new(default_fault, Vec::new());
         }
         Ok(SimFile { inode })
     }
@@ -421,6 +492,15 @@ impl Fs for SimFs {
         })?;
         inner.files.insert(to.to_path_buf(), inode);
         Ok(())
+    }
+
+    fn remove(&self, path: &Path) -> io::Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .files
+            .remove(path)
+            .map(|_| ())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such sim file"))
     }
 }
 
@@ -434,19 +514,44 @@ pub struct SimFile {
 
 impl FileHandle for SimFile {
     fn pwrite(&self, off: u64, buf: &[u8]) -> io::Result<usize> {
-        Ok(self.inode.lock().unwrap().pwrite(off as usize, buf))
+        let mut st = self.inode.lock().unwrap();
+        // Injected ENOSPC fires BEFORE the medium is touched: nothing lands, so
+        // an interrupted write never leaves partial bytes behind (bn-36y).
+        if st.take_enospc(EnospcSite::Pwrite) {
+            return Err(enospc());
+        }
+        Ok(st.medium.pwrite(off as usize, buf))
     }
 
     fn pread(&self, off: u64, buf: &mut [u8]) -> io::Result<usize> {
-        Ok(self.inode.lock().unwrap().pread(off as usize, buf))
+        Ok(self.inode.lock().unwrap().medium.pread(off as usize, buf))
     }
 
     fn fdatasync(&self) -> io::Result<()> {
-        self.inode.lock().unwrap().fdatasync();
+        let mut st = self.inode.lock().unwrap();
+        // A barrier ENOSPC does NOT promote shadow → durable: the pre-fault
+        // durable image is what a later scan sees (matches a real fsync that
+        // reports ENOSPC without having flushed).
+        if st.take_enospc(EnospcSite::Fdatasync) {
+            return Err(enospc());
+        }
+        st.medium.fdatasync();
         Ok(())
     }
 
     fn len(&self) -> io::Result<u64> {
-        Ok(self.inode.lock().unwrap().len())
+        Ok(self.inode.lock().unwrap().medium.len())
+    }
+
+    fn allocate(&self, _len: u64) -> io::Result<()> {
+        let mut st = self.inode.lock().unwrap();
+        if st.take_enospc(EnospcSite::Allocate) {
+            return Err(enospc());
+        }
+        // KEEP_SIZE semantics (see the trait doc): reservation does not change
+        // the logical length, and the sim medium grows lazily on write, so a
+        // successful allocate is a no-op on the image — it never materializes
+        // segment_size bytes of memory.
+        Ok(())
     }
 }

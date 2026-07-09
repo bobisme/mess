@@ -151,9 +151,39 @@ pub enum WriteError {
     /// A short `pwrite` (fewer bytes accepted than offered).
     #[error("short write at offset {offset}: wrote {wrote} of {expected}")]
     ShortWrite { offset: u64, expected: usize, wrote: usize },
+    /// Disk-full at segment **preallocation** (`bn-36y`,
+    /// `docs/spec/03-durability.md` §2.6): [`SegmentWriter::create`] could not
+    /// reserve a full segment via [`FileHandle::allocate`], so the segment
+    /// roll that this append triggered failed. This is the ONE predictable,
+    /// recoverable point at which disk-full is designed to strike: no batch
+    /// bytes were written, no partial segment file is left behind, and every
+    /// already-committed batch stays durable and readable. The triggering
+    /// append earns this typed error; the store is full, not corrupt.
+    #[error("store full: could not preallocate {requested} bytes for a new segment")]
+    StoreFull {
+        /// The segment size the failed [`FileHandle::allocate`] requested.
+        requested: u64,
+    },
+    /// The store is **poisoned** (`bn-36y`, the D8 shape of §2.6): a durability
+    /// barrier (`fdatasync`) on this segment previously failed with `ENOSPC`,
+    /// so which bytes actually reached the device is unknowable. The writer
+    /// fails every subsequent [`append`](SegmentWriter::append) /
+    /// [`sync`](SegmentWriter::sync) fast with this typed error rather than
+    /// risk writing atop an indeterminate durable state; recovery on reopen
+    /// re-establishes the committed prefix. (Full D8 policy — degraded reads,
+    /// restart orchestration — is a later bone; this is the minimal
+    /// poison-on-barrier-ENOSPC.)
+    #[error("store poisoned: a prior fdatasync failed with ENOSPC; reopen and recover")]
+    StorePoisoned,
     /// Underlying filesystem I/O error.
     #[error("io: {0}")]
     Io(#[from] io::Error),
+}
+
+/// Whether `e` is an `ENOSPC` (disk-full). The sim fs injects an error carrying
+/// the same `raw_os_error()` so classification is identical to a real one.
+fn is_enospc(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(libc::ENOSPC)
 }
 
 /// The append-only writer for one segment file.
@@ -174,6 +204,10 @@ pub struct SegmentWriter<F: Fs> {
     batch_count: u64,
     event_count: u64,
     encoder: BatchEncoder,
+    /// Set once a barrier failed with `ENOSPC` (`bn-36y`): the segment's
+    /// durable state is unknowable, so every subsequent append/sync fails with
+    /// [`WriteError::StorePoisoned`] until the store is reopened and recovered.
+    poisoned: bool,
 }
 
 impl<F: Fs> SegmentWriter<F> {
@@ -185,6 +219,22 @@ impl<F: Fs> SegmentWriter<F> {
     /// recycled name must carry a larger `epoch` (A9) which recovery enforces.
     pub fn create(fs: &F, path: &Path, params: SegmentParams) -> Result<Self, WriteError> {
         let file = fs.open(path, OpenOpts::create_rw())?;
+        // bn-36y: preallocate the FULL segment before writing anything, so
+        // disk-full strikes HERE (a clean, recoverable point) rather than
+        // mid-commit. `allocate` reserves blocks without extending the logical
+        // length (FALLOC_FL_KEEP_SIZE), so `len()`/recovery are unaffected. On
+        // ENOSPC the file is still empty (no header) — remove the husk so a
+        // failed roll leaves the store exactly as it was, then surface the
+        // typed StoreFull. Other allocate errors propagate as Io.
+        if let Err(e) = file.allocate(params.segment_size) {
+            drop(file);
+            let _ = fs.remove(path); // best-effort; the husk carries no committed bytes
+            return Err(if is_enospc(&e) {
+                WriteError::StoreFull { requested: params.segment_size }
+            } else {
+                WriteError::Io(e)
+            });
+        }
         let header = encode_segment_header(&params);
         write_all_at(&file, 0, &header)?;
         file.fdatasync()?;
@@ -201,6 +251,7 @@ impl<F: Fs> SegmentWriter<F> {
             batch_count: 0,
             event_count: 0,
             encoder: BatchEncoder::new(),
+            poisoned: false,
         })
     }
 
@@ -235,6 +286,9 @@ impl<F: Fs> SegmentWriter<F> {
     /// encodes byte-exact into the reusable buffer, and `pwrite`s it at the
     /// running offset. Does **not** sync (the committer batches durability).
     pub fn append(&mut self, spec: &BatchSpec) -> Result<Receipt, WriteError> {
+        if self.poisoned {
+            return Err(WriteError::StorePoisoned); // bn-36y: barrier ENOSPC poisoned the store
+        }
         let input = self.input_for(spec);
         let total_len = BatchEncoder::total_len(&input)?; // A5/A2/D-FMT-7
         let remaining = self.remaining();
@@ -266,8 +320,33 @@ impl<F: Fs> SegmentWriter<F> {
     /// The durability barrier (§6, D7): `fdatasync` all appended bytes. This is
     /// the committer's group-commit call; exposed here so the writer is usable
     /// stand-alone and testable.
-    pub fn sync(&self) -> io::Result<()> {
-        self.file.fdatasync()
+    ///
+    /// `bn-36y`: if the barrier fails with `ENOSPC` the segment's durable state
+    /// is unknowable, so the writer is **poisoned** — the error propagates here
+    /// (the committer already treats a failed barrier as non-durable), and
+    /// every subsequent [`append`](SegmentWriter::append)/`sync` fails fast
+    /// with [`WriteError::StorePoisoned`]. Takes `&mut self` to record the
+    /// poison flag.
+    pub fn sync(&mut self) -> io::Result<()> {
+        if self.poisoned {
+            return Err(io::Error::other("store poisoned"));
+        }
+        match self.file.fdatasync() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if is_enospc(&e) {
+                    self.poisoned = true;
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Whether a barrier `ENOSPC` has poisoned this writer (`bn-36y`). Once
+    /// true, every append/sync fails with [`WriteError::StorePoisoned`] until
+    /// the store is reopened and recovered.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
     }
 
     /// A snapshot of the handoff state without consuming the writer.
@@ -308,6 +387,14 @@ impl<F: Fs> SegmentWriter<F> {
     /// the A1 chain (`base_pos = end_pos`) and the A9 chain
     /// (`prev_segment_epoch = this epoch`). `next_epoch` MUST be strictly larger
     /// than this segment's epoch (A9).
+    ///
+    /// `bn-36y`: the new segment is preallocated in full by
+    /// [`create`](SegmentWriter::create). If that preallocation hits `ENOSPC`
+    /// the roll fails with [`WriteError::StoreFull`] and no partial segment is
+    /// left behind — this old segment has already been closed durably (its
+    /// data stays readable via recovery), and the never-headered husk of the
+    /// new segment is removed. The triggering append thus earns a typed
+    /// disk-full error at this single, recoverable point.
     ///
     /// # Panics (debug)
     ///

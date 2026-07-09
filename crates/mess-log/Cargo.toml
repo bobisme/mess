@@ -7,9 +7,14 @@ description = "mess append-only batch log (D1/D2): commit-authority acceptance k
 [dependencies]
 thiserror = { workspace = true }
 crc32c = "0.6"
+# bn-36y: `fallocate(2)`/`FALLOC_FL_KEEP_SIZE` for segment preallocation and
+# `ENOSPC` classification. Unix-only; the crate already targets Unix (`std::os::unix`).
+libc = "0.2"
 
 [dev-dependencies]
 stateright = "0.31"
+# bn-36y: the ENOSPC injection tests assert on `libc::ENOSPC`.
+libc = "0.2"
 
 # `#[cfg(kani)]` proof modules (bn-y0b) are compiled only by the `cargo-kani`
 # driver, which sets this cfg itself; it is never a real Cargo feature.
