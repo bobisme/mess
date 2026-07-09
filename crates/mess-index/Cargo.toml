@@ -13,6 +13,15 @@ fjall = "3.1.6"
 mess-log = { workspace = true }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
+# bn-20e: crc32c over the sealed sidecar's content (same crate/algorithm as
+# mess-log's batch/footer CRCs, so the whole store speaks one checksum).
+crc32c = "0.6"
+
+# bn-20e: `#[cfg(kani)]` ptr-block round-trip proofs are compiled only by
+# `cargo kani`; teach the normal `cargo` build the cfg so it is not flagged
+# (`unexpected_cfgs`), mirroring mess-log.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
 
 [dev-dependencies]
 mess-log = { workspace = true }

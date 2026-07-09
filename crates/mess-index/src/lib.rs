@@ -38,6 +38,13 @@
 pub mod active;
 pub mod rebuild;
 
+// bn-20e: the sealed pointer index — packed varint-delta pointer blocks + skip
+// tables, the background sealer, and the sealed-or-active handoff (D5). This is
+// the documented seam left by `rebuild` (F6 rebuilds unsealed segments; sealed
+// segments are served from here). This crate owns the sealed-index bytes; the
+// sidecar rationale vs. a footer extension section is in `sealed::segment`.
+pub mod sealed;
+
 pub use active::{ActiveIndex, BatchEntry, EventPtr, GlobalEntry, IndexSnapshot, StreamEntry};
 pub use rebuild::{RebuildReport, rebuild, rebuild_into};
 
