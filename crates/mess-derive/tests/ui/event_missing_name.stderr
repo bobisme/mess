@@ -1,0 +1,5 @@
+error: #[event(...)] is missing the required `name = "..."` key, e.g. `#[event(name = "account", version = 1)]`
+ --> tests/ui/event_missing_name.rs:5:1
+  |
+5 | #[event(version = 1)]
+  | ^^^^^^^^^^^^^^^^^^^^^

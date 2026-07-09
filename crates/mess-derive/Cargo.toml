@@ -8,3 +8,11 @@ description = "mess v1: proc-macros"
 proc-macro = true
 
 [dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full", "extra-traits"] }
+
+[dev-dependencies]
+mess-core = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+trybuild = "1"

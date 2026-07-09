@@ -1,0 +1,5 @@
+error: `version` must be an integer literal, e.g. `version = 1`
+ --> tests/ui/event_bad_version.rs:5:27
+  |
+5 | #[event(name = "account", version = "oops")]
+  |                           ^^^^^^^^^^^^^^^^

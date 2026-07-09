@@ -1,0 +1,7 @@
+error: #[derive(Event)] requires an `#[event(name = "...")]` attribute naming the event's wire-name prefix, e.g. `#[event(name = "account", version = 1)]`
+ --> tests/ui/event_missing_attr.rs:5:1
+  |
+5 | / enum AccountEvent {
+6 | |     Opened { owner: String },
+7 | | }
+  | |_^

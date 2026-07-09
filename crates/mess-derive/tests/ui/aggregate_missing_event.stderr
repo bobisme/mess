@@ -1,0 +1,7 @@
+error: #[derive(Aggregate)] requires an `#[aggregate(event = Type)]` attribute naming the event type this aggregate folds, e.g. `#[aggregate(event = AccountEvent)]`
+ --> tests/ui/aggregate_missing_event.rs:5:1
+  |
+5 | / struct Account {
+6 | |     open: bool,
+7 | | }
+  | |_^

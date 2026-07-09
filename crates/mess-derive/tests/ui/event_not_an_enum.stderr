@@ -1,0 +1,8 @@
+error: #[derive(Event)] can only be applied to an enum: each variant maps to one dotted wire name (e.g. `Opened` -> "account.opened")
+ --> tests/ui/event_not_an_enum.rs:5:1
+  |
+5 | / #[event(name = "account", version = 1)]
+6 | | struct Account {
+7 | |     owner: String,
+8 | | }
+  | |_^
