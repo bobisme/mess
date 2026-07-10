@@ -1,0 +1,65 @@
+name: envelope-regression
+
+# bn-4pk: the envelope regression suite (crates/mess-bench). Nightly full
+# gated run of the reference workload set from docs/perf/envelope.md against
+# the committed crates/mess-bench/floors.json ratchet (default -10%
+# tolerance per metric). See crates/mess-bench/README.md for the mode
+# breakdown; this lane runs `mess-bench run --mode full`, which is a
+# ~1-2 minute composite of several fs-heavy benches (buffered/durable
+# append, sealed reads, engine replay, fold-chain, load_verified,
+# recovery) — scheduled, not per-PR, mirroring phase3-exit-gate.yml's
+# reasoning for keeping fs-heavy composite lanes off the PR critical path.
+#
+# The fast harness-rot check (smoke variant, no floors) already runs on
+# every `cargo test -p mess-bench` — including in CI's normal test lane —
+# so a broken workload is caught per-PR even though the gated perf numbers
+# are only nightly.
+
+on:
+  schedule:
+    # 06:11 UTC daily — staggered off the phase3-exit-gate (05:07) and the
+    # single-profile nightly lanes so this lane never contends with them for
+    # a runner.
+    - cron: "11 6 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: envelope-regression-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  full-gated-run:
+    runs-on: ubuntu-latest
+    env:
+      CLANG_PATH: /usr/bin/clang
+      # Real ext4/xfs scratch — MUST NOT be tmpfs (fdatasync is a no-op
+      # there); the harness itself refuses to run if this resolves onto a
+      # tmpfs mount (checks /proc/mounts). GitHub-hosted ubuntu-latest
+      # runners' $HOME is the real root filesystem, not a tmpfs mount.
+      MESS_BENCH_DIR: /home/runner/.cache/mess-bench
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: envelope-regression
+
+      - name: build mess-bench (release)
+        run: cargo build -p mess-bench --release
+
+      - name: full gated run vs floors.json
+        run: |
+          ./target/release/mess-bench run --mode full \
+            --out envelope-ledger.json \
+            --floors crates/mess-bench/floors.json
+
+      - name: upload ledger
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: envelope-ledger
+          path: envelope-ledger.json
+          retention-days: 90

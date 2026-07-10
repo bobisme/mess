@@ -17,6 +17,7 @@ members = [
   "crates/mess-store",
   "crates/mess-derive",
   "crates/mess-testkit",
+  "crates/mess-bench",
   "examples/bank",
   "examples/social",
   "xtask",
@@ -41,6 +42,7 @@ mess-index = { path = "crates/mess-index" }
 mess-store = { path = "crates/mess-store" }
 mess-derive = { path = "crates/mess-derive" }
 mess-testkit = { path = "crates/mess-testkit" }
+mess-bench = { path = "crates/mess-bench" }
 #
 ident = { git = "https://github.com/bobisme/ident" }
 konst = "0.4.3"

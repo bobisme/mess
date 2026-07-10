@@ -157,3 +157,14 @@ append-side and verify-side costs. Same reference host (Ryzen 9 3900X, Linux
 | phase3.exit_gate.buffered_gate | PASS (4.71M >= 1M ev/s) |
 | phase3.exit_gate.vs_interim | PASS (mess-log buffered 4.5x RocksDB at equal batch; durable 148k vs interim's no-durable-equivalent) |
 | phase3.exit_gate.one_ci_run | `.github/workflows/phase3-exit-gate.yml` runs all three full profiles in one job; this local run (2026-07-09, ~60 s combined) stands in for the first CI run |
+
+## Regression harness (bn-4pk)
+
+The rows above are hand-recorded, one-time captures — useful history, not a
+ratchet. `crates/mess-bench` (bn-4pk) turns this same reference workload set
+into one runnable harness: a JSON ledger per run, compared against a
+committed `crates/mess-bench/floors.json` (seeded from the gate rows above,
+default -10% tolerance). Smoke variant wired into `cargo test -p
+mess-bench`; full gated mode runs nightly via
+`.github/workflows/envelope-regression.yml`. See
+`crates/mess-bench/README.md` for the mode breakdown and design notes.

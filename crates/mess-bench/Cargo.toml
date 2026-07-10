@@ -1,0 +1,25 @@
+[package]
+name = "mess-bench"
+version = "0.0.0"
+edition = "2024"
+description = "mess v1 (bn-4pk): the envelope regression suite — one runner over the reference workload set (buffered/durable append, sealed reads, engine sealed replay, fold-chain, load_verified, recovery), a JSON ledger per run, and a floors.json regression ratchet."
+
+[lib]
+name = "mess_bench"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mess-bench"
+path = "src/main.rs"
+
+[dependencies]
+mess-log = { workspace = true }
+mess-index = { workspace = true }
+mess-store = { workspace = true }
+tokio = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
