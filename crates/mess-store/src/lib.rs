@@ -27,6 +27,16 @@
 //! variant, [`CommandError::Conflict`](mess_core::CommandError::Conflict), is
 //! the distinct **conflict-exhaustion** outcome carrying the attempt count.
 //!
+//! An app seam that wraps several aggregates behind one trait (an HTTP
+//! write surface, say) usually wants `R` typed per call but does not want
+//! `S` — this crate's `StoreError<B::Error>` — rippling into its own error
+//! type. [`CommandError::erase_store`](mess_core::CommandError::erase_store)
+//! (and the more general
+//! [`map_store`](mess_core::CommandError::map_store)) exist for exactly that
+//! seam: they keep `R` typed and collapse `S` to
+//! [`mess_core::BoxedStoreError`], preserving `Display` and the `source()`
+//! chain. See that method's doc comment for a worked before/after.
+//!
 //! [`Event`]: mess_core::Event
 //! [`Aggregate`]: mess_core::Aggregate
 //! [`Decide`]: mess_core::Decide
@@ -54,11 +64,11 @@ pub use engine::{
     CommitterMetrics, EngineError, EngineMetrics, EngineOptions, LogEngine,
 };
 pub use fjall_snapshot::{FjallSnapshotBackend, SnapshotBackendError};
-// Re-export the core command error the facade returns so callers need not
-// depend on `mess-core` directly just to match on a command outcome.
-// `Actor` rides along so a caller can implement the authored-command trait
-// ([`EventStore::command_as`]) without a separate `mess-core` import.
-pub use mess_core::{Actor, CommandError};
+// Re-export the core command error (with its store-erasure target and the
+// authored-command trait) the facade returns so callers need not depend on
+// `mess-core` directly just to match on a command outcome, erase the
+// backend type at an app seam, or implement [`EventStore::command_as`].
+pub use mess_core::{Actor, BoxedStoreError, CommandError};
 #[cfg(feature = "mock")]
 pub use mock::MockBackend;
 pub use retry::{DEFAULT_MAX_ATTEMPTS, RetryPolicy};

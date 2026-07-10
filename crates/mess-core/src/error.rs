@@ -100,3 +100,148 @@ where
         }
     }
 }
+
+/// A type-erased store error: any `std::error::Error` that is `Send + Sync +
+/// 'static`, boxed.
+///
+/// This is the erasure target of [`CommandError::erase_store`]. It is a thin
+/// newtype around `Box<dyn Error + Send + Sync>`, **not** a bare type alias
+/// for one, for a real reason: `std` gives `Box<dyn Error + Send + Sync>`
+/// a `Display` impl (the blanket `impl<T: Display + ?Sized> Display for
+/// Box<T>`) but deliberately *not* an `Error` impl — `impl<E: Error> Error
+/// for Box<E>` requires `E: Sized`, which a trait object is not, and there is
+/// no separate blanket for the unsized case. A bare alias would therefore
+/// satisfy `CommandError`'s `Display` bound but silently fail its `Error`
+/// bound (`S: std::error::Error + 'static`), which is exactly the bound that
+/// keeps `source()` reachable through `CommandError` itself — so this
+/// newtype's whole reason to exist is forwarding [`Error::source`] by hand.
+///
+/// [`Error::source`]: std::error::Error::source
+#[derive(Debug)]
+pub struct BoxedStoreError(Box<dyn std::error::Error + Send + Sync>);
+
+impl BoxedStoreError {
+    /// Box `err`, erasing its concrete type.
+    pub fn new(err: impl std::error::Error + Send + Sync + 'static) -> Self {
+        BoxedStoreError(Box::new(err))
+    }
+}
+
+impl fmt::Display for BoxedStoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for BoxedStoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
+    }
+}
+
+impl std::ops::Deref for BoxedStoreError {
+    type Target = dyn std::error::Error + Send + Sync;
+
+    fn deref(&self) -> &Self::Target { self.0.as_ref() }
+}
+
+impl<R, S> CommandError<R, S> {
+    /// Change the store-error type parameter `S` to `S2` by applying `f`,
+    /// leaving [`Domain`](CommandError::Domain) and
+    /// [`Conflict`](CommandError::Conflict) untouched.
+    ///
+    /// This is the general form [`erase_store`](Self::erase_store) is built
+    /// from; reach for it directly when the target is some other type than
+    /// [`BoxedStoreError`] (e.g. mapping `S` to a seam-local enum variant, the
+    /// way `social`'s `WriteError::Store(String)` does today via
+    /// `s.to_string()`).
+    #[must_use]
+    pub fn map_store<S2>(self, f: impl FnOnce(S) -> S2) -> CommandError<R, S2> {
+        match self {
+            CommandError::Domain(r) => CommandError::Domain(r),
+            CommandError::Conflict { stream, attempts } => {
+                CommandError::Conflict { stream, attempts }
+            }
+            CommandError::Store(s) => CommandError::Store(f(s)),
+        }
+    }
+
+    /// Erase the store-error type parameter `S`, keeping the typed domain
+    /// rejection `R`.
+    ///
+    /// `CommandError<R, S>` is precise — `S` is exactly the backend's error
+    /// type — but that precision means `S` ripples into every signature
+    /// downstream of a `command()` call: a seam trait generic over the
+    /// backend (like `social`'s `WriteOps`) either stays generic over `S`
+    /// too, or its errors must be flattened to something backend-agnostic.
+    /// `erase_store` is the "keep `R` typed, drop `S` to a trait object"
+    /// middle ground: cheaper than a full stringly-typed enum (the boxed
+    /// error still round-trips through `Display` and `source()`, so nothing
+    /// about the failure is lost — only its concrete type), and zero-cost
+    /// when unused (nothing here runs unless called).
+    ///
+    /// # Before / after
+    ///
+    /// Modeled on `examples/social/src/contracts.rs`'s `WriteError`, which
+    /// today renders the store error to a `String` because keeping
+    /// `WriteError` generic over the backend would leak it into every HTTP
+    /// handler signature:
+    ///
+    /// ```ignore
+    /// // Before: WriteError::Store(String) — the source chain is gone,
+    /// // only its rendered text survives.
+    /// enum WriteError {
+    ///     User(UserError),
+    ///     Post(PostError),
+    ///     Conflict { stream: String, attempts: u32 },
+    ///     Store(String),
+    /// }
+    ///
+    /// fn user_err<S: std::fmt::Display>(e: CommandError<UserError, S>) -> WriteError {
+    ///     match e {
+    ///         CommandError::Domain(d) => WriteError::User(d),
+    ///         CommandError::Conflict { stream, attempts } => {
+    ///             WriteError::Conflict { stream, attempts }
+    ///         }
+    ///         CommandError::Store(s) => WriteError::Store(s.to_string()),
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// ```ignore
+    /// // After: WriteError::Store(BoxedStoreError) — same one-liner at the
+    /// // call site, but `source()` still walks into the backend's own error
+    /// // chain (e.g. an `io::Error` under a `thiserror` backend variant).
+    /// enum WriteError {
+    ///     User(UserError),
+    ///     Post(PostError),
+    ///     Conflict { stream: String, attempts: u32 },
+    ///     Store(mess_core::BoxedStoreError),
+    /// }
+    ///
+    /// fn user_err<S>(e: CommandError<UserError, S>) -> WriteError
+    /// where
+    ///     S: std::error::Error + Send + Sync + 'static,
+    /// {
+    ///     match e.erase_store() {
+    ///         CommandError::Domain(d) => WriteError::User(d),
+    ///         CommandError::Conflict { stream, attempts } => {
+    ///             WriteError::Conflict { stream, attempts }
+    ///         }
+    ///         CommandError::Store(s) => WriteError::Store(s),
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// `WriteOps` itself is unchanged either way — the point of erasure is
+    /// that the *seam* (`WriteError`, `user_err`/`post_err`) is the one place
+    /// that ever names `S`, whether it collapses it to a `String` or erases
+    /// it to a `BoxedStoreError`.
+    #[must_use]
+    pub fn erase_store(self) -> CommandError<R, BoxedStoreError>
+    where
+        S: std::error::Error + Send + Sync + 'static,
+    {
+        self.map_store(BoxedStoreError::new)
+    }
+}
