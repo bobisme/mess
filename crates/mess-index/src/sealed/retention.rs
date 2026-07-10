@@ -250,6 +250,62 @@ pub fn decide_segment(
     segment_retention_decision(&spans_for_segment(seg), live, anchors)
 }
 
+/// An **active backup lease** (`bn-2ln`, doc 07 §5): while a backup is copying
+/// a consistent cut, every segment id in the cut must be pinned so retention
+/// (v1 whole-segment deletion) cannot delete a segment out from under the copy.
+/// A lease pins the inclusive segment-id range `[protect_min_segment_id,
+/// protect_max_segment_id]` — the range of segments present in the cut.
+///
+/// The lease's *liveness* (a TTL so a crashed backup cannot leak the pin
+/// forever, doc 07 §5.2) is enforced by the caller that reads leases off disk:
+/// only **active** (unexpired) leases are ever passed to the pure predicate
+/// here. This type is deliberately free of time/filesystem/pid concerns so it
+/// is unit-testable and reusable by any future retention executor, exactly as
+/// [`segment_retention_decision`] is for the snapshot rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupLease {
+    /// The backup that holds this lease (its `BACKUP_MANIFEST` / lease-file id).
+    pub backup_id: String,
+    /// Lowest segment id the cut protects (inclusive).
+    pub protect_min_segment_id: u64,
+    /// Highest segment id the cut protects (inclusive).
+    pub protect_max_segment_id: u64,
+}
+
+impl BackupLease {
+    /// Whether this lease pins `segment_id` against deletion.
+    #[must_use]
+    pub fn pins(&self, segment_id: u64) -> bool {
+        segment_id >= self.protect_min_segment_id && segment_id <= self.protect_max_segment_id
+    }
+}
+
+/// Every active backup lease that pins `segment_id` (doc 07 §5.1). Non-empty
+/// ⇒ the segment is retention-blocked by a running backup regardless of the
+/// snapshot decision. The retention executor MUST NOT unlink a segment while
+/// this returns any lease; `mess retention explain` surfaces each as a
+/// `lease-hold` blocker.
+#[must_use]
+pub fn lease_holds(segment_id: u64, leases: &[BackupLease]) -> Vec<&BackupLease> {
+    leases.iter().filter(|l| l.pins(segment_id)).collect()
+}
+
+/// The full retention gate a whole-segment deletion executor calls per
+/// candidate: a segment is deletable iff the snapshot decision is
+/// [`RetentionDecision::Deletable`] **and** no active backup lease pins it
+/// (doc 07 §5.1). This composes the `bn-2ug` snapshot rule with the `bn-2ln`
+/// backup lease into the single "may I unlink this segment?" question.
+#[must_use]
+pub fn segment_deletable(
+    seg: &SealedSegmentIndex,
+    live: &[LiveSnapshotRef],
+    anchors: &[SnapshotAnchor],
+    leases: &[BackupLease],
+) -> bool {
+    !decide_segment(seg, live, anchors).is_blocked()
+        && lease_holds(seg.segment_id(), leases).is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,5 +449,59 @@ mod tests {
         // A snapshot on a stream not present in this segment never blocks.
         let unrelated = [live(999, 0)];
         assert_eq!(decide_segment(&seg, &unrelated, &[]), RetentionDecision::Deletable);
+    }
+
+    fn lease(id: &str, min: u64, max: u64) -> BackupLease {
+        BackupLease {
+            backup_id: id.to_string(),
+            protect_min_segment_id: min,
+            protect_max_segment_id: max,
+        }
+    }
+
+    /// A backup lease pins exactly the inclusive segment-id range of its cut.
+    #[test]
+    fn lease_pins_its_range_inclusive() {
+        let l = lease("b1", 3, 7);
+        assert!(!l.pins(2));
+        assert!(l.pins(3));
+        assert!(l.pins(5));
+        assert!(l.pins(7));
+        assert!(!l.pins(8));
+    }
+
+    /// `lease_holds` names every active lease covering a segment; empty ⇒ not
+    /// lease-blocked.
+    #[test]
+    fn lease_holds_reports_every_covering_lease() {
+        let leases = [lease("b1", 1, 4), lease("b2", 3, 9)];
+        // segment 3 is inside both cuts.
+        let held = lease_holds(3, &leases);
+        assert_eq!(held.len(), 2);
+        // segment 6 only in b2.
+        assert_eq!(lease_holds(6, &leases).iter().map(|l| l.backup_id.as_str()).collect::<Vec<_>>(), ["b2"]);
+        // segment 12 in neither.
+        assert!(lease_holds(12, &leases).is_empty());
+    }
+
+    /// `segment_deletable` composes the snapshot rule AND the lease pin: a
+    /// snapshot-deletable segment becomes undeletable while a lease pins it,
+    /// and deletable again once the lease is gone.
+    #[test]
+    fn segment_deletable_respects_active_lease() {
+        let input = SealInput {
+            segment_id: 5,
+            base_pos: 0,
+            streams: vec![seal_stream(10, &[(0, 1, 0, 4096)])],
+            payloads: None,
+        };
+        let seg = SealedSegmentIndex::from_bytes(encode_sidecar(&input)).unwrap();
+
+        // No snapshots, no leases -> deletable.
+        assert!(segment_deletable(&seg, &[], &[], &[]));
+        // A lease covering segment 5 pins it -> not deletable.
+        assert!(!segment_deletable(&seg, &[], &[], &[lease("b1", 4, 6)]));
+        // A lease that does not cover segment 5 -> still deletable.
+        assert!(segment_deletable(&seg, &[], &[], &[lease("b1", 1, 3)]));
     }
 }

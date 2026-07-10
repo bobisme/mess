@@ -10,11 +10,13 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+use mess_cli::backup::{self, BackupOptions};
 use mess_cli::doctor::{self, DoctorOptions};
 use mess_cli::format::{self, Format};
 use mess_cli::inspect::{self, InspectOptions};
 use mess_cli::rebuild::{self, RebuildOptions};
 use mess_cli::report::{EXIT_SYSTEM, Report};
+use mess_cli::restore::{self, RestoreOptions};
 use mess_cli::retention;
 use mess_cli::verify::{self, VerifyOptions};
 
@@ -116,6 +118,30 @@ enum Command {
         #[command(subcommand)]
         what: RetentionCmd,
     },
+    /// Copy a consistent cut of a live store to a backup destination.
+    Backup {
+        /// The source store directory.
+        dir: PathBuf,
+        /// The backup destination directory.
+        #[arg(long)]
+        to: PathBuf,
+        /// Copy only sealed segments/sidecars not already present at the
+        /// destination (verified by size + CRC).
+        #[arg(long)]
+        incremental: bool,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Restore a store from a backup: copy back, recover, and verify --full.
+    Restore {
+        /// The backup source directory.
+        src: PathBuf,
+        /// The (empty or absent) target store directory.
+        #[arg(long)]
+        to: PathBuf,
+        #[command(flatten)]
+        common: Common,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -198,5 +224,19 @@ fn main() -> ExitCode {
                 emit(&report, resolve_format(&common))
             }
         },
+        Command::Backup { dir, to, incremental, common } => {
+            if let Err(code) = require_dir(&dir) {
+                return code;
+            }
+            let report = backup::run(&dir, &to, &BackupOptions { incremental });
+            emit(&report, resolve_format(&common))
+        }
+        Command::Restore { src, to, common } => {
+            if let Err(code) = require_dir(&src) {
+                return code;
+            }
+            let report = restore::run(&src, &to, &RestoreOptions::default());
+            emit(&report, resolve_format(&common))
+        }
     }
 }

@@ -73,8 +73,8 @@ pub use payload::{
 pub use ptr_block::{BatchPtr, DecodeError, SKIP_K};
 pub use replay::{ReplaySet, global_checksum, stream_checksum};
 pub use retention::{
-    BlockingReason, CertFrame, LiveSnapshotRef, RetentionDecision, SegmentStreamSpan,
-    decide_segment, segment_retention_decision, spans_for_segment,
+    BackupLease, BlockingReason, CertFrame, LiveSnapshotRef, RetentionDecision, SegmentStreamSpan,
+    decide_segment, lease_holds, segment_deletable, segment_retention_decision, spans_for_segment,
 };
 pub use segment::{
     SealBatch, SealInput, SealStream, SealedSegmentIndex, SealedSegmentRef, SidecarError,

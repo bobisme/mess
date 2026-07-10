@@ -12,14 +12,19 @@
 //! - [`verify`] — the recovery scanner over every corruption class.
 //! - [`rebuild`] — I5: rebuild pointer sidecars (byte-equal) + meta.
 //! - [`retention`] — the bn-2ug retention verdict per sealed segment.
+//! - [`backup`] / [`restore`] — bn-2ln online backup: consistent cut,
+//!   incremental copy, retention lease ([`lease`]).
 
+pub mod backup;
 pub mod doctor;
 pub mod format;
 pub mod inspect;
+pub mod lease;
 pub mod lockprobe;
 pub mod metaread;
 pub mod rebuild;
 pub mod report;
+pub mod restore;
 pub mod retention;
 pub mod scan;
 pub mod store;

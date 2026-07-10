@@ -11,7 +11,8 @@
 use std::path::Path;
 
 use mess_index::sealed::retention::{
-    BlockingReason, CertFrame, LiveSnapshotRef, RetentionDecision, decide_segment,
+    BackupLease, BlockingReason, CertFrame, LiveSnapshotRef, RetentionDecision, decide_segment,
+    lease_holds,
 };
 use mess_index::sealed::segment::SealedSegmentIndex;
 use mess_log::footer_ext::{SnapshotAnchor, decode_extension};
@@ -19,6 +20,7 @@ use mess_log::runtime::real::RealFs;
 use mess_log::sealer::read_trailer;
 use serde_json::json;
 
+use crate::lease;
 use crate::lockprobe;
 use crate::metaread;
 use crate::report::{Finding, Report, Severity};
@@ -62,6 +64,16 @@ pub fn run(dir: &Path) -> Report {
         "stream_id": a.stream_id, "version": a.version
     })).collect::<Vec<_>>()));
 
+    // Active backup leases (bn-2ln, doc 07 §5) pin their cut's segment ids
+    // against deletion for the backup's duration; an expired (crashed-backup)
+    // lease is filtered out here so it never blocks.
+    let leases = lease::active_leases(dir, lease::now_unix());
+    report.set("active_leases", json!(leases.iter().map(|l| json!({
+        "backup_id": l.backup_id,
+        "protect_min_segment_id": l.protect_min_segment_id,
+        "protect_max_segment_id": l.protect_max_segment_id,
+    })).collect::<Vec<_>>()));
+
     let segments = store::discover_segments(dir);
     let mut sealed_seen = 0usize;
     for seg in &segments {
@@ -86,10 +98,16 @@ pub fn run(dir: &Path) -> Report {
         };
 
         let decision = decide_segment(&idx, &live, &anchors);
-        let (verdict, blockers) = match &decision {
+        let (snapshot_verdict, blockers) = match &decision {
             RetentionDecision::Deletable => ("deletable", Vec::new()),
             RetentionDecision::Blocked(reasons) => ("blocked", reasons.clone()),
         };
+        // A backup lease pins this segment regardless of the snapshot verdict
+        // (doc 07 §5.1): the segment is blocked while any active lease covers
+        // it.
+        let lease_blockers: Vec<&BackupLease> = lease_holds(idx.segment_id(), &leases);
+        let blocked = decision.is_blocked() || !lease_blockers.is_empty();
+        let verdict = if blocked { "blocked" } else { snapshot_verdict };
 
         report.push_row(json!({
             "segment_id": idx.segment_id(),
@@ -98,7 +116,28 @@ pub fn run(dir: &Path) -> Report {
             "event_count": idx.event_count(),
             "verdict": verdict,
             "blockers": blockers.iter().map(blocker_json).collect::<Vec<_>>(),
+            "lease_blockers": lease_blockers.iter().map(|l| json!({
+                "backup_id": l.backup_id,
+                "protect_max_segment_id": l.protect_max_segment_id,
+            })).collect::<Vec<_>>(),
         }));
+
+        for l in &lease_blockers {
+            report.push_finding(
+                Finding::new(
+                    Severity::Info,
+                    "retention",
+                    "lease-hold",
+                    format!(
+                        "segment {} pinned by active backup lease {}",
+                        idx.segment_id(),
+                        l.backup_id
+                    ),
+                )
+                .with("segment_id", idx.segment_id())
+                .with("backup_id", l.backup_id.clone()),
+            );
+        }
 
         if decision.is_blocked() {
             report.push_finding(
@@ -115,7 +154,7 @@ pub fn run(dir: &Path) -> Report {
                 .with("segment_id", idx.segment_id())
                 .with("blockers", json!(blockers.iter().map(blocker_json).collect::<Vec<_>>())),
             );
-        } else {
+        } else if !blocked {
             report.push_finding(
                 Finding::new(
                     Severity::Ok,
