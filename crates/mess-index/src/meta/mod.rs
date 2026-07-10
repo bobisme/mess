@@ -95,12 +95,18 @@ const P_HW: &str = "hw";
 // Unlike the other meta tables (derived caches, rebuildable from the log by
 // I5), these are the durable *source of truth* for the name↔id bijection —
 // exactly the role `$registry` plays in the full design, kept here as the
-// smallest durable surface for the engine's lightweight interner. They live in
-// the meta store because that is already the store's durable derived-metadata
-// home, opened at the same journal-buffered durability (a clean reopen sees
-// the buffered tail; only a power-loss crash could lose names whose events are
-// nonetheless durable — an acceptable, documented limit shared with every
-// other buffered meta table).
+// smallest durable surface for the engine's lightweight interner. They live
+// in the meta store because that is already the store's durable
+// derived-metadata home, but — unlike every other table here — they are NOT
+// run at plain journal-buffered durability: bn-20b originally documented a
+// buffered write here as "an acceptable, documented limit shared with every
+// other buffered meta table", but it is not, because I5 (rebuildable from
+// the log) does not hold for these two tables. bn-150 closes that gap: the
+// engine (`mess-store`'s `engine.rs`, `LogEngine::persist_new_names`) forces
+// a newly-interned name's row durable (`MetaStore::persist`, a real
+// `fsync`) strictly before its covering append can become durable, so a
+// power-loss crash can no longer separate the two. See that function's doc
+// for the full rationale.
 const P_STREAM_NAMES: &str = "stream_names";
 const P_TYPE_NAMES: &str = "type_names";
 
@@ -209,6 +215,15 @@ pub struct MetaStore {
     type_names: Keyspace,
     dedupe_bounds: Mutex<DedupeBounds>,
     dedupe_capacity: usize,
+    /// Test/diagnostic: counts calls to [`Self::persist`] (bn-150). Lets a
+    /// caller (the engine's name-durability regression tests) assert the
+    /// hot append path (no newly-interned name) makes zero durable-flush
+    /// calls, and that a new-name append makes exactly the expected number —
+    /// a call-count assertion is used because a real power-loss event
+    /// cannot be simulated portably in-process (an `fsync` survives a mere
+    /// process crash/exit; only a real OS crash or power cut loses a
+    /// page-cache write that was never `fsync`ed).
+    persist_calls: std::sync::atomic::AtomicU64,
 }
 
 impl MetaStore {
@@ -265,6 +280,7 @@ impl MetaStore {
             type_names,
             dedupe_bounds: Mutex::new(bounds),
             dedupe_capacity,
+            persist_calls: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -392,11 +408,25 @@ impl MetaStore {
     }
 
     /// Force any buffered writes to disk (fsync). Not needed for correctness
-    /// (I5) — a convenience for clean shutdown or to bound recovery replay by
-    /// periodically checkpointing durability.
+    /// of the I5 derived-cache tables — a convenience for clean shutdown or
+    /// to bound recovery replay by periodically checkpointing durability —
+    /// but IS required for the `stream_names`/`type_names` interner
+    /// bijection tables, the one durable source of truth this store holds
+    /// (bn-150; see [`MetaStore`]'s and `mess-store`'s `engine.rs`
+    /// `persist_new_names` doc for why).
     pub fn persist(&self) -> Result<(), MetaError> {
+        self.persist_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.db.persist(fjall::PersistMode::SyncAll)?;
         Ok(())
+    }
+
+    /// Test/diagnostic: how many times [`Self::persist`] has been called
+    /// (bn-150). Lets a caller assert the hot append path (no newly-interned
+    /// name) makes zero durable-flush calls.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn persist_call_count(&self) -> u64 {
+        self.persist_calls.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     // ---- reads --------------------------------------------------------

@@ -71,10 +71,17 @@
 //!   numeric ids (`stream_id u64`, `event_type_id u32`), never their strings.
 //!   The interner's `id → name` bijection is therefore persisted durably in the
 //!   `mess-index` [`MetaStore`]'s `stream_names` / `type_names` tables (written
-//!   the first time a name is interned, in [`append_batch`](LogEngine::append_batch))
+//!   the first time a name is interned, in [`append_batch`](LogEngine::append_batch),
+//!   via [`persist_new_names`](LogEngine::persist_new_names))
 //!   and reloaded here to reconstruct the interner before the payloads are
 //!   materialised. This is the smallest durable surface for the engine's
-//!   lightweight interner — the role `$registry` plays in the full design.
+//!   lightweight interner — the role `$registry` plays in the full design
+//!   (not implemented here: frames carry no name payload to derive it from).
+//!   A new name is `fsync`ed **before** the covering append can become
+//!   durable (bn-150), so recovery can never observe a durable event whose
+//!   name is missing — see [`persist_new_names`](LogEngine::persist_new_names)'s
+//!   doc for why that co-durability barrier is needed even though every
+//!   other meta table is a lag-tolerant derived cache.
 //!
 //! After rehydration the book is dense from global position 0 again, so
 //! post-reopen appends preserve the dense-position invariant and reads return
@@ -863,6 +870,17 @@ impl LogEngine {
         self.inner.sealed.len()
     }
 
+    /// Test/diagnostic: how many times the durable meta store's
+    /// [`MetaStore::persist`] has been called (bn-150) — i.e. how many
+    /// `fsync`-backed flushes [`persist_new_names`](Self::persist_new_names)
+    /// has performed. Lets a test assert the hot append path (no
+    /// newly-interned name) adds zero durable flushes, and that a new-name
+    /// append adds exactly the expected number.
+    #[must_use]
+    pub fn meta_persist_call_count(&self) -> u64 {
+        self.inner.meta.persist_call_count()
+    }
+
     /// Seal the current active segment into the cold [`SealedStore`], driving
     /// the real `mess-index` [`SealDriver`] (sidecar encode → durable write →
     /// install → evict-from-active). After this, `read_stream` for the sealed
@@ -952,20 +970,68 @@ enum Pre {
 }
 
 impl LogEngine {
-    /// Persist newly-interned id→name mappings to the durable meta store so a
-    /// reopen can reconstruct the interner (bn-20b).
+    /// Write newly-interned id→name mappings to the durable meta store so a
+    /// reopen can reconstruct the interner (bn-20b). Returns whether it wrote
+    /// anything, so the caller can fold that into a single co-durable flush
+    /// across both the stream-name and type-name call sites (bn-150; see
+    /// [`append_batch`](LogEngine::append_batch) and the "Why this needs an
+    /// explicit flush" note below) — this method itself never flushes.
+    ///
+    /// # Why a flush is needed at all, and why it is the CALLER's job (bn-150)
+    ///
+    /// Every other meta table (`stream_heads`, `snapshot_heads`, dedupe) is a
+    /// derived cache the log can always rebuild (I5, see the `mess-index`
+    /// meta module doc) — fjall's default `PersistMode::Buffer` writes
+    /// (a real `write(2)` to the OS page cache, but never `fsync`ed — see
+    /// `fjall::keyspace::Keyspace::insert`/`Database::batch`) are fine for
+    /// them: a lost *page cache* (i.e. actual power-loss/OS-crash, not a
+    /// mere process crash — a process death alone cannot lose a completed
+    /// `write(2)`) just means a slightly longer recovery replay, never lost
+    /// information. `stream_names`/`type_names` are the one exception: they
+    /// are the durable *source of truth* for the name↔id bijection (the
+    /// spec's `$registry`, `04-registry.md`, would carry names in the log
+    /// itself via a system stream, but that is not implemented here — this
+    /// engine's log frames only ever carry the numeric
+    /// `stream_id`/`event_type_id`, never the string, so a name lost off the
+    /// meta table cannot be re-derived from the log at all; see the module
+    /// doc's "Payload materialisation" section).
+    ///
+    /// Before this fix, a newly-interned name's `put_*_name` call used that
+    /// same page-cache-only `Buffer` durability, with **no ordering barrier**
+    /// against the covering append's own durable write — which, under a
+    /// `Durability::Os`/`Group` engine (`03-durability.md`), IS a real
+    /// `fsync`/`fdatasync` barrier. A genuine power-loss event between the
+    /// two could keep the append durable while losing its name entirely, so
+    /// a subsequent reopen's `recover` hit the "no interned name for
+    /// stream_id" gap and returned `EngineError::Meta` — a store that could
+    /// no longer open.
+    ///
+    /// The fix: [`append_batch`](LogEngine::append_batch) folds this
+    /// method's two call sites (stream name, then type names) into a single
+    /// `MetaStore::persist` (a real `fsync`) whenever *either* wrote
+    /// something — one flush even when an append introduces both a new
+    /// stream and a new type — performed strictly before the durable
+    /// committer append is submitted. So by construction, a covering append
+    /// can only become durable once its new name(s) already are: the two can
+    /// no longer race. On the hot path — no new stream, no new types, the
+    /// overwhelmingly common case once a store's names have stabilised —
+    /// neither call site writes anything, so the fold adds no flush at all:
+    /// zero fjall calls, zero added latency.
     fn persist_new_names(
         &self,
         stream: Option<(u64, String)>,
         types: &[(u32, String)],
-    ) -> Result<(), mess_index::meta::MetaError> {
+    ) -> Result<bool, mess_index::meta::MetaError> {
+        let mut wrote = false;
         if let Some((id, name)) = stream {
             self.inner.meta.put_stream_name(id, &name)?;
+            wrote = true;
         }
         for (id, name) in types {
             self.inner.meta.put_type_name(*id, name)?;
+            wrote = true;
         }
-        Ok(())
+        Ok(wrote)
     }
 }
 
@@ -1154,12 +1220,14 @@ impl Backend for LogEngine {
             let new_stream = sid_new.then(|| (sid, stream_id.to_string()));
             (sid, new_stream)
         };
-        // Persist a newly-interned stream name durably (buffered) so a
-        // reopen can resolve it, even on a path that goes on to conflict —
-        // the id was assigned in-process regardless, and the interner is
-        // dense, so a later successful append to this stream must find its
-        // name persisted.
-        self.persist_new_names(new_stream, &[])
+        // Write a newly-interned stream name so a reopen can resolve it,
+        // even on a path that goes on to conflict — the id was assigned
+        // in-process regardless, and the interner is dense, so a later
+        // successful append to this stream must find its name persisted.
+        // NOT flushed here: folded into one co-durable flush below with any
+        // newly-interned type names, ahead of the covering append (bn-150).
+        let wrote_stream = self
+            .persist_new_names(new_stream, &[])
             .map_err(|e| AppendError::Backend(EngineError::Meta(e.to_string())))?;
 
         // Serialise the exact-version critical section PER STREAM (bn-1s0):
@@ -1196,9 +1264,36 @@ impl Backend for LogEngine {
             (pre, new_types)
         };
 
-        // Persist any newly-interned type names the same way (see above).
-        self.persist_new_names(None, &new_types)
+        // Write any newly-interned type names the same way (see above).
+        let wrote_types = self
+            .persist_new_names(None, &new_types)
             .map_err(|e| AppendError::Backend(EngineError::Meta(e.to_string())))?;
+
+        // Co-durable flush (bn-150): one fsync-backed `MetaStore::persist`
+        // covering BOTH call sites above, strictly before the durable
+        // committer append below is even submitted — so a covering append
+        // can only become durable once its new name(s) already are. Skipped
+        // entirely when neither call site wrote anything (the hot path):
+        // zero fjall calls, zero added latency.
+        //
+        // Dispatched via `spawn_blocking`, matching the durable committer
+        // append below: `MetaStore::persist` performs a real, synchronous
+        // `fsync`/`fdatasync` that can take milliseconds on a real device,
+        // and running that directly on the async task would block a tokio
+        // executor thread for the duration — starving OTHER concurrent
+        // appends (including ones on the hot, no-new-name path) rather than
+        // just adding latency to this one. `spawn_blocking` lets this
+        // append's flush and every other in-flight append's own work
+        // proceed on separate threads, so a burst of new-name appends
+        // degrades to "N real fsyncs, however long that takes" rather than
+        // serialising the whole engine behind them.
+        if wrote_stream || wrote_types {
+            let inner = self.inner.clone();
+            tokio::task::spawn_blocking(move || inner.meta.persist())
+                .await
+                .expect("meta persist task panicked")
+                .map_err(|e| AppendError::Backend(EngineError::Meta(e.to_string())))?;
+        }
 
         let (sid, events, first_stream_pos) = match pre {
             Pre::Conflict(actual) => {

@@ -156,23 +156,50 @@ async fn distinct_streams_overlap_under_durable_commit_path() {
 
     const N: usize = 16;
 
-    // Phase 1 — SERIAL baseline: N distinct streams, one append fully
-    // awaited before the next starts. No two requests are ever concurrently
-    // in flight, so every group is pinned at size 1 regardless of gate
-    // design; this is the "no coalescing possible" reference point.
+    // Prime every stream this test times, sequentially, OUTSIDE either timed
+    // phase (bn-150). A newly-interned stream name now forces a real,
+    // synchronous meta-store `fsync` strictly before its covering append —
+    // a correct and deliberate durability cost (bn-150: name persistence
+    // must be co-durable with the covering append), but a DIFFERENT concern
+    // from what this test measures (per-stream gate / committer coalescing
+    // concurrency). Left un-primed, every one of the 32 distinct brand-new
+    // stream names below would pay that extra fsync in BOTH phases, and
+    // — being a second, independent durable barrier outside the committer's
+    // own group-commit coalescing — it does not coalesce the way the
+    // covering append does, which swamps the very effect this test exists
+    // to observe. Priming first means both timed phases below only ever see
+    // already-interned streams and the already-interned "Opened" type: the
+    // hot, no-new-name path, which is unconditionally zero-added-cost
+    // (bn-150) and so cannot confound the measurement.
+    for i in 0..N {
+        engine
+            .append_batch(&format!("serial-{i}"), Version::NoStream, &[rec("Opened", b"seed")])
+            .await
+            .expect("prime serial stream");
+        engine
+            .append_batch(&format!("concurrent-{i}"), Version::NoStream, &[rec("Opened", b"seed")])
+            .await
+            .expect("prime concurrent stream");
+    }
+
+    // Phase 1 — SERIAL baseline: N distinct (already-primed) streams, one
+    // append fully awaited before the next starts. No two requests are ever
+    // concurrently in flight, so every group is pinned at size 1 regardless
+    // of gate design; this is the "no coalescing possible" reference point.
     let serial_start = std::time::Instant::now();
     for i in 0..N {
         engine
-            .append_batch(&format!("serial-{i}"), Version::NoStream, &[rec("Opened", b"payload")])
+            .append_batch(&format!("serial-{i}"), Version::At(0), &[rec("Opened", b"payload")])
             .await
             .expect("serial append");
     }
     let serial_total = serial_start.elapsed();
 
-    // Phase 2 — CONCURRENT: the same N appends, to N other distinct streams,
-    // all submitted at once. Under the per-stream gate these can all reach
-    // the committer together and coalesce; under the old store-wide gate
-    // they'd be admitted one at a time and behave just like phase 1.
+    // Phase 2 — CONCURRENT: the same N appends, to N other distinct
+    // (already-primed) streams, all submitted at once. Under the per-stream
+    // gate these can all reach the committer together and coalesce; under
+    // the old store-wide gate they'd be admitted one at a time and behave
+    // just like phase 1.
     let concurrent_start = std::time::Instant::now();
     let mut handles = Vec::with_capacity(N);
     for i in 0..N {
@@ -181,7 +208,7 @@ async fn distinct_streams_overlap_under_durable_commit_path() {
             engine
                 .append_batch(
                     &format!("concurrent-{i}"),
-                    Version::NoStream,
+                    Version::At(0),
                     &[rec("Opened", b"payload")],
                 )
                 .await
@@ -208,9 +235,10 @@ async fn distinct_streams_overlap_under_durable_commit_path() {
          concurrent={concurrent_total:?} — looks like appends are still effectively serialised"
     );
 
-    // Sanity: every stream actually landed its event.
+    // Sanity: every stream actually landed both its priming event (version 0)
+    // and its timed event (version 1).
     for i in 0..N {
-        assert_eq!(engine.head(&format!("serial-{i}")).await.unwrap(), Version::At(0));
-        assert_eq!(engine.head(&format!("concurrent-{i}")).await.unwrap(), Version::At(0));
+        assert_eq!(engine.head(&format!("serial-{i}")).await.unwrap(), Version::At(1));
+        assert_eq!(engine.head(&format!("concurrent-{i}")).await.unwrap(), Version::At(1));
     }
 }
