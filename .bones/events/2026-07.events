@@ -584,3 +584,13 @@
 1783718828099664	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExnwU		item.move	bn-1yz	{"state":"done"}	blake3:QqQI9dj975I5KldaHHf7V_vayTnn4c3uhwKdES_pnuU
 1783718828145675	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExoAU		item.move	bn-3mc	{"state":"done"}	blake3:LEuppmijJ1_1bvevfWzeIhmu9cAXkEqBGK85J0MHRso
 1783718828187661	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExoQU		item.move	bn-3n7	{"state":"done"}	blake3:wLBJAJdh9sz54S6uMArcWSdCPA2qtm0LBctUblIFg9s
+1783718860993895	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExogU		item.move	bn-2i3	{"state":"doing"}	blake3:k_hMkkqJB2PFYkX0sha1l7Iy8w6XIvfozSO34DF4Fd4
+1783718861047205	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExowU		item.assign	bn-2i3	{"action":"assign","agent":"mess-dev"}	blake3:1mIANp-qQNGDdPczHZLXkGST9teeiBl4aXs4JfV3Onk
+1783718861076900	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExpAU		item.move	bn-19b	{"state":"doing"}	blake3:GBaRVUeggQzA1lHcdc0obUaY8x6bqrUVufuBwZdj3NI
+1783718861100620	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExpQU		item.assign	bn-19b	{"action":"assign","agent":"mess-dev"}	blake3:Gxs5jkZPywEEfRxZfL4kSQwHYOZcgK93Hj4CJkjUyE8
+1783718861127724	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExpgU		item.move	bn-188	{"state":"doing"}	blake3:vdIc-1L6tUyyWbj0YR3isNFUlo_TRzliyl-Ch_y6VDI
+1783718861141836	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExpwU		item.assign	bn-188	{"action":"assign","agent":"mess-dev"}	blake3:hgx4-VP1ZQimZ2pPvS9Dv4ZD10Pa5JZhuETMu-q7c5Q
+1783718861166645	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExqAU		item.move	bn-ve0	{"state":"doing"}	blake3:tlooc6fmdxfH3AMbcMMKKtDGR3PMhMTekHIuZekhu98
+1783718861179449	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExqQU		item.assign	bn-ve0	{"action":"assign","agent":"mess-dev"}	blake3:xBVfgekYVeAcr-p8EcR3gJBvI-FhxekuKJqVl99jeEg
+1783718861205196	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExqgU		item.move	bn-2v0	{"state":"doing"}	blake3:9pMYNxzoz2XLUXQIux9QIJUxmkkV7pEtIrEdsOp7r-s
+1783718861219739	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExqwU		item.assign	bn-2v0	{"action":"assign","agent":"mess-dev"}	blake3:bsO6ZhwwiDjFcVs-44HgM5mwQPCYe9fyQAPueii4lHE
