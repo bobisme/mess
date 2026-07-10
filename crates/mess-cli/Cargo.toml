@@ -1,0 +1,26 @@
+[package]
+name = "mess-cli"
+version = "0.0.0"
+edition = "2024"
+description = "mess v1: the operational CLI (doctor, inspect, verify, rebuild-index, retention explain)"
+
+[lib]
+name = "mess_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mess"
+path = "src/main.rs"
+
+[dependencies]
+mess-log = { workspace = true }
+mess-index = { workspace = true }
+mess-store = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true }
