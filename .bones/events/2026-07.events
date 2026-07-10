@@ -594,3 +594,9 @@
 1783718861179449	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExqQU		item.assign	bn-ve0	{"action":"assign","agent":"mess-dev"}	blake3:xBVfgekYVeAcr-p8EcR3gJBvI-FhxekuKJqVl99jeEg
 1783718861205196	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExqgU		item.move	bn-2v0	{"state":"doing"}	blake3:9pMYNxzoz2XLUXQIux9QIJUxmkkV7pEtIrEdsOp7r-s
 1783718861219739	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExqwU		item.assign	bn-2v0	{"action":"assign","agent":"mess-dev"}	blake3:bsO6ZhwwiDjFcVs-44HgM5mwQPCYe9fyQAPueii4lHE
+1783720431396370	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExrAU		item.move	bn-2i3	{"state":"done"}	blake3:GC5S8Pv-Jpr6W2hF3lWMEREVmvppFXeMmeI9Mzwt50A
+1783720431436682	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExrQU		item.move	bn-19b	{"state":"done"}	blake3:Gj9RZc7Htpth83YYcVC6OzpyKMzm7VfcuwQAnhICjas
+1783720431465281	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExrgU		item.move	bn-188	{"state":"done"}	blake3:kFFdVVuUt7-wM77d2FNmu65m6mgpnGCtJTt2jEXeNOk
+1783720431489799	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExrwU		item.move	bn-ve0	{"state":"done"}	blake3:C-OrMjAZW-AP4gDq3cC5c3RdgA2gWZGNilYbiXQWaK4
+1783720431517112	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExsAU		item.move	bn-2v0	{"state":"done"}	blake3:k0rAjl_zViz3NrBIAN5m7kkNB8idrB3miyDFbPrzF1Q
+1783720431547137	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExsQU		item.comment	bn-jes	{"body":"Wave-21 adoption note: bn-2i3 landed the Actor trait + EventStore::command_as (checked actor/stream convention), but social contracts.rs still calls plain command — the swap was blocked by sibling file ownership. When remodeling Follow/Like as relationship streams here, use command_as for any command that carries its author stream (or note why the relationship key makes it moot). Also adopt CommandError::erase_store (bn-188) at the WriteError seam instead of the hand-rolled stringify."}	blake3:kp0pukJgukWsnEdK2PUjcmdgdX5iMld91CtqUEWPH30
