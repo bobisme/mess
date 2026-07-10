@@ -325,8 +325,8 @@ impl<F: Fs> SegmentWriter<F> {
     pub fn resume(fs: &F, path: &Path, params: ResumeParams) -> Result<Self, WriteError> {
         let file = fs.open(path, OpenOpts::create_rw())?;
 
-        // bn-221: `write_off` MUST be a real recovered batch boundary of this
-        // exact file — it came from `Recovery::safe_offset`, which by
+        // bn-221/bn-28u: `write_off` MUST be a real recovered batch boundary of
+        // this exact file — it came from `Recovery::safe_offset`, which by
         // construction can never name a position before the fixed segment
         // header (batches start at `SEGMENT_HEADER_LEN`) or past the bytes
         // the scan actually read (`safe_offset <= file len` at scan time; the
@@ -334,17 +334,14 @@ impl<F: Fs> SegmentWriter<F> {
         // violating either bound cannot have come from a real recovery of
         // `path` — resuming there would silently place new appends inside the
         // header or past a gap of unaccounted bytes. Checked unconditionally
-        // (not just `debug_assert!`) because `write_off` crosses a public API
-        // boundary from a caller-supplied `ResumeParams`, not a value this
-        // function derived itself.
+        // with a real typed error (not `debug_assert!`) because `write_off`
+        // crosses a public API boundary from a caller-supplied `ResumeParams`,
+        // not a value this function derived itself, and misuse-resistance MUST
+        // hold in every build profile, `--release` included (bn-221's intent;
+        // `debug_assert!` disappears under `--release`, which would have
+        // silently accepted a bogus `write_off` instead of erroring).
         let file_len = file.len()?;
-        let valid_boundary = is_valid_resume_boundary(params.write_off, file_len);
-        debug_assert!(
-            valid_boundary,
-            "resume write_off {} is not a valid batch boundary (header_len={}, file_len={})",
-            params.write_off, SEGMENT_HEADER_LEN, file_len
-        );
-        if !valid_boundary {
+        if !is_valid_resume_boundary(params.write_off, file_len) {
             return Err(WriteError::InvalidResume {
                 write_off: params.write_off,
                 header_len: SEGMENT_HEADER_LEN as u64,
@@ -835,19 +832,29 @@ mod resume_tests {
     }
 
     #[test]
-    #[should_panic(expected = "not a valid batch boundary")]
     fn resume_rejects_write_off_past_file_len() {
         let rt = SimRuntime::new(5);
         let fs = rt.fs();
         let path = Path::new("/seg-resume-past-eof");
         let summary = seed_segment(&fs, path);
         let mut params = real_resume_params(&summary);
-        params.write_off = summary.content_len + 1_000_000; // far past the file's own bytes
-        let _ = SegmentWriter::resume(&fs, path, params);
+        let bogus_write_off = summary.content_len + 1_000_000; // far past the file's own bytes
+        params.write_off = bogus_write_off;
+        let err = match SegmentWriter::resume(&fs, path, params) {
+            Ok(_) => panic!("write_off past file len must be rejected in every build profile"),
+            Err(e) => e,
+        };
+        match err {
+            WriteError::InvalidResume { write_off, header_len, file_len } => {
+                assert_eq!(write_off, bogus_write_off);
+                assert_eq!(header_len, SEGMENT_HEADER_LEN as u64);
+                assert_eq!(file_len, summary.content_len);
+            }
+            other => panic!("expected WriteError::InvalidResume, got {other:?}"),
+        }
     }
 
     #[test]
-    #[should_panic(expected = "not a valid batch boundary")]
     fn resume_rejects_write_off_before_header() {
         let rt = SimRuntime::new(9);
         let fs = rt.fs();
@@ -855,6 +862,17 @@ mod resume_tests {
         let summary = seed_segment(&fs, path);
         let mut params = real_resume_params(&summary);
         params.write_off = 4; // inside the fixed SegmentHeader, before any batch
-        let _ = SegmentWriter::resume(&fs, path, params);
+        let err = match SegmentWriter::resume(&fs, path, params) {
+            Ok(_) => panic!("write_off before the header must be rejected in every build profile"),
+            Err(e) => e,
+        };
+        match err {
+            WriteError::InvalidResume { write_off, header_len, file_len } => {
+                assert_eq!(write_off, 4);
+                assert_eq!(header_len, SEGMENT_HEADER_LEN as u64);
+                assert_eq!(file_len, summary.content_len);
+            }
+            other => panic!("expected WriteError::InvalidResume, got {other:?}"),
+        }
     }
 }
