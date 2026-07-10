@@ -12,13 +12,50 @@ use crate::report::{Finding, Report, Severity};
 use crate::scan::scan_segment;
 use crate::store;
 
+/// Default cap on how many `stream_heads` rows `text`/`pretty` render before
+/// truncating with a `... and K more` line (bn-1yz: unfiltered `inspect` on
+/// an app-scale store previously dumped every stream head in one shot,
+/// unusable at a few hundred streams). `--format json` always carries every
+/// stream head; this only bounds the human/agent-facing render.
+pub const DEFAULT_STREAM_HEADS_LIMIT: usize = 20;
+
 /// Options for [`run`].
 #[derive(Debug, Default, Clone)]
 pub struct InspectOptions {
     /// Restrict the segment overview to this segment id.
     pub segment: Option<u64>,
-    /// Restrict the stream-head overview to this stream id.
-    pub stream: Option<u64>,
+    /// Restrict the stream-head overview to one stream, by its interned
+    /// numeric id (e.g. `"7"`) or its registered name (e.g. `"user-42"`).
+    /// Name matching requires the metadata registry to be readable (not
+    /// blocked by a live writer's lock); see the `registry.available` field.
+    pub stream: Option<String>,
+    /// Disable the default `text`/`pretty` truncation of `stream_heads` and
+    /// show every entry. No effect on `--format json`, which is always
+    /// complete.
+    pub all_streams: bool,
+}
+
+/// A parsed `--stream` filter: either an interned numeric id or a name to
+/// resolve against the registry.
+enum StreamFilter {
+    Id(u64),
+    Name(String),
+}
+
+impl StreamFilter {
+    fn parse(s: &str) -> Self {
+        match s.parse::<u64>() {
+            Ok(id) => StreamFilter::Id(id),
+            Err(_) => StreamFilter::Name(s.to_string()),
+        }
+    }
+
+    fn matches(&self, sid: u64, name: Option<&String>) -> bool {
+        match self {
+            StreamFilter::Id(id) => sid == *id,
+            StreamFilter::Name(n) => name.is_some_and(|resolved| resolved == n),
+        }
+    }
 }
 
 /// Inspect the store at `dir`. Read-only; works against a live-locked store.
@@ -129,43 +166,90 @@ pub fn run(dir: &Path, opts: &InspectOptions) -> Report {
     // Stream heads and registry — from the durable metadata store when it can
     // be opened (a live writer holds fjall's lock, so degrade to the
     // recovered-from-log heads otherwise).
+    //
+    // bn-1yz: the JSON schema here is LOCK-STATE-INDEPENDENT. Earlier this
+    // set a top-level `registry_source` scalar and, only on success, a
+    // sibling `registry` object — so `registry.stream_names` was a real
+    // array when the store was free and simply ABSENT (not even `null`)
+    // when a live writer held the meta lock. A reader had to branch on
+    // whether the key existed at all. Now `registry` is always present with
+    // the same fields; `registry.available` is the one place that state is
+    // signaled, and `stream_names`/`type_names`/`snapshots` are `[]` (not
+    // missing) when degraded.
     let meta = metaread::read(dir);
     let mut names: BTreeMap<u64, String> = BTreeMap::new();
-    match &meta {
+    let registry = match &meta {
         Ok(facts) => {
             for (id, name) in &facts.stream_names {
                 names.insert(*id, name.clone());
             }
-            report.set("registry_source", json!("meta"));
-            report.set(
-                "registry",
-                json!({
-                    "stream_names": facts.stream_names.iter()
-                        .map(|(id, n)| json!({ "stream_id": id, "name": n }))
-                        .collect::<Vec<_>>(),
-                    "type_names": facts.type_names.iter()
-                        .map(|(id, n)| json!({ "event_type_id": id, "name": n }))
-                        .collect::<Vec<_>>(),
-                    "snapshots": facts.snapshots.iter()
-                        .map(|s| json!({
-                            "stream_id": s.stream_id,
-                            "version": s.version,
-                            "fold_version": s.fold_version,
-                            "covers_empty_prefix": s.covers_empty_prefix,
-                        }))
-                        .collect::<Vec<_>>(),
-                }),
-            );
+            json!({
+                "available": true,
+                "source": "meta",
+                "reason": null,
+                "stream_names": facts.stream_names.iter()
+                    .map(|(id, n)| json!({ "stream_id": id, "name": n }))
+                    .collect::<Vec<_>>(),
+                "type_names": facts.type_names.iter()
+                    .map(|(id, n)| json!({ "event_type_id": id, "name": n }))
+                    .collect::<Vec<_>>(),
+                "snapshots": facts.snapshots.iter()
+                    .map(|s| json!({
+                        "stream_id": s.stream_id,
+                        "version": s.version,
+                        "fold_version": s.fold_version,
+                        "covers_empty_prefix": s.covers_empty_prefix,
+                    }))
+                    .collect::<Vec<_>>(),
+            })
         }
         Err(reason) => {
-            report.set("registry_source", json!("recovered"));
             report.advise("registry-unavailable", reason);
+            json!({
+                "available": false,
+                "source": "unavailable",
+                "reason": reason,
+                "stream_names": [],
+                "type_names": [],
+                "snapshots": [],
+            })
         }
+    };
+    report.set("registry", registry);
+    if !opts.all_streams {
+        // registry.stream_names/type_names/snapshots are just as unbounded at
+        // app scale as stream_heads (bn-1yz) — one row per stream/event-type
+        // ever seen. Cap all four listings together under one flag.
+        report.limit_display("registry.stream_names", DEFAULT_STREAM_HEADS_LIMIT);
+        report.limit_display("registry.type_names", DEFAULT_STREAM_HEADS_LIMIT);
+        report.limit_display("registry.snapshots", DEFAULT_STREAM_HEADS_LIMIT);
     }
 
-    let heads: Vec<_> = stream_heads
+    let filter = opts.stream.as_deref().map(StreamFilter::parse);
+    if let Some(StreamFilter::Name(_)) = &filter
+        && meta.is_err()
+    {
+        report.advise(
+            "stream-name-lookup-unavailable",
+            "--stream named a non-numeric stream and the metadata registry \
+             could not be opened (see registry.available), so no name could \
+             match; pass the interned numeric stream id instead, or retry \
+             once the store is free",
+        );
+    }
+
+    // Sorted by head_version (position) descending, stream_id ascending as a
+    // deterministic tiebreak, so a `text`/`pretty` truncation shows the most
+    // active streams first — see `DEFAULT_STREAM_HEADS_LIMIT`.
+    let mut heads_all: Vec<(u64, u64)> = stream_heads.into_iter().collect();
+    heads_all.sort_by(|(sid_a, v_a), (sid_b, v_b)| v_b.cmp(v_a).then(sid_a.cmp(sid_b)));
+
+    let heads: Vec<_> = heads_all
         .iter()
-        .filter(|(sid, _)| opts.stream.is_none_or(|want| **sid == want))
+        .filter(|(sid, _)| {
+            let name = names.get(sid);
+            filter.as_ref().is_none_or(|f| f.matches(*sid, name))
+        })
         .map(|(sid, v)| {
             json!({
                 "stream_id": sid,
@@ -175,6 +259,9 @@ pub fn run(dir: &Path, opts: &InspectOptions) -> Report {
         })
         .collect();
     report.set("stream_heads", json!(heads));
+    if !opts.all_streams {
+        report.limit_display("stream_heads", DEFAULT_STREAM_HEADS_LIMIT);
+    }
 
     report
 }

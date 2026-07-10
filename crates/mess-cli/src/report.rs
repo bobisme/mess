@@ -9,6 +9,7 @@
 //! the most severe finding.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 use serde_json::{Map, Value, json};
 
@@ -128,6 +129,15 @@ pub struct Report {
     pub findings: Vec<Finding>,
     /// Advisory notes (kebab `type`), CLI-conventions `advice` array.
     pub advice: Vec<Value>,
+    /// Display caps applied ONLY when rendering `text`/`pretty` (`json`
+    /// always carries the complete data — see the backward-compatibility
+    /// note on [`Report::to_json`]). Keyed by dotted path from the top of
+    /// `extra` (`"stream_heads"`, `"registry.stream_names"`, ...); a path
+    /// with no entry renders in full. Set via [`Report::limit_display`]; a
+    /// command uses this for a section that can grow unboundedly at app
+    /// scale (e.g. `inspect`'s per-stream listings) without truncating the
+    /// machine-readable payload.
+    pub display_limits: BTreeMap<String, usize>,
 }
 
 impl Report {
@@ -140,6 +150,7 @@ impl Report {
             extra: BTreeMap::new(),
             findings: Vec::new(),
             advice: Vec::new(),
+            display_limits: BTreeMap::new(),
         }
     }
 
@@ -157,6 +168,17 @@ impl Report {
 
     pub fn advise(&mut self, kind: &str, message: &str) {
         self.advice.push(json!({ "level": "warn", "type": kind, "message": message }));
+    }
+
+    /// Cap how many array items a `text`/`pretty` render shows before it
+    /// truncates with a `... and K more` line, for the array at `path` — a
+    /// top-level `extra` key (`"stream_heads"`) or a dotted path into a
+    /// nested object (`"registry.stream_names"`). Has no effect on
+    /// `to_json`, which always carries the complete array — this only bounds
+    /// the human/agent-facing render of a section that can grow unboundedly
+    /// (e.g. `inspect`'s per-stream listings at app scale).
+    pub fn limit_display(&mut self, path: &str, max: usize) {
+        self.display_limits.insert(path.to_string(), max);
     }
 
     /// The most severe finding severity, or `Ok` when there are none.
@@ -200,8 +222,13 @@ impl Report {
         Value::Object(obj)
     }
 
-    /// Concise, token-efficient text: one finding per line, then the rows of
-    /// the collection (already ID-first Values rendered compactly).
+    /// Concise, token-efficient text: findings, the rows of the collection
+    /// (already ID-first Values rendered compactly), then every `extra`
+    /// section in readable `key: value`/table form, then advisories. Every
+    /// field a command puts in `extra` (dir, lock, metrics, registry, ...)
+    /// must be visible here — `text` is the piped/agent default, so an
+    /// extra section that only showed up in `json` was effectively invisible
+    /// to that audience.
     #[must_use]
     pub fn to_text(&self) -> String {
         let mut out = String::new();
@@ -213,20 +240,42 @@ impl Report {
             out.push_str(&row.to_string());
             out.push('\n');
         }
+        for (k, v) in &self.extra {
+            render_extra_entry(&mut out, k, v, "", k, &self.display_limits);
+        }
+        for a in &self.advice {
+            let _ = writeln!(
+                out,
+                "advice  {}  {}",
+                a.get("type").and_then(Value::as_str).unwrap_or(""),
+                a.get("message").and_then(Value::as_str).unwrap_or(""),
+            );
+        }
         out
     }
 
-    /// Human pretty rendering: a header, tagged findings, then the rows.
+    /// Human pretty rendering: a header with every `extra` section in
+    /// readable form, tagged findings, advisories, then the collection rows.
     #[must_use]
     pub fn to_pretty(&self) -> String {
         let mut out = String::new();
         out.push_str(&format!("mess {}\n", self.command));
         for (k, v) in &self.extra {
-            out.push_str(&format!("  {k}: {v}\n"));
+            render_extra_entry(&mut out, k, v, "  ", k, &self.display_limits);
         }
         out.push('\n');
         for f in &self.findings {
             out.push_str(&format!("{} {}: {}\n", f.severity.tag(), f.kind, f.message));
+        }
+        if !self.advice.is_empty() {
+            out.push('\n');
+            for a in &self.advice {
+                out.push_str(&format!(
+                    "[ADVICE] {}: {}\n",
+                    a.get("type").and_then(Value::as_str).unwrap_or(""),
+                    a.get("message").and_then(Value::as_str).unwrap_or(""),
+                ));
+            }
         }
         if !self.collection.is_empty() {
             out.push('\n');
@@ -244,6 +293,107 @@ impl Report {
         ));
         out
     }
+}
+
+// --- extra-section rendering (text/pretty) ---------------------------------
+//
+// A generic, format-agnostic renderer for `Report::extra` values: scalars as
+// `key: value`, empty/scalar arrays inline, arrays of objects as a small
+// ID-first table (capped by `Report::display_limits`), objects recursed one
+// level. Shared by `to_text` and `to_pretty` (`indent` is `""` for text,
+// `"  "` for pretty, which nests everything else two spaces deeper).
+
+/// Render one `extra` entry at `path` (the dotted path from the top of
+/// `extra`, e.g. `"registry.stream_names"` — looked up in `limits` to cap an
+/// object-array's shown rows; scalar-only arrays are always a single compact
+/// line regardless of any limit).
+fn render_extra_entry(
+    out: &mut String,
+    key: &str,
+    value: &Value,
+    indent: &str,
+    path: &str,
+    limits: &BTreeMap<String, usize>,
+) {
+    match value {
+        Value::Null => {
+            let _ = writeln!(out, "{indent}{key}: -");
+        }
+        Value::Bool(_) | Value::Number(_) | Value::String(_) => {
+            let _ = writeln!(out, "{indent}{key}: {}", scalar_str(value));
+        }
+        Value::Array(items) => render_extra_array(out, key, items, indent, limits.get(path).copied()),
+        Value::Object(map) => {
+            let _ = writeln!(out, "{indent}{key}:");
+            let child_indent = format!("{indent}  ");
+            for (k, v) in map {
+                let child_path = format!("{path}.{k}");
+                render_extra_entry(out, k, v, &child_indent, &child_path, limits);
+            }
+        }
+    }
+}
+
+fn render_extra_array(out: &mut String, key: &str, items: &[Value], indent: &str, limit: Option<usize>) {
+    if items.is_empty() {
+        let _ = writeln!(out, "{indent}{key}: (none)");
+        return;
+    }
+    if items.iter().all(is_scalar) {
+        let joined = items.iter().map(scalar_str).collect::<Vec<_>>().join(", ");
+        let _ = writeln!(out, "{indent}{key}: {joined}");
+        return;
+    }
+    let total = items.len();
+    let shown = limit.map_or(total, |l| l.min(total));
+    let _ = writeln!(out, "{indent}{key} ({total}):");
+    let child_indent = format!("{indent}  ");
+    for item in &items[..shown] {
+        match item {
+            Value::Object(obj) => {
+                let _ = writeln!(out, "{child_indent}{}", render_row(obj));
+            }
+            other => {
+                let _ = writeln!(out, "{child_indent}{}", scalar_str(other));
+            }
+        }
+    }
+    if shown < total {
+        let _ = writeln!(
+            out,
+            "{child_indent}... and {} more (showing {shown} of {total}; see --format json or a filter flag for the rest)",
+            total - shown
+        );
+    }
+}
+
+fn is_scalar(v: &Value) -> bool {
+    !matches!(v, Value::Array(_) | Value::Object(_))
+}
+
+fn scalar_str(v: &Value) -> String {
+    match v {
+        Value::Null => "-".to_string(),
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// One table row for an array-of-objects `extra` section: `k=v` pairs,
+/// two-space delimited, with common id-shaped fields sorted first (ID-first,
+/// per the CLI text-format convention) and the rest alphabetical (`Map`'s
+/// natural key order).
+fn render_row(obj: &Map<String, Value>) -> String {
+    const PRIORITY: [&str; 5] = ["stream_id", "segment_id", "event_type_id", "id", "name"];
+    let mut keys: Vec<&String> = obj.keys().collect();
+    keys.sort_by_key(|k| {
+        let p = PRIORITY.iter().position(|&pk| pk == k.as_str()).unwrap_or(PRIORITY.len());
+        (p, k.as_str())
+    });
+    keys.into_iter()
+        .map(|k| format!("{k}={}", scalar_str(&obj[k])))
+        .collect::<Vec<_>>()
+        .join("  ")
 }
 
 /// Clean exit.

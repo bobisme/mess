@@ -77,9 +77,15 @@ enum Command {
         /// Restrict the segment overview to this segment id.
         #[arg(long)]
         segment: Option<u64>,
-        /// Restrict the stream-head overview to this stream id.
+        /// Restrict the stream-head overview to one stream: its interned
+        /// numeric id or its registered name (name lookup needs the
+        /// metadata registry to be readable).
         #[arg(long)]
-        stream: Option<u64>,
+        stream: Option<String>,
+        /// Show every stream head in `text`/`pretty` output instead of the
+        /// default top-N truncation. `--format json` is always complete.
+        #[arg(long)]
+        all_streams: bool,
         #[command(flatten)]
         common: Common,
     },
@@ -194,11 +200,11 @@ fn main() -> ExitCode {
             let report = doctor::run(&dir, &DoctorOptions { expect_fold_version });
             emit(&report, resolve_format(&common))
         }
-        Command::Inspect { dir, segment, stream, common } => {
+        Command::Inspect { dir, segment, stream, all_streams, common } => {
             if let Err(code) = require_dir(&dir) {
                 return code;
             }
-            let report = inspect::run(&dir, &InspectOptions { segment, stream });
+            let report = inspect::run(&dir, &InspectOptions { segment, stream, all_streams });
             emit(&report, resolve_format(&common))
         }
         Command::Verify { dir, full, repair, common } => {
