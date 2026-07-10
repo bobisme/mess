@@ -23,13 +23,11 @@ use ident::Id;
 use mess_core::CommandError;
 use mess_store::{Backend, EventStore};
 
-use crate::domain::post::{
-    CreatePost, DeletePost, Like, Post, PostError, Unlike,
-};
-use crate::domain::user::{
-    Follow, RegisterUser, SetDisplayName, Unfollow, User, UserError,
-};
-use crate::{post_stream, user_stream};
+use crate::domain::follow::{Follow, FollowError, PlaceFollow, RemoveFollow};
+use crate::domain::like::{Like, LikeError, PlaceLike, RemoveLike};
+use crate::domain::post::{CreatePost, DeletePost, Post, PostError};
+use crate::domain::user::{RegisterUser, SetDisplayName, User, UserError};
+use crate::{follow_stream, like_stream, post_stream, user_stream};
 
 // ===========================================================================
 // DTOs
@@ -187,20 +185,41 @@ pub trait ReadModels {
 /// rejections plus the store-side outcomes into one enum the HTTP layer can
 /// map to status codes.
 ///
-/// This is the one place the two domain error types
-/// ([`UserError`]/[`PostError`]) and the infrastructure outcomes
-/// ([`CommandError::Conflict`]/[`CommandError::Store`]) are unified. The store
-/// error is rendered to a `String` rather than carried generically so
-/// `WriteError` is not itself generic over the backend — HTTP handlers stay
-/// backend-agnostic. (Dogfood note: `CommandError<R, S>` is precise but its
-/// two type parameters ripple outward; collapsing them at this seam is the
-/// pragmatic trade.)
+/// This is the one place the four domain error types
+/// ([`UserError`]/[`PostError`]/[`LikeError`]/[`FollowError`]), the seam-level
+/// [`SelfFollow`](WriteError::SelfFollow) check, and the infrastructure
+/// outcomes ([`CommandError::Conflict`]/[`CommandError::Store`]) are unified.
+///
+/// # Dogfood note: why `Store` is a rendered `String`, not `CommandError::erase_store`
+///
+/// `mess_core::CommandError::erase_store` (bn-188) exists precisely to keep a
+/// seam like this one from stringifying the store error — it would let `Store`
+/// hold a `BoxedStoreError` that still round-trips `source()`. We deliberately
+/// **do not** adopt it here: this `WriteError` must stay `Clone + PartialEq +
+/// Eq` because the web layer's test double (`web::tests::FakeWriteOps`) hands
+/// back a *cloned* canned `Result<u64, WriteError>` on every call, and several
+/// handler tests compare `WriteError` values. `BoxedStoreError`
+/// (`Box<dyn Error>`) is none of `Clone`/`PartialEq`/`Eq`, so erasing the
+/// store type would forfeit all three derives and break those test doubles.
+/// Rendering to a `String` keeps the seam backend-agnostic *and* comparable;
+/// the lost `source()` chain is an acceptable trade for an example crate whose
+/// store errors are never programmatically inspected. (Reported as a limitation
+/// of `erase_store` for equality-carrying seams.)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteError {
     /// A [`User`] business rule refused the command.
     User(UserError),
     /// A [`Post`] business rule refused the command.
     Post(PostError),
+    /// A [`Like`] relationship business rule refused the command.
+    Like(LikeError),
+    /// A [`Follow`] relationship business rule refused the command.
+    Follow(FollowError),
+    /// A follow whose follower and followee are the same user. Enforced at
+    /// this seam, before a degenerate `follow-X_X` stream is created — see
+    /// [`crate::domain::follow`] for why this well-formedness check lives here
+    /// rather than in the relationship aggregate's `decide`.
+    SelfFollow,
     /// The optimistic-retry budget was exhausted.
     Conflict { stream: String, attempts: u32 },
     /// The storage backend failed (rendered).
@@ -212,6 +231,11 @@ impl std::fmt::Display for WriteError {
         match self {
             WriteError::User(e) => write!(f, "{e}"),
             WriteError::Post(e) => write!(f, "{e}"),
+            WriteError::Like(e) => write!(f, "{e}"),
+            WriteError::Follow(e) => write!(f, "{e}"),
+            WriteError::SelfFollow => {
+                write!(f, "a user cannot follow themselves")
+            }
             WriteError::Conflict { stream, attempts } => write!(
                 f,
                 "write conflict on {stream:?} after {attempts} attempts"
@@ -245,18 +269,56 @@ fn post_err<S: std::fmt::Display>(e: CommandError<PostError, S>) -> WriteError {
     }
 }
 
+/// Map a [`Like`] command's [`CommandError`] into a [`WriteError`].
+fn like_err<S: std::fmt::Display>(e: CommandError<LikeError, S>) -> WriteError {
+    match e {
+        CommandError::Domain(d) => WriteError::Like(d),
+        CommandError::Conflict { stream, attempts } => {
+            WriteError::Conflict { stream, attempts }
+        }
+        CommandError::Store(s) => WriteError::Store(s.to_string()),
+    }
+}
+
+/// Map a [`Follow`] command's [`CommandError`] into a [`WriteError`].
+fn follow_err<S: std::fmt::Display>(
+    e: CommandError<FollowError, S>,
+) -> WriteError {
+    match e {
+        CommandError::Domain(d) => WriteError::Follow(d),
+        CommandError::Conflict { stream, attempts } => {
+            WriteError::Conflict { stream, attempts }
+        }
+        CommandError::Store(s) => WriteError::Store(s.to_string()),
+    }
+}
+
 /// The write surface the HTTP layer targets: one method per user action, each
 /// mapping to exactly one [`EventStore::command`] call on the right stream.
+/// The relationship actions (`follow`/`unfollow`/`like`/`unlike`) now route to
+/// the per-edge relationship streams (`follow-<a>_<b>`, `like-<p>_<u>`) rather
+/// than folding a crowd into the `User`/`Post` streams — the public signatures
+/// are unchanged, only the stream each targets moved.
+///
+/// **Why plain `command`, never `command_as`.** No method here has an
+/// author-id *restated* alongside a stream key it must match: entity commands
+/// (`register`, `create_post`, …) key on the entity id directly, and the
+/// relationship commands fold their whole identity into the stream key
+/// (`follow-<follower>_<followee>`), leaving nothing for
+/// [`command_as`](EventStore::command_as) to validate. (The pre-refactor
+/// `Follow`-on-the-user-stream was the one genuine `command_as` site; moving
+/// the edge onto its own stream dissolved that need — see `domain::follow`.)
 ///
 /// **Why a wrapper and not "HTTP calls `store.command` directly".** The store
 /// call is generic in three type parameters (aggregate, command, backend) and
 /// returns a `CommandError<R, S>` whose two parameters leak the backend type
 /// into every handler signature. [`WriteOps`] pins the stream-naming
-/// convention (`user-<id>`, `post-<id>`) in one place and collapses the error
-/// to the backend-agnostic [`WriteError`], so an HTTP handler is a
-/// one-liner with a monomorphic signature. Every method returns the write's
-/// **global log position**, the token a caller feeds to
-/// [`ReadModels::wait_for`] to read its own write.
+/// conventions (`user-<id>`, `post-<id>`, `like-<post>_<user>`,
+/// `follow-<follower>_<followee>`) in one place and collapses the error to the
+/// backend-agnostic [`WriteError`], so an HTTP handler is a one-liner with a
+/// monomorphic signature. Every method returns the write's **global log
+/// position**, the token a caller feeds to [`ReadModels::wait_for`] to read
+/// its own write.
 ///
 /// Like [`ReadModels`], every method is `-> impl Future<..> + Send` rather
 /// than bare `async fn`, for the same reason: it lets a caller generic over
@@ -354,13 +416,23 @@ where
         follower: Id,
         target: Id,
     ) -> Result<u64, WriteError> {
+        // Self-follow is a key-well-formedness check, enforced here before a
+        // degenerate `follow-X_X` stream is ever created — see
+        // `domain::follow`. The relationship `decide` cannot see both ids (they
+        // are in the key, not visible to a single-stream fold), so it cannot
+        // make this check itself.
+        if follower == target {
+            return Err(WriteError::SelfFollow);
+        }
+        // Plain `command`, not `command_as`: the follow edge now lives on its
+        // own `follow-<follower>_<followee>` stream, so the whole actor
+        // identity is in the stream key — there is no separately-restated id
+        // to diverge from it, hence nothing for the authored path to check.
+        // See `domain::follow`'s module docs.
         let commit = self
-            .command::<User, _>(
-                &user_stream(follower),
-                Follow { follower, target },
-            )
+            .command::<Follow, _>(&follow_stream(follower, target), PlaceFollow)
             .await
-            .map_err(user_err)?;
+            .map_err(follow_err)?;
         Ok(commit.last_global_position.unwrap_or(0))
     }
 
@@ -370,9 +442,12 @@ where
         target: Id,
     ) -> Result<u64, WriteError> {
         let commit = self
-            .command::<User, _>(&user_stream(follower), Unfollow { target })
+            .command::<Follow, _>(
+                &follow_stream(follower, target),
+                RemoveFollow,
+            )
             .await
-            .map_err(user_err)?;
+            .map_err(follow_err)?;
         Ok(commit.last_global_position.unwrap_or(0))
     }
 
@@ -398,18 +473,21 @@ where
     }
 
     async fn like(&self, post: Id, user: Id) -> Result<u64, WriteError> {
+        // Plain `command`: like edge on its own `like-<post>_<user>` stream —
+        // the key is the full identity, so `command_as` would be a tautology
+        // (see `domain::like`).
         let commit = self
-            .command::<Post, _>(&post_stream(post), Like { user })
+            .command::<Like, _>(&like_stream(post, user), PlaceLike)
             .await
-            .map_err(post_err)?;
+            .map_err(like_err)?;
         Ok(commit.last_global_position.unwrap_or(0))
     }
 
     async fn unlike(&self, post: Id, user: Id) -> Result<u64, WriteError> {
         let commit = self
-            .command::<Post, _>(&post_stream(post), Unlike { user })
+            .command::<Like, _>(&like_stream(post, user), RemoveLike)
             .await
-            .map_err(post_err)?;
+            .map_err(like_err)?;
         Ok(commit.last_global_position.unwrap_or(0))
     }
 }

@@ -1,8 +1,21 @@
-//! The **Post** aggregate: one post's lifecycle — created, liked, deleted.
+//! The **Post** aggregate: one post's lifecycle — created and deleted.
 //!
 //! One stream per post, keyed `post-<id>` (see [`crate::post_stream`]). As in
 //! [`super::user`], every rule is enforced in [`Decide::decide`] against a
 //! single stream's folded state.
+//!
+//! # Bounded state: the like *crowd* is not stored here
+//!
+//! An earlier version of this crate folded a `likes: HashSet<Id>` of every
+//! liker into the post's own state, with `Liked` / `Unliked` events on this
+//! stream. That is **unbounded** aggregate state: a viral post with a million
+//! likes meant a million-element set replayed on every `Post` command and
+//! written into every snapshot. This rework moves each like to its own tiny
+//! [`Like`](super::like::Like) relationship stream (`like-<post>_<user>`), so
+//! `Post` keeps only **bounded** state — content, author, delete tombstone —
+//! and its commands stay O(1) regardless of how many likes the post accrues.
+//! The `AlreadyLiked` / `NotLiked` rejections and the like-on-deleted rule
+//! moved with the relationship; see [`super::like`].
 //!
 //! # Decision: the moderation events were absorbed, not kept
 //!
@@ -19,24 +32,11 @@
 //!   is about roles, appeals, and audit trails that belong in a dedicated
 //!   moderation bone, not smuggled into the core post aggregate. Keeping both
 //!   here would blur the teaching example. When moderation lands it can add its
-//!   own `Hidden { by, reason }` event without disturbing this stream's
-//!   like/delete rules.
+//!   own `Hidden { by, reason }` event without disturbing this stream's delete
+//!   rule.
 //! - `Deleted { by }` records *who* deleted, so a future moderator-delete is a
 //!   one-line extension (widen the `DeletePost` author check) rather than a new
 //!   event.
-//!
-//! # Decision: self-like is ALLOWED
-//!
-//! `Like` does **not** reject the author liking their own post. Contrast with
-//! `Follow`, which forbids self-follow. The difference is semantic: a follow
-//! edge to yourself is meaningless in every timeline/graph query (you always
-//! "see your own posts"), so it is pure noise. A like is a *reaction count*;
-//! real platforms (X, Instagram) let authors like their own posts and it is a
-//! legitimate, countable signal. Forbidding it would be a surprising rule with
-//! no invariant behind it. (Documented per bn-154's "self-like allowed?
-//! DECIDE" instruction.)
-
-use std::collections::HashSet;
 
 use ident::Id;
 use mess_core::Decide;
@@ -48,8 +48,9 @@ use mess_derive::{Aggregate, Event};
 
 /// Every fact that can happen to a post.
 ///
-/// `#[event(name = "post", version = 1)]` → wire names `"post.posted"`,
-/// `"post.deleted"`, `"post.liked"`, `"post.unliked"`.
+/// `#[event(name = "post", version = 1)]` → wire names `"post.posted"` and
+/// `"post.deleted"`. (Likes are no longer post events — they live on the
+/// `like-<post>_<user>` streams; see the module docs.)
 #[derive(Debug, Clone, PartialEq, Eq, Event)]
 #[event(name = "post", version = 1)]
 pub enum PostEvent {
@@ -58,36 +59,29 @@ pub enum PostEvent {
     /// The post was deleted `by` a user (only ever the author — see
     /// [`DeletePost`]).
     Deleted { by: Id },
-    /// `user` liked the post.
-    Liked { user: Id },
-    /// `user` retracted their like.
-    Unliked { user: Id },
 }
 
 // ---------------------------------------------------------------------------
 // The aggregate: one post's folded state.
 // ---------------------------------------------------------------------------
 
-/// The read-model folded from one post's event stream.
-///
-/// Like [`super::user::User`], `likes` is a [`HashSet`] (an order-independent
-/// set; `ident::Id` is not `Ord`, so a `BTreeSet` is not an option — see that
-/// type's docs). `author` is `Option<Id>` so `Default` (an unwritten post) is
-/// representable — `created` is the explicit existence flag commands check.
+/// The read-model folded from one post's event stream — now fully **bounded**:
+/// three scalar-ish fields, no crowd set. `author` is `Option<Id>` so
+/// `Default` (an unwritten post) is representable — `created` is the explicit
+/// existence flag commands check.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Aggregate)]
 #[aggregate(event = PostEvent)]
 pub struct Post {
     /// `false` until a `Posted` event is folded.
     pub created: bool,
     /// `true` once a `Deleted` event is folded. A deleted post is a tombstone:
-    /// it still exists in the log, but new likes are refused.
+    /// it still exists in the log, but the projection drops it from every
+    /// feed.
     pub deleted: bool,
     /// The author, set by `Posted`. `None` before creation.
     pub author:  Option<Id>,
     /// The post body.
     pub body:    String,
-    /// The set of users who currently like this post.
-    pub likes:   HashSet<Id>,
 }
 
 impl Post {
@@ -102,12 +96,6 @@ impl Post {
             }
             PostEvent::Deleted { .. } => {
                 self.deleted = true;
-            }
-            PostEvent::Liked { user } => {
-                self.likes.insert(*user);
-            }
-            PostEvent::Unliked { user } => {
-                self.likes.remove(user);
             }
         }
     }
@@ -139,12 +127,6 @@ pub enum PostError {
     NotAuthor,
     /// `DeletePost` on an already-deleted post.
     AlreadyDeleted,
-    /// `Like` on a deleted post.
-    LikeOnDeleted,
-    /// `Like` by a user who already likes the post.
-    AlreadyLiked,
-    /// `Unlike` by a user who does not currently like the post.
-    NotLiked,
 }
 
 impl std::fmt::Display for PostError {
@@ -160,11 +142,6 @@ impl std::fmt::Display for PostError {
                 write!(f, "only the author may delete this post")
             }
             PostError::AlreadyDeleted => write!(f, "post is already deleted"),
-            PostError::LikeOnDeleted => {
-                write!(f, "cannot like a deleted post")
-            }
-            PostError::AlreadyLiked => write!(f, "already liked this post"),
-            PostError::NotLiked => write!(f, "have not liked this post"),
         }
     }
 }
@@ -183,19 +160,6 @@ pub struct CreatePost {
 #[derive(Debug, Clone, Copy)]
 pub struct DeletePost {
     pub by: Id,
-}
-
-/// Like a post as `user`. Self-like (author liking their own post) is allowed
-/// — see the module docs.
-#[derive(Debug, Clone, Copy)]
-pub struct Like {
-    pub user: Id,
-}
-
-/// Retract a like as `user`.
-#[derive(Debug, Clone, Copy)]
-pub struct Unlike {
-    pub user: Id,
 }
 
 impl Decide<CreatePost> for Post {
@@ -234,41 +198,5 @@ impl Decide<DeletePost> for Post {
             return Err(PostError::AlreadyDeleted);
         }
         Ok(vec![PostEvent::Deleted { by: cmd.by }])
-    }
-}
-
-impl Decide<Like> for Post {
-    type Rejection = PostError;
-
-    fn decide(&self, cmd: Like) -> Result<Vec<PostEvent>, PostError> {
-        if !self.created {
-            return Err(PostError::NotCreated);
-        }
-        if self.deleted {
-            return Err(PostError::LikeOnDeleted);
-        }
-        if self.likes.contains(&cmd.user) {
-            return Err(PostError::AlreadyLiked);
-        }
-        Ok(vec![PostEvent::Liked { user: cmd.user }])
-    }
-}
-
-impl Decide<Unlike> for Post {
-    type Rejection = PostError;
-
-    fn decide(&self, cmd: Unlike) -> Result<Vec<PostEvent>, PostError> {
-        if !self.created {
-            return Err(PostError::NotCreated);
-        }
-        // Note: we do NOT reject unliking a *deleted* post. Only `Like` is
-        // blocked on deletion (bn-154 lists "no like-on-deleted" but not its
-        // mirror). Retracting a like you placed before deletion is harmless
-        // bookkeeping, and gating it would add a rejection reason no rule asks
-        // for. The membership check below is the only gate.
-        if !self.likes.contains(&cmd.user) {
-            return Err(PostError::NotLiked);
-        }
-        Ok(vec![PostEvent::Unliked { user: cmd.user }])
     }
 }

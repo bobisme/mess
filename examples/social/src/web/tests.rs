@@ -14,6 +14,7 @@ use tower::ServiceExt;
 
 use super::{AppState, router};
 use crate::contracts::{FakeReadModels, WriteError, WriteOps};
+use crate::domain::like::LikeError;
 use crate::domain::post::PostError;
 use crate::domain::user::UserError;
 
@@ -297,7 +298,7 @@ async fn like_happy_then_already_liked() {
     assert!(w.called("like"));
 
     let (_w, app, _alice, _b, _c, p1, ..) =
-        world(FakeWriteOps::err(WriteError::Post(PostError::AlreadyLiked)));
+        world(FakeWriteOps::err(WriteError::Like(LikeError::AlreadyLiked)));
     let (status, _, loc) =
         send(&app, post_form(&format!("/p/{p1}/like"), "", Some("alice")))
             .await;
@@ -341,9 +342,9 @@ async fn follow_happy_reject_and_unknown_handle() {
     assert!(is_ok_redirect(status, &loc));
     assert!(w.called("follow"));
 
-    // Rejection: self-follow.
+    // Rejection: self-follow (a seam-level WriteError, not a domain rejection).
     let (_w, app, _alice, ..) =
-        world(FakeWriteOps::err(WriteError::User(UserError::SelfFollow)));
+        world(FakeWriteOps::err(WriteError::SelfFollow));
     let (status, _, loc) =
         send(&app, post_form("/u/alice/follow", "", Some("alice"))).await;
     assert!(is_err_redirect(status, &loc));

@@ -1,13 +1,20 @@
 //! Store-backed roundtrip: drive `register -> follow -> post -> like ->
 //! delete` through a real [`EventStore`](mess_store::EventStore) via the
 //! [`WriteOps`] wrapper, then assert the folded aggregates match. This is the
-//! integration counterpart to the store-free `tests/gwt.rs` specs.
+//! integration counterpart to the store-free `tests/gwt.rs` specs, and the
+//! home of the two seam-level rules `decide` cannot express: self-follow
+//! refusal and self-like allowance.
 
 use ident::Id;
 use mess_store::{EventStore, LogEngine};
+use social::domain::follow::Follow;
+use social::domain::like::Like;
 use social::domain::post::Post;
 use social::domain::user::User;
-use social::{WriteError, WriteOps, post_stream, user_stream};
+use social::{
+    FollowError, WriteError, WriteOps, follow_stream, like_stream, post_stream,
+    user_stream,
+};
 
 /// A fresh store in a unique temp dir per test invocation.
 fn fresh_store() -> EventStore<LogEngine> {
@@ -33,18 +40,26 @@ async fn happy_path_roundtrip() -> Result<(), WriteError> {
     store.like(post, alice).await?;
     store.delete_post(post, bob).await?;
 
+    // The entities keep only bounded state.
     let alice_state =
         store.load::<User>(&user_stream(alice)).await.unwrap().state;
     assert!(alice_state.registered);
     assert_eq!(alice_state.handle, "alice");
-    assert!(alice_state.following.contains(&bob));
 
     let post_state =
         store.load::<Post>(&post_stream(post)).await.unwrap().state;
     assert!(post_state.created);
     assert!(post_state.deleted);
     assert_eq!(post_state.author, Some(bob));
-    assert!(post_state.likes.contains(&alice));
+
+    // The crowds live on their own relationship streams.
+    let edge =
+        store.load::<Follow>(&follow_stream(alice, bob)).await.unwrap().state;
+    assert!(edge.following, "alice -> bob follow edge is active");
+
+    let like =
+        store.load::<Like>(&like_stream(post, alice)).await.unwrap().state;
+    assert!(like.liked, "alice's like on the post is active");
     Ok(())
 }
 
@@ -64,10 +79,10 @@ async fn typed_rejections_surface_through_the_store() {
         other => panic!("expected InvalidHandle, got {other:?}"),
     }
 
-    // Double-follow rejected.
+    // Double-follow rejected — now a Follow-relationship rejection.
     store.follow(alice, bob).await.unwrap();
     match store.follow(alice, bob).await {
-        Err(WriteError::User(social::UserError::AlreadyFollowing)) => {}
+        Err(WriteError::Follow(FollowError::AlreadyFollowing)) => {}
         other => panic!("expected AlreadyFollowing, got {other:?}"),
     }
 
@@ -77,4 +92,40 @@ async fn typed_rejections_surface_through_the_store() {
         Err(WriteError::Post(social::PostError::NotAuthor)) => {}
         other => panic!("expected NotAuthor, got {other:?}"),
     }
+}
+
+/// Self-follow is refused at the [`WriteOps`] seam — the relationship
+/// aggregate cannot see both ids (they are the stream key), so the
+/// well-formedness check lives here and never creates a `follow-X_X` stream.
+#[tokio::test]
+async fn self_follow_is_refused_at_the_seam() {
+    let store = fresh_store();
+    let alice = Id::new();
+    store.register(alice, "alice".into(), "Alice".into()).await.unwrap();
+
+    match store.follow(alice, alice).await {
+        Err(WriteError::SelfFollow) => {}
+        other => panic!("expected SelfFollow, got {other:?}"),
+    }
+    // No degenerate stream was ever written.
+    let edge =
+        store.load::<Follow>(&follow_stream(alice, alice)).await.unwrap();
+    assert!(!edge.state.following, "no self-follow edge should exist");
+}
+
+/// Self-like IS allowed: an author liking their own post is a legitimate,
+/// countable signal, so the like relationship has no self-check and the write
+/// simply succeeds.
+#[tokio::test]
+async fn self_like_is_allowed() {
+    let store = fresh_store();
+    let author = Id::new();
+    let post = Id::new();
+    store.register(author, "author".into(), "Author".into()).await.unwrap();
+    store.create_post(post, author, "mine".into()).await.unwrap();
+
+    store.like(post, author).await.expect("author may like own post");
+    let like =
+        store.load::<Like>(&like_stream(post, author)).await.unwrap().state;
+    assert!(like.liked);
 }

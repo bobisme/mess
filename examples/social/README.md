@@ -2,9 +2,9 @@
 
 A small Twitter-clone built on `mess` — the second showcase example after
 `examples/bank`. Where `bank` teaches the vocabulary on one aggregate, this
-crate is the *shape of a real application*: two aggregates that reference
-each other by id without sharing a stream, a real rebuildable read model, and
-a server-rendered HTML frontend, all wired to a real on-disk event log.
+crate is the *shape of a real application at scale*: **every aggregate has
+bounded state**, a real rebuildable read model, and a server-rendered HTML
+frontend, all wired to a real on-disk event log.
 
 This README is the demo tour: what it shows, how to run it, why the
 "rebuild from the log" trick works, and a walk through the real `mess`
@@ -12,13 +12,16 @@ operational CLI run against the demo's own seeded store.
 
 ## What this demonstrates
 
-- **Two aggregates, two stream families, no shared state.** `User` lives at
-  `user-<id>` (handle, display name, the follow set); `Post` lives at
-  `post-<id>` (author, body, likes, delete tombstone). See
-  `src/domain/user.rs` and `src/domain/post.rs` — both are commented in depth
-  on *why* each invariant is enforced where it is (e.g. why the follow set
-  lives on the follower's own stream, why self-like is allowed but
-  self-follow is not).
+- **Four aggregates, all with bounded state.** Two *entities* —
+  `User` at `user-<id>` (handle, display name) and `Post` at `post-<id>`
+  (author, body, delete tombstone) — and two *relationships*, `Like` at
+  `like-<post>_<user>` and `Follow` at `follow-<follower>_<followee>`, each a
+  tiny alternating two-state machine on its own stream. The crowds (a post's
+  likers, a user's followers) are **not** aggregate state anywhere; see
+  [Why relationship streams](#why-relationship-streams) below.
+  `src/domain/*.rs` are commented in depth on *why* each invariant is enforced
+  where it is (e.g. why self-like is allowed but self-follow is refused at the
+  write seam).
 - **A real, rebuildable read model.** `src/projections.rs`'s `Projections`
   type folds the *entire* event log into in-memory tables by replaying
   `read_global` from position 0, then keeps tailing it live. There is no
@@ -79,24 +82,71 @@ cargo run -p social --bin social-web   # no --dir: in-memory demo world
                       │      Projections          │  │    mess_store::EventStore    │
                       │  (projections.rs)          │  │   over mess_store::LogEngine  │
                       │  in-memory fold, rebuilt   │◀─┤                               │
-                      │  from position 0 at boot,  │  │  user-<id> / post-<id>        │
-                      │  then live-tails the log   │  │  stream families               │
+                      │  from position 0 at boot,  │  │  entities:                    │
+                      │  then live-tails the log,  │  │    user-<id> / post-<id>      │
+                      │  reconstructing the like   │  │  relationships:               │
+                      │  & follow crowds from the  │  │    like-<post>_<user>         │
+                      │  relationship streams      │  │    follow-<flwr>_<flwee>      │
                       └────────────┬───────────────┘  └────────────┬──────────────────┘
                                    │ read_global(after, limit)      │ append_batch
+                                   │  routed by StoredRecord         │
+                                   │  ::category() (before 1st '-')  │
                                    └───────────────┬─────────────────┘
                                                     ▼
                                     durable on-disk log
                                     ($STORE_DIR/seg-*.log + meta/)
 ```
 
-`User` and `Post` never reference each other's aggregate state directly — a
-`Followed { target }` event only *records* a target id, it never checks that
-id is a registered user (`decide` folds exactly one stream; see
-`src/domain/user.rs`'s module docs for why that is a feature, not a gap).
-`Projections` is what joins the two: it folds both stream families into one
-set of tables and answers cross-aggregate queries (a post's `PostView` joins
-in the author's current handle/display name from the `User` fold) at query
-time.
+No aggregate reads another's state. A `Follow` edge only *records* that
+`follow-<a>_<b>` is active; it never checks that `b` is a registered user
+(`decide` folds exactly one stream; see `src/domain/user.rs`'s module docs on
+the accept-and-reconcile posture — why that is a feature, not a gap).
+`Projections` is what joins everything: it routes each record to the right
+fold by `StoredRecord::category()` (the segment before the first `-`), folds
+the entity streams into user/post tables *and* reconstructs the like/follow
+crowds from the relationship streams into count/membership indexes, and answers
+cross-aggregate queries (a post's `PostView` joins the author's current
+handle/display name and its live like count) at query time.
+
+## Why relationship streams
+
+The scaling problem with putting a crowd *inside* an aggregate: if `Post` held
+`likes: HashSet<Id>`, a viral post with a million likes would replay a
+million-element set on **every** `Post` command and write it into **every**
+snapshot — O(crowd) work forever, on the hot write path. Same for a hub user's
+follow graph.
+
+The event-sourcing fix is that a crowd is not aggregate state — each
+*relationship* is its own tiny aggregate. A like is one `like-<post>_<user>`
+stream: a `not-liked ↔ liked` machine holding a single bit. Placing or removing
+a like is O(1) no matter how many other people liked the same post, because the
+command folds only *that one edge's* stream. Ditto follows. So:
+
+- **Bounded commands.** Every `decide` folds a handful of fields, never a
+  crowd. Snapshots stay tiny.
+- **Crowds live in the projection.** The read model reconstructs like counts,
+  `liked_by_me`, and follower/following sets from the relationship streams at
+  query time — exactly where a home timeline was already computed by filtering
+  posts against the viewer's *current* follow set. (The broader scale story —
+  fan-out, sharding — is a later bone; this example just establishes the
+  bounded-state shape.)
+- **Stream naming.** A relationship stream keys on *both* ids:
+  `like-<post>_<user>`. The `_` is a sound separator because an `Id` renders
+  only over `[0-9a-z-]` (Crockford base32 plus two internal `-`s) and never
+  contains `_`; `StoredRecord::category()` splits at the first `-`, and the
+  suffix splits once on `_` back into the two ids. See `src/lib.rs`'s
+  `PAIR_SEP` / `parse_pair` for the format invariant.
+
+### Event-vocabulary reset
+
+This rework changes the **on-disk event vocabulary**: `Post` no longer emits
+`Liked`/`Unliked` and `User` no longer emits `Followed`/`Unfollowed`; those are
+now `Liked`/`Unliked` on `like-*` streams and `Followed`/`Unfollowed` on
+`follow-*` streams. For an example crate that is **fine and needs no
+migration** — there is no persisted corpus to preserve; `social-seed`
+regenerates the whole log from scratch on demand. A production system would
+treat this as a real schema change (a new event version and a migration/replay
+plan); here it is just a reseed.
 
 ## The rebuild-from-log party trick
 
@@ -202,6 +252,17 @@ Everything below is the **real** `mess` CLI (`crates/mess-cli`), run against
 this demo's own seeded store (`~/.cache/mess-social-demo/store`, 50 users +
 500 posts + likes/deletes/unfollows, 1,488 events), output trimmed for
 length but otherwise unedited.
+
+> **Note — this transcript predates the bounded-state (relationship-stream)
+> rework.** The **event** count is unchanged (each action is still exactly one
+> event: 50 + 88 + 500 + 800 + 30 + 20 = 1,488), so `doctor`, `verify`, and the
+> `backup`/`restore` watermarks below all still read `1,488`. What *did* change
+> is the **stream** count: likes and follows are now their own streams, so the
+> store holds ~1,438 streams (50 `user-` + 500 `post-` + 88 `follow-` + 800
+> `like-`) rather than 550. The `inspect` numbers below (`550 entries`,
+> `stream_id` 1..550) are the pre-rework capture; rerun `mess inspect` after a
+> reseed to see the relationship streams. The dogfood findings the tour makes
+> are unaffected.
 
 ### `mess doctor` — is the store healthy?
 

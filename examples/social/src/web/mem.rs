@@ -10,10 +10,13 @@
 //!
 //! [`MemBackend`] bridges the gap without duplicating any domain rule or query:
 //!
-//! - **Writes** fold the real [`User`]/[`Post`] aggregates and run their real
-//!   [`Decide`] impls, so every business rule (self-follow, delete-not-yours,
-//!   double-like, …) is enforced exactly as in production. A rejection maps
-//!   straight to [`WriteError`].
+//! - **Writes** fold the real [`User`]/[`Post`] entity aggregates *and* the
+//!   real [`Like`]/[`Follow`] relationship aggregates (one folded value per
+//!   edge, keyed by its `(id, id)` pair — the bounded-state mirror of the
+//!   `like-`/`follow-` streams), running their real [`Decide`] impls, so every
+//!   business rule (delete-not-yours, double-like, …) is enforced exactly as in
+//!   production, and self-follow is refused at the same seam the real
+//!   [`WriteOps`] guards it. A rejection maps straight to [`WriteError`].
 //! - **Reads** rebuild a [`FakeReadModels`] from the current folded state on
 //!   each query and delegate — so all feed/profile/pagination logic is reused,
 //!   never reimplemented.
@@ -22,6 +25,7 @@
 //! production read model. Swapping it for the real `EventStore` + bn-2xl
 //! projections is the final wiring step described in the bone.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use ident::Id;
@@ -31,10 +35,10 @@ use crate::contracts::{
     FakeReadModels, PostView, ProfileView, ReadModels, TimelinePage,
     WriteError, WriteOps,
 };
-use crate::domain::post::{CreatePost, DeletePost, Like, Post, Unlike};
-use crate::domain::user::{
-    Follow, RegisterUser, SetDisplayName, Unfollow, User,
-};
+use crate::domain::follow::{Follow, PlaceFollow, RemoveFollow};
+use crate::domain::like::{Like, PlaceLike, RemoveLike};
+use crate::domain::post::{CreatePost, DeletePost, Post};
+use crate::domain::user::{RegisterUser, SetDisplayName, User};
 
 struct UserRow {
     id:  Id,
@@ -49,9 +53,15 @@ struct PostRow {
 
 #[derive(Default)]
 struct Inner {
-    users: Vec<UserRow>,
-    posts: Vec<PostRow>,
-    pos:   u64,
+    users:   Vec<UserRow>,
+    posts:   Vec<PostRow>,
+    /// One folded [`Follow`] relationship aggregate per `(follower, followee)`
+    /// edge — the bounded-state mirror of the write side, exactly as the real
+    /// projection folds the `follow-<a>_<b>` streams.
+    follows: HashMap<(Id, Id), Follow>,
+    /// One folded [`Like`] relationship aggregate per `(post, user)` edge.
+    likes:   HashMap<(Id, Id), Like>,
+    pos:     u64,
 }
 
 /// A coherent in-memory backend implementing both [`ReadModels`] and
@@ -87,7 +97,9 @@ impl Inner {
 
     /// Rebuild a [`FakeReadModels`] snapshot from current folded state so every
     /// query reuses the contract's own logic. Posts are seeded in creation
-    /// order so the fake's sequence matches the real feed order.
+    /// order so the fake's sequence matches the real feed order. Like/follow
+    /// crowds come from the relationship aggregates, mirroring how the real
+    /// projection folds them from the `like-`/`follow-` streams.
     fn snapshot(&self) -> FakeReadModels {
         let mut rm = FakeReadModels::new();
         for u in &self.users {
@@ -98,16 +110,18 @@ impl Inner {
         for p in posts {
             let Some(author) = p.agg.author else { continue };
             rm = rm.with_post(p.id, author, &p.agg.body);
-            for liker in &p.agg.likes {
-                rm = rm.with_like(p.id, *liker);
-            }
             if p.agg.deleted {
                 rm = rm.with_deleted(p.id);
             }
         }
-        for u in &self.users {
-            for t in &u.agg.following {
-                rm = rm.with_follow(u.id, *t);
+        for (&(post, user), like) in &self.likes {
+            if like.liked {
+                rm = rm.with_like(post, user);
+            }
+        }
+        for (&(follower, followee), follow) in &self.follows {
+            if follow.following {
+                rm = rm.with_follow(follower, followee);
             }
         }
         rm
@@ -225,20 +239,22 @@ impl WriteOps for MemBackend {
         follower: Id,
         target: Id,
     ) -> Result<u64, WriteError> {
+        // Same seam-level self-follow guard the real `WriteOps` applies, before
+        // touching the relationship aggregate — see
+        // `contracts`/`domain::follow`.
+        if follower == target {
+            return Err(WriteError::SelfFollow);
+        }
         let mut g = self.inner.lock().unwrap();
         let mut agg =
-            g.user(follower).map(|r| r.agg.clone()).unwrap_or_default();
-        let events = agg
-            .decide(Follow { follower, target })
-            .map_err(WriteError::User)?;
+            g.follows.get(&(follower, target)).cloned().unwrap_or_default();
+        let events = agg.decide(PlaceFollow).map_err(WriteError::Follow)?;
         let mut pos = g.pos;
         for e in &events {
             agg.apply(e);
             pos = g.next_pos();
         }
-        if let Some(row) = g.user_mut(follower) {
-            row.agg = agg;
-        }
+        g.follows.insert((follower, target), agg);
         Ok(pos)
     }
 
@@ -249,17 +265,14 @@ impl WriteOps for MemBackend {
     ) -> Result<u64, WriteError> {
         let mut g = self.inner.lock().unwrap();
         let mut agg =
-            g.user(follower).map(|r| r.agg.clone()).unwrap_or_default();
-        let events =
-            agg.decide(Unfollow { target }).map_err(WriteError::User)?;
+            g.follows.get(&(follower, target)).cloned().unwrap_or_default();
+        let events = agg.decide(RemoveFollow).map_err(WriteError::Follow)?;
         let mut pos = g.pos;
         for e in &events {
             agg.apply(e);
             pos = g.next_pos();
         }
-        if let Some(row) = g.user_mut(follower) {
-            row.agg = agg;
-        }
+        g.follows.insert((follower, target), agg);
         Ok(pos)
     }
 
@@ -289,35 +302,10 @@ impl WriteOps for MemBackend {
     }
 
     async fn delete_post(&self, post: Id, by: Id) -> Result<u64, WriteError> {
-        self.mutate_post(post, |p| p.decide(DeletePost { by }))
-    }
-
-    async fn like(&self, post: Id, user: Id) -> Result<u64, WriteError> {
-        self.mutate_post(post, |p| p.decide(Like { user }))
-    }
-
-    async fn unlike(&self, post: Id, user: Id) -> Result<u64, WriteError> {
-        self.mutate_post(post, |p| p.decide(Unlike { user }))
-    }
-}
-
-impl MemBackend {
-    /// Shared body for post commands on an existing stream: fold, decide,
-    /// apply.
-    fn mutate_post(
-        &self,
-        post: Id,
-        decide: impl FnOnce(
-            &Post,
-        ) -> Result<
-            Vec<crate::domain::post::PostEvent>,
-            crate::domain::post::PostError,
-        >,
-    ) -> Result<u64, WriteError> {
         let mut g = self.inner.lock().unwrap();
         let mut agg =
             g.post_mut(post).map(|r| r.agg.clone()).unwrap_or_default();
-        let events = decide(&agg).map_err(WriteError::Post)?;
+        let events = agg.decide(DeletePost { by }).map_err(WriteError::Post)?;
         let mut pos = g.pos;
         for e in &events {
             agg.apply(e);
@@ -326,6 +314,32 @@ impl MemBackend {
         if let Some(row) = g.post_mut(post) {
             row.agg = agg;
         }
+        Ok(pos)
+    }
+
+    async fn like(&self, post: Id, user: Id) -> Result<u64, WriteError> {
+        let mut g = self.inner.lock().unwrap();
+        let mut agg = g.likes.get(&(post, user)).cloned().unwrap_or_default();
+        let events = agg.decide(PlaceLike).map_err(WriteError::Like)?;
+        let mut pos = g.pos;
+        for e in &events {
+            agg.apply(e);
+            pos = g.next_pos();
+        }
+        g.likes.insert((post, user), agg);
+        Ok(pos)
+    }
+
+    async fn unlike(&self, post: Id, user: Id) -> Result<u64, WriteError> {
+        let mut g = self.inner.lock().unwrap();
+        let mut agg = g.likes.get(&(post, user)).cloned().unwrap_or_default();
+        let events = agg.decide(RemoveLike).map_err(WriteError::Like)?;
+        let mut pos = g.pos;
+        for e in &events {
+            agg.apply(e);
+            pos = g.next_pos();
+        }
+        g.likes.insert((post, user), agg);
         Ok(pos)
     }
 }

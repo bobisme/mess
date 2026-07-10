@@ -1,15 +1,20 @@
 //! Mapping typed domain rejections to friendly, user-facing flash messages.
 //!
-//! Every [`WriteError`] variant — the two domain rejection enums
-//! ([`UserError`]/[`PostError`]) plus the infrastructure outcomes — is turned
-//! into a short sentence a visitor can act on. **No rejection ever becomes a
-//! 500**: a refused command is a normal, expected outcome of a business rule,
-//! so it round-trips as a flash banner on the redirected page.
+//! Every [`WriteError`] variant — the four domain rejection enums
+//! ([`UserError`]/[`PostError`]/[`LikeError`]/[`FollowError`]), the seam-level
+//! self-follow check, plus the infrastructure outcomes — is turned into a
+//! short sentence a visitor can act on. **No rejection ever becomes a 500**: a
+//! refused command is a normal, expected outcome of a business rule, so it
+//! round-trips as a flash banner on the redirected page.
 //!
 //! [`UserError`]: crate::domain::user::UserError
 //! [`PostError`]: crate::domain::post::PostError
+//! [`LikeError`]: crate::domain::like::LikeError
+//! [`FollowError`]: crate::domain::follow::FollowError
 
 use crate::contracts::WriteError;
+use crate::domain::follow::FollowError;
+use crate::domain::like::LikeError;
 use crate::domain::post::PostError;
 use crate::domain::user::UserError;
 
@@ -28,6 +33,9 @@ pub fn friendly(err: &WriteError) -> String {
     match err {
         WriteError::User(u) => friendly_user(u),
         WriteError::Post(p) => friendly_post(p),
+        WriteError::Like(l) => friendly_like(l),
+        WriteError::Follow(fo) => friendly_follow(fo),
+        WriteError::SelfFollow => "You cannot follow yourself.".to_string(),
         WriteError::Conflict { .. } => "That action hit heavy contention and \
                                         was not applied. Please try again."
             .to_string(),
@@ -46,11 +54,6 @@ fn friendly_user(err: &UserError) -> String {
         UserError::InvalidHandle { .. } => "Handles must be 1-30 characters \
                                             of lowercase a-z, 0-9, or _."
             .to_string(),
-        UserError::SelfFollow => "You cannot follow yourself.".to_string(),
-        UserError::AlreadyFollowing => {
-            "You already follow that user.".to_string()
-        }
-        UserError::NotFollowing => "You do not follow that user.".to_string(),
     }
 }
 
@@ -68,10 +71,21 @@ fn friendly_post(err: &PostError) -> String {
         PostError::AlreadyDeleted => {
             "That post was already deleted.".to_string()
         }
-        PostError::LikeOnDeleted => {
-            "You cannot like a deleted post.".to_string()
+    }
+}
+
+fn friendly_like(err: &LikeError) -> String {
+    match err {
+        LikeError::AlreadyLiked => "You already liked that post.".to_string(),
+        LikeError::NotLiked => "You have not liked that post.".to_string(),
+    }
+}
+
+fn friendly_follow(err: &FollowError) -> String {
+    match err {
+        FollowError::AlreadyFollowing => {
+            "You already follow that user.".to_string()
         }
-        PostError::AlreadyLiked => "You already liked that post.".to_string(),
-        PostError::NotLiked => "You have not liked that post.".to_string(),
+        FollowError::NotFollowing => "You do not follow that user.".to_string(),
     }
 }

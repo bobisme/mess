@@ -48,6 +48,17 @@
 //! - **`created_seq` is the global position of the `Posted` event.** It is the
 //!   stable, monotonic feed sort key and pagination cursor, assigned once when
 //!   the post is created and never moved by later likes/deletes.
+//! - **Relationships are reconciled here, not in the writer.** The `Like` and
+//!   `Follow` aggregates cannot see the `post-<id>`/`user-<id>` streams, so
+//!   they accept edges the entity cannot validate (a like on a since-deleted
+//!   post, a follow of a user who never registered). This projection is where
+//!   those are made harmless: a like on a deleted post never surfaces because
+//!   the *post* is filtered out of every feed and the single-post query first;
+//!   a follow of a nonexistent user contributes no posts to a timeline. This
+//!   mirrors how the home timeline has always filtered by the viewer's
+//!   *current* follow set at query time — the crowd membership is the
+//!   projection's job, computed from the relationship streams, not the
+//!   aggregate's.
 
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
@@ -65,8 +76,11 @@ use mess_store::{
 use tokio::sync::{Notify, RwLock};
 
 use crate::contracts::{PostView, ProfileView, ReadModels, TimelinePage};
+use crate::domain::follow::FollowEvent;
+use crate::domain::like::LikeEvent;
 use crate::domain::post::PostEvent;
 use crate::domain::user::UserEvent;
+use crate::parse_pair;
 
 /// How many global events to pull per `read_global` page.
 const BATCH: usize = 512;
@@ -82,23 +96,28 @@ const POLL: Duration = Duration::from_millis(1);
 // ===========================================================================
 
 /// One user row, folded from that user's `user-<id>` stream.
+///
+/// Bounded, mirroring the write aggregate: the follow *graph* is **not** here.
+/// It is reconstructed from the `follow-<a>_<b>` relationship streams into
+/// [`State::following`]/[`State::followers`] — see the module docs on why the
+/// crowd lives in the projection, not the aggregate.
 #[derive(Debug, Default, Clone)]
 struct UserRow {
     handle:       String,
     display_name: String,
-    /// Ids this user currently follows (the follow set, mirroring the write
-    /// aggregate's `following`).
-    following:    HashSet<Id>,
 }
 
 /// One post row, folded from that post's `post-<id>` stream.
+///
+/// Bounded, mirroring the write aggregate: the like *crowd* is **not** here.
+/// It is reconstructed from the `like-<post>_<user>` relationship streams into
+/// [`State::likes`].
 #[derive(Debug, Clone)]
 struct PostRow {
     /// The post's id (also its stream id, `post-<id>`, less the prefix).
     id:      Id,
     author:  Id,
     body:    String,
-    likes:   HashSet<Id>,
     deleted: bool,
     /// Global position of the `Posted` event — the stable feed sort key.
     seq:     u64,
@@ -106,17 +125,31 @@ struct PostRow {
 
 /// The whole in-memory read model. All queries read this behind an
 /// [`RwLock`]; the live pump is the only writer.
+///
+/// The `following`/`followers`/`likes` maps are the projection's
+/// reconstruction of the crowds that used to be aggregate state: folded from
+/// the relationship streams, keyed for O(1) counts and membership, and kept
+/// independent of the entity rows so a relationship event that lands before
+/// its entity (any global order is possible) folds cleanly regardless.
 #[derive(Debug, Default)]
 struct State {
     /// user id -> folded user row.
     users:     HashMap<Id, UserRow>,
     /// handle -> user id, so handle-keyed queries are O(1).
     handles:   HashMap<String, Id>,
-    /// target id -> the set of users following it (reverse of `following`), so
+    /// follower id -> the set of users it currently follows (folded from
+    /// `follow-<follower>_<followee>` streams), so `following_count` and a
+    /// home-timeline author set are O(1) lookups.
+    following: HashMap<Id, HashSet<Id>>,
+    /// followee id -> the set of users following it (the reverse index), so
     /// `follower_count` is O(1) rather than a full scan.
     followers: HashMap<Id, HashSet<Id>>,
     /// post id -> folded post row.
     posts:     HashMap<Id, PostRow>,
+    /// post id -> the set of users who currently like it (folded from
+    /// `like-<post>_<user>` streams), so a like count and `liked_by_me` are
+    /// O(1) lookups.
+    likes:     HashMap<Id, HashSet<Id>>,
 }
 
 /// Record one anomaly hit at `rec`'s position, and — only on that counter's
@@ -160,18 +193,6 @@ impl State {
                     display_name.clone_into(&mut row.display_name);
                 }
             }
-            UserEvent::Followed { target } => {
-                self.users.entry(owner).or_default().following.insert(*target);
-                self.followers.entry(*target).or_default().insert(owner);
-            }
-            UserEvent::Unfollowed { target } => {
-                if let Some(row) = self.users.get_mut(&owner) {
-                    row.following.remove(target);
-                }
-                if let Some(set) = self.followers.get_mut(target) {
-                    set.remove(&owner);
-                }
-            }
         }
     }
 
@@ -187,7 +208,6 @@ impl State {
                         id,
                         author: *author,
                         body: body.clone(),
-                        likes: HashSet::new(),
                         deleted: false,
                         seq: gp,
                     },
@@ -198,14 +218,43 @@ impl State {
                     p.deleted = true;
                 }
             }
-            PostEvent::Liked { user } => {
-                if let Some(p) = self.posts.get_mut(&id) {
-                    p.likes.insert(*user);
+        }
+    }
+
+    /// Fold one like-relationship event into the [`likes`](State::likes) index.
+    /// `post` and `user` are parsed from the `like-<post>_<user>` stream
+    /// suffix. Stored independent of any [`PostRow`], so a like folded before
+    /// its post's `Posted` event (any global order is possible) is retained and
+    /// surfaces once the post appears.
+    fn apply_like(&mut self, post: Id, user: Id, ev: &LikeEvent) {
+        match ev {
+            LikeEvent::Liked => {
+                self.likes.entry(post).or_default().insert(user);
+            }
+            LikeEvent::Unliked => {
+                if let Some(set) = self.likes.get_mut(&post) {
+                    set.remove(&user);
                 }
             }
-            PostEvent::Unliked { user } => {
-                if let Some(p) = self.posts.get_mut(&id) {
-                    p.likes.remove(user);
+        }
+    }
+
+    /// Fold one follow-relationship event into the
+    /// [`following`](State::following)/[`followers`](State::followers) indexes.
+    /// `follower` and `followee` are parsed from the
+    /// `follow-<follower>_<followee>` stream suffix.
+    fn apply_follow(&mut self, follower: Id, followee: Id, ev: &FollowEvent) {
+        match ev {
+            FollowEvent::Followed => {
+                self.following.entry(follower).or_default().insert(followee);
+                self.followers.entry(followee).or_default().insert(follower);
+            }
+            FollowEvent::Unfollowed => {
+                if let Some(set) = self.following.get_mut(&follower) {
+                    set.remove(&followee);
+                }
+                if let Some(set) = self.followers.get_mut(&followee) {
+                    set.remove(&follower);
                 }
             }
         }
@@ -276,26 +325,75 @@ impl State {
                     rec,
                 ),
             },
+            // Relationship streams: the suffix is a `<id>_<id>` pair (see
+            // `crate::parse_pair` / `crate::PAIR_SEP`), not a single id.
+            "like" => match parse_pair(suffix) {
+                Some((post, user)) => {
+                    match LikeEvent::decode(&rec.message_type, &rec.data) {
+                        Ok(ev) => self.apply_like(post, user, &ev),
+                        Err(CodecError::UnknownEventName(_)) => record_anomaly(
+                            anomalies,
+                            AnomalyKind::UnknownEventKind,
+                            rec,
+                        ),
+                        Err(_) => record_anomaly(
+                            anomalies,
+                            AnomalyKind::UndecodablePayload,
+                            rec,
+                        ),
+                    }
+                }
+                None => record_anomaly(
+                    anomalies,
+                    AnomalyKind::UnroutableStream,
+                    rec,
+                ),
+            },
+            "follow" => match parse_pair(suffix) {
+                Some((follower, followee)) => {
+                    match FollowEvent::decode(&rec.message_type, &rec.data) {
+                        Ok(ev) => self.apply_follow(follower, followee, &ev),
+                        Err(CodecError::UnknownEventName(_)) => record_anomaly(
+                            anomalies,
+                            AnomalyKind::UnknownEventKind,
+                            rec,
+                        ),
+                        Err(_) => record_anomaly(
+                            anomalies,
+                            AnomalyKind::UndecodablePayload,
+                            rec,
+                        ),
+                    }
+                }
+                None => record_anomaly(
+                    anomalies,
+                    AnomalyKind::UnroutableStream,
+                    rec,
+                ),
+            },
             _ => record_anomaly(anomalies, AnomalyKind::UnroutableStream, rec),
         }
     }
 
     /// Render one post row into a viewer-relative [`PostView`], joining the
-    /// author's profile.
+    /// author's profile and the like crowd (from [`likes`](State::likes),
+    /// keyed by post id).
     fn view_of(&self, p: &PostRow, viewer: Option<Id>) -> PostView {
         let (handle, display) = self
             .users
             .get(&p.author)
             .map(|u| (u.handle.clone(), u.display_name.clone()))
             .unwrap_or_default();
+        let likers = self.likes.get(&p.id);
         PostView {
             id:             p.id,
             author_id:      p.author,
             author_handle:  handle,
             author_display: display,
             body:           p.body.clone(),
-            likes:          p.likes.len() as u64,
-            liked_by_me:    viewer.is_some_and(|v| p.likes.contains(&v)),
+            likes:          likers.map_or(0, HashSet::len) as u64,
+            liked_by_me:    viewer
+                .is_some_and(|v| likers.is_some_and(|s| s.contains(&v))),
             created_seq:    p.seq,
         }
     }
@@ -521,13 +619,11 @@ impl<B: Backend> ReadModels for Projections<B> {
     ) -> TimelinePage {
         let st = self.state.read().await;
         // Authors in `user`'s home feed: everyone they currently follow, plus
-        // themselves. Computed at query time against the *current* follow set,
-        // which is what makes follow-after-post retroactive.
-        let mut authors: HashSet<Id> = st
-            .users
-            .get(&user)
-            .map(|u| u.following.clone())
-            .unwrap_or_default();
+        // themselves. Computed at query time against the *current* follow set
+        // (folded from the follow-relationship streams), which is what makes
+        // follow-after-post retroactive.
+        let mut authors: HashSet<Id> =
+            st.following.get(&user).cloned().unwrap_or_default();
         authors.insert(user);
         let posts: Vec<&PostRow> = st
             .posts
@@ -577,15 +673,17 @@ impl<B: Backend> ReadModels for Projections<B> {
                 as u64;
         let follower_count =
             st.followers.get(&id).map_or(0, HashSet::len) as u64;
+        let following_count =
+            st.following.get(&id).map_or(0, HashSet::len) as u64;
         let followed_by_me = viewer.is_some_and(|v| {
-            st.users.get(&v).is_some_and(|vu| vu.following.contains(&id))
+            st.following.get(&v).is_some_and(|s| s.contains(&id))
         });
         Some(ProfileView {
             handle: u.handle.clone(),
             display_name: u.display_name.clone(),
             post_count,
             follower_count,
-            following_count: u.following.len() as u64,
+            following_count,
             followed_by_me,
         })
     }

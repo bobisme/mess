@@ -15,9 +15,13 @@
 
 use ident::Id;
 use mess_store::{EventStore, LogEngine};
+use social::domain::follow::Follow;
+use social::domain::like::Like;
 use social::domain::post::Post;
 use social::domain::user::User;
-use social::{WriteError, WriteOps, post_stream, user_stream};
+use social::{
+    WriteError, WriteOps, follow_stream, like_stream, post_stream, user_stream,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), WriteError> {
@@ -39,8 +43,9 @@ async fn main() -> Result<(), WriteError> {
     store.register(bob, "bob".into(), "Bob".into()).await?;
     println!("registered alice ({alice}) and bob ({bob})");
 
-    // The follow edge is recorded on ALICE's stream (the follower's own
-    // aggregate) — see `domain::user` for why.
+    // The follow edge is its own tiny relationship stream,
+    // `follow-<alice>_<bob>` — not state on alice's user stream. See
+    // `domain::follow` for why the crowd lives in per-edge aggregates.
     store.follow(alice, bob).await?;
     println!("alice now follows bob");
 
@@ -64,27 +69,43 @@ async fn main() -> Result<(), WriteError> {
     println!("bob deleted his own post");
 
     // Read the folded aggregates straight back — the same replay `command`
-    // does internally before it decides.
+    // does internally before it decides. The entities are bounded: alice's own
+    // stream no longer carries her follow graph, and the post's stream no
+    // longer carries its likers.
     let loaded_alice =
         store.load::<User>(&user_stream(alice)).await.expect("load alice");
-    assert!(loaded_alice.state.following.contains(&bob));
     println!(
-        "alice's aggregate: handle={:?} following {} user(s)",
+        "alice's aggregate: handle={:?} (bounded — no follow set on this \
+         stream)",
         loaded_alice.state.handle,
-        loaded_alice.state.following.len()
     );
 
     let loaded_post =
         store.load::<Post>(&post_stream(post)).await.expect("load post");
     assert!(loaded_post.state.deleted);
-    assert!(loaded_post.state.likes.contains(&alice));
     println!(
-        "post aggregate: author={:?} deleted={} likes={} (replayed {} events)",
+        "post aggregate: author={:?} deleted={} (replayed {} events; likes \
+         live on their own streams)",
         loaded_post.state.author,
         loaded_post.state.deleted,
-        loaded_post.state.likes.len(),
         loaded_post.events_replayed,
     );
+
+    // The follow and like *edges* live on their own tiny relationship streams
+    // — each a bounded, alternating state machine.
+    let edge = store
+        .load::<Follow>(&follow_stream(alice, bob))
+        .await
+        .expect("load follow edge");
+    assert!(edge.state.following);
+    println!("follow edge {}: active", follow_stream(alice, bob));
+
+    let like = store
+        .load::<Like>(&like_stream(post, alice))
+        .await
+        .expect("load like edge");
+    assert!(like.state.liked);
+    println!("like edge {}: active", like_stream(post, alice));
 
     println!("social example OK");
     Ok(())

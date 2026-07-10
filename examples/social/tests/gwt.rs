@@ -1,7 +1,14 @@
 //! Given-When-Then specs for the social domain via `mess-testkit`'s
 //! store-free [`AggregateTest`] — one test per **accept** and per
-//! **rejection** of every command on both aggregates. Read these as the
-//! executable specification of the rules documented in `src/domain/*`.
+//! **rejection** of every command on all four aggregates (the two entities,
+//! [`User`]/[`Post`], and the two relationships, [`Like`]/[`Follow`]). Read
+//! these as the executable specification of the rules documented in
+//! `src/domain/*`.
+//!
+//! Cross-aggregate / seam-level rules that no single `decide` can express —
+//! self-follow refusal (a `follow-X_X` well-formedness check) and self-like
+//! *allowance* — are specified in `tests/store_roundtrip.rs`, which drives them
+//! through [`WriteOps`], the seam that owns them.
 //!
 //! See `examples/bank/tests/gwt.rs` for the first walkthrough of this kit.
 //!
@@ -12,13 +19,16 @@
 //! ```
 
 use ident::Id;
-use mess_core::Actor;
 use mess_testkit::{AggregateTest, matching};
+use social::domain::follow::{
+    Follow, FollowError, FollowEvent, PlaceFollow, RemoveFollow,
+};
+use social::domain::like::{Like, LikeError, LikeEvent, PlaceLike, RemoveLike};
 use social::domain::post::{
-    CreatePost, DeletePost, Like, Post, PostError, PostEvent, Unlike,
+    CreatePost, DeletePost, Post, PostError, PostEvent,
 };
 use social::domain::user::{
-    Follow, RegisterUser, SetDisplayName, Unfollow, User, UserError, UserEvent,
+    RegisterUser, SetDisplayName, User, UserError, UserEvent,
 };
 
 // ===========================================================================
@@ -138,113 +148,6 @@ fn cannot_set_display_name_when_unregistered() {
 }
 
 // ===========================================================================
-// User: Follow
-// ===========================================================================
-
-#[test]
-fn follow_emits_followed() {
-    let alice = Id::new();
-    let bob = Id::new();
-    AggregateTest::<User>::given([UserEvent::Registered {
-        handle:       "alice".into(),
-        display_name: "Alice".into(),
-    }])
-    .when(Follow { follower: alice, target: bob })
-    .then_events([UserEvent::Followed { target: bob }]);
-}
-
-#[test]
-fn cannot_follow_when_unregistered() {
-    let alice = Id::new();
-    let bob = Id::new();
-    AggregateTest::<User>::given_no_events()
-        .when(Follow { follower: alice, target: bob })
-        .then_error(UserError::NotRegistered);
-}
-
-#[test]
-fn cannot_follow_self() {
-    let alice = Id::new();
-    AggregateTest::<User>::given([UserEvent::Registered {
-        handle:       "alice".into(),
-        display_name: "Alice".into(),
-    }])
-    .when(Follow { follower: alice, target: alice })
-    .then_error(UserError::SelfFollow);
-}
-
-#[test]
-fn follow_declares_its_follower_stream() {
-    // bn-2i3: the echoed `follower` id is now the command's declared *actor
-    // stream*, built from the same `user_stream` helper the writer dispatches
-    // with — so `EventStore::command_as` can assert the two agree instead of
-    // trusting the restated id.
-    let alice = Id::new();
-    let bob = Id::new();
-    assert_eq!(
-        Follow { follower: alice, target: bob }.actor_stream(),
-        social::user_stream(alice),
-    );
-    // A divergent restating (some *other* follower) resolves to a different
-    // stream — precisely the mismatch the authored command path refuses.
-    assert_ne!(
-        Follow { follower: bob, target: alice }.actor_stream(),
-        social::user_stream(alice),
-    );
-}
-
-#[test]
-fn cannot_follow_twice() {
-    let alice = Id::new();
-    let bob = Id::new();
-    AggregateTest::<User>::given([
-        UserEvent::Registered {
-            handle:       "alice".into(),
-            display_name: "Alice".into(),
-        },
-        UserEvent::Followed { target: bob },
-    ])
-    .when(Follow { follower: alice, target: bob })
-    .then_error(UserError::AlreadyFollowing);
-}
-
-// ===========================================================================
-// User: Unfollow
-// ===========================================================================
-
-#[test]
-fn unfollow_emits_unfollowed() {
-    let bob = Id::new();
-    AggregateTest::<User>::given([
-        UserEvent::Registered {
-            handle:       "alice".into(),
-            display_name: "Alice".into(),
-        },
-        UserEvent::Followed { target: bob },
-    ])
-    .when(Unfollow { target: bob })
-    .then_events([UserEvent::Unfollowed { target: bob }]);
-}
-
-#[test]
-fn cannot_unfollow_when_unregistered() {
-    AggregateTest::<User>::given_no_events()
-        .when(Unfollow { target: Id::new() })
-        .then_error(UserError::NotRegistered);
-}
-
-#[test]
-fn cannot_unfollow_when_not_following() {
-    let bob = Id::new();
-    AggregateTest::<User>::given([UserEvent::Registered {
-        handle:       "alice".into(),
-        display_name: "Alice".into(),
-    }])
-    .when(Unfollow { target: bob })
-    .then_error(UserError::NotFollowing);
-}
-
-// ===========================================================================
 // Post: CreatePost
 // ===========================================================================
 
@@ -341,97 +244,105 @@ fn cannot_delete_post_twice() {
 }
 
 // ===========================================================================
-// Post: Like
+// Like relationship: PlaceLike / RemoveLike — the alternating machine
 // ===========================================================================
 
 #[test]
-fn like_emits_liked() {
-    let author = Id::new();
-    let liker = Id::new();
-    AggregateTest::<Post>::given([PostEvent::Posted {
-        author,
-        body: "hello".into(),
-    }])
-    .when(Like { user: liker })
-    .then_events([PostEvent::Liked { user: liker }]);
-}
-
-#[test]
-fn author_may_like_own_post() {
-    // Decision (see post.rs): self-like IS allowed.
-    let author = Id::new();
-    AggregateTest::<Post>::given([PostEvent::Posted {
-        author,
-        body: "hello".into(),
-    }])
-    .when(Like { user: author })
-    .then_events([PostEvent::Liked { user: author }]);
-}
-
-#[test]
-fn cannot_like_post_that_was_never_created() {
-    AggregateTest::<Post>::given_no_events()
-        .when(Like { user: Id::new() })
-        .then_error(PostError::NotCreated);
-}
-
-#[test]
-fn cannot_like_deleted_post() {
-    let author = Id::new();
-    let liker = Id::new();
-    AggregateTest::<Post>::given([
-        PostEvent::Posted { author, body: "hello".into() },
-        PostEvent::Deleted { by: author },
-    ])
-    .when(Like { user: liker })
-    .then_error(PostError::LikeOnDeleted);
+fn place_like_emits_liked() {
+    AggregateTest::<Like>::given_no_events()
+        .when(PlaceLike)
+        .then_events([LikeEvent::Liked]);
 }
 
 #[test]
 fn cannot_like_twice() {
-    let author = Id::new();
-    let liker = Id::new();
-    AggregateTest::<Post>::given([
-        PostEvent::Posted { author, body: "hello".into() },
-        PostEvent::Liked { user: liker },
-    ])
-    .when(Like { user: liker })
-    .then_error(PostError::AlreadyLiked);
-}
-
-// ===========================================================================
-// Post: Unlike
-// ===========================================================================
-
-#[test]
-fn unlike_emits_unliked() {
-    let author = Id::new();
-    let liker = Id::new();
-    AggregateTest::<Post>::given([
-        PostEvent::Posted { author, body: "hello".into() },
-        PostEvent::Liked { user: liker },
-    ])
-    .when(Unlike { user: liker })
-    .then_events([PostEvent::Unliked { user: liker }]);
+    AggregateTest::<Like>::given([LikeEvent::Liked])
+        .when(PlaceLike)
+        .then_error(LikeError::AlreadyLiked);
 }
 
 #[test]
-fn cannot_unlike_post_that_was_never_created() {
-    AggregateTest::<Post>::given_no_events()
-        .when(Unlike { user: Id::new() })
-        .then_error(PostError::NotCreated);
+fn remove_like_emits_unliked() {
+    AggregateTest::<Like>::given([LikeEvent::Liked])
+        .when(RemoveLike)
+        .then_events([LikeEvent::Unliked]);
 }
 
 #[test]
 fn cannot_unlike_when_not_liked() {
-    let author = Id::new();
-    let liker = Id::new();
-    AggregateTest::<Post>::given([PostEvent::Posted {
-        author,
-        body: "hello".into(),
-    }])
-    .when(Unlike { user: liker })
-    .then_error(PostError::NotLiked);
+    AggregateTest::<Like>::given_no_events()
+        .when(RemoveLike)
+        .then_error(LikeError::NotLiked);
+}
+
+#[test]
+fn cannot_unlike_after_unliking() {
+    // Idempotent-rejection: the machine is back to not-liked, so a second
+    // RemoveLike is refused just like the first-ever one.
+    AggregateTest::<Like>::given([LikeEvent::Liked, LikeEvent::Unliked])
+        .when(RemoveLike)
+        .then_error(LikeError::NotLiked);
+}
+
+#[test]
+fn can_relike_after_unliking() {
+    // The edge alternates: after unliking, liking again is accepted.
+    AggregateTest::<Like>::given([LikeEvent::Liked, LikeEvent::Unliked])
+        .when(PlaceLike)
+        .then_events([LikeEvent::Liked]);
+}
+
+// ===========================================================================
+// Follow relationship: PlaceFollow / RemoveFollow — the alternating machine
+// ===========================================================================
+
+#[test]
+fn place_follow_emits_followed() {
+    AggregateTest::<Follow>::given_no_events()
+        .when(PlaceFollow)
+        .then_events([FollowEvent::Followed]);
+}
+
+#[test]
+fn cannot_follow_twice() {
+    AggregateTest::<Follow>::given([FollowEvent::Followed])
+        .when(PlaceFollow)
+        .then_error(FollowError::AlreadyFollowing);
+}
+
+#[test]
+fn remove_follow_emits_unfollowed() {
+    AggregateTest::<Follow>::given([FollowEvent::Followed])
+        .when(RemoveFollow)
+        .then_events([FollowEvent::Unfollowed]);
+}
+
+#[test]
+fn cannot_unfollow_when_not_following() {
+    AggregateTest::<Follow>::given_no_events()
+        .when(RemoveFollow)
+        .then_error(FollowError::NotFollowing);
+}
+
+#[test]
+fn cannot_unfollow_after_unfollowing() {
+    // Idempotent-rejection: back to not-following, second RemoveFollow refused.
+    AggregateTest::<Follow>::given([
+        FollowEvent::Followed,
+        FollowEvent::Unfollowed,
+    ])
+    .when(RemoveFollow)
+    .then_error(FollowError::NotFollowing);
+}
+
+#[test]
+fn can_refollow_after_unfollowing() {
+    AggregateTest::<Follow>::given([
+        FollowEvent::Followed,
+        FollowEvent::Unfollowed,
+    ])
+    .when(PlaceFollow)
+    .then_events([FollowEvent::Followed]);
 }
 
 // ===========================================================================
@@ -440,8 +351,6 @@ fn cannot_unlike_when_not_liked() {
 
 #[test]
 fn user_full_fold_matches_expected_state() {
-    let bob = Id::new();
-    let carol = Id::new();
     let mut state = User::default();
     for event in [
         UserEvent::Registered {
@@ -449,38 +358,54 @@ fn user_full_fold_matches_expected_state() {
             display_name: "Alice".into(),
         },
         UserEvent::DisplayNameChanged { display_name: "Alice B.".into() },
-        UserEvent::Followed { target: bob },
-        UserEvent::Followed { target: carol },
-        UserEvent::Unfollowed { target: bob },
     ] {
         state.apply(&event);
     }
     assert!(state.registered);
     assert_eq!(state.handle, "alice");
     assert_eq!(state.display_name, "Alice B.");
-    assert!(state.following.contains(&carol));
-    assert!(!state.following.contains(&bob));
-    assert_eq!(state.following.len(), 1);
 }
 
 #[test]
 fn post_full_fold_matches_expected_state() {
     let author = Id::new();
-    let liker = Id::new();
     let mut state = Post::default();
     for event in [
         PostEvent::Posted { author, body: "hello".into() },
-        PostEvent::Liked { user: liker },
-        PostEvent::Liked { user: author },
-        PostEvent::Unliked { user: liker },
+        PostEvent::Deleted { by: author },
     ] {
         state.apply(&event);
     }
     assert!(state.created);
-    assert!(!state.deleted);
+    assert!(state.deleted);
     assert_eq!(state.author, Some(author));
     assert_eq!(state.body, "hello");
-    assert!(state.likes.contains(&author));
-    assert!(!state.likes.contains(&liker));
-    assert_eq!(state.likes.len(), 1);
+}
+
+#[test]
+fn like_full_fold_alternates() {
+    let mut state = Like::default();
+    assert!(!state.liked);
+    for (event, expected) in [
+        (LikeEvent::Liked, true),
+        (LikeEvent::Unliked, false),
+        (LikeEvent::Liked, true),
+    ] {
+        state.apply(&event);
+        assert_eq!(state.liked, expected);
+    }
+}
+
+#[test]
+fn follow_full_fold_alternates() {
+    let mut state = Follow::default();
+    assert!(!state.following);
+    for (event, expected) in [
+        (FollowEvent::Followed, true),
+        (FollowEvent::Unfollowed, false),
+        (FollowEvent::Followed, true),
+    ] {
+        state.apply(&event);
+        assert_eq!(state.following, expected);
+    }
 }

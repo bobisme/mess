@@ -1,46 +1,63 @@
-//! The **User** aggregate: identity, display name, and the follow graph.
+//! The **User** aggregate: identity and display name.
 //!
 //! One stream per user, keyed `user-<id>` (see [`crate::user_stream`]). Every
 //! rule below is enforced in [`Decide::decide`] against a single stream's
 //! folded state — the whole point of an aggregate boundary. See
 //! `examples/bank/src/lib.rs` for the first walkthrough of
 //! `#[derive(Event)]` / `#[derive(Aggregate)]` / `Decide`; this module adds
-//! two things bank did not have: input **validation** (handle syntax) and a
-//! **set-valued invariant** (the follow set).
+//! input **validation** (handle syntax) that bank did not have.
 //!
-//! # Why the follow SET lives in the *follower's* own aggregate
+//! # Bounded state: the follow *graph* is not stored here
 //!
-//! A follow edge `alice -> bob` is recorded as a `Followed { target: bob }`
-//! event on **alice's** stream, and alice's folded state carries the set of
-//! ids she currently follows. It is deliberately *not* stored on bob's
-//! stream, nor in some third "edges" aggregate. Why:
+//! An earlier version of this crate folded a `following: HashSet<Id>` — the
+//! set of everyone this user follows — into the user's own state, with
+//! `Followed` / `Unfollowed` events on this stream. That is **unbounded**
+//! aggregate state: a user following ten thousand accounts meant a
+//! ten-thousand-element set replayed on every `User` command and written into
+//! every snapshot. This rework moves each follow edge to its own tiny
+//! [`Follow`](super::follow::Follow) relationship stream
+//! (`follow-<follower>_<followee>`), so `User` keeps only **bounded** state —
+//! registration and display name — and its commands stay O(1) regardless of
+//! how large the follow graph grows. The `AlreadyFollowing` / `NotFollowing`
+//! rejections moved with the relationship; the `SelfFollow` check moved to the
+//! [`WriteOps`](crate::WriteOps) seam (see [`super::follow`]).
 //!
-//! - **Single-stream invariant enforcement.** The rules Follow must uphold —
-//!   *not already following*, *not self*, *registered* — are all facts about
-//!   **alice**. Because `decide` folds exactly one stream, every fact it needs
-//!   to check must live on that one stream. Put the set on alice's stream and
-//!   "am I already following bob?" is a pure, race-free lookup in alice's own
-//!   folded state. The optimistic-concurrency retry in `EventStore::command`
-//!   then makes the check-and-append atomic *per stream* with no cross-stream
-//!   lock.
+//! # The accept-and-reconcile posture (unchanged, and now the *only* place it
+//! is documented)
+//!
+//! This module has always carried the crate's canonical statement of *why a
+//! `decide` deliberately cannot make cross-aggregate existence checks* — the
+//! posture the project's official docs (bn-2v0) link to. Moving the follow
+//! edge out of `User` does not change that lesson one bit; it sharpens it, so
+//! the statement stays here, restated for the relationship shape:
+//!
+//! - **Single-stream invariant enforcement.** Every rule a command upholds must
+//!   be a fact about the *one* stream `decide` folds. The old `Follow` checked
+//!   "am I already following bob?" against alice's own follow set; the new
+//!   [`Follow`](super::follow::Follow) checks "is this one edge already
+//!   active?" against the `follow-<alice>_<bob>` stream's own folded [`bool`].
+//!   Both are pure, race-free lookups in a single stream's state, made atomic
+//!   per stream by the optimistic-concurrency retry in
+//!   [`EventStore::command`](mess_store::EventStore::command) — with no
+//!   cross-stream lock.
 //!
 //! - **Cross-aggregate existence checks are deliberately impossible in
-//!   `decide`.** Notice what Follow does **not** verify: that `bob` exists and
-//!   is registered. `decide` is a pure function of *one* aggregate's state; it
-//!   cannot load bob's stream. That is a feature, not a gap. The event-sourcing
-//!   answer to "does the target exist?" is: don't enforce it synchronously in
-//!   the writer. Either (a) accept the edge and let a downstream
-//!   projection/read-model reconcile or drop dangling edges, or (b) enforce it
-//!   in a process manager / saga that reacts to `Followed` and emits a
-//!   compensating `Unfollowed` if the target turns out not to exist. A single
-//!   `decide` call spanning two streams would need a distributed transaction —
-//!   exactly what event sourcing trades away for per-stream linearizability.
-//!   (Logged as a dogfood finding for bn-154.)
+//!   `decide`.** Notice what following still does **not** verify: that the
+//!   followee `bob` exists and is registered. `decide` is a pure function of
+//!   *one* aggregate's state; it cannot load bob's `user-<bob>` stream. That is
+//!   a feature, not a gap. The event-sourcing answer to "does the target
+//!   exist?" is: don't enforce it synchronously in the writer. Either (a)
+//!   accept the edge and let a downstream projection/read-model reconcile or
+//!   drop dangling edges, or (b) enforce it in a process manager / saga that
+//!   reacts to the follow and emits a compensating unfollow if the target turns
+//!   out not to exist. A single `decide` spanning two streams would need a
+//!   distributed transaction — exactly what event sourcing trades away for
+//!   per-stream linearizability. The projection ([`crate::projections`]) is
+//!   where the reconciliation happens: it filters home timelines by the
+//!   viewer's *current* follow set at query time, so a dangling or retracted
+//!   edge simply contributes nothing.
 
-use std::collections::HashSet;
-
-use ident::Id;
-use mess_core::{Actor, Decide};
+use mess_core::Decide;
 use mess_derive::{Aggregate, Event};
 
 // ---------------------------------------------------------------------------
@@ -50,9 +67,11 @@ use mess_derive::{Aggregate, Event};
 /// Every fact that can happen to a user.
 ///
 /// `#[event(name = "user", version = 1)]` gives `Registered` the stored wire
-/// name `"user.registered"`, `Followed` → `"user.followed"`, and so on — the
-/// derive keys decode on that stored *name string*, so reordering variants
-/// never silently re-tags stored bytes (see `examples/bank`).
+/// name `"user.registered"` and `DisplayNameChanged` → `"user.display_name_
+/// changed"` — the derive keys decode on that stored *name string*, so
+/// reordering variants never silently re-tags stored bytes (see
+/// `examples/bank`). (Follows are no longer user events — they live on the
+/// `follow-<follower>_<followee>` streams; see the module docs.)
 #[derive(Debug, Clone, PartialEq, Eq, Event)]
 #[event(name = "user", version = 1)]
 pub enum UserEvent {
@@ -60,25 +79,14 @@ pub enum UserEvent {
     Registered { handle: String, display_name: String },
     /// The user changed their (mutable) display name.
     DisplayNameChanged { display_name: String },
-    /// The user started following `target`.
-    Followed { target: Id },
-    /// The user stopped following `target`.
-    Unfollowed { target: Id },
 }
 
 // ---------------------------------------------------------------------------
 // The aggregate: one user's folded state.
 // ---------------------------------------------------------------------------
 
-/// The read-model folded from one user's event stream.
-///
-/// `following` is a [`HashSet`], and `HashSet` equality is order-independent,
-/// so the derived `PartialEq`/`Eq` on `User` stays a true value comparison
-/// regardless of insertion order. (Dogfood finding for bn-154: the natural
-/// first choice was a `BTreeSet` for order-stable folding, but `ident::Id`
-/// does not implement `Ord`, so it cannot go in a `BTreeSet` — only `Hash`.
-/// A future fold-certificate that hashes aggregate state will therefore need
-/// an order-independent set hash, or `Id` will need an `Ord` impl.)
+/// The read-model folded from one user's event stream — now fully **bounded**:
+/// an existence flag and two strings, no follow set.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Aggregate)]
 #[aggregate(event = UserEvent)]
 pub struct User {
@@ -89,9 +97,6 @@ pub struct User {
     pub handle:       String,
     /// The current display name (mutated by `DisplayNameChanged`).
     pub display_name: String,
-    /// The set of user ids this user currently follows — the follow edge set,
-    /// living on the follower's own stream (see the module docs).
-    pub following:    HashSet<Id>,
 }
 
 impl User {
@@ -106,12 +111,6 @@ impl User {
             }
             UserEvent::DisplayNameChanged { display_name } => {
                 display_name.clone_into(&mut self.display_name);
-            }
-            UserEvent::Followed { target } => {
-                self.following.insert(*target);
-            }
-            UserEvent::Unfollowed { target } => {
-                self.following.remove(target);
             }
         }
     }
@@ -156,12 +155,6 @@ pub enum UserError {
     NotRegistered,
     /// `RegisterUser` with a handle that fails [`handle_is_valid`].
     InvalidHandle { handle: String },
-    /// `Follow` where the follower and target are the same id.
-    SelfFollow,
-    /// `Follow` on a target already in the follow set.
-    AlreadyFollowing,
-    /// `Unfollow` on a target not in the follow set.
-    NotFollowing,
 }
 
 impl std::fmt::Display for UserError {
@@ -176,13 +169,6 @@ impl std::fmt::Display for UserError {
                 "invalid handle {handle:?}: must be 1-{HANDLE_MAX_LEN} \
                  characters of lowercase a-z, 0-9, or underscore"
             ),
-            UserError::SelfFollow => {
-                write!(f, "a user cannot follow themselves")
-            }
-            UserError::AlreadyFollowing => {
-                write!(f, "already following that user")
-            }
-            UserError::NotFollowing => write!(f, "not following that user"),
         }
     }
 }
@@ -202,53 +188,6 @@ pub struct RegisterUser {
 #[derive(Debug, Clone)]
 pub struct SetDisplayName {
     pub display_name: String,
-}
-
-/// Follow another user.
-///
-/// `follower` is the id of the user *this stream belongs to*. It is restated
-/// in the command because [`Decide::decide`] sees only the folded aggregate
-/// state, never the stream id it was loaded from — so the self-follow check has
-/// no other way to learn "who am I?". A self-referential invariant forces the
-/// command to echo the actor id that the stream key `user-<follower>` already
-/// implies.
-///
-/// # The echoed actor id is now *checked*, not merely trusted (bn-2i3)
-///
-/// Echoing the id makes a divergence **representable**: a
-/// `Follow { follower: X }` committed to *Y*'s stream type-checks, and `decide`
-/// — which never learns Y — cannot catch it. The blessed remedy is the
-/// [`Actor`] convention: `Follow` declares, via [`Actor::actor_stream`], the
-/// stream it belongs to (built from `follower` through the one
-/// [`user_stream`](crate::user_stream) helper the writer also dispatches with),
-/// and the store's authored command path
-/// ([`command_as`](mess_store::EventStore::command_as)) asserts the two agree
-/// **before** deciding. The field stays — the self-follow rule still needs it —
-/// but a `follower`/stream divergence is now a fail-fast
-/// [`AuthoredCommandError::ActorMismatch`](mess_store::AuthoredCommandError),
-/// not a silent mis-write.
-#[derive(Debug, Clone, Copy)]
-pub struct Follow {
-    pub follower: Id,
-    pub target:   Id,
-}
-
-impl Actor for Follow {
-    /// A `Follow` is authored against the *follower's* own stream — the same
-    /// `user-<follower>` key [`WriteOps`](crate::WriteOps) dispatches it to.
-    /// Reusing [`user_stream`](crate::user_stream) keeps the two spellings a
-    /// single source of truth, so the store's dispatch check compares like with
-    /// like.
-    fn actor_stream(&self) -> String { crate::user_stream(self.follower) }
-}
-
-/// Unfollow a user. No `follower` field is needed: you can never be following
-/// yourself (Follow forbids it), so a self-target simply lands on
-/// [`UserError::NotFollowing`], and every other rule is a lookup in this
-/// stream's own follow set.
-#[derive(Debug, Clone, Copy)]
-pub struct Unfollow {
-    pub target: Id,
 }
 
 impl Decide<RegisterUser> for User {
@@ -278,36 +217,5 @@ impl Decide<SetDisplayName> for User {
         Ok(vec![UserEvent::DisplayNameChanged {
             display_name: cmd.display_name,
         }])
-    }
-}
-
-impl Decide<Follow> for User {
-    type Rejection = UserError;
-
-    fn decide(&self, cmd: Follow) -> Result<Vec<UserEvent>, UserError> {
-        if !self.registered {
-            return Err(UserError::NotRegistered);
-        }
-        if cmd.follower == cmd.target {
-            return Err(UserError::SelfFollow);
-        }
-        if self.following.contains(&cmd.target) {
-            return Err(UserError::AlreadyFollowing);
-        }
-        Ok(vec![UserEvent::Followed { target: cmd.target }])
-    }
-}
-
-impl Decide<Unfollow> for User {
-    type Rejection = UserError;
-
-    fn decide(&self, cmd: Unfollow) -> Result<Vec<UserEvent>, UserError> {
-        if !self.registered {
-            return Err(UserError::NotRegistered);
-        }
-        if !self.following.contains(&cmd.target) {
-            return Err(UserError::NotFollowing);
-        }
-        Ok(vec![UserEvent::Unfollowed { target: cmd.target }])
     }
 }
