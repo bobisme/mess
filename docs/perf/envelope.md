@@ -114,10 +114,38 @@ engine_envelope`.
 | engine.open_rehydrate.s | 0.2876 | same run: 1M-event reopen wall time (book fully rehydrated, `total_events == 1_000_000` asserted). Unlike the isolation row above this pays the payload-materialisation + book-build cost the `Backend` reads depend on | 2026-07-09 | as above |
 | engine.zero_api_changes | true | all Phase 1/2 mess-store suites (bank_account, cache, snapshot_law, differential_model, registry, fjall_snapshot) green on `LogEngine` with no `Backend`/facade API change; differential oracle green vs the engine across 192 randomized sequences with 198 **GENUINE** crash-reopens (drop engine, release `StoreLock`, fresh `LogEngine::open`, book rehydrated from the log — no shared `Arc`); plus the `engine_reopen` regression probe | 2026-07-09 | `cargo test -p mess-store` |
 
+## Phase 5 exit gate — verification + compression envelope (bn-1l6)
+
+The moment the fold chain (D4), fold certificates (`load_verified`), and the D6
+columnar payload sidecar are all on trunk. These rows independently verify the
+phase's two promises — **sealed tier ≤ 35 B/event with replay ≥ 2.5M ev/s**, and
+**`load_verified` round-trips through the crash-recovery path** — plus the
+append-side and verify-side costs. Same reference host (Ryzen 9 3900X, Linux
+7.0.12-arch1-1, `--release`). The columnar rows are in-memory encode/reassemble
+(no fs); the engine row uses ext4 scratch under `$HOME/.cache`.
+
+| metric | value | conditions | date | source command |
+|---|---|---|---|---|
+| phase5.sealed.bytes_per_event | 8.86 | columnar `.pcol` payload sidecar, D6 default (zstd-9, 128-event blocks, no dicts); 1M-event block-clustered corpus (~90% shreddable msgpack, ~10% binary-block row fallback → 722/7813 row blocks); raw 34.7 B/event ⇒ 3.92× | 2026-07-09 | `cargo test -p mess-index --release --lib payload_replay_bench -- --ignored --nocapture` |
+| phase5.sealed.bytes_per_event.gate | 35 | acceptance ceiling (≤35 B/event, columnar) — PASS (8.86, 3.95× margin) | 2026-07-09 | as above |
+| phase5.sealed.columnar_replay.ev_per_s | 9370000 | `reassemble_all` over the `.pcol` sidecar: columnar-decode all 1M events in stored order; single core, in-memory (106.7 ms) | 2026-07-09 | as above |
+| phase5.sealed.columnar_replay.gate | 2500000 | acceptance floor (≥2.5M ev/s sealed replay, columnar on) — PASS (3.75×) | 2026-07-09 | as above |
+| phase5.sealed.point_read.us | 6.236 | one `reassemble_event` per block (7813 reads): cold decode of the owning block, mid-block index | 2026-07-09 | as above |
+| phase5.seal_verify.ev_per_s | 1330000 | columnar seal encode + **permanent verify-on-seal** (every block reassembled and byte-compared) over the 1M-event corpus (749.8 ms) | 2026-07-09 | as above |
+| phase5.foldchain.append_overhead_ns | 169.3 | `chain_step` delta: the second BLAKE3 (over 72 fixed bytes) the crypto chain adds on top of a frame-hashing store; 1M events, 250 B payloads, single core | 2026-07-09 | `cargo run -p mess-log --release --example fold_chain_bench` |
+| phase5.foldchain.full_chain.ev_per_s | 1949088 | full chain (2× BLAKE3/event: `frame_hash` + `chain_step`); 513.1 ns/ev; same run (frame_hash-only baseline 343.8 ns/ev) | 2026-07-09 | as above |
+| phase5.verify.load_verified.ev_per_s | 3590000 | `load_verified` over a 1M-event tail (snapshot at v=0 ⇒ full prefix cert + tail replay + head anchor); 278.4 ns/ev; best-of-3; single core, in-memory | 2026-07-09 | `cargo test -p mess-log --release --test crash_verify verify_throughput_bench -- --ignored --nocapture` |
+| phase5.engine.sealed_replay.ev_per_s | 3600000 | end-to-end `EventStore` load of a 2M-event sealed corpus through the composed engine (`ReplaySet` cold path + record materialization); single run; ext4 scratch | 2026-07-09 | `cargo bench -p mess-store --bench engine_envelope` |
+| phase5.crash_verify.green | true | `load_verified` round-trips through the **production scanner**: 6 cases — honest batch-boundary + mid-batch loads over the recovered prefix; torn-tail truncation caught as `HeadMismatch` by the pre-crash durable anchor; CRC-repaired tail payload tamper (scanner accepts) caught by the chain as `ChainBreakPrev`/`HeadMismatch`; prefix frame-v tamper → `PrefixHashMismatch{FromFrameV}`; empty-tail Path-C retention anchor loads then rejects on tamper | 2026-07-09 | `cargo test -p mess-log --test crash_verify` |
+
 ## Gate summary
 
 | metric | value |
 |---|---|
+| phase5.exit_gate.bytes_per_event_gate | PASS (8.86 ≤ 35 B/event, columnar `.pcol` sidecar) |
+| phase5.exit_gate.columnar_replay_gate | PASS (9.37M ≥ 2.5M ev/s, `reassemble_all` over the sidecar) |
+| phase5.exit_gate.engine_sealed_replay | PASS (3.60M ≥ 2.5M ev/s, end-to-end EventStore load) |
+| phase5.exit_gate.load_verified_post_crash | PASS (verified load round-trips through the scanner; truncation/tamper caught with the correct typed outcomes — `crash_verify`, 6 cases) |
 | phase4.exit_gate.buffered_gate | PASS (2.96M >= 1M ev/s, composed engine append path) |
 | phase4.exit_gate.sealed_replay_gate | PASS (3.46M >= 2.5M ev/s, EventStore load of sealed corpus) |
 | phase4.exit_gate.recovery_gate | PASS (0.14 ms <= 0.5 s, recover_all + manifest, 3.2M ev / 32 segs) |
