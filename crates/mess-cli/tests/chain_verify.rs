@@ -232,7 +232,7 @@ async fn chain_off_is_byte_identical_and_chain_on_differs() {
         "chain-on store must set flag bit 0 on every batch"
     );
 
-    let report = verify::run(c.path(), &VerifyOptions { full: true });
+    let report = verify::run(c.path(), &VerifyOptions { full: true, ..Default::default() });
     assert_eq!(report.exit_code(), 0, "verify --full on honest chained store:\n{}", report.to_pretty());
 }
 
@@ -269,7 +269,7 @@ async fn reopen_continues_chain_and_verifies_whole_stream() {
     assert_eq!(out.state.count, 14, "verified aggregate saw every event");
 
     // And `mess verify --full` is green across the reopen boundary.
-    let report = verify::run(dir.path(), &VerifyOptions { full: true });
+    let report = verify::run(dir.path(), &VerifyOptions { full: true, ..Default::default() });
     assert_eq!(
         report.exit_code(),
         0,
@@ -320,11 +320,11 @@ async fn full_verify_catches_crc_repaired_tamper() {
     std::fs::write(&log, &image).expect("write tampered seg");
 
     // The structural scan + CRC accept the tampered batch...
-    let plain = verify::run(dir.path(), &VerifyOptions { full: false });
+    let plain = verify::run(dir.path(), &VerifyOptions { full: false, ..Default::default() });
     assert_eq!(plain.exit_code(), 0, "structural scan cannot see a CRC-repaired tamper");
 
     // ...but the fold chain catches it under --full.
-    let full = verify::run(dir.path(), &VerifyOptions { full: true });
+    let full = verify::run(dir.path(), &VerifyOptions { full: true, ..Default::default() });
     assert_ne!(full.exit_code(), 0, "verify --full must catch the CRC-repaired tamper");
     assert!(
         full.to_pretty().contains("fold-chain-break"),

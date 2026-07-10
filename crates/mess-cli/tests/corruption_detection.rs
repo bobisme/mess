@@ -25,7 +25,7 @@ fn tmp() -> tempfile::TempDir {
 }
 
 fn verify_full(dir: &std::path::Path) -> Report {
-    verify::run(dir, &VerifyOptions { full: true })
+    verify::run(dir, &VerifyOptions { full: true, repair: false })
 }
 
 /// A clean, uncorrupted corpus verifies clean: exit 0, no error findings.

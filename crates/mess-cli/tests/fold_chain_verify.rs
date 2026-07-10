@@ -107,7 +107,7 @@ fn clean_chained_corpus_verifies_full_clean() {
     let d = tmp();
     write_chained_corpus(d.path(), &workload(50), 10);
 
-    let report = verify::run(d.path(), &VerifyOptions { full: true });
+    let report = verify::run(d.path(), &VerifyOptions { full: true, repair: false });
     assert_eq!(report.exit_code(), 0, "clean chained corpus must exit 0: {:#?}", report.findings);
     assert!(
         !report.findings.iter().any(|f| f.severity == Severity::Error),
@@ -133,7 +133,7 @@ fn crc_repaired_tamper_passes_structural_but_fails_full() {
 
     // Structural (no --full): the batch CRC and marker are self-consistent
     // again, so the byte-layer scan sees nothing wrong.
-    let structural = verify::run(d.path(), &VerifyOptions { full: false });
+    let structural = verify::run(d.path(), &VerifyOptions { full: false, repair: false });
     assert_eq!(
         structural.exit_code(),
         0,
@@ -147,7 +147,7 @@ fn crc_repaired_tamper_passes_structural_but_fails_full() {
     );
 
     // --full: the fold chain catches what the CRC could not.
-    let full = verify::run(d.path(), &VerifyOptions { full: true });
+    let full = verify::run(d.path(), &VerifyOptions { full: true, repair: false });
     assert_ne!(full.exit_code(), 0, "fold-chain tamper must exit non-zero under --full");
     assert!(
         full.findings.iter().any(|f| f.severity == Severity::Error && f.kind == "fold-chain-break"),

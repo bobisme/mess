@@ -34,6 +34,11 @@ xorf = "0.12"
 # the row-fallback dictionary tier uses (bn-zge / D6): a magic-stripped frame
 # per row block saves the 4-byte magic on the rare fallback tier.
 zstd = { version = "0.13", features = ["experimental"] }
+# bn-2za: Reed-Solomon parity for the seal-time `.par` sidecar + offline
+# `verify --repair`. MDS-optimal erasure coding, deterministic, O(n log n)
+# SIMD encode/decode (fast at our 4 KiB-shard sizes). Pinned; license
+# "MIT AND BSD-3-Clause".
+reed-solomon-simd = "=3.1.0"
 
 # bn-20e: `#[cfg(kani)]` ptr-block round-trip proofs are compiled only by
 # `cargo kani`; teach the normal `cargo` build the cfg so it is not flagged

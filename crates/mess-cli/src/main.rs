@@ -89,6 +89,12 @@ enum Command {
         /// linkage recompute.
         #[arg(long)]
         full: bool,
+        /// Attempt Reed-Solomon repair of damaged sealed segments from their
+        /// `.par` parity sidecars (bn-2za): reconstruct damaged blocks,
+        /// re-verify against batch CRCs + fold chain, keep the damaged original
+        /// as `.damaged-<ts>`, and write the repaired segment atomically.
+        #[arg(long)]
+        repair: bool,
         #[command(flatten)]
         common: Common,
     },
@@ -169,11 +175,11 @@ fn main() -> ExitCode {
             let report = inspect::run(&dir, &InspectOptions { segment, stream });
             emit(&report, resolve_format(&common))
         }
-        Command::Verify { dir, full, common } => {
+        Command::Verify { dir, full, repair, common } => {
             if let Err(code) = require_dir(&dir) {
                 return code;
             }
-            let report = verify::run(&dir, &VerifyOptions { full });
+            let report = verify::run(&dir, &VerifyOptions { full, repair });
             emit(&report, resolve_format(&common))
         }
         Command::RebuildIndex { dir, dry_run, meta, common } => {

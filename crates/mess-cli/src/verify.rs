@@ -20,12 +20,13 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use mess_index::sealed::parity::{ParityError, ParitySidecar};
 use mess_index::sealed::payload::{NoDicts, SealedPayloadIndex};
 use mess_index::sealed::segment::SealedSegmentIndex;
 use mess_log::fold_chain::{self, Hash as ChainHash};
 use mess_log::format::{CHAIN_LEN, HEADER_LEN};
 use mess_log::runtime::real::RealFs;
-use mess_log::scanner::{AcceptedBatch, ScanStop, recover_segment_with_image};
+use mess_log::scanner::{AcceptedBatch, ScanStop, recover_segment_with_image, scan_image};
 use serde_json::json;
 
 use crate::lockprobe;
@@ -44,6 +45,13 @@ pub struct VerifyOptions {
     /// Run the full byte-integrity pass (payload reassembly), not just the
     /// structural scan.
     pub full: bool,
+    /// Attempt Reed-Solomon repair of damaged sealed segments from their `.par`
+    /// parity sidecars (bn-2za). Reconstructs damaged byte blocks, re-verifies
+    /// them against the segment's own batch CRCs (+ fold chain) BEFORE writing,
+    /// keeps the damaged original as `.damaged-<ts>`, and reports exactly which
+    /// blocks were repaired. Refuses if the parity is itself damaged or the
+    /// damage exceeds the correction budget.
+    pub repair: bool,
 }
 
 /// Verify the store at `dir`. Read-only; works against a live-locked store.
@@ -51,6 +59,7 @@ pub fn run(dir: &Path, opts: &VerifyOptions) -> Report {
     let mut report = Report::new("verify", "segments");
     report.set("dir", json!(dir.display().to_string()));
     report.set("full", json!(opts.full));
+    report.set("repair", json!(opts.repair));
 
     let lock = lockprobe::probe(dir);
     if lock.is_held() {
@@ -94,6 +103,12 @@ pub fn run(dir: &Path, opts: &VerifyOptions) -> Report {
         }
         if opts.full {
             verify_fold_chain(&mut report, seg.segment_id, &seg.log_path);
+        }
+
+        // bn-2za: offline Reed-Solomon repair from the `.par` parity sidecar.
+        // Only attempted for a sealed segment carrying a parity sidecar.
+        if opts.repair && seg.has_par && scan.is_sealed() {
+            attempt_repair(&mut report, seg, &scan);
         }
     }
 
@@ -531,4 +546,351 @@ fn verify_fold_chain(report: &mut Report, segment_id: u64, log_path: &Path) {
             .with("segment_id", segment_id),
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// bn-2za: Reed-Solomon repair from the `.par` parity sidecar
+// ---------------------------------------------------------------------------
+
+/// Attempt to repair a damaged sealed segment from its parity sidecar.
+///
+/// Flow (all read-only until the very last step):
+/// 1. Open + CRC-validate the `.par`. A parity that fails its own content CRC is
+///    *itself* damaged — reported, no repair attempted.
+/// 2. Localize damaged byte blocks (per-shard CRC) and reconstruct them via RS.
+///    Refuse (typed finding, originals untouched) if any group's damage exceeds
+///    its parity budget, or the segment length no longer matches the sidecar.
+/// 3. **Re-verify the reconstructed image against the segment's own batch CRCs
+///    and fold chain BEFORE writing anything** — parity proves erasure recovery,
+///    the batch CRC / chain prove the bytes are the committed bytes.
+/// 4. Only on a clean re-verify: keep the damaged original as `.damaged-<ts>`
+///    and install the repaired image via temp → fsync → rename. Report exactly
+///    which blocks were repaired.
+fn attempt_repair(report: &mut Report, seg: &crate::store::SegmentFile, scan: &SegmentScan) {
+    let segment_id = seg.segment_id;
+
+    let current = match std::fs::read(&seg.log_path) {
+        Ok(b) => b,
+        Err(e) => {
+            report.push_finding(
+                Finding::new(
+                    Severity::Error,
+                    "repair",
+                    "repair-io",
+                    format!("segment {segment_id}: failed to read for repair: {e}"),
+                )
+                .with("segment_id", segment_id),
+            );
+            return;
+        }
+    };
+
+    // 1. Parity sidecar integrity.
+    let sidecar = match ParitySidecar::open(&seg.par_path) {
+        Ok(Ok(s)) => s,
+        Ok(Err(ParityError::ParityCorrupt)) => {
+            report.push_finding(
+                Finding::new(
+                    Severity::Error,
+                    "repair",
+                    "par-corrupt",
+                    format!(
+                        "segment {segment_id}: parity sidecar {} is itself damaged (content CRC \
+                         mismatch); no repair attempted",
+                        seg.par_path.display()
+                    ),
+                )
+                .with("segment_id", segment_id)
+                .with("path", seg.par_path.display().to_string()),
+            );
+            return;
+        }
+        Ok(Err(e)) => {
+            report.push_finding(
+                Finding::new(
+                    Severity::Error,
+                    "repair",
+                    "par-invalid",
+                    format!(
+                        "segment {segment_id}: parity sidecar {} failed to parse: {e}",
+                        seg.par_path.display()
+                    ),
+                )
+                .with("segment_id", segment_id),
+            );
+            return;
+        }
+        Err(e) => {
+            report.push_finding(
+                Finding::new(
+                    Severity::Error,
+                    "repair",
+                    "par-io",
+                    format!("segment {segment_id}: parity sidecar unreadable: {e}"),
+                )
+                .with("segment_id", segment_id),
+            );
+            return;
+        }
+    };
+
+    if sidecar.segment_id() != segment_id {
+        report.push_finding(
+            Finding::new(
+                Severity::Error,
+                "repair",
+                "par-segment-mismatch",
+                format!(
+                    "segment {segment_id}: parity sidecar claims segment {}",
+                    sidecar.segment_id()
+                ),
+            )
+            .with("segment_id", segment_id)
+            .with("par_segment_id", sidecar.segment_id()),
+        );
+        return;
+    }
+
+    // 2. Plan the reconstruction (no writes).
+    let plan = match sidecar.plan_repair(&current) {
+        Ok(p) => p,
+        Err(ParityError::BeyondTolerance { group, damaged, tolerance, beyond_groups }) => {
+            report.push_finding(
+                Finding::new(
+                    Severity::Error,
+                    "repair",
+                    "repair-beyond-tolerance",
+                    format!(
+                        "segment {segment_id}: damage exceeds parity budget (group {group} lost \
+                         {damaged} shards, budget {tolerance}; {beyond_groups} group(s) beyond \
+                         tolerance); refusing repair, originals untouched"
+                    ),
+                )
+                .with("segment_id", segment_id)
+                .with("group", group)
+                .with("damaged", damaged as u64)
+                .with("tolerance", tolerance as u64)
+                .with("groups_beyond_tolerance", beyond_groups as u64),
+            );
+            return;
+        }
+        Err(ParityError::LengthMismatch { expected, actual }) => {
+            report.push_finding(
+                Finding::new(
+                    Severity::Error,
+                    "repair",
+                    "repair-length-mismatch",
+                    format!(
+                        "segment {segment_id}: current length {actual} != parity source length \
+                         {expected}; RS block repair does not cover truncation/extension"
+                    ),
+                )
+                .with("segment_id", segment_id)
+                .with("expected_len", expected)
+                .with("actual_len", actual),
+            );
+            return;
+        }
+        Err(e) => {
+            report.push_finding(
+                Finding::new(
+                    Severity::Error,
+                    "repair",
+                    "repair-failed",
+                    format!("segment {segment_id}: reconstruction failed: {e}"),
+                )
+                .with("segment_id", segment_id),
+            );
+            return;
+        }
+    };
+
+    if plan.repaired_blocks.is_empty() {
+        report.push_finding(
+            Finding::new(
+                Severity::Ok,
+                "repair",
+                "repair-clean",
+                format!(
+                    "segment {segment_id}: parity localized no damaged blocks; nothing to repair"
+                ),
+            )
+            .with("segment_id", segment_id),
+        );
+        return;
+    }
+
+    // 3. Prove the reconstruction restored the committed bytes BEFORE writing.
+    if let Err(reasons) = reverify_repaired_image(segment_id, &plan.image, scan) {
+        report.push_finding(
+            Finding::new(
+                Severity::Error,
+                "repair",
+                "repair-reverify-failed",
+                format!(
+                    "segment {segment_id}: reconstructed image failed batch-CRC/fold-chain \
+                     re-verification; refusing to write (originals untouched): {reasons}"
+                ),
+            )
+            .with("segment_id", segment_id),
+        );
+        return;
+    }
+
+    // 4. Install: keep the damaged original, then atomically swap in the repair.
+    match install_repaired(&seg.log_path, &plan.image) {
+        Ok(damaged_path) => {
+            report.push_finding(
+                Finding::new(
+                    Severity::Ok,
+                    "repair",
+                    "repaired",
+                    format!(
+                        "segment {segment_id}: repaired {} block(s) {:?} from parity and \
+                         re-verified against batch CRCs + fold chain; damaged original kept at {}",
+                        plan.repaired_blocks.len(),
+                        plan.repaired_blocks,
+                        damaged_path.display()
+                    ),
+                )
+                .with("segment_id", segment_id)
+                .with("repaired_block_count", plan.repaired_blocks.len() as u64)
+                .with("repaired_blocks", json!(plan.repaired_blocks))
+                .with("damaged_original", damaged_path.display().to_string()),
+            );
+        }
+        Err(e) => {
+            report.push_finding(
+                Finding::new(
+                    Severity::Error,
+                    "repair",
+                    "repair-write-failed",
+                    format!("segment {segment_id}: repaired image re-verified but write failed: {e}"),
+                )
+                .with("segment_id", segment_id),
+            );
+        }
+    }
+}
+
+/// Re-verify a reconstructed segment image against the segment's own committed
+/// structure: the structural/byte scan (every batch CRC) must land clean at the
+/// sealed content length and match the trailer's batch/event counts, and every
+/// chain-enabled batch's fold linkage must recompute. Returns `Err` describing
+/// the first failure. This is the gate that proves RS erasure recovery restored
+/// the *committed* bytes, not merely *some* bytes that satisfy the parity.
+fn reverify_repaired_image(
+    segment_id: u64,
+    image: &[u8],
+    scan: &SegmentScan,
+) -> Result<(), String> {
+    let recovery = scan_image(image, None);
+
+    // The recovery scanner is a prefix model: it accepts committed batches until
+    // it can go no further. On a *sealed* segment it naturally halts at the
+    // checksummed trailer (which is not a batch header), so the stop reason is
+    // not `EndOfSegment` — the authoritative "clean" proof is that the accepted
+    // prefix reaches the sealed content length and matches the trailer's
+    // batch/event counts. A mid-body batch-CRC failure would stop the scan
+    // early, short of `ext_offset`, and fail this cross-check.
+    let trailer = scan
+        .trailer
+        .as_ref()
+        .ok_or_else(|| "segment is not sealed (no checksummed trailer to prove against)".to_string())?;
+    let batches = recovery.accepted.len() as u64;
+    let events: u64 = recovery.accepted.iter().map(|b| u64::from(b.frame_count)).sum();
+    if batches != trailer.batch_count {
+        return Err(format!("batch_count {batches} != trailer {}", trailer.batch_count));
+    }
+    if events != trailer.event_count {
+        return Err(format!("event_count {events} != trailer {}", trailer.event_count));
+    }
+    if recovery.safe_offset != trailer.ext_offset {
+        return Err(format!(
+            "recovered content length {} != trailer content length {} (batch CRC broke mid-body)",
+            recovery.safe_offset, trailer.ext_offset
+        ));
+    }
+
+    // Fold-chain linkage over every chain-enabled batch (spec 05 §3, §6).
+    let mut by_stream: BTreeMap<u64, Vec<&AcceptedBatch>> = BTreeMap::new();
+    for b in &recovery.accepted {
+        if b.has_crypto_chain {
+            by_stream.entry(b.stream_id).or_default().push(b);
+        }
+    }
+    for (stream_id, mut batches) in by_stream {
+        batches.sort_by_key(|b| b.first_stream_version);
+        let mut expected_entry: Option<ChainHash> = None;
+        for b in batches {
+            let off = b.offset as usize;
+            let stored: ChainHash = image
+                .get(off + HEADER_LEN..off + HEADER_LEN + CHAIN_LEN)
+                .ok_or_else(|| format!("segment {segment_id}: chain slot outside image"))?
+                .try_into()
+                .expect("slice is CHAIN_LEN bytes");
+
+            if b.first_stream_version == 0 {
+                let want = fold_chain::genesis(stream_id);
+                if stored != want {
+                    return Err(format!(
+                        "stream {stream_id} genesis chain mismatch at offset {off}"
+                    ));
+                }
+            } else if let Some(want) = expected_entry
+                && stored != want
+            {
+                return Err(format!(
+                    "stream {stream_id} chain break at offset {off} (want {}, found {})",
+                    hex(&want),
+                    hex(&stored)
+                ));
+            }
+
+            let frames = b
+                .frames(image)
+                .map_err(|_| format!("stream {stream_id} batch at {off} failed to re-materialize"))?;
+            let payloads: Vec<&[u8]> = frames.map(|f| f.payload).collect();
+            expected_entry =
+                Some(fold_chain::recompute_batch(&stored, b.first_stream_version, payloads, |_| {}));
+        }
+    }
+
+    Ok(())
+}
+
+/// Install a re-verified repaired image: rename the damaged original aside to
+/// `<log>.damaged-<unix_nanos>` (preserved for forensics), then write the
+/// repaired bytes via temp → fsync → rename → dir-fsync. Returns the path the
+/// damaged original was preserved at.
+fn install_repaired(log_path: &Path, image: &[u8]) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write;
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut damaged_name = log_path.file_name().unwrap_or_default().to_os_string();
+    damaged_name.push(format!(".damaged-{ts}"));
+    let damaged_path = log_path.with_file_name(damaged_name);
+
+    // Preserve the damaged original first (atomic rename off the live name).
+    std::fs::rename(log_path, &damaged_path)?;
+
+    // Write the repaired image durably into the live name.
+    let mut tmp_name = log_path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".repair-tmp");
+    let tmp = log_path.with_file_name(tmp_name);
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(image)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, log_path)?;
+    if let Some(parent) = log_path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+    Ok(damaged_path)
 }

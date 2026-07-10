@@ -523,6 +523,11 @@ pub struct EngineOptions {
     /// per-stream heads are rehydrated on recovery, and `mess verify --full`
     /// recomputes the chain to catch a CRC-repaired payload tamper.
     pub chain: bool,
+    /// Seal-time Reed-Solomon parity sidecar policy (bn-2za). **Disabled by
+    /// default** (evidence-gated): when enabled, the background sealer writes a
+    /// `.par` sidecar next to each sealed segment so `mess verify --repair` can
+    /// reconstruct latent-sector / bit-rot damage offline.
+    pub parity: mess_index::sealed::parity::ParityConfig,
 }
 
 /// Re-export of the committer's runtime metrics snapshot (`bn-e2y`), the
@@ -599,6 +604,8 @@ impl Default for EngineOptions {
             // Fold chain off by default: opt in per store for tamper-evident
             // segments (spec 05 §6).
             chain: false,
+            // bn-2za: parity is opt-in / evidence-gated — off by default.
+            parity: mess_index::sealed::parity::ParityConfig::default(),
         }
     }
 }
@@ -717,7 +724,8 @@ impl LogEngine {
             .map_err(|e| EngineError::SealedRead(format!("mkdir sealed: {e}")))?;
         let seal_thread = {
             let driver = SealDriver::new(Arc::clone(&sealed), dir.join("sealed"))
-                .with_metrics(Arc::clone(&seal_metrics));
+                .with_metrics(Arc::clone(&seal_metrics))
+                .with_parity(opts.parity);
             let active = Arc::clone(&active);
             let book = Arc::clone(&book);
             let dir = dir.to_path_buf();
@@ -977,11 +985,19 @@ impl LogEngine {
 
             // Finalize: write + fsync the fixed footer trailer (§3.3.1), making
             // the segment R2-trusted, only after the sidecars are durable.
-            let seg_path = segment_path(&dir, summary.segment_id);
+            let seg_id = summary.segment_id;
+            let seg_path = segment_path(&dir, seg_id);
+            let seg_path_for_parity = seg_path.clone();
             let sum = summary;
             let finalize = move || finalize_footer(&seg_path, &sum);
             // Best-effort: on failure the segment stays unsealed + recoverable.
-            let _ = driver.seal(input, finalize);
+            if driver.seal(input, finalize).is_ok() {
+                // bn-2za: once the footer is finalized the `.log` bytes are
+                // complete — emit the RS parity sidecar over them (no-op unless
+                // parity is enabled). Best-effort, like the `.filter`: a parity
+                // failure never fails the seal.
+                let _ = driver.write_parity_sidecar(&seg_path_for_parity, seg_id);
+            }
         }
     }
 

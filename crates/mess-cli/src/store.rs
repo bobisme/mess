@@ -33,10 +33,14 @@ pub struct SegmentFile {
     pub pcol_path: PathBuf,
     /// The membership-filter sidecar path (may or may not exist).
     pub filter_path: PathBuf,
+    /// The Reed-Solomon parity sidecar path (bn-2za; may or may not exist).
+    pub par_path: PathBuf,
     /// Whether the `.pidx` sidecar exists on disk.
     pub has_pidx: bool,
     /// Whether the `.pcol` sidecar exists on disk.
     pub has_pcol: bool,
+    /// Whether the `.par` parity sidecar exists on disk (bn-2za).
+    pub has_par: bool,
 }
 
 /// The `.log` path for a segment id (`seg-<id:08>.log`).
@@ -49,6 +53,13 @@ pub fn log_path(dir: &Path, segment_id: u64) -> PathBuf {
 #[must_use]
 pub fn pidx_path(dir: &Path, segment_id: u64) -> PathBuf {
     dir.join("sealed").join(format!("seg-{segment_id:020}.pidx"))
+}
+
+/// The Reed-Solomon parity-sidecar path for a segment id
+/// (`sealed/seg-<id:020>.par`, bn-2za).
+#[must_use]
+pub fn par_path(dir: &Path, segment_id: u64) -> PathBuf {
+    pidx_path(dir, segment_id).with_extension("par")
 }
 
 /// The lock-file path.
@@ -87,14 +98,17 @@ pub fn discover_segments(dir: &Path) -> Vec<SegmentFile> {
             let pidx = pidx_path(dir, segment_id);
             let pcol = pidx.with_extension("pcol");
             let filter = pidx.with_extension("filter");
+            let par = pidx.with_extension("par");
             SegmentFile {
                 segment_id,
                 log_path: log_path(dir, segment_id),
                 has_pidx: pidx.exists(),
                 has_pcol: pcol.exists(),
+                has_par: par.exists(),
                 pidx_path: pidx,
                 pcol_path: pcol,
                 filter_path: filter,
+                par_path: par,
             }
         })
         .collect()

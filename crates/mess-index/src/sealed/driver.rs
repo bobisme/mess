@@ -54,6 +54,7 @@ use mess_log::metrics::{
 };
 
 use crate::sealed::filter::SegmentFilter;
+use crate::sealed::parity::{self, ParityConfig};
 use crate::sealed::payload::{
     self, PayloadError, PayloadSealOpts, SealedPayloadIndex,
 };
@@ -190,12 +191,20 @@ pub struct SealDriver {
     /// (and every existing caller/test) allocation- and instrumentation-free;
     /// the engine attaches a shared sink via [`Self::with_metrics`].
     metrics: Option<Arc<SealMetrics>>,
+    /// Reed-Solomon parity-sidecar policy (bn-2za). Default disabled: the `.par`
+    /// sidecar is written at seal only when the engine opts in (evidence-gated).
+    parity: ParityConfig,
 }
 
 impl SealDriver {
     /// A driver writing sidecars into `dir` and publishing into `store`.
     pub fn new(store: Arc<SealedStore>, dir: impl Into<PathBuf>) -> Self {
-        SealDriver { store, dir: Arc::new(dir.into()), metrics: None }
+        SealDriver {
+            store,
+            dir: Arc::new(dir.into()),
+            metrics: None,
+            parity: ParityConfig::default(),
+        }
     }
 
     /// Attach a shared seal-path metrics sink (`bn-e2y`): this driver then times
@@ -206,6 +215,45 @@ impl SealDriver {
     pub fn with_metrics(mut self, metrics: Arc<SealMetrics>) -> Self {
         self.metrics = Some(metrics);
         self
+    }
+
+    /// Set the Reed-Solomon parity policy (bn-2za). When
+    /// [`ParityConfig::enabled`] is `true`, [`Self::write_parity_sidecar`]
+    /// emits a `.par` alongside the segment after it is sealed. Chainable.
+    #[must_use]
+    pub fn with_parity(mut self, parity: ParityConfig) -> Self {
+        self.parity = parity;
+        self
+    }
+
+    /// The `.par` parity-sidecar path for `segment_id`
+    /// (`<dir>/seg-<id:020>.par`).
+    pub fn parity_path(&self, segment_id: u64) -> PathBuf {
+        parity::par_path(&self.dir, segment_id)
+    }
+
+    /// Generate and durably write the Reed-Solomon parity sidecar (`.par`) for a
+    /// **sealed** segment whose finalized `.log` bytes live at `seg_path`
+    /// (bn-2za). No-op returning `Ok(None)` when parity is disabled. Written
+    /// with the same temp → fsync → rename → dir-fsync discipline as the other
+    /// sidecars ([`write_durable`]). Best-effort by design (like the `.filter`):
+    /// callers ignore the error so a parity-write failure never fails the seal —
+    /// the segment is fully durable and detectable without parity, just not
+    /// repairable. Returns the sidecar byte length on success.
+    pub fn write_parity_sidecar(
+        &self,
+        seg_path: &Path,
+        segment_id: u64,
+    ) -> io::Result<Option<u64>> {
+        if !self.parity.enabled {
+            return Ok(None);
+        }
+        let source = std::fs::read(seg_path)?;
+        let bytes = parity::generate(segment_id, &source, &self.parity)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let path = self.parity_path(segment_id);
+        write_durable_metered(&path, &bytes, self.metrics.as_deref())?;
+        Ok(Some(bytes.len() as u64))
     }
 
     /// The shared sealed store.

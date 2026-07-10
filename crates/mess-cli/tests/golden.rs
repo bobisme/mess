@@ -334,7 +334,7 @@ async fn generate(version: &str, chain: bool) {
         std::fs::write(out_dir.join("expected-events.json"), &manifest_bytes).expect("write manifest");
 
         // ---- 5. Verify the freshly built store BEFORE packing it. ----
-        let report = verify::run(&store, &VerifyOptions { full: true });
+        let report = verify::run(&store, &VerifyOptions { full: true, repair: false });
         assert_eq!(report.exit_code(), 0, "mess verify --full on fresh store: {}", report.to_pretty());
 
         // Drop the engine + snapshot backend (drains the sealer so sidecars +
@@ -520,7 +520,7 @@ async fn check(version: &str, chain: bool) {
     );
 
     // ---- 8. `mess verify --full` exits 0 on the committed golden. ----
-    let report = verify::run(&store, &VerifyOptions { full: true });
+    let report = verify::run(&store, &VerifyOptions { full: true, repair: false });
     assert_eq!(report.exit_code(), 0, "mess verify --full must pass:\n{}", report.to_pretty());
 
     // ---- 9. (chained goldens only) the segments really carry the on-disk

@@ -51,6 +51,7 @@
 pub mod block_cache;
 pub mod driver;
 pub mod filter;
+pub mod parity;
 pub mod payload;
 pub mod ptr_block;
 pub mod replay;
@@ -63,6 +64,7 @@ pub use driver::{
     BackgroundSealer, FinalizeFn, SealDriver, SealError, SealMetrics, SealMetricsSnapshot,
 };
 pub use filter::{FilterError, SegmentFilter};
+pub use parity::{ParityConfig, ParityError, ParitySidecar, RepairPlan, generate as generate_parity, par_path};
 pub use payload::{
     ARCHIVE_BLOCK_EVENTS, ARCHIVE_ZSTD_LEVEL, ArchivePolicy, BlockEntry, BlockKind, DictResolver,
     NoDicts, PayloadError, PayloadSealOpts, ReblockError, ReblockOutcome, SealedPayloadIndex,

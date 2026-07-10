@@ -110,3 +110,32 @@ pub fn truncate(path: &Path, len: u64) {
     let f = std::fs::OpenOptions::new().write(true).open(path).expect("open");
     f.set_len(len).expect("truncate");
 }
+
+// --- bn-2za: parity sidecar helpers ---------------------------------------
+
+use mess_index::sealed::parity::{ParityConfig, generate as generate_parity};
+
+/// A small-shard parity config for the tiny corpus (so a few hundred bytes span
+/// several groups): 64-byte shards, 4 data + 2 parity per group.
+pub fn parity_test_cfg() -> ParityConfig {
+    ParityConfig { enabled: true, shard_size: 64, data_per_group: 4, parity_per_group: 2 }
+}
+
+/// Generate a `.par` parity sidecar over the (already sealed) segment's current
+/// `.log` bytes and write it next to the pointer sidecar. Returns the sidecar
+/// byte length. Call after [`seal_log_trailer`].
+pub fn write_parity(dir: &Path, cfg: ParityConfig) -> u64 {
+    let log = store::log_path(dir, SEG_ID);
+    let bytes = std::fs::read(&log).expect("read log");
+    let par_bytes = generate_parity(SEG_ID, &bytes, &cfg).expect("generate parity");
+    let path = store::par_path(dir, SEG_ID);
+    std::fs::create_dir_all(path.parent().expect("sealed parent")).expect("mkdir sealed");
+    let len = par_bytes.len() as u64;
+    std::fs::write(&path, par_bytes).expect("write par");
+    len
+}
+
+/// The parity-sidecar path for the corpus segment.
+pub fn par(dir: &Path) -> std::path::PathBuf {
+    store::par_path(dir, SEG_ID)
+}
