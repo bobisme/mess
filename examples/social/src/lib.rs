@@ -86,7 +86,7 @@ pub use domain::user::{
     HANDLE_MAX_LEN, RegisterUser, SetDisplayName, User, UserError, UserEvent,
     handle_is_valid,
 };
-pub use projections::{PostLookup, Projections};
+pub use projections::{PROJECTION_VERSION, PostLookup, Projections};
 
 /// The separator between the two [`Id`]s inside a relationship stream's suffix
 /// (e.g. the `_` in `like-<post>_<user>`).

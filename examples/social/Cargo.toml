@@ -17,6 +17,13 @@ ident = { workspace = true, features = ["serde"] }
 # `Deserialize` wrapper structs for each variant's payload, so any crate
 # using the derive needs `serde` as a direct dependency.
 serde = { version = "1.0.188", features = ["derive"] }
+# rmp-serde: msgpack codec for the projection checkpoint sidecar. Chosen over
+# adding serde_json/bincode because it is the *same* codec `#[derive(Event)]`
+# already uses for event payloads (mess-core depends on rmp-serde), so the
+# checkpoint reuses the workspace's established serialization strategy rather
+# than introducing a second one. Compact and self-describing enough that a
+# truncated file reliably fails to decode (the corrupt-checkpoint rebuild path).
+rmp-serde = "1"
 tokio = { workspace = true }
 # --- web layer (bn-13l) ---
 # axum: the HTTP router/extractor layer. `default-features` kept (macros, form,

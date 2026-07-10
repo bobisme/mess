@@ -11,22 +11,36 @@
 //! [`ReadModels`]: social::contracts::ReadModels
 
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::time::Duration;
 
 use ident::Id;
 use mess_store::{Backend, EventStore, LogEngine, RecordToAppend, Version};
 use social::{
-    PostLookup, ProfileView, Projections, ReadModels, TimelinePage, WriteError,
-    WriteOps,
+    PROJECTION_VERSION, PostLookup, ProfileView, Projections, ReadModels,
+    TimelinePage, WriteError, WriteOps,
 };
 
-/// A fresh store in a unique temp dir per test (mirrors `store_roundtrip`).
-fn fresh_store() -> EventStore<LogEngine> {
-    let dir = std::env::temp_dir().join(format!(
+/// A fresh store dir, unique per test.
+fn fresh_dir() -> PathBuf {
+    std::env::temp_dir().join(format!(
         "mess-social-proj-{}-{}",
         std::process::id(),
         Id::new()
-    ));
-    EventStore::new(LogEngine::open(&dir).expect("open engine"))
+    ))
+}
+
+/// A fresh store in a unique temp dir per test (mirrors `store_roundtrip`).
+fn fresh_store() -> EventStore<LogEngine> {
+    EventStore::new(LogEngine::open(fresh_dir()).expect("open engine"))
+}
+
+/// A fresh store plus the dir it lives in — the checkpoint sidecar tests need
+/// the dir to place `<dir>/.social-projections.ckpt` next to the store.
+fn fresh_store_with_dir() -> (EventStore<LogEngine>, PathBuf) {
+    let dir = fresh_dir();
+    let store = EventStore::new(LogEngine::open(&dir).expect("open engine"));
+    (store, dir)
 }
 
 // ===========================================================================
@@ -543,4 +557,308 @@ async fn anomalies_are_counted_while_the_projection_stays_live_and_correct() {
     // dave and eve never registered (their only records were garbage), so
     // they never got a handle to resolve.
     assert!(proj.profile("dave", None).await.is_none());
+}
+
+// ===========================================================================
+// Checkpointed projections: resume via subscribe(from=checkpoint), not
+// replay-from-0. Each test proves the resumed answers equal a from-0 rebuild
+// on the same store — the checkpoint is only ever an optimization, never a
+// source of divergence.
+// ===========================================================================
+
+/// The five-user, eight-post cast the equivalence tests use, reused by the
+/// checkpoint tests so their `drive`/`snapshot` cover the same query surface.
+fn cast() -> (Vec<(Id, String)>, Vec<Id>) {
+    let users: Vec<(Id, String)> = ["u0", "u1", "u2", "u3", "u4"]
+        .iter()
+        .map(|h| (Id::new(), (*h).to_string()))
+        .collect();
+    let posts: Vec<Id> = (0..8).map(|_| Id::new()).collect();
+    (users, posts)
+}
+
+/// A cadence that never auto-checkpoints (astronomically many events, an hour
+/// between time-based writes), so the checkpoint tests checkpoint *only* on an
+/// explicit `checkpoint_now`/`checkpoint_now_as_version` — fully deterministic,
+/// no cadence races.
+const MANUAL_ONLY_N: u64 = u64::MAX;
+fn manual_only_t() -> Duration { Duration::from_secs(3600) }
+
+/// (a) Kill/restart: build a checkpointing projection, drive events,
+/// checkpoint, drop it, then restart from the checkpoint. The resumed
+/// projection must **resume** (not rebuild from 0) yet answer every query
+/// identically to a fresh from-0 rebuild over the same store.
+#[tokio::test]
+async fn checkpoint_kill_restart_matches_from_zero_rebuild() {
+    let (users, posts) = cast();
+    let (store, dir) = fresh_store_with_dir();
+    let ckpt = dir.join(".social-projections.ckpt");
+
+    let last;
+    {
+        let proj = Projections::with_checkpoint_cadence(
+            &store,
+            ckpt.clone(),
+            MANUAL_ONLY_N,
+            manual_only_t(),
+        )
+        .await;
+        // A fresh store starts empty, so the first build is a from-0 rebuild.
+        assert_eq!(proj.resumed_from(), 0);
+        last = drive(&store, 7, &users, &posts)
+            .await
+            .expect("the deterministic prelude always writes events");
+        proj.wait_for(last).await;
+        proj.checkpoint_now().await.expect("checkpoint write");
+    } // <- projection dropped: the pump is aborted, the process "dies".
+
+    // Restart: this MUST resume from the checkpoint, not replay from 0.
+    let resumed = Projections::with_checkpoint_cadence(
+        &store,
+        ckpt.clone(),
+        MANUAL_ONLY_N,
+        manual_only_t(),
+    )
+    .await;
+    assert!(
+        resumed.resumed_from() > 0,
+        "a valid checkpoint must be resumed, not rebuilt from 0"
+    );
+    resumed.wait_for(last).await;
+
+    // A plain from-0 rebuild over the same log, for comparison.
+    let rebuilt = Projections::new(&store).await;
+    rebuilt.wait_for(last).await;
+
+    let resumed_snap = snapshot(&resumed, &users, &posts).await;
+    let rebuilt_snap = snapshot(&rebuilt, &users, &posts).await;
+    assert_eq!(
+        resumed_snap, rebuilt_snap,
+        "resume-from-checkpoint must equal a from-0 rebuild"
+    );
+}
+
+/// (b) A checkpoint stamped with a mismatched `projection_version` is discarded
+/// and the projection rebuilds clean from 0 (asserted via the `resumed_from`
+/// marker), still matching a from-0 rebuild.
+#[tokio::test]
+async fn stale_projection_version_checkpoint_forces_full_rebuild() {
+    let (users, posts) = cast();
+    let (store, dir) = fresh_store_with_dir();
+    let ckpt = dir.join(".social-projections.ckpt");
+
+    let last;
+    {
+        let proj = Projections::with_checkpoint_cadence(
+            &store,
+            ckpt.clone(),
+            MANUAL_ONLY_N,
+            manual_only_t(),
+        )
+        .await;
+        last = drive(&store, 3, &users, &posts)
+            .await
+            .expect("prelude writes events");
+        proj.wait_for(last).await;
+        // Plant a checkpoint stamped with a FUTURE projection version — as if
+        // the fold logic had been bumped since this file was written.
+        proj.checkpoint_now_as_version(PROJECTION_VERSION + 1)
+            .await
+            .expect("checkpoint write");
+    }
+
+    // The stale-version checkpoint must be discarded -> full from-0 rebuild.
+    let restarted = Projections::with_checkpoint_cadence(
+        &store,
+        ckpt.clone(),
+        MANUAL_ONLY_N,
+        manual_only_t(),
+    )
+    .await;
+    assert_eq!(
+        restarted.resumed_from(),
+        0,
+        "a mismatched projection_version must force a from-0 rebuild"
+    );
+    restarted.wait_for(last).await;
+
+    let rebuilt = Projections::new(&store).await;
+    rebuilt.wait_for(last).await;
+    assert_eq!(
+        snapshot(&restarted, &users, &posts).await,
+        snapshot(&rebuilt, &users, &posts).await,
+    );
+}
+
+/// (c) A corrupt/truncated checkpoint file is discarded — no panic — and the
+/// projection rebuilds clean from 0. Two flavours: a truncated (undecodable)
+/// file and a fully-garbage file.
+#[tokio::test]
+async fn corrupt_checkpoint_forces_full_rebuild_without_panic() {
+    let (users, posts) = cast();
+    let (store, dir) = fresh_store_with_dir();
+    let ckpt = dir.join(".social-projections.ckpt");
+
+    let last;
+    {
+        let proj = Projections::with_checkpoint_cadence(
+            &store,
+            ckpt.clone(),
+            MANUAL_ONLY_N,
+            manual_only_t(),
+        )
+        .await;
+        last = drive(&store, 13, &users, &posts)
+            .await
+            .expect("prelude writes events");
+        proj.wait_for(last).await;
+        proj.checkpoint_now().await.expect("checkpoint write");
+    }
+
+    // Flavour 1: truncate the checkpoint to half its bytes (undecodable).
+    let bytes = std::fs::read(&ckpt).expect("read checkpoint");
+    assert!(bytes.len() > 8, "checkpoint should be non-trivial");
+    std::fs::write(&ckpt, &bytes[..bytes.len() / 2]).expect("truncate");
+
+    let restarted = Projections::with_checkpoint_cadence(
+        &store,
+        ckpt.clone(),
+        MANUAL_ONLY_N,
+        manual_only_t(),
+    )
+    .await;
+    assert_eq!(
+        restarted.resumed_from(),
+        0,
+        "a truncated checkpoint must force a from-0 rebuild, not panic"
+    );
+    restarted.wait_for(last).await;
+    let rebuilt = Projections::new(&store).await;
+    rebuilt.wait_for(last).await;
+    assert_eq!(
+        snapshot(&restarted, &users, &posts).await,
+        snapshot(&rebuilt, &users, &posts).await,
+    );
+
+    // Flavour 2: fully-garbage bytes.
+    std::fs::write(&ckpt, [0xFFu8; 64]).expect("garbage");
+    let restarted2 = Projections::with_checkpoint_cadence(
+        &store,
+        ckpt.clone(),
+        MANUAL_ONLY_N,
+        manual_only_t(),
+    )
+    .await;
+    assert_eq!(
+        restarted2.resumed_from(),
+        0,
+        "a garbage checkpoint must force a from-0 rebuild, not panic"
+    );
+    restarted2.wait_for(last).await;
+    assert_eq!(
+        snapshot(&restarted2, &users, &posts).await,
+        snapshot(&rebuilt, &users, &posts).await,
+    );
+}
+
+/// (d) Checkpoint mid-stream during the live pump: checkpoint after a first
+/// wave, write a second wave, restart. The resume must replay **only the
+/// suffix** — `resumed_from` equals the checkpoint's position, strictly less
+/// than the final position — and still match a from-0 rebuild. This proves
+/// folds are idempotent from a position: re-folding only the suffix reaches the
+/// same state as folding the whole log.
+#[tokio::test]
+async fn checkpoint_during_live_pump_resumes_only_the_suffix() {
+    let (users, posts) = cast();
+    let (store, dir) = fresh_store_with_dir();
+    let ckpt = dir.join(".social-projections.ckpt");
+
+    let ckpt_pos;
+    let last;
+    {
+        let proj = Projections::with_checkpoint_cadence(
+            &store,
+            ckpt.clone(),
+            MANUAL_ONLY_N,
+            manual_only_t(),
+        )
+        .await;
+        // First wave, folded live, then checkpointed mid-stream.
+        let mid = drive(&store, 5, &users, &posts)
+            .await
+            .expect("first wave writes events");
+        proj.wait_for(mid).await;
+        proj.checkpoint_now().await.expect("mid-stream checkpoint");
+        ckpt_pos = proj.applied_position();
+
+        // Second wave, committed AFTER the checkpoint — the suffix a resume
+        // must replay.
+        last = drive(&store, 9, &users, &posts)
+            .await
+            .expect("second wave writes events");
+        proj.wait_for(last).await;
+    }
+    assert!(ckpt_pos > 0, "the checkpoint must be past position 0");
+    assert!(last >= ckpt_pos, "the suffix must have added positions");
+
+    let resumed = Projections::with_checkpoint_cadence(
+        &store,
+        ckpt.clone(),
+        MANUAL_ONLY_N,
+        manual_only_t(),
+    )
+    .await;
+    assert_eq!(
+        resumed.resumed_from(),
+        ckpt_pos,
+        "resume must start at the checkpoint position — only the suffix \
+         replays"
+    );
+    resumed.wait_for(last).await;
+
+    let rebuilt = Projections::new(&store).await;
+    rebuilt.wait_for(last).await;
+    assert_eq!(
+        snapshot(&resumed, &users, &posts).await,
+        snapshot(&rebuilt, &users, &posts).await,
+        "suffix-resume must equal a from-0 rebuild"
+    );
+}
+
+/// (e) `wait_for` is event-bounded, not poll-bounded. A code-level assertion
+/// (the source no longer carries the old 1 ms poll and does drive the
+/// subscription) plus a latency-shaped smoke check that the barrier actually
+/// wakes on a commit within a generous, non-brittle bound.
+#[tokio::test]
+async fn wait_for_is_event_bounded_not_poll_bounded() {
+    // Code-level: the removed 1 ms steady-state poll must be gone, and the pump
+    // must now drive the store subscription.
+    let src = include_str!("../src/projections.rs");
+    assert!(
+        !src.contains("from_millis(1)"),
+        "the old 1 ms poll interval must be gone"
+    );
+    assert!(
+        !src.contains("const POLL"),
+        "the steady-state POLL constant must be gone"
+    );
+    assert!(
+        src.contains("next_batch"),
+        "the live pump must drive the subscription (next_batch)"
+    );
+
+    // Latency-shaped smoke (not wall-clock-brittle): wait_for on a not-yet-
+    // written position must wake once the write lands, well within a generous
+    // bound. The code-level check above is what proves event-boundedness; this
+    // proves the barrier is actually wired to wake.
+    let store = fresh_store();
+    let proj = Projections::new(&store).await;
+    let alice = Id::new();
+    store.register(alice, "alice".into(), "Alice".into()).await.unwrap();
+    let post = Id::new();
+    let pos = store.create_post(post, alice, "hi".into()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), proj.wait_for(pos))
+        .await
+        .expect("wait_for must wake promptly on the commit, not hang");
+    assert!(proj.post(post, None).await.is_some());
 }

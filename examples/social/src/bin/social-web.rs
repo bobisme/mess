@@ -17,11 +17,15 @@
 //!   tiny hardcoded world — a quick sanity check that needs no setup.
 //! - **`--dir PATH`.** Opens a real [`mess_store::EventStore`] over
 //!   [`mess_store::LogEngine`] at `PATH` (written by `social-seed`, or by using
-//!   the app), and builds a real [`social::Projections`] read model by
-//!   replaying that store's log from position 0 — this is the "the read model
-//!   rebuilds from the log" party trick the README walks through: stop this
-//!   process and start it again, and `Projections::new` redoes exactly that
-//!   replay before serving a single request.
+//!   the app), and builds a real [`social::Projections`] read model that
+//!   **resumes from a checkpoint** ([`social::Projections::with_checkpoint`])
+//!   when one is present next to the store (`PATH/.social-projections.ckpt`),
+//!   replaying only the log *suffix* committed since. With no valid checkpoint
+//!   (a fresh store, or a stale/corrupt file) it falls back to the "the read
+//!   model rebuilds from the log" party trick — a full replay from position 0.
+//!   On clean shutdown (Ctrl-C) it writes a fresh checkpoint so the next boot
+//!   resumes from the very last folded position. The from-0 rebuild seam stays
+//!   public as [`social::Projections::new`].
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -120,14 +124,23 @@ async fn mem_state() -> AppState<MemBackend, MemBackend> {
     AppState::new(backend.clone(), backend)
 }
 
-/// The real, store-backed world: open `dir` and rebuild the read model by
-/// replaying its whole log (see [`Projections::new`]). No directory to
-/// populate: handle resolution goes through
+/// The sidecar checkpoint file kept next to the store dir — see
+/// [`Projections::with_checkpoint`] for why a sidecar (and not the log itself)
+/// and the atomic write-rename it uses.
+fn checkpoint_path(dir: &std::path::Path) -> PathBuf {
+    dir.join(".social-projections.ckpt")
+}
+
+/// The real, store-backed world: open `dir` and build the read model,
+/// **resuming from the sidecar checkpoint** when present and valid, else a full
+/// replay from position 0 (see [`Projections::with_checkpoint`]). Returns the
+/// [`AppState`] plus the projections handle so the caller can checkpoint on a
+/// clean shutdown. No directory to populate: handle resolution goes through
 /// [`ReadModels::resolve`](social::contracts::ReadModels::resolve) instead —
 /// see `social::web`'s module docs.
 async fn store_state(
     dir: &std::path::Path,
-) -> AppState<Projections<LogEngine>, Store> {
+) -> (AppState<Projections<LogEngine>, Store>, Arc<Projections<LogEngine>>) {
     if !dir.is_dir() {
         eprintln!(
             "error: store directory not found at {}\n  Run `cargo run -p \
@@ -143,13 +156,19 @@ async fn store_state(
     });
     let store: Store = EventStore::new(backend);
 
-    print!("replaying log from position 0 ... ");
+    print!("building read model (resume-or-rebuild) ... ");
     use std::io::Write;
     std::io::stdout().flush().ok();
-    let projections = Arc::new(Projections::new(&store).await);
-    println!("done.");
+    let projections = Arc::new(
+        Projections::with_checkpoint(&store, checkpoint_path(dir)).await,
+    );
+    match projections.resumed_from() {
+        0 => println!("done (full rebuild from position 0)."),
+        pos => println!("done (resumed from checkpoint at position {pos})."),
+    }
 
-    AppState::new(projections, Arc::new(store))
+    let state = AppState::new(projections.clone(), Arc::new(store));
+    (state, projections)
 }
 
 #[tokio::main]
@@ -164,13 +183,28 @@ async fn main() {
     // docs on what "generic state, not a trait object" costs here.
     match &args.dir {
         Some(dir) => {
-            let state = store_state(dir).await;
+            let (state, projections) = store_state(dir).await;
             println!(
                 "social-web listening on http://{} (store at {})",
                 args.addr,
                 dir.display()
             );
-            axum::serve(listener, router(state)).await.expect("serve");
+            // Serve until Ctrl-C, then write a final checkpoint so the next
+            // boot resumes from the very last folded position rather than the
+            // last periodic cadence write.
+            axum::serve(listener, router(state))
+                .with_graceful_shutdown(async {
+                    tokio::signal::ctrl_c().await.ok();
+                })
+                .await
+                .expect("serve");
+            print!("\nwriting shutdown checkpoint ... ");
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+            match projections.checkpoint_now().await {
+                Ok(()) => println!("done."),
+                Err(e) => println!("failed: {e}"),
+            }
         }
         None => {
             let state = mem_state().await;

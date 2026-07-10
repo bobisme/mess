@@ -1,33 +1,76 @@
 //! Real [`ReadModels`] over the store: **rebuildable** in-memory projections
-//! that tail the global event log.
+//! that tail the global event log via [`EventStore::subscribe`], and
+//! **checkpoint** their folded state so a restart resumes from where it left
+//! off instead of replaying the whole log from position 0.
 //!
 //! This is the read-path counterpart to [`crate::contracts::FakeReadModels`].
 //! Where the fake is seeded imperatively and is synchronously consistent, this
-//! [`Projections`] type is built the way a production read model is: by
-//! **replaying the event log from position 0**, folding every event into
-//! in-memory tables, and then **following the log live** as new events land.
-//! Construction *is* a rebuild — there is no separate "rebuild" entry point,
-//! because rebuild-from-zero is the only way it is ever built. That is the
-//! event-sourcing showcase: the same [`new`](Projections::new) call that a
-//! long-running process invokes once at boot is exactly what a test invokes to
-//! rebuild a fresh, identical view (see the `rebuild == live` equivalence
-//! test).
+//! [`Projections`] type is built the way a production read model is: by folding
+//! the event log into in-memory tables and following the log live as new events
+//! land. [`Projections::new`] always folds **from position 0** — a full,
+//! from-scratch rebuild, the event-sourcing showcase and the equivalence test's
+//! baseline. [`Projections::with_checkpoint`] is the operational path: it
+//! **resumes** from a persisted checkpoint (folded state + the global position
+//! it was current to) and only replays the *suffix* of the log committed since,
+//! falling back to a clean from-0 rebuild whenever the checkpoint is missing,
+//! stale, or corrupt.
 //!
-//! # What the store hands an application (dogfood finding)
+//! # The store primitives this is built on
 //!
-//! The app-facing [`EventStore`] exposes **no** subscription or live-tail API.
-//! The only global-read primitive reachable from an application is
-//! [`Backend::read_global`] via [`EventStore::backend`] — a paged
-//! `read_global(after, limit)` pull. The catch-up→live subscription runtime in
-//! `mess-log` (`subscription.rs`, spec D11) runs on that crate's own
-//! `ReadView`/`Watermark` primitives and is **not** wired to
-//! [`EventStore`]/[`Backend`]. So this projection is built on the one thing
-//! that *is* exposed — `read_global` — with a small **polling adapter**: a
-//! background task that pages `read_global` from a cursor, applies each event,
-//! and advances a watermark. A proposed store-level API to remove the polling
-//! is filed as this bone's top open question.
+//! The app-facing [`EventStore`] exposes an **event-bounded** catch-up→live
+//! subscription ([`EventStore::subscribe`]) plus a committed-watermark barrier
+//! ([`EventStore::watermark`]/[`EventStore::await_past`]), all driven by commit
+//! notification rather than polling — the [`SubscribeBackend`] capability. This
+//! projection adopts them directly:
 //!
-//! # Design decisions
+//! - **Live tail.** The pump owns one [`Subscription`] and pulls batches with
+//!   [`Subscription::next_batch`]. While caught up it is *parked on the
+//!   watermark*, woken by the next commit — there is no `sleep`-based poll loop
+//!   (the previous 1 ms `read_global` poll is gone).
+//! - **`wait_for` is event-bounded.** The read-your-writes barrier resolves the
+//!   instant the pump has *folded* past the requested position. Because the
+//!   pump advances only on a real commit-notification wake, `wait_for` inherits
+//!   event-bounded latency — it no longer waits out a poll interval.
+//!
+//! # Checkpoint placement (deliberate)
+//!
+//! The checkpoint is a **sidecar file next to the store dir**
+//! (`<dir>/.social-projections.ckpt`), written with an **atomic
+//! write-to-temp-then-rename** so a crash mid-write can never leave a
+//! half-written checkpoint in place (the rename is atomic; a stale/partial
+//! `.tmp` is simply ignored on the next load). It is deliberately **not**
+//! written into the event log itself: a projection checkpoint is derived,
+//! disposable read-model state, and appending it to the domain history would
+//! pollute the log every application would then have to replay and skip. A
+//! sidecar keeps the log pure and the checkpoint trivially discardable.
+//!
+//! # Versioning & crash-safety
+//!
+//! [`PROJECTION_VERSION`] mirrors a `fold_version`: bump it whenever the fold
+//! logic changes, so a checkpoint written by older logic is **discarded** and
+//! the projection rebuilds clean from 0 — never partially trusted. The file
+//! also carries a [`CKPT_MAGIC`] magic and an envelope [`CKPT_FORMAT_VERSION`]
+//! (orthogonal to `PROJECTION_VERSION`: the envelope framing versus the fold
+//! logic), so a truncated or foreign file that happens to decode is rejected on
+//! the header rather than half-loaded. A corrupt/truncated file simply fails to
+//! decode and triggers a from-0 rebuild — no panic. Crash-safety is therefore:
+//! at worst re-fold the suffix from the last checkpoint, and folds are
+//! idempotent from a position (the resume path folds exactly the positions the
+//! checkpoint had not yet seen), which the `tests/projections.rs` kill/restart
+//! and live-pump-checkpoint tests prove against a from-0 rebuild.
+//!
+//! # The counter story
+//!
+//! Like/follower counts are projection-maintained (folded from the
+//! relationship streams into the crowd maps below), so they live **inside** the
+//! checkpointed [`State`] and resume with it — a restart does not re-scan the
+//! log to recount. What the checkpoint does **not** carry is the
+//! [`ProjectionAnomalies`] counters: those count the records *this process*
+//! skipped and are observability of a run, not domain-derived state, so a fresh
+//! process starts them at zero (persisting cross-restart totals would conflate
+//! distinct processes' skip histories — an explicitly rejected choice).
+//!
+//! # Design decisions (unchanged from the pre-checkpoint model)
 //!
 //! - **Pull (query-time filtering), not push (fan-out).** A home timeline is
 //!   computed at query time by filtering all posts against the viewer's
@@ -62,17 +105,19 @@
 
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ident::Id;
 use mess_core::{CodecError, Event};
 use mess_store::{
     AnomalyKind, Backend, EventStore, ProjectionAnomalies,
-    ProjectionAnomaliesSnapshot, StoredRecord,
+    ProjectionAnomaliesSnapshot, StoredRecord, SubscribeBackend, Subscription,
 };
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, RwLock};
 
 use crate::contracts::{PostView, ProfileView, ReadModels, TimelinePage};
@@ -82,14 +127,42 @@ use crate::domain::post::PostEvent;
 use crate::domain::user::UserEvent;
 use crate::parse_pair;
 
-/// How many global events to pull per `read_global` page.
-const BATCH: usize = 512;
+/// The **projection-logic version**, mirroring a `fold_version`.
+///
+/// Bump this whenever the fold logic (what [`State::apply_record`] does with an
+/// event, or the shape of [`State`]) changes in a way that makes an older
+/// checkpoint's folded state wrong. A checkpoint whose `projection_version`
+/// does not match this constant is **discarded** and the projection rebuilds
+/// clean from position 0 — never partially trusted. This is deliberately
+/// distinct from [`CKPT_FORMAT_VERSION`] (the on-disk envelope framing): the
+/// framing can be stable while the fold logic changes, and vice versa.
+pub const PROJECTION_VERSION: u32 = 1;
 
-/// How long the live pump sleeps when it has drained the log, before polling
-/// `read_global` again. Small because the only backpressure signal available
-/// over the `read_global` pull is "an empty page means caught up" — there is
-/// no commit notification to await (see the module docs' dogfood finding).
-const POLL: Duration = Duration::from_millis(1);
+/// Magic bytes at the head of a checkpoint file, distinct from
+/// [`PROJECTION_VERSION`]. A truncated, foreign, or garbage file that happens
+/// to decode into the envelope shape is rejected here rather than half-loaded.
+const CKPT_MAGIC: u32 = 0x534F_4350; // "SOCP"
+
+/// On-disk checkpoint **envelope** format version — the framing of the file,
+/// orthogonal to [`PROJECTION_VERSION`]. Bump only if the [`Checkpoint`] struct
+/// layout changes; a mismatch discards the checkpoint like any other.
+const CKPT_FORMAT_VERSION: u16 = 1;
+
+/// Default live-pump checkpoint cadence: write a checkpoint after this many
+/// folded events. Bounds staleness by event count.
+const CKPT_EVERY_N: u64 = 256;
+
+/// Default live-pump checkpoint cadence by wall time: also write a checkpoint
+/// if this long has elapsed since the last one (whichever trips first). Only
+/// evaluated when a batch lands — a quiescent projection has nothing new to
+/// persist.
+const CKPT_EVERY_T: Duration = Duration::from_secs(5);
+
+/// How long the pump backs off after a *transient backend error* from the
+/// subscription before retrying. This is an error backoff, **not** a
+/// steady-state poll: on the happy path the pump is parked on the store
+/// watermark (event-bounded), never sleeping.
+const PUMP_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 
 // ===========================================================================
 // Folded state
@@ -101,7 +174,7 @@ const POLL: Duration = Duration::from_millis(1);
 /// It is reconstructed from the `follow-<a>_<b>` relationship streams into
 /// [`State::following`]/[`State::followers`] — see the module docs on why the
 /// crowd lives in the projection, not the aggregate.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct UserRow {
     handle:       String,
     display_name: String,
@@ -112,7 +185,7 @@ struct UserRow {
 /// Bounded, mirroring the write aggregate: the like *crowd* is **not** here.
 /// It is reconstructed from the `like-<post>_<user>` relationship streams into
 /// [`State::likes`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PostRow {
     /// The post's id (also its stream id, `post-<id>`, less the prefix).
     id:      Id,
@@ -131,7 +204,12 @@ struct PostRow {
 /// the relationship streams, keyed for O(1) counts and membership, and kept
 /// independent of the entity rows so a relationship event that lands before
 /// its entity (any global order is possible) folds cleanly regardless.
-#[derive(Debug, Default)]
+///
+/// `Serialize`/`Deserialize` are derived so the whole folded view — including
+/// the like/follower crowd maps that back the counts — round-trips into a
+/// checkpoint (see [`Checkpoint`]). `Clone` lets the pump snapshot the state
+/// under a brief read lock and serialize the copy outside the lock.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct State {
     /// user id -> folded user row.
     users:     HashMap<Id, UserRow>,
@@ -431,6 +509,100 @@ impl State {
 }
 
 // ===========================================================================
+// Checkpoint: the on-disk sidecar
+// ===========================================================================
+
+/// The on-disk checkpoint envelope: a magic + envelope-format header, the
+/// projection-logic version it was written under, the global position the
+/// folded state is current *to* (its watermark, i.e. one past the highest
+/// global position folded), and the folded [`State`] itself.
+///
+/// Serialized with msgpack (`rmp-serde`) — the same codec `#[derive(Event)]`
+/// uses for event payloads, so no new serialization strategy enters the crate.
+/// The header fields come first so a truncated file fails to decode (or fails
+/// the header check) rather than half-loading a plausible-looking state.
+#[derive(Serialize, Deserialize)]
+struct Checkpoint {
+    /// [`CKPT_MAGIC`] — a foreign/garbage file that decodes is rejected here.
+    magic:              u32,
+    /// [`CKPT_FORMAT_VERSION`] — the envelope framing version.
+    format_version:     u16,
+    /// [`PROJECTION_VERSION`] the state was folded under; a mismatch discards.
+    projection_version: u32,
+    /// The watermark the state is current to: one past the highest folded
+    /// global position, i.e. the `from` a resume subscribes at.
+    applied:            u64,
+    /// The folded read model, crowd count maps included.
+    state:              State,
+}
+
+impl Checkpoint {
+    /// Load and **validate** a checkpoint from `path`. Returns the `(applied,
+    /// state)` to resume from, or `None` — a full from-0 rebuild — whenever the
+    /// file is missing, undecodable (corrupt/truncated), or fails any header
+    /// check (wrong magic, envelope format, or [`PROJECTION_VERSION`]). Never
+    /// panics and never partially trusts a checkpoint.
+    fn load(path: &Path) -> Option<(u64, State)> {
+        let bytes = std::fs::read(path).ok()?;
+        // A truncated or garbage file fails to decode here -> None -> rebuild.
+        let ck: Checkpoint = rmp_serde::from_slice(&bytes).ok()?;
+        if ck.magic != CKPT_MAGIC
+            || ck.format_version != CKPT_FORMAT_VERSION
+            || ck.projection_version != PROJECTION_VERSION
+        {
+            return None;
+        }
+        Some((ck.applied, ck.state))
+    }
+}
+
+/// Serialize `state` (current to `applied`, folded under projection-logic
+/// version `version`) and write it to `path` **atomically**: write a sibling
+/// temp file, then rename it over `path`. The rename is atomic on every target
+/// filesystem, so a reader (this process on the next boot, or a concurrent one)
+/// never observes a half-written checkpoint; a crash mid-write leaves at worst
+/// a stale `.tmp` that the next [`Checkpoint::load`] ignores.
+fn write_checkpoint(
+    state: State,
+    applied: u64,
+    version: u32,
+    path: &Path,
+) -> std::io::Result<()> {
+    let ck = Checkpoint {
+        magic: CKPT_MAGIC,
+        format_version: CKPT_FORMAT_VERSION,
+        projection_version: version,
+        applied,
+        state,
+    };
+    let bytes = rmp_serde::to_vec(&ck).map_err(std::io::Error::other)?;
+    let tmp = tmp_path(path);
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// The sibling temp path for the atomic write: `<path>.tmp`.
+fn tmp_path(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".tmp");
+    PathBuf::from(s)
+}
+
+/// Live-pump checkpoint cadence + destination, shared (behind an `Arc`) between
+/// the pump task and [`Projections::checkpoint_now`].
+#[derive(Debug)]
+struct CheckpointCfg {
+    /// The sidecar checkpoint file to (atomically) write.
+    path:    PathBuf,
+    /// Write a checkpoint after this many folded events.
+    every_n: u64,
+    /// ...or after this much wall time since the last checkpoint, whichever
+    /// trips first (evaluated only when a batch lands).
+    every_t: Duration,
+}
+
+// ===========================================================================
 // Projections: the live, rebuildable read model
 // ===========================================================================
 
@@ -453,104 +625,223 @@ pub struct PostLookup {
 }
 
 /// A rebuildable, live-tailing [`ReadModels`] implementation over any
-/// [`Backend`].
+/// [`SubscribeBackend`], with optional checkpointed resume.
 ///
 /// Cloneable is intentionally **not** derived: the value owns the live pump
 /// task and aborts it on drop, so there is exactly one owner of the tail.
 /// Share it behind an `Arc` if several handlers need it.
 #[derive(Debug)]
 pub struct Projections<B: Backend> {
-    state:     Arc<RwLock<State>>,
+    state:        Arc<RwLock<State>>,
     /// The read watermark: the number of global events applied, i.e. one past
     /// the highest global position folded in. `wait_for(p)` waits for this to
     /// exceed `p`.
-    applied:   Arc<AtomicU64>,
+    applied:      Arc<AtomicU64>,
     /// Pulsed after every batch the pump applies, so `wait_for` waiters wake.
-    notify:    Arc<Notify>,
+    notify:       Arc<Notify>,
     /// Counts of records this projection could not decode or route, across
     /// both the catch-up replay and the live pump (`bn-3uu`). Held behind an
     /// `Arc` (not the `state` lock) so [`Projections::anomalies`] reads it
     /// without contending with the fold.
-    anomalies: Arc<ProjectionAnomalies>,
+    anomalies:    Arc<ProjectionAnomalies>,
+    /// The global position this instance resumed folding from: `0` for a full
+    /// from-0 rebuild (including a discarded/absent checkpoint), or the
+    /// checkpoint's watermark when it resumed. Exposed by
+    /// [`Projections::resumed_from`] so a test can assert whether a rebuild or
+    /// a resume happened.
+    resumed_from: u64,
+    /// The checkpoint destination + cadence, if this instance checkpoints.
+    /// `None` for [`Projections::new`] (a pure from-0 rebuild that never
+    /// persists). Shared with the pump task.
+    checkpoint:   Option<Arc<CheckpointCfg>>,
     /// The live pump; aborted on drop.
-    pump:      tokio::task::JoinHandle<()>,
-    _backend:  PhantomData<B>,
+    pump:         tokio::task::JoinHandle<()>,
+    _backend:     PhantomData<B>,
 }
 
 impl<B: Backend> Drop for Projections<B> {
     fn drop(&mut self) { self.pump.abort(); }
 }
 
-impl<B: Backend + Clone> Projections<B> {
+impl<B: SubscribeBackend + Clone> Projections<B> {
     /// Build the read model by **replaying the whole log from position 0**,
-    /// then spawn the live pump that follows it forward.
+    /// then spawn the live pump that follows it forward. This instance does
+    /// **not** checkpoint — it is the pure, from-scratch rebuild the
+    /// equivalence tests use as their baseline and the public "rebuild from 0"
+    /// seam. Use [`with_checkpoint`](Self::with_checkpoint) for the operational
+    /// path that resumes.
     ///
-    /// Two phases, the catch-up→live handoff:
-    /// 1. **Catch-up** (synchronous): drain `read_global` from the start into
-    ///    the tables, so every query issued immediately after `new` returns
-    ///    reflects all events already committed at build time.
-    /// 2. **Live** (background task): continue paging `read_global` from the
-    ///    catch-up cursor, applying new events and advancing the watermark as
-    ///    they land.
-    ///
-    /// Because phase 1 always starts from 0, **construction is a full
-    /// rebuild** — that is the property the equivalence test exercises.
+    /// Construction is a full rebuild: phase 1 folds all committed history
+    /// synchronously (so every query issued immediately after `new` reflects
+    /// it) and phase 2 tails the log live via [`EventStore::subscribe`].
     pub async fn new(store: &EventStore<B>) -> Self {
-        let backend = store.backend().clone();
-        let state = Arc::new(RwLock::new(State::default()));
-        let applied = Arc::new(AtomicU64::new(0));
+        Self::build(store, State::default(), 0, None).await
+    }
+
+    /// Build the read model, **resuming from a checkpoint** at `path` when one
+    /// is present and valid, else falling back to a clean from-0 rebuild.
+    ///
+    /// On resume, only the log *suffix* committed since the checkpoint is
+    /// replayed — startup does not re-fold the whole log. The checkpoint is
+    /// discarded (and a full rebuild done) whenever it is missing, corrupt/
+    /// truncated, header-invalid, of a mismatched [`PROJECTION_VERSION`], or —
+    /// a safety guard — ahead of the store's current watermark (which would
+    /// mean the state is inconsistent with the log). The instance then
+    /// checkpoints during the live pump at the default cadence
+    /// ([`CKPT_EVERY_N`] events / [`CKPT_EVERY_T`]) and on
+    /// [`checkpoint_now`](Self::checkpoint_now).
+    pub async fn with_checkpoint(
+        store: &EventStore<B>,
+        path: impl Into<PathBuf>,
+    ) -> Self {
+        Self::with_checkpoint_cadence(store, path, CKPT_EVERY_N, CKPT_EVERY_T)
+            .await
+    }
+
+    /// [`with_checkpoint`](Self::with_checkpoint) with an explicit live-pump
+    /// cadence — a checkpoint is written after `every_n` folded events or
+    /// `every_t` elapsed since the last one, whichever trips first. Tests use a
+    /// very large `every_n` to make checkpointing happen only on an explicit
+    /// [`checkpoint_now`](Self::checkpoint_now).
+    pub async fn with_checkpoint_cadence(
+        store: &EventStore<B>,
+        path: impl Into<PathBuf>,
+        every_n: u64,
+        every_t: Duration,
+    ) -> Self {
+        let path = path.into();
+        let head = store.watermark().await.unwrap_or(0);
+        // Resume only from a checkpoint that is valid AND not ahead of the
+        // store's watermark — a checkpoint ahead of the log means the folded
+        // state reflects positions the store no longer has (e.g. after a store
+        // rollback), so it cannot be trusted: rebuild clean.
+        let (state, from) = match Checkpoint::load(&path) {
+            Some((applied, state)) if applied <= head => (state, applied),
+            _ => (State::default(), 0),
+        };
+        let cfg = Arc::new(CheckpointCfg { path, every_n, every_t });
+        Self::build(store, state, from, Some(cfg)).await
+    }
+
+    /// The shared construction core: seed `initial` state as current to global
+    /// position `from`, synchronously catch up to the store's current
+    /// watermark, then spawn the live pump.
+    async fn build(
+        store: &EventStore<B>,
+        initial: State,
+        from: u64,
+        checkpoint: Option<Arc<CheckpointCfg>>,
+    ) -> Self {
+        let head = store.watermark().await.unwrap_or(0);
+        let state = Arc::new(RwLock::new(initial));
+        let applied = Arc::new(AtomicU64::new(from));
         let notify = Arc::new(Notify::new());
         let anomalies = Arc::new(ProjectionAnomalies::new());
 
-        // Phase 1: synchronous catch-up from position 0 to the current head.
-        let mut after: Option<u64> = None;
+        // One subscription serves both phases: catch-up reads committed history
+        // page-by-page (never blocking while `position < head`), then the same
+        // cursor is handed to the pump for the event-bounded live tail — no gap
+        // between the two.
+        let mut sub = store.subscribe(Some(from));
+
+        // Phase 1: synchronous catch-up from `from` to the current watermark.
         {
             let mut st = state.write().await;
-            loop {
-                let page = match backend.read_global(after, BATCH).await {
-                    Ok(p) => p,
+            while sub.position() < head {
+                match sub.next_batch().await {
+                    Ok(batch) => {
+                        for rec in &batch {
+                            st.apply_record(rec, &anomalies);
+                        }
+                    }
                     // A transient read error ends catch-up early; the live pump
-                    // resumes from `after` and self-heals.
+                    // resumes from the same cursor and self-heals.
                     Err(_) => break,
-                };
-                if page.is_empty() {
-                    break;
-                }
-                let short = page.len() < BATCH;
-                for rec in &page {
-                    st.apply_record(rec, &anomalies);
-                    after = Some(rec.global_position);
-                }
-                if short {
-                    break;
                 }
             }
         }
-        applied.store(watermark_of(after), Ordering::Release);
+        applied.store(sub.position(), Ordering::Release);
 
-        // Phase 2: spawn the live pump.
+        // Phase 2: spawn the live pump over the same subscription.
         let pump = tokio::spawn(pump_loop(
-            backend,
+            sub,
             state.clone(),
             applied.clone(),
             notify.clone(),
             anomalies.clone(),
-            after,
+            checkpoint.clone(),
         ));
 
-        Self { state, applied, notify, anomalies, pump, _backend: PhantomData }
+        Self {
+            state,
+            applied,
+            notify,
+            anomalies,
+            resumed_from: from,
+            checkpoint,
+            pump,
+            _backend: PhantomData,
+        }
     }
 
+    /// Persist a checkpoint **now**, atomically, current to whatever the pump
+    /// has folded so far. A no-op (`Ok(())`) for an instance built without a
+    /// checkpoint destination ([`Projections::new`]). Call this on a clean
+    /// shutdown so the next boot resumes from the very last folded position
+    /// rather than the last periodic cadence write.
+    pub async fn checkpoint_now(&self) -> std::io::Result<()> {
+        self.checkpoint_as(PROJECTION_VERSION).await
+    }
+
+    /// Test hook: persist a checkpoint stamped with an arbitrary
+    /// `projection_version`, so a test can plant a *stale-version* checkpoint
+    /// and prove the resume path discards it in favour of a from-0 rebuild.
+    /// Not part of the supported surface.
+    #[doc(hidden)]
+    pub async fn checkpoint_now_as_version(
+        &self,
+        version: u32,
+    ) -> std::io::Result<()> {
+        self.checkpoint_as(version).await
+    }
+
+    async fn checkpoint_as(&self, version: u32) -> std::io::Result<()> {
+        let Some(cfg) = &self.checkpoint else { return Ok(()) };
+        let applied = self.applied.load(Ordering::Acquire);
+        // Snapshot under a brief read lock, serialize + write outside it.
+        let snap = self.state.read().await.clone();
+        write_checkpoint(snap, applied, version, &cfg.path)
+    }
+}
+
+impl<B: Backend> Projections<B> {
     /// The undecodable-payload / unroutable-stream / unknown-event-kind
     /// counters for records this projection has skipped, across both the
     /// initial catch-up replay and the live pump (`bn-3uu`). The liveness
     /// policy is unchanged — a skip is still a skip — but a schema drift or
     /// routing bug now shows up here (and, on each counter's first hit, as a
-    /// one-time warning line) instead of vanishing silently. See
+    /// one-time warning line) instead of vanishing silently. Not carried in
+    /// the checkpoint (per-process observability, not domain state), so a
+    /// resumed instance starts these at zero. See
     /// [`mess_store::ProjectionAnomalies`].
     #[must_use]
     pub fn anomalies(&self) -> ProjectionAnomaliesSnapshot {
         self.anomalies.snapshot()
+    }
+
+    /// The global position this instance resumed folding from: `0` for a full
+    /// from-0 rebuild (a fresh store, or a discarded/absent/stale checkpoint),
+    /// or the checkpoint's watermark when it resumed and replayed only the
+    /// suffix. The test marker for "did we rebuild or resume?".
+    #[must_use]
+    pub fn resumed_from(&self) -> u64 { self.resumed_from }
+
+    /// The current read watermark: one past the highest global position folded
+    /// (equivalently, the count of events applied). This is exactly what a
+    /// checkpoint written now would record as its `applied`.
+    #[must_use]
+    pub fn applied_position(&self) -> u64 {
+        self.applied.load(Ordering::Acquire)
     }
 
     /// Permalink lookup: resolve a post by id **including deleted posts**,
@@ -569,44 +860,60 @@ impl<B: Backend + Clone> Projections<B> {
     }
 }
 
-/// The watermark for a "last applied global position" cursor: one past it, or
-/// 0 when nothing has been applied.
-fn watermark_of(after: Option<u64>) -> u64 { after.map_or(0, |p| p + 1) }
-
-/// The live pump: page `read_global` from `after`, apply each event, advance
-/// the watermark, and pulse waiters — sleeping briefly whenever the log is
-/// drained. Runs until the [`Projections`] is dropped (which aborts it).
-async fn pump_loop<B: Backend>(
-    backend: B,
+/// The live pump: pull the next committed batch from the subscription (parked
+/// event-bounded on the store watermark while caught up — no poll loop), fold
+/// each record, advance the watermark, pulse `wait_for` waiters, and write a
+/// checkpoint when the cadence trips. Runs until the [`Projections`] is dropped
+/// (which aborts it).
+async fn pump_loop<B: SubscribeBackend>(
+    mut sub: Subscription<B>,
     state: Arc<RwLock<State>>,
     applied: Arc<AtomicU64>,
     notify: Arc<Notify>,
     anomalies: Arc<ProjectionAnomalies>,
-    mut after: Option<u64>,
+    checkpoint: Option<Arc<CheckpointCfg>>,
 ) {
+    let mut since_ckpt: u64 = 0;
+    let mut last_ckpt = Instant::now();
     loop {
-        let page = match backend.read_global(after, BATCH).await {
-            Ok(p) => p,
+        let batch = match sub.next_batch().await {
+            Ok(b) => b,
+            // Transient backend error: back off briefly (an error backoff, not
+            // a steady-state poll) and retry from the same cursor.
             Err(_) => {
-                tokio::time::sleep(POLL).await;
+                tokio::time::sleep(PUMP_ERROR_BACKOFF).await;
                 continue;
             }
         };
-        if page.is_empty() {
-            // Caught up: nothing to await over a bare `read_global` pull, so
-            // poll again shortly.
-            tokio::time::sleep(POLL).await;
-            continue;
-        }
         {
             let mut st = state.write().await;
-            for rec in &page {
+            for rec in &batch {
                 st.apply_record(rec, &anomalies);
-                after = Some(rec.global_position);
             }
         }
-        applied.store(watermark_of(after), Ordering::Release);
+        let now_applied = sub.position();
+        applied.store(now_applied, Ordering::Release);
         notify.notify_waiters();
+
+        if let Some(cfg) = &checkpoint {
+            since_ckpt += batch.len() as u64;
+            if since_ckpt >= cfg.every_n || last_ckpt.elapsed() >= cfg.every_t {
+                let snap = state.read().await.clone();
+                if let Err(e) = write_checkpoint(
+                    snap,
+                    now_applied,
+                    PROJECTION_VERSION,
+                    &cfg.path,
+                ) {
+                    eprintln!(
+                        "social projections: WARNING checkpoint write failed \
+                         at position {now_applied}: {e}"
+                    );
+                }
+                since_ckpt = 0;
+                last_ckpt = Instant::now();
+            }
+        }
     }
 }
 
@@ -699,10 +1006,13 @@ impl<B: Backend> ReadModels for Projections<B> {
     }
 
     async fn wait_for(&self, position: u64) {
-        // Block until the pump has applied the event at global `position`,
-        // i.e. the watermark (count applied) has passed it. Arm the notified()
-        // future *before* the final check to avoid a lost wakeup between the
-        // load and the await.
+        // Block until the pump has *folded* past global `position` — i.e. the
+        // applied watermark exceeds it. The pump advances only on a real
+        // commit-notification wake from the subscription (it is parked on the
+        // store watermark while caught up, never polling), so this barrier is
+        // event-bounded: it resolves as soon as the write is folded, not after
+        // a poll interval. Arm the `notified()` future *before* the final check
+        // to avoid a lost wakeup between the load and the await.
         loop {
             if self.applied.load(Ordering::Acquire) > position {
                 return;
