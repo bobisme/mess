@@ -33,7 +33,9 @@ impl StrPos {
 impl Eq for StrPos {}
 impl std::cmp::Ord for StrPos {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.partial_cmp(other).unwrap()
+        self.0
+            .load(Ordering::SeqCst)
+            .cmp(&other.0.load(Ordering::SeqCst))
     }
 }
 
@@ -51,9 +53,7 @@ impl std::hash::Hash for StrPos {
 
 impl PartialOrd for StrPos {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.0
-            .load(Ordering::SeqCst)
-            .partial_cmp(&other.0.load(Ordering::SeqCst))
+        Some(self.cmp(other))
     }
 }
 
@@ -86,7 +86,7 @@ pub struct StreamName<'a> {
     ex_split: StrPos,
 }
 
-impl<'a> std::hash::Hash for StreamName<'a> {
+impl std::hash::Hash for StreamName<'_> {
     #[inline]
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.source.hash(state);

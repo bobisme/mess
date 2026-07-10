@@ -32,10 +32,7 @@
 pub mod error;
 pub mod streams;
 
-use std::{
-    borrow::Cow, convert::Into, fmt::Display, marker::PhantomData, ops::Deref,
-    sync::Arc,
-};
+use std::{borrow::Cow, convert::Into, fmt::Display, ops::Deref, sync::Arc};
 
 use crate::error::Error;
 use ident::Id;
@@ -139,13 +136,13 @@ pub trait Event {
     /// # Errors
     ///
     /// Return an error if there is a problem serializing the data.
-    fn data<'a>(&self) -> Result<Cow<'a, [u8]>, Error>;
+    fn data<'a>(&self) -> Result<Cow<'a, [u8]>, Error<'_>>;
     /// Return serialized version of the event's metadata.
     ///
     /// # Errors
     ///
     /// Return an error if there is a problem serializing the metadata.
-    fn metadata<'a>(&self) -> Result<Cow<'a, [u8]>, Error>;
+    fn metadata<'a>(&self) -> Result<Cow<'a, [u8]>, Error<'_>>;
 }
 
 pub trait ApplyEvents {
@@ -232,7 +229,7 @@ impl EventDB {
         stream_name: &str,
         event: &impl Event,
         expected_version: Option<Version>,
-    ) -> Result<Position, Error> {
+    ) -> Result<Position, Error<'_>> {
         // let msg = event.into();
         debug!(stream_name, ?expected_version, "putting message");
         let stream_name = stream_name.to_string().into();
@@ -277,7 +274,7 @@ impl<Data, Db: AsRef<EventDB>> ComponentStore<Data, Db> {
         &self,
         entity: Entity,
         stream_name: &str,
-    ) -> Result<Component<Data>, Error>
+    ) -> Result<Component<Data>, Error<'_>>
     where
         Component<Data>: ApplyMessages<'msg>,
         Data: Default + Send + Sync,
