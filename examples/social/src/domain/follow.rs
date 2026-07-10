@@ -51,6 +51,9 @@
 
 use mess_core::Decide;
 use mess_derive::{Aggregate, Event};
+use mess_store::{Snapshottable, StateCodecError};
+
+use crate::domain::snapshot_codec::Reader;
 
 // ---------------------------------------------------------------------------
 // Events: the wire vocabulary for one follow edge's stream.
@@ -92,6 +95,30 @@ impl Follow {
             FollowEvent::Followed => self.following = true,
             FollowEvent::Unfollowed => self.following = false,
         }
+    }
+}
+
+/// A [`Follow`] edge's snapshot is a single byte — the alternating bit, exactly
+/// like [`Like`](super::like::Like). What used to be an O(followers) `HashSet`
+/// on the user is now one bit per edge, so snapshots stay tiny and the
+/// warm-write / snapshot-cold-load paths are trivially cheap.
+///
+/// **`FOLD_VERSION` bump rule.** Bump whenever [`Follow::apply`] semantics or
+/// the `encode_state` / `decode_state` byte shape change such that an old blob
+/// would misrepresent the state; a bump invalidates older snapshots (rebuilt by
+/// full replay, §9). A pure refactor that preserves both does not bump.
+impl Snapshottable for Follow {
+    const FOLD_VERSION: u32 = 1;
+
+    fn encode_state(&self) -> Result<Vec<u8>, StateCodecError> {
+        Ok(vec![u8::from(self.following)])
+    }
+
+    fn decode_state(bytes: &[u8]) -> Result<Self, StateCodecError> {
+        let mut r = Reader::new(bytes);
+        let following = r.read_bool()?;
+        r.finish()?;
+        Ok(Follow { following })
     }
 }
 
@@ -159,5 +186,25 @@ impl Decide<RemoveFollow> for Follow {
             return Err(FollowError::NotFollowing);
         }
         Ok(vec![FollowEvent::Unfollowed])
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn state_round_trips_through_bytes() {
+        for following in [false, true] {
+            let state = Follow { following };
+            let bytes = state.encode_state().unwrap();
+            assert_eq!(Follow::decode_state(&bytes).unwrap(), state);
+        }
+    }
+
+    #[test]
+    fn malformed_blob_errors_not_panics() {
+        assert!(Follow::decode_state(&[]).is_err());
+        assert!(Follow::decode_state(&[1, 2, 3]).is_err());
     }
 }

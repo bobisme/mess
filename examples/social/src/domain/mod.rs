@@ -28,3 +28,8 @@ pub mod follow;
 pub mod like;
 pub mod post;
 pub mod user;
+
+/// The tiny length-prefixed byte codec the four aggregates share for their
+/// [`Snapshottable`](mess_store::Snapshottable) state blobs. Crate-internal —
+/// the on-wire snapshot shape is an implementation detail, not public API.
+pub(crate) mod snapshot_codec;

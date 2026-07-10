@@ -59,6 +59,9 @@
 
 use mess_core::Decide;
 use mess_derive::{Aggregate, Event};
+use mess_store::{Snapshottable, StateCodecError};
+
+use crate::domain::snapshot_codec::{Reader, put_bool, put_str};
 
 // ---------------------------------------------------------------------------
 // Events: the wire vocabulary for one user's stream.
@@ -113,6 +116,37 @@ impl User {
                 display_name.clone_into(&mut self.display_name);
             }
         }
+    }
+}
+
+/// A [`User`] snapshot is an existence bit plus two short, length-capped
+/// strings — bounded by construction now that the follow graph lives on its own
+/// relationship streams (`bn-jes`). No O(following) set is ever serialized.
+///
+/// **`FOLD_VERSION` bump rule.** Bump whenever [`User::apply`] semantics or the
+/// `encode_state` / `decode_state` byte shape change such that a blob written
+/// by the old fold would misrepresent the state (a newly-folded [`UserEvent`]
+/// variant, a new/removed field, a reordered blob). A bump invalidates older
+/// snapshots, which `load_cached` rebuilds by full replay (§9); a pure refactor
+/// that preserves the folded state and blob shape does not bump.
+impl Snapshottable for User {
+    const FOLD_VERSION: u32 = 1;
+
+    fn encode_state(&self) -> Result<Vec<u8>, StateCodecError> {
+        let mut out = Vec::new();
+        put_bool(&mut out, self.registered);
+        put_str(&mut out, &self.handle);
+        put_str(&mut out, &self.display_name);
+        Ok(out)
+    }
+
+    fn decode_state(bytes: &[u8]) -> Result<Self, StateCodecError> {
+        let mut r = Reader::new(bytes);
+        let registered = r.read_bool()?;
+        let handle = r.read_str()?;
+        let display_name = r.read_str()?;
+        r.finish()?;
+        Ok(User { registered, handle, display_name })
     }
 }
 
@@ -217,5 +251,39 @@ impl Decide<SetDisplayName> for User {
         Ok(vec![UserEvent::DisplayNameChanged {
             display_name: cmd.display_name,
         }])
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn state_round_trips_through_bytes() {
+        let states = [
+            User::default(),
+            User {
+                registered:   true,
+                handle:       "alice".into(),
+                display_name: "Alice 🎉".into(),
+            },
+            User {
+                registered:   true,
+                handle:       "under_score_30_chars_0000000_x".into(),
+                display_name: String::new(),
+            },
+        ];
+        for state in states {
+            let bytes = state.encode_state().unwrap();
+            assert_eq!(User::decode_state(&bytes).unwrap(), state);
+        }
+    }
+
+    #[test]
+    fn malformed_blob_errors_not_panics() {
+        // Truncated: a registered flag but no handle length/bytes.
+        assert!(User::decode_state(&[1]).is_err());
+        // Empty blob.
+        assert!(User::decode_state(&[]).is_err());
     }
 }

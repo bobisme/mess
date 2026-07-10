@@ -41,6 +41,9 @@
 use ident::Id;
 use mess_core::Decide;
 use mess_derive::{Aggregate, Event};
+use mess_store::{Snapshottable, StateCodecError};
+
+use crate::domain::snapshot_codec::{Reader, put_bool, put_opt_id, put_str};
 
 // ---------------------------------------------------------------------------
 // Events: the wire vocabulary for one post's stream.
@@ -98,6 +101,41 @@ impl Post {
                 self.deleted = true;
             }
         }
+    }
+}
+
+/// A [`Post`] snapshot is two existence bits, an optional author id, and the
+/// length-capped body — bounded now that the like *crowd* lives on its own
+/// [`Like`](super::like::Like) relationship streams (`bn-jes`). The pre-remodel
+/// aggregate would have serialized an O(likers) `HashSet` into every snapshot;
+/// this one never does. (The retired unbounded shape is measured directly by
+/// the `hot-post` benchmark in `tests/hot_post_bench.rs`.)
+///
+/// **`FOLD_VERSION` bump rule.** Bump whenever [`Post::apply`] semantics or the
+/// `encode_state` / `decode_state` byte shape change such that an old blob
+/// would misrepresent the state (a newly-folded [`PostEvent`] variant, a
+/// new/removed field, a reordered blob). A bump invalidates older snapshots
+/// (rebuilt by full replay, §9); a pure refactor preserving both does not bump.
+impl Snapshottable for Post {
+    const FOLD_VERSION: u32 = 1;
+
+    fn encode_state(&self) -> Result<Vec<u8>, StateCodecError> {
+        let mut out = Vec::new();
+        put_bool(&mut out, self.created);
+        put_bool(&mut out, self.deleted);
+        put_opt_id(&mut out, self.author);
+        put_str(&mut out, &self.body);
+        Ok(out)
+    }
+
+    fn decode_state(bytes: &[u8]) -> Result<Self, StateCodecError> {
+        let mut r = Reader::new(bytes);
+        let created = r.read_bool()?;
+        let deleted = r.read_bool()?;
+        let author = r.read_opt_id()?;
+        let body = r.read_str()?;
+        r.finish()?;
+        Ok(Post { created, deleted, author, body })
     }
 }
 
@@ -198,5 +236,41 @@ impl Decide<DeletePost> for Post {
             return Err(PostError::AlreadyDeleted);
         }
         Ok(vec![PostEvent::Deleted { by: cmd.by }])
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn state_round_trips_through_bytes() {
+        let author = Id::new();
+        let states = [
+            Post::default(),
+            Post {
+                created: true,
+                deleted: false,
+                author:  Some(author),
+                body:    "hello world".into(),
+            },
+            Post {
+                created: true,
+                deleted: true,
+                author:  Some(author),
+                body:    String::new(),
+            },
+        ];
+        for state in states {
+            let bytes = state.encode_state().unwrap();
+            assert_eq!(Post::decode_state(&bytes).unwrap(), state);
+        }
+    }
+
+    #[test]
+    fn malformed_blob_errors_not_panics() {
+        // created+deleted bits, an author-present tag, then nothing.
+        assert!(Post::decode_state(&[1, 0, 1]).is_err());
+        assert!(Post::decode_state(&[]).is_err());
     }
 }

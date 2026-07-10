@@ -376,6 +376,34 @@ pub trait WriteOps {
     ) -> impl Future<Output = Result<u64, WriteError>> + Send;
 }
 
+// ---------------------------------------------------------------------------
+// Warm writes: why this blanket impl still calls `command`, not
+// `command_cached`
+// ---------------------------------------------------------------------------
+//
+// Post-`bn-jes` every aggregate has *bounded* state and now implements
+// `Snapshottable` + `Clone` (see `domain::{user,post,like,follow}`), which are
+// exactly the bounds `EventStore::command_cached` (the hot-aggregate
+// write-through cache + snapshot-accelerated cold load) requires. So the warm
+// path is *available* for these aggregates — the `tests/snapshots.rs`
+// differential proves `command_cached` yields byte-identical results to
+// `command` (cache-off == cache-miss), and `tests/hot_post_bench.rs` measures
+// the speedup on a deep stream.
+//
+// This blanket impl nonetheless stays on plain `command`, deliberately, because
+// it is generic over `B: Backend`. `command_cached` lives in
+// `impl<B: SnapshotStore> EventStore<B>`, so switching this impl's body to it
+// would force the bound to `B: SnapshotStore` — and that bound is **not free to
+// tighten here**: `seed::generate<B: Backend>` (an out-of-scope file for this
+// bone) calls these `WriteOps` methods for *every* `B: Backend`, and the demo's
+// concrete on-disk `Store = EventStore<LogEngine>` is over `LogEngine`, which
+// is a plain `Backend`, not a `SnapshotStore`. Tightening the bound would break
+// both. Flipping the *app* to warm writes is therefore a construction-site
+// change (wrap the engine in `FjallSnapshotBackend<LogEngine>` and thread the
+// `SnapshotStore` bound through `seed::generate` and the web binary) that spans
+// files this bone must not touch — see the worker's concerns note. The warm
+// path is fully implemented and tested at the store seam; only the demo's
+// backing store is not yet snapshot-capable.
 impl<B: Backend> WriteOps for EventStore<B>
 where
     B::Error: std::fmt::Display,

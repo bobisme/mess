@@ -45,6 +45,9 @@
 
 use mess_core::Decide;
 use mess_derive::{Aggregate, Event};
+use mess_store::{Snapshottable, StateCodecError};
+
+use crate::domain::snapshot_codec::Reader;
 
 // ---------------------------------------------------------------------------
 // Events: the wire vocabulary for one like edge's stream.
@@ -86,6 +89,34 @@ impl Like {
             LikeEvent::Liked => self.liked = true,
             LikeEvent::Unliked => self.liked = false,
         }
+    }
+}
+
+/// A [`Like`] edge's snapshot is a single byte — the alternating bit. This is
+/// the payoff of the bounded relationship remodel (`bn-jes`): what used to be
+/// an O(likers) `HashSet` folded onto the post is now one bit per edge, so the
+/// warm-write path ([`command_cached`](mess_store::EventStore::command_cached))
+/// and the snapshot-accelerated cold load are both trivially cheap here.
+///
+/// **`FOLD_VERSION` bump rule.** Bump it whenever [`Like::apply`] semantics
+/// change in a way an old snapshot blob would misrepresent — a new
+/// [`LikeEvent`] variant that `apply` now folds, or any change to the
+/// `encode_state` / `decode_state` byte shape below. A bump invalidates every
+/// older snapshot, which `load_cached` then rebuilds by full replay (§9). A
+/// pure refactor that leaves the folded state and blob shape identical does
+/// **not** bump.
+impl Snapshottable for Like {
+    const FOLD_VERSION: u32 = 1;
+
+    fn encode_state(&self) -> Result<Vec<u8>, StateCodecError> {
+        Ok(vec![u8::from(self.liked)])
+    }
+
+    fn decode_state(bytes: &[u8]) -> Result<Self, StateCodecError> {
+        let mut r = Reader::new(bytes);
+        let liked = r.read_bool()?;
+        r.finish()?;
+        Ok(Like { liked })
     }
 }
 
@@ -143,5 +174,32 @@ impl Decide<RemoveLike> for Like {
             return Err(LikeError::NotLiked);
         }
         Ok(vec![LikeEvent::Unliked])
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn state_round_trips_through_bytes() {
+        for liked in [false, true] {
+            let state = Like { liked };
+            let bytes = state.encode_state().unwrap();
+            assert_eq!(Like::decode_state(&bytes).unwrap(), state);
+        }
+    }
+
+    #[test]
+    fn a_liked_edge_snapshots_to_one_byte() {
+        assert_eq!(Like { liked: true }.encode_state().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn malformed_blob_errors_not_panics() {
+        // Empty blob: nothing to read the bool from.
+        assert!(Like::decode_state(&[]).is_err());
+        // Trailing byte past the single-bit state.
+        assert!(Like::decode_state(&[1, 0]).is_err());
     }
 }
