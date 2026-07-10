@@ -92,7 +92,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 
@@ -289,67 +289,103 @@ const APPEND_GATE_SHARDS: usize = 256;
 /// each other unnecessarily — a bounded throughput cost, never a
 /// correctness hazard: the version check inside the shard still reads the
 /// true per-stream head from the book.
+///
+/// Each shard is an `Arc<Mutex>` (not a bare `Mutex`) so the guard can be
+/// handed out as an [`OwnedMutexGuard`](tokio::sync::OwnedMutexGuard) — a
+/// `'static` guard that [`append_batch`](LogEngine::append_batch) moves into
+/// its non-cancellable commit+publish blocking task (bn-3nz). Holding the
+/// shard across the publish is what keeps the check-head → append → publish
+/// section atomic per stream; carrying an OWNED guard (rather than a
+/// borrowed `MutexGuard` held on the async future) means a cancelled append
+/// future can no longer release the shard early and let a concurrent
+/// same-stream append double-write the same stream version while the
+/// cancelled append's committed batch is still publishing.
 struct AppendGate {
-    shards: [tokio::sync::Mutex<()>; APPEND_GATE_SHARDS],
+    shards: [Arc<tokio::sync::Mutex<()>>; APPEND_GATE_SHARDS],
 }
 
 impl AppendGate {
     fn new() -> Self {
-        AppendGate { shards: std::array::from_fn(|_| tokio::sync::Mutex::new(())) }
+        AppendGate { shards: std::array::from_fn(|_| Arc::new(tokio::sync::Mutex::new(()))) }
     }
 
-    /// Acquire the shard guarding `stream_id`'s check-and-reserve section.
-    async fn lock_for(&self, stream_id: u64) -> tokio::sync::MutexGuard<'_, ()> {
+    /// Acquire the shard guarding `stream_id`'s check-and-reserve section,
+    /// as an owned guard that can be moved into the commit+publish blocking
+    /// task and released only once the publish completes (bn-3nz).
+    async fn lock_for(&self, stream_id: u64) -> tokio::sync::OwnedMutexGuard<()> {
         let idx = (stream_id as usize) % APPEND_GATE_SHARDS;
-        self.shards[idx].lock().await
+        Arc::clone(&self.shards[idx]).lock_owned().await
     }
 }
 
 /// Orders the post-ack publish step (record book + active index + meta head)
-/// across concurrently-committing streams (bn-1s0).
+/// across concurrently-committing streams (bn-1s0), and — since bn-3nz — is
+/// waited on **from the committer-side blocking task**, not the async
+/// caller's future, so a cancelled append can never strand an assigned
+/// position (see below).
 ///
 /// The durable committer assigns each accepted batch a dense, globally
 /// unique position range, but once distinct streams can have appends in
 /// flight at the same time — the whole point of the per-stream
-/// [`AppendGate`] — their `spawn_blocking` acks can resolve to the async
-/// executor in ANY order, not necessarily the order the committer assigned
-/// positions in. `Book::payloads` requires strictly increasing-by-position
-/// pushes (dense rehydration), and `ActiveIndex::apply_committed` /
-/// `MetaStore::apply_group` carry their own out-of-order asserts — so every
-/// publish must wait its turn here before touching any of them.
+/// [`AppendGate`] — their `spawn_blocking` acks can resolve in ANY order,
+/// not necessarily the order the committer assigned positions in.
+/// `Book::payloads` requires strictly increasing-by-position pushes (dense
+/// rehydration), and `ActiveIndex::apply_committed` / `MetaStore::apply_group`
+/// carry their own out-of-order asserts — so every publish must wait its turn
+/// here before touching any of them.
+///
+/// # Why this is a *blocking* primitive (bn-3nz)
+///
+/// The append's position is assigned by the durable committer *inside* the
+/// `spawn_blocking` task in [`append_batch`](LogEngine::append_batch). A
+/// `spawn_blocking` task is **never cancelled** — it always runs to
+/// completion even if its `JoinHandle` (the caller's `.await`) is dropped.
+/// [`append_batch`](LogEngine::append_batch) therefore also takes its
+/// [`turn`](PublishSequencer::turn) and performs the whole book/index/meta
+/// publish *within that same non-cancellable task*, so the assign→publish
+/// sequence is atomic against API-future cancellation: a dropped append future
+/// can no longer commit a position durably and then skip publishing it, which
+/// would have left [`turn`](PublishSequencer::turn)'s strict `== next` wait
+/// stalling every higher-positioned publish forever. Because the wait now
+/// happens on a blocking thread (not a tokio task), it is a plain
+/// [`Condvar`], not a `tokio::sync::watch`.
 ///
 /// This only ever guards the in-memory publish step (a handful of
 /// `Vec`/`HashMap` writes) — never the slow durable write itself, which the
 /// committer already serialises regardless. So it does not reintroduce the
-/// store-wide throughput ceiling this bone removes; it just re-serialises a
+/// store-wide throughput ceiling bn-1s0 removes; it just re-serialises a
 /// microseconds-long tail, in position order instead of ack-arrival order.
 struct PublishSequencer {
-    /// The global position a publish must match to go next. Readers
-    /// `wait_for` their turn; the publisher advances it via
-    /// [`PublishTurn`]'s `Drop`.
-    next: tokio::sync::watch::Sender<u64>,
+    /// The global position a publish must match to go next, behind a
+    /// [`Condvar`]. Waiters block until it equals their `first_global`; the
+    /// publisher advances it via [`PublishTurn`]'s `Drop`.
+    next: Mutex<u64>,
+    advanced: Condvar,
 }
 
 impl PublishSequencer {
     /// `start` is the first position a publish is allowed to claim — the
     /// book's recovered dense length on open (0 for a fresh store).
     fn new_at(start: u64) -> Self {
-        let (next, _rx) = tokio::sync::watch::channel(start);
-        PublishSequencer { next }
+        PublishSequencer { next: Mutex::new(start), advanced: Condvar::new() }
     }
 
-    /// Wait until `first_global` is next in line, then hold the turn: the
+    /// Block until `first_global` is next in line, then hold the turn: the
     /// returned guard advances the sequence to `watermark` when dropped —
-    /// on ANY exit path (success or error), since the durable committer has
-    /// already permanently assigned this position range regardless of
-    /// whether the local book/index/meta publish fully succeeds. Failing to
-    /// advance on an error path would deadlock every higher-positioned
-    /// publish behind this one forever.
-    async fn turn(&self, first_global: u64, watermark: u64) -> PublishTurn<'_> {
-        let mut rx = self.next.subscribe();
-        rx.wait_for(|&n| n == first_global)
-            .await
-            .expect("PublishSequencer's Sender outlives all receivers (owned by Inner)");
+    /// on ANY exit path (success, error, or unwind), since the durable
+    /// committer has already permanently assigned this position range
+    /// regardless of whether the local book/index/meta publish fully
+    /// succeeds. Failing to advance on an error path would deadlock every
+    /// higher-positioned publish behind this one forever.
+    ///
+    /// Called on the [`append_batch`](LogEngine::append_batch) blocking task
+    /// (a `spawn_blocking` thread), never on an async executor thread — the
+    /// wait is a real blocking [`Condvar`] wait.
+    fn turn(&self, first_global: u64, watermark: u64) -> PublishTurn<'_> {
+        let mut next = self.next.lock().expect("publish sequencer poisoned");
+        while *next != first_global {
+            next = self.advanced.wait(next).expect("publish sequencer poisoned");
+        }
         PublishTurn { seq: self, watermark }
     }
 }
@@ -362,7 +398,14 @@ struct PublishTurn<'a> {
 
 impl Drop for PublishTurn<'_> {
     fn drop(&mut self) {
-        self.seq.next.send_modify(|n| *n = self.watermark);
+        {
+            let mut next = self.seq.next.lock().expect("publish sequencer poisoned");
+            *next = self.watermark;
+        }
+        // Wake every waiter: exactly one has the matching `first_global`, the
+        // rest re-check and block again. The waiter set is at most the number
+        // of appends in flight, so this is cheap.
+        self.seq.advanced.notify_all();
     }
 }
 
@@ -1233,8 +1276,14 @@ impl Backend for LogEngine {
         // Serialise the exact-version critical section PER STREAM (bn-1s0):
         // two appenders racing `Exact(v)` on the SAME stream still resolve to
         // exactly one winner; appenders on DIFFERENT streams no longer queue
-        // behind one store-wide lock.
-        let _gate = self.inner.append_gate.lock_for(sid).await;
+        // behind one store-wide lock. An OWNED guard (bn-3nz): on the
+        // Proceed path it is moved into the commit+publish blocking task and
+        // released only after the publish, so the shard stays held across the
+        // whole check-head → append → publish section even if this async
+        // future is cancelled — otherwise a dropped future could free the
+        // shard while its committed batch is still publishing and let a
+        // concurrent same-stream append double-write the same stream version.
+        let gate = self.inner.append_gate.lock_for(sid).await;
 
         // Check the expected version under the book lock, capturing any
         // newly-assigned type names, then drop the lock (we must not hold a
@@ -1316,82 +1365,128 @@ impl Backend for LogEngine {
             Pre::Proceed { sid, events, first_stream_pos } => (sid, events, first_stream_pos),
         };
 
-        // Durable append through the real committer, off the async executor.
+        // Durable append + publish, both inside ONE `spawn_blocking` task
+        // (bn-3nz). This is the structural fix for the "dropped append future
+        // gaps the position sequence" hazard: the durable committer assigns
+        // this batch's global position range as a permanent, irreversible
+        // fact, and the book/index/meta publish plus its
+        // [`PublishSequencer`] turn are what make that position visible and
+        // let the NEXT position publish. If those two steps could be split by
+        // a cancellation point — as they were when the publish lived back on
+        // the async caller's future, awaiting `spawn_blocking(append)` and
+        // then `turn()` separately — a caller that dropped its append future
+        // (e.g. a `tokio::select!` timeout) between them would leave a
+        // committed-but-never-published position, and `turn`'s strict
+        // `== next` wait would stall every higher position forever.
+        //
+        // A `spawn_blocking` task is never cancelled: it runs to completion
+        // even if this `.await`'s `JoinHandle` is dropped. Doing the assign
+        // AND the publish inside it therefore makes the whole
+        // assign→turn→publish sequence atomic against API-future
+        // cancellation. A cancelled append still fully publishes (its events
+        // are already durable, so full visibility is the only consistent
+        // outcome — never a torn or missing slot); the caller simply never
+        // observes the returned [`Appended`].
         let req = AppendRequest {
             stream_id: sid,
             category_id: CATEGORY_ID,
             first_stream_version: first_stream_pos,
             events,
         };
-        let appender = self.inner.appender.clone();
-        let rt = self.inner.rt.clone();
-        let outcome = tokio::task::spawn_blocking(move || rt.block_on(appender.append(req)))
-            .await
-            .expect("append task panicked")
-            .map_err(|e| AppendError::Backend(EngineError::Append(e.to_string())))?;
+        // Owned copy of the records for the publish step, which now runs in a
+        // `'static` blocking closure and so can no longer borrow `records`.
+        // (No extra payload copy versus before: the pre-bn-3nz publish also
+        // cloned each payload into the book — `Arc::from(rec.data)` — while
+        // the durable `events` cloned it for the log; this just moves the
+        // book's copy into the closure instead of taking it from the borrow.)
+        let records_owned: Vec<RecordToAppend> = records.to_vec();
+        let inner = self.inner.clone();
+        let appended = tokio::task::spawn_blocking(move || -> Result<Appended, EngineError> {
+            // Hold the per-stream gate (moved in from the async future) for the
+            // whole commit+publish, releasing it only when this closure ends —
+            // AFTER the publish below. Because a `spawn_blocking` task always
+            // runs to completion, the shard cannot be freed early by a
+            // cancelled append future (bn-3nz).
+            let _gate = gate;
 
-        let (first_global, last_global) = match outcome {
-            AppendOutcome::Acked { first_position, last_position } => {
-                (first_position, last_position)
+            // 1) Durable append through the real committer — assigns the
+            //    global position range. Off the async executor, on this
+            //    blocking thread.
+            let outcome = inner
+                .rt
+                .block_on(inner.appender.append(req))
+                .map_err(|e| EngineError::Append(e.to_string()))?;
+            let (first_global, last_global) = match outcome {
+                AppendOutcome::Acked { first_position, last_position } => {
+                    (first_position, last_position)
+                }
+                AppendOutcome::Indeterminate => {
+                    return Err(EngineError::Append("indeterminate durability".to_string()));
+                }
+            };
+            let frame_count = (last_global - first_global + 1) as u32;
+            let watermark = last_global + 1;
+            let last_stream_pos = first_stream_pos + u64::from(frame_count) - 1;
+
+            // 2) Wait this batch's turn to publish (bn-1s0): concurrent
+            //    distinct-stream commits can ack out of position order, but
+            //    the book/index/meta below all require strictly
+            //    increasing-by-position writes. `_turn`'s `Drop` advances the
+            //    sequence past `watermark` on EVERY exit path below (success,
+            //    error, or unwind), so the next position never stalls behind
+            //    this one — including if this closure returns the meta error
+            //    below.
+            let _turn = inner.publish_seq.turn(first_global, watermark);
+
+            // 3) Publish: record book, active index (watermark-gated), meta
+            //    head. No `.await` and no cancellation point exists past the
+            //    position assignment above, so this always completes.
+            {
+                let mut book = inner.book.lock().expect("book lock");
+                let stream_name = book.stream_name(sid);
+                for (i, rec) in records_owned.iter().enumerate() {
+                    let gp = first_global + i as u64;
+                    let payload = Payload {
+                        stream_name: stream_name.clone(),
+                        message_type: Arc::from(rec.message_type.as_str()),
+                        data: Arc::from(rec.data.as_slice()),
+                        stream_position: first_stream_pos + i as u64,
+                    };
+                    debug_assert_eq!(book.payloads.len() as u64, gp);
+                    book.payloads.push(payload);
+                    book.stream_events.entry(sid).or_default().push(gp);
+                }
+                book.heads.insert(sid, last_stream_pos);
             }
-            AppendOutcome::Indeterminate => {
-                return Err(AppendError::Backend(EngineError::Append(
-                    "indeterminate durability".to_string(),
-                )));
-            }
-        };
-        let frame_count = (last_global - first_global + 1) as u32;
-        let watermark = last_global + 1;
-        let last_stream_pos = first_stream_pos + u64::from(frame_count) - 1;
 
-        // Wait this batch's turn to publish (bn-1s0): concurrent
-        // distinct-stream commits can ack out of position order, but the
-        // book/index/meta below all require strictly increasing-by-position
-        // writes. `_turn`'s `Drop` advances the sequence past `watermark` on
-        // every exit path below, success or error.
-        let _turn = self.inner.publish_seq.turn(first_global, watermark).await;
+            let batch = BatchEntry {
+                stream_id: sid,
+                first_stream_version: first_stream_pos,
+                frame_count,
+                first_global_pos: first_global,
+                ptr: EventPtr { segment_id: ACTIVE_SEGMENT_ID, offset: first_global },
+            };
+            inner.active.apply_committed(watermark, &[batch]);
 
-        // Publish: record book, active index (watermark-gated), meta head.
-        {
-            let mut book = self.inner.book.lock().expect("book lock");
-            let stream_name = book.stream_name(sid);
-            for (i, rec) in records.iter().enumerate() {
-                let gp = first_global + i as u64;
-                let payload = Payload {
-                    stream_name: stream_name.clone(),
-                    message_type: Arc::from(rec.message_type.as_str()),
-                    data: Arc::from(rec.data.as_slice()),
-                    stream_position: first_stream_pos + i as u64,
-                };
-                debug_assert_eq!(book.payloads.len() as u64, gp);
-                book.payloads.push(payload);
-                book.stream_events.entry(sid).or_default().push(gp);
-            }
-            book.heads.insert(sid, last_stream_pos);
-        }
+            let mut group = CommitGroup::new(watermark);
+            group.stream_heads.push((
+                StreamId(sid),
+                Head { version: last_stream_pos, global_position: last_global },
+            ));
+            inner
+                .meta
+                .apply_group(&group)
+                .map_err(|e| EngineError::Meta(e.to_string()))?;
 
-        let batch = BatchEntry {
-            stream_id: sid,
-            first_stream_version: first_stream_pos,
-            frame_count,
-            first_global_pos: first_global,
-            ptr: EventPtr { segment_id: ACTIVE_SEGMENT_ID, offset: first_global },
-        };
-        self.inner.active.apply_committed(watermark, &[batch]);
-
-        let mut group = CommitGroup::new(watermark);
-        group.stream_heads.push((
-            StreamId(sid),
-            Head { version: last_stream_pos, global_position: last_global },
-        ));
-        self.inner
-            .meta
-            .apply_group(&group)
-            .map_err(|e| AppendError::Backend(EngineError::Meta(e.to_string())))?;
-
-        Ok(Appended {
-            version: Version::At(last_stream_pos),
-            last_global_position: last_global,
+            Ok(Appended {
+                version: Version::At(last_stream_pos),
+                last_global_position: last_global,
+            })
         })
+        .await
+        .expect("append task panicked")
+        .map_err(AppendError::Backend)?;
+
+        Ok(appended)
     }
 }
