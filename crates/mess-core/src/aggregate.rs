@@ -36,6 +36,16 @@ pub trait Aggregate: Default + Send + Sync + 'static {
 /// A `#[derive]` (bn-hy7) can generate this impl mechanically: it knows the
 /// command type from the handler, the event type from the aggregate, and emits
 /// `type Rejection = <the declared error>;`.
+///
+/// # Cross-aggregate preconditions
+///
+/// `decide` takes `&self` — one aggregate's folded state — and nothing else,
+/// so it structurally cannot check a *different* aggregate's stream (e.g. "is
+/// this foreign id registered?"). That is by design, not a gap: see
+/// `docs/cross-aggregate-invariants.md` for why (one stream is the store's
+/// only atomic boundary) and the blessed patterns (accept-and-reconcile
+/// downstream, escalating to a saga/compensating command) for when a rule
+/// needs another aggregate's facts.
 pub trait Decide<C>: Aggregate {
     /// The typed business-rule rejection this handler can produce.
     type Rejection: std::error::Error;
