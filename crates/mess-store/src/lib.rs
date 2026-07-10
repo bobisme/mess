@@ -54,6 +54,9 @@ pub use engine::{
     CommitterMetrics, EngineError, EngineMetrics, EngineOptions, LogEngine,
 };
 pub use fjall_snapshot::{FjallSnapshotBackend, SnapshotBackendError};
+// Re-export the core command error the facade returns so callers need not
+// depend on `mess-core` directly just to match on a command outcome.
+pub use mess_core::CommandError;
 #[cfg(feature = "mock")]
 pub use mock::MockBackend;
 pub use retry::{DEFAULT_MAX_ATTEMPTS, RetryPolicy};
@@ -66,7 +69,3 @@ pub use store::{
 };
 pub use subscription::Subscription;
 pub use version::Version;
-
-// Re-export the core command error the facade returns so callers need not
-// depend on `mess-core` directly just to match on a command outcome.
-pub use mess_core::CommandError;

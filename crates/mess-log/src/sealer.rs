@@ -53,10 +53,10 @@
 //!   (A9), so a stale prior-generation batch left behind a new header carries
 //!   the *old* epoch and is rejected by the scanner (`EpochMismatch`).
 //! - A stale prior-generation **trailer** left at (or past) EOF behind a fresh
-//!   header is rejected by [`recover_fast`]'s header/trailer cross-check
-//!   (its `epoch`/`base_pos`/`segment_id` will not match the new header), so it
-//!   is never trusted as a seal — the segment falls back to a full scan, which
-//!   in turn rejects the stale batches by epoch. The bytes decide (D1); the
+//!   header is rejected by [`recover_fast`]'s header/trailer cross-check (its
+//!   `epoch`/`base_pos`/`segment_id` will not match the new header), so it is
+//!   never trusted as a seal — the segment falls back to a full scan, which in
+//!   turn rejects the stale batches by epoch. The bytes decide (D1); the
 //!   trailer only seeds and skips.
 //!
 //! [`docs/spec/01-log-format.md`]: ../../../../docs/spec/01-log-format.md
@@ -75,23 +75,23 @@ use crate::scanner::{self, Recovery};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrailerFields {
     /// MUST equal the `SegmentHeader.segment_id` (§3.3.1).
-    pub segment_id: u64,
+    pub segment_id:  u64,
     /// R3: the trailer carries the A9 epoch; MUST equal the header's `epoch`.
-    pub epoch: u64,
+    pub epoch:       u64,
     /// MUST equal the header's `base_pos` (§3.3.1).
-    pub base_pos: u64,
+    pub base_pos:    u64,
     /// Number of accepted batches in the segment.
     pub batch_count: u64,
     /// Total events (Σ `frame_count`) in the segment.
     pub event_count: u64,
-    /// Byte offset where the extension region begins — the first byte after the
-    /// last batch's `CommitMarker` (§3.3.1). In Phase 3 this is the segment's
-    /// whole content length.
-    pub ext_offset: u64,
+    /// Byte offset where the extension region begins — the first byte after
+    /// the last batch's `CommitMarker` (§3.3.1). In Phase 3 this is the
+    /// segment's whole content length.
+    pub ext_offset:  u64,
     /// Byte length of the extension region. **`0` in Phase 3.**
-    pub ext_len: u64,
+    pub ext_len:     u64,
     /// CRC32C over the extension region. **MUST be `0` when `ext_len == 0`.**
-    pub ext_crc: u32,
+    pub ext_crc:     u32,
 }
 
 impl TrailerFields {
@@ -118,18 +118,14 @@ impl TrailerFields {
         }
     }
 
-    /// `end_pos = base_pos + event_count`: the A1 seed handed across the segment
-    /// boundary (the next segment's `base_pos`), and the trailer's `end_pos`
-    /// (§3.3.1).
-    pub fn end_pos(&self) -> u64 {
-        self.base_pos + self.event_count
-    }
+    /// `end_pos = base_pos + event_count`: the A1 seed handed across the
+    /// segment boundary (the next segment's `base_pos`), and the trailer's
+    /// `end_pos` (§3.3.1).
+    pub fn end_pos(&self) -> u64 { self.base_pos + self.event_count }
 
-    /// `sealed_len = ext_offset + ext_len`: the byte offset at which the trailer
-    /// begins (§3.3.1).
-    pub fn sealed_len(&self) -> u64 {
-        self.ext_offset + self.ext_len
-    }
+    /// `sealed_len = ext_offset + ext_len`: the byte offset at which the
+    /// trailer begins (§3.3.1).
+    pub fn sealed_len(&self) -> u64 { self.ext_offset + self.ext_len }
 }
 
 /// Encode the fixed 100-byte `SegmentFooter` trailer (§3.3.1), including its
@@ -164,28 +160,29 @@ pub fn encode_trailer(t: &TrailerFields) -> [u8; SEGMENT_TRAILER_LEN] {
 }
 
 /// The segment-catalog entry a sealed segment's trailer supplies to the R2 fast
-/// path (§8.3): the fields recovery can trust without scanning the body. This is
-/// the advisory, rebuildable seed (R2/D1) — never a commit authority.
+/// path (§8.3): the fields recovery can trust without scanning the body. This
+/// is the advisory, rebuildable seed (R2/D1) — never a commit authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentCatalogEntry {
-    pub segment_id: u64,
+    pub segment_id:  u64,
     /// R3/A9 epoch, covered by `footer_crc`.
-    pub epoch: u64,
-    pub base_pos: u64,
+    pub epoch:       u64,
+    pub base_pos:    u64,
     /// `base_pos + event_count`: the next segment's `base_pos` seed (§8.1).
-    pub end_pos: u64,
+    pub end_pos:     u64,
     pub batch_count: u64,
     pub event_count: u64,
     /// Extension-region locator (§3.3.2); `ext_len == 0` in Phase 3.
-    pub ext_offset: u64,
-    pub ext_len: u64,
-    pub ext_crc: u32,
+    pub ext_offset:  u64,
+    pub ext_len:     u64,
+    pub ext_crc:     u32,
 }
 
 /// Decode + validate the fixed trailer from the final [`SEGMENT_TRAILER_LEN`]
 /// bytes of a sealed segment (§3.3.1). Returns `None` if `tail` is too short,
 /// has the wrong `magic`/`format_version`, or fails its `footer_crc` over
-/// `[0, 96)` — in every such case §8.3 says treat the segment as **not sealed**.
+/// `[0, 96)` — in every such case §8.3 says treat the segment as **not
+/// sealed**.
 pub fn decode_trailer(tail: &[u8]) -> Option<SegmentCatalogEntry> {
     if tail.len() < SEGMENT_TRAILER_LEN {
         return None;
@@ -203,24 +200,27 @@ pub fn decode_trailer(tail: &[u8]) -> Option<SegmentCatalogEntry> {
         return None;
     }
     Some(SegmentCatalogEntry {
-        segment_id: rd_u64(t, FT_SEGMENT_ID_OFF),
-        epoch: rd_u64(t, FT_EPOCH_OFF),
-        base_pos: rd_u64(t, FT_BASE_POS_OFF),
-        end_pos: rd_u64(t, FT_END_POS_OFF),
+        segment_id:  rd_u64(t, FT_SEGMENT_ID_OFF),
+        epoch:       rd_u64(t, FT_EPOCH_OFF),
+        base_pos:    rd_u64(t, FT_BASE_POS_OFF),
+        end_pos:     rd_u64(t, FT_END_POS_OFF),
         batch_count: rd_u64(t, FT_BATCH_COUNT_OFF),
         event_count: rd_u64(t, FT_EVENT_COUNT_OFF),
-        ext_offset: rd_u64(t, FT_EXT_OFFSET_OFF),
-        ext_len: rd_u64(t, FT_EXT_LEN_OFF),
-        ext_crc: rd_u32(t, FT_EXT_CRC_OFF),
+        ext_offset:  rd_u64(t, FT_EXT_OFFSET_OFF),
+        ext_len:     rd_u64(t, FT_EXT_LEN_OFF),
+        ext_crc:     rd_u32(t, FT_EXT_CRC_OFF),
     })
 }
 
-/// `pread` exactly the final [`SEGMENT_TRAILER_LEN`] bytes from EOF and validate
-/// them as a sealed segment's trailer (R2, §8.3). Returns `Ok(None)` when the
-/// file is shorter than a trailer or the tail does not validate (⇒ the caller
-/// treats it as unsealed). This performs the `pread`-exact-from-EOF fast path:
-/// one positioned read of 100 bytes, no full-file read.
-pub fn read_trailer<F: Fs>(fs: &F, path: &Path) -> io::Result<Option<SegmentCatalogEntry>> {
+/// `pread` exactly the final [`SEGMENT_TRAILER_LEN`] bytes from EOF and
+/// validate them as a sealed segment's trailer (R2, §8.3). Returns `Ok(None)`
+/// when the file is shorter than a trailer or the tail does not validate (⇒ the
+/// caller treats it as unsealed). This performs the `pread`-exact-from-EOF fast
+/// path: one positioned read of 100 bytes, no full-file read.
+pub fn read_trailer<F: Fs>(
+    fs: &F,
+    path: &Path,
+) -> io::Result<Option<SegmentCatalogEntry>> {
     let file = fs.open(path, OpenOpts::read_only())?;
     let len = file.len()?;
     if len < SEGMENT_TRAILER_LEN as u64 {
@@ -247,10 +247,7 @@ pub enum FastRecovery {
     /// The trailer validated and cross-checked against the header: the sealed
     /// segment is trusted via R2 without scanning its body. Carries the catalog
     /// entry (counts, epoch, positions) and the validated header seeds.
-    Sealed {
-        catalog: SegmentCatalogEntry,
-        header: scanner::SegmentHeaderInfo,
-    },
+    Sealed { catalog: SegmentCatalogEntry, header: scanner::SegmentHeaderInfo },
     /// No trusted trailer (unsealed active segment, torn seal, corrupt
     /// `footer_crc`, or a stale trailer that fails the header cross-check): the
     /// authoritative full scan (§8.2) was run. The bytes decide (D1).
@@ -341,8 +338,9 @@ pub fn read_segment_header<F: Fs>(
 }
 
 /// Decode + validate the fixed 52-byte `SegmentHeader` (§3.2). Mirrors the
-/// scanner's private decoder but returns the public [`scanner::SegmentHeaderInfo`]
-/// so the fast path can cross-check without depending on scanner internals.
+/// scanner's private decoder but returns the public
+/// [`scanner::SegmentHeaderInfo`] so the fast path can cross-check without
+/// depending on scanner internals.
 fn decode_segment_header(img: &[u8]) -> Option<scanner::SegmentHeaderInfo> {
     if img.len() < SEGMENT_HEADER_LEN {
         return None;
@@ -358,9 +356,9 @@ fn decode_segment_header(img: &[u8]) -> Option<scanner::SegmentHeaderInfo> {
         return None;
     }
     Some(scanner::SegmentHeaderInfo {
-        segment_id: rd_u64(img, SH_SEGMENT_ID_OFF),
-        base_pos: rd_u64(img, SH_BASE_POS_OFF),
-        epoch: rd_u64(img, SH_EPOCH_OFF),
+        segment_id:         rd_u64(img, SH_SEGMENT_ID_OFF),
+        base_pos:           rd_u64(img, SH_BASE_POS_OFF),
+        epoch:              rd_u64(img, SH_EPOCH_OFF),
         prev_segment_epoch: rd_u64(img, SH_PREV_SEGMENT_EPOCH_OFF),
     })
 }
@@ -395,7 +393,14 @@ mod tests {
     use super::*;
 
     fn sample() -> TrailerFields {
-        TrailerFields::phase3(7, 42, 1000, 3, 5, SEGMENT_HEADER_LEN as u64 + 384)
+        TrailerFields::phase3(
+            7,
+            42,
+            1000,
+            3,
+            5,
+            SEGMENT_HEADER_LEN as u64 + 384,
+        )
     }
 
     #[test]
@@ -428,7 +433,10 @@ mod tests {
     fn footer_crc_mismatch_rejected() {
         let mut bytes = encode_trailer(&sample());
         bytes[FT_EPOCH_OFF] ^= 0xFF; // flip an epoch byte inside CRC coverage
-        assert!(decode_trailer(&bytes).is_none(), "corrupt footer_crc ⇒ unsealed");
+        assert!(
+            decode_trailer(&bytes).is_none(),
+            "corrupt footer_crc ⇒ unsealed"
+        );
     }
 
     #[test]

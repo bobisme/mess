@@ -33,8 +33,9 @@ pub fn run(size: RunSize, scratch: &Path) -> Vec<Metric> {
         r.best_ev_per_s,
         "ev/s",
         format!(
-            "Durability::Process; {writers} writers x {batch}-event batches x {batches_per_writer}/writer \
-             = {} events; ~250B payload; real-fs scratch (see machine.scratch_fs); best-of-{reps}",
+            "Durability::Process; {writers} writers x {batch}-event batches x \
+             {batches_per_writer}/writer = {} events; ~250B payload; real-fs \
+             scratch (see machine.scratch_fs); best-of-{reps}",
             r.total_events
         ),
     )]

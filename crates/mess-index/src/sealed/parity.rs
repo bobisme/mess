@@ -16,7 +16,8 @@
 //! advantages (unknown loss rate, many receivers, no feedback) in a *transport*
 //! setting that does not apply to a file on one disk; their home in this system
 //! is the future replication / anti-entropy path, not seal-time local parity.
-//! We use the `reed-solomon-simd` crate (O(n log n), SIMD, fast at these sizes).
+//! We use the `reed-solomon-simd` crate (O(n log n), SIMD, fast at these
+//! sizes).
 //!
 //! # Grouped layout & the default budget
 //!
@@ -27,9 +28,9 @@
 //! gives:
 //!
 //! - **6.25 % storage overhead** (`M/K`), plus a ~0.1 % per-shard CRC table;
-//! - correction of **any single damaged shard within each 64 KiB group** —
-//!   i.e. scattered latent errors are corrected independently as long as no
-//!   single 64 KiB window loses more than one page.
+//! - correction of **any single damaged shard within each 64 KiB group** — i.e.
+//!   scattered latent errors are corrected independently as long as no single
+//!   64 KiB window loses more than one page.
 //!
 //! Grouping (vs one RS block over the whole file) matches the *scattered*
 //! nature of bit-rot: losses spread across groups rather than piling into one
@@ -37,10 +38,11 @@
 //!
 //! # Determinism
 //!
-//! The sidecar carries **no timestamps or nondeterministic fields**. RS encoding
-//! is a pure function of the input shards, so the same segment bytes always
-//! produce byte-identical `.par` bytes (asserted by a test). This is what lets a
-//! rebuild or an independent re-seal reproduce and cross-check the sidecar.
+//! The sidecar carries **no timestamps or nondeterministic fields**. RS
+//! encoding is a pure function of the input shards, so the same segment bytes
+//! always produce byte-identical `.par` bytes (asserted by a test). This is
+//! what lets a rebuild or an independent re-seal reproduce and cross-check the
+//! sidecar.
 //!
 //! # File format (`.par`)
 //!
@@ -86,11 +88,11 @@ const PAR_HEADER_LEN: usize = 48;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParityConfig {
     /// Master switch. When `false`, no `.par` is written at seal.
-    pub enabled: bool,
+    pub enabled:          bool,
     /// Shard (byte-block) size. Must be even and non-zero. Default `4096`.
-    pub shard_size: u32,
+    pub shard_size:       u32,
     /// Data shards per RS group (`K`). Must be ≥ 1. Default `16`.
-    pub data_per_group: u16,
+    pub data_per_group:   u16,
     /// Parity shards per RS group (`M`). Must be ≥ 1. Default `1`
     /// (⇒ 6.25 % overhead, corrects one damaged shard per group).
     pub parity_per_group: u16,
@@ -99,9 +101,9 @@ pub struct ParityConfig {
 impl Default for ParityConfig {
     fn default() -> Self {
         ParityConfig {
-            enabled: false,
-            shard_size: 4096,
-            data_per_group: 16,
+            enabled:          false,
+            shard_size:       4096,
+            data_per_group:   16,
             parity_per_group: 1,
         }
     }
@@ -110,7 +112,9 @@ impl Default for ParityConfig {
 impl ParityConfig {
     fn validate(&self) -> Result<(), ParityError> {
         if self.shard_size == 0 || !self.shard_size.is_multiple_of(2) {
-            return Err(ParityError::Config("shard_size must be even and non-zero"));
+            return Err(ParityError::Config(
+                "shard_size must be even and non-zero",
+            ));
         }
         if self.data_per_group == 0 {
             return Err(ParityError::Config("data_per_group (K) must be ≥ 1"));
@@ -158,16 +162,17 @@ pub enum ParityError {
     /// At least one RS group has more damaged shards than its parity budget can
     /// correct. Repair is refused **entirely** (originals untouched).
     #[error(
-        "group {group} has {damaged} damaged shards but only {tolerance} parity shards \
-         (repair refused; {beyond_groups} group(s) beyond tolerance)"
+        "group {group} has {damaged} damaged shards but only {tolerance} \
+         parity shards (repair refused; {beyond_groups} group(s) beyond \
+         tolerance)"
     )]
     BeyondTolerance {
         /// The first group found beyond tolerance.
-        group: u64,
+        group:         u64,
         /// Damaged shard count in that group.
-        damaged: usize,
+        damaged:       usize,
         /// Parity budget per group (`M`).
-        tolerance: usize,
+        tolerance:     usize,
         /// How many groups in total exceeded tolerance.
         beyond_groups: usize,
     },
@@ -262,26 +267,28 @@ pub fn generate(
 /// A parsed, CRC-validated `.par` sidecar.
 #[derive(Debug, Clone)]
 pub struct ParitySidecar {
-    segment_id: u64,
-    source_len: u64,
-    shard_size: usize,
-    data_per_group: usize,
+    segment_id:       u64,
+    source_len:       u64,
+    shard_size:       usize,
+    data_per_group:   usize,
     parity_per_group: usize,
     data_shard_count: usize,
-    source_crc: u32,
+    source_crc:       u32,
     /// Per-data-shard crc32c (length `data_shard_count`).
-    data_crcs: Vec<u32>,
+    data_crcs:        Vec<u32>,
     /// Group-major parity shards: `num_groups × M`, each `shard_size` bytes.
-    parity: Vec<u8>,
+    parity:           Vec<u8>,
 }
 
 /// The outcome of a successful [`ParitySidecar::plan_repair`]: the repaired
-/// segment image and exactly which data shards (byte blocks) were reconstructed.
+/// segment image and exactly which data shards (byte blocks) were
+/// reconstructed.
 #[derive(Debug, Clone)]
 pub struct RepairPlan {
     /// The reconstructed, byte-complete segment image (same length as input).
-    pub image: Vec<u8>,
-    /// Global data-shard indices that were damaged and reconstructed, ascending.
+    pub image:           Vec<u8>,
+    /// Global data-shard indices that were damaged and reconstructed,
+    /// ascending.
     pub repaired_blocks: Vec<u64>,
     /// Byte ranges `[start, end)` of each repaired block within the segment
     /// (aligned to the shard grid; the last block is clamped to `source_len`).
@@ -301,39 +308,31 @@ fn rd_u64(d: &[u8], at: usize) -> u64 {
 impl ParitySidecar {
     /// The segment id this sidecar covers.
     #[must_use]
-    pub fn segment_id(&self) -> u64 {
-        self.segment_id
-    }
+    pub fn segment_id(&self) -> u64 { self.segment_id }
+
     /// The byte length of the sealed `.log` this sidecar was built over.
     #[must_use]
-    pub fn source_len(&self) -> u64 {
-        self.source_len
-    }
+    pub fn source_len(&self) -> u64 { self.source_len }
+
     /// crc32c of the whole original sealed `.log` (identity witness).
     #[must_use]
-    pub fn source_crc(&self) -> u32 {
-        self.source_crc
-    }
+    pub fn source_crc(&self) -> u32 { self.source_crc }
+
     /// Shard (byte-block) size in bytes.
     #[must_use]
-    pub fn shard_size(&self) -> usize {
-        self.shard_size
-    }
+    pub fn shard_size(&self) -> usize { self.shard_size }
+
     /// Data shards per group (`K`).
     #[must_use]
-    pub fn data_per_group(&self) -> usize {
-        self.data_per_group
-    }
+    pub fn data_per_group(&self) -> usize { self.data_per_group }
+
     /// Parity shards per group (`M`) — the per-group correction budget.
     #[must_use]
-    pub fn parity_per_group(&self) -> usize {
-        self.parity_per_group
-    }
+    pub fn parity_per_group(&self) -> usize { self.parity_per_group }
+
     /// Total number of data shards covered.
     #[must_use]
-    pub fn data_shard_count(&self) -> usize {
-        self.data_shard_count
-    }
+    pub fn data_shard_count(&self) -> usize { self.data_shard_count }
 
     /// Open and validate a `.par` sidecar from disk. Outer `io::Result` is the
     /// read; inner `Result` is the parse/CRC validation.
@@ -442,11 +441,14 @@ impl ParitySidecar {
     /// against the segment's own batch CRCs (+ fold chain) before installing
     /// it — parity proves *erasure recovery*, the batch CRC/chain prove the
     /// bytes are the committed bytes.
-    pub fn plan_repair(&self, current: &[u8]) -> Result<RepairPlan, ParityError> {
+    pub fn plan_repair(
+        &self,
+        current: &[u8],
+    ) -> Result<RepairPlan, ParityError> {
         if current.len() as u64 != self.source_len {
             return Err(ParityError::LengthMismatch {
                 expected: self.source_len,
-                actual: current.len() as u64,
+                actual:   current.len() as u64,
             });
         }
         let k = self.data_per_group;
@@ -468,9 +470,9 @@ impl ParitySidecar {
             .collect();
         if let Some(&(group, damaged_ct)) = beyond.first() {
             return Err(ParityError::BeyondTolerance {
-                group: group as u64,
-                damaged: damaged_ct,
-                tolerance: m,
+                group:         group as u64,
+                damaged:       damaged_ct,
+                tolerance:     m,
                 beyond_groups: beyond.len(),
             });
         }
@@ -481,7 +483,8 @@ impl ParitySidecar {
 
         for (&g, missing) in &per_group {
             // Surviving original shards (all non-damaged slots of the group).
-            let missing_set: std::collections::BTreeSet<usize> = missing.iter().copied().collect();
+            let missing_set: std::collections::BTreeSet<usize> =
+                missing.iter().copied().collect();
             let mut originals: Vec<(usize, Vec<u8>)> = Vec::with_capacity(k);
             for j in 0..k {
                 let global = g * k + j;
@@ -502,9 +505,12 @@ impl ParitySidecar {
                 if global >= self.data_shard_count {
                     continue; // a pure padding slot — nothing on disk to write
                 }
-                // Tripwire: the reconstructed shard must match its recorded CRC.
+                // Tripwire: the reconstructed shard must match its recorded
+                // CRC.
                 if crc32c(&bytes) != self.data_crcs[global] {
-                    return Err(ParityError::ReconstructVerify { shard: global as u64 });
+                    return Err(ParityError::ReconstructVerify {
+                        shard: global as u64,
+                    });
                 }
                 let start = global * shard_size;
                 let end = (start + shard_size).min(image.len());
@@ -535,18 +541,25 @@ mod tests {
             self.0 = x;
             x
         }
+
         fn fill(&mut self, buf: &mut [u8]) {
             for b in buf.iter_mut() {
                 *b = (self.next_u64() & 0xFF) as u8;
             }
         }
+
         fn below(&mut self, n: usize) -> usize {
             (self.next_u64() % n as u64) as usize
         }
     }
 
     fn cfg() -> ParityConfig {
-        ParityConfig { enabled: true, shard_size: 64, data_per_group: 4, parity_per_group: 2 }
+        ParityConfig {
+            enabled:          true,
+            shard_size:       64,
+            data_per_group:   4,
+            parity_per_group: 2,
+        }
     }
 
     fn corpus(len: usize, seed: u64) -> Vec<u8> {
@@ -578,7 +591,9 @@ mod tests {
     #[test]
     fn no_damage_repairs_to_noop() {
         let src = corpus(4000, 3);
-        let side = ParitySidecar::from_bytes(generate(1, &src, &cfg()).unwrap()).unwrap();
+        let side =
+            ParitySidecar::from_bytes(generate(1, &src, &cfg()).unwrap())
+                .unwrap();
         let plan = side.plan_repair(&src).unwrap();
         assert!(plan.repaired_blocks.is_empty());
         assert_eq!(plan.image, src);
@@ -590,7 +605,8 @@ mod tests {
     fn repairs_within_tolerance_byte_exact() {
         let src = corpus(4000, 4);
         let c = cfg();
-        let side = ParitySidecar::from_bytes(generate(1, &src, &c).unwrap()).unwrap();
+        let side =
+            ParitySidecar::from_bytes(generate(1, &src, &c).unwrap()).unwrap();
         let mut damaged = src.clone();
         // Damage shards 0 and 1 (group 0, M=2) — flip a byte in each.
         damaged[0] ^= 0xFF;
@@ -605,7 +621,8 @@ mod tests {
     fn repairs_scattered_single_shard_per_group() {
         let src = corpus(20_000, 5);
         let c = cfg();
-        let side = ParitySidecar::from_bytes(generate(1, &src, &c).unwrap()).unwrap();
+        let side =
+            ParitySidecar::from_bytes(generate(1, &src, &c).unwrap()).unwrap();
         let ss = c.shard_size as usize;
         let k = c.data_per_group as usize;
         let mut damaged = src.clone();
@@ -629,14 +646,20 @@ mod tests {
     fn beyond_tolerance_refuses() {
         let src = corpus(4000, 6);
         let c = cfg(); // M=2
-        let side = ParitySidecar::from_bytes(generate(1, &src, &c).unwrap()).unwrap();
+        let side =
+            ParitySidecar::from_bytes(generate(1, &src, &c).unwrap()).unwrap();
         let ss = c.shard_size as usize;
         let mut damaged = src.clone();
         for j in 0..3 {
             damaged[j * ss] ^= 0xFF; // shards 0,1,2 all in group 0
         }
         match side.plan_repair(&damaged) {
-            Err(ParityError::BeyondTolerance { group, damaged: d, tolerance, .. }) => {
+            Err(ParityError::BeyondTolerance {
+                group,
+                damaged: d,
+                tolerance,
+                ..
+            }) => {
                 assert_eq!(group, 0);
                 assert_eq!(d, 3);
                 assert_eq!(tolerance, 2);
@@ -645,7 +668,8 @@ mod tests {
         }
     }
 
-    /// A corrupted `.par` sidecar is detected by its own content CRC; no repair.
+    /// A corrupted `.par` sidecar is detected by its own content CRC; no
+    /// repair.
     #[test]
     fn parity_self_corruption_detected() {
         let src = corpus(4000, 7);
@@ -662,7 +686,9 @@ mod tests {
     #[test]
     fn length_mismatch_refuses() {
         let src = corpus(4000, 8);
-        let side = ParitySidecar::from_bytes(generate(1, &src, &cfg()).unwrap()).unwrap();
+        let side =
+            ParitySidecar::from_bytes(generate(1, &src, &cfg()).unwrap())
+                .unwrap();
         let mut short = src.clone();
         short.truncate(3000);
         match side.plan_repair(&short) {
@@ -678,14 +704,21 @@ mod tests {
     /// always byte-exact recovery.
     #[test]
     fn random_within_tolerance_always_recovers() {
-        let c = ParityConfig { enabled: true, shard_size: 128, data_per_group: 8, parity_per_group: 3 };
+        let c = ParityConfig {
+            enabled:          true,
+            shard_size:       128,
+            data_per_group:   8,
+            parity_per_group: 3,
+        };
         let ss = c.shard_size as usize;
         let k = c.data_per_group as usize;
         let m = c.parity_per_group as usize;
         for seed in 0..40u64 {
             let len = 500 + (seed as usize) * 137;
             let src = corpus(len, seed * 31 + 1);
-            let side = ParitySidecar::from_bytes(generate(seed, &src, &c).unwrap()).unwrap();
+            let side =
+                ParitySidecar::from_bytes(generate(seed, &src, &c).unwrap())
+                    .unwrap();
             let mut damaged = src.clone();
             let mut r = Rng(seed * 7 + 3);
             let groups = side.data_shard_count().div_ceil(k);
@@ -699,7 +732,10 @@ mod tests {
                     if global >= side.data_shard_count() {
                         continue;
                     }
-                    let byte = global * ss + r.below(ss.min(len.saturating_sub(global * ss).max(1)));
+                    let byte = global * ss
+                        + r.below(
+                            ss.min(len.saturating_sub(global * ss).max(1)),
+                        );
                     if byte < damaged.len() {
                         damaged[byte] ^= 0x5A | (d as u8 + 1);
                     }
@@ -713,8 +749,9 @@ mod tests {
 
 #[cfg(test)]
 mod bench {
-    use super::*;
     use std::time::Instant;
+
+    use super::*;
 
     fn corpus(len: usize, seed: u64) -> Vec<u8> {
         let mut x = seed | 1;
@@ -754,8 +791,13 @@ mod bench {
             let overhead = par.len() as f64 / len as f64 * 100.0;
             println!(
                 "[parity] {mib} MiB segment | shard={}B K={} M={} | gen {:?} \
-                 ({mbps:.0} MiB/s) | sidecar {} bytes | overhead {overhead:.3}%",
-                cfg.shard_size, cfg.data_per_group, cfg.parity_per_group, dt, par.len()
+                 ({mbps:.0} MiB/s) | sidecar {} bytes | overhead \
+                 {overhead:.3}%",
+                cfg.shard_size,
+                cfg.data_per_group,
+                cfg.parity_per_group,
+                dt,
+                par.len()
             );
 
             // Sanity: a full round of decode over a lightly-damaged copy works.
@@ -766,7 +808,10 @@ mod bench {
             let plan = side.plan_repair(&damaged).unwrap();
             let repair_dt = t1.elapsed();
             assert_eq!(plan.image, src);
-            println!("[parity] {mib} MiB single-block repair (localize+decode+verify): {repair_dt:?}");
+            println!(
+                "[parity] {mib} MiB single-block repair \
+                 (localize+decode+verify): {repair_dt:?}"
+            );
         }
     }
 }

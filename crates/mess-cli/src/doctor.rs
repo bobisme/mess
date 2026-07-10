@@ -42,13 +42,22 @@ pub fn run(dir: &Path, opts: &DoctorOptions) -> Report {
 fn check_lock(report: &mut Report, dir: &Path) {
     let lock = lockprobe::probe(dir);
     let (sev, kind, msg, extra) = match &lock {
-        LockState::Free => (Severity::Ok, "lock-free", "store is not locked by a live writer".to_string(), json!({})),
+        LockState::Free => (
+            Severity::Ok,
+            "lock-free",
+            "store is not locked by a live writer".to_string(),
+            json!({}),
+        ),
         LockState::Held { pid } => (
             Severity::Info,
             "lock-held",
             match pid {
-                Some(p) => format!("store is locked by a live writer (pid {p})"),
-                None => "store is locked by a live writer (pid unknown)".to_string(),
+                Some(p) => {
+                    format!("store is locked by a live writer (pid {p})")
+                }
+                None => {
+                    "store is locked by a live writer (pid unknown)".to_string()
+                }
             },
             json!({ "pid": pid }),
         ),
@@ -109,7 +118,10 @@ fn check_segments(report: &mut Report, dir: &Path) {
                     Severity::Error,
                     "epoch",
                     "segment-header-corrupt",
-                    format!("segment {}: header did not validate", seg.segment_id),
+                    format!(
+                        "segment {}: header did not validate",
+                        seg.segment_id
+                    ),
                 )
                 .with("segment_id", seg.segment_id),
             ),
@@ -137,7 +149,8 @@ fn check_segments(report: &mut Report, dir: &Path) {
                             "epoch",
                             "epoch-regression",
                             format!(
-                                "segment {}: epoch {epoch} < previous segment epoch {prev}",
+                                "segment {}: epoch {epoch} < previous segment \
+                                 epoch {prev}",
                                 seg.segment_id
                             ),
                         )
@@ -161,7 +174,8 @@ fn check_segments(report: &mut Report, dir: &Path) {
                     "chain",
                     "base-pos-gap",
                     format!(
-                        "segment {}: base_pos {base} != previous segment end_pos {prev_end}",
+                        "segment {}: base_pos {base} != previous segment \
+                         end_pos {prev_end}",
                         seg.segment_id
                     ),
                 )
@@ -180,7 +194,8 @@ fn check_segments(report: &mut Report, dir: &Path) {
                             "trailer",
                             "trailer-epoch-mismatch",
                             format!(
-                                "segment {}: header epoch {:?} != trailer epoch {}",
+                                "segment {}: header epoch {:?} != trailer \
+                                 epoch {}",
                                 seg.segment_id,
                                 scan.epoch(),
                                 trailer.epoch
@@ -196,7 +211,10 @@ fn check_segments(report: &mut Report, dir: &Path) {
                             Severity::Warn,
                             "sidecar",
                             "sidecar-missing",
-                            format!("segment {}: sealed but no .pidx sidecar", seg.segment_id),
+                            format!(
+                                "segment {}: sealed but no .pidx sidecar",
+                                seg.segment_id
+                            ),
                         )
                         .with("segment_id", seg.segment_id),
                     );
@@ -213,7 +231,11 @@ fn check_segments(report: &mut Report, dir: &Path) {
                         Severity::Ok,
                         "trailer",
                         "unsealed-head",
-                        format!("segment {}: unsealed active/rolled head (no trailer)", seg.segment_id),
+                        format!(
+                            "segment {}: unsealed active/rolled head (no \
+                             trailer)",
+                            seg.segment_id
+                        ),
                     )
                     .with("segment_id", seg.segment_id),
                 );
@@ -297,13 +319,18 @@ fn check_fold_version(report: &mut Report, dir: &Path, opts: &DoctorOptions) {
                 Severity::Info,
                 "fold-version",
                 "registry-unavailable",
-                format!("could not read snapshot metadata for fold-version check: {reason}"),
+                format!(
+                    "could not read snapshot metadata for fold-version check: \
+                     {reason}"
+                ),
             ));
             return;
         }
     };
-    let folds: BTreeSet<u32> = facts.snapshots.iter().map(|s| s.fold_version).collect();
-    report.set("fold_versions", json!(folds.iter().copied().collect::<Vec<_>>()));
+    let folds: BTreeSet<u32> =
+        facts.snapshots.iter().map(|s| s.fold_version).collect();
+    report
+        .set("fold_versions", json!(folds.iter().copied().collect::<Vec<_>>()));
 
     if facts.snapshots.is_empty() {
         report.push_finding(Finding::new(
@@ -327,7 +354,10 @@ fn check_fold_version(report: &mut Report, dir: &Path, opts: &DoctorOptions) {
                 Severity::Ok,
                 "fold-version",
                 "fold-version-current",
-                format!("all live snapshots carry the expected fold_version {expected}"),
+                format!(
+                    "all live snapshots carry the expected fold_version \
+                     {expected}"
+                ),
             ));
         } else {
             report.push_finding(
@@ -335,7 +365,10 @@ fn check_fold_version(report: &mut Report, dir: &Path, opts: &DoctorOptions) {
                     Severity::Warn,
                     "fold-version",
                     "fold-version-drift",
-                    format!("{} snapshot(s) do not carry fold_version {expected}", drifted.len()),
+                    format!(
+                        "{} snapshot(s) do not carry fold_version {expected}",
+                        drifted.len()
+                    ),
                 )
                 .with("expected", expected)
                 .with("drifted", json!(drifted)),
@@ -348,20 +381,25 @@ fn check_fold_version(report: &mut Report, dir: &Path, opts: &DoctorOptions) {
                 "fold-version",
                 "fold-version-drift",
                 format!(
-                    "live snapshots span multiple fold_versions {:?}; stale snapshots pending re-fold",
+                    "live snapshots span multiple fold_versions {:?}; stale \
+                     snapshots pending re-fold",
                     folds.iter().copied().collect::<Vec<_>>()
                 ),
             )
-            .with("fold_versions", json!(folds.iter().copied().collect::<Vec<_>>())),
-        );
-    } else {
-        report.push_finding(
-            Finding::new(
-                Severity::Ok,
-                "fold-version",
-                "fold-version-consistent",
-                format!("all live snapshots carry a single fold_version {:?}", folds.iter().next()),
+            .with(
+                "fold_versions",
+                json!(folds.iter().copied().collect::<Vec<_>>()),
             ),
         );
+    } else {
+        report.push_finding(Finding::new(
+            Severity::Ok,
+            "fold-version",
+            "fold-version-consistent",
+            format!(
+                "all live snapshots carry a single fold_version {:?}",
+                folds.iter().next()
+            ),
+        ));
     }
 }

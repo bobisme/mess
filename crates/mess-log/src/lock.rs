@@ -96,10 +96,7 @@ pub enum LockError {
         "store dir {dir} is already locked by another process{}",
         HolderPid(*holder_pid)
     )]
-    HeldByOther {
-        dir: PathBuf,
-        holder_pid: Option<u32>,
-    },
+    HeldByOther { dir: PathBuf, holder_pid: Option<u32> },
     /// Could not open (or create) the `LOCK` file at all — a store-dir
     /// or filesystem problem, not a contention problem.
     #[error("failed to open lock file {path}: {source}")]
@@ -154,24 +151,18 @@ impl StoreLock {
             // a side effect of merely opening the path.
             .truncate(false)
             .open(&path)
-            .map_err(|source| LockError::Open {
-                path: path.clone(),
-                source,
-            })?;
+            .map_err(|source| LockError::Open { path: path.clone(), source })?;
 
         match file.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
                 return Err(LockError::HeldByOther {
-                    dir: dir.to_path_buf(),
+                    dir:        dir.to_path_buf(),
                     holder_pid: read_holder_pid(&path),
                 });
             }
             Err(TryLockError::Error(source)) => {
-                return Err(LockError::Lock {
-                    path: path.clone(),
-                    source,
-                });
+                return Err(LockError::Lock { path: path.clone(), source });
             }
         }
 
@@ -219,8 +210,9 @@ fn read_holder_pid(path: &Path) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
 
     /// A directory under the OS temp dir, unique per test, cleaned up
     /// on drop. No `tempfile` dependency: this crate has none besides
@@ -297,8 +289,8 @@ mod tests {
         // Drop released the OS lock; a fresh acquire must succeed,
         // reusing the same LOCK file (never deleted, see module
         // docs).
-        let second =
-            StoreLock::acquire(dir.path()).expect("reacquire after clean close");
+        let second = StoreLock::acquire(dir.path())
+            .expect("reacquire after clean close");
         drop(second);
     }
 
@@ -372,18 +364,20 @@ mod tests {
         // over it, and confirming a second acquire still fails.
         let dir = TestDir::new("live-over-stale-bytes");
         let lock_path = dir.path().join(LOCK_FILE_NAME);
-        std::fs::write(&lock_path, "123456\n").expect("seed stale-looking bytes");
+        std::fs::write(&lock_path, "123456\n")
+            .expect("seed stale-looking bytes");
 
         let _live = StoreLock::acquire(dir.path()).expect("live acquire");
-        let err = StoreLock::acquire(dir.path())
-            .expect_err("a live holder must still block, regardless of prior bytes");
+        let err = StoreLock::acquire(dir.path()).expect_err(
+            "a live holder must still block, regardless of prior bytes",
+        );
         assert!(matches!(err, LockError::HeldByOther { .. }));
     }
 
     #[test]
     fn error_display_without_pid_omits_the_parenthetical() {
         let err = LockError::HeldByOther {
-            dir: PathBuf::from("/tmp/example-store"),
+            dir:        PathBuf::from("/tmp/example-store"),
             holder_pid: None,
         };
         let msg = err.to_string();

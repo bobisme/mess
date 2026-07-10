@@ -54,7 +54,8 @@ pub const GENESIS_LABEL: &[u8; 14] = b"mess-stream-v1";
 ///
 /// `stream_id` is the interned u64 id (D3), **not** the stream name — names can
 /// be re-aliased, the interned id is immutable. The binding is MANDATORY: a
-/// certificate computed from a different `stream_id` mismatches at every `h[v]`.
+/// certificate computed from a different `stream_id` mismatches at every
+/// `h[v]`.
 #[must_use]
 pub fn genesis(stream_id: u64) -> Hash {
     let mut h = blake3::Hasher::new();
@@ -64,7 +65,8 @@ pub fn genesis(stream_id: u64) -> Hash {
     *h.finalize().as_bytes()
 }
 
-/// The frame hash `frame_hash[i] = BLAKE3(0x01 || le64(i) || payload[i])` (§3.2).
+/// The frame hash `frame_hash[i] = BLAKE3(0x01 || le64(i) || payload[i])`
+/// (§3.2).
 ///
 /// `payload` is the event payload bytes **as committed on disk** (post-codec /
 /// post-compression); verification hashes exactly what is stored. The
@@ -102,13 +104,12 @@ pub fn advance(prev: &Hash, version: u64, payload: &[u8]) -> Hash {
     chain_step(prev, &frame_hash(version, payload), version)
 }
 
-/// `BLAKE3(state_blob)` — the snapshot blob-integrity hash (`SnapshotRef.state_hash`,
-/// §2.1). No domain tag: it hashes an opaque blob, not a chain input, so it can
-/// never be confused with the tagged chain families.
+/// `BLAKE3(state_blob)` — the snapshot blob-integrity hash
+/// (`SnapshotRef.state_hash`, §2.1). No domain tag: it hashes an opaque blob,
+/// not a chain input, so it can never be confused with the tagged chain
+/// families.
 #[must_use]
-pub fn blob_hash(bytes: &[u8]) -> Hash {
-    *blake3::hash(bytes).as_bytes()
-}
+pub fn blob_hash(bytes: &[u8]) -> Hash { *blake3::hash(bytes).as_bytes() }
 
 // ---------------------------------------------------------------------------
 // Append-side chain state (wires BatchEncoder's crypto_chain slot, §6)
@@ -129,7 +130,7 @@ pub fn blob_hash(bytes: &[u8]) -> Hash {
 /// `crypto_chain` alone ([`recompute_batch`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChainHead {
-    head: Hash,
+    head:         Hash,
     /// Version of the *next* frame this head will absorb (0 at genesis).
     next_version: u64,
 }
@@ -148,28 +149,26 @@ impl ChainHead {
         ChainHead { head: head_hash, next_version: last_version + 1 }
     }
 
-    /// A head seeded from an arbitrary genesis value at version 0. Used to model
-    /// the §3.1 counterfactual — an *unbound* genesis shared across streams —
-    /// so a test can demonstrate that dropping the `stream_id` binding lets a
-    /// cross-stream snapshot pass (proving the binding is load-bearing).
+    /// A head seeded from an arbitrary genesis value at version 0. Used to
+    /// model the §3.1 counterfactual — an *unbound* genesis shared across
+    /// streams — so a test can demonstrate that dropping the `stream_id`
+    /// binding lets a cross-stream snapshot pass (proving the binding is
+    /// load-bearing).
     #[must_use]
     pub fn with_genesis_hash(head: Hash) -> Self {
         ChainHead { head, next_version: 0 }
     }
 
     /// The `crypto_chain` value to stamp into the next batch (`h[base-1]`),
-    /// i.e. the current head bytes. This is exactly what [`crate::encode::BatchInput::crypto_chain`]
-    /// wants when `flags.CRYPTO_CHAIN` is set.
+    /// i.e. the current head bytes. This is exactly what
+    /// [`crate::encode::BatchInput::crypto_chain`] wants when
+    /// `flags.CRYPTO_CHAIN` is set.
     #[must_use]
-    pub fn entry(&self) -> Hash {
-        self.head
-    }
+    pub fn entry(&self) -> Hash { self.head }
 
     /// The `stream_version` the next absorbed frame must carry.
     #[must_use]
-    pub fn next_version(&self) -> u64 {
-        self.next_version
-    }
+    pub fn next_version(&self) -> u64 { self.next_version }
 
     /// Fold one frame's payload into the head, returning the new `h[version]`.
     /// The frame's version MUST equal [`ChainHead::next_version`] (the batch is
@@ -204,12 +203,12 @@ impl ChainHead {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameChain {
     /// The frame's `stream_version` (0-based).
-    pub version: u64,
+    pub version:          u64,
     /// `h[version-1]` — the frame's `prev_stream_hash`, reconstructed from the
     /// batch's `crypto_chain` (never stored per frame, §6.2).
     pub prev_stream_hash: Hash,
     /// `h[version]` — the chain value after this frame.
-    pub chain: Hash,
+    pub chain:            Hash,
 }
 
 /// Reconstruct every frame's `(prev_stream_hash, h[version])` for one batch by
@@ -227,7 +226,12 @@ pub struct FrameChain {
 /// of frame `base + k` (as committed on disk). `f` is invoked once per frame in
 /// ascending order with its [`FrameChain`]; the return value is the batch's
 /// **exit head** `h[last]`.
-pub fn recompute_batch<'a, I, F>(crypto_chain: &Hash, base: u64, payloads: I, mut f: F) -> Hash
+pub fn recompute_batch<'a, I, F>(
+    crypto_chain: &Hash,
+    base: u64,
+    payloads: I,
+    mut f: F,
+) -> Hash
 where
     I: IntoIterator<Item = &'a [u8]>,
     F: FnMut(FrameChain),
@@ -244,11 +248,16 @@ where
 
 /// The `prev_stream_hash` of a single frame at `target` inside a batch, and the
 /// running chain up to and including `target` — the bounded intra-batch walk
-/// Path A/B need for a mid-batch frame (§6.4). Returns `(prev_stream_hash[target],
-/// h[target])`, or `None` if `target < base` or the batch's payloads run out
-/// before reaching it.
+/// Path A/B need for a mid-batch frame (§6.4). Returns
+/// `(prev_stream_hash[target], h[target])`, or `None` if `target < base` or the
+/// batch's payloads run out before reaching it.
 #[must_use]
-pub fn chain_at<'a, I>(crypto_chain: &Hash, base: u64, payloads: I, target: u64) -> Option<(Hash, Hash)>
+pub fn chain_at<'a, I>(
+    crypto_chain: &Hash,
+    base: u64,
+    payloads: I,
+    target: u64,
+) -> Option<(Hash, Hash)>
 where
     I: IntoIterator<Item = &'a [u8]>,
 {
@@ -313,23 +322,28 @@ mod tests {
         // Append-side ChainHead must produce exactly the crypto_chain +
         // per-frame values the read-side recompute reconstructs.
         let stream_id = 99u64;
-        let payloads: Vec<Vec<u8>> = (0..5u64).map(|i| vec![i as u8; 20]).collect();
+        let payloads: Vec<Vec<u8>> =
+            (0..5u64).map(|i| vec![i as u8; 20]).collect();
 
         // Batch 1: frames 0..=2. Batch 2: frames 3..=4.
         let mut head = ChainHead::genesis(stream_id);
         let entry1 = head.entry();
-        let refs1: Vec<&[u8]> = payloads[0..3].iter().map(Vec::as_slice).collect();
+        let refs1: Vec<&[u8]> =
+            payloads[0..3].iter().map(Vec::as_slice).collect();
         let exit1 = head.absorb_batch(refs1.iter().copied());
 
         let entry2 = head.entry();
         assert_eq!(entry2, exit1, "batch 2's entry is batch 1's exit head");
-        let refs2: Vec<&[u8]> = payloads[3..5].iter().map(Vec::as_slice).collect();
+        let refs2: Vec<&[u8]> =
+            payloads[3..5].iter().map(Vec::as_slice).collect();
         let exit2 = head.absorb_batch(refs2.iter().copied());
 
         // Read side: recompute batch 1 from entry1.
         let mut got = Vec::new();
         let recomputed_exit1 =
-            recompute_batch(&entry1, 0, refs1.iter().copied(), |fc| got.push(fc));
+            recompute_batch(&entry1, 0, refs1.iter().copied(), |fc| {
+                got.push(fc)
+            });
         assert_eq!(recomputed_exit1, exit1);
         assert_eq!(got.len(), 3);
         assert_eq!(got[0].prev_stream_hash, genesis(stream_id));
@@ -339,7 +353,9 @@ mod tests {
         // Read side: recompute batch 2 from entry2.
         let mut got2 = Vec::new();
         let recomputed_exit2 =
-            recompute_batch(&entry2, 3, refs2.iter().copied(), |fc| got2.push(fc));
+            recompute_batch(&entry2, 3, refs2.iter().copied(), |fc| {
+                got2.push(fc)
+            });
         assert_eq!(recomputed_exit2, exit2);
         assert_eq!(got2[0].prev_stream_hash, exit1);
         assert_eq!(got2[0].version, 3);
@@ -347,7 +363,8 @@ mod tests {
 
     #[test]
     fn chain_at_matches_full_recompute() {
-        let payloads: Vec<Vec<u8>> = (0..4u64).map(|i| vec![0xA0 | i as u8; 12]).collect();
+        let payloads: Vec<Vec<u8>> =
+            (0..4u64).map(|i| vec![0xA0 | i as u8; 12]).collect();
         let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
         let entry = genesis(3);
 
@@ -367,7 +384,8 @@ mod tests {
         // A head resumed from a durable anchor must chain identically to one
         // that folded the whole prefix.
         let stream_id = 5u64;
-        let payloads: Vec<Vec<u8>> = (0..6u64).map(|i| vec![i as u8; 8]).collect();
+        let payloads: Vec<Vec<u8>> =
+            (0..6u64).map(|i| vec![i as u8; 8]).collect();
         let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
 
         let mut whole = ChainHead::genesis(stream_id);

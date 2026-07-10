@@ -25,9 +25,7 @@ pub enum LockState {
 
 impl LockState {
     #[must_use]
-    pub fn is_held(&self) -> bool {
-        matches!(self, LockState::Held { .. })
-    }
+    pub fn is_held(&self) -> bool { matches!(self, LockState::Held { .. }) }
 }
 
 /// Probe the lock without holding it: acquire-then-drop when free, report the
@@ -40,7 +38,9 @@ pub fn probe(dir: &Path) -> LockState {
             drop(lock);
             LockState::Free
         }
-        Err(LockError::HeldByOther { holder_pid, .. }) => LockState::Held { pid: holder_pid },
+        Err(LockError::HeldByOther { holder_pid, .. }) => {
+            LockState::Held { pid: holder_pid }
+        }
         Err(e) => LockState::Unknown { reason: e.to_string() },
     }
 }

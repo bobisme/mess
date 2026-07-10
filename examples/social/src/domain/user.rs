@@ -17,25 +17,25 @@
 //!
 //! - **Single-stream invariant enforcement.** The rules Follow must uphold —
 //!   *not already following*, *not self*, *registered* — are all facts about
-//!   **alice**. Because `decide` folds exactly one stream, every fact it
-//!   needs to check must live on that one stream. Put the set on alice's
-//!   stream and "am I already following bob?" is a pure, race-free lookup in
-//!   alice's own folded state. The optimistic-concurrency retry in
-//!   `EventStore::command` then makes the check-and-append atomic *per
-//!   stream* with no cross-stream lock.
+//!   **alice**. Because `decide` folds exactly one stream, every fact it needs
+//!   to check must live on that one stream. Put the set on alice's stream and
+//!   "am I already following bob?" is a pure, race-free lookup in alice's own
+//!   folded state. The optimistic-concurrency retry in `EventStore::command`
+//!   then makes the check-and-append atomic *per stream* with no cross-stream
+//!   lock.
 //!
 //! - **Cross-aggregate existence checks are deliberately impossible in
-//!   `decide`.** Notice what Follow does **not** verify: that `bob` exists
-//!   and is registered. `decide` is a pure function of *one* aggregate's
-//!   state; it cannot load bob's stream. That is a feature, not a gap. The
-//!   event-sourcing answer to "does the target exist?" is: don't enforce it
-//!   synchronously in the writer. Either (a) accept the edge and let a
-//!   downstream projection/read-model reconcile or drop dangling edges, or
-//!   (b) enforce it in a process manager / saga that reacts to `Followed` and
-//!   emits a compensating `Unfollowed` if the target turns out not to exist.
-//!   A single `decide` call spanning two streams would need a distributed
-//!   transaction — exactly what event sourcing trades away for per-stream
-//!   linearizability. (Logged as a dogfood finding for bn-154.)
+//!   `decide`.** Notice what Follow does **not** verify: that `bob` exists and
+//!   is registered. `decide` is a pure function of *one* aggregate's state; it
+//!   cannot load bob's stream. That is a feature, not a gap. The event-sourcing
+//!   answer to "does the target exist?" is: don't enforce it synchronously in
+//!   the writer. Either (a) accept the edge and let a downstream
+//!   projection/read-model reconcile or drop dangling edges, or (b) enforce it
+//!   in a process manager / saga that reacts to `Followed` and emits a
+//!   compensating `Unfollowed` if the target turns out not to exist. A single
+//!   `decide` call spanning two streams would need a distributed transaction —
+//!   exactly what event sourcing trades away for per-stream linearizability.
+//!   (Logged as a dogfood finding for bn-154.)
 
 use std::collections::HashSet;
 
@@ -84,14 +84,14 @@ pub enum UserEvent {
 pub struct User {
     /// `false` until a `Registered` event is folded — the existence flag every
     /// command except `RegisterUser` checks first.
-    pub registered: bool,
+    pub registered:   bool,
     /// The immutable handle chosen at registration.
-    pub handle: String,
+    pub handle:       String,
     /// The current display name (mutated by `DisplayNameChanged`).
     pub display_name: String,
     /// The set of user ids this user currently follows — the follow edge set,
     /// living on the follower's own stream (see the module docs).
-    pub following: HashSet<Id>,
+    pub following:    HashSet<Id>,
 }
 
 impl User {
@@ -176,7 +176,9 @@ impl std::fmt::Display for UserError {
                 "invalid handle {handle:?}: must be 1-{HANDLE_MAX_LEN} \
                  characters of lowercase a-z, 0-9, or underscore"
             ),
-            UserError::SelfFollow => write!(f, "a user cannot follow themselves"),
+            UserError::SelfFollow => {
+                write!(f, "a user cannot follow themselves")
+            }
             UserError::AlreadyFollowing => {
                 write!(f, "already following that user")
             }
@@ -192,7 +194,7 @@ impl std::error::Error for UserError {}
 /// wire; only the events `decide` returns cross into the log.
 #[derive(Debug, Clone)]
 pub struct RegisterUser {
-    pub handle: String,
+    pub handle:       String,
     pub display_name: String,
 }
 
@@ -213,7 +215,7 @@ pub struct SetDisplayName {
 #[derive(Debug, Clone, Copy)]
 pub struct Follow {
     pub follower: Id,
-    pub target: Id,
+    pub target:   Id,
 }
 
 /// Unfollow a user. No `follower` field is needed: you can never be following
@@ -236,7 +238,7 @@ impl Decide<RegisterUser> for User {
             return Err(UserError::InvalidHandle { handle: cmd.handle });
         }
         Ok(vec![UserEvent::Registered {
-            handle: cmd.handle,
+            handle:       cmd.handle,
             display_name: cmd.display_name,
         }])
     }

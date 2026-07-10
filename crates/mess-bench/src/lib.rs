@@ -24,12 +24,12 @@
 //! so:
 //!
 //!   - the smoke variant ([`RunSize::Smoke`]) exercises the *exact* code path
-//!     the gated run does, just at tiny N — a separate shell script wired
-//!     into CI could rot independently of the thing it is supposed to smoke
-//!     test; a shared function parameterized by size cannot.
+//!     the gated run does, just at tiny N — a separate shell script wired into
+//!     CI could rot independently of the thing it is supposed to smoke test; a
+//!     shared function parameterized by size cannot.
 //!   - one binary, one JSON ledger, one exit code — no fragile stdout
-//!     regex-scraping across `cargo` invocations with their own build
-//!     output interleaved.
+//!     regex-scraping across `cargo` invocations with their own build output
+//!     interleaved.
 //!
 //! # Settle-pacing (perf_group_commit finding)
 //!
@@ -47,16 +47,15 @@
 //! not glossed over:
 //!
 //!   1. **Best-of-N per workload** (matching each ported entry point's own
-//!      methodology) — device jitter only ever slows a rep down, so the
-//!      fastest rep is still the truest read of the code path.
+//!      methodology) — device jitter only ever slows a rep down, so the fastest
+//!      rep is still the truest read of the code path.
 //!   2. **A settle sleep between workloads** ([`settle`]), default
-//!      [`DEFAULT_SETTLE_SECS`] seconds, so one workload's write burst does
-//!      not directly poison the next workload's fsync latency. This is
-//!      deliberately shorter than perf_group_commit's 12-20s — that duration
-//!      was sized for *interleaved reps across designs* chasing a
-//!      few-percent effect; this ratchet's threshold is a coarse -10%
-//!      regression, and every gate-relevant workload already reports its own
-//!      best-of-N.
+//!      [`DEFAULT_SETTLE_SECS`] seconds, so one workload's write burst does not
+//!      directly poison the next workload's fsync latency. This is deliberately
+//!      shorter than perf_group_commit's 12-20s — that duration was sized for
+//!      *interleaved reps across designs* chasing a few-percent effect; this
+//!      ratchet's threshold is a coarse -10% regression, and every
+//!      gate-relevant workload already reports its own best-of-N.
 //!
 //!   What this does **not** claim: it is not a drift-controlled comparison
 //!   in the perf_group_commit sense. If the compare step ever flags a
@@ -99,9 +98,9 @@ pub const DEFAULT_SETTLE_SECS: u64 = 5;
 /// date/machine profile carried once on [`Ledger`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Metric {
-    pub metric: String,
-    pub value: f64,
-    pub unit: String,
+    pub metric:     String,
+    pub value:      f64,
+    pub unit:       String,
     pub conditions: String,
 }
 
@@ -126,23 +125,23 @@ impl Metric {
 /// it from scratch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MachineProfile {
-    pub cpu_model: String,
-    pub cpu_count: usize,
-    pub kernel: String,
+    pub cpu_model:   String,
+    pub cpu_count:   usize,
+    pub kernel:      String,
     pub scratch_dir: String,
-    pub scratch_fs: String,
+    pub scratch_fs:  String,
 }
 
 impl MachineProfile {
     pub fn probe(scratch: &Path) -> Self {
         MachineProfile {
-            cpu_model: cpu_model(),
-            cpu_count: std::thread::available_parallelism()
+            cpu_model:   cpu_model(),
+            cpu_count:   std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(1),
-            kernel: kernel_release(),
+            kernel:      kernel_release(),
             scratch_dir: scratch.display().to_string(),
-            scratch_fs: fs_type_of(scratch)
+            scratch_fs:  fs_type_of(scratch)
                 .unwrap_or_else(|_| "unknown".to_string()),
         }
     }
@@ -172,8 +171,8 @@ fn kernel_release() -> String {
 /// A run ledger: date, machine profile, run mode, and every emitted metric.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ledger {
-    pub date: String,
-    pub mode: String,
+    pub date:    String,
+    pub mode:    String,
     pub machine: MachineProfile,
     pub metrics: Vec<Metric>,
 }
@@ -245,8 +244,9 @@ pub fn assert_real_fs(path: &Path) -> Result<(), String> {
     if fstype == "tmpfs" || fstype == "ramfs" {
         return Err(format!(
             "refusing to run: scratch dir {} resolves onto a {fstype} mount \
-             (fdatasync is a no-op there; durable-append numbers would be a lie). \
-             Point MESS_BENCH_DIR at a real-fs path (e.g. $HOME/.cache/mess-bench).",
+             (fdatasync is a no-op there; durable-append numbers would be a \
+             lie). Point MESS_BENCH_DIR at a real-fs path (e.g. \
+             $HOME/.cache/mess-bench).",
             path.display()
         ));
     }
@@ -293,14 +293,14 @@ pub enum Direction {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Floor {
-    pub metric: String,
+    pub metric:    String,
     pub direction: Direction,
-    pub floor: f64,
+    pub floor:     f64,
     /// Fractional tolerance, e.g. `0.10` for the default -10%. Always
     /// stored as a positive magnitude; [`Direction`] decides which way it
     /// shifts the bound.
     pub tolerance: f64,
-    pub source: String,
+    pub source:    String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -327,10 +327,10 @@ impl Floor {
 
 #[derive(Debug, Clone)]
 pub struct Regression {
-    pub metric: String,
-    pub value: f64,
-    pub bound: f64,
-    pub floor: f64,
+    pub metric:    String,
+    pub value:     f64,
+    pub bound:     f64,
+    pub floor:     f64,
     pub direction: Direction,
 }
 
@@ -365,10 +365,10 @@ pub fn compare(ledger: &Ledger, floors: &FloorsFile) -> Vec<Regression> {
         };
         if !floor.passes(m.value) {
             out.push(Regression {
-                metric: floor.metric.clone(),
-                value: m.value,
-                bound: floor.bound(),
-                floor: floor.floor,
+                metric:    floor.metric.clone(),
+                value:     m.value,
+                bound:     floor.bound(),
+                floor:     floor.floor,
                 direction: floor.direction,
             });
         }

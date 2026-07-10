@@ -13,24 +13,23 @@
 //!
 //! # Abstractions (and why they are sound)
 //!
-//! - **Perfect CRC (A4).** A slot byte-validates iff its header, body,
-//!   and marker regions all hold bytes of the SAME complete write. That
-//!   the real CRC actually delivers this — against torn sectors, holes,
-//!   stale bytes, straddled headers (A2/A3/A11/A12) — is exactly what
-//!   `spikes/torn_write` proved empirically over 24k randomized crash
-//!   images. The model layers protocol logic above that result.
+//! - **Perfect CRC (A4).** A slot byte-validates iff its header, body, and
+//!   marker regions all hold bytes of the SAME complete write. That the real
+//!   CRC actually delivers this — against torn sectors, holes, stale bytes,
+//!   straddled headers (A2/A3/A11/A12) — is exactly what `spikes/torn_write`
+//!   proved empirically over 24k randomized crash images. The model layers
+//!   protocol logic above that result.
 //! - **Slot granularity.** Every batch occupies one slot of three
-//!   independently-persisted parts (header/body/marker) — the minimal
-//!   geometry in which marker-before-frames reordering (A4's killer)
-//!   exists. Byte geometry (alignment, straddling) is the harness's
-//!   domain, not the model's.
+//!   independently-persisted parts (header/body/marker) — the minimal geometry
+//!   in which marker-before-frames reordering (A4's killer) exists. Byte
+//!   geometry (alignment, straddling) is the harness's domain, not the model's.
 //! - **fsync is a true barrier**, matching the harness fault model (no
 //!   volatile-cache lies).
-//! - **Content is identity.** A write's bytes are represented by its
-//!   [`Spec`]; `uniq` distinguishes writes whose header fields collide
-//!   (e.g. a post-recovery rewrite of a dead slot), so the oracle can
-//!   tell WHICH write's bytes were accepted even when the kernel-visible
-//!   candidate fields are identical.
+//! - **Content is identity.** A write's bytes are represented by its [`Spec`];
+//!   `uniq` distinguishes writes whose header fields collide (e.g. a
+//!   post-recovery rewrite of a dead slot), so the oracle can tell WHICH
+//!   write's bytes were accepted even when the kernel-visible candidate fields
+//!   are identical.
 
 use crate::acceptance::{Candidate, CandidateStatus, ScanOutcome};
 

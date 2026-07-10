@@ -3,14 +3,14 @@
 //! Two error types live here:
 //!
 //! - [`CodecError`] — a failure while encoding or decoding an event payload,
-//!   surfaced by [`crate::Event::encode`] / [`crate::Event::decode`]. Its
-//!   shape is frozen from the `dx_api` spike.
+//!   surfaced by [`crate::Event::encode`] / [`crate::Event::decode`]. Its shape
+//!   is frozen from the `dx_api` spike.
 //! - [`CommandError`] — the outcome of a full command round (load → decide →
-//!   append). It keeps the spike's three-variant shape
-//!   (`Domain` / `Conflict` / `Store`) but is generic over the domain
-//!   rejection `R` and the store error `S` so `mess-core` never has to name a
-//!   backend type (a backend crate supplies `S`; the aggregate supplies `R`
-//!   via [`crate::Decide::Rejection`]).
+//!   append). It keeps the spike's three-variant shape (`Domain` / `Conflict` /
+//!   `Store`) but is generic over the domain rejection `R` and the store error
+//!   `S` so `mess-core` never has to name a backend type (a backend crate
+//!   supplies `S`; the aggregate supplies `R` via
+//!   [`crate::Decide::Rejection`]).
 
 use std::fmt;
 
@@ -27,7 +27,7 @@ pub enum CodecError {
         /// The event name whose payload failed to decode.
         event_name: String,
         /// The underlying decoder error, rendered.
-        source: String,
+        source:     String,
     },
     /// The stored name does not correspond to any known event.
     UnknownEventName(String),
@@ -54,8 +54,8 @@ impl std::error::Error for CodecError {}
 /// Generic parameters keep `mess-core` free of any backend dependency while
 /// preserving the spike's three-variant shape:
 ///
-/// - `R` — the domain rejection, i.e. [`crate::Decide::Rejection`], returned
-///   by [`crate::Decide::decide`] when a business rule refuses the command.
+/// - `R` — the domain rejection, i.e. [`crate::Decide::Rejection`], returned by
+///   [`crate::Decide::decide`] when a business rule refuses the command.
 /// - `S` — the infrastructure (store) error, supplied by whichever backend
 ///   crate drives the load/append; `mess-core` never names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,7 +65,7 @@ pub enum CommandError<R, S> {
     /// Optimistic-retry budget exhausted: the stream kept moving under us.
     Conflict {
         /// The stream that could not be written.
-        stream: String,
+        stream:   String,
         /// How many optimistic attempts were made before giving up.
         attempts: u32,
     },

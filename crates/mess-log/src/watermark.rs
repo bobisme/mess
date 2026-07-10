@@ -13,11 +13,11 @@
 //! with `n` durable events it reads `base_pos + n`.
 //!
 //! Consequences, both used by D11 later:
-//! - a **batch** covering positions `[first, first + count)` is durable
-//!   once `value >= first + count` — this is what an appender awaits to be
-//!   acked ([`Watermark::wait_for`]).
-//! - a **position** `p` is durable (may be served) once `value >= p + 1`,
-//!   i.e. `value > p`; a consumer awaits `wait_for(p + 1)`.
+//! - a **batch** covering positions `[first, first + count)` is durable once
+//!   `value >= first + count` — this is what an appender awaits to be acked
+//!   ([`Watermark::wait_for`]).
+//! - a **position** `p` is durable (may be served) once `value >= p + 1`, i.e.
+//!   `value > p`; a consumer awaits `wait_for(p + 1)`.
 //!
 //! # Watch-channel shape
 //!
@@ -38,7 +38,7 @@ use std::task::{Context, Poll, Waker};
 
 struct State {
     /// Exclusive durable end (log end). Monotone non-decreasing while live.
-    value: u64,
+    value:   u64,
     /// `(threshold, waker)` for each parked `wait_for`. Drained on every
     /// `advance`; a waiter whose threshold is still unmet re-registers when
     /// it is re-polled.
@@ -57,15 +57,16 @@ impl Watermark {
     /// `base_pos`: no events durable yet).
     pub fn new(initial: u64) -> Self {
         Watermark {
-            inner: Arc::new(Mutex::new(State { value: initial, waiters: Vec::new() })),
+            inner: Arc::new(Mutex::new(State {
+                value:   initial,
+                waiters: Vec::new(),
+            })),
         }
     }
 
     /// The current durable end (the log end). Monotone while the store is
     /// live.
-    pub fn get(&self) -> u64 {
-        self.inner.lock().unwrap().value
-    }
+    pub fn get(&self) -> u64 { self.inner.lock().unwrap().value }
 
     /// Advance the durable end to `to`, covering every position `< to`.
     /// Monotone: a `to` not greater than the current value is a no-op.
@@ -114,7 +115,7 @@ impl Watermark {
 
 /// The future returned by [`Watermark::wait_for`].
 pub struct WaitFor {
-    inner: Arc<Mutex<State>>,
+    inner:     Arc<Mutex<State>>,
     threshold: u64,
 }
 
@@ -134,15 +135,15 @@ impl Future for WaitFor {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::task::Wake;
 
+    use super::*;
+
     struct Noop(AtomicBool);
     impl Wake for Noop {
-        fn wake(self: Arc<Self>) {
-            self.0.store(true, Ordering::SeqCst);
-        }
+        fn wake(self: Arc<Self>) { self.0.store(true, Ordering::SeqCst); }
+
         fn wake_by_ref(self: &Arc<Self>) {
             self.0.store(true, Ordering::SeqCst);
         }
@@ -225,10 +226,19 @@ mod tests {
         let mut cx = Context::from_waker(&waker);
         // Positions 0..10 are durable (exclusive end 10), so every position
         // < 9 is already past; position 9 needs value >= 10 — satisfied.
-        assert_eq!(Box::pin(wm.await_past(9)).as_mut().poll(&mut cx), Poll::Ready(()));
-        assert_eq!(Box::pin(wm.await_past(0)).as_mut().poll(&mut cx), Poll::Ready(()));
+        assert_eq!(
+            Box::pin(wm.await_past(9)).as_mut().poll(&mut cx),
+            Poll::Ready(())
+        );
+        assert_eq!(
+            Box::pin(wm.await_past(0)).as_mut().poll(&mut cx),
+            Poll::Ready(())
+        );
         // Position 10 needs value >= 11 — not yet.
-        assert_eq!(Box::pin(wm.await_past(10)).as_mut().poll(&mut cx), Poll::Pending);
+        assert_eq!(
+            Box::pin(wm.await_past(10)).as_mut().poll(&mut cx),
+            Poll::Pending
+        );
     }
 
     #[test]
@@ -266,7 +276,10 @@ mod tests {
         let w = Arc::new(Noop(AtomicBool::new(false)));
         let waker = Waker::from(w.clone());
         let mut cx = Context::from_waker(&waker);
-        assert_eq!(Box::pin(wm.await_past(u64::MAX)).as_mut().poll(&mut cx), Poll::Ready(()));
+        assert_eq!(
+            Box::pin(wm.await_past(u64::MAX)).as_mut().poll(&mut cx),
+            Poll::Ready(())
+        );
     }
 }
 
@@ -308,7 +321,10 @@ mod kani_proofs {
         let wm = Watermark::new(initial);
         wm.advance(to);
 
-        assert!(wm.get() >= initial, "advance must never regress the watermark");
+        assert!(
+            wm.get() >= initial,
+            "advance must never regress the watermark"
+        );
     }
 
     /// Exact semantics, not just the inequality above: `advance(to)` sets
@@ -334,7 +350,11 @@ mod kani_proofs {
         wm.advance(to);
 
         let expected = if to > initial { to } else { initial };
-        assert_eq!(wm.get(), expected, "advance must set value to max(initial, to)");
+        assert_eq!(
+            wm.get(),
+            expected,
+            "advance must set value to max(initial, to)"
+        );
     }
 
     /// Await-past semantics predicate: `WaitFor::poll` resolves a waiter
@@ -356,7 +376,10 @@ mod kani_proofs {
         let wm = Watermark::new(initial);
         wm.advance(to);
 
-        assert!(wm.get() >= to, "advance(to) must leave a waiter on `to` immediately satisfiable");
+        assert!(
+            wm.get() >= to,
+            "advance(to) must leave a waiter on `to` immediately satisfiable"
+        );
     }
 
     /// Monotonicity across a SEQUENCE of advances, not just one call: the
@@ -388,11 +411,17 @@ mod kani_proofs {
         wm.advance(t2);
         let v2 = wm.get();
         assert!(v2 >= v1, "step 2 must not regress");
-        assert!(v2 >= t1 && v2 >= t2, "step 2 must still clear every target offered so far");
+        assert!(
+            v2 >= t1 && v2 >= t2,
+            "step 2 must still clear every target offered so far"
+        );
 
         wm.advance(t3);
         let v3 = wm.get();
         assert!(v3 >= v2, "step 3 must not regress");
-        assert!(v3 >= t1 && v3 >= t2 && v3 >= t3, "final value must clear every target offered");
+        assert!(
+            v3 >= t1 && v3 >= t2 && v3 >= t3,
+            "final value must clear every target offered"
+        );
     }
 }

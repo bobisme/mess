@@ -57,7 +57,10 @@ pub fn is_tmpfs(dir: &Path) -> io::Result<bool> {
                 if !probe.pop() {
                     return Err(io::Error::new(
                         io::ErrorKind::NotFound,
-                        format!("cannot resolve any ancestor of {}", dir.display()),
+                        format!(
+                            "cannot resolve any ancestor of {}",
+                            dir.display()
+                        ),
                     ));
                 }
             }
@@ -70,7 +73,9 @@ pub fn is_tmpfs(dir: &Path) -> io::Result<bool> {
     for line in mounts.lines() {
         // fields: dev  mountpoint  fstype  opts ...
         let mut f = line.split_whitespace();
-        let (Some(_dev), Some(mount_raw), Some(fstype)) = (f.next(), f.next(), f.next()) else {
+        let (Some(_dev), Some(mount_raw), Some(fstype)) =
+            (f.next(), f.next(), f.next())
+        else {
             continue;
         };
         let mount = unescape_mount(mount_raw);
@@ -128,13 +133,18 @@ pub fn guard_fresh_dir(dir: &Path) -> Result<(), String> {
     markers.sort();
     Err(format!(
         "refusing to soak on non-empty --dir {}: found a leftover store \
-         ({segments} seg-*.log segment file(s), markers: [{}]{}) — the shadow model \
-         starts empty, so pre-existing events would read as fabricated extras and \
-         pre-existing stream heads as version conflicts (the bn-3dr false alarm). \
-         Use a fresh directory per run; there is no resume mode.",
+         ({segments} seg-*.log segment file(s), markers: [{}]{}) — the shadow \
+         model starts empty, so pre-existing events would read as fabricated \
+         extras and pre-existing stream heads as version conflicts (the \
+         bn-3dr false alarm). Use a fresh directory per run; there is no \
+         resume mode.",
         dir.display(),
         markers.join(", "),
-        if others > 0 { format!(", plus {others} other entr(ies)") } else { String::new() },
+        if others > 0 {
+            format!(", plus {others} other entr(ies)")
+        } else {
+            String::new()
+        },
     ))
 }
 
@@ -187,7 +197,10 @@ mod tests {
     fn tmpfs_detects_dev_shm() {
         // `/dev/shm` is tmpfs on essentially every Linux box.
         if Path::new("/dev/shm").exists() {
-            assert!(is_tmpfs(Path::new("/dev/shm")).unwrap(), "/dev/shm must read as tmpfs");
+            assert!(
+                is_tmpfs(Path::new("/dev/shm")).unwrap(),
+                "/dev/shm must read as tmpfs"
+            );
         }
     }
 

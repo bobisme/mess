@@ -89,20 +89,24 @@ fn golden_fixture_1_single_frame() {
     let payload: Vec<u8> = (0u8..12).collect();
     let sfs = [Subframe::plain(0x11, 0, 0, &payload)];
     let input = BatchInput {
-        segment_epoch: 1,
-        batch_id: 0,
-        first_global_pos: 0,
-        stream_id: 0,
-        category_id: 0,
+        segment_epoch:        1,
+        batch_id:             0,
+        first_global_pos:     0,
+        stream_id:            0,
+        category_id:          0,
         first_stream_version: 0,
-        crypto_chain: None,
-        subframes: &sfs,
+        crypto_chain:         None,
+        subframes:            &sfs,
     };
     let mut enc = BatchEncoder::new();
     let got = enc.encode(&input).unwrap();
     let want = hx(F1_HEX);
     assert_eq!(want.len(), 128);
-    assert_eq!(got, &want[..], "1-frame batch bytes must match the spec-derived golden");
+    assert_eq!(
+        got,
+        &want[..],
+        "1-frame batch bytes must match the spec-derived golden"
+    );
 
     // Spot-check the load-bearing offsets against the spec tables directly.
     assert_eq!(&got[0..4], &HEADER_MAGIC.to_le_bytes());
@@ -121,37 +125,37 @@ fn golden_fixture_2_multi_frame() {
     let pb = b"world!!";
     let sfs = [
         Subframe {
-            event_type_id: 0xAABB_CCDD,
-            schema_version: 2,
-            codec_id: 1,
-            compression_id: 0,
-            dict_id: 0,
+            event_type_id:    0xAABB_CCDD,
+            schema_version:   2,
+            codec_id:         1,
+            compression_id:   0,
+            dict_id:          0,
             uncompressed_len: 5,
-            metadata_len: 0,
-            data_len: 5,
-            payload: pa,
+            metadata_len:     0,
+            data_len:         5,
+            payload:          pa,
         },
         Subframe {
-            event_type_id: 0x0102_0304,
-            schema_version: 1,
-            codec_id: 1,
-            compression_id: 0,
-            dict_id: 3,
+            event_type_id:    0x0102_0304,
+            schema_version:   1,
+            codec_id:         1,
+            compression_id:   0,
+            dict_id:          3,
             uncompressed_len: 7,
-            metadata_len: 2,
-            data_len: 5,
-            payload: pb,
+            metadata_len:     2,
+            data_len:         5,
+            payload:          pb,
         },
     ];
     let input = BatchInput {
-        segment_epoch: 7,
-        batch_id: 3,
-        first_global_pos: 100,
-        stream_id: 42,
-        category_id: 9,
+        segment_epoch:        7,
+        batch_id:             3,
+        first_global_pos:     100,
+        stream_id:            42,
+        category_id:          9,
         first_stream_version: 5,
-        crypto_chain: None,
-        subframes: &sfs,
+        crypto_chain:         None,
+        subframes:            &sfs,
     };
     let mut enc = BatchEncoder::new();
     let got = enc.encode(&input).unwrap();
@@ -167,14 +171,14 @@ fn golden_fixture_3_with_crypto_chain() {
     let payload = [0xDEu8, 0xAD, 0xBE, 0xEF];
     let sfs = [Subframe::plain(9, 0, 0, &payload)];
     let input = BatchInput {
-        segment_epoch: 2,
-        batch_id: 1,
-        first_global_pos: 50,
-        stream_id: 5,
-        category_id: 1,
+        segment_epoch:        2,
+        batch_id:             1,
+        first_global_pos:     50,
+        stream_id:            5,
+        category_id:          1,
         first_stream_version: 10,
-        crypto_chain: Some(&chain),
-        subframes: &sfs,
+        crypto_chain:         Some(&chain),
+        subframes:            &sfs,
     };
     let mut enc = BatchEncoder::new();
     let got = enc.encode(&input).unwrap();
@@ -183,7 +187,10 @@ fn golden_fixture_3_with_crypto_chain() {
     assert_eq!(got, &want[..], "with-chain batch bytes must match the golden");
 
     // flags bit 0 set; chain occupies [72, 104); subframe starts at 104.
-    assert_eq!(u16::from_le_bytes(got[6..8].try_into().unwrap()), FLAG_CRYPTO_CHAIN);
+    assert_eq!(
+        u16::from_le_bytes(got[6..8].try_into().unwrap()),
+        FLAG_CRYPTO_CHAIN
+    );
     assert_eq!(&got[72..104], &chain[..]);
 }
 

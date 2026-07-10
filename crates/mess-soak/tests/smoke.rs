@@ -23,7 +23,8 @@ fn scratch_dir(tag: &str) -> PathBuf {
         .map(PathBuf::from)
         .filter(|p| !mess_soak::resource::is_tmpfs(p).unwrap_or(true))
         .unwrap_or_else(|| {
-            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".cache")
+            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+                .join(".cache")
         });
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -67,7 +68,11 @@ async fn soak_smoke_survives_crashes_with_all_probes_on() {
     println!("smoke report: {report:#?}");
 
     // Crashes actually happened (acceptance: >= 2 crash cycles inside).
-    assert!(report.crashes >= 2, "expected >= 2 crash cycles, got {}", report.crashes);
+    assert!(
+        report.crashes >= 2,
+        "expected >= 2 crash cycles, got {}",
+        report.crashes
+    );
     // Work actually happened.
     assert!(report.appends > 0, "no appends");
     assert!(report.events >= report.appends, "events < appends");

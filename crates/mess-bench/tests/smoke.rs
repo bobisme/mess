@@ -21,8 +21,9 @@ fn smoke_harness_runs_every_workload_and_emits_expected_metrics() {
     let scratch = default_scratch_root().join("smoke-test");
     std::fs::create_dir_all(&scratch).expect("create smoke scratch dir");
     assert_real_fs(&scratch).expect(
-        "smoke test scratch dir must be real-fs; set MESS_BENCH_DIR to an ext4/xfs/btrfs path \
-         if $HOME/.cache is unexpectedly tmpfs on this host",
+        "smoke test scratch dir must be real-fs; set MESS_BENCH_DIR to an \
+         ext4/xfs/btrfs path if $HOME/.cache is unexpectedly tmpfs on this \
+         host",
     );
 
     let metrics = run_all(RunSize::Smoke, &scratch, 0);

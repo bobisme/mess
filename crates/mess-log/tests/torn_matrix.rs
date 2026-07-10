@@ -11,8 +11,8 @@
 //! (arbitrary pending-sector persistence + optional torn sector), recover
 //! with the production [`recover_segment`], and assert:
 //!
-//! - **acked-implies-recovered**: every synced batch is in the accepted
-//!   prefix, byte-exact, at its exact offset;
+//! - **acked-implies-recovered**: every synced batch is in the accepted prefix,
+//!   byte-exact, at its exact offset;
 //! - **never-accept-uncommitted**: EVERY accepted batch (acked or the A6
 //!   surfaced-unacked-but-fully-persisted kind) is byte-exact one of the
 //!   batches that was actually written — never partial, reordered-hole,
@@ -66,8 +66,8 @@ use std::path::Path;
 use mess_log::acceptance::{AcceptState, Candidate, CandidateStatus, Step};
 use mess_log::encode::{BatchEncoder, BatchInput, Subframe};
 use mess_log::format::*;
-use mess_log::runtime::{FileHandle, Fault, Fs, OpenOpts, Rng, SimFs};
-use mess_log::scanner::{recover_segment, ScanStop};
+use mess_log::runtime::{Fault, FileHandle, Fs, OpenOpts, Rng, SimFs};
+use mess_log::scanner::{ScanStop, recover_segment};
 use mess_log::writer::{BatchSpec, SegmentParams, SegmentWriter};
 
 // ---------------------------------------------------------------------------
@@ -114,17 +114,18 @@ fn rd_u64(d: &[u8], o: usize) -> u64 {
 // ---------------------------------------------------------------------------
 
 struct WeakDecoded {
-    offset: u64,
-    epoch: u64,
-    batch_id: u64,
+    offset:           u64,
+    epoch:            u64,
+    batch_id:         u64,
     first_global_pos: u64,
-    frame_count: u32,
-    total_len: u64,
+    frame_count:      u32,
+    total_len:        u64,
 }
 
 /// `decode_batch`'s byte-decode (§2.1 steps 1-6 of `docs/spec/02-recovery.md`)
 /// with the A4 full-batch CRC verify and the marker's CRC echo comparison
-/// **omitted** — magic + length echo only, exactly the spike's `Validation::Weak`.
+/// **omitted** — magic + length echo only, exactly the spike's
+/// `Validation::Weak`.
 fn decode_weak(img: &[u8], off: usize) -> Result<WeakDecoded, ()> {
     let rem = img.len().checked_sub(off).ok_or(())?;
     if rem < HEADER_LEN {
@@ -170,12 +171,23 @@ fn decode_weak(img: &[u8], off: usize) -> Result<WeakDecoded, ()> {
         return Err(());
     }
 
-    Ok(WeakDecoded { offset: off as u64, epoch, batch_id, first_global_pos, frame_count, total_len })
+    Ok(WeakDecoded {
+        offset: off as u64,
+        epoch,
+        batch_id,
+        first_global_pos,
+        frame_count,
+        total_len,
+    })
 }
 
 /// Duplicate of `scanner::subframes_tile` (structural check only — kept in
 /// the weak path too, so the differential isolates the CRC, not tiling).
-fn subframes_tile_weak(batch: &[u8], frame_count: u32, has_crypto_chain: bool) -> bool {
+fn subframes_tile_weak(
+    batch: &[u8],
+    frame_count: u32,
+    has_crypto_chain: bool,
+) -> bool {
     let frames_end = batch.len() - MARKER_LEN;
     let mut p = HEADER_LEN + if has_crypto_chain { CHAIN_LEN } else { 0 };
     if p > frames_end {
@@ -210,16 +222,18 @@ fn scan_weak(img: &[u8], epoch: u64, base_pos: u64) -> Vec<WeakDecoded> {
         let decoded = decode_weak(img, off);
         let status = match &decoded {
             Ok(d) => CandidateStatus::ByteValid(Candidate {
-                epoch: d.epoch,
-                batch_id: d.batch_id,
+                epoch:            d.epoch,
+                batch_id:         d.batch_id,
                 first_global_pos: d.first_global_pos,
-                frame_count: d.frame_count,
+                frame_count:      d.frame_count,
             }),
             Err(()) => CandidateStatus::ByteInvalid,
         };
         match state.step(status) {
             Step::Accept(_) => {
-                let d = decoded.expect("ByteValid status always carries a successful decode");
+                let d = decoded.expect(
+                    "ByteValid status always carries a successful decode",
+                );
                 off += d.total_len as usize;
                 out.push(d);
             }
@@ -270,16 +284,17 @@ fn stale_background(rng: &mut Rng, capacity: usize) -> Vec<u8> {
                 rand_bytes(rng, len)
             })
             .collect();
-        let sfs: Vec<Subframe> = payloads.iter().map(|p| Subframe::plain(0x22, 0, 0, p)).collect();
+        let sfs: Vec<Subframe> =
+            payloads.iter().map(|p| Subframe::plain(0x22, 0, 0, p)).collect();
         let input = BatchInput {
-            segment_epoch: 1,
-            batch_id: id,
-            first_global_pos: pos,
-            stream_id: 9,
-            category_id: 9,
+            segment_epoch:        1,
+            batch_id:             id,
+            first_global_pos:     pos,
+            stream_id:            9,
+            category_id:          9,
             first_stream_version: pos,
-            crypto_chain: None,
-            subframes: &sfs,
+            crypto_chain:         None,
+            subframes:            &sfs,
         };
         let Ok(bytes) = enc.encode(&input) else { break };
         if img.len() + bytes.len() > capacity {
@@ -302,12 +317,12 @@ enum Bg {
 
 #[derive(Default)]
 struct Stats {
-    cases: u64,
-    acked_verified: u64,
-    unacked_surfaced: u64,
+    cases:                        u64,
+    acked_verified:               u64,
+    unacked_surfaced:             u64,
     crc_was_last_line_of_defense: u64,
-    weak_wrong_batches: u64,
-    weak_wrong_cases: u64,
+    weak_wrong_batches:           u64,
+    weak_wrong_cases:             u64,
 }
 
 /// One matrix case: plan `1..=4` batches, ack (append+sync) a random prefix,
@@ -315,7 +330,14 @@ struct Stats {
 /// torn sector), recover through the production scanner, and check both the
 /// full-validation invariants and the weak-validation differential on the
 /// SAME crashed image.
-fn run_case(cfg_idx: u64, seed: u64, sector: usize, bg: Bg, tear_prob: f64, stats: &mut Stats) {
+fn run_case(
+    cfg_idx: u64,
+    seed: u64,
+    sector: usize,
+    bg: Bg,
+    tear_prob: f64,
+    stats: &mut Stats,
+) {
     let mut rng = Rng::new(seed);
     stats.cases += 1;
 
@@ -333,20 +355,22 @@ fn run_case(cfg_idx: u64, seed: u64, sector: usize, bg: Bg, tear_prob: f64, stat
         let n_sub = 1 + rng.below(4) as usize;
         let payloads: Vec<Vec<u8>> = (0..n_sub)
             .map(|_| {
-                let len = rng.below(sector as u64 + sector as u64 / 2 + 1) as usize;
+                let len =
+                    rng.below(sector as u64 + sector as u64 / 2 + 1) as usize;
                 rand_bytes(&mut rng, len)
             })
             .collect();
-        let sfs: Vec<Subframe> = payloads.iter().map(|p| Subframe::plain(0x11, 0, 0, p)).collect();
+        let sfs: Vec<Subframe> =
+            payloads.iter().map(|p| Subframe::plain(0x11, 0, 0, p)).collect();
         let input = BatchInput {
-            segment_epoch: epoch,
-            batch_id: id,
-            first_global_pos: pos,
-            stream_id: 0,
-            category_id: 0,
+            segment_epoch:        epoch,
+            batch_id:             id,
+            first_global_pos:     pos,
+            stream_id:            0,
+            category_id:          0,
             first_stream_version: pos,
-            crypto_chain: None,
-            subframes: &sfs,
+            crypto_chain:         None,
+            subframes:            &sfs,
         };
         planned_len.push(BatchEncoder::total_len(&input).expect("encodable"));
         pos += n_sub as u64;
@@ -354,7 +378,8 @@ fn run_case(cfg_idx: u64, seed: u64, sector: usize, bg: Bg, tear_prob: f64, stat
     }
     let content_len: u64 = planned_len.iter().sum();
     let capacity =
-        ((SEGMENT_HEADER_LEN as u64 + content_len + 2 * sector as u64).div_ceil(sector as u64)
+        ((SEGMENT_HEADER_LEN as u64 + content_len + 2 * sector as u64)
+            .div_ceil(sector as u64)
             * sector as u64) as usize;
 
     let background = match bg {
@@ -368,18 +393,24 @@ fn run_case(cfg_idx: u64, seed: u64, sector: usize, bg: Bg, tear_prob: f64, stat
     let path = Path::new("torn.seg");
     fs.seed(path, fault, background);
 
-    let mut w = SegmentWriter::create(&fs, path, SegmentParams::new(1, base_pos, epoch, 0)).unwrap();
+    let mut w = SegmentWriter::create(
+        &fs,
+        path,
+        SegmentParams::new(1, base_pos, epoch, 0),
+    )
+    .unwrap();
 
     let acked = rng.below(k as u64 + 1) as usize;
     let mut offsets = Vec::with_capacity(k);
     for (idx, payloads) in payloads_per_batch.iter().enumerate() {
-        let sfs: Vec<Subframe> = payloads.iter().map(|p| Subframe::plain(0x11, 0, 0, p)).collect();
+        let sfs: Vec<Subframe> =
+            payloads.iter().map(|p| Subframe::plain(0x11, 0, 0, p)).collect();
         let spec = BatchSpec {
-            stream_id: 0,
-            category_id: 0,
+            stream_id:            0,
+            category_id:          0,
             first_stream_version: w.next_pos(),
-            crypto_chain: None,
-            subframes: &sfs,
+            crypto_chain:         None,
+            subframes:            &sfs,
         };
         let r = w.append(&spec).unwrap();
         offsets.push(r.offset);
@@ -412,14 +443,17 @@ fn run_case(cfg_idx: u64, seed: u64, sector: usize, bg: Bg, tear_prob: f64, stat
     for (i, ab) in rec.accepted.iter().enumerate() {
         assert_eq!(ab.batch_id, i as u64, "cfg{cfg_idx} seed{seed}: batch_id");
         assert_eq!(ab.offset, offsets[i], "cfg{cfg_idx} seed{seed}: offset");
-        assert_eq!(ab.total_len, planned_len[i], "cfg{cfg_idx} seed{seed}: total_len");
+        assert_eq!(
+            ab.total_len, planned_len[i],
+            "cfg{cfg_idx} seed{seed}: total_len"
+        );
         let a = ab.offset as usize;
         let b = a + ab.total_len as usize;
         assert_eq!(
             &crashed_image[a..b],
             &clean_image[a..b],
-            "cfg{cfg_idx} seed{seed}: accepted batch {i} bytes differ from what was written \
-             -- a corrupt/partial/stale batch was accepted"
+            "cfg{cfg_idx} seed{seed}: accepted batch {i} bytes differ from \
+             what was written -- a corrupt/partial/stale batch was accepted"
         );
     }
     stats.acked_verified += acked as u64;
@@ -433,7 +467,9 @@ fn run_case(cfg_idx: u64, seed: u64, sector: usize, bg: Bg, tear_prob: f64, stat
     assert_eq!(rec, again, "cfg{cfg_idx} seed{seed}: recovery not idempotent");
 
     // ---- (b) weak-validation differential, SAME crashed image -----------
-    let header = rec.header.expect("segment header is always durable (writer syncs it at create)");
+    let header = rec
+        .header
+        .expect("segment header is always durable (writer syncs it at create)");
     let weak = scan_weak(&crashed_image, header.epoch, header.base_pos);
     let mut wrong_here = 0u64;
     for (i, wd) in weak.iter().enumerate() {
@@ -444,7 +480,9 @@ fn run_case(cfg_idx: u64, seed: u64, sector: usize, bg: Bg, tear_prob: f64, stat
             && {
                 let a = offsets[i] as usize;
                 let b = a + wd.total_len as usize;
-                b <= crashed_image.len() && b <= clean_image.len() && crashed_image[a..b] == clean_image[a..b]
+                b <= crashed_image.len()
+                    && b <= clean_image.len()
+                    && crashed_image[a..b] == clean_image[a..b]
             };
         if !byte_ok {
             wrong_here += 1;
@@ -481,13 +519,15 @@ fn run_matrix(iters_per_config: u64, strict_per_config: bool) -> Stats {
     for (idx, (sector, bg)) in configs().iter().enumerate() {
         let mut s = Stats::default();
         for i in 0..iters_per_config {
-            let seed = MASTER_SEED ^ ((idx as u64) << 56) ^ i.wrapping_mul(GOLDEN);
+            let seed =
+                MASTER_SEED ^ ((idx as u64) << 56) ^ i.wrapping_mul(GOLDEN);
             run_case(idx as u64, seed, *sector, *bg, 0.3, &mut s);
         }
         if strict_per_config {
             assert!(
                 s.weak_wrong_batches > 0,
-                "config ({sector}, {bg:?}): weakened validation never failed -- differential broken"
+                "config ({sector}, {bg:?}): weakened validation never failed \
+                 -- differential broken"
             );
         }
         grand.cases += s.cases;
@@ -516,15 +556,24 @@ fn run_matrix(iters_per_config: u64, strict_per_config: bool) -> Stats {
 /// under `cargo +nightly miri test` (versus ~0.1s natively), which would blow
 /// out the documented "~20s for mess-log" Miri-lane budget on every PR.
 #[test]
-#[cfg_attr(miri, ignore = "1k-case matrix: too slow under Miri's interpreter, see doc comment")]
+#[cfg_attr(
+    miri,
+    ignore = "1k-case matrix: too slow under Miri's interpreter, see doc \
+              comment"
+)]
 fn torn_matrix_fast() {
     let g = run_matrix(170, false);
     assert_eq!(g.cases, 1020);
     println!(
-        "torn_matrix_fast: {} cases | {} acked verified | {} unacked surfaced (A6) | \
-         CRC last line of defense in {} | weak wrongly accepted {} batches in {} cases",
-        g.cases, g.acked_verified, g.unacked_surfaced, g.crc_was_last_line_of_defense,
-        g.weak_wrong_batches, g.weak_wrong_cases
+        "torn_matrix_fast: {} cases | {} acked verified | {} unacked surfaced \
+         (A6) | CRC last line of defense in {} | weak wrongly accepted {} \
+         batches in {} cases",
+        g.cases,
+        g.acked_verified,
+        g.unacked_surfaced,
+        g.crc_was_last_line_of_defense,
+        g.weak_wrong_batches,
+        g.weak_wrong_cases
     );
     assert!(g.weak_wrong_batches > 0, "differential failed to demonstrate A4");
 }
@@ -539,9 +588,9 @@ fn torn_matrix_fast() {
 /// unacked-but-complete surfaced (A6), the CRC was the only rejecting check
 /// in 1,876 cases, and the weak-validation differential wrongly accepted
 /// 398 corrupt batches across 392 of 24,000 cases (~1.63%) — every one of
-/// the 6 configs individually demonstrated the differential (`strict_per_config`
-/// below). Consistent with `spikes/torn_write/REPORT.md`'s original 24,000-case
-/// sweep (348 wrongly accepted in 341 cases, ~1.4%).
+/// the 6 configs individually demonstrated the differential
+/// (`strict_per_config` below). Consistent with `spikes/torn_write/REPORT.md`'s
+/// original 24,000-case sweep (348 wrongly accepted in 341 cases, ~1.4%).
 // Already unconditionally `#[ignore]`d (never runs under plain `cargo test`,
 // nor `cargo miri test`, without `--ignored`); no separate `cfg_attr(miri,
 // ignore)` is needed on top — see `torn_matrix_fast`'s doc comment for why
@@ -554,10 +603,15 @@ fn torn_matrix_full() {
     let elapsed = start.elapsed();
     assert_eq!(g.cases, 24_000);
     println!(
-        "torn_matrix_full: {} cases in {elapsed:?} | {} acked verified | {} unacked surfaced (A6) | \
-         CRC last line of defense in {} | weak wrongly accepted {} batches in {} cases",
-        g.cases, g.acked_verified, g.unacked_surfaced, g.crc_was_last_line_of_defense,
-        g.weak_wrong_batches, g.weak_wrong_cases
+        "torn_matrix_full: {} cases in {elapsed:?} | {} acked verified | {} \
+         unacked surfaced (A6) | CRC last line of defense in {} | weak \
+         wrongly accepted {} batches in {} cases",
+        g.cases,
+        g.acked_verified,
+        g.unacked_surfaced,
+        g.crc_was_last_line_of_defense,
+        g.weak_wrong_batches,
+        g.weak_wrong_cases
     );
     assert!(g.weak_wrong_batches > 0, "differential failed to demonstrate A4");
 }
@@ -571,15 +625,20 @@ fn weak_decoder_offsets_match_production_on_clean_image() {
     let fault = Fault::SECTOR_512;
     let fs = SimFs::new(fault);
     let path = Path::new("pin.seg");
-    let mut w = SegmentWriter::create(&fs, path, SegmentParams::new(1, 10, 7, 0)).unwrap();
+    let mut w =
+        SegmentWriter::create(&fs, path, SegmentParams::new(1, 10, 7, 0))
+            .unwrap();
     let payload = vec![0xABu8; 37];
-    let sfs = [Subframe::plain(0x11, 0, 0, &payload), Subframe::plain(0x11, 0, 0, &payload)];
+    let sfs = [
+        Subframe::plain(0x11, 0, 0, &payload),
+        Subframe::plain(0x11, 0, 0, &payload),
+    ];
     let spec = BatchSpec {
-        stream_id: 3,
-        category_id: 4,
+        stream_id:            3,
+        category_id:          4,
         first_stream_version: 10,
-        crypto_chain: None,
-        subframes: &sfs,
+        crypto_chain:         None,
+        subframes:            &sfs,
     };
     let receipt = w.append(&spec).unwrap();
     w.sync().unwrap();

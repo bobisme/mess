@@ -51,7 +51,9 @@ fn run_in_process(cfg: Config) {
     let result = rt.block_on(mess_soak::run(cfg));
     match result {
         Ok(report) => {
-            println!("\n[soak] COMPLETE — no invariant violations.\n  {report:#?}");
+            println!(
+                "\n[soak] COMPLETE — no invariant violations.\n  {report:#?}"
+            );
         }
         Err(aborted) => {
             eprintln!("{}", aborted.dump);
@@ -73,22 +75,39 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
         };
         match key.as_str() {
             "--duration" => cfg.duration = parse_secs(value()?)?,
-            "--streams" => cfg.streams = parse_usize(value()?, "streams")?.max(1),
-            "--writers" => cfg.writers = parse_usize(value()?, "writers")?.max(1),
-            "--crash-every-actions" => cfg.crash_every_actions = parse_u64(value()?)?,
+            "--streams" => {
+                cfg.streams = parse_usize(value()?, "streams")?.max(1)
+            }
+            "--writers" => {
+                cfg.writers = parse_usize(value()?, "writers")?.max(1)
+            }
+            "--crash-every-actions" => {
+                cfg.crash_every_actions = parse_u64(value()?)?
+            }
             "--crash-every" => cfg.crash_every = parse_secs(value()?)?,
             "--seed" => cfg.seed = parse_u64(value()?)?,
             "--dir" => cfg.dir = PathBuf::from(value()?),
             "--zipf-skew" => {
-                cfg.zipf_skew = value()?.parse().map_err(|_| "zipf-skew: expected float")?
+                cfg.zipf_skew =
+                    value()?.parse().map_err(|_| "zipf-skew: expected float")?
             }
-            "--max-batch" => cfg.max_batch = parse_usize(value()?, "max-batch")?.max(1),
-            "--subscribers" => cfg.subscribers = parse_usize(value()?, "subscribers")?,
-            "--segment-size" => cfg.segment_size = parse_u64(value()?)?.max(4096),
+            "--max-batch" => {
+                cfg.max_batch = parse_usize(value()?, "max-batch")?.max(1)
+            }
+            "--subscribers" => {
+                cfg.subscribers = parse_usize(value()?, "subscribers")?
+            }
+            "--segment-size" => {
+                cfg.segment_size = parse_u64(value()?)?.max(4096)
+            }
             "--durability" => cfg.durability = parse_durability(value()?)?,
             "--rss-ceiling" => cfg.rss_ceiling_bytes = parse_u64(value()?)?,
-            "--fd-ceiling" => cfg.fd_ceiling = parse_usize(value()?, "fd-ceiling")?,
-            "--fsync-p99-ceiling" => cfg.fsync_p99_ceiling = parse_millis(value()?)?,
+            "--fd-ceiling" => {
+                cfg.fd_ceiling = parse_usize(value()?, "fd-ceiling")?
+            }
+            "--fsync-p99-ceiling" => {
+                cfg.fsync_p99_ceiling = parse_millis(value()?)?
+            }
             "--crash-mode" => cfg.crash_mode = parse_crash_mode(value()?)?,
             "--metrics-every" => cfg.metrics_every = parse_secs(value()?)?,
             "--dump-extras" => cfg.dump_extras = Some(PathBuf::from(value()?)),
@@ -101,11 +120,13 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
 }
 
 fn parse_secs(s: &str) -> Result<Duration, String> {
-    let v: f64 = s.parse().map_err(|_| format!("expected seconds, got {s:?}"))?;
+    let v: f64 =
+        s.parse().map_err(|_| format!("expected seconds, got {s:?}"))?;
     Ok(Duration::from_secs_f64(v.max(0.0)))
 }
 fn parse_millis(s: &str) -> Result<Duration, String> {
-    let v: f64 = s.parse().map_err(|_| format!("expected milliseconds, got {s:?}"))?;
+    let v: f64 =
+        s.parse().map_err(|_| format!("expected milliseconds, got {s:?}"))?;
     Ok(Duration::from_secs_f64(v.max(0.0) / 1e3))
 }
 fn parse_usize(s: &str, what: &str) -> Result<usize, String> {
@@ -113,7 +134,8 @@ fn parse_usize(s: &str, what: &str) -> Result<usize, String> {
 }
 fn parse_u64(s: &str) -> Result<u64, String> {
     if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        u64::from_str_radix(hex, 16).map_err(|_| format!("expected hex u64, got {s:?}"))
+        u64::from_str_radix(hex, 16)
+            .map_err(|_| format!("expected hex u64, got {s:?}"))
     } else {
         s.parse().map_err(|_| format!("expected u64, got {s:?}"))
     }
@@ -123,7 +145,9 @@ fn parse_durability(s: &str) -> Result<Durability, String> {
         "process" => Ok(Durability::Process),
         "os" => Ok(Durability::Os),
         "group" => Ok(Durability::group_default()),
-        other => Err(format!("durability: want process|os|group, got {other:?}")),
+        other => {
+            Err(format!("durability: want process|os|group, got {other:?}"))
+        }
     }
 }
 fn parse_crash_mode(s: &str) -> Result<CrashMode, String> {
@@ -137,37 +161,35 @@ fn parse_crash_mode(s: &str) -> Result<CrashMode, String> {
 fn print_help() {
     let d = Config::default();
     println!(
-        "mess-soak — multi-hour mixed-workload soak with continuous invariant checking\n\
-\n\
-USAGE: mess-soak [FLAGS]\n\
-\n\
-FLAGS (defaults in brackets):\n\
-  --duration <secs>          total run length [{dur}]\n\
-  --streams <n>              distinct streams the Zipf sampler ranges over [{streams}]\n\
-  --writers <n>              sigkill-mode child writer tasks ONLY; the in-process\n\
-                             drop-reopen driver is strictly sequential [{writers}]\n\
-  --subscribers <n>          target concurrent subscribers [{subs}]\n\
-  --crash-every-actions <n>  drop mode: actions between crash cycles (deterministic,\n\
-                             never wall-clock); 0 = never [{cea}]\n\
-  --crash-every <secs>       sigkill mode ONLY: wall delay before the child is killed [{crash}]\n\
-  --crash-mode <drop|sigkill>  drop-and-reopen (in-proc) or fork+SIGKILL child [drop]\n\
-  --seed <u64|0xHEX>         master seed; deterministic per seed [{seed:#x}]\n\
-  --dir <path>               store dir; MUST be EMPTY/fresh and MUST NOT be tmpfs\n\
-                             (both refused) [$HOME/.cache/mess-soak]\n\
-  --dump-extras <path>       write the extra-event classification JSON there if the\n\
-                             post-reopen reconcile finds illegal extras\n\
-  --zipf-skew <f>            0=uniform, higher=hotter head [{skew}]\n\
-  --max-batch <n>            max events per append [{mb}]\n\
-  --segment-size <bytes>     active segment size; small => frequent rolls/seals [{seg}]\n\
-  --durability <process|os|group>  ack barrier [os]\n\
-  --rss-ceiling <bytes>      RSS abort ceiling; 0 disables [{rss}]\n\
-  --fd-ceiling <n>           open-fd abort ceiling; 0 disables [{fd}]\n\
-  --fsync-p99-ceiling <ms>   fsync p99 abort ceiling; 0 disables [off]\n\
-  --metrics-every <secs>     periodic metric print interval [{me}]\n\
-  --verbose                  per-crash chatter\n\
-  -h, --help                 this help\n\
-\n\
-See crates/mess-soak/README.md for the 2h nightly profile and how to read an abort dump.",
+        "mess-soak — multi-hour mixed-workload soak with continuous invariant \
+         checking\n\nUSAGE: mess-soak [FLAGS]\n\nFLAGS (defaults in \
+         brackets):\n--duration <secs>          total run length \
+         [{dur}]\n--streams <n>              distinct streams the Zipf \
+         sampler ranges over [{streams}]\n--writers <n>              \
+         sigkill-mode child writer tasks ONLY; the in-process\ndrop-reopen \
+         driver is strictly sequential [{writers}]\n--subscribers <n>          \
+         target concurrent subscribers [{subs}]\n--crash-every-actions <n>  \
+         drop mode: actions between crash cycles (deterministic,\nnever \
+         wall-clock); 0 = never [{cea}]\n--crash-every <secs>       sigkill \
+         mode ONLY: wall delay before the child is killed \
+         [{crash}]\n--crash-mode <drop|sigkill>  drop-and-reopen (in-proc) or \
+         fork+SIGKILL child [drop]\n--seed <u64|0xHEX>         master seed; \
+         deterministic per seed [{seed:#x}]\n--dir <path>               store \
+         dir; MUST be EMPTY/fresh and MUST NOT be tmpfs\n(both refused) \
+         [$HOME/.cache/mess-soak]\n--dump-extras <path>       write the \
+         extra-event classification JSON there if the\npost-reopen reconcile \
+         finds illegal extras\n--zipf-skew <f>            0=uniform, \
+         higher=hotter head [{skew}]\n--max-batch <n>            max events \
+         per append [{mb}]\n--segment-size <bytes>     active segment size; \
+         small => frequent rolls/seals [{seg}]\n--durability \
+         <process|os|group>  ack barrier [os]\n--rss-ceiling <bytes>      RSS \
+         abort ceiling; 0 disables [{rss}]\n--fd-ceiling <n>           \
+         open-fd abort ceiling; 0 disables [{fd}]\n--fsync-p99-ceiling <ms>   \
+         fsync p99 abort ceiling; 0 disables [off]\n--metrics-every <secs>     \
+         periodic metric print interval [{me}]\n--verbose                  \
+         per-crash chatter\n-h, --help                 this help\n\nSee \
+         crates/mess-soak/README.md for the 2h nightly profile and how to \
+         read an abort dump.",
         dur = d.duration.as_secs(),
         streams = d.streams,
         writers = d.writers,

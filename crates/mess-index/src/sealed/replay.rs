@@ -24,9 +24,9 @@
 //!   this is the pointer-index analogue — per-segment decode fanned across a
 //!   thread pool, concatenated in order.
 //! - **Stream replay** for one stream is its per-segment batch lists
-//!   concatenated in segment order, which is automatically version-ascending
-//!   (a stream's versions only grow across later segments). The candidate
-//!   segments are found by a cheap directory probe
+//!   concatenated in segment order, which is automatically version-ascending (a
+//!   stream's versions only grow across later segments). The candidate segments
+//!   are found by a cheap directory probe
 //!   ([`stream_head`](crate::sealed::segment::SealedSegmentIndex::stream_head)),
 //!   their blocks decoded in parallel (cache-aware), then assembled in order —
 //!   the "segment-order coalesced reads + parallel decode" shape `perf_replay`
@@ -35,8 +35,8 @@
 //!
 //! # Measured (bn-1hx, `tests/sealed_read_paths.rs`, release, this machine)
 //!
-//! Corpus: 24 sealed segments tiling the A1 axis, 2,000 streams present in every
-//! segment, 5 batches/stream/segment, 10 frames/batch — **2.4M events**,
+//! Corpus: 24 sealed segments tiling the A1 axis, 2,000 streams present in
+//! every segment, 5 batches/stream/segment, 10 frames/batch — **2.4M events**,
 //! ~48k pointer blocks. Best-of-5 wall; the byte-identity gate (parallel ==
 //! sequential, checksummed) ran on every measured pass.
 //!
@@ -47,12 +47,13 @@
 //! | block cache hit rate, repeat replay | **60.2%** | two passes over the same 1,000-stream set; 19,104 unique blocks, 4.8 MiB resident |
 //!
 //! These are **pointer-index decode** rates: blocks are uncompressed until
-//! Phase 5, so this is varint decode + assembly only, with none of the zstd cost
-//! that put `perf_replay`'s comparable paths at 95M / 24.6M ev/s. The floor the
-//! bone gates on — 2.5M ev/s stream replay — is cleared by ~500×; when the
-//! Phase-5 decompress stage lands in the *materialize* step the rate drops
-//! toward `perf_replay`'s numbers, but the path shape (locate → materialize →
-//! decode → assemble, cache over the decoded product) is already in place.
+//! Phase 5, so this is varint decode + assembly only, with none of the zstd
+//! cost that put `perf_replay`'s comparable paths at 95M / 24.6M ev/s. The
+//! floor the bone gates on — 2.5M ev/s stream replay — is cleared by ~500×;
+//! when the Phase-5 decompress stage lands in the *materialize* step the rate
+//! drops toward `perf_replay`'s numbers, but the path shape (locate →
+//! materialize → decode → assemble, cache over the decoded product) is already
+//! in place.
 //!
 //! # The decompress seam (Phase 5)
 //!
@@ -80,14 +81,14 @@
 //! a truncated, torn, or bit-flipped sidecar is a typed
 //! [`SidecarError`](crate::sealed::segment::SidecarError) at **open** and the
 //! segment is simply never admitted to a [`ReplaySet`]. There is therefore no
-//! `SIGBUS` surface here — the `perf_replay` mmap-of-the-payload-segment concern
-//! (a truncated mapping faulting to `SIGBUS` mid-read) belongs to Phase-5
-//! payload reads in `mess-log`, not to the pointer index. For the residual case
-//! of a decode error discovered *mid-replay* (defense in depth; a CRC-valid
-//! sidecar never hits it), the read paths return the error **typed**, never
-//! panic, and [`ReplaySet::stream_replay_many_verified`] re-runs single-threaded to
-//! yield the authoritative result or the same typed error — the log stays truth
-//! (D1), so the ultimate fallback is a rebuild.
+//! `SIGBUS` surface here — the `perf_replay` mmap-of-the-payload-segment
+//! concern (a truncated mapping faulting to `SIGBUS` mid-read) belongs to
+//! Phase-5 payload reads in `mess-log`, not to the pointer index. For the
+//! residual case of a decode error discovered *mid-replay* (defense in depth; a
+//! CRC-valid sidecar never hits it), the read paths return the error **typed**,
+//! never panic, and [`ReplaySet::stream_replay_many_verified`] re-runs
+//! single-threaded to yield the authoritative result or the same typed error —
+//! the log stays truth (D1), so the ultimate fallback is a rebuild.
 
 use crate::active::{GlobalEntry, StreamEntry};
 use crate::sealed::block_cache::BlockCache;
@@ -156,34 +157,29 @@ impl std::fmt::Debug for ReplaySet {
 }
 
 impl ReplaySet {
-    /// Build a replay set from already-opened sealed segments, sorting them into
-    /// global A1 order (ascending `base_pos`, `segment_id` breaking any tie).
-    /// The caller owns admission: a sidecar that failed to open (a typed
-    /// [`SidecarError`](crate::sealed::segment::SidecarError)) is simply not
-    /// passed in — see the module's mmap/SIGBUS stance.
+    /// Build a replay set from already-opened sealed segments, sorting them
+    /// into global A1 order (ascending `base_pos`, `segment_id` breaking
+    /// any tie). The caller owns admission: a sidecar that failed to open
+    /// (a typed [`SidecarError`](crate::sealed::segment::SidecarError)) is
+    /// simply not passed in — see the module's mmap/SIGBUS stance.
     pub fn from_segments<I>(segments: I) -> Self
     where
         I: IntoIterator<Item = SealedSegmentRef>,
     {
-        let mut segments: Vec<SealedSegmentRef> = segments.into_iter().collect();
+        let mut segments: Vec<SealedSegmentRef> =
+            segments.into_iter().collect();
         segments.sort_by_key(|s| (s.base_pos(), s.segment_id()));
         Self { segments }
     }
 
     /// The segments, in global order.
-    pub fn segments(&self) -> &[SealedSegmentRef] {
-        &self.segments
-    }
+    pub fn segments(&self) -> &[SealedSegmentRef] { &self.segments }
 
     /// Number of sealed segments.
-    pub fn len(&self) -> usize {
-        self.segments.len()
-    }
+    pub fn len(&self) -> usize { self.segments.len() }
 
     /// Whether the set is empty.
-    pub fn is_empty(&self) -> bool {
-        self.segments.is_empty()
-    }
+    pub fn is_empty(&self) -> bool { self.segments.is_empty() }
 
     /// Total events across all segments.
     pub fn event_count(&self) -> u64 {
@@ -227,9 +223,9 @@ impl ReplaySet {
     /// **Batched coalesced stream replay**: replay each stream in `streams`,
     /// fanning the per-stream coalesces across the scoped-thread pool. Returns
     /// one `(stream_id, entries)` per input, **input order preserved**. This is
-    /// the parallel path — the working set (a projection rebuild's stream set, a
-    /// subscription fan-out) is decoded across cores, each block at most once
-    /// through `cache`.
+    /// the parallel path — the working set (a projection rebuild's stream set,
+    /// a subscription fan-out) is decoded across cores, each block at most
+    /// once through `cache`.
     pub fn stream_replay_many(
         &self,
         streams: &[u64],
@@ -244,8 +240,8 @@ impl ReplaySet {
 
     /// Single-threaded reference for
     /// [`stream_replay_many`](Self::stream_replay_many) — the naive walk the
-    /// parallel path must equal element-for-element (the always-on byte-identity
-    /// gate).
+    /// parallel path must equal element-for-element (the always-on
+    /// byte-identity gate).
     pub fn stream_replay_many_seq(
         &self,
         streams: &[u64],
@@ -259,10 +255,10 @@ impl ReplaySet {
 
     /// [`stream_replay_many`](Self::stream_replay_many) with an exact
     /// single-threaded fallback: if the parallel path returns a decode error,
-    /// re-run sequentially to produce the authoritative result (identical bytes)
-    /// or the same typed error. Never panics, never `SIGBUS`es (the module maps
-    /// nothing — see the module's mmap/SIGBUS stance). The documented
-    /// degraded-mode entry point.
+    /// re-run sequentially to produce the authoritative result (identical
+    /// bytes) or the same typed error. Never panics, never `SIGBUS`es (the
+    /// module maps nothing — see the module's mmap/SIGBUS stance). The
+    /// documented degraded-mode entry point.
     pub fn stream_replay_many_verified(
         &self,
         streams: &[u64],
@@ -278,17 +274,20 @@ impl ReplaySet {
 
     /// **Parallel global scan**: every batch across the whole sealed history in
     /// global-position (A1) order. Each segment's global order is decoded in
-    /// parallel and the pieces concatenated in `base_pos` order — since segments
-    /// hold disjoint, contiguous A1 ranges the concatenation is already globally
-    /// sorted (no cross-segment merge).
+    /// parallel and the pieces concatenated in `base_pos` order — since
+    /// segments hold disjoint, contiguous A1 ranges the concatenation is
+    /// already globally sorted (no cross-segment merge).
     pub fn global_scan(&self) -> Result<Vec<GlobalEntry>, DecodeError> {
-        let parts = parallel_map(self.segments.len(), |i| self.segments[i].global_entries());
+        let parts = parallel_map(self.segments.len(), |i| {
+            self.segments[i].global_entries()
+        });
         let mut out = Vec::new();
         for part in parts {
             out.extend_from_slice(&part?);
         }
         debug_assert!(
-            out.windows(2).all(|w| w[0].first_global_pos <= w[1].first_global_pos),
+            out.windows(2)
+                .all(|w| w[0].first_global_pos <= w[1].first_global_pos),
             "global scan must be non-descending in global position"
         );
         Ok(out)
@@ -337,15 +336,16 @@ impl ReplaySet {
     }
 
     /// **Payload point read** through the D6 payload sidecar: reassemble the
-    /// event at global position `global_pos` byte-exact, dispatching to whichever
-    /// segment covers it and through `resolver` for a row-fallback dictionary
-    /// block. Works uniformly for columnar and row-fallback blocks (the block
-    /// kind is internal to the segment's `.pcol`). Returns:
+    /// event at global position `global_pos` byte-exact, dispatching to
+    /// whichever segment covers it and through `resolver` for a
+    /// row-fallback dictionary block. Works uniformly for columnar and
+    /// row-fallback blocks (the block kind is internal to the segment's
+    /// `.pcol`). Returns:
     ///
     /// - `Ok(Some(bytes))` — reassembled from the covering segment's `.pcol`;
     /// - `Ok(None)` — `global_pos` is past the sealed history, **or** the
-    ///   covering segment has no `.pcol` attached (pointer-only seal — the caller
-    ///   reads the payload from the raw log instead);
+    ///   covering segment has no `.pcol` attached (pointer-only seal — the
+    ///   caller reads the payload from the raw log instead);
     /// - `Err(_)` — a block decode / dictionary-resolution failure.
     pub fn payload_at(
         &self,
@@ -360,12 +360,13 @@ impl ReplaySet {
         seg.reassemble_payload(local, resolver)
     }
 
-    /// **Payload global replay**: reassemble every sealed payload in global (A1)
-    /// order across the whole set, byte-exact, appending bytes to `out` and
-    /// `event_count + 1` boundaries to `offs`. Because segments hold disjoint,
-    /// contiguous A1 ranges, concatenating each segment's `.pcol` reassembly in
-    /// `base_pos` order is already globally ordered — this is the payload-side
-    /// analogue of [`global_scan`](Self::global_scan), and it handles **mixed
+    /// **Payload global replay**: reassemble every sealed payload in global
+    /// (A1) order across the whole set, byte-exact, appending bytes to
+    /// `out` and `event_count + 1` boundaries to `offs`. Because segments
+    /// hold disjoint, contiguous A1 ranges, concatenating each segment's
+    /// `.pcol` reassembly in `base_pos` order is already globally ordered —
+    /// this is the payload-side analogue of
+    /// [`global_scan`](Self::global_scan), and it handles **mixed
     /// segments** (columnar + row-fallback blocks) through the one path.
     ///
     /// Requires every segment to carry a `.pcol` ([`Self::all_have_payloads`]);
@@ -380,9 +381,9 @@ impl ReplaySet {
         out.clear();
         offs.clear();
         for (i, seg) in self.segments.iter().enumerate() {
-            let payload = seg
-                .payload_index()
-                .ok_or(PayloadError::Corrupt("segment in payload_scan has no .pcol sidecar"))?;
+            let payload = seg.payload_index().ok_or(PayloadError::Corrupt(
+                "segment in payload_scan has no .pcol sidecar",
+            ))?;
             payload.reassemble_all(resolver, out, offs)?;
             // reassemble_all appends this segment's boundaries plus a trailing
             // `out.len()`. Drop that duplicate between segments so the next
@@ -405,9 +406,9 @@ fn mix(mut x: u64) -> u64 {
     // splitmix64 finalizer — spreads each field across all 64 bits so the
     // order-independent wrapping sum below is a strong equality fingerprint.
     x ^= x >> 30;
-    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
     x ^= x >> 27;
-    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
     x ^ (x >> 31)
 }
 
@@ -436,18 +437,24 @@ pub fn global_checksum(entries: &[GlobalEntry]) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::active::EventPtr;
     use crate::sealed::segment::{
         SealBatch, SealInput, SealStream, SealedSegmentIndex, encode_sidecar,
     };
-    use std::sync::Arc;
 
     /// A segment whose `base_pos` is `base`, holding `streams` as
     /// `(stream_id, first_version, n_batches)` with a fixed 10-frame batch and
     /// A1 positions laid out contiguously from `base`.
-    fn segment(segment_id: u64, base: u64, streams: &[(u64, u64, usize)]) -> SealedSegmentRef {
-        // Assign contiguous global positions across the segment in stream order.
+    fn segment(
+        segment_id: u64,
+        base: u64,
+        streams: &[(u64, u64, usize)],
+    ) -> SealedSegmentRef {
+        // Assign contiguous global positions across the segment in stream
+        // order.
         let mut g = base;
         let streams: Vec<SealStream> = streams
             .iter()
@@ -455,10 +462,10 @@ mod tests {
                 let batches = (0..n)
                     .map(|i| {
                         let b = SealBatch {
-                            first_version: fv0 + (i * 10) as u64,
-                            frame_count: 10,
+                            first_version:    fv0 + (i * 10) as u64,
+                            frame_count:      10,
                             first_global_pos: g,
-                            offset: 4096 + (i * 512) as u64,
+                            offset:           4096 + (i * 512) as u64,
                         };
                         g += 10;
                         b
@@ -467,8 +474,11 @@ mod tests {
                 SealStream { stream_id: sid, batches }
             })
             .collect();
-        let input = SealInput { segment_id, base_pos: base, streams, payloads: None };
-        Arc::new(SealedSegmentIndex::from_bytes(encode_sidecar(&input)).unwrap())
+        let input =
+            SealInput { segment_id, base_pos: base, streams, payloads: None };
+        Arc::new(
+            SealedSegmentIndex::from_bytes(encode_sidecar(&input)).unwrap(),
+        )
     }
 
     /// Three segments, contiguous A1 ranges, stream 10 present in all three,
@@ -487,7 +497,8 @@ mod tests {
     #[test]
     fn set_is_sorted_by_base_pos() {
         let set = sample_set();
-        let bases: Vec<u64> = set.segments().iter().map(|s| s.base_pos()).collect();
+        let bases: Vec<u64> =
+            set.segments().iter().map(|s| s.base_pos()).collect();
         assert_eq!(bases, vec![0, 30, 80]);
         assert_eq!(set.len(), 3);
         assert_eq!(set.event_count(), 30 + 50 + 10);
@@ -556,10 +567,10 @@ mod tests {
     #[test]
     fn checksum_detects_a_single_field_change() {
         let a = [StreamEntry {
-            first_version: 0,
-            frame_count: 10,
+            first_version:    0,
+            frame_count:      10,
             first_global_pos: 0,
-            ptr: EventPtr { segment_id: 1, offset: 4096 },
+            ptr:              EventPtr { segment_id: 1, offset: 4096 },
         }];
         let mut b = a;
         b[0].ptr.offset = 4608;
@@ -572,7 +583,10 @@ mod tests {
         let cache = BlockCache::with_budget_bytes(1 << 20, 64);
         let first = set.stream_replay(10, &cache).unwrap();
         let misses_after_first = cache.misses();
-        assert!(misses_after_first >= 1, "cold replay decodes at least one block");
+        assert!(
+            misses_after_first >= 1,
+            "cold replay decodes at least one block"
+        );
         let second = set.stream_replay(10, &cache).unwrap();
         assert_eq!(first, second);
         // The repeat added only hits, no new misses.
@@ -604,7 +618,8 @@ mod tests {
 
     use crate::columnar::{emit_int, emit_str};
     use crate::sealed::payload::{
-        BlockKind, NoDicts, PayloadSealOpts, SealedPayloadIndex, encode_payload_sidecar,
+        BlockKind, NoDicts, PayloadSealOpts, SealedPayloadIndex,
+        encode_payload_sidecar,
     };
 
     /// A shreddable msgpack map (columnar) at sequence `seq`.
@@ -617,13 +632,20 @@ mod tests {
         m
     }
 
-    /// A build of a sealed segment carrying an attached `.pcol` whose blocks are
-    /// a MIX of columnar and row-fallback (small block size over alternating
-    /// msgpack/binary runs). `base` is the segment's A1 base; the segment holds
-    /// `payloads` at global positions `base..base + payloads.len()`.
-    fn segment_with_payloads(segment_id: u64, base: u64, payloads: &[Vec<u8>]) -> SealedSegmentRef {
-        use crate::sealed::segment::{SealBatch, SealInput, SealStream, encode_sidecar};
+    /// A build of a sealed segment carrying an attached `.pcol` whose blocks
+    /// are a MIX of columnar and row-fallback (small block size over
+    /// alternating msgpack/binary runs). `base` is the segment's A1 base;
+    /// the segment holds `payloads` at global positions `base..base +
+    /// payloads.len()`.
+    fn segment_with_payloads(
+        segment_id: u64,
+        base: u64,
+        payloads: &[Vec<u8>],
+    ) -> SealedSegmentRef {
         use crate::sealed::segment::SealedSegmentIndex;
+        use crate::sealed::segment::{
+            SealBatch, SealInput, SealStream, encode_sidecar,
+        };
         // A single stream/batch whose frame_count == event count fixes the
         // segment's event_count and base_pos for the global→local mapping.
         let input = SealInput {
@@ -631,16 +653,17 @@ mod tests {
             base_pos: base,
             streams: vec![SealStream {
                 stream_id: 1,
-                batches: vec![SealBatch {
-                    first_version: 0,
-                    frame_count: payloads.len() as u32,
+                batches:   vec![SealBatch {
+                    first_version:    0,
+                    frame_count:      payloads.len() as u32,
                     first_global_pos: base,
-                    offset: 4096,
+                    offset:           4096,
                 }],
             }],
             payloads: None,
         };
-        let mut idx = SealedSegmentIndex::from_bytes(encode_sidecar(&input)).unwrap();
+        let mut idx =
+            SealedSegmentIndex::from_bytes(encode_sidecar(&input)).unwrap();
         let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
         let opts = PayloadSealOpts { block_events: 4, ..Default::default() };
         let bytes = encode_payload_sidecar(segment_id, &refs, &opts).unwrap();
@@ -649,7 +672,8 @@ mod tests {
     }
 
     /// A mixed corpus for one segment: alternating short runs of msgpack
-    /// (columnar) and binary (row fallback) so a 4-event block size yields both.
+    /// (columnar) and binary (row fallback) so a 4-event block size yields
+    /// both.
     fn mixed(seed: u64) -> Vec<Vec<u8>> {
         let mut v = Vec::new();
         for r in 0..3u64 {
@@ -657,7 +681,7 @@ mod tests {
                 v.push(msgpack(seed * 100 + r * 6 + i));
             }
             for i in 0..5u8 {
-                v.push(vec![0xff, 0x00, (seed as u8).wrapping_add(i), 0x99]);
+                v.push(vec![0xFF, 0x00, (seed as u8).wrapping_add(i), 0x99]);
             }
         }
         v
@@ -665,7 +689,8 @@ mod tests {
 
     #[test]
     fn payload_scan_reassembles_mixed_segments_in_global_order() {
-        // Three segments tiling the A1 axis, each with mixed columnar/row blocks.
+        // Three segments tiling the A1 axis, each with mixed columnar/row
+        // blocks.
         let p1 = mixed(1);
         let p2 = mixed(2);
         let p3 = mixed(3);
@@ -682,10 +707,21 @@ mod tests {
 
         // Each segment must actually be mixed (both block kinds present).
         for seg in set.segments() {
-            let kinds: Vec<BlockKind> =
-                seg.payload_index().unwrap().blocks().iter().map(|b| b.kind).collect();
-            assert!(kinds.contains(&BlockKind::Columnar), "expected columnar block");
-            assert!(kinds.contains(&BlockKind::Row), "expected row-fallback block");
+            let kinds: Vec<BlockKind> = seg
+                .payload_index()
+                .unwrap()
+                .blocks()
+                .iter()
+                .map(|b| b.kind)
+                .collect();
+            assert!(
+                kinds.contains(&BlockKind::Columnar),
+                "expected columnar block"
+            );
+            assert!(
+                kinds.contains(&BlockKind::Row),
+                "expected row-fallback block"
+            );
         }
 
         // The expected global-order concatenation.
@@ -698,9 +734,17 @@ mod tests {
         let mut out = Vec::new();
         let mut offs = Vec::new();
         set.payload_scan(&NoDicts, &mut out, &mut offs).unwrap();
-        assert_eq!(offs.len(), expect.len() + 1, "one boundary per event + tail");
+        assert_eq!(
+            offs.len(),
+            expect.len() + 1,
+            "one boundary per event + tail"
+        );
         for (i, w) in offs.windows(2).enumerate() {
-            assert_eq!(&out[w[0] as usize..w[1] as usize], expect[i].as_slice(), "scan mismatch at {i}");
+            assert_eq!(
+                &out[w[0] as usize..w[1] as usize],
+                expect[i].as_slice(),
+                "scan mismatch at {i}"
+            );
         }
 
         // Point reads by GLOBAL position dispatch to the right segment + block.
@@ -712,7 +756,10 @@ mod tests {
             );
         }
         // Past the sealed history: a clean None, not a panic.
-        assert_eq!(set.payload_at(expect.len() as u64, &NoDicts).unwrap(), None);
+        assert_eq!(
+            set.payload_at(expect.len() as u64, &NoDicts).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -731,7 +778,10 @@ mod tests {
         ));
         // But payload_at still works for the covered range, and returns None
         // (fall back to raw) for the pointer-only segment's range.
-        assert_eq!(set.payload_at(0, &NoDicts).unwrap().as_deref(), Some(p1[0].as_slice()));
+        assert_eq!(
+            set.payload_at(0, &NoDicts).unwrap().as_deref(),
+            Some(p1[0].as_slice())
+        );
         assert_eq!(set.payload_at(p1.len() as u64, &NoDicts).unwrap(), None);
     }
 }

@@ -35,15 +35,23 @@ fn run_ordering_case(seed: u64, buggy: bool) -> (u64, u64) {
     let mut writer = SegmentWriter::create(
         &fs,
         path,
-        SegmentParams { segment_size: SEGMENT_SIZE, ..SegmentParams::new(0, 0, 1, 0) },
+        SegmentParams {
+            segment_size: SEGMENT_SIZE,
+            ..SegmentParams::new(0, 0, 1, 0)
+        },
     )
     .unwrap();
     let wm = Watermark::new(0);
 
     let payload = b"payload".to_vec();
     let subs = [Subframe::plain(1, 1, 0, &payload)];
-    let spec =
-        BatchSpec { stream_id: 1, category_id: 1, first_stream_version: 0, crypto_chain: None, subframes: &subs };
+    let spec = BatchSpec {
+        stream_id:            1,
+        category_id:          1,
+        first_stream_version: 0,
+        crypto_chain:         None,
+        subframes:            &subs,
+    };
     writer.append(&spec).unwrap();
 
     let observed_watermark = if buggy {
@@ -66,18 +74,22 @@ fn run_ordering_case(seed: u64, buggy: bool) -> (u64, u64) {
     // up to the real sync watermark regardless of what we ask for, so the
     // healthy order (already synced) always keeps its batch; only the buggy
     // order (never synced) can lose it.
-    fs.crash(path, CrashPlan::Tail(TailPlan { keep: 0, scramble: vec![] })).unwrap();
+    fs.crash(path, CrashPlan::Tail(TailPlan { keep: 0, scramble: vec![] }))
+        .unwrap();
     let rec = recover_segment(&fs, path).unwrap();
     (observed_watermark, rec.next_pos)
 }
 
 /// The exact invariant `dst_support::run_one_segment` checks, extracted so
 /// this file demonstrably runs the SAME assertion, not a look-alike.
-fn assert_reader_never_past_watermark(observed_watermark: u64, recovered_next_pos: u64) {
+fn assert_reader_never_past_watermark(
+    observed_watermark: u64,
+    recovered_next_pos: u64,
+) {
     assert!(
         recovered_next_pos >= observed_watermark,
-        "a reader observed position {observed_watermark} as committed, \
-         but recovery only reconstructed up to {recovered_next_pos}"
+        "a reader observed position {observed_watermark} as committed, but \
+         recovery only reconstructed up to {recovered_next_pos}"
     );
 }
 
@@ -113,13 +125,27 @@ fn buggy_ordering_is_caught_and_replays_deterministically() {
     let second = run();
     std::panic::set_hook(prev_hook);
 
-    assert!(first.is_err(), "the harness must CATCH the publish-before-watermark bug");
-    assert!(second.is_err(), "seed {SEED} must replay the SAME caught failure deterministically");
+    assert!(
+        first.is_err(),
+        "the harness must CATCH the publish-before-watermark bug"
+    );
+    assert!(
+        second.is_err(),
+        "seed {SEED} must replay the SAME caught failure deterministically"
+    );
 
     // Byte-identical replay, not just "both panicked": the raw (watermark,
     // recovered) pair the checker was fed is identical across runs.
     let a = run_ordering_case(SEED, true);
     let b = run_ordering_case(SEED, true);
-    assert_eq!(a, b, "seed {SEED}: the buggy run's own observations must reproduce exactly");
-    assert_eq!(a, (1, 0), "seed {SEED}: the bug loses exactly the one published-but-unsynced position");
+    assert_eq!(
+        a, b,
+        "seed {SEED}: the buggy run's own observations must reproduce exactly"
+    );
+    assert_eq!(
+        a,
+        (1, 0),
+        "seed {SEED}: the bug loses exactly the one published-but-unsynced \
+         position"
+    );
 }

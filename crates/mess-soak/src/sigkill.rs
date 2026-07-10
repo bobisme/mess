@@ -1,8 +1,8 @@
 //! The out-of-process `SIGKILL` crash orchestrator (`--crash-mode sigkill`).
 //!
 //! The in-process drop-and-reopen crash is a *graceful* shutdown in disguise:
-//! [`Inner::drop`](mess_store) shuts the committer and joins the seal thread, so
-//! every destructor runs. That exercises recovery, but it is not the "hour
+//! [`Inner::drop`](mess_store) shuts the committer and joins the seal thread,
+//! so every destructor runs. That exercises recovery, but it is not the "hour
 //! three, the box lost power / the process was `OOM`-killed" crash — the one
 //! where no destructor runs and whatever the durability barrier had NOT yet
 //! forced to disk is simply gone.
@@ -15,10 +15,11 @@
 //!
 //! - **No acked loss.** Every `(stream, stream_pos, global_pos)` the parent
 //!   received before the kill MUST be present, unchanged, after recovery.
-//! - **Dense prefix.** The recovered global order is `0..N` with no gap or dupe.
+//! - **Dense prefix.** The recovered global order is `0..N` with no gap or
+//!   dupe.
 //! - **Tail slack is legal.** The child may have earned an ack the parent never
-//!   read (killed between the `fdatasync` and the stdout write). Extra recovered
-//!   tail events beyond the ledger are correct, not a violation.
+//!   read (killed between the `fdatasync` and the stdout write). Extra
+//!   recovered tail events beyond the ledger are correct, not a violation.
 //!
 //! Mirrors `mess-log`'s proven `sigkill_harness`, one tier up.
 
@@ -29,19 +30,18 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use mess_store::backend::Backend;
-use mess_store::{LogEngine, Version};
-
 use mess_soak::config::Config;
 use mess_soak::resource;
+use mess_store::backend::Backend;
+use mess_store::{LogEngine, Version};
 
 /// One acked batch as reported by the child.
 #[derive(Debug, Clone, Copy)]
 struct Ack {
-    stream_idx: u64,
+    stream_idx:       u64,
     first_stream_pos: u64,
-    first_global: u64,
-    count: u64,
+    first_global:     u64,
+    count:            u64,
 }
 
 pub fn run(cfg: Config) {
@@ -99,8 +99,8 @@ pub fn run(cfg: Config) {
         );
     }
     println!(
-        "\n[soak/sigkill] COMPLETE — {round} kill/recover rounds, {total_acks} acked \
-         events reconciled, zero recovery violations."
+        "\n[soak/sigkill] COMPLETE — {round} kill/recover rounds, \
+         {total_acks} acked events reconciled, zero recovery violations."
     );
 }
 
@@ -112,17 +112,24 @@ fn guard_dir(cfg: &Config) -> Result<(), String> {
     resource::guard_fresh_dir(&cfg.dir)?;
     if resource::is_tmpfs(&cfg.dir).map_err(|e| format!("tmpfs check: {e}"))? {
         return Err(format!(
-            "refusing to soak on tmpfs dir {} — fdatasync is a no-op there (--dir must be a real device)",
+            "refusing to soak on tmpfs dir {} — fdatasync is a no-op there \
+             (--dir must be a real device)",
             cfg.dir.display()
         ));
     }
-    std::fs::create_dir_all(&cfg.dir).map_err(|e| format!("create_dir_all: {e}"))
+    std::fs::create_dir_all(&cfg.dir)
+        .map_err(|e| format!("create_dir_all: {e}"))
 }
 
 /// Spawn `soak-child`, read its ack ledger concurrently, kill it after
 /// `kill_delay`, and return whatever acks the parent had actually received by
 /// the time the pipe closed (that set IS the ledger, by definition).
-fn run_round(cfg: &Config, child_exe: &PathBuf, kill_delay: Duration, round: u64) -> Vec<Ack> {
+fn run_round(
+    cfg: &Config,
+    child_exe: &PathBuf,
+    kill_delay: Duration,
+    round: u64,
+) -> Vec<Ack> {
     let mut child = Command::new(child_exe)
         .arg(&cfg.dir)
         .arg(cfg.seed.to_string())
@@ -139,7 +146,8 @@ fn run_round(cfg: &Config, child_exe: &PathBuf, kill_delay: Duration, round: u64
     let stderr = child.stderr.take().expect("piped stderr");
     let stderr_reader = std::thread::spawn(move || {
         let mut s = String::new();
-        let _ = std::io::Read::read_to_string(&mut BufReader::new(stderr), &mut s);
+        let _ =
+            std::io::Read::read_to_string(&mut BufReader::new(stderr), &mut s);
         s
     });
 
@@ -174,8 +182,9 @@ fn run_round(cfg: &Config, child_exe: &PathBuf, kill_delay: Duration, round: u64
         // The child exited on its own before we killed it — for a soak worker
         // that loops forever, that is a real crash/panic and a genuine bug.
         eprintln!(
-            "[soak/sigkill] round {round}: child exited on its own (status={status:?}) — \
-             this is a real failure, not a vacuous round.\nchild stderr:\n{stderr_out}"
+            "[soak/sigkill] round {round}: child exited on its own \
+             (status={status:?}) — this is a real failure, not a vacuous \
+             round.\nchild stderr:\n{stderr_out}"
         );
         std::process::exit(1);
     }
@@ -227,7 +236,9 @@ async fn reconcile(cfg: &Config, acks: &[Ack]) -> Result<(), String> {
         }
     }
     if expect != total {
-        return Err(format!("recovered {expect} events but total_events()={total}"));
+        return Err(format!(
+            "recovered {expect} events but total_events()={total}"
+        ));
     }
 
     // 2) No acked loss. The ledger's highest global must be < total, and a
@@ -236,7 +247,9 @@ async fn reconcile(cfg: &Config, acks: &[Ack]) -> Result<(), String> {
     if let Some(m) = ledger_max
         && m >= total
     {
-        return Err(format!("acked global {m} lost: recovered total is only {total} events"));
+        return Err(format!(
+            "acked global {m} lost: recovered total is only {total} events"
+        ));
     }
     // Verify up to 256 acked events precisely (bounded cost).
     let stride = (acks.len() / 256).max(1);
@@ -250,22 +263,26 @@ async fn reconcile(cfg: &Config, acks: &[Ack]) -> Result<(), String> {
                 .read_global(after, 1)
                 .await
                 .map_err(|e| format!("read_global({gp}) reconcile: {e}"))?;
-            let rec = page
-                .into_iter()
-                .next()
-                .ok_or_else(|| format!("acked global {gp} missing after recovery"))?;
+            let rec = page.into_iter().next().ok_or_else(|| {
+                format!("acked global {gp} missing after recovery")
+            })?;
             if rec.global_position != gp {
-                return Err(format!("acked global {gp} recovered at {}", rec.global_position));
+                return Err(format!(
+                    "acked global {gp} recovered at {}",
+                    rec.global_position
+                ));
             }
             if rec.stream_id != want_stream {
                 return Err(format!(
-                    "acked global {gp} recovered on stream {} (expected {want_stream})",
+                    "acked global {gp} recovered on stream {} (expected \
+                     {want_stream})",
                     rec.stream_id
                 ));
             }
             if rec.stream_position != want_sp {
                 return Err(format!(
-                    "acked global {gp} recovered at stream_pos {} (expected {want_sp})",
+                    "acked global {gp} recovered at stream_pos {} (expected \
+                     {want_sp})",
                     rec.stream_position
                 ));
             }
@@ -280,7 +297,8 @@ async fn reconcile(cfg: &Config, acks: &[Ack]) -> Result<(), String> {
             Version::At(v) if v >= want_last => {}
             other => {
                 return Err(format!(
-                    "stream-{:05} head {other:?} regressed below acked pos {want_last}",
+                    "stream-{:05} head {other:?} regressed below acked pos \
+                     {want_last}",
                     ack.stream_idx
                 ));
             }
@@ -297,6 +315,9 @@ fn locate_child() -> Result<PathBuf, String> {
     if candidate.exists() {
         Ok(candidate)
     } else {
-        Err(format!("{} not found (build the `soak-child` bin)", candidate.display()))
+        Err(format!(
+            "{} not found (build the `soak-child` bin)",
+            candidate.display()
+        ))
     }
 }

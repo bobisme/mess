@@ -8,8 +8,8 @@ pub const LIMIT_DEFAULT: usize = 1_000;
 /// Typestate builder for read requests:
 ///
 /// ```
-/// use mess_db::read::GetMessages;
 /// use mess_db::StreamPos;
+/// use mess_db::read::GetMessages;
 ///
 /// let global = GetMessages::default().from_global(200).with_limit(100);
 /// let stream = GetMessages::default()
@@ -30,8 +30,8 @@ pub struct OptStreamPos(pub(crate) StreamPos);
 pub struct GetMessages<Strm, Gpos, Spos> {
     pub(crate) start_global_position: Gpos,
     pub(crate) start_stream_position: Spos,
-    pub(crate) limit: usize,
-    pub(crate) stream: Strm,
+    pub(crate) limit:                 usize,
+    pub(crate) stream:                Strm,
 }
 
 impl<Strm, Gpos, Spos> GetMessages<Strm, Gpos, Spos> {
@@ -54,8 +54,8 @@ impl<Strm, Gpos, Spos> GetMessages<Strm, Gpos, Spos> {
         GetMessages {
             start_global_position: OptGlobalPos(position),
             start_stream_position: self.start_stream_position,
-            limit: self.limit,
-            stream: self.stream,
+            limit:                 self.limit,
+            stream:                self.stream,
         }
     }
 }
@@ -69,20 +69,23 @@ impl<Strm, Gpos, Spos> GetMessages<Strm, Gpos, Spos> {
         GetMessages {
             start_global_position: self.start_global_position,
             start_stream_position: OptStreamPos(position),
-            limit: self.limit,
-            stream: self.stream,
+            limit:                 self.limit,
+            stream:                self.stream,
         }
     }
 }
 
 impl<Strm, Gpos, Spos> GetMessages<Strm, Gpos, Spos> {
-    pub fn in_stream(self, name: &str) -> GetMessages<OptStream<'_>, Gpos, Spos> {
+    pub fn in_stream(
+        self,
+        name: &str,
+    ) -> GetMessages<OptStream<'_>, Gpos, Spos> {
         let name = name.to_string();
         GetMessages {
             start_global_position: self.start_global_position,
             start_stream_position: self.start_stream_position,
-            limit: self.limit,
-            stream: OptStream(name.into()),
+            limit:                 self.limit,
+            stream:                OptStream(name.into()),
         }
     }
 }
@@ -92,8 +95,8 @@ impl Default for GetMessages<Unset, Unset, Unset> {
         Self {
             start_global_position: Default::default(),
             start_stream_position: Default::default(),
-            limit: LIMIT_DEFAULT,
-            stream: Default::default(),
+            limit:                 LIMIT_DEFAULT,
+            stream:                Default::default(),
         }
     }
 }
@@ -106,8 +109,9 @@ mod test {
         use super::*;
 
         mod from_stream {
-            use super::*;
             use pretty_assertions::assert_eq;
+
+            use super::*;
 
             #[tokio::test]
             async fn default_is_none() {
@@ -123,8 +127,9 @@ mod test {
         }
 
         mod from_global_position {
-            use super::*;
             use pretty_assertions::assert_eq;
+
+            use super::*;
 
             #[tokio::test]
             async fn default_is_zero() {
@@ -140,8 +145,9 @@ mod test {
         }
 
         mod with_limit {
-            use super::*;
             use pretty_assertions::assert_eq;
+
+            use super::*;
 
             #[tokio::test]
             async fn it_sets_the_given_limit() {

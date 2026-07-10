@@ -30,7 +30,7 @@ pub struct RetryPolicy {
     /// backoff (retry immediately) — useful in tests.
     pub base_backoff: Duration,
     /// The ceiling the doubled backoff is clamped to before jitter.
-    pub max_backoff: Duration,
+    pub max_backoff:  Duration,
 }
 
 impl Default for RetryPolicy {
@@ -38,7 +38,7 @@ impl Default for RetryPolicy {
         Self {
             max_attempts: DEFAULT_MAX_ATTEMPTS,
             base_backoff: Duration::from_micros(100),
-            max_backoff: Duration::from_millis(5),
+            max_backoff:  Duration::from_millis(5),
         }
     }
 }
@@ -57,7 +57,7 @@ impl RetryPolicy {
         Self {
             max_attempts: max_attempts.max(1),
             base_backoff: Duration::ZERO,
-            max_backoff: Duration::ZERO,
+            max_backoff:  Duration::ZERO,
         }
     }
 

@@ -3,24 +3,24 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
 use crate::{
+    Message, OwnedMessage, Position, StreamPos,
     error::{Error, Result},
     read::{GetMessages, OptGlobalPos, OptStream, OptStreamPos, Unset},
     rocks::{db::DB, read::Fetch, write::WriteSerializer},
     write::{OwnedWriteMessages, WriteMessage, WriteMessages},
-    Message, OwnedMessage, Position, StreamPos,
 };
 
 #[derive(Debug)]
 pub enum RequestBody {
     GetGlobalMessages {
-        stream: Option<String>,
+        stream:     Option<String>,
         global_pos: u64,
-        limit: usize,
+        limit:      usize,
     },
     GetStreamMessages {
-        stream: String,
+        stream:     String,
         stream_pos: Option<StreamPos>,
-        limit: usize,
+        limit:      usize,
     },
     Write(OwnedWriteMessages),
 }
@@ -28,9 +28,9 @@ pub enum RequestBody {
 impl From<GetMessages<Unset, OptGlobalPos, Unset>> for RequestBody {
     fn from(val: GetMessages<Unset, OptGlobalPos, Unset>) -> Self {
         RequestBody::GetGlobalMessages {
-            stream: None,
+            stream:     None,
             global_pos: val.start_global_position.0,
-            limit: val.limit,
+            limit:      val.limit,
         }
     }
 }
@@ -38,9 +38,9 @@ impl From<GetMessages<Unset, OptGlobalPos, Unset>> for RequestBody {
 impl From<GetMessages<OptStream<'_>, OptGlobalPos, Unset>> for RequestBody {
     fn from(val: GetMessages<OptStream, OptGlobalPos, Unset>) -> Self {
         RequestBody::GetGlobalMessages {
-            stream: Some(val.stream.0.to_string()),
+            stream:     Some(val.stream.0.to_string()),
             global_pos: val.start_global_position.0,
-            limit: val.limit,
+            limit:      val.limit,
         }
     }
 }
@@ -48,9 +48,9 @@ impl From<GetMessages<OptStream<'_>, OptGlobalPos, Unset>> for RequestBody {
 impl From<GetMessages<OptStream<'_>, Unset, Unset>> for RequestBody {
     fn from(val: GetMessages<OptStream, Unset, Unset>) -> Self {
         RequestBody::GetStreamMessages {
-            stream: val.stream.0.to_string(),
+            stream:     val.stream.0.to_string(),
             stream_pos: None,
-            limit: val.limit,
+            limit:      val.limit,
         }
     }
 }
@@ -58,16 +58,16 @@ impl From<GetMessages<OptStream<'_>, Unset, Unset>> for RequestBody {
 impl From<GetMessages<OptStream<'_>, Unset, OptStreamPos>> for RequestBody {
     fn from(val: GetMessages<OptStream, Unset, OptStreamPos>) -> Self {
         RequestBody::GetStreamMessages {
-            stream: val.stream.0.to_string(),
+            stream:     val.stream.0.to_string(),
             stream_pos: Some(val.start_stream_position.0),
-            limit: val.limit,
+            limit:      val.limit,
         }
     }
 }
 
 #[derive(Debug)]
 pub struct Request {
-    pub(crate) body: RequestBody,
+    pub(crate) body:          RequestBody,
     pub(crate) response_chan: oneshot::Sender<Response>,
 }
 
@@ -112,12 +112,11 @@ pub struct Response {
     pub body: ResponseBody,
 }
 
-
 pub struct Actor {
     inbox: mpsc::Receiver<Request>,
     // Only the actor can touch the DB.
-    db: DB,
-    ser: WriteSerializer,
+    db:    DB,
+    ser:   WriteSerializer,
     token: CancellationToken,
 }
 
@@ -198,7 +197,7 @@ async fn run_actor(mut actor: Actor) {
 #[derive(Clone)]
 pub struct ActorHandle<const S: usize = 4096> {
     outbox: mpsc::Sender<Request>,
-    token: CancellationToken,
+    token:  CancellationToken,
 }
 
 impl<const S: usize> ActorHandle<S> {
@@ -217,9 +216,7 @@ impl<const S: usize> ActorHandle<S> {
         Self { outbox, token }
     }
 
-    pub fn kill(&self) {
-        self.token.cancel()
-    }
+    pub fn kill(&self) { self.token.cancel() }
 
     /// Append a single event. Convenience wrapper over [`Self::put_messages`].
     pub async fn put_message(&self, wm: WriteMessage<'_>) -> Result<Position> {
@@ -238,7 +235,7 @@ impl<const S: usize> ActorHandle<S> {
         }
         let (send, recv) = oneshot::channel();
         let req = Request {
-            body: RequestBody::Write(batch.into()),
+            body:          RequestBody::Write(batch.into()),
             response_chan: send,
         };
         // Ignore send errors and handle it on the recv end below.
@@ -280,14 +277,15 @@ impl<const S: usize> ActorHandle<S> {
 
 #[cfg(test)]
 mod test_actor {
-    use super::*;
-    use crate::ExpectedVersion;
     use assert2::assert;
     use ident::Id;
 
+    use super::*;
+    use crate::ExpectedVersion;
+
     struct TmpHandle {
         handle: ActorHandle,
-        path: std::path::PathBuf,
+        path:   std::path::PathBuf,
     }
 
     impl TmpHandle {
@@ -315,11 +313,11 @@ mod test_actor {
         expected: crate::ExpectedVersion,
     ) -> WriteMessage<'static> {
         WriteMessage {
-            id: Id::new(),
-            stream_name: stream.to_owned().into(),
-            message_type: "SomeType".to_owned().into(),
-            data: b"{\"a\": 1}".as_slice().into(),
-            metadata: [].as_slice().into(),
+            id:               Id::new(),
+            stream_name:      stream.to_owned().into(),
+            message_type:     "SomeType".to_owned().into(),
+            data:             b"{\"a\": 1}".as_slice().into(),
+            metadata:         [].as_slice().into(),
             expected_version: expected,
         }
     }
@@ -332,14 +330,14 @@ mod test_actor {
     ) -> WriteMessages<'static> {
         use crate::write::WriteEvent;
         WriteMessages {
-            stream_name: stream.to_owned().into(),
+            stream_name:      stream.to_owned().into(),
             expected_version: expected,
-            events: (0..n)
+            events:           (0..n)
                 .map(|i| WriteEvent {
-                    id: Id::new(),
+                    id:           Id::new(),
                     message_type: message_type.to_owned().into(),
-                    data: (i as u64).to_be_bytes().to_vec().into(),
-                    metadata: Vec::new().into(),
+                    data:         (i as u64).to_be_bytes().to_vec().into(),
+                    metadata:     Vec::new().into(),
                 })
                 .collect(),
         }
@@ -477,8 +475,7 @@ mod test_actor {
         }
 
         // Read every event on the stream.
-        let req =
-            GetMessages::default().in_stream("s1").with_limit(TOTAL + 8);
+        let req = GetMessages::default().in_stream("s1").with_limit(TOTAL + 8);
         let messages = h.handle.fetch_messages(req).await.unwrap();
         let messages: Result<Vec<_>> = messages.into_iter().collect();
         let messages = messages.unwrap();
@@ -552,8 +549,13 @@ mod test_actor {
                 .in_stream("s1")
                 .from_stream_position(next_pos)
                 .with_limit(PAGE);
-            let page: Result<Vec<_>> =
-                h.handle.fetch_messages(req).await.unwrap().into_iter().collect();
+            let page: Result<Vec<_>> = h
+                .handle
+                .fetch_messages(req)
+                .await
+                .unwrap()
+                .into_iter()
+                .collect();
             let page = page.unwrap();
             assert!(page.len() <= PAGE);
             let page_len = page.len();
@@ -584,8 +586,10 @@ mod test_actor {
         const N: usize = 120;
         const PAGE: usize = 20;
 
-        let mut next_expected: std::collections::HashMap<&str, Option<StreamPos>> =
-            std::collections::HashMap::new();
+        let mut next_expected: std::collections::HashMap<
+            &str,
+            Option<StreamPos>,
+        > = std::collections::HashMap::new();
         for i in 0..N {
             let stream = if i % 2 == 0 { "s1" } else { "s2" };
             let expected = *next_expected.entry(stream).or_insert(None);
@@ -602,9 +606,15 @@ mod test_actor {
         let mut all = Vec::new();
         let mut next_pos = 0u64;
         loop {
-            let req = GetMessages::default().from_global(next_pos).with_limit(PAGE);
-            let page: Result<Vec<_>> =
-                h.handle.fetch_messages(req).await.unwrap().into_iter().collect();
+            let req =
+                GetMessages::default().from_global(next_pos).with_limit(PAGE);
+            let page: Result<Vec<_>> = h
+                .handle
+                .fetch_messages(req)
+                .await
+                .unwrap()
+                .into_iter()
+                .collect();
             let page = page.unwrap();
             assert!(page.len() <= PAGE);
             let page_len = page.len();

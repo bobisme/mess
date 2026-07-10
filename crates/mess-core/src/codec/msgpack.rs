@@ -37,7 +37,10 @@ pub const MAX_MSGPACK_DEPTH: usize = 64;
 /// real decoder — to report with its own proper error. This function's
 /// only job is the one check that a fully-recursive decoder cannot safely
 /// make on its own: bounding depth *before* recursing.
-pub(crate) fn check_msgpack_depth(data: &[u8], max_depth: usize) -> Result<(), CodecError> {
+pub(crate) fn check_msgpack_depth(
+    data: &[u8],
+    max_depth: usize,
+) -> Result<(), CodecError> {
     // Each stack entry is "how many more sibling values remain to be read
     // at this nesting level, including the one about to be read next".
     // Depth at any point is `stack.len()`. Seeded with 1: we need to walk
@@ -81,35 +84,37 @@ pub(crate) fn check_msgpack_depth(data: &[u8], max_depth: usize) -> Result<(), C
         // Extra data-byte length for scalar/leaf markers (0 for markers
         // with no trailing bytes at all, e.g. nil/bool/fixint).
         let extra: Option<usize> = match marker {
-            0x00..=0x7f | 0xe0..=0xff => Some(0), // fixint
-            0xc0 | 0xc2 | 0xc3 => Some(0),        // nil, false, true
-            0xc1 => Some(0),                      // reserved/unused marker
-            0xa0..=0xbf => Some((marker & 0x1f) as usize), // fixstr
-            0xc4 => read_u8(data, &mut pos),      // bin8
-            0xc5 => read_u16(data, &mut pos),     // bin16
-            0xc6 => read_u32(data, &mut pos),     // bin32
-            0xc7 => read_u8(data, &mut pos).map(|n| n + 1), // ext8 (+type byte)
-            0xc8 => read_u16(data, &mut pos).map(|n| n + 1), // ext16
-            0xc9 => read_u32(data, &mut pos).map(|n| n + 1), // ext32
-            0xca => Some(4),                      // f32
-            0xcb => Some(8),                      // f64
-            0xcc => Some(1),                      // u8
-            0xcd => Some(2),                      // u16
-            0xce => Some(4),                      // u32
-            0xcf => Some(8),                      // u64
-            0xd0 => Some(1),                      // i8
-            0xd1 => Some(2),                      // i16
-            0xd2 => Some(4),                      // i32
-            0xd3 => Some(8),                      // i64
-            0xd4 => Some(2),                      // fixext1 (type + 1)
-            0xd5 => Some(3),                      // fixext2
-            0xd6 => Some(5),                      // fixext4
-            0xd7 => Some(9),                      // fixext8
-            0xd8 => Some(17),                     // fixext16
-            0xd9 => read_u8(data, &mut pos),      // str8
-            0xda => read_u16(data, &mut pos),     // str16
-            0xdb => read_u32(data, &mut pos),     // str32
-            _ => None, // container marker, or unreachable — handled below
+            0x00..=0x7F | 0xE0..=0xFF => Some(0), // fixint
+            0xC0 | 0xC2 | 0xC3 => Some(0),        // nil, false, true
+            0xC1 => Some(0),                      // reserved/unused marker
+            0xA0..=0xBF => Some((marker & 0x1F) as usize), // fixstr
+            0xC4 => read_u8(data, &mut pos),      // bin8
+            0xC5 => read_u16(data, &mut pos),     // bin16
+            0xC6 => read_u32(data, &mut pos),     // bin32
+            0xC7 => read_u8(data, &mut pos).map(|n| n + 1), // ext8 (+type byte)
+            0xC8 => read_u16(data, &mut pos).map(|n| n + 1), // ext16
+            0xC9 => read_u32(data, &mut pos).map(|n| n + 1), // ext32
+            0xCA => Some(4),                      // f32
+            0xCB => Some(8),                      // f64
+            0xCC => Some(1),                      // u8
+            0xCD => Some(2),                      // u16
+            0xCE => Some(4),                      // u32
+            0xCF => Some(8),                      // u64
+            0xD0 => Some(1),                      // i8
+            0xD1 => Some(2),                      // i16
+            0xD2 => Some(4),                      // i32
+            0xD3 => Some(8),                      // i64
+            0xD4 => Some(2),                      // fixext1 (type + 1)
+            0xD5 => Some(3),                      // fixext2
+            0xD6 => Some(5),                      // fixext4
+            0xD7 => Some(9),                      // fixext8
+            0xD8 => Some(17),                     // fixext16
+            0xD9 => read_u8(data, &mut pos),      // str8
+            0xDA => read_u16(data, &mut pos),     // str16
+            0xDB => read_u32(data, &mut pos),     // str32
+            _ => None,                            /* container marker, or
+                                                    * unreachable — handled
+                                                    * below */
         };
 
         if let Some(extra) = extra {
@@ -125,15 +130,15 @@ pub(crate) fn check_msgpack_depth(data: &[u8], max_depth: usize) -> Result<(), C
         // Container markers: push a new frame for their children and
         // check the depth this introduces.
         let children: Option<usize> = match marker {
-            0x80..=0x8f => Some(2 * (marker & 0x0f) as usize), // fixmap
-            0x90..=0x9f => Some((marker & 0x0f) as usize),     // fixarray
-            0xdc => read_u16(data, &mut pos),                  // array16
-            0xdd => read_u32(data, &mut pos),                  // array32
-            0xde => read_u16(data, &mut pos).map(|n| 2 * n),   // map16
-            0xdf => read_u32(data, &mut pos).map(|n| 2 * n),   // map32
-            _ => Some(0), // marker byte alone was the whole value (shouldn't
-                          // happen given the match above is exhaustive over
-                          // every byte value, but stay conservative)
+            0x80..=0x8F => Some(2 * (marker & 0x0F) as usize), // fixmap
+            0x90..=0x9F => Some((marker & 0x0F) as usize),     // fixarray
+            0xDC => read_u16(data, &mut pos),                  // array16
+            0xDD => read_u32(data, &mut pos),                  // array32
+            0xDE => read_u16(data, &mut pos).map(|n| 2 * n),   // map16
+            0xDF => read_u32(data, &mut pos).map(|n| 2 * n),   // map32
+            _ => Some(0), /* marker byte alone was the whole value (shouldn't
+                           * happen given the match above is exhaustive over
+                           * every byte value, but stay conservative) */
         };
         let Some(children) = children else { break 'walk };
         if children > 0 {
@@ -236,7 +241,7 @@ mod tests {
 
     #[derive(Serialize, Deserialize, PartialEq, Debug)]
     struct Sample {
-        id: u32,
+        id:   u32,
         name: String,
     }
 
@@ -279,7 +284,7 @@ mod tests {
     #[test]
     fn corrupt_payload_fails_loudly() {
         let err =
-            decode_payload::<Sample>(CODEC_ID_MSGPACK_NAMED, &[0xff, 0x01])
+            decode_payload::<Sample>(CODEC_ID_MSGPACK_NAMED, &[0xFF, 0x01])
                 .unwrap_err();
         assert!(matches!(err, CodecError::Decode(_)));
     }
@@ -301,13 +306,14 @@ mod tests {
     fn deeply_nested_unknown_field_fails_loudly_not_crash() {
         let mut payload = Vec::new();
         payload.push(0x82); // fixmap, 2 entries: known + unknown
-        payload.extend_from_slice(&[0xa2, b'i', b'd']);
+        payload.extend_from_slice(&[0xA2, b'i', b'd']);
         payload.push(0x01); // id: 1
-        payload.extend_from_slice(&[0xa5]);
+        payload.extend_from_slice(&[0xA5]);
         payload.extend_from_slice(b"extra");
         payload.extend_from_slice(&deep_nested_array(200_000));
 
-        let err = decode_payload::<Sample>(CODEC_ID_MSGPACK_NAMED, &payload).unwrap_err();
+        let err = decode_payload::<Sample>(CODEC_ID_MSGPACK_NAMED, &payload)
+            .unwrap_err();
         assert!(
             matches!(err, CodecError::TooDeeplyNested { max } if max == MAX_MSGPACK_DEPTH),
             "expected TooDeeplyNested, got {err:?}"
@@ -324,18 +330,29 @@ mod tests {
     #[test]
     fn nesting_at_the_cap_is_not_rejected_for_depth() {
         let payload = deep_nested_array(MAX_MSGPACK_DEPTH - 1);
-        let err = decode_payload::<Sample>(CODEC_ID_MSGPACK_NAMED, &payload).unwrap_err();
-        assert!(!matches!(err, CodecError::TooDeeplyNested { .. }), "got {err:?}");
+        let err = decode_payload::<Sample>(CODEC_ID_MSGPACK_NAMED, &payload)
+            .unwrap_err();
+        assert!(
+            !matches!(err, CodecError::TooDeeplyNested { .. }),
+            "got {err:?}"
+        );
 
         // One level deeper must be the first depth rejected.
         let too_deep = deep_nested_array(MAX_MSGPACK_DEPTH);
-        let err = decode_payload::<Sample>(CODEC_ID_MSGPACK_NAMED, &too_deep).unwrap_err();
-        assert!(matches!(err, CodecError::TooDeeplyNested { .. }), "got {err:?}");
+        let err = decode_payload::<Sample>(CODEC_ID_MSGPACK_NAMED, &too_deep)
+            .unwrap_err();
+        assert!(
+            matches!(err, CodecError::TooDeeplyNested { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]
     fn check_msgpack_depth_accepts_shallow_and_rejects_deep() {
-        assert!(check_msgpack_depth(&deep_nested_array(10), MAX_MSGPACK_DEPTH).is_ok());
+        assert!(
+            check_msgpack_depth(&deep_nested_array(10), MAX_MSGPACK_DEPTH)
+                .is_ok()
+        );
         assert!(matches!(
             check_msgpack_depth(&deep_nested_array(1000), MAX_MSGPACK_DEPTH),
             Err(CodecError::TooDeeplyNested { max }) if max == MAX_MSGPACK_DEPTH
@@ -355,7 +372,19 @@ mod tests {
             let _ = check_msgpack_depth(&buf, MAX_MSGPACK_DEPTH);
         }
         // A container header claiming far more data than exists.
-        assert!(check_msgpack_depth(&[0xdf, 0xff, 0xff, 0xff, 0xff], MAX_MSGPACK_DEPTH).is_ok());
-        assert!(check_msgpack_depth(&[0xdb, 0xff, 0xff, 0xff, 0xff], MAX_MSGPACK_DEPTH).is_ok());
+        assert!(
+            check_msgpack_depth(
+                &[0xDF, 0xFF, 0xFF, 0xFF, 0xFF],
+                MAX_MSGPACK_DEPTH
+            )
+            .is_ok()
+        );
+        assert!(
+            check_msgpack_depth(
+                &[0xDB, 0xFF, 0xFF, 0xFF, 0xFF],
+                MAX_MSGPACK_DEPTH
+            )
+            .is_ok()
+        );
     }
 }

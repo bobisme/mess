@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use ident::Id;
 use mess_store::{EventStore, LogEngine};
 use social::{
-    PostLookup, Projections, ProfileView, ReadModels, TimelinePage, WriteError,
+    PostLookup, ProfileView, Projections, ReadModels, TimelinePage, WriteError,
     WriteOps,
 };
 
@@ -36,13 +36,8 @@ fn fresh_store() -> EventStore<LogEngine> {
 /// alice follows bob (not carol); bob posts p1 & p3, carol posts p2; alice
 /// likes p1. Returns the store, a live projection caught up to `last`, the
 /// three user ids, the three post ids, and `last` (the final global position).
-async fn world() -> (
-    EventStore<LogEngine>,
-    Projections<LogEngine>,
-    [Id; 3],
-    [Id; 3],
-    u64,
-) {
+async fn world()
+-> (EventStore<LogEngine>, Projections<LogEngine>, [Id; 3], [Id; 3], u64) {
     let store = fresh_store();
     let proj = Projections::new(&store).await;
     let (alice, bob, carol) = (Id::new(), Id::new(), Id::new());
@@ -231,9 +226,8 @@ impl Rng {
         self.0 = x;
         x
     }
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
+
+    fn below(&mut self, n: usize) -> usize { (self.next() % n as u64) as usize }
 }
 
 /// Drive a seeded random-but-valid event sequence at `store`. Returns the last
@@ -271,7 +265,9 @@ async fn drive(
         let r = match rng.below(8) {
             0 => {
                 let u = users[rng.below(users.len())].0;
-                store.set_display_name(u, format!("n{}", rng.next() % 997)).await
+                store
+                    .set_display_name(u, format!("n{}", rng.next() % 997))
+                    .await
             }
             1 => {
                 let a = users[rng.below(users.len())].0;
@@ -325,12 +321,12 @@ async fn drive(
 /// built.
 #[derive(Debug, PartialEq, Eq)]
 struct Snap {
-    firehose: TimelinePage,
-    homes: Vec<TimelinePage>,
+    firehose:   TimelinePage,
+    homes:      Vec<TimelinePage>,
     user_posts: Vec<TimelinePage>,
-    profiles: Vec<Option<ProfileView>>,
-    posts: Vec<Option<social::PostView>>,
-    lookups: Vec<Option<PostLookup>>,
+    profiles:   Vec<Option<ProfileView>>,
+    posts:      Vec<Option<social::PostView>>,
+    lookups:    Vec<Option<PostLookup>>,
 }
 
 async fn snapshot(
@@ -359,14 +355,7 @@ async fn snapshot(
         post_views.push(proj.post(*p, None).await);
         lookups.push(proj.lookup_post(*p, None).await);
     }
-    Snap {
-        firehose,
-        homes,
-        user_posts,
-        profiles,
-        posts: post_views,
-        lookups,
-    }
+    Snap { firehose, homes, user_posts, profiles, posts: post_views, lookups }
 }
 
 #[tokio::test]
@@ -384,7 +373,8 @@ async fn rebuild_equals_live_over_random_sequences() {
         let live = Projections::new(&store).await;
 
         let last = drive(&store, seed, &users, &posts).await;
-        let last = last.expect("the deterministic prelude always writes events");
+        let last =
+            last.expect("the deterministic prelude always writes events");
         live.wait_for(last).await;
 
         // The REBUILD projection is built AFTER all events: a full replay from

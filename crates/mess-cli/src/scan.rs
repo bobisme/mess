@@ -12,22 +12,21 @@ use mess_log::sealer::{SegmentCatalogEntry, read_trailer};
 #[derive(Debug)]
 pub struct SegmentScan {
     pub segment_id: u64,
-    /// The recovery scan result (typed accept/stop over the acceptance kernel).
-    pub recovery: Recovery,
+    /// The recovery scan result (typed accept/stop over the acceptance
+    /// kernel).
+    pub recovery:   Recovery,
     /// The decoded sealed trailer, if the segment is sealed (§3.3.1); `None`
     /// means the segment is unsealed (the active/rolled head) or its trailer
     /// did not validate.
-    pub trailer: Option<SegmentCatalogEntry>,
+    pub trailer:    Option<SegmentCatalogEntry>,
     /// The raw byte length of the file.
-    pub file_len: u64,
+    pub file_len:   u64,
 }
 
 impl SegmentScan {
     /// The number of accepted (committed) batches.
     #[must_use]
-    pub fn batch_count(&self) -> usize {
-        self.recovery.accepted.len()
-    }
+    pub fn batch_count(&self) -> usize { self.recovery.accepted.len() }
 
     /// Σ frame_count over the accepted prefix.
     #[must_use]
@@ -37,9 +36,7 @@ impl SegmentScan {
 
     /// Whether the segment carries a valid sealed trailer.
     #[must_use]
-    pub fn is_sealed(&self) -> bool {
-        self.trailer.is_some()
-    }
+    pub fn is_sealed(&self) -> bool { self.trailer.is_some() }
 
     /// The segment's own header epoch, if the header validated.
     #[must_use]
@@ -55,7 +52,10 @@ impl SegmentScan {
 }
 
 /// Recover and characterise one segment file.
-pub fn scan_segment(segment_id: u64, log_path: &Path) -> std::io::Result<SegmentScan> {
+pub fn scan_segment(
+    segment_id: u64,
+    log_path: &Path,
+) -> std::io::Result<SegmentScan> {
     let fs = RealFs;
     let recovery = recover_segment(&fs, log_path)?;
     let trailer = read_trailer(&fs, log_path)?;

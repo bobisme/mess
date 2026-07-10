@@ -48,27 +48,30 @@ pub struct RebuildReport {
     /// `segment_id`s that were trusted-sealed via their footer trailer and
     /// therefore **skipped** — their pointer index is bn-20e (the documented
     /// seam). Position chain was still advanced across them.
-    pub sealed_skipped: Vec<u64>,
+    pub sealed_skipped:   Vec<u64>,
     /// `segment_id`s whose header/body did not validate at all (no committed
     /// batches of this generation); nothing was inserted for them.
     pub empty_or_invalid: Vec<u64>,
     /// The global position following the last committed event across all
     /// segments — the exclusive durable end the rebuilt index is applied to.
-    pub next_pos: u64,
+    pub next_pos:         u64,
 }
 
 /// Turn one unsealed segment's recovered accepted prefix into the
 /// [`BatchEntry`]s the active index inserts. Pure — no I/O — so it is trivially
 /// testable against a scan result.
-fn batch_entries_from(rec: &mess_log::scanner::Recovery, segment_id: u64) -> Vec<BatchEntry> {
+fn batch_entries_from(
+    rec: &mess_log::scanner::Recovery,
+    segment_id: u64,
+) -> Vec<BatchEntry> {
     rec.accepted
         .iter()
         .map(|b| BatchEntry {
-            stream_id: b.stream_id,
+            stream_id:            b.stream_id,
             first_stream_version: b.first_stream_version,
-            frame_count: b.frame_count,
-            first_global_pos: b.first_global_pos,
-            ptr: EventPtr { segment_id, offset: b.offset },
+            frame_count:          b.frame_count,
+            first_global_pos:     b.first_global_pos,
+            ptr:                  EventPtr { segment_id, offset: b.offset },
         })
         .collect()
 }
@@ -81,7 +84,10 @@ fn batch_entries_from(rec: &mess_log::scanner::Recovery, segment_id: u64) -> Vec
 ///
 /// Every I/O goes through the [`Fs`] seam, so the whole rebuild runs on the sim
 /// fault filesystem in tests exactly as it does on the real one.
-pub fn rebuild<F: Fs>(fs: &F, segments: &[PathBuf]) -> io::Result<(ActiveIndex, RebuildReport)> {
+pub fn rebuild<F: Fs>(
+    fs: &F,
+    segments: &[PathBuf],
+) -> io::Result<(ActiveIndex, RebuildReport)> {
     let index = ActiveIndex::new();
     let report = rebuild_into(&index, fs, segments)?;
     Ok((index, report))

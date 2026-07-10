@@ -19,6 +19,7 @@ impl<'a> Error<'a> {
     pub fn external(err: impl DisplayErr + 'a) -> Self {
         Self::External(Box::new(err))
     }
+
     #[inline]
     pub fn external_to_string(err: impl std::fmt::Display) -> Self {
         Self::ExternalString(err.to_string())

@@ -44,9 +44,11 @@ pub fn run(size: RunSize, scratch: &Path) -> Vec<Metric> {
             r.best_ev_per_s,
             "ev/s",
             format!(
-                "Durability::group_default (D7 early-close, fdatasync/group); {writers} writers x \
-                 {batch}-event batches x {batches_per_writer}/writer = {} events; ~250B payload; \
-                 real-fs scratch (see machine.scratch_fs); best-of-{reps}; ev/fsync {ev_per_fsync:.0}",
+                "Durability::group_default (D7 early-close, fdatasync/group); \
+                 {writers} writers x {batch}-event batches x \
+                 {batches_per_writer}/writer = {} events; ~250B payload; \
+                 real-fs scratch (see machine.scratch_fs); best-of-{reps}; \
+                 ev/fsync {ev_per_fsync:.0}",
                 r.total_events
             ),
         ),

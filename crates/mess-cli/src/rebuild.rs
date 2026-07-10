@@ -12,7 +12,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use mess_index::meta::{CommitGroup, Head, MetaStore, StreamId};
-use mess_index::sealed::segment::{SealBatch, SealInput, SealStream, encode_sidecar};
+use mess_index::sealed::segment::{
+    SealBatch, SealInput, SealStream, encode_sidecar,
+};
 use serde_json::json;
 
 use crate::lockprobe;
@@ -27,7 +29,7 @@ pub struct RebuildOptions {
     pub dry_run: bool,
     /// Also rebuild the derivable metadata tables (stream heads). Off by
     /// default so a plain `rebuild-index` never touches the metadata store.
-    pub meta: bool,
+    pub meta:    bool,
 }
 
 /// Build the byte-image of a segment's pointer sidecar from its recovered,
@@ -43,15 +45,16 @@ pub fn rebuild_sidecar_bytes(
     let mut by_stream: BTreeMap<u64, Vec<SealBatch>> = BTreeMap::new();
     for b in accepted {
         by_stream.entry(b.stream_id).or_default().push(SealBatch {
-            first_version: b.first_stream_version,
-            frame_count: b.frame_count,
+            first_version:    b.first_stream_version,
+            frame_count:      b.frame_count,
             first_global_pos: b.first_global_pos,
-            // The composed engine is pointer-only: its `EventPtr.offset` is the
-            // batch's global position (a pseudo pointer, never dereferenced
-            // into the `.log` — sealed reads come from the record book / `.pcol`).
-            // The sealer persists exactly that, so a byte-equal rebuild must
-            // reproduce the global position here, not the raw byte offset.
-            offset: b.first_global_pos,
+            // The composed engine is pointer-only: its `EventPtr.offset` is
+            // the batch's global position (a pseudo pointer, never
+            // dereferenced into the `.log` — sealed reads come
+            // from the record book / `.pcol`). The sealer persists
+            // exactly that, so a byte-equal rebuild must reproduce
+            // the global position here, not the raw byte offset.
+            offset:           b.first_global_pos,
         });
     }
     let streams: Vec<SealStream> = by_stream
@@ -79,7 +82,8 @@ pub fn run(dir: &Path, opts: &RebuildOptions) -> Report {
             Severity::Error,
             "lock",
             "store-locked",
-            "store is locked by a live writer; rebuild-index needs exclusive access (use --dry-run to preview)",
+            "store is locked by a live writer; rebuild-index needs exclusive \
+             access (use --dry-run to preview)",
         ));
         return report;
     }
@@ -114,7 +118,10 @@ pub fn run(dir: &Path, opts: &RebuildOptions) -> Report {
                     Severity::Warn,
                     "rebuild",
                     "no-header",
-                    format!("segment {} has no valid header; skipping", seg.segment_id),
+                    format!(
+                        "segment {} has no valid header; skipping",
+                        seg.segment_id
+                    ),
                 )
                 .with("segment_id", seg.segment_id),
             );
@@ -134,14 +141,22 @@ pub fn run(dir: &Path, opts: &RebuildOptions) -> Report {
                         h.global_position = head_gpos;
                     }
                 })
-                .or_insert(Head { version: head_version, global_position: head_gpos });
+                .or_insert(Head {
+                    version:         head_version,
+                    global_position: head_gpos,
+                });
         }
 
         // The rebuilt pointer sidecar image.
-        let bytes = rebuild_sidecar_bytes(header.segment_id, header.base_pos, &scan.recovery.accepted);
+        let bytes = rebuild_sidecar_bytes(
+            header.segment_id,
+            header.base_pos,
+            &scan.recovery.accepted,
+        );
         let path = store::pidx_path(dir, seg.segment_id);
 
-        let identical = std::fs::read(&path).map(|old| old == bytes).unwrap_or(false);
+        let identical =
+            std::fs::read(&path).map(|old| old == bytes).unwrap_or(false);
         if opts.dry_run {
             report.push_row(json!({
                 "segment_id": seg.segment_id,
@@ -160,7 +175,11 @@ pub fn run(dir: &Path, opts: &RebuildOptions) -> Report {
                     Severity::Error,
                     "rebuild",
                     "sidecar-write",
-                    format!("segment {}: failed to write {}: {e}", seg.segment_id, path.display()),
+                    format!(
+                        "segment {}: failed to write {}: {e}",
+                        seg.segment_id,
+                        path.display()
+                    ),
                 )
                 .with("segment_id", seg.segment_id),
             );
@@ -179,7 +198,8 @@ pub fn run(dir: &Path, opts: &RebuildOptions) -> Report {
     if opts.meta && !opts.dry_run {
         rebuild_meta(&mut report, dir, &stream_heads, end_position);
     } else if opts.meta {
-        report.set("meta_stream_heads_would_rebuild", json!(stream_heads.len()));
+        report
+            .set("meta_stream_heads_would_rebuild", json!(stream_heads.len()));
     }
 
     report.set("segments", json!(segments.len()));
@@ -188,7 +208,12 @@ pub fn run(dir: &Path, opts: &RebuildOptions) -> Report {
 
 /// Rebuild the stream-head metadata table from the recovered heads (idempotent
 /// per I5: rewriting the same group rewrites the same bytes).
-fn rebuild_meta(report: &mut Report, dir: &Path, heads: &BTreeMap<u64, Head>, end_position: u64) {
+fn rebuild_meta(
+    report: &mut Report,
+    dir: &Path,
+    heads: &BTreeMap<u64, Head>,
+    end_position: u64,
+) {
     let meta = match MetaStore::open(store::meta_dir(dir)) {
         Ok(m) => m,
         Err(e) => {
@@ -219,7 +244,11 @@ fn rebuild_meta(report: &mut Report, dir: &Path, heads: &BTreeMap<u64, Head>, en
 /// Crash-safe sidecar write: temp file in the same dir, then rename (mirrors
 /// the sealer's temp→fsync→rename discipline; the dir fsync the sealer adds is
 /// not reproduced here since rebuild is an offline recovery tool).
-fn write_atomic(sealed_dir: &Path, final_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+fn write_atomic(
+    sealed_dir: &Path,
+    final_path: &Path,
+    bytes: &[u8],
+) -> std::io::Result<()> {
     std::fs::create_dir_all(sealed_dir)?;
     let tmp = final_path.with_extension("pidx.tmp");
     std::fs::write(&tmp, bytes)?;

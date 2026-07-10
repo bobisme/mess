@@ -1,15 +1,14 @@
 use std::marker::PhantomData;
 
-use super::keys::{GlobalKey, StreamKey, SEPARATOR_CHAR};
-use crate::{
-    error::{Error, Result},
-    read::{GetMessages, OptGlobalPos, OptStream, OptStreamPos, Unset},
-    Message, StreamPos,
-};
-
+use super::keys::{GlobalKey, SEPARATOR_CHAR, StreamKey};
 use super::{
     db::DB,
     record::{GlobalRecord, StreamRecord},
+};
+use crate::{
+    Message, StreamPos,
+    error::{Error, Result},
+    read::{GetMessages, OptGlobalPos, OptStream, OptStreamPos, Unset},
 };
 
 // NOTE: `LIMIT_MAX` / `LIMIT_DEFAULT` have a single source of truth in
@@ -151,22 +150,20 @@ mod test {
 
     use std::str::FromStr;
 
-    use super::*;
     use ident::Id;
     use rstest::*;
 
+    use super::*;
     use crate::{
+        StreamPos,
         rocks::{
             db::test::SelfDestructingDB,
-            write::{write_mess, WriteSerializer},
+            write::{WriteSerializer, write_mess},
         },
         write::WriteMessage,
-        StreamPos,
     };
 
-    fn test_ser() -> WriteSerializer {
-        WriteSerializer::new()
-    }
+    fn test_ser() -> WriteSerializer { WriteSerializer::new() }
 
     fn test_db(rows_per_stream: i64) -> SelfDestructingDB {
         let rows_per_stream = rows_per_stream.max(0) as usize;
@@ -216,10 +213,10 @@ mod test {
     }
 
     mod test_get_messages {
-        use crate::StreamPos;
+        use assert2::assert;
 
         use super::*;
-        use assert2::assert;
+        use crate::StreamPos;
 
         #[rstest]
         fn it_gets_messages_up_to_limit() {
@@ -302,8 +299,7 @@ mod test {
             assert!(messages[0].stream_position == StreamPos::new(2));
             assert!(messages[0].stream_name == "stream1");
             assert!(
-                messages.last().unwrap().stream_position
-                    == StreamPos::new(4)
+                messages.last().unwrap().stream_position == StreamPos::new(4)
             );
         }
 
@@ -343,9 +339,9 @@ mod test {
         //     #[rstest]
         //     fn the_max_is_10_000() {
         //         let conn = test_db(5_010);
-        //         let messages = get_messages(&conn, 0, Some(100_000)).unwrap();
-        //         assert!(messages.len() == 10_000);
-        //     }
+        //         let messages = get_messages(&conn, 0,
+        // Some(100_000)).unwrap();         assert!(messages.len() ==
+        // 10_000);     }
         // }
         //
         // mod fn_get_stream_messages {
@@ -361,9 +357,9 @@ mod test {
         //     fn it_returns_messages_with_highest_stream_pos() {
         //         let conn = test_db(5);
         //         let m =
-        //             get_latest_stream_message(&conn, "stream1").unwrap().unwrap();
-        //         assert_ne!(m.time_ms, 0);
-        //         assert!(m.global_position == 9);
+        //             get_latest_stream_message(&conn,
+        // "stream1").unwrap().unwrap();         assert_ne!(m.time_ms,
+        // 0);         assert!(m.global_position == 9);
         //         assert!(m.position == 4);
         //         assert!(m.stream_name == "stream1");
         //         assert!(m.message_type == "X");
@@ -396,8 +392,8 @@ mod test {
         //     fn it_returns_none_if_no_stream() {
         //         let conn = test_db(5);
         //         let position =
-        //             get_latest_stream_position(&conn, "null-stream").unwrap();
-        //         assert!(position == None);
+        //             get_latest_stream_position(&conn,
+        // "null-stream").unwrap();         assert!(position == None);
         //     }
     }
 
@@ -427,10 +423,11 @@ mod test {
     /// mess_db (out of this bone's scope) or rewording the AC. Flagging
     /// this explicitly rather than presenting the AC as closed.
     mod paging {
-        use super::*;
-        use crate::read::{GetMessages, LIMIT_MAX, OptStreamPos};
         use assert2::assert;
         use ident::Id;
+
+        use super::*;
+        use crate::read::{GetMessages, LIMIT_MAX, OptStreamPos};
 
         /// Write `n` sequential events into `stream` on a fresh temp DB.
         fn write_stream(stream: &str, n: usize) -> SelfDestructingDB {
@@ -444,11 +441,11 @@ mod test {
                     Some(StreamPos::new((i - 1) as u64))
                 };
                 let msg = WriteMessage {
-                    id: Id::new(),
-                    stream_name: stream.into(),
-                    message_type: "PagingTestEvent".into(),
-                    data: data[..].into(),
-                    metadata: [][..].into(),
+                    id:               Id::new(),
+                    stream_name:      stream.into(),
+                    message_type:     "PagingTestEvent".into(),
+                    data:             data[..].into(),
+                    metadata:         [][..].into(),
                     expected_version: expected.into(),
                 };
                 write_mess(&db, msg, &mut ser).unwrap();
@@ -505,10 +502,8 @@ mod test {
             }
             // No duplicates: positions are strictly increasing, so a set of
             // them has the same cardinality as the list.
-            let unique: std::collections::HashSet<u64> = messages
-                .iter()
-                .map(|m| m.stream_position.position())
-                .collect();
+            let unique: std::collections::HashSet<u64> =
+                messages.iter().map(|m| m.stream_position.position()).collect();
             assert!(unique.len() == expected_count);
         }
 

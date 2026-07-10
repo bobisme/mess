@@ -14,14 +14,14 @@ use crate::{Metric, RunSize};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Account {
-    balance: i64,
+    balance:  i64,
     tx_count: u64,
 }
 impl Aggregate for Account {
     const FOLD_VERSION: u32 = 1;
-    fn init() -> Self {
-        Account { balance: 0, tx_count: 0 }
-    }
+
+    fn init() -> Self { Account { balance: 0, tx_count: 0 } }
+
     fn apply(&mut self, payload: &[u8]) {
         let tag = payload[0];
         let amount = u64::from_le_bytes(payload[1..9].try_into().unwrap());
@@ -32,18 +32,20 @@ impl Aggregate for Account {
         }
         self.tx_count += 1;
     }
+
     fn to_bytes(&self) -> Vec<u8> {
         let mut o = Vec::with_capacity(16);
         o.extend_from_slice(&self.balance.to_le_bytes());
         o.extend_from_slice(&self.tx_count.to_le_bytes());
         o
     }
+
     fn from_bytes(b: &[u8]) -> Option<Self> {
         if b.len() != 16 {
             return None;
         }
         Some(Account {
-            balance: i64::from_le_bytes(b[0..8].try_into().ok()?),
+            balance:  i64::from_le_bytes(b[0..8].try_into().ok()?),
             tx_count: u64::from_le_bytes(b[8..16].try_into().ok()?),
         })
     }
@@ -88,8 +90,9 @@ pub fn run(size: RunSize) -> Vec<Metric> {
         n as f64 / best,
         "ev/s",
         format!(
-            "load_verified over a {n}-event tail (snapshot at v=0 => full prefix cert + tail replay \
-             + head anchor); batch {batch}; best-of-{reps}; single core, in-memory"
+            "load_verified over a {n}-event tail (snapshot at v=0 => full \
+             prefix cert + tail replay + head anchor); batch {batch}; \
+             best-of-{reps}; single core, in-memory"
         ),
     )]
 }

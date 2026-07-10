@@ -3,6 +3,19 @@ set positional-arguments
 @test *args='':
 	env CLICOLOR_FORCE=1 cargo nextest run --workspace --failure-output=final "$@"
 
+# bn-3mc: rustfmt.toml uses nightly-only options (see its header comment), so
+# these always target +nightly rather than the default toolchain — a stable
+# `cargo fmt` silently drops those options and reports spurious diffs. No
+# `*args` pass-through here (unlike `test`/`bench` above): `just`'s empty
+# default for a variadic parameter passes cargo a bare "" when no args are
+# given, which nextest tolerates but `cargo fmt` rejects as an unexpected
+# argument.
+@fmt:
+	cargo +nightly fmt --all
+
+@fmt-check:
+	cargo +nightly fmt --all --check
+
 @bench *args='':
 	cargo bench --workspace "$@"
 

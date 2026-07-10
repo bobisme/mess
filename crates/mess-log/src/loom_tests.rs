@@ -92,9 +92,10 @@ fn count_iteration(counter: &AtomicUsize) {
 /// by inspection."
 #[cfg(loom)]
 mod watermark_publish {
-    use super::*;
-    use loom::sync::atomic::{AtomicU64, Ordering};
     use loom::sync::Arc;
+    use loom::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
 
     static EXPLORED: AtomicUsize = AtomicUsize::new(0);
 
@@ -134,7 +135,8 @@ mod watermark_publish {
                 assert_eq!(
                     seen, 42,
                     "W1 violated: watermark advanced past position 0 but its \
-                     data is not yet visible — a subscriber would publish a gap"
+                     data is not yet visible — a subscriber would publish a \
+                     gap"
                 );
             }
 
@@ -148,7 +150,8 @@ mod watermark_publish {
     fn loom_watermark_publish_release_acquire_is_gapless() {
         publish(Ordering::Release, Ordering::Acquire);
         eprintln!(
-            "loom watermark_publish (Release/Acquire): {} interleavings, gapless",
+            "loom watermark_publish (Release/Acquire): {} interleavings, \
+             gapless",
             EXPLORED.swap(0, StdOrdering::Relaxed)
         );
     }
@@ -185,18 +188,19 @@ mod watermark_publish {
 /// advance-then-park) and confirms it.
 #[cfg(loom)]
 mod watermark_wakeup {
-    use super::*;
     use loom::sync::Arc;
     use loom::sync::Mutex;
+
+    use super::*;
 
     static EXPLORED: AtomicUsize = AtomicUsize::new(0);
 
     /// Mirror of `watermark::State`: the value and, for the single waiter this
     /// bounded model needs, whether it is parked and whether it was woken.
     struct State {
-        value: u64,
+        value:  u64,
         parked: bool,
-        woken: bool,
+        woken:  bool,
     }
 
     /// One waiter polling `wait_for(THRESHOLD)`, one committer advancing past
@@ -206,7 +210,11 @@ mod watermark_wakeup {
         const THRESHOLD: u64 = 4;
         loom::model(|| {
             count_iteration(&EXPLORED);
-            let st = Arc::new(Mutex::new(State { value: 0, parked: false, woken: false }));
+            let st = Arc::new(Mutex::new(State {
+                value:  0,
+                parked: false,
+                woken:  false,
+            }));
 
             // Reader: WaitFor::poll. Snapshots the value it observes so we can
             // assert monotonicity (it must never later see a smaller value).
@@ -237,19 +245,26 @@ mod watermark_wakeup {
             let g = st.lock().unwrap();
             // Monotone reads (module doc: "never later observes it regress"):
             // whatever the reader saw, the value only ever grew.
-            assert!(g.value >= first_observed, "watermark regressed: {} < {}", g.value, first_observed);
+            assert!(
+                g.value >= first_observed,
+                "watermark regressed: {} < {}",
+                g.value,
+                first_observed
+            );
             assert_eq!(g.value, THRESHOLD, "advance must reach its target");
-            // No lost wakeup: if the reader parked (saw value < THRESHOLD before
-            // the advance landed), the advance that raised value past THRESHOLD
-            // must have woken it. The shared mutex guarantees this.
+            // No lost wakeup: if the reader parked (saw value < THRESHOLD
+            // before the advance landed), the advance that raised
+            // value past THRESHOLD must have woken it. The shared
+            // mutex guarantees this.
             assert!(
                 !g.parked || g.woken,
-                "lost wakeup: a waiter parked below the threshold was not woken \
-                 by the covering advance"
+                "lost wakeup: a waiter parked below the threshold was not \
+                 woken by the covering advance"
             );
         });
         eprintln!(
-            "loom watermark_wakeup (single mutex): {} interleavings, no lost wakeup",
+            "loom watermark_wakeup (single mutex): {} interleavings, no lost \
+             wakeup",
             EXPLORED.swap(0, StdOrdering::Relaxed)
         );
     }
@@ -258,9 +273,9 @@ mod watermark_wakeup {
     /// behind **separate** mutexes — a plausible "finer-grained locking"
     /// refactor. Loom finds the interleaving where the reader reads `value`
     /// (below threshold) under lock A, the committer raises `value` and finds
-    /// the waiter set (lock B) still empty, and only *then* the reader registers
-    /// under lock B — a lost wakeup. This is exactly the hazard the single
-    /// `Mutex<State>` design prevents.
+    /// the waiter set (lock B) still empty, and only *then* the reader
+    /// registers under lock B — a lost wakeup. This is exactly the hazard
+    /// the single `Mutex<State>` design prevents.
     #[test]
     #[should_panic(expected = "lost wakeup")]
     fn loom_watermark_split_lock_loses_wakeup() {
@@ -310,9 +325,9 @@ mod watermark_wakeup {
 /// - `Gate::enter` — `count.fetch_add(1, Relaxed)` (`committer.rs:322`).
 /// - `Gate::leave` — `if count.fetch_sub(1, Relaxed) == 1 { take + wake the
 ///   registered waker }` (`committer.rs:327-333`).
-/// - the gather's poll — `register(waker)` **then** re-check `is_zero()`
-///   under the same poll (`committer.rs:559-561`), the "set-then-signal race"
-///   the code comment calls out.
+/// - the gather's poll — `register(waker)` **then** re-check `is_zero()` under
+///   the same poll (`committer.rs:559-561`), the "set-then-signal race" the
+///   code comment calls out.
 ///
 /// The `count` is `Relaxed` — a load could read a **stale** non-zero even after
 /// the decrement. Correctness comes from the **waker `Mutex`**: because the
@@ -327,10 +342,11 @@ mod watermark_wakeup {
 /// Either way `closed || woken` — no stranded batch. Loom enumerates both.
 #[cfg(loom)]
 mod committer_handoff {
-    use super::*;
-    use loom::sync::atomic::{AtomicUsize as LoomUsize, Ordering};
     use loom::sync::Arc;
     use loom::sync::Mutex;
+    use loom::sync::atomic::{AtomicUsize as LoomUsize, Ordering};
+
+    use super::*;
 
     static EXPLORED: AtomicUsize = AtomicUsize::new(0);
 
@@ -362,7 +378,8 @@ mod committer_handoff {
                 }
             });
 
-            // The gather poll (committer.rs:559-561): register FIRST, then load.
+            // The gather poll (committer.rs:559-561): register FIRST, then
+            // load.
             {
                 let mut w = waker.lock().unwrap();
                 w.0 = true;
@@ -374,12 +391,13 @@ mod committer_handoff {
             let w = waker.lock().unwrap();
             assert!(
                 closed || w.1,
-                "batch stranded: the committer neither observed the gate reach \
-                 zero nor was woken by the last appender's submission"
+                "batch stranded: the committer neither observed the gate \
+                 reach zero nor was woken by the last appender's submission"
             );
         });
         eprintln!(
-            "loom committer_handoff (register-before-check): {} interleavings, no stranded batch",
+            "loom committer_handoff (register-before-check): {} \
+             interleavings, no stranded batch",
             EXPLORED.swap(0, StdOrdering::Relaxed)
         );
     }

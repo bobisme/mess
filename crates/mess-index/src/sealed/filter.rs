@@ -21,13 +21,14 @@
 //! # Scope: stream ids only, not category
 //!
 //! The bone also invites a per-category filter "if cheaply available from
-//! entries" — it is not, today. [`SealInput`](crate::sealed::segment::SealInput)
-//! and the active index it is built from ([`crate::active`]) carry no
-//! `category` field at all; category derivation belongs to the Phase-5
-//! payload-column work (per-category dictionaries, `sealed::mod` module
-//! docs), which this bone does not touch. Adding a category filter here would
-//! mean plumbing category through `SealBatch`/`StreamEntry` first — out of
-//! scope for a filter module. Scoped to stream-id membership only.
+//! entries" — it is not, today.
+//! [`SealInput`](crate::sealed::segment::SealInput) and the active index it is
+//! built from ([`crate::active`]) carry no `category` field at all; category
+//! derivation belongs to the Phase-5 payload-column work (per-category
+//! dictionaries, `sealed::mod` module docs), which this bone does not touch.
+//! Adding a category filter here would mean plumbing category through
+//! `SealBatch`/`StreamEntry` first — out of scope for a filter module. Scoped
+//! to stream-id membership only.
 //!
 //! # Why a parallel file, not a sidecar region
 //!
@@ -107,7 +108,8 @@ use std::path::Path;
 
 use xorf::{BinaryFuse16, BinaryFuse16Ref, DmaSerializable, Filter, FilterRef};
 
-/// Filter-file magic (`"SXF1"`-ish, distinct from the sidecar's `SIDECAR_MAGIC`).
+/// Filter-file magic (`"SXF1"`-ish, distinct from the sidecar's
+/// `SIDECAR_MAGIC`).
 pub const FILTER_MAGIC: u32 = 0x5359_4602;
 /// Current filter-file `format_version`.
 pub const FILTER_FORMAT_VERSION: u16 = 1;
@@ -147,8 +149,8 @@ fn rd_u64(d: &[u8], at: usize) -> u64 {
 /// sealed segment's `stream_id`s.
 #[derive(Debug, Clone)]
 pub struct SegmentFilter {
-    segment_id: u64,
-    descriptor: [u8; FILTER_DESCRIPTOR_LEN],
+    segment_id:   u64,
+    descriptor:   [u8; FILTER_DESCRIPTOR_LEN],
     /// Owned so the allocation is guaranteed `u16`-aligned — see the module
     /// docs' "Reconstruction without unsafe zero-copy" section.
     fingerprints: Vec<u16>,
@@ -177,23 +179,17 @@ impl SegmentFilter {
     }
 
     /// The segment this filter was built for.
-    pub fn segment_id(&self) -> u64 {
-        self.segment_id
-    }
+    pub fn segment_id(&self) -> u64 { self.segment_id }
 
     /// Number of fingerprint slots (not the number of keys — `BinaryFuse16`
     /// over-allocates; see `xorf`'s docs for the ~1.13x factor).
-    pub fn len(&self) -> usize {
-        self.fingerprints.len()
-    }
+    pub fn len(&self) -> usize { self.fingerprints.len() }
 
     /// Whether this filter has no fingerprint slots at all. [`Self::build`]
     /// never returns such a filter (it rejects empty key sets), so this is
     /// realistically always `false`; provided to satisfy the `len`/`is_empty`
     /// convention (`clippy::len_without_is_empty`).
-    pub fn is_empty(&self) -> bool {
-        self.fingerprints.is_empty()
-    }
+    pub fn is_empty(&self) -> bool { self.fingerprints.is_empty() }
 
     /// `false` — the key is **definitely absent**: safe to skip the
     /// segment's directory/pointer blocks entirely. `true` — "maybe":
@@ -210,7 +206,8 @@ impl SegmentFilter {
         // view; it is rebuilt per call rather than cached because it is a
         // few-field, allocation-free struct (a descriptor copy + a slice) —
         // see `tests/filter_scale.rs` for the measured per-query cost.
-        let (prefix, bytes, suffix) = unsafe { self.fingerprints.align_to::<u8>() };
+        let (prefix, bytes, suffix) =
+            unsafe { self.fingerprints.align_to::<u8>() };
         debug_assert!(prefix.is_empty() && suffix.is_empty());
         let filter_ref = BinaryFuse16Ref::from_dma(&self.descriptor, bytes);
         filter_ref.contains(&key)
@@ -222,7 +219,10 @@ impl SegmentFilter {
     pub fn to_bytes(&self) -> Vec<u8> {
         let n_fingerprints = self.fingerprints.len();
         let mut buf = Vec::with_capacity(
-            FILTER_HEADER_LEN + FILTER_DESCRIPTOR_LEN + n_fingerprints * 2 + FILTER_FOOTER_LEN,
+            FILTER_HEADER_LEN
+                + FILTER_DESCRIPTOR_LEN
+                + n_fingerprints * 2
+                + FILTER_FOOTER_LEN,
         );
         buf.extend_from_slice(&FILTER_MAGIC.to_le_bytes());
         buf.extend_from_slice(&FILTER_FORMAT_VERSION.to_le_bytes());
@@ -247,9 +247,12 @@ impl SegmentFilter {
     /// Parse a filter-file byte image, validating magic, version, size, and
     /// CRC.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, FilterError> {
-        let min_len = FILTER_HEADER_LEN + FILTER_DESCRIPTOR_LEN + FILTER_FOOTER_LEN;
+        let min_len =
+            FILTER_HEADER_LEN + FILTER_DESCRIPTOR_LEN + FILTER_FOOTER_LEN;
         if bytes.len() < min_len {
-            return Err(FilterError::Corrupt("shorter than header + descriptor + footer"));
+            return Err(FilterError::Corrupt(
+                "shorter than header + descriptor + footer",
+            ));
         }
         if rd_u32(bytes, 0) != FILTER_MAGIC {
             return Err(FilterError::Corrupt("bad header magic"));
@@ -267,7 +270,9 @@ impl SegmentFilter {
                 .ok_or(FilterError::Corrupt("fingerprint length overflow"))?
             + FILTER_FOOTER_LEN;
         if bytes.len() != expected_len {
-            return Err(FilterError::Corrupt("length does not match header n_fingerprints"));
+            return Err(FilterError::Corrupt(
+                "length does not match header n_fingerprints",
+            ));
         }
 
         let footer_start = bytes.len() - FILTER_FOOTER_LEN;
@@ -281,7 +286,10 @@ impl SegmentFilter {
         }
 
         let mut descriptor = [0u8; FILTER_DESCRIPTOR_LEN];
-        descriptor.copy_from_slice(&bytes[FILTER_HEADER_LEN..FILTER_HEADER_LEN + FILTER_DESCRIPTOR_LEN]);
+        descriptor.copy_from_slice(
+            &bytes
+                [FILTER_HEADER_LEN..FILTER_HEADER_LEN + FILTER_DESCRIPTOR_LEN],
+        );
 
         let fp_start = FILTER_HEADER_LEN + FILTER_DESCRIPTOR_LEN;
         let fingerprints: Vec<u16> = bytes[fp_start..footer_start]
@@ -314,7 +322,10 @@ mod tests {
         assert_eq!(reopened.segment_id(), 42);
 
         for &id in &ids {
-            assert!(reopened.might_contain(id), "false negative for present key {id}");
+            assert!(
+                reopened.might_contain(id),
+                "false negative for present key {id}"
+            );
         }
     }
 
@@ -329,8 +340,11 @@ mod tests {
         let filter = SegmentFilter::build(1, &ids).unwrap();
         let mut bytes = filter.to_bytes();
         let mid = bytes.len() / 2;
-        bytes[mid] ^= 0xff;
-        assert!(matches!(SegmentFilter::from_bytes(&bytes), Err(FilterError::Corrupt(_))));
+        bytes[mid] ^= 0xFF;
+        assert!(matches!(
+            SegmentFilter::from_bytes(&bytes),
+            Err(FilterError::Corrupt(_))
+        ));
     }
 
     #[test]
@@ -339,7 +353,10 @@ mod tests {
         let filter = SegmentFilter::build(1, &ids).unwrap();
         let bytes = filter.to_bytes();
         let short = bytes[..bytes.len() - 1].to_vec();
-        assert!(matches!(SegmentFilter::from_bytes(&short), Err(FilterError::Corrupt(_))));
+        assert!(matches!(
+            SegmentFilter::from_bytes(&short),
+            Err(FilterError::Corrupt(_))
+        ));
     }
 
     #[test]
@@ -347,8 +364,11 @@ mod tests {
         let ids: Vec<u64> = (0..10u64).collect();
         let filter = SegmentFilter::build(1, &ids).unwrap();
         let mut bytes = filter.to_bytes();
-        bytes[0] ^= 0xff;
-        assert!(matches!(SegmentFilter::from_bytes(&bytes), Err(FilterError::Corrupt(_))));
+        bytes[0] ^= 0xFF;
+        assert!(matches!(
+            SegmentFilter::from_bytes(&bytes),
+            Err(FilterError::Corrupt(_))
+        ));
     }
 
     /// Correctness property: NO false negatives across a seeded corpus of
@@ -374,7 +394,10 @@ mod tests {
         let filter = SegmentFilter::build(7, &ids).unwrap();
 
         for &id in &ids {
-            assert!(filter.might_contain(id), "false negative for present key {id}");
+            assert!(
+                filter.might_contain(id),
+                "false negative for present key {id}"
+            );
         }
 
         let mut false_positives = 0u64;
@@ -390,7 +413,13 @@ mod tests {
             }
         }
         let fpr = false_positives as f64 / checked as f64;
-        assert!(fpr < 0.01, "false positive rate too high: {fpr} ({false_positives}/{checked})");
-        eprintln!("bn-1i7 FPR sanity: {false_positives}/{checked} = {:.5}%", fpr * 100.0);
+        assert!(
+            fpr < 0.01,
+            "false positive rate too high: {fpr} ({false_positives}/{checked})"
+        );
+        eprintln!(
+            "bn-1i7 FPR sanity: {false_positives}/{checked} = {:.5}%",
+            fpr * 100.0
+        );
     }
 }

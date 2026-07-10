@@ -15,17 +15,17 @@
 //!    `Acked{first,last}` position.
 //! 3. Inject a crash via [`CrashFs`] at a randomized point — critically
 //!    including **inside the committer's write-then-barrier window**
-//!    (`FireOnFsync`: a batch's bytes are `pwrite`-durable in the page
-//!    cache but its covering `fdatasync` never returns, so it is never
-//!    acked). Then materialize the surviving on-disk image with a
-//!    randomized `TailPlan` (torn tail + scramble) and the mode-appropriate
-//!    crash class (a page-cache-preserving process crash vs. a power crash).
-//! 4. Recover with the production scanner and assert the four invariants
-//!    the spike established:
+//!    (`FireOnFsync`: a batch's bytes are `pwrite`-durable in the page cache
+//!    but its covering `fdatasync` never returns, so it is never acked). Then
+//!    materialize the surviving on-disk image with a randomized `TailPlan`
+//!    (torn tail + scramble) and the mode-appropriate crash class (a
+//!    page-cache-preserving process crash vs. a power crash).
+//! 4. Recover with the production scanner and assert the four invariants the
+//!    spike established:
 //!      - **acked ⟹ recovered**, *per the [`Durability`] contract*
-//!        (`03-durability.md` §1): `Os`/`Group` acked data survives any
-//!        crash; `Process` acked data survives a process crash but MAY be
-//!        lost to a power crash (§1.1);
+//!        (`03-durability.md` §1): `Os`/`Group` acked data survives any crash;
+//!        `Process` acked data survives a process crash but MAY be lost to a
+//!        power crash (§1.1);
 //!      - **no partial batch is ever visible** (the scanner accepts only
 //!        complete, CRC-valid, contiguous batches);
 //!      - **contiguous positions after resume** (a fresh production writer
@@ -35,29 +35,31 @@
 //!
 //! # Profiles
 //!
-//! - `randomized_crash_recovery_loop` — the fast profile (~1.5k cases),
-//!   under 60 s in a debug `cargo test`, on every CI run.
-//! - `randomized_crash_recovery_loop_full` — the 12k+ profile, `#[ignore]`d
-//!   by default and run by the nightly `crash-harness` workflow.
-//! - `reproduces_a_fixed_seed` — a single-seed smoke case that also runs
-//!   under Miri (the loops are Miri-ignored: thousands of iterations are far
-//!   too slow for the isolation interpreter, and `SimFs` is already covered
-//!   there by the writer suite).
+//! - `randomized_crash_recovery_loop` — the fast profile (~1.5k cases), under
+//!   60 s in a debug `cargo test`, on every CI run.
+//! - `randomized_crash_recovery_loop_full` — the 12k+ profile, `#[ignore]`d by
+//!   default and run by the nightly `crash-harness` workflow.
+//! - `reproduces_a_fixed_seed` — a single-seed smoke case that also runs under
+//!   Miri (the loops are Miri-ignored: thousands of iterations are far too slow
+//!   for the isolation interpreter, and `SimFs` is already covered there by the
+//!   writer suite).
 
 use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use mess_log::committer::{
-    AppendError, AppendOutcome, AppendRequest, Committer, Durability, EventInput,
+    AppendError, AppendOutcome, AppendRequest, Committer, Durability,
+    EventInput,
 };
+use mess_log::encode::Subframe;
 use mess_log::format::{SEGMENT_HEADER_LEN, SEGMENT_SIZE};
 use mess_log::runtime::{
-    CrashPlan, Fault, FileHandle, Fs, OpenOpts, Rng, Runtime, SimFs, SimRuntime, TailPlan,
+    CrashPlan, Fault, FileHandle, Fs, OpenOpts, Rng, Runtime, SimFs,
+    SimRuntime, TailPlan,
 };
-use mess_log::scanner::{recover_segment, Recovery};
+use mess_log::scanner::{Recovery, recover_segment};
 use mess_log::writer::{BatchSpec, SegmentParams, SegmentWriter};
-use mess_log::encode::Subframe;
 
 // ===========================================================================
 // CrashFs — the failpoint fs wrapper (test-only; production types untouched)
@@ -94,9 +96,9 @@ enum Trigger {
 
 struct CrashCtl {
     trigger: Trigger,
-    fsyncs: Mutex<u64>,
+    fsyncs:  Mutex<u64>,
     pwrites: Mutex<u64>,
-    fired: Mutex<bool>,
+    fired:   Mutex<bool>,
 }
 
 impl CrashCtl {
@@ -109,13 +111,9 @@ impl CrashCtl {
         }
     }
 
-    fn is_fired(&self) -> bool {
-        *self.fired.lock().unwrap()
-    }
+    fn is_fired(&self) -> bool { *self.fired.lock().unwrap() }
 
-    fn fire(&self) {
-        *self.fired.lock().unwrap() = true;
-    }
+    fn fire(&self) { *self.fired.lock().unwrap() = true; }
 
     /// Returns `true` if this `pwrite` must make no progress (fired or firing).
     fn on_pwrite(&self) -> bool {
@@ -155,20 +153,25 @@ impl CrashCtl {
 #[derive(Clone)]
 struct CrashFs {
     inner: SimFs,
-    ctl: Arc<CrashCtl>,
+    ctl:   Arc<CrashCtl>,
 }
 
 #[derive(Clone)]
 struct CrashFile {
     inner: <SimFs as Fs>::File,
-    ctl: Arc<CrashCtl>,
+    ctl:   Arc<CrashCtl>,
 }
 
 impl Fs for CrashFs {
     type File = CrashFile;
+
     fn open(&self, path: &Path, opts: OpenOpts) -> io::Result<CrashFile> {
-        Ok(CrashFile { inner: self.inner.open(path, opts)?, ctl: self.ctl.clone() })
+        Ok(CrashFile {
+            inner: self.inner.open(path, opts)?,
+            ctl:   self.ctl.clone(),
+        })
     }
+
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         self.inner.rename(from, to)
     }
@@ -182,20 +185,24 @@ impl FileHandle for CrashFile {
         }
         self.inner.pwrite(off, buf)
     }
+
     fn pread(&self, off: u64, buf: &mut [u8]) -> io::Result<usize> {
         // Reads are unaffected by the crash trigger; recovery reads the
         // durable image through the base `SimFs` directly anyway.
         self.inner.pread(off, buf)
     }
+
     fn fdatasync(&self) -> io::Result<()> {
         if self.ctl.on_fdatasync() {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "crashed barrier"));
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "crashed barrier",
+            ));
         }
         self.inner.fdatasync()
     }
-    fn len(&self) -> io::Result<u64> {
-        self.inner.len()
-    }
+
+    fn len(&self) -> io::Result<u64> { self.inner.len() }
 }
 
 // ===========================================================================
@@ -217,25 +224,25 @@ enum CrashClass {
 /// A batch the harness will submit, plus its bookkeeping.
 #[derive(Clone)]
 struct PlannedBatch {
-    stream_id: u64,
+    stream_id:            u64,
     first_stream_version: u64,
-    events: Vec<Vec<u8>>,
+    events:               Vec<Vec<u8>>,
 }
 
 struct CasePlan {
-    durability: Durability,
-    writers: u64,
-    base_pos: u64,
-    epoch: u64,
-    trigger: Trigger,
-    class: CrashClass,
-    keep_frac: f64,
+    durability:     Durability,
+    writers:        u64,
+    base_pos:       u64,
+    epoch:          u64,
+    trigger:        Trigger,
+    class:          CrashClass,
+    keep_frac:      f64,
     scramble_fracs: Vec<f64>,
     /// `plans[w]` is writer w's sequence of batches.
-    plans: Vec<Vec<PlannedBatch>>,
+    plans:          Vec<Vec<PlannedBatch>>,
     /// Resume workload: batches appended to a fresh segment seeded at
     /// `next_pos` after recovery.
-    resume_events: Vec<Vec<Vec<u8>>>,
+    resume_events:  Vec<Vec<Vec<u8>>>,
 }
 
 fn plan_case(seed: u64) -> CasePlan {
@@ -282,7 +289,8 @@ fn plan_case(seed: u64) -> CasePlan {
         _ => Trigger::FireOnPwrite(2 + rng.below(8)),
     };
 
-    let class = if rng.bool() { CrashClass::Process } else { CrashClass::Power };
+    let class =
+        if rng.bool() { CrashClass::Process } else { CrashClass::Power };
     let keep_frac = (rng.below(1_000_001) as f64) / 1_000_000.0;
     let n_scramble = rng.below(4); // 0..=3
     let scramble_fracs = (0..n_scramble)
@@ -321,10 +329,10 @@ fn plan_case(seed: u64) -> CasePlan {
 
 fn to_request(pb: &PlannedBatch) -> AppendRequest {
     AppendRequest {
-        stream_id: pb.stream_id,
-        category_id: 100 + pb.stream_id,
+        stream_id:            pb.stream_id,
+        category_id:          100 + pb.stream_id,
         first_stream_version: pb.first_stream_version,
-        events: pb
+        events:               pb
             .events
             .iter()
             .map(|p| EventInput::plain(1, 1, 0, p.clone()))
@@ -338,8 +346,8 @@ fn to_request(pb: &PlannedBatch) -> AppendRequest {
 
 #[derive(Debug, Default, Clone, Copy)]
 struct CaseStats {
-    fired: bool,
-    acked_batches: u64,
+    fired:            bool,
+    acked_batches:    u64,
     surfaced_unacked: bool,
 }
 
@@ -353,12 +361,12 @@ fn run_case(seed: u64) -> CaseStats {
     let cfs = CrashFs { inner: base_fs.clone(), ctl: ctl.clone() };
 
     let params = SegmentParams {
-        segment_id: 0,
-        base_pos: plan.base_pos,
-        epoch: plan.epoch,
+        segment_id:         0,
+        base_pos:           plan.base_pos,
+        epoch:              plan.epoch,
         prev_segment_epoch: 0,
         created_unix_nanos: 0,
-        segment_size: SEGMENT_SIZE,
+        segment_size:       SEGMENT_SIZE,
     };
     // The header's create-time pwrite+fdatasync are op #1 and always succeed
     // (triggers use k >= 2), so the SegmentHeader is durable in every case.
@@ -384,8 +392,14 @@ fn run_case(seed: u64) -> CaseStats {
             joins.push(rt.spawn(async move {
                 for pb in &batches {
                     match ap.append(to_request(pb)).await {
-                        Ok(AppendOutcome::Acked { first_position, last_position }) => {
-                            acked.lock().unwrap().push((first_position, last_position));
+                        Ok(AppendOutcome::Acked {
+                            first_position,
+                            last_position,
+                        }) => {
+                            acked
+                                .lock()
+                                .unwrap()
+                                .push((first_position, last_position));
                         }
                         Ok(AppendOutcome::Indeterminate) => {}
                         // D8 (bn-25e): after a barrier fault poisons the store,
@@ -395,7 +409,9 @@ fn run_case(seed: u64) -> CaseStats {
                         // error instead of Indeterminate. Both are non-acks, so
                         // the acked-prefix invariant below is unchanged.
                         Err(AppendError::StorePoisoned) => {}
-                        Err(e) => panic!("seed {seed}: valid batch rejected pre-flight: {e}"),
+                        Err(e) => panic!(
+                            "seed {seed}: valid batch rejected pre-flight: {e}"
+                        ),
                     }
                 }
             }));
@@ -418,9 +434,13 @@ fn run_case(seed: u64) -> CaseStats {
     for &(first, last) in &acked {
         assert_eq!(
             first, expect,
-            "seed {seed}: acked positions not a dense prefix (gap/overlap at {first}, expected {expect})"
+            "seed {seed}: acked positions not a dense prefix (gap/overlap at \
+             {first}, expected {expect})"
         );
-        assert!(last >= first, "seed {seed}: inverted ack range {first}..={last}");
+        assert!(
+            last >= first,
+            "seed {seed}: inverted ack range {first}..={last}"
+        );
         expect = last + 1;
     }
     let acked_end = expect; // first_global_pos just past the last acked event
@@ -444,20 +464,32 @@ fn run_case(seed: u64) -> CaseStats {
             let scramble: Vec<usize> = plan
                 .scramble_fracs
                 .iter()
-                .map(|f| ((f * len as f64) as usize).min(len.saturating_sub(1) as usize))
+                .map(|f| {
+                    ((f * len as f64) as usize)
+                        .min(len.saturating_sub(1) as usize)
+                })
                 .collect();
             (keep, scramble)
         }
     };
     base_fs
-        .crash(path, CrashPlan::Tail(TailPlan { keep: keep as usize, scramble }))
+        .crash(
+            path,
+            CrashPlan::Tail(TailPlan { keep: keep as usize, scramble }),
+        )
         .unwrap_or_else(|e| panic!("seed {seed}: crash failed: {e}"));
 
     // ---- recover with the PRODUCTION scanner -----------------------------
     let rec = recover_segment(&base_fs, path)
         .unwrap_or_else(|e| panic!("seed {seed}: recover failed: {e}"));
 
-    assert_recovery_wellformed(seed, &rec, plan.base_pos, plan.epoch, total_submitted_events);
+    assert_recovery_wellformed(
+        seed,
+        &rec,
+        plan.base_pos,
+        plan.epoch,
+        total_submitted_events,
+    );
 
     // Invariant: acked ⟹ recovered, per the Durability contract (§1).
     // Os/Group acks are barrier-backed and survive any crash; Process acks
@@ -471,8 +503,8 @@ fn run_case(seed: u64) -> CaseStats {
     if acked_guaranteed && acked_batches > 0 {
         assert!(
             rec.next_pos >= acked_end,
-            "seed {seed}: LOST ACKED DATA: recovered next_pos={} < acked_end={} \
-             (mode={:?}, class={:?}, trigger={:?})",
+            "seed {seed}: LOST ACKED DATA: recovered next_pos={} < \
+             acked_end={} (mode={:?}, class={:?}, trigger={:?})",
             rec.next_pos,
             acked_end,
             plan.durability,
@@ -497,10 +529,17 @@ fn run_case(seed: u64) -> CaseStats {
     let tfs = SimFs::new(Fault::Tail);
     let tpath = Path::new("/truncated");
     tfs.seed(tpath, Fault::Tail, truncated);
-    let rec3 = recover_segment(&tfs, tpath)
-        .unwrap_or_else(|e| panic!("seed {seed}: truncated recover failed: {e}"));
-    assert_eq!(rec3.accepted, rec.accepted, "seed {seed}: truncated recovery differs");
-    assert_eq!(rec3.next_pos, rec.next_pos, "seed {seed}: truncated next_pos differs");
+    let rec3 = recover_segment(&tfs, tpath).unwrap_or_else(|e| {
+        panic!("seed {seed}: truncated recover failed: {e}")
+    });
+    assert_eq!(
+        rec3.accepted, rec.accepted,
+        "seed {seed}: truncated recovery differs"
+    );
+    assert_eq!(
+        rec3.next_pos, rec.next_pos,
+        "seed {seed}: truncated next_pos differs"
+    );
     assert_eq!(
         rec3.safe_offset, rec.safe_offset,
         "seed {seed}: truncated safe_offset differs"
@@ -508,13 +547,20 @@ fn run_case(seed: u64) -> CaseStats {
     assert_eq!(
         rec3.stop,
         mess_log::scanner::ScanStop::EndOfSegment,
-        "seed {seed}: a truncated-to-safe-offset image must scan to a clean end"
+        "seed {seed}: a truncated-to-safe-offset image must scan to a clean \
+         end"
     );
 
     // Invariant: contiguous positions after resume. A fresh production writer
     // seeded at the recovered `next_pos` (and a strictly larger epoch, A9)
     // continues the global-position sequence with no gap.
-    assert_resume_contiguous(seed, plan.base_pos, &rec, plan.epoch, &plan.resume_events);
+    assert_resume_contiguous(
+        seed,
+        plan.base_pos,
+        &rec,
+        plan.epoch,
+        &plan.resume_events,
+    );
 
     CaseStats { fired, acked_batches, surfaced_unacked }
 }
@@ -530,9 +576,9 @@ fn assert_recovery_wellformed(
     epoch: u64,
     total_submitted_events: u64,
 ) {
-    let header = rec
-        .header
-        .unwrap_or_else(|| panic!("seed {seed}: durable SegmentHeader must always survive"));
+    let header = rec.header.unwrap_or_else(|| {
+        panic!("seed {seed}: durable SegmentHeader must always survive")
+    });
     assert_eq!(header.base_pos, base_pos, "seed {seed}: header base_pos");
     assert_eq!(header.epoch, epoch, "seed {seed}: header epoch");
 
@@ -543,14 +589,26 @@ fn assert_recovery_wellformed(
             b.first_global_pos, expect_pos,
             "seed {seed}: accepted batch not position-contiguous"
         );
-        assert_eq!(b.offset, off, "seed {seed}: accepted batch not byte-contiguous");
-        assert_eq!(b.segment_epoch, epoch, "seed {seed}: accepted batch wrong epoch");
+        assert_eq!(
+            b.offset, off,
+            "seed {seed}: accepted batch not byte-contiguous"
+        );
+        assert_eq!(
+            b.segment_epoch, epoch,
+            "seed {seed}: accepted batch wrong epoch"
+        );
         assert!(b.frame_count >= 1, "seed {seed}: empty batch accepted (A5)");
         expect_pos += u64::from(b.frame_count);
         off += b.total_len;
     }
-    assert_eq!(rec.next_pos, expect_pos, "seed {seed}: next_pos != contiguous end");
-    assert_eq!(rec.safe_offset, off, "seed {seed}: safe_offset != end of accepted bytes");
+    assert_eq!(
+        rec.next_pos, expect_pos,
+        "seed {seed}: next_pos != contiguous end"
+    );
+    assert_eq!(
+        rec.safe_offset, off,
+        "seed {seed}: safe_offset != end of accepted bytes"
+    );
     assert_eq!(
         rec.next_batch_id,
         rec.accepted.len() as u64,
@@ -559,7 +617,8 @@ fn assert_recovery_wellformed(
     // Recovery can never invent events that were never written.
     assert!(
         rec.next_pos <= base_pos + total_submitted_events,
-        "seed {seed}: recovered {} events past base but only {} were ever submitted",
+        "seed {seed}: recovered {} events past base but only {} were ever \
+         submitted",
         rec.next_pos - base_pos,
         total_submitted_events,
     );
@@ -581,31 +640,36 @@ fn assert_resume_contiguous(
         &rfs,
         rpath,
         SegmentParams {
-            segment_id: 1,
-            base_pos: rec.next_pos,
-            epoch: epoch + 1,
+            segment_id:         1,
+            base_pos:           rec.next_pos,
+            epoch:              epoch + 1,
             prev_segment_epoch: epoch,
             created_unix_nanos: 0,
-            segment_size: SEGMENT_SIZE,
+            segment_size:       SEGMENT_SIZE,
         },
     )
-    .unwrap_or_else(|e| panic!("seed {seed}: resume segment create failed: {e}"));
+    .unwrap_or_else(|e| {
+        panic!("seed {seed}: resume segment create failed: {e}")
+    });
 
     let mut resumed_events = 0u64;
     for evs in resume_events {
         let subs: Vec<Subframe> =
             evs.iter().map(|p| Subframe::plain(1, 1, 0, p)).collect();
         let spec = BatchSpec {
-            stream_id: 7,
-            category_id: 7,
+            stream_id:            7,
+            category_id:          7,
             first_stream_version: resumed_events,
-            crypto_chain: None,
-            subframes: &subs,
+            crypto_chain:         None,
+            subframes:            &subs,
         };
-        w.append(&spec).unwrap_or_else(|e| panic!("seed {seed}: resume append failed: {e}"));
+        w.append(&spec).unwrap_or_else(|e| {
+            panic!("seed {seed}: resume append failed: {e}")
+        });
         resumed_events += evs.len() as u64;
     }
-    w.close().unwrap_or_else(|e| panic!("seed {seed}: resume close failed: {e}"));
+    w.close()
+        .unwrap_or_else(|e| panic!("seed {seed}: resume close failed: {e}"));
 
     let rrec = recover_segment(&rfs, rpath)
         .unwrap_or_else(|e| panic!("seed {seed}: resume recover failed: {e}"));
@@ -664,8 +728,8 @@ fn run_loop(count: u64) {
     println!(
         "crash harness: {count} cases, {fired} with an injected crash, \
          {acked_total} acked batches verified recovered (per mode contract), \
-         {surfaced} cases surfaced an unacked-but-complete batch (A6, allowed), \
-         0 partial batches visible, 0 acked losses against contract"
+         {surfaced} cases surfaced an unacked-but-complete batch (A6, \
+         allowed), 0 partial batches visible, 0 acked losses against contract"
     );
 }
 
@@ -673,17 +737,14 @@ fn run_loop(count: u64) {
 /// CI invocation.
 #[test]
 #[cfg_attr(miri, ignore = "thousands of iterations are too slow under Miri")]
-fn randomized_crash_recovery_loop() {
-    run_loop(1_500);
-}
+fn randomized_crash_recovery_loop() { run_loop(1_500); }
 
 /// Full profile: 12k+ cases. `#[ignore]`d by default (kept out of the 60 s
 /// gate); the nightly `crash-harness` workflow runs it with `--ignored`.
 #[test]
-#[ignore = "full 12k-case profile: run via `cargo test -- --ignored` (nightly CI)"]
-fn randomized_crash_recovery_loop_full() {
-    run_loop(12_000);
-}
+#[ignore = "full 12k-case profile: run via `cargo test -- --ignored` (nightly \
+            CI)"]
+fn randomized_crash_recovery_loop_full() { run_loop(12_000); }
 
 /// A single fixed seed, cheap enough to also run under Miri: proves a seed is
 /// self-contained and reproducible, and gives the Miri lane one real pass over

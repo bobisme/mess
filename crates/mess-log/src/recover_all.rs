@@ -36,14 +36,14 @@
 //! # R1 parallelism, and its sim-determinism gate
 //!
 //! Because A8 makes segments independent and each carries its own A1/A9 seed,
-//! per-segment recovery is embarrassingly parallel (§8.2 R1). [`RecoverOptions`]
-//! carries a `parallel` flag: when set, segments are recovered on a
-//! [`std::thread::scope`] worker fan-out over the [`Fs`] seam; when clear, they
-//! are recovered serially in-order. **Determinism:** the parallel path only
-//! affects *scheduling*, never the result (the stitch is serial and pure), and
-//! the deterministic-simulation harness always passes `parallel: false` so a
-//! sim run is bit-reproducible. Callers on the real runtime pass `true` to
-//! reach the device ceiling.
+//! per-segment recovery is embarrassingly parallel (§8.2 R1).
+//! [`RecoverOptions`] carries a `parallel` flag: when set, segments are
+//! recovered on a [`std::thread::scope`] worker fan-out over the [`Fs`] seam;
+//! when clear, they are recovered serially in-order. **Determinism:** the
+//! parallel path only affects *scheduling*, never the result (the stitch is
+//! serial and pure), and the deterministic-simulation harness always passes
+//! `parallel: false` so a sim run is bit-reproducible. Callers on the real
+//! runtime pass `true` to reach the device ceiling.
 //!
 //! [`docs/spec/02-recovery.md`]: ../../../../docs/spec/02-recovery.md
 
@@ -62,7 +62,7 @@ use crate::sealer::{self, SegmentCatalogEntry};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentFile {
     pub segment_id: u64,
-    pub path: PathBuf,
+    pub path:       PathBuf,
 }
 
 impl SegmentFile {
@@ -97,7 +97,7 @@ pub enum RecoverySource {
 /// Options for a whole-log recovery.
 #[derive(Debug, Clone, Copy)]
 pub struct RecoverOptions {
-    pub mode: RecoveryMode,
+    pub mode:     RecoveryMode,
     /// Run per-segment recovery on parallel worker threads (R1). MUST be
     /// `false` under deterministic simulation.
     pub parallel: bool,
@@ -124,22 +124,22 @@ impl RecoverOptions {
 /// The per-segment summary that composes the committed prefix (§1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentReport {
-    pub segment_id: u64,
+    pub segment_id:  u64,
     /// A1 seed: the global position of this segment's first event.
-    pub base_pos: u64,
+    pub base_pos:    u64,
     /// A9 generation.
-    pub epoch: u64,
+    pub epoch:       u64,
     /// `base_pos + accepted events`: the A1 seed handed to the next segment.
-    pub end_pos: u64,
+    pub end_pos:     u64,
     pub batch_count: u64,
     pub event_count: u64,
     /// Byte offset of the first byte past the accepted content — the
     /// truncation/resume point for the active segment (§1). For a footer-
     /// trusted sealed segment this is `ext_offset` (the first byte after the
-    /// last `CommitMarker`), which a full scan of the same segment also reports
-    /// (it stops at the footer magic there).
+    /// last `CommitMarker`), which a full scan of the same segment also
+    /// reports (it stops at the footer magic there).
     pub safe_offset: u64,
-    pub source: RecoverySource,
+    pub source:      RecoverySource,
 }
 
 /// The outcome of recovering a whole log: the committed prefix (§1) as a list
@@ -149,24 +149,24 @@ pub struct WholeLog {
     /// The live segments in `segment_id` order, up to (and including) the
     /// active tail. Segment files beyond the first cross-segment hole are dead
     /// space (A10) and are absent here.
-    pub segments: Vec<SegmentReport>,
+    pub segments:          Vec<SegmentReport>,
     /// `next_global_pos`: the A1 position the next append will stamp (§1).
-    pub next_pos: u64,
+    pub next_pos:          u64,
     /// The current `epoch` — the last live segment's generation (§1). The next
     /// segment MUST carry a strictly larger one (A9). `0` for an empty log.
-    pub next_epoch: u64,
+    pub next_epoch:        u64,
     /// `next_batch_id`: the per-segment id the next append stamps *into the
     /// active segment*. `0` when the last live segment is sealed (the next
     /// append opens a fresh segment) or the log is empty (§1, D-FMT-5).
-    pub next_batch_id: u64,
+    pub next_batch_id:     u64,
     /// The active (unsealed) segment the writer resumes into, if any. `None`
     /// when every live segment is sealed (a new segment will be opened) or the
     /// log is empty.
     pub active_segment_id: Option<u64>,
     /// Total accepted batches across the committed prefix.
-    pub total_batches: u64,
+    pub total_batches:     u64,
     /// Total accepted events across the committed prefix.
-    pub total_events: u64,
+    pub total_events:      u64,
 }
 
 impl WholeLog {
@@ -204,16 +204,26 @@ pub enum StitchError {
     /// A1 across the boundary: segment `at_segment_id`'s `base_pos` does not
     /// continue its predecessor's `end_pos` (§8.1). The log is broken.
     #[error(
-        "segment {at_segment_id}: base_pos {found_base_pos} does not continue predecessor end_pos {expected_base_pos} (A1 cross-segment)"
+        "segment {at_segment_id}: base_pos {found_base_pos} does not continue \
+         predecessor end_pos {expected_base_pos} (A1 cross-segment)"
     )]
-    PositionGap { at_segment_id: u64, expected_base_pos: u64, found_base_pos: u64 },
-    /// A9 across the boundary: segment `at_segment_id`'s `epoch` is not strictly
-    /// greater than its predecessor's — a stale or out-of-order generation
-    /// (§8.1). The log is broken.
+    PositionGap {
+        at_segment_id:     u64,
+        expected_base_pos: u64,
+        found_base_pos:    u64,
+    },
+    /// A9 across the boundary: segment `at_segment_id`'s `epoch` is not
+    /// strictly greater than its predecessor's — a stale or out-of-order
+    /// generation (§8.1). The log is broken.
     #[error(
-        "segment {at_segment_id}: epoch {found_epoch} does not exceed predecessor epoch {prev_epoch} (A9 chain)"
+        "segment {at_segment_id}: epoch {found_epoch} does not exceed \
+         predecessor epoch {prev_epoch} (A9 chain)"
     )]
-    EpochChainBroken { at_segment_id: u64, prev_epoch: u64, found_epoch: u64 },
+    EpochChainBroken {
+        at_segment_id: u64,
+        prev_epoch:    u64,
+        found_epoch:   u64,
+    },
 }
 
 /// A whole-log recovery failure: either an I/O error reaching a segment, or a
@@ -230,24 +240,24 @@ pub enum RecoverError {
 /// it carries everything the stitch and the resume state need, from whichever
 /// authority produced it.
 struct SegRec {
-    segment_id: u64,
+    segment_id:    u64,
     /// `None` iff the segment's own `SegmentHeader` did not validate — the
     /// segment holds no committed batches of any generation (§8.3 posture).
-    header: Option<SegmentHeaderInfo>,
-    end_pos: u64,
-    batch_count: u64,
-    event_count: u64,
-    safe_offset: u64,
+    header:        Option<SegmentHeaderInfo>,
+    end_pos:       u64,
+    batch_count:   u64,
+    event_count:   u64,
+    safe_offset:   u64,
     next_batch_id: u64,
-    source: RecoverySource,
+    source:        RecoverySource,
     /// Whether the segment is *complete*: its whole batch region was accepted,
     /// ending in a clean end-of-segment or at a `SegmentFooter` (sealed —
-    /// trusted, or present-but-corrupt). A complete segment may legitimately be
-    /// followed by another. `false` means a genuine torn tail (the scan stopped
-    /// mid-body on a fault): an incomplete segment is a hole (A10), so nothing
-    /// after it in the log is committed. Always `true` for a footer-trusted
-    /// (immutable) segment.
-    complete: bool,
+    /// trusted, or present-but-corrupt). A complete segment may legitimately
+    /// be followed by another. `false` means a genuine torn tail (the scan
+    /// stopped mid-body on a fault): an incomplete segment is a hole
+    /// (A10), so nothing after it in the log is committed. Always `true`
+    /// for a footer-trusted (immutable) segment.
+    complete:      bool,
 }
 
 /// Recover a whole log: recover each segment (per `opts.mode`, optionally in
@@ -269,7 +279,8 @@ pub fn recover_whole_log<F: Fs + Sync>(
     // Stitch in segment_id order; do not mutate the caller's slice.
     let mut order: Vec<usize> = (0..segments.len()).collect();
     order.sort_by_key(|&i| segments[i].segment_id);
-    let ordered: Vec<&SegmentFile> = order.iter().map(|&i| &segments[i]).collect();
+    let ordered: Vec<&SegmentFile> =
+        order.iter().map(|&i| &segments[i]).collect();
 
     let recs = recover_each(fs, &ordered, manifest, opts)?;
     stitch(recs)
@@ -293,11 +304,17 @@ fn recover_each<F: Fs + Sync>(
             let handles: Vec<_> = ordered
                 .iter()
                 .map(|seg| {
-                    let entry = manifest.and_then(|m| m.get(seg.segment_id)).copied();
-                    scope.spawn(move || resolve_segment(fs, seg, entry.as_ref(), opts.mode))
+                    let entry =
+                        manifest.and_then(|m| m.get(seg.segment_id)).copied();
+                    scope.spawn(move || {
+                        resolve_segment(fs, seg, entry.as_ref(), opts.mode)
+                    })
                 })
                 .collect();
-            handles.into_iter().map(|h| h.join().expect("recovery worker panicked")).collect()
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("recovery worker panicked"))
+                .collect()
         })
     } else {
         ordered
@@ -335,15 +352,26 @@ fn resolve_segment<F: Fs>(
                 if let Some(cat) = manifest_entry
                     && catalog_coherent_with_header(cat, &hdr)
                 {
-                    return Ok(sealed_rec(seg.segment_id, hdr, *cat, RecoverySource::Footer));
+                    return Ok(sealed_rec(
+                        seg.segment_id,
+                        hdr,
+                        *cat,
+                        RecoverySource::Footer,
+                    ));
                 }
                 if let Some(cat) = sealer::read_trailer(fs, &seg.path)?
                     && catalog_coherent_with_header(&cat, &hdr)
                 {
-                    return Ok(sealed_rec(seg.segment_id, hdr, cat, RecoverySource::Footer));
+                    return Ok(sealed_rec(
+                        seg.segment_id,
+                        hdr,
+                        cat,
+                        RecoverySource::Footer,
+                    ));
                 }
             }
-            // Unsealed / torn / no coherent seed: scan the tail (the authority).
+            // Unsealed / torn / no coherent seed: scan the tail (the
+            // authority).
             let rec = scanner::recover_segment(fs, &seg.path)?;
             scanned_rec(fs, &seg.path, seg.segment_id, &rec)
         }
@@ -358,18 +386,24 @@ fn resolve_segment<F: Fs>(
             // and cross-check them against both manifest and trailer").
             let sealed = header.is_some()
                 && sealer::read_trailer(fs, &seg.path)?
-                    .filter(|cat| catalog_coherent_with_header(cat, header.as_ref().unwrap()))
+                    .filter(|cat| {
+                        catalog_coherent_with_header(
+                            cat,
+                            header.as_ref().unwrap(),
+                        )
+                    })
                     .map(|cat| {
-                        cat.batch_count == rec.accepted.len() as u64 && cat.end_pos == rec.next_pos
+                        cat.batch_count == rec.accepted.len() as u64
+                            && cat.end_pos == rec.next_pos
                     })
                     .unwrap_or(false);
             let mut out = scanned_rec(fs, &seg.path, seg.segment_id, &rec)?;
             if sealed {
                 // Tag it `Footer` — the same provenance the fast path records —
                 // so the two authorities agree tag-for-tag and the manifest can
-                // be rebuilt from a Full recovery too. Counts stay the *scanned*
-                // (authoritative) ones, which equal the trailer's (cross-checked
-                // above).
+                // be rebuilt from a Full recovery too. Counts stay the
+                // *scanned* (authoritative) ones, which equal
+                // the trailer's (cross-checked above).
                 out.source = RecoverySource::Footer;
                 out.complete = true;
             }
@@ -381,7 +415,10 @@ fn resolve_segment<F: Fs>(
 /// Whether a cached/footer catalog entry belongs to *this* segment header
 /// (§3.3.1 cross-check, mirrored from [`sealer::recover_fast`]): a mismatch
 /// means the entry is stale/foreign and MUST NOT be trusted.
-fn catalog_coherent_with_header(cat: &SegmentCatalogEntry, hdr: &SegmentHeaderInfo) -> bool {
+fn catalog_coherent_with_header(
+    cat: &SegmentCatalogEntry,
+    hdr: &SegmentHeaderInfo,
+) -> bool {
     cat.segment_id == hdr.segment_id
         && cat.epoch == hdr.epoch
         && cat.base_pos == hdr.base_pos
@@ -424,13 +461,15 @@ fn scanned_rec<F: Fs>(
     segment_id: u64,
     rec: &scanner::Recovery,
 ) -> io::Result<SegRec> {
-    let complete = rec.stop == ScanStop::EndOfSegment || stops_at_footer(fs, path, rec.safe_offset)?;
+    let complete = rec.stop == ScanStop::EndOfSegment
+        || stops_at_footer(fs, path, rec.safe_offset)?;
     Ok(SegRec {
         segment_id,
         header: rec.header,
         end_pos: rec.next_pos,
         batch_count: rec.accepted.len() as u64,
-        event_count: rec.next_pos - rec.header.map(|h| h.base_pos).unwrap_or(rec.next_pos),
+        event_count: rec.next_pos
+            - rec.header.map(|h| h.base_pos).unwrap_or(rec.next_pos),
         safe_offset: rec.safe_offset,
         next_batch_id: rec.next_batch_id,
         source: RecoverySource::Scan,
@@ -438,13 +477,17 @@ fn scanned_rec<F: Fs>(
     })
 }
 
-/// Whether the bytes at `safe_offset` begin a `SegmentFooter` (the `FOOTER_MAGIC`
-/// tag). When a body scan stops there, the batch region ended exactly at the
-/// segment's footer — the segment is a *complete* sealed segment (even if the
-/// footer's own CRC is corrupt, so the trailer was not trusted). This is what
-/// distinguishes "complete, seal present" from "torn mid-body" without trusting
-/// the footer's contents.
-fn stops_at_footer<F: Fs>(fs: &F, path: &std::path::Path, safe_offset: u64) -> io::Result<bool> {
+/// Whether the bytes at `safe_offset` begin a `SegmentFooter` (the
+/// `FOOTER_MAGIC` tag). When a body scan stops there, the batch region ended
+/// exactly at the segment's footer — the segment is a *complete* sealed segment
+/// (even if the footer's own CRC is corrupt, so the trailer was not trusted).
+/// This is what distinguishes "complete, seal present" from "torn mid-body"
+/// without trusting the footer's contents.
+fn stops_at_footer<F: Fs>(
+    fs: &F,
+    path: &std::path::Path,
+    safe_offset: u64,
+) -> io::Result<bool> {
     let file = fs.open(path, OpenOpts::read_only())?;
     let mut buf = [0u8; 4];
     let mut filled = 0usize;
@@ -486,12 +529,13 @@ fn stitch(recs: Vec<SegRec>) -> Result<WholeLog, RecoverError> {
             // §8.1 A1: this segment's base_pos must continue the predecessor.
             if hdr.base_pos != prev_end {
                 if prev_complete {
-                    // Two internally-valid segments with a broken position chain
-                    // (§8.2 R1): the log is broken, fail recovery.
+                    // Two internally-valid segments with a broken position
+                    // chain (§8.2 R1): the log is broken,
+                    // fail recovery.
                     return Err(StitchError::PositionGap {
-                        at_segment_id: rec.segment_id,
+                        at_segment_id:     rec.segment_id,
                         expected_base_pos: prev_end,
-                        found_base_pos: hdr.base_pos,
+                        found_base_pos:    hdr.base_pos,
                     }
                     .into());
                 }
@@ -512,14 +556,14 @@ fn stitch(recs: Vec<SegRec>) -> Result<WholeLog, RecoverError> {
         }
 
         segments.push(SegmentReport {
-            segment_id: rec.segment_id,
-            base_pos: hdr.base_pos,
-            epoch: hdr.epoch,
-            end_pos: rec.end_pos,
+            segment_id:  rec.segment_id,
+            base_pos:    hdr.base_pos,
+            epoch:       hdr.epoch,
+            end_pos:     rec.end_pos,
             batch_count: rec.batch_count,
             event_count: rec.event_count,
             safe_offset: rec.safe_offset,
-            source: rec.source,
+            source:      rec.source,
         });
         total_batches += rec.batch_count;
         total_events += rec.event_count;
@@ -527,8 +571,9 @@ fn stitch(recs: Vec<SegRec>) -> Result<WholeLog, RecoverError> {
         next_epoch = hdr.epoch;
         prev = Some((rec.end_pos, hdr.epoch, rec.complete));
 
-        // Resume state: the active segment is the last live *scanned* (unsealed)
-        // segment; a sealed segment resumes into a fresh one.
+        // Resume state: the active segment is the last live *scanned*
+        // (unsealed) segment; a sealed segment resumes into a fresh
+        // one.
         if rec.source == RecoverySource::Scan {
             active_segment_id = Some(rec.segment_id);
             next_batch_id = rec.next_batch_id;
@@ -551,10 +596,10 @@ fn stitch(recs: Vec<SegRec>) -> Result<WholeLog, RecoverError> {
 
 /// Build the advisory manifest (R2) from a completed recovery: the catalog
 /// entries for the sealed segments of `whole`, in `segment_id` order. A footer-
-/// sourced report is a sealed segment; a scanned report is the (unsealed) active
-/// tail and is intentionally omitted (only immutable sealed segments are cached
-/// — the tail changes on every append). The `epoch`-and-position fields come
-/// straight from the reports; the extension is Phase-3 empty. This is the
+/// sourced report is a sealed segment; a scanned report is the (unsealed)
+/// active tail and is intentionally omitted (only immutable sealed segments are
+/// cached — the tail changes on every append). The `epoch`-and-position fields
+/// come straight from the reports; the extension is Phase-3 empty. This is the
 /// "rebuildable from the footers" construction the spec requires.
 pub fn manifest_entries(whole: &WholeLog) -> Vec<SegmentCatalogEntry> {
     whole
@@ -562,15 +607,15 @@ pub fn manifest_entries(whole: &WholeLog) -> Vec<SegmentCatalogEntry> {
         .iter()
         .filter(|s| s.source == RecoverySource::Footer)
         .map(|s| SegmentCatalogEntry {
-            segment_id: s.segment_id,
-            epoch: s.epoch,
-            base_pos: s.base_pos,
-            end_pos: s.end_pos,
+            segment_id:  s.segment_id,
+            epoch:       s.epoch,
+            base_pos:    s.base_pos,
+            end_pos:     s.end_pos,
             batch_count: s.batch_count,
             event_count: s.event_count,
-            ext_offset: s.safe_offset,
-            ext_len: 0,
-            ext_crc: 0,
+            ext_offset:  s.safe_offset,
+            ext_len:     0,
+            ext_crc:     0,
         })
         .collect()
 }

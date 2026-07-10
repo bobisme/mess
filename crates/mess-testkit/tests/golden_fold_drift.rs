@@ -9,8 +9,8 @@
 //!   - `--features drift` flips the aggregate's `apply` (mirrors the
 //!     `spikes/fold_cert` cfg-flagged demo), so the generated golden below
 //!     FAILS with the bump message. The default suite stays green.
-//!   - `fold_drift_failure_path_reports_bump_message` drives the check
-//!     function *directly* against a deliberately-drifted fold and asserts the
+//!   - `fold_drift_failure_path_reports_bump_message` drives the check function
+//!     *directly* against a deliberately-drifted fold and asserts the
 //!     actionable error — so the failure path is proven in the default config
 //!     that CI runs.
 
@@ -28,8 +28,8 @@ enum AccountEvent {
 #[derive(Debug, Default, Clone, PartialEq, Eq, Aggregate)]
 #[aggregate(event = AccountEvent, fold_version = 1)]
 struct Account {
-    open: bool,
-    balance: i64,
+    open:        bool,
+    balance:     i64,
     withdrawals: u32,
 }
 

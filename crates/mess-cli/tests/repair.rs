@@ -14,26 +14,31 @@ mod common;
 use mess_cli::report::{Report, Severity};
 use mess_cli::verify::{self, VerifyOptions};
 
-fn tmp() -> tempfile::TempDir {
-    tempfile::tempdir().expect("tempdir")
-}
+fn tmp() -> tempfile::TempDir { tempfile::tempdir().expect("tempdir") }
 
 fn repair_run(dir: &std::path::Path) -> Report {
     verify::run(dir, &VerifyOptions { full: true, repair: true })
 }
 
 fn has_error(report: &Report, kind: &str) -> bool {
-    report.findings.iter().any(|f| f.severity == Severity::Error && f.kind == kind)
+    report
+        .findings
+        .iter()
+        .any(|f| f.severity == Severity::Error && f.kind == kind)
 }
 
-fn find_ok<'a>(report: &'a Report, kind: &str) -> Option<&'a mess_cli::report::Finding> {
-    report.findings.iter().find(|f| f.severity == Severity::Ok && f.kind == kind)
+fn find_ok<'a>(
+    report: &'a Report,
+    kind: &str,
+) -> Option<&'a mess_cli::report::Finding> {
+    report
+        .findings
+        .iter()
+        .find(|f| f.severity == Severity::Ok && f.kind == kind)
 }
 
 /// Byte offset of shard `i` for the small test config (64-byte shards).
-fn shard_off(i: u64) -> u64 {
-    i * 64
-}
+fn shard_off(i: u64) -> u64 { i * 64 }
 
 /// Build a sealed corpus with a parity sidecar; return the temp dir and the
 /// pristine sealed `.log` bytes for byte-exactness assertions.
@@ -42,7 +47,9 @@ fn sealed_corpus_with_parity(n_batches: u64) -> (tempfile::TempDir, Vec<u8>) {
     common::build_corpus(d.path(), n_batches);
     common::seal_log_trailer(d.path());
     common::write_parity(d.path(), common::parity_test_cfg());
-    let pristine = std::fs::read(mess_cli::store::log_path(d.path(), common::SEG_ID)).unwrap();
+    let pristine =
+        std::fs::read(mess_cli::store::log_path(d.path(), common::SEG_ID))
+            .unwrap();
     (d, pristine)
 }
 
@@ -59,13 +66,23 @@ fn repairs_within_tolerance_and_reverifies_green() {
     assert_ne!(std::fs::read(&log).unwrap(), pristine, "corruption must land");
 
     let report = repair_run(d.path());
-    let repaired = find_ok(&report, "repaired")
-        .unwrap_or_else(|| panic!("a `repaired` finding, got: {:#?}", report.findings));
-    let blocks = repaired.fields.get("repaired_blocks").expect("repaired_blocks field");
-    assert_eq!(blocks, &serde_json::json!([1, 2]), "must name exactly blocks 1 and 2");
+    let repaired = find_ok(&report, "repaired").unwrap_or_else(|| {
+        panic!("a `repaired` finding, got: {:#?}", report.findings)
+    });
+    let blocks =
+        repaired.fields.get("repaired_blocks").expect("repaired_blocks field");
+    assert_eq!(
+        blocks,
+        &serde_json::json!([1, 2]),
+        "must name exactly blocks 1 and 2"
+    );
 
     // Byte-exact restoration.
-    assert_eq!(std::fs::read(&log).unwrap(), pristine, "repaired .log must be byte-exact");
+    assert_eq!(
+        std::fs::read(&log).unwrap(),
+        pristine,
+        "repaired .log must be byte-exact"
+    );
 
     // The damaged original is preserved, and the exit is clean.
     let damaged: Vec<_> = std::fs::read_dir(d.path())
@@ -73,12 +90,22 @@ fn repairs_within_tolerance_and_reverifies_green() {
         .flatten()
         .filter(|e| e.file_name().to_string_lossy().contains(".damaged-"))
         .collect();
-    assert_eq!(damaged.len(), 1, "exactly one .damaged-<ts> backup must remain");
+    assert_eq!(
+        damaged.len(),
+        1,
+        "exactly one .damaged-<ts> backup must remain"
+    );
 
     // A fresh full verify (no repair) over the now-repaired store is green:
     // the repair restored the committed bytes exactly.
-    let after = verify::run(d.path(), &VerifyOptions { full: true, repair: false });
-    assert_eq!(after.exit_code(), 0, "post-repair verify must be green: {:#?}", after.findings);
+    let after =
+        verify::run(d.path(), &VerifyOptions { full: true, repair: false });
+    assert_eq!(
+        after.exit_code(),
+        0,
+        "post-repair verify must be green: {:#?}",
+        after.findings
+    );
     assert!(!after.findings.iter().any(|f| f.severity == Severity::Error));
 }
 
@@ -103,8 +130,13 @@ fn beyond_tolerance_refuses_and_leaves_originals() {
     );
     assert_ne!(report.exit_code(), 0, "beyond-tolerance must exit non-zero");
 
-    // Originals untouched: the .log is exactly the damaged bytes, no backup made.
-    assert_eq!(std::fs::read(&log).unwrap(), damaged_bytes, "originals must be untouched");
+    // Originals untouched: the .log is exactly the damaged bytes, no backup
+    // made.
+    assert_eq!(
+        std::fs::read(&log).unwrap(),
+        damaged_bytes,
+        "originals must be untouched"
+    );
     let backups = std::fs::read_dir(d.path())
         .unwrap()
         .flatten()
@@ -137,7 +169,11 @@ fn corrupt_parity_sidecar_detected_no_repair() {
     );
     assert_ne!(report.exit_code(), 0);
     // The damaged segment is left exactly as-is (no repair attempted).
-    assert_eq!(std::fs::read(&log).unwrap(), damaged_bytes, "segment must be untouched");
+    assert_eq!(
+        std::fs::read(&log).unwrap(),
+        damaged_bytes,
+        "segment must be untouched"
+    );
 }
 
 /// Shape 4: parity generation is deterministic — regenerating over the same

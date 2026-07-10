@@ -30,14 +30,22 @@ unsafe impl GlobalAlloc for Counting {
         ALLOCS.fetch_add(1, Ordering::Relaxed);
         unsafe { System.alloc(layout) }
     }
+
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         unsafe { System.dealloc(ptr, layout) }
     }
+
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         ALLOCS.fetch_add(1, Ordering::Relaxed);
         unsafe { System.alloc_zeroed(layout) }
     }
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+
+    unsafe fn realloc(
+        &self,
+        ptr: *mut u8,
+        layout: Layout,
+        new_size: usize,
+    ) -> *mut u8 {
         // A grow is a fresh allocation for our purposes; a shrink is not.
         if new_size > layout.size() {
             ALLOCS.fetch_add(1, Ordering::Relaxed);
@@ -49,9 +57,7 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static GLOBAL: Counting = Counting;
 
-fn allocs() -> usize {
-    ALLOCS.load(Ordering::Relaxed)
-}
+fn allocs() -> usize { ALLOCS.load(Ordering::Relaxed) }
 
 // bn-25j: the writer half of this test opens a real segment file via
 // `RealRuntime` (`std::env::temp_dir()` + `std::fs`); Miri's isolation
@@ -89,17 +95,29 @@ fn zero_allocs_per_event_on_the_hot_path() {
         sink ^= bytes[0] ^ bytes[bytes.len() - 1]; // keep the work observable
     }
     let encode_allocs = allocs() - before;
-    assert_eq!(encode_allocs, 0, "encoder allocated {encode_allocs} times over {N} batches (want 0)");
+    assert_eq!(
+        encode_allocs, 0,
+        "encoder allocated {encode_allocs} times over {N} batches (want 0)"
+    );
     std::hint::black_box(sink);
 
     // --- Part 2: encode + append through the writer is zero-alloc ----------
     // RealRuntime's pwrite is write_at(2): no Rust heap allocation.
     let rt = RealRuntime::new();
-    let path = std::env::temp_dir().join(format!("mess-log-alloc-{}.seg", std::process::id()));
+    let path = std::env::temp_dir()
+        .join(format!("mess-log-alloc-{}.seg", std::process::id()));
     let _cleanup = RmOnDrop(path.clone());
 
-    let mut w = SegmentWriter::create(&rt.fs(), &path, SegmentParams::new(1, 0, 1, 0)).unwrap();
-    let spec = BatchSpec { stream_id: 7, category_id: 0, first_stream_version: 0, crypto_chain: None, subframes: &sfs };
+    let mut w =
+        SegmentWriter::create(&rt.fs(), &path, SegmentParams::new(1, 0, 1, 0))
+            .unwrap();
+    let spec = BatchSpec {
+        stream_id:            7,
+        category_id:          0,
+        first_stream_version: 0,
+        crypto_chain:         None,
+        subframes:            &sfs,
+    };
 
     // Warm up the writer's encoder buffer + first pwrite.
     w.append(&spec).unwrap();
@@ -109,12 +127,14 @@ fn zero_allocs_per_event_on_the_hot_path() {
         w.append(&spec).unwrap();
     }
     let append_allocs = allocs() - before;
-    assert_eq!(append_allocs, 0, "encode+append allocated {append_allocs} times over {N} batches (want 0)");
+    assert_eq!(
+        append_allocs, 0,
+        "encode+append allocated {append_allocs} times over {N} batches (want \
+         0)"
+    );
 }
 
 struct RmOnDrop(std::path::PathBuf);
 impl Drop for RmOnDrop {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
+    fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
 }

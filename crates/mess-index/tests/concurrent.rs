@@ -24,15 +24,16 @@ const N_READERS: usize = 3;
 /// A deterministic workload: a flat batch list in global-position order (dense
 /// positions from 0), each batch continuing its stream's versions.
 struct Workload {
-    plan: Vec<BatchEntry>,
+    plan:            Vec<BatchEntry>,
     /// Group boundaries: index i is applied in group `groups[i]`.
-    group_ends: Vec<usize>,
+    group_ends:      Vec<usize>,
     /// Position-ordered global entries the plan will produce.
     expected_global: Vec<GlobalEntry>,
     /// Valid committed head versions per stream (each batch's last_version).
-    valid_heads: BTreeMap<u64, HashSet<u64>>,
-    /// The final committed batch per stream head → its ptr (for resolve checks).
-    head_ptr: BTreeMap<(u64, u64), EventPtr>,
+    valid_heads:     BTreeMap<u64, HashSet<u64>>,
+    /// The final committed batch per stream head → its ptr (for resolve
+    /// checks).
+    head_ptr:        BTreeMap<(u64, u64), EventPtr>,
 }
 
 fn generate(seed: u64) -> Workload {
@@ -78,9 +79,9 @@ fn generate(seed: u64) -> Workload {
         .iter()
         .map(|b| GlobalEntry {
             first_global_pos: b.first_global_pos,
-            frame_count: b.frame_count,
-            stream_id: b.stream_id,
-            ptr: b.ptr,
+            frame_count:      b.frame_count,
+            stream_id:        b.stream_id,
+            ptr:              b.ptr,
         })
         .collect();
 
@@ -95,21 +96,36 @@ fn check_reader_view(index: &ActiveIndex, wl: &Workload) {
     let g = index.global_committed();
     assert!(g.len() <= wl.expected_global.len());
     for (i, e) in g.iter().enumerate() {
-        assert_eq!(*e, wl.expected_global[i], "global entry {i} diverged from plan");
+        assert_eq!(
+            *e, wl.expected_global[i],
+            "global entry {i} diverged from plan"
+        );
     }
     // Density: each entry begins exactly where the previous ended.
     for w in g.windows(2) {
-        assert_eq!(w[0].end_pos(), w[1].first_global_pos, "gap in committed global view");
+        assert_eq!(
+            w[0].end_pos(),
+            w[1].first_global_pos,
+            "gap in committed global view"
+        );
     }
 
     // 2. Every per-stream head is a real committed head, and resolves to the
     //    planned pointer — never a version the writer has not committed.
     for stream in 0..N_STREAMS {
         if let Some(head) = index.stream_head(stream) {
-            let valid = wl.valid_heads.get(&stream).expect("stream present in plan");
-            assert!(valid.contains(&head), "stream {stream} head {head} not a committed head");
+            let valid =
+                wl.valid_heads.get(&stream).expect("stream present in plan");
+            assert!(
+                valid.contains(&head),
+                "stream {stream} head {head} not a committed head"
+            );
             let want = wl.head_ptr[&(stream, head)];
-            assert_eq!(index.resolve(stream, head), Some(want), "stream {stream} resolve(head)");
+            assert_eq!(
+                index.resolve(stream, head),
+                Some(want),
+                "stream {stream} resolve(head)"
+            );
         }
     }
 }
@@ -131,7 +147,10 @@ fn run_seed(seed: u64) {
                 while !done.load(Ordering::Acquire) {
                     // applied_end is monotone from any single reader's view.
                     let e = index.applied_end();
-                    assert!(e >= last_end, "applied_end regressed {last_end} -> {e}");
+                    assert!(
+                        e >= last_end,
+                        "applied_end regressed {last_end} -> {e}"
+                    );
                     last_end = e;
                     check_reader_view(&index, wl);
                 }
@@ -162,7 +181,11 @@ fn run_seed(seed: u64) {
     let reference = ActiveIndex::new();
     let final_pos = wl.plan.last().map(|b| b.end_pos()).unwrap_or(0);
     reference.apply_committed(final_pos, &wl.plan);
-    assert_eq!(index.snapshot(), reference.snapshot(), "seed {seed} final differential");
+    assert_eq!(
+        index.snapshot(),
+        reference.snapshot(),
+        "seed {seed} final differential"
+    );
 }
 
 #[test]

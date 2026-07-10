@@ -44,9 +44,7 @@ impl Rng {
     }
 
     /// `true` with probability `p` (clamped to `[0,1]`).
-    pub fn chance(&mut self, p: f64) -> bool {
-        self.unit() < p.clamp(0.0, 1.0)
-    }
+    pub fn chance(&mut self, p: f64) -> bool { self.unit() < p.clamp(0.0, 1.0) }
 }
 
 /// A Zipf sampler over stream indices `0..n`: index `k` (1-based rank) is drawn

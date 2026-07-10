@@ -3,12 +3,12 @@
 //!
 //! Two media, one per spike, slotted behind the same [`FileHandle`]:
 //!
-//! - [`Fault::Sector`] ports `spikes/torn_write`'s **`SectorDisk`**: a
-//!   file's un-`fdatasync`ed sectors persist independently and in
-//!   arbitrary order on crash, and one may tear at an arbitrary byte cut.
-//!   This is the ALICE-style block-write-reordering model that the 24k
-//!   torn-write conformance cases (the future bar) run against — A4's
-//!   killer (marker sector before frame sectors) lives here.
+//! - [`Fault::Sector`] ports `spikes/torn_write`'s **`SectorDisk`**: a file's
+//!   un-`fdatasync`ed sectors persist independently and in arbitrary order on
+//!   crash, and one may tear at an arbitrary byte cut. This is the ALICE-style
+//!   block-write-reordering model that the 24k torn-write conformance cases
+//!   (the future bar) run against — A4's killer (marker sector before frame
+//!   sectors) lives here.
 //! - [`Fault::Tail`] ports `spikes/crash_log`'s **`FaultWriter`**: the
 //!   un-synced tail survives only up to some length (torn prefix), with
 //!   optional byte scrambling in the surviving-but-unsynced region.
@@ -49,7 +49,7 @@ pub struct SectorPlan {
     pub persist: Vec<usize>,
     /// One sector persisted only up to `keep_bytes`; the rest keeps its
     /// prior durable bytes (a partial-sector write).
-    pub tear: Option<(usize, usize)>,
+    pub tear:    Option<(usize, usize)>,
 }
 
 /// A deterministic crash plan for a [`Fault::Tail`] file.
@@ -57,7 +57,7 @@ pub struct SectorPlan {
 pub struct TailPlan {
     /// The surviving prefix length. MUST be in `[synced, len]`; the tail
     /// past it is lost.
-    pub keep: usize,
+    pub keep:     usize,
     /// Byte offsets in `(synced, keep)` to scramble (torn page).
     pub scramble: Vec<usize>,
 }
@@ -100,10 +100,10 @@ pub enum EnospcSite {
 #[derive(Debug, Clone)]
 struct SectorDisk {
     sector_size: usize,
-    durable: Vec<u8>,
-    shadow: Vec<u8>,
+    durable:     Vec<u8>,
+    shadow:      Vec<u8>,
     logical_len: usize,
-    pending: BTreeSet<usize>,
+    pending:     BTreeSet<usize>,
 }
 
 impl SectorDisk {
@@ -200,7 +200,7 @@ impl SectorDisk {
 /// bytes in the surviving-but-unsynced region.
 #[derive(Debug, Clone)]
 struct TailDisk {
-    buf: Vec<u8>,
+    buf:    Vec<u8>,
     synced: usize,
 }
 
@@ -228,9 +228,7 @@ impl TailDisk {
         n
     }
 
-    fn fdatasync(&mut self) {
-        self.synced = self.buf.len();
-    }
+    fn fdatasync(&mut self) { self.synced = self.buf.len(); }
 
     fn crash(&mut self, plan: &TailPlan) {
         let keep = plan.keep.clamp(self.synced, self.buf.len());
@@ -345,9 +343,7 @@ type Inode = Arc<Mutex<FileState>>;
 
 /// The sim's `ENOSPC` [`io::Error`], carrying `raw_os_error() == Some(ENOSPC)`
 /// so the writer classifies it exactly as it would a real one.
-fn enospc() -> io::Error {
-    io::Error::from_raw_os_error(libc::ENOSPC)
-}
+fn enospc() -> io::Error { io::Error::from_raw_os_error(libc::ENOSPC) }
 
 /// An in-memory filesystem whose files inject the spike fault models.
 ///
@@ -358,7 +354,7 @@ pub struct SimFs {
 }
 
 struct Inner {
-    files: HashMap<PathBuf, Inode>,
+    files:         HashMap<PathBuf, Inode>,
     default_fault: Fault,
 }
 
@@ -402,10 +398,9 @@ impl SimFs {
         let path = path.into();
         let mut inner = self.inner.lock().unwrap();
         let default_fault = inner.default_fault;
-        let inode = inner
-            .files
-            .entry(path)
-            .or_insert_with(|| Arc::new(Mutex::new(FileState::new(default_fault, Vec::new()))));
+        let inode = inner.files.entry(path).or_insert_with(|| {
+            Arc::new(Mutex::new(FileState::new(default_fault, Vec::new())))
+        });
         inode.lock().unwrap().enospc.push(site);
     }
 
@@ -480,7 +475,8 @@ impl Fs for SimFs {
             }
         };
         if opts.truncate {
-            inode.lock().unwrap().medium = Medium::new(default_fault, Vec::new());
+            inode.lock().unwrap().medium =
+                Medium::new(default_fault, Vec::new());
         }
         Ok(SimFile { inode })
     }
@@ -496,11 +492,9 @@ impl Fs for SimFs {
 
     fn remove(&self, path: &Path) -> io::Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        inner
-            .files
-            .remove(path)
-            .map(|_| ())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such sim file"))
+        inner.files.remove(path).map(|_| ()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "no such sim file")
+        })
     }
 }
 

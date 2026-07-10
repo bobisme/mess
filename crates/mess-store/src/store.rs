@@ -9,11 +9,11 @@ use mess_core::{Aggregate, CodecError, CommandError, Decide, Event};
 use crate::backend::{AppendError, Backend, RecordToAppend, SubscribeBackend};
 use crate::cache::StateCache;
 use crate::retry::RetryPolicy;
-use crate::subscription::Subscription;
 use crate::snapshot::{
     BlobPtr, SnapshotRef, SnapshotStore, Snapshottable, StateCodecError,
     StoredSnapshot, interim_stream_id,
 };
+use crate::subscription::Subscription;
 use crate::version::Version;
 
 /// The default page size for the [`load`](EventStore::load) replay loop.
@@ -46,25 +46,21 @@ pub enum StoreError<E> {
 }
 
 impl<E> From<CodecError> for StoreError<E> {
-    fn from(e: CodecError) -> Self {
-        StoreError::Codec(e)
-    }
+    fn from(e: CodecError) -> Self { StoreError::Codec(e) }
 }
 
 impl<E> From<StateCodecError> for StoreError<E> {
-    fn from(e: StateCodecError) -> Self {
-        StoreError::State(e)
-    }
+    fn from(e: StateCodecError) -> Self { StoreError::State(e) }
 }
 
 /// Result of replaying a stream through [`Aggregate::apply`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Loaded<A> {
     /// The folded aggregate state.
-    pub state: A,
+    pub state:           A,
     /// The version the stream was at when loaded; feed this straight back to
     /// [`append`](EventStore::append) as the expected version.
-    pub version: Version,
+    pub version:         Version,
     /// How many events were replayed to build `state`.
     pub events_replayed: usize,
 }
@@ -74,15 +70,15 @@ pub struct Loaded<A> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Commit {
     /// The stream's version after the commit.
-    pub version: Version,
+    pub version:              Version,
     /// Global position of the last event written, or `None` when nothing was
     /// appended (e.g. a command that decided zero events).
     pub last_global_position: Option<u64>,
     /// How many events were appended.
-    pub events_appended: usize,
+    pub events_appended:      usize,
     /// How many optimistic attempts [`command`](EventStore::command) needed
     /// (always 1 for a direct [`append`](EventStore::append)).
-    pub attempts: u32,
+    pub attempts:             u32,
 }
 
 /// Observability counters for the snapshot-accelerated load path — the deploy
@@ -106,9 +102,10 @@ pub struct SnapshotMetrics {
 
 impl SnapshotMetrics {
     /// How many stored snapshots have been invalidated by a `fold_version`
-    /// mismatch and rebuilt by full replay (§9). This is the deploy-observability
-    /// counter: it climbs once per stale stream after a `fold_version` bump and
-    /// then stops, because the rebuilt state is persisted with the new version.
+    /// mismatch and rebuilt by full replay (§9). This is the
+    /// deploy-observability counter: it climbs once per stale stream after
+    /// a `fold_version` bump and then stops, because the rebuilt state is
+    /// persisted with the new version.
     #[must_use]
     pub fn invalidated(&self) -> u64 {
         self.invalidated.load(Ordering::Relaxed)
@@ -123,10 +120,11 @@ impl SnapshotMetrics {
 /// The outcome of consulting the snapshot store on the accelerated load path.
 ///
 /// Separating "no snapshot to use" from "a snapshot existed but its
-/// `fold_version` is stale" is what lets [`load_cached`](EventStore::load_cached)
-/// treat the deploy case specially: count it, and *replace* the stale snapshot
-/// after the rebuild — without turning an ordinary snapshot-less load into an
-/// (unwanted) implicit `save_snapshot`.
+/// `fold_version` is stale" is what lets
+/// [`load_cached`](EventStore::load_cached) treat the deploy case specially:
+/// count it, and *replace* the stale snapshot after the rebuild — without
+/// turning an ordinary snapshot-less load into an (unwanted) implicit
+/// `save_snapshot`.
 enum SnapshotOutcome<A> {
     /// A valid snapshot was found and folded forward; this is the answer.
     Used(Loaded<A>),
@@ -148,17 +146,17 @@ enum SnapshotOutcome<A> {
 /// `Arc`), so warm state is shared across clones and across concurrent writers.
 #[derive(Debug, Clone)]
 pub struct EventStore<B> {
-    backend: B,
-    policy: RetryPolicy,
+    backend:   B,
+    policy:    RetryPolicy,
     page_size: usize,
     /// Hot-aggregate state cache (doc-02). Disabled by default, so the base
     /// [`load`](Self::load)/[`command`](Self::command) behavior — and every
     /// existing test — is unchanged until a caller opts in with
     /// [`with_cache_capacity`](Self::with_cache_capacity).
-    cache: StateCache,
+    cache:     StateCache,
     /// Snapshot-path observability (the `fold_version` invalidation counter,
     /// §9). Shared across clones via its internal `Arc`.
-    metrics: SnapshotMetrics,
+    metrics:   SnapshotMetrics,
 }
 
 impl<B: Backend> EventStore<B> {
@@ -175,13 +173,15 @@ impl<B: Backend> EventStore<B> {
         }
     }
 
-    /// Enable the hot-aggregate [`StateCache`] with room for `capacity` streams.
+    /// Enable the hot-aggregate [`StateCache`] with room for `capacity`
+    /// streams.
     ///
     /// This is the on-switch for the warm command/read path
-    /// ([`command_cached`](Self::command_cached) / [`load_hot`](Self::load_hot)).
-    /// Off (the default) those methods still work — they simply run the
-    /// cache-miss fallthrough on every call, which is the *identical* code path,
-    /// so the cache changes performance, never results.
+    /// ([`command_cached`](Self::command_cached) /
+    /// [`load_hot`](Self::load_hot)). Off (the default) those methods still
+    /// work — they simply run the cache-miss fallthrough on every call,
+    /// which is the *identical* code path, so the cache changes
+    /// performance, never results.
     #[must_use]
     pub fn with_cache_capacity(mut self, capacity: usize) -> Self {
         self.cache = StateCache::with_capacity(capacity);
@@ -199,17 +199,13 @@ impl<B: Backend> EventStore<B> {
 
     /// Borrow the hot-aggregate state cache (for inspection / tests).
     #[must_use]
-    pub fn cache(&self) -> &StateCache {
-        &self.cache
-    }
+    pub fn cache(&self) -> &StateCache { &self.cache }
 
     /// Borrow the snapshot-path observability metrics — chiefly the
     /// `fold_version` invalidation counter that makes the deploy-time rebuild
     /// wave visible (§9). Shared across clones.
     #[must_use]
-    pub fn snapshot_metrics(&self) -> &SnapshotMetrics {
-        &self.metrics
-    }
+    pub fn snapshot_metrics(&self) -> &SnapshotMetrics { &self.metrics }
 
     /// Replace the optimistic-retry policy.
     #[must_use]
@@ -235,14 +231,10 @@ impl<B: Backend> EventStore<B> {
 
     /// The configured retry policy.
     #[must_use]
-    pub fn retry_policy(&self) -> RetryPolicy {
-        self.policy
-    }
+    pub fn retry_policy(&self) -> RetryPolicy { self.policy }
 
     /// Borrow the underlying backend.
-    pub fn backend(&self) -> &B {
-        &self.backend
-    }
+    pub fn backend(&self) -> &B { &self.backend }
 
     /// Load an aggregate by replaying its whole stream through
     /// [`Aggregate::apply`].
@@ -297,11 +289,11 @@ impl<B: Backend> EventStore<B> {
         })?;
         match self.backend.append_batch(stream_id, expected, &records).await {
             Ok(appended) => Ok(Commit {
-                version: appended.version,
+                version:              appended.version,
                 last_global_position: (!events.is_empty())
                     .then_some(appended.last_global_position),
-                events_appended: events.len(),
-                attempts: 1,
+                events_appended:      events.len(),
+                attempts:             1,
             }),
             Err(AppendError::Conflict { expected, actual }) => {
                 Err(AppendError::Conflict { expected, actual })
@@ -347,10 +339,10 @@ impl<B: Backend> EventStore<B> {
                 .map_err(CommandError::Domain)?;
             if events.is_empty() {
                 return Ok(Commit {
-                    version: loaded.version,
+                    version:              loaded.version,
                     last_global_position: None,
-                    events_appended: 0,
-                    attempts: attempt,
+                    events_appended:      0,
+                    attempts:             attempt,
                 });
             }
             let records = encode_events(&events)
@@ -362,18 +354,18 @@ impl<B: Backend> EventStore<B> {
             {
                 Ok(appended) => {
                     return Ok(Commit {
-                        version: appended.version,
+                        version:              appended.version,
                         last_global_position: Some(
                             appended.last_global_position,
                         ),
-                        events_appended: events.len(),
-                        attempts: attempt,
+                        events_appended:      events.len(),
+                        attempts:             attempt,
                     });
                 }
                 Err(AppendError::Conflict { .. }) => {
                     if attempt >= self.policy.max_attempts {
                         return Err(CommandError::Conflict {
-                            stream: stream_id.to_string(),
+                            stream:   stream_id.to_string(),
                             attempts: attempt,
                         });
                     }
@@ -396,8 +388,8 @@ impl<B: SubscribeBackend> EventStore<B> {
     /// committed global-position sequence — every global position `< watermark`
     /// is committed and visible to
     /// [`backend().read_global`](crate::backend::Backend::read_global), and it
-    /// is the count of committed events. Monotone non-decreasing while the store
-    /// is live.
+    /// is the count of committed events. Monotone non-decreasing while the
+    /// store is live.
     pub async fn watermark(&self) -> Result<u64, StoreError<B::Error>> {
         self.backend.watermark().await.map_err(StoreError::Backend)
     }
@@ -409,9 +401,9 @@ impl<B: SubscribeBackend> EventStore<B> {
     ///
     /// This is the **event-bounded** barrier a read model wants after issuing a
     /// write: pass the write's [`Commit::last_global_position`] and await it to
-    /// know the projection can now observe that write — woken by the commit that
-    /// crosses it, never by polling. Dropping the future is safe and never
-    /// wedges the committer (see [`Subscription`]'s module docs).
+    /// know the projection can now observe that write — woken by the commit
+    /// that crosses it, never by polling. Dropping the future is safe and
+    /// never wedges the committer (see [`Subscription`]'s module docs).
     pub async fn await_past(
         &self,
         pos: u64,
@@ -474,7 +466,8 @@ impl<B: SnapshotStore> EventStore<B> {
     }
 
     /// Persist a snapshot for `stream_id` from an **already-folded** `state`
-    /// covering `version`, stamping the current [`Snapshottable::FOLD_VERSION`].
+    /// covering `version`, stamping the current
+    /// [`Snapshottable::FOLD_VERSION`].
     ///
     /// Factored out of [`save_snapshot`](Self::save_snapshot) so the
     /// invalidation-on-deploy path can *replace* a stale snapshot from the
@@ -584,9 +577,9 @@ impl<B: SnapshotStore> EventStore<B> {
     /// Consult the snapshot store on the accelerated path. Distinguishes a
     /// deploy-time [`Invalidated`](SnapshotOutcome::Invalidated) snapshot
     /// (stale `fold_version`) from an ordinary
-    /// [`NoSnapshot`](SnapshotOutcome::NoSnapshot) miss, so the caller can count
-    /// and replace the former. Only a genuine backend error short-circuits with
-    /// `Err`.
+    /// [`NoSnapshot`](SnapshotOutcome::NoSnapshot) miss, so the caller can
+    /// count and replace the former. Only a genuine backend error
+    /// short-circuits with `Err`.
     async fn try_load_from_snapshot<A: Snapshottable>(
         &self,
         stream_id: &str,
@@ -695,8 +688,8 @@ impl<B: SnapshotStore> EventStore<B> {
     ///   them into the cached state (write-through) — no re-read, no
     ///   invalidation protocol.
     /// - **Conflict:** fetch only the events appended since the cached version
-    ///   and fold them in (via [`replay_tail`](Self::replay_tail)), then retry —
-    ///   so a lost race costs O(events lost), not a full reload.
+    ///   and fold them in (via [`replay_tail`](Self::replay_tail)), then retry
+    ///   — so a lost race costs O(events lost), not a full reload.
     /// - **Miss / cache disabled:** fall through to the snapshot + tail
     ///   [`load_cached`](Self::load_cached) — the *same* code path either way,
     ///   so the cache changes performance, never results.
@@ -707,15 +700,16 @@ impl<B: SnapshotStore> EventStore<B> {
     ///
     /// # Backoff under contention
     ///
-    /// The delta catch-up makes a conflict retry *cheap* — but that cheapness is
-    /// a double-edged sword under genuine multi-writer contention on one hot
-    /// stream: cheap retries collide back-to-back, where the uncached full
-    /// reload incidentally spaces writers out. So `command_cached` needs a
-    /// [`RetryPolicy`](crate::RetryPolicy) with **real jittered backoff** (the
-    /// [default](crate::RetryPolicy::default)) under contention; a
-    /// `no_backoff` policy is for deterministic single-threaded tests only and
-    /// can let a thundering herd starve one writer into conflict exhaustion.
-    /// The backoff is still honored on every conflict here regardless.
+    /// The delta catch-up makes a conflict retry *cheap* — but that cheapness
+    /// is a double-edged sword under genuine multi-writer contention on one
+    /// hot stream: cheap retries collide back-to-back, where the uncached
+    /// full reload incidentally spaces writers out. So `command_cached`
+    /// needs a [`RetryPolicy`](crate::RetryPolicy) with **real jittered
+    /// backoff** (the [default](crate::RetryPolicy::default)) under
+    /// contention; a `no_backoff` policy is for deterministic
+    /// single-threaded tests only and can let a thundering herd starve one
+    /// writer into conflict exhaustion. The backoff is still honored on
+    /// every conflict here regardless.
     pub async fn command_cached<A, C>(
         &self,
         stream_id: &str,
@@ -764,20 +758,21 @@ impl<B: SnapshotStore> EventStore<B> {
             match self.backend.append_batch(stream_id, version, &records).await
             {
                 Ok(appended) => {
-                    // Write-through fold: fold the events we just wrote into the
-                    // cached state instead of re-reading them.
+                    // Write-through fold: fold the events we just wrote into
+                    // the cached state instead of
+                    // re-reading them.
                     let mut folded = state;
                     for e in &events {
                         folded.apply(e);
                     }
                     self.cache.put::<A>(stream_id, appended.version, folded);
                     return Ok(Commit {
-                        version: appended.version,
+                        version:              appended.version,
                         last_global_position: Some(
                             appended.last_global_position,
                         ),
-                        events_appended: events.len(),
-                        attempts: attempt,
+                        events_appended:      events.len(),
+                        attempts:             attempt,
                     });
                 }
                 Err(AppendError::Conflict { .. }) => {
@@ -786,7 +781,7 @@ impl<B: SnapshotStore> EventStore<B> {
                         // drop it so the next caller reloads clean.
                         self.cache.invalidate(stream_id);
                         return Err(CommandError::Conflict {
-                            stream: stream_id.to_string(),
+                            stream:   stream_id.to_string(),
                             attempts: attempt,
                         });
                     }
@@ -795,8 +790,9 @@ impl<B: SnapshotStore> EventStore<B> {
                         tokio::time::sleep(backoff).await;
                     }
                     // Delta catch-up: fold ONLY the events appended since our
-                    // stale `version` — O(events lost), not a full reload — then
-                    // retry against the caught-up state.
+                    // stale `version` — O(events lost), not a full reload —
+                    // then retry against the caught-up
+                    // state.
                     let (caught, caught_version, _delta) = self
                         .replay_tail::<A>(stream_id, state, version)
                         .await
@@ -819,17 +815,18 @@ impl<B: SnapshotStore> EventStore<B> {
     /// most the delta since the cache last saw it.
     ///
     /// - **Warm hit:** one [`head`](Backend::head) check (cheap metadata,
-    ///   **zero event reads**). If the stream has not moved, the cached state is
-    ///   returned untouched; if it has, only the delta events are folded in and
-    ///   the cache is refreshed.
+    ///   **zero event reads**). If the stream has not moved, the cached state
+    ///   is returned untouched; if it has, only the delta events are folded in
+    ///   and the cache is refreshed.
     /// - **Miss / cache disabled:** the snapshot + tail
     ///   [`load_cached`](Self::load_cached), then the result warms the cache —
     ///   the same code path as an uncached [`load_cached`](Self::load_cached).
     ///
-    /// [`Loaded::events_replayed`] counts only what *this* call folded: `0` on a
-    /// fully-warm hit, the delta length on a catch-up, the tail length on a
-    /// miss — so a test can prove the warm read touched no events. The returned
-    /// state is always byte-identical to what [`load`](Self::load) would yield.
+    /// [`Loaded::events_replayed`] counts only what *this* call folded: `0` on
+    /// a fully-warm hit, the delta length on a catch-up, the tail length on
+    /// a miss — so a test can prove the warm read touched no events. The
+    /// returned state is always byte-identical to what [`load`](Self::load)
+    /// would yield.
     pub async fn load_hot<A: Snapshottable + Clone>(
         &self,
         stream_id: &str,
@@ -849,8 +846,8 @@ impl<B: SnapshotStore> EventStore<B> {
                 self.replay_tail::<A>(stream_id, state, version).await?;
             self.cache.put::<A>(stream_id, caught_version, caught.clone());
             return Ok(Loaded {
-                state: caught,
-                version: caught_version,
+                state:           caught,
+                version:         caught_version,
                 events_replayed: delta,
             });
         }
@@ -870,7 +867,7 @@ fn encode_events<E: Event>(
         .map(|e| {
             Ok(RecordToAppend {
                 message_type: e.name().to_string(),
-                data: e.encode()?,
+                data:         e.encode()?,
             })
         })
         .collect()

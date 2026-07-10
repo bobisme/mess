@@ -52,23 +52,21 @@ impl Event for AccountEvent {
 
     fn decode(name: &str, data: &[u8]) -> Result<Self, CodecError> {
         let decode_amount = |bytes: &[u8]| -> Result<i64, CodecError> {
-            let arr: [u8; 8] = bytes.try_into().map_err(|_| {
-                CodecError::Decode {
+            let arr: [u8; 8] =
+                bytes.try_into().map_err(|_| CodecError::Decode {
                     event_name: name.to_string(),
-                    source: "expected 8 payload bytes".to_string(),
-                }
-            })?;
+                    source:     "expected 8 payload bytes".to_string(),
+                })?;
             Ok(i64::from_le_bytes(arr))
         };
         match name {
             "account.opened" => {
-                let owner =
-                    String::from_utf8(data.to_vec()).map_err(|e| {
-                        CodecError::Decode {
-                            event_name: name.to_string(),
-                            source: e.to_string(),
-                        }
-                    })?;
+                let owner = String::from_utf8(data.to_vec()).map_err(|e| {
+                    CodecError::Decode {
+                        event_name: name.to_string(),
+                        source:     e.to_string(),
+                    }
+                })?;
                 Ok(AccountEvent::Opened { owner })
             }
             "account.deposited" => {
@@ -84,7 +82,7 @@ impl Event for AccountEvent {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct Account {
-    open: bool,
+    open:    bool,
     balance: i64,
 }
 
@@ -178,7 +176,7 @@ impl Decide<Withdraw> for Account {
         }
         if cmd.amount > self.balance {
             return Err(AccountError::InsufficientFunds {
-                balance: self.balance,
+                balance:   self.balance,
                 requested: cmd.amount,
             });
         }
@@ -231,8 +229,8 @@ where
         match self.result {
             Ok(actual) => assert_eq!(
                 actual, expected,
-                "emitted events did not match\nexpected: {expected:#?}\n\
-                 actual:   {actual:#?}"
+                "emitted events did not match\nexpected: \
+                 {expected:#?}\nactual:   {actual:#?}"
             ),
             Err(err) => panic!(
                 "expected the command to emit events, but it was \
@@ -306,7 +304,7 @@ fn gwt_overdraw_is_rejected() {
     ])
     .when(Withdraw { amount: 100 })
     .then_error(AccountError::InsufficientFunds {
-        balance: 30,
+        balance:   30,
         requested: 100,
     });
 }
@@ -339,10 +337,7 @@ fn event_codec_round_trips() {
 #[test]
 fn decode_rejects_unknown_event_name() {
     let err = AccountEvent::decode("account.frozen", &[]).unwrap_err();
-    assert_eq!(
-        err,
-        CodecError::UnknownEventName("account.frozen".to_string())
-    );
+    assert_eq!(err, CodecError::UnknownEventName("account.frozen".to_string()));
     assert_eq!(err.to_string(), "unknown event name \"account.frozen\"");
 }
 
@@ -350,7 +345,8 @@ fn decode_rejects_unknown_event_name() {
 fn overdraw_rejection_renders_like_the_spike() {
     // The spike asserted this exact string; the typed error must still render
     // it, so existing operator-facing messages are preserved.
-    let err = AccountError::InsufficientFunds { balance: 120, requested: 1000 };
+    let err =
+        AccountError::InsufficientFunds { balance: 120, requested: 1000 };
     assert_eq!(
         err.to_string(),
         "insufficient funds: balance is 120, requested 1000"

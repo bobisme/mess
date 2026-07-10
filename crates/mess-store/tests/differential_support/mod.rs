@@ -11,18 +11,18 @@
 //!
 //! # Design
 //!
-//! - **Domain**: the same bank-account aggregate as `cache.rs` (duplicated
-//!   here — separate test binaries can't share a `tests/` module without a
-//!   `#[path]` mod, and this one intentionally stands alone).
+//! - **Domain**: the same bank-account aggregate as `cache.rs` (duplicated here
+//!   — separate test binaries can't share a `tests/` module without a `#[path]`
+//!   mod, and this one intentionally stands alone).
 //! - **RNG**: a dependency-free splitmix64 generator (mirrors
-//!   `mess_log::runtime::Rng`'s rationale: no external `rand` crate pulled
-//!   into `mess-store` just for test-side sequence generation).
-//! - **The model IS the oracle.** [`Model::append`]'s expected-version check
-//!   is the ONLY place a "conflict" is decided; when a generated op wants a
-//!   deliberately stale expected version, the stale value is resolved from
-//!   the model's own tracked version (never the real store's) so a bug in the
-//!   real store's version bookkeeping shows up as a genuine divergence rather
-//!   than being absorbed into the resolution itself.
+//!   `mess_log::runtime::Rng`'s rationale: no external `rand` crate pulled into
+//!   `mess-store` just for test-side sequence generation).
+//! - **The model IS the oracle.** [`Model::append`]'s expected-version check is
+//!   the ONLY place a "conflict" is decided; when a generated op wants a
+//!   deliberately stale expected version, the stale value is resolved from the
+//!   model's own tracked version (never the real store's) so a bug in the real
+//!   store's version bookkeeping shows up as a genuine divergence rather than
+//!   being absorbed into the resolution itself.
 //! - **`command`'s `Conflict`-exhaustion variant is out of scope here.** This
 //!   harness drives one sequential actor with no concurrency, and
 //!   `command`/`command_cached` always reload immediately before deciding —
@@ -35,13 +35,13 @@
 //!   (the raw, no-retry primitive `append` speaks) IS fully covered here via
 //!   deliberately stale expected versions.
 //! - **Crash-recover-reopen fidelity.** [`MockBackend`] is in-memory with no
-//!   fault injection, so there is nothing to lose: "crash" is modeled as
-//!   "acked state survives," exactly as the bone specifies. Concretely,
+//!   fault injection, so there is nothing to lose: "crash" is modeled as "acked
+//!   state survives," exactly as the bone specifies. Concretely,
 //!   `Op::CrashReopen` rebuilds a fresh `EventStore` over the SAME backend
-//!   handle (dropping any hot-aggregate cache, as a real process restart
-//!   would) while the model does nothing (its state IS the durable state).
-//!   Real torn-write / partial-batch / power-loss recovery is the DST
-//!   harness's job at the log layer (`crates/mess-log/tests/dst_scenarios.rs`
+//!   handle (dropping any hot-aggregate cache, as a real process restart would)
+//!   while the model does nothing (its state IS the durable state). Real
+//!   torn-write / partial-batch / power-loss recovery is the DST harness's job
+//!   at the log layer (`crates/mess-log/tests/dst_scenarios.rs`
 //!   `crates/mess-log/tests/crash_harness.rs`); this harness only proves that
 //!   the store facade keeps serving correct results across a handle rebuild
 //!   over already-durable state, and that the throwaway snapshot keyspace's
@@ -49,8 +49,8 @@
 //!   when the backend itself is dropped).
 //! - **`subscribe` is NOT exercised.** `EventStore` (this crate) has no
 //!   `subscribe` method to drive — the subscription runtime lives one layer
-//!   down in `mess-log` and is out of this crate's public API surface, so it
-//!   is not "cheaply drivable against the mock" as the bone's optional clause
+//!   down in `mess-log` and is out of this crate's public API surface, so it is
+//!   not "cheaply drivable against the mock" as the bone's optional clause
 //!   allows for. Left out; not a gap in this harness's scope.
 //! - **`events_replayed` and `attempts` are excluded from the compared
 //!   `Outcome`** — both are implementation/perf details, not correctness, the
@@ -59,23 +59,22 @@
 //!   is not observable-correctness). `attempts`' exclusion was a DIVERGENCE
 //!   THIS HARNESS FOUND during development, not an a-priori design choice: the
 //!   first version of this file compared `attempts` too, on the theory that a
-//!   single-actor sequential harness has no concurrency, so every commit
-//!   should need exactly one attempt. That is true for `append` and for
+//!   single-actor sequential harness has no concurrency, so every commit should
+//!   need exactly one attempt. That is true for `append` and for
 //!   `command`/`command_cached` in a vacuum — but `Op::AppendRaw` writes
-//!   directly to a stream, bypassing the store's hot-aggregate cache
-//!   entirely. When cache is ON and a later `command_cached` targets the SAME
-//!   stream, its cached version is now genuinely stale (the raw append moved
-//!   the stream out from under it) — the append conflicts, the delta
-//!   catch-up fires, and `attempts == 2`. That's real, correct
-//!   `command_cached` behavior (exactly what `cache.rs`'s
-//!   `conflict_retry_fetches_only_the_delta` proves deliberately with two
-//!   handles), not a bug — this harness produces the SAME effect for free
-//!   with a single handle, because `AppendRaw` plays the role of "someone
-//!   else moved the stream." The naive model has no cache to go stale, so its
-//!   `attempts` is always 1; comparing the field was comparing an
+//!   directly to a stream, bypassing the store's hot-aggregate cache entirely.
+//!   When cache is ON and a later `command_cached` targets the SAME stream, its
+//!   cached version is now genuinely stale (the raw append moved the stream out
+//!   from under it) — the append conflicts, the delta catch-up fires, and
+//!   `attempts == 2`. That's real, correct `command_cached` behavior (exactly
+//!   what `cache.rs`'s `conflict_retry_fetches_only_the_delta` proves
+//!   deliberately with two handles), not a bug — this harness produces the SAME
+//!   effect for free with a single handle, because `AppendRaw` plays the role
+//!   of "someone else moved the stream." The naive model has no cache to go
+//!   stale, so its `attempts` is always 1; comparing the field was comparing an
 //!   implementation detail, not a behavioral contract. Fixed by dropping
-//!   `attempts` from `Outcome` entirely (state/version/error-shape is what
-//!   the contract promises).
+//!   `attempts` from `Outcome` entirely (state/version/error-shape is what the
+//!   contract promises).
 
 use std::collections::HashMap;
 use std::fmt;
@@ -160,7 +159,7 @@ impl Event for AccountEvent {
             let bytes: [u8; 8] =
                 data.try_into().map_err(|_| CodecError::Decode {
                     event_name: name.to_string(),
-                    source: format!("expected 8 bytes, got {}", data.len()),
+                    source:     format!("expected 8 bytes, got {}", data.len()),
                 })?;
             Ok(i64::from_le_bytes(bytes))
         };
@@ -169,7 +168,7 @@ impl Event for AccountEvent {
                 owner: String::from_utf8(data.to_vec()).map_err(|e| {
                     CodecError::Decode {
                         event_name: name.to_string(),
-                        source: e.to_string(),
+                        source:     e.to_string(),
                     }
                 })?,
             }),
@@ -186,7 +185,7 @@ impl Event for AccountEvent {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Account {
-    pub open: bool,
+    pub open:    bool,
     pub balance: i64,
 }
 
@@ -299,7 +298,7 @@ impl Decide<Withdraw> for Account {
         }
         if cmd.amount > self.balance {
             return Err(AccountError::InsufficientFunds {
-                balance: self.balance,
+                balance:   self.balance,
                 requested: cmd.amount,
             });
         }
@@ -334,7 +333,7 @@ impl Decide<Withdraw> for Account {
 
 #[derive(Debug, Default, Clone)]
 pub struct Model {
-    streams: HashMap<String, Vec<AccountEvent>>,
+    streams:    HashMap<String, Vec<AccountEvent>>,
     /// Global position counter, dense across every stream — mirrors
     /// `MockBackend::Inner::global`'s assignment exactly (0-based, assigned in
     /// append order) so `last_global_position` is comparable byte-for-byte.
@@ -344,21 +343,21 @@ pub struct Model {
     /// [`Model::load_hot`] — i.e. only when the caller is driving the
     /// cache-on configuration; a run with cache off never touches this field,
     /// matching a real disabled `StateCache` (always empty, by construction).
-    hot: HashMap<String, (Version, Account)>,
+    hot:        HashMap<String, (Version, Account)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelCommit {
-    pub version: Version,
+    pub version:         Version,
     pub events_appended: usize,
-    pub last_global: Option<u64>,
-    pub attempts: u32,
+    pub last_global:     Option<u64>,
+    pub attempts:        u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelConflict {
     pub expected: Version,
-    pub actual: Version,
+    pub actual:   Version,
 }
 
 impl Model {
@@ -402,10 +401,10 @@ impl Model {
         }
         if events.is_empty() {
             return Ok(ModelCommit {
-                version: actual,
+                version:         actual,
                 events_appended: 0,
-                last_global: None,
-                attempts: 1,
+                last_global:     None,
+                attempts:        1,
             });
         }
         let entry = self.streams.entry(stream.to_string()).or_default();
@@ -548,9 +547,7 @@ impl Model {
     /// Simulate a crash-recover-reopen: the durable `streams`/`global_len`
     /// survive (this IS the durable state — nothing to lose), but a fresh
     /// `EventStore` handle starts with an empty hot cache.
-    pub fn crash_reopen(&mut self) {
-        self.hot.clear();
-    }
+    pub fn crash_reopen(&mut self) { self.hot.clear(); }
 }
 
 // ===========================================================================
@@ -561,7 +558,7 @@ impl Model {
 pub enum Op {
     Open {
         stream: usize,
-        owner: String,
+        owner:  String,
     },
     Deposit {
         stream: usize,
@@ -577,7 +574,7 @@ pub enum Op {
     AppendRaw {
         stream: usize,
         events: Vec<AccountEvent>,
-        stale: bool,
+        stale:  bool,
     },
     /// `load` (cache off) / `load_hot` (cache on).
     Load {
@@ -668,20 +665,20 @@ fn resolve_expected(correct: Version, stale: bool) -> Version {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     Commit {
-        version: Version,
+        version:         Version,
         events_appended: usize,
-        last_global: Option<u64>,
+        last_global:     Option<u64>,
     },
     Conflict {
         expected: Version,
-        actual: Version,
+        actual:   Version,
     },
     CommandConflict {
         attempts: u32,
     },
     Domain(AccountError),
     Loaded {
-        state: Account,
+        state:   Account,
         version: Version,
     },
     SnapshotOk,
@@ -689,16 +686,13 @@ pub enum Outcome {
 }
 
 fn map_command_result<E: std::error::Error>(
-    res: Result<
-        mess_store::Commit,
-        CommandError<AccountError, StoreError<E>>,
-    >,
+    res: Result<mess_store::Commit, CommandError<AccountError, StoreError<E>>>,
 ) -> Outcome {
     match res {
         Ok(c) => Outcome::Commit {
-            version: c.version,
+            version:         c.version,
             events_appended: c.events_appended,
-            last_global: c.last_global_position,
+            last_global:     c.last_global_position,
         },
         Err(CommandError::Domain(e)) => Outcome::Domain(e),
         Err(CommandError::Conflict { attempts, .. }) => {
@@ -717,9 +711,9 @@ fn map_append_result<E: std::error::Error>(
 ) -> Outcome {
     match res {
         Ok(c) => Outcome::Commit {
-            version: c.version,
+            version:         c.version,
             events_appended: c.events_appended,
-            last_global: c.last_global_position,
+            last_global:     c.last_global_position,
         },
         Err(AppendError::Conflict { expected, actual }) => {
             Outcome::Conflict { expected, actual }
@@ -745,9 +739,9 @@ fn apply_model(
 ) -> Outcome {
     fn commit_outcome(c: ModelCommit) -> Outcome {
         Outcome::Commit {
-            version: c.version,
+            version:         c.version,
             events_appended: c.events_appended,
-            last_global: c.last_global,
+            last_global:     c.last_global,
         }
     }
 
@@ -785,9 +779,10 @@ fn apply_model(
                 .expect("AppendRaw always resolves an expected version");
             match model.append(name, expected, events) {
                 Ok(c) => commit_outcome(c),
-                Err(e) => {
-                    Outcome::Conflict { expected: e.expected, actual: e.actual }
-                }
+                Err(e) => Outcome::Conflict {
+                    expected: e.expected,
+                    actual:   e.actual,
+                },
             }
         }
         Op::Load { stream } => {
@@ -904,7 +899,9 @@ async fn apply_real<B: mess_store::snapshot::SnapshotStore + Clone>(
             // releasing its lock), so it cannot run behind `&mut store` here —
             // the driver loop ([`run_sequence_with`]) intercepts `CrashReopen`
             // and reopens the backend + store itself.
-            unreachable!("CrashReopen is handled by the run_sequence_with driver loop")
+            unreachable!(
+                "CrashReopen is handled by the run_sequence_with driver loop"
+            )
         }
     }
 }
@@ -946,20 +943,20 @@ where
 /// prefix (every op up to and including the divergent one).
 #[derive(Debug)]
 pub struct DivergenceReport {
-    pub seed: u64,
-    pub cache_on: bool,
-    pub index: usize,
-    pub op_prefix: Vec<Op>,
+    pub seed:          u64,
+    pub cache_on:      bool,
+    pub index:         usize,
+    pub op_prefix:     Vec<Op>,
     pub model_outcome: Outcome,
-    pub real_outcome: Outcome,
+    pub real_outcome:  Outcome,
 }
 
 impl fmt::Display for DivergenceReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
-            "differential divergence: seed={} cache_on={} at op index {} \
-             (of {} ops in the prefix)",
+            "differential divergence: seed={} cache_on={} at op index {} (of \
+             {} ops in the prefix)",
             self.seed,
             self.cache_on,
             self.index,
@@ -990,7 +987,8 @@ pub async fn run_sequence(
     n_streams: usize,
 ) -> Result<(), DivergenceReport> {
     // The interim in-memory backend: kept for differential testing (bn-20b).
-    run_sequence_with(MockBackend::new(), seed, cache_on, n_ops, n_streams).await
+    run_sequence_with(MockBackend::new(), seed, cache_on, n_ops, n_streams)
+        .await
 }
 
 /// The same differential sequence, driven against an arbitrary supplied
@@ -1034,7 +1032,8 @@ where
             backend = b;
             Outcome::Reopened
         } else {
-            apply_real(&mut store, cache_on, &streams, op, resolved_expected).await
+            apply_real(&mut store, cache_on, &streams, op, resolved_expected)
+                .await
         };
 
         if model_outcome != real_outcome {

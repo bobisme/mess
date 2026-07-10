@@ -50,7 +50,10 @@ use mess_store::backend::{Backend, RecordToAppend};
 use mess_store::{LogEngine, Version};
 
 fn rec(message_type: &str, data: &[u8]) -> RecordToAppend {
-    RecordToAppend { message_type: message_type.to_string(), data: data.to_vec() }
+    RecordToAppend {
+        message_type: message_type.to_string(),
+        data:         data.to_vec(),
+    }
 }
 
 /// The bone's core regression: an append that interns a brand-new stream
@@ -64,14 +67,19 @@ async fn new_stream_name_forces_a_durable_meta_flush() {
     assert_eq!(engine.meta_persist_call_count(), 0, "nothing flushed yet");
 
     engine
-        .append_batch("new-stream", Version::NoStream, &[rec("evt.a", b"payload")])
+        .append_batch(
+            "new-stream",
+            Version::NoStream,
+            &[rec("evt.a", b"payload")],
+        )
         .await
         .expect("append with a new stream name");
 
     assert_eq!(
         engine.meta_persist_call_count(),
         1,
-        "a newly-interned stream name must force exactly one durable meta flush"
+        "a newly-interned stream name must force exactly one durable meta \
+         flush"
     );
 }
 
@@ -91,7 +99,8 @@ async fn new_type_name_forces_a_durable_meta_flush() {
     assert_eq!(
         engine.meta_persist_call_count(),
         1,
-        "a new stream + a new type in the SAME append must fold into one flush, not two"
+        "a new stream + a new type in the SAME append must fold into one \
+         flush, not two"
     );
 
     engine
@@ -121,7 +130,11 @@ async fn hot_path_appends_add_zero_meta_flushes() {
         .append_batch("hot", Version::NoStream, &[rec("hot.type", b"0")])
         .await
         .expect("priming append");
-    assert_eq!(engine.meta_persist_call_count(), 1, "priming append: exactly one flush");
+    assert_eq!(
+        engine.meta_persist_call_count(),
+        1,
+        "priming append: exactly one flush"
+    );
 
     let mut expected = Version::At(0);
     for i in 0..500u64 {
@@ -135,7 +148,8 @@ async fn hot_path_appends_add_zero_meta_flushes() {
     assert_eq!(
         engine.meta_persist_call_count(),
         1,
-        "500 no-new-name appends must add ZERO durable meta flushes beyond the priming one"
+        "500 no-new-name appends must add ZERO durable meta flushes beyond \
+         the priming one"
     );
     assert_eq!(engine.head("hot").await.unwrap(), Version::At(500));
 }
@@ -146,7 +160,8 @@ async fn hot_path_appends_add_zero_meta_flushes() {
 /// every one of them must reopen correctly-named afterwards — the
 /// concurrency counterpart to the sequential tests above.
 #[tokio::test]
-async fn concurrent_new_stream_names_each_flush_exactly_once_and_survive_reopen() {
+async fn concurrent_new_stream_names_each_flush_exactly_once_and_survive_reopen()
+ {
     let dir = tempfile::tempdir().expect("tempdir");
     let store_path = dir.path().join("store");
     let engine = LogEngine::open(&store_path).expect("open");
@@ -173,7 +188,8 @@ async fn concurrent_new_stream_names_each_flush_exactly_once_and_survive_reopen(
     assert_eq!(
         engine.meta_persist_call_count(),
         N as u64,
-        "exactly one durable flush per newly-interned stream name, even under concurrency"
+        "exactly one durable flush per newly-interned stream name, even under \
+         concurrency"
     );
 
     drop(engine);
@@ -200,12 +216,17 @@ async fn reopen_after_new_name_append_resolves_correct_name_everywhere() {
     {
         let engine = LogEngine::open(&store_path).expect("open fresh");
         engine
-            .append_batch("acct-42", Version::NoStream, &[rec("account.opened", b"carol")])
+            .append_batch(
+                "acct-42",
+                Version::NoStream,
+                &[rec("account.opened", b"carol")],
+            )
             .await
             .expect("append with new stream + new type");
     }
 
-    let engine = LogEngine::open(&store_path).expect("reopen must not error EngineError::Meta");
+    let engine = LogEngine::open(&store_path)
+        .expect("reopen must not error EngineError::Meta");
     assert_eq!(engine.head("acct-42").await.unwrap(), Version::At(0));
     let s = engine.read_stream("acct-42", Version::NoStream, 10).await.unwrap();
     assert_eq!(s.len(), 1);

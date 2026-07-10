@@ -14,13 +14,9 @@ struct ThreadWaker {
 }
 
 impl Wake for ThreadWaker {
-    fn wake(self: Arc<Self>) {
-        self.thread.unpark();
-    }
+    fn wake(self: Arc<Self>) { self.thread.unpark(); }
 
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.thread.unpark();
-    }
+    fn wake_by_ref(self: &Arc<Self>) { self.thread.unpark(); }
 }
 
 /// Poll `fut` to completion on the current thread, parking between polls.

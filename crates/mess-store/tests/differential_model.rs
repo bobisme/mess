@@ -21,8 +21,8 @@
 //!
 //! - [`differential_fast_profile`] — 500 seeds x ~40 ops x {cache off, cache
 //!   on} = 1,000 sequences, on every `cargo test -p mess-store`.
-//! - [`differential_full_profile`] — 5,000 seeds x ~40 ops x {cache off,
-//!   cache on} = 10,000 sequences, `#[ignore]`d, run nightly by
+//! - [`differential_full_profile`] — 5,000 seeds x ~40 ops x {cache off, cache
+//!   on} = 10,000 sequences, `#[ignore]`d, run nightly by
 //!   `.github/workflows/differential-store.yml`.
 //! - [`same_seed_same_trace`] — reproducibility: two independent runs of the
 //!   same seed must produce the identical op plan and identical results.
@@ -130,11 +130,18 @@ async fn differential_profile_on_engine() {
     println!(
         "differential ON ENGINE: {ENGINE_SEEDS} seeds x {FAST_OPS} ops x 2 \
          cache configs = {} sequences green against LogEngine; \
-         {crash_reopens_seen} CrashReopen ops, {conflicts_seen} stale AppendRaw",
+         {crash_reopens_seen} CrashReopen ops, {conflicts_seen} stale \
+         AppendRaw",
         ENGINE_SEEDS * 2
     );
-    assert!(crash_reopens_seen > 0, "engine profile never hit a CrashReopen op");
-    assert!(conflicts_seen > 0, "engine profile never hit a stale AppendRaw op");
+    assert!(
+        crash_reopens_seen > 0,
+        "engine profile never hit a CrashReopen op"
+    );
+    assert!(
+        conflicts_seen > 0,
+        "engine profile never hit a stale AppendRaw op"
+    );
 }
 
 /// The full 5k-seed profile. `#[ignore]`d by default; the nightly
@@ -149,7 +156,8 @@ async fn differential_profile_on_engine() {
 /// `CrashReopen` mid-sequence. Cheap enough that the nightly workflow needs
 /// no special-cased timeout and no release build.
 #[tokio::test]
-#[ignore = "full 5k-seed x 2-cache-config profile: run via `cargo test -- --ignored` (nightly CI)"]
+#[ignore = "full 5k-seed x 2-cache-config profile: run via `cargo test -- \
+            --ignored` (nightly CI)"]
 async fn differential_full_profile() {
     let start = std::time::Instant::now();
     let mut crash_reopens_seen = 0u64;

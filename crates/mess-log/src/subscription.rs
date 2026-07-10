@@ -21,13 +21,13 @@
 //! # Two sources, asymmetric authority (spec §3)
 //!
 //! - **History** — [`ReadView`] paged reads. *Authoritative.* Serves only
-//!   positions `< watermark` (the D7 durable end): nothing unacknowledged
-//!   is ever visible. A subscription that polled history exclusively would
-//!   already satisfy §2, just with worse tail latency.
+//!   positions `< watermark` (the D7 durable end): nothing unacknowledged is
+//!   ever visible. A subscription that polled history exclusively would already
+//!   satisfy §2, just with worse tail latency.
 //! - **Live feed** — a bounded, per-subscriber broadcast buffer
-//!   ([`LiveReceiver`]) fed by the [`LiveTap`] pump. *Optimization only,
-//!   zero correctness weight.* Its whole job is to avoid a history
-//!   round-trip per commit while caught up.
+//!   ([`LiveReceiver`]) fed by the [`LiveTap`] pump. *Optimization only, zero
+//!   correctness weight.* Its whole job is to avoid a history round-trip per
+//!   commit while caught up.
 //!
 //! # Writer obligation W1, satisfied by construction (spec §4)
 //!
@@ -55,8 +55,8 @@
 //! overflow: {Switching, Live} --Lagged/anomaly--> CatchUp (last unchanged)
 //! ```
 //!
-//! - **CatchUp** — page history from `cursor`; an empty page (proof we
-//!   reached the watermark, SUB2) → Switching.
+//! - **CatchUp** — page history from `cursor`; an empty page (proof we reached
+//!   the watermark, SUB2) → Switching.
 //! - **Switching** — history drained; draining the live buffer, no live
 //!   delivery yet since entering.
 //! - **Live** — delivered ≥1 live position since the last switch.
@@ -139,18 +139,18 @@ pub enum RecvOutcome {
 
 struct BroadcastInner {
     /// Most-recent `cap` positions, oldest at the front.
-    buf: VecDeque<u64>,
-    cap: usize,
+    buf:      VecDeque<u64>,
+    cap:      usize,
     /// Absolute sequence number of `buf.front()` (0 if empty). `next_seq -
     /// buf.len()`.
     base_seq: u64,
     /// Total positions ever pushed == sequence one past the newest.
     next_seq: u64,
     /// Live sender count; `Closed` is observable once it reaches 0.
-    senders: usize,
+    senders:  usize,
     /// Parked receiver wakers, woken on every push/close (each re-registers
     /// on its next poll if still not satisfied — the watermark's discipline).
-    wakers: Vec<Waker>,
+    wakers:   Vec<Waker>,
 }
 
 impl BroadcastInner {
@@ -217,7 +217,7 @@ impl LiveHandle {
 /// The consuming half of the live broadcast: one independent bounded cursor
 /// over the shared ring.
 pub struct LiveReceiver {
-    inner: Arc<Mutex<BroadcastInner>>,
+    inner:    Arc<Mutex<BroadcastInner>>,
     read_seq: u64,
 }
 
@@ -225,13 +225,14 @@ impl LiveReceiver {
     /// Await the next [`RecvOutcome`]. Resolves immediately if a value (or a
     /// lag, or closure) is already available; otherwise parks until the next
     /// [`LiveSender::send`] or the sender drops.
-    pub fn recv(&mut self) -> Recv<'_> {
-        Recv { rx: self }
-    }
+    pub fn recv(&mut self) -> Recv<'_> { Recv { rx: self } }
 
     /// Non-blocking poll of the receiver's ring cursor. `None` means "no
     /// value, lag, or closure available right now" (would park).
-    fn poll_next(&mut self, cx: Option<&mut Context<'_>>) -> Option<RecvOutcome> {
+    fn poll_next(
+        &mut self,
+        cx: Option<&mut Context<'_>>,
+    ) -> Option<RecvOutcome> {
         let mut st = self.inner.lock().unwrap();
         if self.read_seq < st.base_seq {
             // Lapped: the producer overran this receiver. Resume at the
@@ -288,9 +289,9 @@ impl Notify {
     fn new() -> Self {
         Notify { inner: Arc::new(Mutex::new((false, Vec::new()))) }
     }
-    fn handle(&self) -> Notify {
-        Notify { inner: self.inner.clone() }
-    }
+
+    fn handle(&self) -> Notify { Notify { inner: self.inner.clone() } }
+
     fn fire(&self) {
         let mut st = self.inner.lock().unwrap();
         st.0 = true;
@@ -298,9 +299,8 @@ impl Notify {
             w.wake();
         }
     }
-    fn wait(&self) -> NotifyWait {
-        NotifyWait { inner: self.inner.clone() }
-    }
+
+    fn wait(&self) -> NotifyWait { NotifyWait { inner: self.inner.clone() } }
 }
 
 struct NotifyWait {
@@ -309,6 +309,7 @@ struct NotifyWait {
 
 impl Future for NotifyWait {
     type Output = ();
+
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let mut st = self.inner.lock().unwrap();
         if st.0 {
@@ -334,6 +335,7 @@ where
     B: Future<Output = ()> + Unpin,
 {
     type Output = bool;
+
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<bool> {
         // Both futures are `Unpin` (the watermark `WaitFor` and `NotifyWait`
         // hold only `Arc`s and a `u64`), so no unsafe pin projection is
@@ -363,10 +365,10 @@ where
 /// One tap serves a whole store: any number of subscriptions attach via
 /// [`LiveTap::subscribe`] / [`subscribe`](crate::subscription::subscribe).
 pub struct LiveTap {
-    handle: LiveHandle,
+    handle:    LiveHandle,
     watermark: Watermark,
-    stop: Notify,
-    done: Notify,
+    stop:      Notify,
+    done:      Notify,
 }
 
 impl LiveTap {
@@ -419,19 +421,13 @@ impl LiveTap {
     /// Attach a receiver to the live feed (SUB1: before the first history
     /// read). Prefer [`subscribe`](crate::subscription::subscribe), which
     /// wires this to a [`ReadView`] and the state machine.
-    pub fn subscribe(&self) -> LiveReceiver {
-        self.handle.subscribe()
-    }
+    pub fn subscribe(&self) -> LiveReceiver { self.handle.subscribe() }
 
     /// A clone of the underlying handle, for building subscriptions.
-    pub fn handle(&self) -> LiveHandle {
-        self.handle.clone()
-    }
+    pub fn handle(&self) -> LiveHandle { self.handle.clone() }
 
     /// The watermark this tap pumps (for building [`ReadView`]s / lag).
-    pub fn watermark(&self) -> Watermark {
-        self.watermark.clone()
-    }
+    pub fn watermark(&self) -> Watermark { self.watermark.clone() }
 
     /// Signal the pump to stop and await its exit. After this the tap no
     /// longer publishes (the pump's sender drops → receivers see `Closed`
@@ -451,11 +447,17 @@ impl Drop for LiveTap {
     }
 }
 
-async fn run_pump(watermark: Watermark, sender: LiveSender, stop: Notify, start: u64) {
+async fn run_pump(
+    watermark: Watermark,
+    sender: LiveSender,
+    stop: Notify,
+    start: u64,
+) {
     let mut cursor = start;
     loop {
         // Wake on the next watermark advance past `cursor` OR on shutdown.
-        let advanced = Race { a: watermark.await_past(cursor), b: stop.wait() }.await;
+        let advanced =
+            Race { a: watermark.await_past(cursor), b: stop.wait() }.await;
         if !advanced {
             break; // shutdown
         }
@@ -497,23 +499,23 @@ pub enum SubState {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SubMetrics {
     /// Positions delivered from history (the authoritative source).
-    pub history_delivered: u64,
+    pub history_delivered:   u64,
     /// Positions delivered from the live feed.
-    pub live_delivered: u64,
+    pub live_delivered:      u64,
     /// Live positions dropped by the `< cursor` overlap dedupe (SUB4).
-    pub dedupe_skips: u64,
+    pub dedupe_skips:        u64,
     /// Regressions to CatchUp caused by a `Lagged` overflow (SUB6). Loud
     /// operational signal, never a consumer-visible error (SUB7).
-    pub lag_regressions: u64,
+    pub lag_regressions:     u64,
     /// Regressions caused by an in-order gap with **no** preceding overflow
     /// signal (SUB8). Impossible under W1+SUB1; MUST be 0 across the
     /// conformance suite — a nonzero count is a broken W1 (publish escaped
     /// the durable-before-publish/ascending discipline).
     pub anomaly_regressions: u64,
     /// CatchUp → Switching transitions (empty-page switches, SUB2).
-    pub switches: u64,
+    pub switches:            u64,
     /// History pages read (including the empty page that triggers a switch).
-    pub catchup_pages: u64,
+    pub catchup_pages:       u64,
 }
 
 /// A subscription that could not (re)attach at its cursor because the log
@@ -522,10 +524,13 @@ pub struct SubMetrics {
 /// application logic knows whether their downstream effects need
 /// compensating, so this MUST surface rather than be silently re-subscribed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("cursor {cursor} regressed past log end {log_end} (positions {log_end}..{cursor} no longer exist)")]
+#[error(
+    "cursor {cursor} regressed past log end {log_end} (positions \
+     {log_end}..{cursor} no longer exist)"
+)]
 pub struct CursorRegressed {
     /// The subscription's next-to-deliver cursor.
-    pub cursor: u64,
+    pub cursor:  u64,
     /// The freshly observed exclusive durable end (log end).
     pub log_end: u64,
 }
@@ -555,21 +560,21 @@ pub enum SubError {
 ///
 /// Build one with [`subscribe`](crate::subscription::subscribe).
 pub struct Subscription<F: Fs> {
-    view: ReadView<F>,
-    rx: LiveReceiver,
+    view:       ReadView<F>,
+    rx:         LiveReceiver,
     /// Next position to deliver. `cursor - 1` is the spec's `last`
     /// delivered; the `< cursor` dedupe below is the spec's `<= last`.
-    cursor: u64,
-    state: SubState,
+    cursor:     u64,
+    state:      SubState,
     page_limit: usize,
-    metrics: SubMetrics,
+    metrics:    SubMetrics,
     /// Positions from the current history page not yet handed out.
-    pending: VecDeque<u64>,
+    pending:    VecDeque<u64>,
     /// Set once the live feed is observed closed AND history is drained.
-    ended: bool,
+    ended:      bool,
     /// Shared lag view: the watermark, read on demand for `watermark -
     /// cursor` (SUB9).
-    watermark: Watermark,
+    watermark:  Watermark,
 }
 
 /// Create a subscription at `cursor` (next position to deliver) over
@@ -604,19 +609,13 @@ pub fn subscribe<F: Fs>(
 
 impl<F: Fs> Subscription<F> {
     /// The current observable state (spec §5).
-    pub fn state(&self) -> SubState {
-        self.state
-    }
+    pub fn state(&self) -> SubState { self.state }
 
     /// A snapshot of this subscription's counters.
-    pub fn metrics(&self) -> SubMetrics {
-        self.metrics
-    }
+    pub fn metrics(&self) -> SubMetrics { self.metrics }
 
     /// The next position this subscription will deliver.
-    pub fn cursor(&self) -> u64 {
-        self.cursor
-    }
+    pub fn cursor(&self) -> u64 { self.cursor }
 
     /// Per-subscription lag: `watermark - cursor` (spec §9, SUB9) — the
     /// count of committed positions not yet delivered. `0` when caught up.
@@ -638,9 +637,12 @@ impl<F: Fs> Subscription<F> {
         let end = prefix.next_pos(); // == watermark on a batch boundary
         self.metrics.catchup_pages += 1;
         if self.cursor > end {
-            return Err(CursorRegressed { cursor: self.cursor, log_end: end }.into());
+            return Err(
+                CursorRegressed { cursor: self.cursor, log_end: end }.into()
+            );
         }
-        let page_end = end.min(self.cursor.saturating_add(self.page_limit as u64));
+        let page_end =
+            end.min(self.cursor.saturating_add(self.page_limit as u64));
         // Positions [cursor, page_end) are all durable and dense (A1), so
         // they are genuinely present in the committed prefix just read.
         Ok((self.cursor..page_end).collect())
@@ -648,10 +650,10 @@ impl<F: Fs> Subscription<F> {
 
     /// Pull the next delivered position, driving the state machine.
     ///
-    /// - `Ok(Some(p))` — position `p` delivered in order (`p == cursor`
-    ///   before the call).
-    /// - `Ok(None)` — the subscription ended: the live feed closed and
-    ///   history is fully drained (nothing can ever arrive).
+    /// - `Ok(Some(p))` — position `p` delivered in order (`p == cursor` before
+    ///   the call).
+    /// - `Ok(None)` — the subscription ended: the live feed closed and history
+    ///   is fully drained (nothing can ever arrive).
     /// - `Err(CursorRegressed)` — SUB10; the consumer must handle it (§10)
     ///   before re-subscribing from `log_end`.
     /// - `Err(Io)` — an authoritative history read failed.
@@ -659,7 +661,10 @@ impl<F: Fs> Subscription<F> {
         loop {
             // Hand out any buffered history-page position first.
             if let Some(p) = self.pending.pop_front() {
-                debug_assert_eq!(p, self.cursor, "history pages are dense (SUB3)");
+                debug_assert_eq!(
+                    p, self.cursor,
+                    "history pages are dense (SUB3)"
+                );
                 self.cursor = p + 1;
                 self.metrics.history_delivered += 1;
                 return Ok(Some(p));
@@ -726,24 +731,25 @@ impl<F: Fs> Subscription<F> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
     use super::*;
     use crate::committer::{
         AppendOutcome, AppendRequest, Committer, Durability, EventInput,
     };
     use crate::runtime::{Clock, RealRuntime, Runtime, SimRuntime};
     use crate::writer::{SegmentParams, SegmentWriter};
-    use std::path::Path;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Duration;
 
     // A single-stream batch of `n` events; payloads are irrelevant to the
     // handoff problem (delivery is over positions).
     fn req(stream: u64, version: u64, n: usize) -> AppendRequest {
         AppendRequest {
-            stream_id: stream,
-            category_id: 0,
+            stream_id:            stream,
+            category_id:          0,
             first_stream_version: version,
-            events: (0..n)
+            events:               (0..n)
                 .map(|i| EventInput::plain(1, 1, 0, vec![(i as u8) ^ 0x5A; 8]))
                 .collect(),
         }
@@ -822,19 +828,22 @@ mod tests {
     #[derive(Clone)]
     struct SubPlan {
         start_cursor: u64,
-        page_limit: usize,
-        slow: bool,
+        page_limit:   usize,
+        slow:         bool,
     }
 
     #[derive(Clone)]
     struct Scenario {
         live_capacity: usize,
-        pre_events: u64,
-        bursts: Vec<u64>, // extra-event bursts committed by the writer
-        subs: Vec<SubPlan>,
+        pre_events:    u64,
+        bursts:        Vec<u64>, // extra-event bursts committed by the writer
+        subs:          Vec<SubPlan>,
     }
 
-    fn gen_scenario(rng: &mut crate::runtime::Rng, tiny_buffer: bool) -> Scenario {
+    fn gen_scenario(
+        rng: &mut crate::runtime::Rng,
+        tiny_buffer: bool,
+    ) -> Scenario {
         let live_capacity = if tiny_buffer {
             2 + rng.below(3) as usize // 2..=4
         } else {
@@ -842,7 +851,8 @@ mod tests {
         };
         let pre_events = if rng.chance(0.2) { 0 } else { rng.below(41) };
         let n_bursts = 1 + rng.below(8);
-        let bursts: Vec<u64> = (0..n_bursts).map(|_| 1 + rng.below(12)).collect();
+        let bursts: Vec<u64> =
+            (0..n_bursts).map(|_| 1 + rng.below(12)).collect();
         let extra: u64 = bursts.iter().sum();
         let final_wm = pre_events + extra;
         let n_subs = 1 + rng.below(3);
@@ -868,7 +878,8 @@ mod tests {
         let mut expect = start;
         for (i, &p) in got.iter().enumerate() {
             assert_eq!(
-                p, expect,
+                p,
+                expect,
                 "{label}: at index {i} expected {expect} got {p} ({})",
                 if p > expect { "gap" } else { "dup/reorder" },
             );
@@ -876,21 +887,22 @@ mod tests {
         }
         assert_eq!(
             expect, final_wm,
-            "{label}: delivered up to {expect} but final watermark is {final_wm} (missing tail)",
+            "{label}: delivered up to {expect} but final watermark is \
+             {final_wm} (missing tail)",
         );
     }
 
     // Aggregate counters proving the interesting paths ran.
     #[derive(Default)]
     struct Agg {
-        scenarios: u64,
+        scenarios:   u64,
         subscribers: u64,
-        history: u64,
-        live: u64,
-        dedupe: u64,
-        lags: u64,
-        switches: u64,
-        pages: u64,
+        history:     u64,
+        live:        u64,
+        dedupe:      u64,
+        lags:        u64,
+        switches:    u64,
+        pages:       u64,
     }
     impl Agg {
         fn add(&mut self, m: &[SubMetrics]) {
@@ -909,12 +921,20 @@ mod tests {
                 );
             }
         }
+
         fn print(&self, name: &str) {
             println!(
-                "[{name}] scenarios={} subscribers={} delivered(history={}, live={}) \
-                 dedupe_skips={} lag_regressions={} switches={} catchup_pages={}",
-                self.scenarios, self.subscribers, self.history, self.live,
-                self.dedupe, self.lags, self.switches, self.pages,
+                "[{name}] scenarios={} subscribers={} delivered(history={}, \
+                 live={}) dedupe_skips={} lag_regressions={} switches={} \
+                 catchup_pages={}",
+                self.scenarios,
+                self.subscribers,
+                self.history,
+                self.live,
+                self.dedupe,
+                self.lags,
+                self.switches,
+                self.pages,
             );
         }
     }
@@ -926,7 +946,8 @@ mod tests {
         let fs = rt.fs();
         let path = Path::new("/seg");
         let writer =
-            SegmentWriter::create(&fs, path, SegmentParams::new(0, 0, 1, 0)).unwrap();
+            SegmentWriter::create(&fs, path, SegmentParams::new(0, 0, 1, 0))
+                .unwrap();
         let extra: u64 = sc.bursts.iter().sum();
         let final_wm = sc.pre_events + extra;
 
@@ -945,14 +966,19 @@ mod tests {
             }
             assert_eq!(c.watermark().get(), sc.pre_events);
 
-            let tap = LiveTap::spawn_with_capacity(&rt, c.watermark(), sc.live_capacity);
+            let tap = LiveTap::spawn_with_capacity(
+                &rt,
+                c.watermark(),
+                sc.live_capacity,
+            );
 
             // Subscribers, each owning its Subscription and draining it to
             // its expected count (delivery is exactly start..final_wm).
             let mut consumers = Vec::new();
             for plan in sc.subs.iter().cloned() {
                 let view = ReadView::new(fs.clone(), path, tap.watermark());
-                let sub = subscribe(&tap, view, plan.start_cursor, plan.page_limit);
+                let sub =
+                    subscribe(&tap, view, plan.start_cursor, plan.page_limit);
                 let rt2 = rt.clone();
                 let expected = (final_wm - plan.start_cursor) as usize;
                 consumers.push(rt.spawn(async move {
@@ -985,7 +1011,8 @@ mod tests {
             let writer_task = rt.spawn(async move {
                 let mut start_ver = pre;
                 for b in bursts {
-                    let out = ap.append(req(0, start_ver, b as usize)).await.unwrap();
+                    let out =
+                        ap.append(req(0, start_ver, b as usize)).await.unwrap();
                     assert!(matches!(out, AppendOutcome::Acked { .. }));
                     start_ver += b;
                     rt3.sleep(Duration::from_micros(20)).await;
@@ -999,7 +1026,10 @@ mod tests {
             for (i, ch) in consumers.into_iter().enumerate() {
                 let (got, m) = ch.await;
                 check_exact(
-                    &format!("seed {seed} sub {i} (cursor {})", sc.subs[i].start_cursor),
+                    &format!(
+                        "seed {seed} sub {i} (cursor {})",
+                        sc.subs[i].start_cursor
+                    ),
                     sc.subs[i].start_cursor,
                     final_wm,
                     &got,
@@ -1045,7 +1075,11 @@ mod tests {
             agg.add(&run_scenario(0x0F10_0000 + seed, sc));
         }
         agg.print("overflow_storm");
-        assert!(agg.lags >= 100, "expected frequent Lagged regressions, got {}", agg.lags);
+        assert!(
+            agg.lags >= 100,
+            "expected frequent Lagged regressions, got {}",
+            agg.lags
+        );
     }
 
     /// Racing switch: subscriber starts exactly at the pre-head while the
@@ -1060,21 +1094,25 @@ mod tests {
             let mut rng = crate::runtime::Rng::new(0xACE0_0000 + seed);
             let pre = 10 + rng.below(40);
             let n_bursts = 4 + rng.below(8);
-            let bursts: Vec<u64> = (0..n_bursts).map(|_| 1 + rng.below(10)).collect();
+            let bursts: Vec<u64> =
+                (0..n_bursts).map(|_| 1 + rng.below(10)).collect();
             let sc = Scenario {
                 live_capacity: 4 + rng.below(13) as usize,
                 pre_events: pre,
                 bursts,
                 subs: vec![SubPlan {
                     start_cursor: pre, // at head: switches immediately
-                    page_limit: 1 + rng.below(8) as usize,
-                    slow: rng.chance(0.3),
+                    page_limit:   1 + rng.below(8) as usize,
+                    slow:         rng.chance(0.3),
                 }],
             };
             agg.add(&run_scenario(0xACE0_0000 + seed, sc));
         }
         agg.print("racing_switch");
-        assert!(agg.switches >= N, "each racing-switch scenario switches at least once");
+        assert!(
+            agg.switches >= N,
+            "each racing-switch scenario switches at least once"
+        );
     }
 
     // ===================================================================
@@ -1091,9 +1129,13 @@ mod tests {
     fn forever_slower_stays_in_stable_catchup() {
         let sc = Scenario {
             live_capacity: 4,
-            pre_events: 0,
-            bursts: vec![16; 30], // 480 events in fast bursts
-            subs: vec![SubPlan { start_cursor: 0, page_limit: 16, slow: true }],
+            pre_events:    0,
+            bursts:        vec![16; 30], // 480 events in fast bursts
+            subs:          vec![SubPlan {
+                start_cursor: 0,
+                page_limit:   16,
+                slow:         true,
+            }],
         };
         let m = run_scenario(0xF0F0, sc);
         let s = m[0];
@@ -1120,14 +1162,22 @@ mod tests {
     fn overflow_regress_is_loud_and_lossless() {
         let sc = Scenario {
             live_capacity: 2, // tiny
-            pre_events: 5,
-            bursts: vec![20], // one 20-event burst overruns the cap-2 buffer
-            subs: vec![SubPlan { start_cursor: 5, page_limit: 8, slow: false }],
+            pre_events:    5,
+            bursts:        vec![20], /* one 20-event burst overruns the
+                                      * cap-2 buffer */
+            subs:          vec![SubPlan {
+                start_cursor: 5,
+                page_limit:   8,
+                slow:         false,
+            }],
         };
         let m = run_scenario(0xB00F, sc);
         let s = m[0];
         println!("[overflow_regress] {s:?}");
-        assert!(s.lag_regressions >= 1, "the burst must overflow the buffer (loud)");
+        assert!(
+            s.lag_regressions >= 1,
+            "the burst must overflow the buffer (loud)"
+        );
         assert_eq!(s.anomaly_regressions, 0, "no anomaly on overflow (SUB8)");
         // run_scenario already asserted exact delivery of 5..25 (lossless).
     }
@@ -1139,9 +1189,14 @@ mod tests {
     fn start_exactly_at_watermark_delivers_live() {
         let sc = Scenario {
             live_capacity: 32,
-            pre_events: 30,
-            bursts: vec![1; 15], // paced single-event commits, subscriber keeps up
-            subs: vec![SubPlan { start_cursor: 30, page_limit: 8, slow: false }],
+            pre_events:    30,
+            bursts:        vec![1; 15], /* paced single-event commits,
+                                         * subscriber keeps up */
+            subs:          vec![SubPlan {
+                start_cursor: 30,
+                page_limit:   8,
+                slow:         false,
+            }],
         };
         let m = run_scenario(0x1234, sc);
         let s = m[0];
@@ -1157,9 +1212,13 @@ mod tests {
     fn start_on_empty_log() {
         let sc = Scenario {
             live_capacity: 8,
-            pre_events: 0,
-            bursts: vec![10],
-            subs: vec![SubPlan { start_cursor: 0, page_limit: 4, slow: false }],
+            pre_events:    0,
+            bursts:        vec![10],
+            subs:          vec![SubPlan {
+                start_cursor: 0,
+                page_limit:   4,
+                slow:         false,
+            }],
         };
         let m = run_scenario(0xEEEE, sc);
         assert_eq!(m[0].anomaly_regressions, 0);
@@ -1177,7 +1236,8 @@ mod tests {
         let fs = rt.fs();
         let path = Path::new("/seg-reg");
         let writer =
-            SegmentWriter::create(&fs, path, SegmentParams::new(0, 0, 1, 0)).unwrap();
+            SegmentWriter::create(&fs, path, SegmentParams::new(0, 0, 1, 0))
+                .unwrap();
         rt.block_on(async {
             let c = Committer::spawn(&rt, writer, Durability::Os);
             // Commit 5 positions: log end (exclusive) == 5.
@@ -1202,7 +1262,11 @@ mod tests {
             let out = c.append(req(0, 5, 1)).await.unwrap();
             assert!(matches!(out, AppendOutcome::Acked { .. }));
             let p = sub2.next().await.unwrap();
-            assert_eq!(p, Some(5), "at-head sub delivers the next committed position");
+            assert_eq!(
+                p,
+                Some(5),
+                "at-head sub delivers the next committed position"
+            );
             tap.shutdown().await;
             c.shutdown().await;
         });
@@ -1233,7 +1297,8 @@ mod tests {
         let fs = rt.fs();
         let path = Path::new("/seg-naive");
         let writer =
-            SegmentWriter::create(&fs, path, SegmentParams::new(0, 0, 1, 0)).unwrap();
+            SegmentWriter::create(&fs, path, SegmentParams::new(0, 0, 1, 0))
+                .unwrap();
         let (naive_len, final_wm) = rt.block_on(async {
             let c = Committer::spawn(&rt, writer, Durability::Os);
             c.append(req(0, 0, 12)).await.unwrap(); // pre-history: 0..12
@@ -1271,7 +1336,8 @@ mod tests {
                         got.push(p);
                         cursor += 1;
                     }
-                    Some(RecvOutcome::Value(_)) | Some(RecvOutcome::Lagged(_)) => {}
+                    Some(RecvOutcome::Value(_))
+                    | Some(RecvOutcome::Lagged(_)) => {}
                     Some(RecvOutcome::Closed) | None => break,
                 }
                 if cursor >= final_wm {
@@ -1285,7 +1351,8 @@ mod tests {
         assert_eq!(final_wm, 19);
         assert!(
             naive_len < final_wm,
-            "naive protocol must lose the switch-window events (got {naive_len}, final {final_wm})",
+            "naive protocol must lose the switch-window events (got \
+             {naive_len}, final {final_wm})",
         );
 
         // SPECIFIED side: the exact same shape (12 pre + a 7-event burst),
@@ -1294,9 +1361,13 @@ mod tests {
         // that no anomaly regression occurred.
         let sc = Scenario {
             live_capacity: 64,
-            pre_events: 12,
-            bursts: vec![7],
-            subs: vec![SubPlan { start_cursor: 0, page_limit: 8, slow: false }],
+            pre_events:    12,
+            bursts:        vec![7],
+            subs:          vec![SubPlan {
+                start_cursor: 0,
+                page_limit:   8,
+                slow:         false,
+            }],
         };
         let m = run_scenario(0xC0FFEE, sc);
         assert_eq!(m[0].anomaly_regressions, 0);
@@ -1322,9 +1393,7 @@ mod tests {
 
     struct Cleanup(std::path::PathBuf);
     impl Drop for Cleanup {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
+        fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
     }
 
     #[test]
@@ -1337,7 +1406,10 @@ mod tests {
         let writer = SegmentWriter::create(
             &fs,
             &path,
-            SegmentParams { segment_size: 64 * 1024 * 1024, ..SegmentParams::new(0, 0, 1, 0) },
+            SegmentParams {
+                segment_size: 64 * 1024 * 1024,
+                ..SegmentParams::new(0, 0, 1, 0)
+            },
         )
         .unwrap();
 

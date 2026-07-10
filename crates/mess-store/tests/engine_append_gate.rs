@@ -9,9 +9,9 @@
 //! 1. The `ExpectedVersion` check-and-reserve is still atomic PER STREAM: N
 //!    tasks racing `Exact(v)` against the SAME stream must yield exactly one
 //!    winner.
-//! 2. Appends to DIFFERENT streams genuinely overlap in wall-clock time
-//!    under a real (non-tmpfs) durable commit path — the thing the old
-//!    store-wide gate made impossible.
+//! 2. Appends to DIFFERENT streams genuinely overlap in wall-clock time under a
+//!    real (non-tmpfs) durable commit path — the thing the old store-wide gate
+//!    made impossible.
 #![cfg(not(miri))]
 
 use std::path::PathBuf;
@@ -55,7 +55,11 @@ async fn same_stream_exact_version_race_has_exactly_one_winner() {
 
     // Establish the stream at version 0.
     engine
-        .append_batch("race-stream", Version::NoStream, &[rec("Opened", b"seed")])
+        .append_batch(
+            "race-stream",
+            Version::NoStream,
+            &[rec("Opened", b"seed")],
+        )
         .await
         .expect("seed append");
     assert_eq!(engine.head("race-stream").await.unwrap(), Version::At(0));
@@ -81,24 +85,38 @@ async fn same_stream_exact_version_race_has_exactly_one_winner() {
         match h.await.expect("task panicked") {
             Ok(appended) => {
                 wins += 1;
-                assert_eq!(appended.version, Version::At(1), "winner lands at version 1");
+                assert_eq!(
+                    appended.version,
+                    Version::At(1),
+                    "winner lands at version 1"
+                );
             }
             Err(AppendError::Conflict { expected, actual }) => {
                 assert_eq!(expected, Version::At(0));
-                assert_eq!(actual, Version::At(1), "conflict must see the winner's head");
+                assert_eq!(
+                    actual,
+                    Version::At(1),
+                    "conflict must see the winner's head"
+                );
                 conflicts += 1;
             }
             Err(other) => panic!("unexpected error: {other:?}"),
         }
     }
 
-    assert_eq!(wins, 1, "exactly one Exact(0) append must win the race, got {wins}");
+    assert_eq!(
+        wins, 1,
+        "exactly one Exact(0) append must win the race, got {wins}"
+    );
     assert_eq!(conflicts, N - 1);
     assert_eq!(engine.head("race-stream").await.unwrap(), Version::At(1));
 
     // No double/lost writes: exactly 2 events total on the stream (seed +
     // the single winner), and read_stream agrees with the head.
-    let page = engine.read_stream("race-stream", Version::NoStream, 1000).await.unwrap();
+    let page = engine
+        .read_stream("race-stream", Version::NoStream, 1000)
+        .await
+        .unwrap();
     assert_eq!(page.len(), 2);
 }
 
@@ -149,7 +167,11 @@ async fn distinct_streams_overlap_under_durable_commit_path() {
     // into either timed phase below.
     for i in 0..4 {
         engine
-            .append_batch(&format!("warmup-{i}"), Version::NoStream, &[rec("Warmed", b"x")])
+            .append_batch(
+                &format!("warmup-{i}"),
+                Version::NoStream,
+                &[rec("Warmed", b"x")],
+            )
             .await
             .expect("warmup append");
     }
@@ -173,11 +195,19 @@ async fn distinct_streams_overlap_under_durable_commit_path() {
     // (bn-150) and so cannot confound the measurement.
     for i in 0..N {
         engine
-            .append_batch(&format!("serial-{i}"), Version::NoStream, &[rec("Opened", b"seed")])
+            .append_batch(
+                &format!("serial-{i}"),
+                Version::NoStream,
+                &[rec("Opened", b"seed")],
+            )
             .await
             .expect("prime serial stream");
         engine
-            .append_batch(&format!("concurrent-{i}"), Version::NoStream, &[rec("Opened", b"seed")])
+            .append_batch(
+                &format!("concurrent-{i}"),
+                Version::NoStream,
+                &[rec("Opened", b"seed")],
+            )
             .await
             .expect("prime concurrent stream");
     }
@@ -189,7 +219,11 @@ async fn distinct_streams_overlap_under_durable_commit_path() {
     let serial_start = std::time::Instant::now();
     for i in 0..N {
         engine
-            .append_batch(&format!("serial-{i}"), Version::At(0), &[rec("Opened", b"payload")])
+            .append_batch(
+                &format!("serial-{i}"),
+                Version::At(0),
+                &[rec("Opened", b"payload")],
+            )
             .await
             .expect("serial append");
     }
@@ -221,24 +255,31 @@ async fn distinct_streams_overlap_under_durable_commit_path() {
     let concurrent_total = concurrent_start.elapsed();
 
     eprintln!(
-        "distinct_streams_overlap_under_durable_commit_path: serial {N}x = {serial_total:?}, \
-         concurrent {N}x = {concurrent_total:?} \
-         (speedup {:.2}x)",
+        "distinct_streams_overlap_under_durable_commit_path: serial {N}x = \
+         {serial_total:?}, concurrent {N}x = {concurrent_total:?} (speedup \
+         {:.2}x)",
         serial_total.as_secs_f64() / concurrent_total.as_secs_f64().max(1e-9)
     );
 
     assert!(
         concurrent_total < serial_total / 2,
-        "expected concurrent distinct-stream appends to be at least 2x faster than the serial \
-         baseline (per-stream gate should let the committer coalesce concurrently in-flight \
-         requests into fewer fdatasync calls); got serial={serial_total:?} \
-         concurrent={concurrent_total:?} — looks like appends are still effectively serialised"
+        "expected concurrent distinct-stream appends to be at least 2x faster \
+         than the serial baseline (per-stream gate should let the committer \
+         coalesce concurrently in-flight requests into fewer fdatasync \
+         calls); got serial={serial_total:?} concurrent={concurrent_total:?} \
+         — looks like appends are still effectively serialised"
     );
 
     // Sanity: every stream actually landed both its priming event (version 0)
     // and its timed event (version 1).
     for i in 0..N {
-        assert_eq!(engine.head(&format!("serial-{i}")).await.unwrap(), Version::At(1));
-        assert_eq!(engine.head(&format!("concurrent-{i}")).await.unwrap(), Version::At(1));
+        assert_eq!(
+            engine.head(&format!("serial-{i}")).await.unwrap(),
+            Version::At(1)
+        );
+        assert_eq!(
+            engine.head(&format!("concurrent-{i}")).await.unwrap(),
+            Version::At(1)
+        );
     }
 }

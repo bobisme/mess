@@ -24,8 +24,8 @@ use mess_store::{Appended, LogEngine, Version};
 
 use crate::config::Config;
 use crate::metrics::LatencyHist;
-use crate::probe::{self, SubCursor, Violation};
 use crate::prng::{Rng, Zipf};
+use crate::probe::{self, SubCursor, Violation};
 use crate::resource;
 use crate::shadow::{Shadow, ShadowEvent};
 
@@ -50,7 +50,7 @@ fn hexp(bytes: &[u8]) -> String {
 #[derive(Debug, Clone)]
 pub struct Aborted {
     pub violation: Violation,
-    pub dump: String,
+    pub dump:      String,
 }
 
 impl std::fmt::Display for Aborted {
@@ -63,61 +63,63 @@ impl std::error::Error for Aborted {}
 /// Roll-up stats for a completed run.
 #[derive(Debug, Clone, Default)]
 pub struct SoakReport {
-    pub actions: u64,
-    pub appends: u64,
-    pub events: u64,
-    pub conflicts: u64,
-    pub crashes: u64,
-    pub index_checks: u64,
-    pub density_checks: u64,
-    pub head_checks: u64,
-    pub subscription_reads: u64,
+    pub actions:             u64,
+    pub appends:             u64,
+    pub events:              u64,
+    pub conflicts:           u64,
+    pub crashes:             u64,
+    pub index_checks:        u64,
+    pub density_checks:      u64,
+    pub head_checks:         u64,
+    pub subscription_reads:  u64,
     pub subscribers_created: u64,
-    pub max_reopen: Duration,
-    pub last_reopen: Duration,
-    pub sealed_segments: usize,
-    pub final_events: u64,
-    pub fsync: String,
+    pub max_reopen:          Duration,
+    pub last_reopen:         Duration,
+    pub sealed_segments:     usize,
+    pub final_events:        u64,
+    pub fsync:               String,
 }
 
 /// The driver state.
 pub struct Driver {
-    cfg: Config,
-    rng: Rng,
-    zipf: Zipf,
-    shadow: Shadow,
-    engine: Option<LogEngine>,
-    subs: Vec<SubCursor>,
-    hist: LatencyHist,
-    write_nonce: u64,
-    sub_seq: u64,
-    report: SoakReport,
-    started: Instant,
+    cfg:                   Config,
+    rng:                   Rng,
+    zipf:                  Zipf,
+    shadow:                Shadow,
+    engine:                Option<LogEngine>,
+    subs:                  Vec<SubCursor>,
+    hist:                  LatencyHist,
+    write_nonce:           u64,
+    sub_seq:               u64,
+    report:                SoakReport,
+    started:               Instant,
     /// `report.actions` at the last crash cycle — the crash trigger is pinned
     /// to the deterministic action count (`crash_every_actions`), never
     /// wall-clock, so crash points reproduce exactly across machines and CPU
     /// load (reviewer nit, bn-3dr).
     actions_at_last_crash: u64,
-    last_metrics: Instant,
+    last_metrics:          Instant,
     /// Payloads the driver GENERATED for an append that did not return `Ok`
     /// (a version conflict, or an error) — so the events were never acked and
-    /// (correctly) never written durably. An engine "extra" whose payload is in
-    /// here means the engine surfaced a conflicted/failed append's bytes: a real
-    /// bug (it was never a durable, ordered write), classified as `fabricated`.
-    generated_unacked: std::collections::HashSet<Vec<u8>>,
+    /// (correctly) never written durably. An engine "extra" whose payload is
+    /// in here means the engine surfaced a conflicted/failed append's
+    /// bytes: a real bug (it was never a durable, ordered write),
+    /// classified as `fabricated`.
+    generated_unacked:     std::collections::HashSet<Vec<u8>>,
     /// The spec-02 A6 candidate set: payloads the driver has SUBMITTED to
     /// `append_batch` but whose result it has not yet observed. A crash that
-    /// interrupts an in-flight append leaves its payload here; recovery MAY then
-    /// legally surface that complete-but-unacked batch (spec 02 §6 A6 / §3.1
-    /// Z1), so a post-reopen "extra" whose payload matches a candidate is
-    /// correct, not a violation. In this strictly-sequential driver every
-    /// `append_batch` is awaited to a definite result before the next action (a
-    /// crash only fires *between* actions), so this set is empty at every probe
-    /// point — which is *why* the sequential driver can never legally surface an
-    /// extra. Tracked explicitly so the invariant is the spec-correct
-    /// candidate-set form (robust if the workload ever gains real concurrency)
-    /// rather than a blunt count compare.
-    inflight: std::collections::HashMap<Vec<u8>, (String, u64)>,
+    /// interrupts an in-flight append leaves its payload here; recovery MAY
+    /// then legally surface that complete-but-unacked batch (spec 02 §6 A6
+    /// / §3.1 Z1), so a post-reopen "extra" whose payload matches a
+    /// candidate is correct, not a violation. In this strictly-sequential
+    /// driver every `append_batch` is awaited to a definite result before
+    /// the next action (a crash only fires *between* actions), so this set
+    /// is empty at every probe point — which is *why* the sequential
+    /// driver can never legally surface an extra. Tracked explicitly so
+    /// the invariant is the spec-correct candidate-set form (robust if the
+    /// workload ever gains real concurrency) rather than a blunt count
+    /// compare.
+    inflight:              std::collections::HashMap<Vec<u8>, (String, u64)>,
 }
 
 impl Driver {
@@ -127,14 +129,18 @@ impl Driver {
     /// dir is tmpfs, or if the engine cannot open.
     pub fn open(cfg: Config) -> Result<Self, String> {
         resource::guard_fresh_dir(&cfg.dir)?;
-        if resource::is_tmpfs(&cfg.dir).map_err(|e| format!("tmpfs check: {e}"))? {
+        if resource::is_tmpfs(&cfg.dir)
+            .map_err(|e| format!("tmpfs check: {e}"))?
+        {
             return Err(format!(
-                "refusing to soak on tmpfs dir {} — fdatasync is a no-op there, so a \
-                 durability/crash soak would validate nothing (--dir must be a real device)",
+                "refusing to soak on tmpfs dir {} — fdatasync is a no-op \
+                 there, so a durability/crash soak would validate nothing \
+                 (--dir must be a real device)",
                 cfg.dir.display()
             ));
         }
-        std::fs::create_dir_all(&cfg.dir).map_err(|e| format!("create_dir_all: {e}"))?;
+        std::fs::create_dir_all(&cfg.dir)
+            .map_err(|e| format!("create_dir_all: {e}"))?;
         let engine = LogEngine::open_with(&cfg.dir, cfg.engine_options())
             .map_err(|e| format!("open engine: {e}"))?;
         let rng = Rng::new(cfg.seed);
@@ -163,9 +169,7 @@ impl Driver {
         self.engine.as_ref().expect("engine present between crash cycles")
     }
 
-    fn stream_name(&self, idx: usize) -> String {
-        format!("stream-{idx:05}")
-    }
+    fn stream_name(&self, idx: usize) -> String { format!("stream-{idx:05}") }
 
     /// Run the soak to completion (or to the first violation).
     pub async fn run(&mut self) -> Result<SoakReport, Aborted> {
@@ -189,7 +193,8 @@ impl Driver {
                 self.last_metrics = Instant::now();
             }
         }
-        // A final full reconciliation so the run ends on a proven-consistent store.
+        // A final full reconciliation so the run ends on a proven-consistent
+        // store.
         self.reconcile_after_reopen().await?;
         self.report.final_events = self.engine().total_events() as u64;
         self.report.sealed_segments = self.engine().sealed_segment_count();
@@ -231,8 +236,12 @@ impl Driver {
             data.extend_from_slice(&nonce.to_le_bytes());
             data.extend_from_slice(&(first_sp + k as u64).to_le_bytes());
             data.extend_from_slice(&self.cfg.seed.to_le_bytes());
-            records.push(RecordToAppend { message_type: ty.to_string(), data: data.clone() });
-            shadow_events.push(ShadowEvent { message_type: ty.to_string(), data });
+            records.push(RecordToAppend {
+                message_type: ty.to_string(),
+                data:         data.clone(),
+            });
+            shadow_events
+                .push(ShadowEvent { message_type: ty.to_string(), data });
         }
 
         // Mark every event of this batch in-flight (a spec-02 A6 candidate)
@@ -242,7 +251,8 @@ impl Driver {
         // probe — the candidate set is empty at reconcile. Tracked so the probe
         // is the spec-correct candidate-set form all the same.
         for (k, ev) in shadow_events.iter().enumerate() {
-            self.inflight.insert(ev.data.clone(), (stream.clone(), first_sp + k as u64));
+            self.inflight
+                .insert(ev.data.clone(), (stream.clone(), first_sp + k as u64));
         }
 
         let t0 = Instant::now();
@@ -257,16 +267,22 @@ impl Driver {
             Ok(Appended { version, last_global_position }) => {
                 let k = batch as u64;
                 let first_global = last_global_position + 1 - k;
-                // The engine's own accounting must agree with what we asked for.
+                // The engine's own accounting must agree with what we asked
+                // for.
                 let want_version = Version::At(first_sp + k - 1);
                 if version != want_version {
                     return Err(self.abort(Violation::HeadMismatch {
-                        stream: stream.clone(),
+                        stream:   stream.clone(),
                         expected: want_version,
-                        got: version,
+                        got:      version,
                     }));
                 }
-                self.shadow.record_append(&stream, first_sp, first_global, &shadow_events);
+                self.shadow.record_append(
+                    &stream,
+                    first_sp,
+                    first_global,
+                    &shadow_events,
+                );
                 self.report.appends += 1;
                 self.report.events += k;
                 Ok(())
@@ -275,19 +291,19 @@ impl Driver {
                 // The driver is the single writer of record, so a conflict is
                 // unexpected but not itself a durability violation — count it
                 // and move on (the shadow is untouched). Remember the generated
-                // payloads: they were never acked and must never surface durably
-                // (the --dump-extras classifier checks exactly this).
+                // payloads: they were never acked and must never surface
+                // durably (the --dump-extras classifier checks
+                // exactly this).
                 for ev in &shadow_events {
                     self.generated_unacked.insert(ev.data.clone());
                 }
                 self.report.conflicts += 1;
                 Ok(())
             }
-            Err(mess_store::backend::AppendError::Backend(e)) => {
-                Err(self.abort(Violation::RecoveryLoss {
+            Err(mess_store::backend::AppendError::Backend(e)) => Err(self
+                .abort(Violation::RecoveryLoss {
                     detail: format!("append to {stream} failed: {e}"),
-                }))
-            }
+                })),
         }
     }
 
@@ -304,8 +320,10 @@ impl Driver {
             let total = self.shadow.total();
             // Half join full (from 0), half join at the live tail.
             let start = if self.rng.chance(0.5) { 0 } else { total };
-            self.subs
-                .push(SubCursor::joining_from(format!("sub-{}", self.sub_seq), start));
+            self.subs.push(SubCursor::joining_from(
+                format!("sub-{}", self.sub_seq),
+                start,
+            ));
             self.report.subscribers_created += 1;
         }
         if self.subs.is_empty() {
@@ -328,11 +346,16 @@ impl Driver {
             // Cross-check the delivered payload against the shadow at that
             // global position while we are here (a subscription that delivers
             // the wrong bytes is as bad as a gap).
-            if let Some(expected) = self.shadow.event_at_global(rec.global_position) {
+            if let Some(expected) =
+                self.shadow.event_at_global(rec.global_position)
+            {
                 let gref = self.shadow.global_ref(rec.global_position).unwrap();
-                if let Err(v) =
-                    probe::check_record(&gref.stream, gref.stream_pos, expected, &rec)
-                {
+                if let Err(v) = probe::check_record(
+                    &gref.stream,
+                    gref.stream_pos,
+                    expected,
+                    &rec,
+                ) {
                     return Err(self.abort(v));
                 }
             }
@@ -368,48 +391,62 @@ impl Driver {
         };
         let Some(rec) = page.into_iter().next() else {
             return Err(self.abort(Violation::IndexMismatch {
-                stream: gref.stream.clone(),
+                stream:     gref.stream.clone(),
                 stream_pos: gref.stream_pos,
-                field: "global_missing",
-                expected: format!("event at global {gp}"),
-                got: "empty read_global page".into(),
+                field:      "global_missing",
+                expected:   format!("event at global {gp}"),
+                got:        "empty read_global page".into(),
             }));
         };
         if rec.global_position != gp {
             return Err(self.abort(Violation::IndexMismatch {
-                stream: gref.stream.clone(),
+                stream:     gref.stream.clone(),
                 stream_pos: gref.stream_pos,
-                field: "global_position",
-                expected: gp.to_string(),
-                got: rec.global_position.to_string(),
+                field:      "global_position",
+                expected:   gp.to_string(),
+                got:        rec.global_position.to_string(),
             }));
         }
-        if let Err(v) = probe::check_record(&gref.stream, gref.stream_pos, &expected, &rec) {
+        if let Err(v) =
+            probe::check_record(&gref.stream, gref.stream_pos, &expected, &rec)
+        {
             return Err(self.abort(v));
         }
 
         // Path B: the stream tier (hot ActiveIndex or sealed cold path,
         // whichever this stream currently routes through).
-        let after_v =
-            if gref.stream_pos == 0 { Version::NoStream } else { Version::At(gref.stream_pos - 1) };
-        let spage = match self.engine().read_stream(&gref.stream, after_v, 1).await {
-            Ok(p) => p,
-            Err(e) => {
-                return Err(self.abort(Violation::RecoveryLoss {
-                    detail: format!("read_stream({}, {}) failed: {e}", gref.stream, gref.stream_pos),
-                }));
-            }
+        let after_v = if gref.stream_pos == 0 {
+            Version::NoStream
+        } else {
+            Version::At(gref.stream_pos - 1)
         };
+        let spage =
+            match self.engine().read_stream(&gref.stream, after_v, 1).await {
+                Ok(p) => p,
+                Err(e) => {
+                    return Err(self.abort(Violation::RecoveryLoss {
+                        detail: format!(
+                            "read_stream({}, {}) failed: {e}",
+                            gref.stream, gref.stream_pos
+                        ),
+                    }));
+                }
+            };
         let Some(srec) = spage.into_iter().next() else {
             return Err(self.abort(Violation::IndexMismatch {
-                stream: gref.stream.clone(),
+                stream:     gref.stream.clone(),
                 stream_pos: gref.stream_pos,
-                field: "stream_missing",
-                expected: format!("event at {}@{}", gref.stream, gref.stream_pos),
-                got: "empty read_stream page".into(),
+                field:      "stream_missing",
+                expected:   format!(
+                    "event at {}@{}",
+                    gref.stream, gref.stream_pos
+                ),
+                got:        "empty read_stream page".into(),
             }));
         };
-        if let Err(v) = probe::check_record(&gref.stream, gref.stream_pos, &expected, &srec) {
+        if let Err(v) =
+            probe::check_record(&gref.stream, gref.stream_pos, &expected, &srec)
+        {
             return Err(self.abort(v));
         }
         self.report.index_checks += 1;
@@ -438,7 +475,8 @@ impl Driver {
             return Err(self.abort(Violation::Density {
                 stream: name.clone(),
                 detail: format!(
-                    "truncated: shadow has {expect_len} events, engine returned {}",
+                    "truncated: shadow has {expect_len} events, engine \
+                     returned {}",
                     positions.len()
                 ),
             }));
@@ -448,7 +486,10 @@ impl Driver {
     }
 
     /// Page a stream's `stream_position`s in order, up to [`DENSITY_SCAN_CAP`].
-    async fn read_stream_positions(&self, name: &str) -> Result<Vec<u64>, Violation> {
+    async fn read_stream_positions(
+        &self,
+        name: &str,
+    ) -> Result<Vec<u64>, Violation> {
         let mut out = Vec::new();
         let mut cursor = Version::NoStream;
         loop {
@@ -510,7 +551,8 @@ impl Driver {
             return Err(self.abort(v));
         }
         let p99 = self.hist.percentile(99.0);
-        if let Err(v) = probe::check_fsync_p99(p99, self.cfg.fsync_p99_ceiling) {
+        if let Err(v) = probe::check_fsync_p99(p99, self.cfg.fsync_p99_ceiling)
+        {
             return Err(self.abort(v));
         }
         Ok(())
@@ -522,19 +564,28 @@ impl Driver {
         // We are between actions: this sequential driver awaits every append to
         // a definite result before the next, so no append is in flight and the
         // A6 candidate set ([`inflight`](Self::inflight)) is empty here — which
-        // is exactly why the engine may legally surface nothing beyond the acked
-        // set (the reconcile below still asserts the general spec-02 A6 form, so
-        // it stays correct if the workload ever gains real concurrency). Drop the
-        // handle (Inner::Drop shuts the committer + joins the seal thread →
-        // graceful flush + full seal drain) and reopen the SAME dir with NO
-        // shared Arc — a genuine recover-from-disk cycle.
+        // is exactly why the engine may legally surface nothing beyond the
+        // acked set (the reconcile below still asserts the general
+        // spec-02 A6 form, so it stays correct if the workload ever
+        // gains real concurrency). Drop the handle (Inner::Drop shuts
+        // the committer + joins the seal thread → graceful flush + full
+        // seal drain) and reopen the SAME dir with NO shared Arc — a
+        // genuine recover-from-disk cycle.
         if self.cfg.verbose {
-            println!("[soak] crash cycle: dropping and reopening {}", self.cfg.dir.display());
+            println!(
+                "[soak] crash cycle: dropping and reopening {}",
+                self.cfg.dir.display()
+            );
         }
         self.engine = None; // runs Inner::Drop.
         let t0 = Instant::now();
-        let engine = LogEngine::open_with(&self.cfg.dir, self.cfg.engine_options())
-            .map_err(|e| self.abort(Violation::RecoveryLoss { detail: format!("reopen: {e}") }))?;
+        let engine =
+            LogEngine::open_with(&self.cfg.dir, self.cfg.engine_options())
+                .map_err(|e| {
+                    self.abort(Violation::RecoveryLoss {
+                        detail: format!("reopen: {e}"),
+                    })
+                })?;
         let reopen = t0.elapsed();
         self.engine = Some(engine);
         self.report.crashes += 1;
@@ -591,13 +642,15 @@ impl Driver {
         {
             return Err(self.abort(Violation::RecoveryLoss {
                 detail: format!(
-                    "acked global {max_acked} lost: recovered total is only {engine_total} events"
+                    "acked global {max_acked} lost: recovered total is only \
+                     {engine_total} events"
                 ),
             }));
         }
 
         // Page the whole recovered global order once.
-        let mut engine: Vec<StoredRecord> = Vec::with_capacity(engine_total as usize);
+        let mut engine: Vec<StoredRecord> =
+            Vec::with_capacity(engine_total as usize);
         let mut after = None;
         loop {
             let page = match self.engine().read_global(after, 2048).await {
@@ -640,24 +693,33 @@ impl Driver {
                 Some(gref) => {
                     // Part 1: acked event must be byte-exact at its position.
                     let gref = gref.clone();
-                    let expected = self.shadow.event_at_global(gp).unwrap().clone();
-                    if let Err(v) =
-                        probe::check_record(&gref.stream, gref.stream_pos, &expected, rec)
-                    {
+                    let expected =
+                        self.shadow.event_at_global(gp).unwrap().clone();
+                    if let Err(v) = probe::check_record(
+                        &gref.stream,
+                        gref.stream_pos,
+                        &expected,
+                        rec,
+                    ) {
                         return Err(self.abort(v));
                     }
                     acked_seen += 1;
                 }
                 None => {
                     // Part 3: an extra — classify it (pure probe fn).
-                    extras.record(probe::classify_extra(&rec.data, &acked_index, &mut candidates));
+                    extras.record(probe::classify_extra(
+                        &rec.data,
+                        &acked_index,
+                        &mut candidates,
+                    ));
                 }
             }
         }
         if acked_seen != shadow_total {
             return Err(self.abort(Violation::RecoveryLoss {
                 detail: format!(
-                    "acked events unaccounted: matched {acked_seen} of {shadow_total} at their positions"
+                    "acked events unaccounted: matched {acked_seen} of \
+                     {shadow_total} at their positions"
                 ),
             }));
         }
@@ -670,9 +732,9 @@ impl Driver {
             }
             return Err(self.abort(Violation::RecoveryLoss {
                 detail: format!(
-                    "illegal extras after reopen: {} duplicate-of-acked (double-replay) + {} \
-                     fabricated (out of {} total extras; {} were legal submitted-unacked A6 \
-                     candidates)",
+                    "illegal extras after reopen: {} duplicate-of-acked \
+                     (double-replay) + {} fabricated (out of {} total extras; \
+                     {} were legal submitted-unacked A6 candidates)",
                     extras.duplicate_of_acked,
                     extras.fabricated,
                     engine_total - shadow_total,
@@ -686,7 +748,8 @@ impl Driver {
         let names = self.shadow.stream_names();
         let sample = names.len().min(32);
         for _ in 0..sample {
-            let name = names[self.rng.below(names.len() as u64) as usize].clone();
+            let name =
+                names[self.rng.below(names.len() as u64) as usize].clone();
             let positions = match self.read_stream_positions(&name).await {
                 Ok(p) => p,
                 Err(v) => return Err(self.abort(v)),
@@ -700,15 +763,19 @@ impl Driver {
                 Ok(h) => h,
                 Err(e) => {
                     return Err(self.abort(Violation::RecoveryLoss {
-                        detail: format!("head({name}) after reopen failed: {e}"),
+                        detail: format!(
+                            "head({name}) after reopen failed: {e}"
+                        ),
                     }));
                 }
             };
-            if engine_head.next_position() < self.shadow.head(&name).next_position() {
+            if engine_head.next_position()
+                < self.shadow.head(&name).next_position()
+            {
                 return Err(self.abort(Violation::HeadMismatch {
-                    stream: name.clone(),
+                    stream:   name.clone(),
                     expected: self.shadow.head(&name),
-                    got: engine_head,
+                    got:      engine_head,
                 }));
             }
         }
@@ -722,11 +789,16 @@ impl Driver {
     /// generated but whose append never returned `Ok`) — and writes the whole
     /// picture to the configured JSON path. Best-effort: any I/O error here is
     /// printed, never masks the abort that follows.
-    async fn classify_and_dump_extras(&self, shadow_total: u64, engine_total: u64) {
+    async fn classify_and_dump_extras(
+        &self,
+        shadow_total: u64,
+        engine_total: u64,
+    ) {
         let Some(path) = self.cfg.dump_extras.clone() else { return };
 
         // Page the engine's whole global order.
-        let mut engine: Vec<StoredRecord> = Vec::with_capacity(engine_total as usize);
+        let mut engine: Vec<StoredRecord> =
+            Vec::with_capacity(engine_total as usize);
         let mut after = None;
         loop {
             let page = match self.engine().read_global(after, 4096).await {
@@ -744,15 +816,24 @@ impl Driver {
         }
 
         // Multiset of engine payloads → global positions.
-        let mut engine_by_payload: std::collections::HashMap<Vec<u8>, Vec<u64>> =
-            std::collections::HashMap::new();
+        let mut engine_by_payload: std::collections::HashMap<
+            Vec<u8>,
+            Vec<u64>,
+        > = std::collections::HashMap::new();
         for rec in &engine {
-            engine_by_payload.entry(rec.data.clone()).or_default().push(rec.global_position);
+            engine_by_payload
+                .entry(rec.data.clone())
+                .or_default()
+                .push(rec.global_position);
         }
         let acked = self.shadow.acked_payload_index();
 
-        let (mut duplicate_of_acked, mut acked_missing, mut submitted_unacked, mut fabricated) =
-            (0u64, 0u64, 0u64, 0u64);
+        let (
+            mut duplicate_of_acked,
+            mut acked_missing,
+            mut submitted_unacked,
+            mut fabricated,
+        ) = (0u64, 0u64, 0u64, 0u64);
         let mut dup_samples: Vec<String> = Vec::new();
         let mut fab_samples: Vec<String> = Vec::new();
         for (payload, gps) in &engine_by_payload {
@@ -785,11 +866,12 @@ impl Driver {
                     } else {
                         fabricated += ecount;
                         if fab_samples.len() < 20 {
-                            let tag = if self.generated_unacked.contains(payload) {
-                                "was a CONFLICTED (never-durable) append"
-                            } else {
-                                "matches NO submitted append"
-                            };
+                            let tag =
+                                if self.generated_unacked.contains(payload) {
+                                    "was a CONFLICTED (never-durable) append"
+                                } else {
+                                    "matches NO submitted append"
+                                };
                             fab_samples.push(format!(
                                 "payload {} engine@{:?} ({tag})",
                                 hexp(payload),
@@ -801,29 +883,31 @@ impl Driver {
             }
         }
 
-        // Is the shadow prefix 0..shadow_total byte-exact, i.e. are the extras a
-        // clean tail? (A mid-log double-count would shift the prefix.)
+        // Is the shadow prefix 0..shadow_total byte-exact, i.e. are the extras
+        // a clean tail? (A mid-log double-count would shift the
+        // prefix.)
         let mut prefix_divergent = 0u64;
         let bound = shadow_total.min(engine.len() as u64);
         for gp in 0..bound {
             if let Some(exp) = self.shadow.event_at_global(gp) {
                 let got = &engine[gp as usize];
-                if got.data != exp.data || got.message_type != exp.message_type {
+                if got.data != exp.data || got.message_type != exp.message_type
+                {
                     prefix_divergent += 1;
                 }
             }
         }
 
         let json = format!(
-            "{{\n  \"shadow_total\": {shadow_total},\n  \"engine_total\": {engine_total},\n  \
-             \"extras\": {extras},\n  \"conflicts\": {conflicts},\n  \
-             \"generated_unacked_distinct\": {gu},\n  \
-             \"classification\": {{\n    \"duplicateOfAcked\": {duplicate_of_acked},\n    \
-             \"fabricated\": {fabricated},\n    \"submittedUnacked\": {submitted_unacked},\n    \
+            "{{\n  \"shadow_total\": {shadow_total},\n  \"engine_total\": \
+             {engine_total},\n  \"extras\": {extras},\n  \"conflicts\": \
+             {conflicts},\n  \"generated_unacked_distinct\": {gu},\n  \
+             \"classification\": {{\n    \"duplicateOfAcked\": \
+             {duplicate_of_acked},\n    \"fabricated\": {fabricated},\n    \
+             \"submittedUnacked\": {submitted_unacked},\n    \
              \"ackedMissing\": {acked_missing}\n  }},\n  \
-             \"prefix_divergent\": {prefix_divergent},\n  \
-             \"clean_tail\": {clean_tail},\n  \
-             \"duplicate_samples\": [\n    {dups}\n  ],\n  \
+             \"prefix_divergent\": {prefix_divergent},\n  \"clean_tail\": \
+             {clean_tail},\n  \"duplicate_samples\": [\n    {dups}\n  ],\n  \
              \"fabricated_samples\": [\n    {fabs}\n  ]\n}}\n",
             extras = engine_total.saturating_sub(shadow_total),
             conflicts = self.report.conflicts,
@@ -841,8 +925,13 @@ impl Driver {
                 .join(",\n    "),
         );
         match std::fs::write(&path, &json) {
-            Ok(()) => eprintln!("[dump-extras] wrote classification to {}", path.display()),
-            Err(e) => eprintln!("[dump-extras] write {} failed: {e}", path.display()),
+            Ok(()) => eprintln!(
+                "[dump-extras] wrote classification to {}",
+                path.display()
+            ),
+            Err(e) => {
+                eprintln!("[dump-extras] write {} failed: {e}", path.display())
+            }
         }
         eprintln!("[dump-extras] {json}");
     }
@@ -851,12 +940,14 @@ impl Driver {
 
     fn print_metrics(&self) {
         let elapsed = self.started.elapsed();
-        let rss = resource::current_rss_bytes().map(|b| b / (1024 * 1024)).unwrap_or(0);
+        let rss = resource::current_rss_bytes()
+            .map(|b| b / (1024 * 1024))
+            .unwrap_or(0);
         let fd = resource::current_fd_count().unwrap_or(0);
         println!(
             "[soak] t={:>5.0}s actions={} appends={} events={} crashes={} \
-             sealed={} subs={}({} created)\n       rss={}MiB fd={} reopen(last/max)={:?}/{:?} \
-             fsync[{}]",
+             sealed={} subs={}({} created)\n       rss={}MiB fd={} \
+             reopen(last/max)={:?}/{:?} fsync[{}]",
             elapsed.as_secs_f64(),
             self.report.actions,
             self.report.appends,

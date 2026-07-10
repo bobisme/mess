@@ -4,8 +4,9 @@
 //! surface [`CodecError`] rather than panicking on corrupt block bytes.
 
 use super::{
-    ENC_DELTA, FLAG_COLUMNAR, FLAG_PERCOL, FLAG_RESERVED_MASK, K_BOOL, K_INT, K_STR,
-    COLUMNAR_VERSION, emit_int, emit_str, read_varint, unzz,
+    COLUMNAR_VERSION, ENC_DELTA, FLAG_COLUMNAR, FLAG_PERCOL,
+    FLAG_RESERVED_MASK, K_BOOL, K_INT, K_STR, emit_int, emit_str, read_varint,
+    unzz,
 };
 
 /// Upper bound on a block's decompressed size (guards a hostile `ulen`).
@@ -50,7 +51,9 @@ pub enum CodecError {
     /// many columns, each a tiny (highly compressible, e.g. all-zero) zstd
     /// frame claiming a large `ulen`, could force allocating far more memory
     /// in aggregate than the input bytes justify.
-    #[error("per-column block's aggregate decompressed size exceeds the block cap")]
+    #[error(
+        "per-column block's aggregate decompressed size exceeds the block cap"
+    )]
     TotalUlenExceeded,
 }
 
@@ -62,13 +65,13 @@ enum ROp {
 }
 
 struct ColMeta {
-    kind: u8,
-    enc: u8,
+    kind:  u8,
+    enc:   u8,
     // whole-block: uncompressed data range in `buf`.
     // per-column: compressed data range in `buf` plus decompressed length.
     start: usize,
-    len: usize,
-    ulen: usize,
+    len:   usize,
+    ulen:  usize,
 }
 
 /// A decoded columnar (or raw fallback) block, ready for byte-exact
@@ -83,7 +86,10 @@ impl std::fmt::Debug for Block {
             Inner::Whole { .. } => "columnar-whole",
             Inner::PerCol { .. } => "columnar-percol",
         };
-        f.debug_struct("Block").field("layout", &layout).field("events", &self.len()).finish()
+        f.debug_struct("Block")
+            .field("layout", &layout)
+            .field("events", &self.len())
+            .finish()
     }
 }
 
@@ -91,27 +97,27 @@ enum Inner {
     /// Raw fallback: original payloads stored verbatim.
     Raw {
         /// Row-image buffer (decompressed).
-        buf: Vec<u8>,
+        buf:     Vec<u8>,
         /// `n+1` offsets into the payload region.
         offsets: Vec<u32>,
         /// Start of the payload region within `buf`.
-        base: usize,
+        base:    usize,
     },
     /// Whole-block columnar: the columnar image is decompressed into `buf`.
     Whole {
-        buf: Vec<u8>,
-        n: usize,
-        skels: Vec<Vec<ROp>>,
+        buf:      Vec<u8>,
+        n:        usize,
+        skels:    Vec<Vec<ROp>>,
         skel_ids: Vec<u16>,
-        cols: Vec<ColMeta>,
+        cols:     Vec<ColMeta>,
     },
     /// Per-column columnar: preamble in `buf`; each column zstd frame in `buf`.
     PerCol {
-        buf: Vec<u8>,
-        n: usize,
-        skels: Vec<Vec<ROp>>,
+        buf:      Vec<u8>,
+        n:        usize,
+        skels:    Vec<Vec<ROp>>,
         skel_ids: Vec<u16>,
-        cols: Vec<ColMeta>,
+        cols:     Vec<ColMeta>,
     },
 }
 
@@ -122,24 +128,26 @@ struct Rdr<'a> {
 }
 
 impl<'a> Rdr<'a> {
-    fn new(d: &'a [u8]) -> Self {
-        Rdr { d, p: 0 }
-    }
+    fn new(d: &'a [u8]) -> Self { Rdr { d, p: 0 } }
+
     fn u8(&mut self) -> Result<u8, CodecError> {
         let b = *self.d.get(self.p).ok_or(CodecError::Truncated)?;
         self.p += 1;
         Ok(b)
     }
+
     fn u16(&mut self) -> Result<u16, CodecError> {
         let s = self.d.get(self.p..self.p + 2).ok_or(CodecError::Truncated)?;
         self.p += 2;
         Ok(u16::from_le_bytes(s.try_into().unwrap()))
     }
+
     fn u32(&mut self) -> Result<u32, CodecError> {
         let s = self.d.get(self.p..self.p + 4).ok_or(CodecError::Truncated)?;
         self.p += 4;
         Ok(u32::from_le_bytes(s.try_into().unwrap()))
     }
+
     /// Advance over `n` bytes, returning their start offset.
     fn take(&mut self, n: usize) -> Result<usize, CodecError> {
         let start = self.p;
@@ -152,7 +160,10 @@ impl<'a> Rdr<'a> {
     }
 }
 
-fn parse_skeletons(r: &mut Rdr, n_skels: usize) -> Result<Vec<Vec<ROp>>, CodecError> {
+fn parse_skeletons(
+    r: &mut Rdr,
+    n_skels: usize,
+) -> Result<Vec<Vec<ROp>>, CodecError> {
     let mut skels = Vec::with_capacity(n_skels);
     for _ in 0..n_skels {
         let nops = r.u16()? as usize;
@@ -297,7 +308,9 @@ impl Block {
             let enc = r.u8()?;
             let clen = r.u32()? as usize;
             let ulen = r.u32()? as usize;
-            total_ulen = total_ulen.checked_add(ulen).ok_or(CodecError::TotalUlenExceeded)?;
+            total_ulen = total_ulen
+                .checked_add(ulen)
+                .ok_or(CodecError::TotalUlenExceeded)?;
             if total_ulen > MAX_ULEN {
                 return Err(CodecError::TotalUlenExceeded);
             }
@@ -321,9 +334,7 @@ impl Block {
     }
 
     /// Whether the block holds no events.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
 
     /// Reassemble every event, appending bytes to `out` and `n+1` event
     /// boundaries to `offs`.
@@ -362,7 +373,11 @@ impl Block {
             Inner::Whole { buf, skels, skel_ids, cols, .. } => {
                 let refs: Vec<ColRef> = cols
                     .iter()
-                    .map(|c| ColRef { kind: c.kind, enc: c.enc, data: &buf[c.start..c.start + c.len] })
+                    .map(|c| ColRef {
+                        kind: c.kind,
+                        enc:  c.enc,
+                        data: &buf[c.start..c.start + c.len],
+                    })
                     .collect();
                 reassemble_core(buf, skels, skel_ids, &refs, a, b, out, offs)
             }
@@ -421,21 +436,24 @@ impl Block {
         cols: &[ColMeta],
         idx: usize,
     ) -> Result<Vec<u8>, CodecError> {
-        let sk = *skel_ids.get(idx).ok_or(CodecError::IndexOutOfRange)? as usize;
+        let sk =
+            *skel_ids.get(idx).ok_or(CodecError::IndexOutOfRange)? as usize;
         let ops = skels.get(sk).ok_or(CodecError::MalformedSkeleton)?;
         // Which columns does this row touch?
         let mut referenced = vec![false; cols.len()];
         for op in ops {
             if let ROp::Val { col, .. } = op {
                 let c = *col as usize;
-                *referenced.get_mut(c).ok_or(CodecError::ColumnOutOfRange)? = true;
+                *referenced.get_mut(c).ok_or(CodecError::ColumnOutOfRange)? =
+                    true;
             }
         }
         // Count elements each referenced column contributes before row `idx`
         // (a single pass over the prior skeleton ids).
         let mut skip = vec![0u32; cols.len()];
         for &id in &skel_ids[..idx] {
-            let prev_ops = skels.get(id as usize).ok_or(CodecError::MalformedSkeleton)?;
+            let prev_ops =
+                skels.get(id as usize).ok_or(CodecError::MalformedSkeleton)?;
             for op in prev_ops {
                 if let ROp::Val { col, .. } = op {
                     let c = *col as usize;
@@ -455,7 +473,8 @@ impl Block {
             if !referenced[c] {
                 continue;
             }
-            let data = decompress(&buf[meta.start..meta.start + meta.len], meta.ulen)?;
+            let data =
+                decompress(&buf[meta.start..meta.start + meta.len], meta.ulen)?;
             decoded[c] = Some(data);
         }
         for (c, meta) in cols.iter().enumerate() {
@@ -463,7 +482,8 @@ impl Block {
                 continue;
             }
             let data = decoded[c].as_deref().unwrap();
-            let mut cur = Cur { kind: meta.kind, enc: meta.enc, data, pos: 0, prev: 0 };
+            let mut cur =
+                Cur { kind: meta.kind, enc: meta.enc, data, pos: 0, prev: 0 };
             for _ in 0..skip[c] {
                 cur.next()?; // advance past prior rows' elements
             }
@@ -475,7 +495,8 @@ impl Block {
             match op {
                 ROp::Lit { start, len } => {
                     out.extend_from_slice(
-                        buf.get(*start..*start + *len).ok_or(CodecError::Truncated)?,
+                        buf.get(*start..*start + *len)
+                            .ok_or(CodecError::Truncated)?,
                     );
                 }
                 ROp::Val { col, kind } => {
@@ -495,16 +516,16 @@ impl Block {
 /// A column's kind/encoding and its decompressed data slice.
 struct ColRef<'a> {
     kind: u8,
-    enc: u8,
+    enc:  u8,
     data: &'a [u8],
 }
 
 /// A per-column decode cursor.
 struct Cur<'a> {
     kind: u8,
-    enc: u8,
+    enc:  u8,
     data: &'a [u8],
-    pos: usize,
+    pos:  usize,
     prev: i64,
 }
 
@@ -518,7 +539,8 @@ impl<'a> Cur<'a> {
     fn next(&mut self) -> Result<Scalar<'a>, CodecError> {
         match self.kind {
             K_INT => {
-                let raw = read_varint(self.data, &mut self.pos).ok_or(CodecError::CorruptColumn)?;
+                let raw = read_varint(self.data, &mut self.pos)
+                    .ok_or(CodecError::CorruptColumn)?;
                 let d = unzz(raw);
                 let v = if self.enc == ENC_DELTA {
                     self.prev = self.prev.wrapping_add(d);
@@ -529,7 +551,8 @@ impl<'a> Cur<'a> {
                 Ok(Scalar::I(v))
             }
             K_STR => {
-                let l = read_varint(self.data, &mut self.pos).ok_or(CodecError::CorruptColumn)?
+                let l = read_varint(self.data, &mut self.pos)
+                    .ok_or(CodecError::CorruptColumn)?
                     as usize;
                 let s = self
                     .data
@@ -539,7 +562,10 @@ impl<'a> Cur<'a> {
                 Ok(Scalar::S(s))
             }
             K_BOOL => {
-                let b = *self.data.get(self.pos).ok_or(CodecError::CorruptColumn)?;
+                let b = *self
+                    .data
+                    .get(self.pos)
+                    .ok_or(CodecError::CorruptColumn)?;
                 self.pos += 1;
                 Ok(Scalar::B(b != 0))
             }
@@ -548,11 +574,15 @@ impl<'a> Cur<'a> {
     }
 }
 
-fn emit_scalar(out: &mut Vec<u8>, kind: u8, sv: Scalar) -> Result<(), CodecError> {
+fn emit_scalar(
+    out: &mut Vec<u8>,
+    kind: u8,
+    sv: Scalar,
+) -> Result<(), CodecError> {
     match (kind, sv) {
         (K_INT, Scalar::I(v)) => emit_int(out, v),
         (K_STR, Scalar::S(s)) => emit_str(out, s),
-        (K_BOOL, Scalar::B(b)) => out.push(if b { 0xc3 } else { 0xc2 }),
+        (K_BOOL, Scalar::B(b)) => out.push(if b { 0xC3 } else { 0xC2 }),
         _ => return Err(CodecError::CorruptColumn),
     }
     Ok(())
@@ -573,7 +603,13 @@ fn reassemble_core(
 ) -> Result<(), CodecError> {
     let mut curs: Vec<Cur> = cols
         .iter()
-        .map(|c| Cur { kind: c.kind, enc: c.enc, data: c.data, pos: 0, prev: 0 })
+        .map(|c| Cur {
+            kind: c.kind,
+            enc:  c.enc,
+            data: c.data,
+            pos:  0,
+            prev: 0,
+        })
         .collect();
     for e in 0..b {
         let emit = e >= a;
@@ -587,12 +623,15 @@ fn reassemble_core(
                 ROp::Lit { start, len } => {
                     if emit {
                         out.extend_from_slice(
-                            buf.get(*start..*start + *len).ok_or(CodecError::Truncated)?,
+                            buf.get(*start..*start + *len)
+                                .ok_or(CodecError::Truncated)?,
                         );
                     }
                 }
                 ROp::Val { col, kind } => {
-                    let cur = curs.get_mut(*col as usize).ok_or(CodecError::ColumnOutOfRange)?;
+                    let cur = curs
+                        .get_mut(*col as usize)
+                        .ok_or(CodecError::ColumnOutOfRange)?;
                     let sv = cur.next()?;
                     if emit {
                         emit_scalar(out, *kind, sv)?;

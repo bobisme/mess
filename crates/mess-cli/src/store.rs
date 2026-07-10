@@ -25,22 +25,22 @@ pub const LOCK_FILE_NAME: &str = "LOCK";
 /// A discovered segment on disk.
 #[derive(Debug, Clone)]
 pub struct SegmentFile {
-    pub segment_id: u64,
-    pub log_path: PathBuf,
+    pub segment_id:  u64,
+    pub log_path:    PathBuf,
     /// The sealed pointer sidecar path (may or may not exist).
-    pub pidx_path: PathBuf,
+    pub pidx_path:   PathBuf,
     /// The payload sidecar path (may or may not exist).
-    pub pcol_path: PathBuf,
+    pub pcol_path:   PathBuf,
     /// The membership-filter sidecar path (may or may not exist).
     pub filter_path: PathBuf,
     /// The Reed-Solomon parity sidecar path (bn-2za; may or may not exist).
-    pub par_path: PathBuf,
+    pub par_path:    PathBuf,
     /// Whether the `.pidx` sidecar exists on disk.
-    pub has_pidx: bool,
+    pub has_pidx:    bool,
     /// Whether the `.pcol` sidecar exists on disk.
-    pub has_pcol: bool,
+    pub has_pcol:    bool,
     /// Whether the `.par` parity sidecar exists on disk (bn-2za).
-    pub has_par: bool,
+    pub has_par:     bool,
 }
 
 /// The `.log` path for a segment id (`seg-<id:08>.log`).
@@ -49,7 +49,8 @@ pub fn log_path(dir: &Path, segment_id: u64) -> PathBuf {
     dir.join(format!("seg-{segment_id:08}.log"))
 }
 
-/// The sealed pointer-sidecar path for a segment id (`sealed/seg-<id:020>.pidx`).
+/// The sealed pointer-sidecar path for a segment id
+/// (`sealed/seg-<id:020>.pidx`).
 #[must_use]
 pub fn pidx_path(dir: &Path, segment_id: u64) -> PathBuf {
     dir.join("sealed").join(format!("seg-{segment_id:020}.pidx"))
@@ -64,15 +65,11 @@ pub fn par_path(dir: &Path, segment_id: u64) -> PathBuf {
 
 /// The lock-file path.
 #[must_use]
-pub fn lock_path(dir: &Path) -> PathBuf {
-    dir.join(LOCK_FILE_NAME)
-}
+pub fn lock_path(dir: &Path) -> PathBuf { dir.join(LOCK_FILE_NAME) }
 
 /// The metadata directory.
 #[must_use]
-pub fn meta_dir(dir: &Path) -> PathBuf {
-    dir.join("meta")
-}
+pub fn meta_dir(dir: &Path) -> PathBuf { dir.join("meta") }
 
 /// Enumerate every `seg-<id>.log` under `dir`, ascending by id, resolving
 /// each one's sidecar paths and presence. Files that do not match the naming

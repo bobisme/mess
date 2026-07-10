@@ -11,9 +11,9 @@ use mess_index::meta::{
 #[derive(Clone)]
 struct LogRecord {
     global_position: u64,
-    stream: StreamId,
-    stream_version: u64,
-    dedupe_key: Option<Vec<u8>>,
+    stream:          StreamId,
+    stream_version:  u64,
+    dedupe_key:      Option<Vec<u8>>,
 }
 
 /// A deterministic log: `n` records round-robined across `streams` streams,
@@ -27,9 +27,9 @@ fn synth_log(n: u64, streams: u64) -> Vec<LogRecord> {
             versions[s as usize] += 1;
             LogRecord {
                 global_position: p,
-                stream: StreamId(s + 1),
-                stream_version: v,
-                dedupe_key: Some(format!("k{p}").into_bytes()),
+                stream:          StreamId(s + 1),
+                stream_version:  v,
+                dedupe_key:      Some(format!("k{p}").into_bytes()),
             }
         })
         .collect()
@@ -40,7 +40,10 @@ fn apply_record(store: &MetaStore, r: &LogRecord) {
     let mut g = CommitGroup::new(r.global_position + 1);
     g.stream_heads.push((
         r.stream,
-        Head { version: r.stream_version, global_position: r.global_position },
+        Head {
+            version:         r.stream_version,
+            global_position: r.global_position,
+        },
     ));
     if let Some(k) = &r.dedupe_key {
         g.dedupe.push((r.stream, k.clone(), r.global_position));
@@ -56,10 +59,15 @@ fn roundtrip_all_tables() {
 
     // stream head
     let mut g = CommitGroup::new(43);
-    g.stream_heads.push((StreamId(7), Head { version: 4, global_position: 42 }));
+    g.stream_heads
+        .push((StreamId(7), Head { version: 4, global_position: 42 }));
     g.snapshot_heads.push((
         StreamId(7),
-        SnapshotHead { covered_version: 4, global_position: 42, snapshot_ref: b"blob-ptr".to_vec() },
+        SnapshotHead {
+            covered_version: 4,
+            global_position: 42,
+            snapshot_ref:    b"blob-ptr".to_vec(),
+        },
     ));
     g.dedupe.push((StreamId(7), b"cmd-1".to_vec(), 42));
     store.apply_group(&g).unwrap();
@@ -118,7 +126,10 @@ fn rebuild_is_byte_equal() {
 
     assert_eq!(heads_a, heads_b, "stream_heads not byte-equal after rebuild");
     assert_eq!(snaps_a, snaps_b, "snapshot_heads not byte-equal after rebuild");
-    assert_eq!(dedupe_a, dedupe_b, "dedupe window not byte-equal after rebuild");
+    assert_eq!(
+        dedupe_a, dedupe_b,
+        "dedupe window not byte-equal after rebuild"
+    );
 }
 
 /// Acceptance: on reopen the tables lag the log; lag is detected and replaying
@@ -149,7 +160,10 @@ fn crash_lag_detected_and_replayed() {
 
     // Recovery replays exactly the gap [from, to).
     let (from, to) = gap.unwrap();
-    for r in log.iter().filter(|r| r.global_position >= from && r.global_position < to) {
+    for r in log
+        .iter()
+        .filter(|r| r.global_position >= from && r.global_position < to)
+    {
         apply_record(&store, r);
     }
 
@@ -185,7 +199,11 @@ fn dedupe_absorb_and_aging() {
     // Bounded: only the last `capacity` (4) survive.
     assert_eq!(store.dump(MetaTable::Dedupe).unwrap().len(), 4);
     for p in 0u64..6 {
-        assert_eq!(store.dedupe_lookup(s, format!("k{p}").as_bytes()).unwrap(), None, "k{p} should have aged out");
+        assert_eq!(
+            store.dedupe_lookup(s, format!("k{p}").as_bytes()).unwrap(),
+            None,
+            "k{p} should have aged out"
+        );
     }
     for p in 6u64..10 {
         assert_eq!(
@@ -198,7 +216,11 @@ fn dedupe_absorb_and_aging() {
     // A6 absorb: a writer sees the recent key and returns the original
     // position instead of committing a second time.
     let dup = store.dedupe_lookup(s, b"k9").unwrap();
-    assert_eq!(dup, Some(9), "duplicate command absorbs to the original position");
+    assert_eq!(
+        dup,
+        Some(9),
+        "duplicate command absorbs to the original position"
+    );
 
     // Seq bounds survive a reopen: aging still bounds the window after crash.
     drop(store);
@@ -208,9 +230,17 @@ fn dedupe_absorb_and_aging() {
         g.dedupe.push((s, format!("k{p}").into_bytes(), p));
         store.apply_group(&g).unwrap();
     }
-    assert_eq!(store.dump(MetaTable::Dedupe).unwrap().len(), 4, "still bounded after reopen");
+    assert_eq!(
+        store.dump(MetaTable::Dedupe).unwrap().len(),
+        4,
+        "still bounded after reopen"
+    );
     assert_eq!(store.dedupe_lookup(s, b"k12").unwrap(), Some(12));
-    assert_eq!(store.dedupe_lookup(s, b"k8").unwrap(), None, "k8 aged out after reopen inserts");
+    assert_eq!(
+        store.dedupe_lookup(s, b"k8").unwrap(),
+        None,
+        "k8 aged out after reopen inserts"
+    );
 }
 
 /// Checkpoints have their own lag: a projection's checkpoint value is its

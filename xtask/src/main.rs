@@ -53,7 +53,8 @@ fn coverage(args: &clap::ArgMatches) -> Result<(), Box<dyn std::error::Error>> {
         .env("RUSTDOCFLAGS", "-Cpanic=abort")
         .env(
             "RUSTFLAGS",
-            "-Zprofile -Ccodegen-units=1 -Copt-level=0 -Clink-dead-code -Coverflow-checks=off -Zpanic_abort_tests -Cpanic=abort",
+            "-Zprofile -Ccodegen-units=1 -Copt-level=0 -Clink-dead-code \
+             -Coverflow-checks=off -Zpanic_abort_tests -Cpanic=abort",
         )
         .run()?;
     println!("ok.");

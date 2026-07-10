@@ -18,12 +18,12 @@
 //! - **Moderation is a distinct bounded context.** A moderator hiding content
 //!   is about roles, appeals, and audit trails that belong in a dedicated
 //!   moderation bone, not smuggled into the core post aggregate. Keeping both
-//!   here would blur the teaching example. When moderation lands it can add
-//!   its own `Hidden { by, reason }` event without disturbing this stream's
+//!   here would blur the teaching example. When moderation lands it can add its
+//!   own `Hidden { by, reason }` event without disturbing this stream's
 //!   like/delete rules.
 //! - `Deleted { by }` records *who* deleted, so a future moderator-delete is a
-//!   one-line extension (widen the `DeletePost` author check) rather than a
-//!   new event.
+//!   one-line extension (widen the `DeletePost` author check) rather than a new
+//!   event.
 //!
 //! # Decision: self-like is ALLOWED
 //!
@@ -83,11 +83,11 @@ pub struct Post {
     /// it still exists in the log, but new likes are refused.
     pub deleted: bool,
     /// The author, set by `Posted`. `None` before creation.
-    pub author: Option<Id>,
+    pub author:  Option<Id>,
     /// The post body.
-    pub body: String,
+    pub body:    String,
     /// The set of users who currently like this post.
-    pub likes: HashSet<Id>,
+    pub likes:   HashSet<Id>,
 }
 
 impl Post {
@@ -153,10 +153,9 @@ impl std::fmt::Display for PostError {
             PostError::AlreadyCreated => write!(f, "post already exists"),
             PostError::NotCreated => write!(f, "post does not exist yet"),
             PostError::EmptyBody => write!(f, "post body must not be empty"),
-            PostError::BodyTooLong { len, max } => write!(
-                f,
-                "post body is {len} characters; the maximum is {max}"
-            ),
+            PostError::BodyTooLong { len, max } => {
+                write!(f, "post body is {len} characters; the maximum is {max}")
+            }
             PostError::NotAuthor => {
                 write!(f, "only the author may delete this post")
             }
@@ -176,7 +175,7 @@ impl std::error::Error for PostError {}
 #[derive(Debug, Clone)]
 pub struct CreatePost {
     pub author: Id,
-    pub body: String,
+    pub body:   String,
 }
 
 /// Delete a post. `by` is the actor requesting the delete; the aggregate

@@ -1,13 +1,12 @@
 use std::borrow::{BorrowMut, Cow};
 use std::ops::Deref;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use criterion::{
-    black_box, criterion_group, criterion_main, BenchmarkId, Criterion,
+    BenchmarkId, Criterion, black_box, criterion_group, criterion_main,
 };
-
 use ident::Id;
 use mess_db::rocks::db::DB;
 use mess_db::rocks::write::WriteSerializer;
@@ -22,9 +21,7 @@ where
 {
     type Target = D;
 
-    fn deref(&self) -> &Self::Target {
-        self.0.as_ref().unwrap()
-    }
+    fn deref(&self) -> &Self::Target { self.0.as_ref().unwrap() }
 }
 
 impl<D> Drop for SelfDestructingDB<D>
@@ -54,11 +51,11 @@ fn msg_to_write(expect: Option<u64>) -> WriteMessage<'static> {
     let data = b"{ \"one\": 1, \"two\": 2, \"string\": \"Some data here\" }";
     let metadata = b"{ \"three\": 3, \"four\": 4 }";
     mess_db::write::WriteMessage {
-        id: Id::new(),
-        stream_name: "stream1".into(),
-        message_type: "someMsgType".into(),
-        data: Cow::Borrowed(data),
-        metadata: Cow::Borrowed(metadata),
+        id:               Id::new(),
+        stream_name:      "stream1".into(),
+        message_type:     "someMsgType".into(),
+        data:             Cow::Borrowed(data),
+        metadata:         Cow::Borrowed(metadata),
         expected_version: mess_db::ExpectedVersion::from(
             expect.map(mess_db::StreamPos::new),
         ),

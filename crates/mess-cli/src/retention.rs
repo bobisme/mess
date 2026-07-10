@@ -11,8 +11,8 @@
 use std::path::Path;
 
 use mess_index::sealed::retention::{
-    BackupLease, BlockingReason, CertFrame, LiveSnapshotRef, RetentionDecision, decide_segment,
-    lease_holds,
+    BackupLease, BlockingReason, CertFrame, LiveSnapshotRef, RetentionDecision,
+    decide_segment, lease_holds,
 };
 use mess_index::sealed::segment::SealedSegmentIndex;
 use mess_log::footer_ext::{SnapshotAnchor, decode_extension};
@@ -33,7 +33,10 @@ pub fn run(dir: &Path) -> Report {
 
     let lock = lockprobe::probe(dir);
     if lock.is_held() {
-        report.advise("store-locked", "store is locked by a live writer; explaining read-only");
+        report.advise(
+            "store-locked",
+            "store is locked by a live writer; explaining read-only",
+        );
     }
 
     // Live snapshots drive the decision. A §4.2 empty-prefix snapshot has no
@@ -43,7 +46,10 @@ pub fn run(dir: &Path) -> Report {
             .snapshots
             .iter()
             .filter(|s| !s.covers_empty_prefix)
-            .map(|s| LiveSnapshotRef { stream_id: s.stream_id, version: s.version })
+            .map(|s| LiveSnapshotRef {
+                stream_id: s.stream_id,
+                version:   s.version,
+            })
             .collect(),
         Err(reason) => {
             // Without the live snapshot set we cannot compute blockers; report
@@ -53,26 +59,49 @@ pub fn run(dir: &Path) -> Report {
             Vec::new()
         }
     };
-    report.set("live_snapshots", json!(live.iter().map(|s| json!({
-        "stream_id": s.stream_id, "version": s.version
-    })).collect::<Vec<_>>()));
+    report.set(
+        "live_snapshots",
+        json!(
+            live.iter()
+                .map(|s| json!({
+                    "stream_id": s.stream_id, "version": s.version
+                }))
+                .collect::<Vec<_>>()
+        ),
+    );
 
     // Durable Path-C anchors, gathered across every sealed segment's footer
     // extension (§3.3.2). Empty in Phase 3, but honoured when present.
     let anchors = gather_anchors(dir);
-    report.set("anchors", json!(anchors.iter().map(|a| json!({
-        "stream_id": a.stream_id, "version": a.version
-    })).collect::<Vec<_>>()));
+    report.set(
+        "anchors",
+        json!(
+            anchors
+                .iter()
+                .map(|a| json!({
+                    "stream_id": a.stream_id, "version": a.version
+                }))
+                .collect::<Vec<_>>()
+        ),
+    );
 
     // Active backup leases (bn-2ln, doc 07 §5) pin their cut's segment ids
     // against deletion for the backup's duration; an expired (crashed-backup)
     // lease is filtered out here so it never blocks.
     let leases = lease::active_leases(dir, lease::now_unix());
-    report.set("active_leases", json!(leases.iter().map(|l| json!({
-        "backup_id": l.backup_id,
-        "protect_min_segment_id": l.protect_min_segment_id,
-        "protect_max_segment_id": l.protect_max_segment_id,
-    })).collect::<Vec<_>>()));
+    report.set(
+        "active_leases",
+        json!(
+            leases
+                .iter()
+                .map(|l| json!({
+                    "backup_id": l.backup_id,
+                    "protect_min_segment_id": l.protect_min_segment_id,
+                    "protect_max_segment_id": l.protect_max_segment_id,
+                }))
+                .collect::<Vec<_>>()
+        ),
+    );
 
     let segments = store::discover_segments(dir);
     let mut sealed_seen = 0usize;
@@ -89,7 +118,11 @@ pub fn run(dir: &Path) -> Report {
                         Severity::Error,
                         "retention",
                         "sidecar-unreadable",
-                        format!("segment {}: sidecar unreadable, cannot decide retention: {e}", seg.segment_id),
+                        format!(
+                            "segment {}: sidecar unreadable, cannot decide \
+                             retention: {e}",
+                            seg.segment_id
+                        ),
                     )
                     .with("segment_id", seg.segment_id),
                 );
@@ -105,7 +138,8 @@ pub fn run(dir: &Path) -> Report {
         // A backup lease pins this segment regardless of the snapshot verdict
         // (doc 07 §5.1): the segment is blocked while any active lease covers
         // it.
-        let lease_blockers: Vec<&BackupLease> = lease_holds(idx.segment_id(), &leases);
+        let lease_blockers: Vec<&BackupLease> =
+            lease_holds(idx.segment_id(), &leases);
         let blocked = decision.is_blocked() || !lease_blockers.is_empty();
         let verdict = if blocked { "blocked" } else { snapshot_verdict };
 
@@ -152,7 +186,12 @@ pub fn run(dir: &Path) -> Report {
                     ),
                 )
                 .with("segment_id", idx.segment_id())
-                .with("blockers", json!(blockers.iter().map(blocker_json).collect::<Vec<_>>())),
+                .with(
+                    "blockers",
+                    json!(
+                        blockers.iter().map(blocker_json).collect::<Vec<_>>()
+                    ),
+                ),
             );
         } else if !blocked {
             report.push_finding(
@@ -193,7 +232,9 @@ fn gather_anchors(dir: &Path) -> Vec<SnapshotAnchor> {
     let fs = RealFs;
     let mut anchors = Vec::new();
     for seg in store::discover_segments(dir) {
-        let Ok(Some(trailer)) = read_trailer(&fs, &seg.log_path) else { continue };
+        let Ok(Some(trailer)) = read_trailer(&fs, &seg.log_path) else {
+            continue
+        };
         if trailer.ext_len == 0 {
             continue;
         }

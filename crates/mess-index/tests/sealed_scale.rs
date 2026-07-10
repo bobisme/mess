@@ -36,7 +36,8 @@ const FC: u32 = 10; // events per batch (spike: batches of 10)
 fn build_big(segment_id: u64) -> (Arc<ActiveIndex>, SealInput) {
     let active = ActiveIndex::new();
     let n_batches = EVENTS / u64::from(FC);
-    let mut seal_batches: Vec<Vec<SealBatch>> = vec![Vec::new(); N_STREAMS as usize];
+    let mut seal_batches: Vec<Vec<SealBatch>> =
+        vec![Vec::new(); N_STREAMS as usize];
     let mut ver = vec![0u64; N_STREAMS as usize];
     let mut global: u64 = 0;
     let mut offset: u64 = 4096;
@@ -46,11 +47,11 @@ fn build_big(segment_id: u64) -> (Arc<ActiveIndex>, SealInput) {
         active.apply_committed(
             global + u64::from(FC),
             &[BatchEntry {
-                stream_id: s,
+                stream_id:            s,
                 first_stream_version: v,
-                frame_count: FC,
-                first_global_pos: global,
-                ptr: EventPtr { segment_id, offset },
+                frame_count:          FC,
+                first_global_pos:     global,
+                ptr:                  EventPtr { segment_id, offset },
             }],
         );
         seal_batches[s as usize].push(SealBatch {
@@ -65,9 +66,15 @@ fn build_big(segment_id: u64) -> (Arc<ActiveIndex>, SealInput) {
     }
     let streams: Vec<SealStream> = (0..N_STREAMS)
         .filter(|&s| !seal_batches[s as usize].is_empty())
-        .map(|s| SealStream { stream_id: s, batches: seal_batches[s as usize].clone() })
+        .map(|s| SealStream {
+            stream_id: s,
+            batches:   seal_batches[s as usize].clone(),
+        })
         .collect();
-    (Arc::new(active), SealInput { segment_id, base_pos: 0, streams, payloads: None })
+    (
+        Arc::new(active),
+        SealInput { segment_id, base_pos: 0, streams, payloads: None },
+    )
 }
 
 fn percentile(sorted: &[Duration], q: f64) -> Duration {
@@ -108,11 +115,14 @@ fn full_scale_seal_is_off_path_and_reads_fast() {
         active_new.apply_committed(
             pos + u64::from(FC),
             &[BatchEntry {
-                stream_id: nv % 1000,
+                stream_id:            nv % 1000,
                 first_stream_version: nv / 1000 * u64::from(FC),
-                frame_count: FC,
-                first_global_pos: pos,
-                ptr: EventPtr { segment_id: 2, offset: pos * 256 },
+                frame_count:          FC,
+                first_global_pos:     pos,
+                ptr:                  EventPtr {
+                    segment_id: 2,
+                    offset:     pos * 256,
+                },
             }],
         );
         append_lat.push(t.elapsed());
@@ -128,8 +138,8 @@ fn full_scale_seal_is_off_path_and_reads_fast() {
     }
     let seal_wall = seal_started.elapsed();
 
-    // The seal finished; fetch the installed index (submit already delivered it,
-    // but re-fetch from the store to confirm the handoff completed).
+    // The seal finished; fetch the installed index (submit already delivered
+    // it, but re-fetch from the store to confirm the handoff completed).
     let sealed = store.get(1).expect("sealed index installed");
     assert!(store.is_evicted(1), "active entries evicted after seal");
     assert_eq!(sealed.event_count(), EVENTS);
@@ -140,11 +150,12 @@ fn full_scale_seal_is_off_path_and_reads_fast() {
     let apmax = append_lat.last().copied().unwrap_or_default();
 
     // (1) Off-path: appends never stalled anywhere near the inline ~1.4 s seal
-    // cost `perf_append` measured. A single-batch apply is sub-microsecond; even
-    // a very loose bound catches an inline stall.
+    // cost `perf_append` measured. A single-batch apply is sub-microsecond;
+    // even a very loose bound catches an inline stall.
     assert!(
         apmax < Duration::from_millis(50),
-        "append hot path stalled during background seal: max={apmax:?} (p99={ap99:?})"
+        "append hot path stalled during background seal: max={apmax:?} \
+         (p99={ap99:?})"
     );
 
     // (3) Cached point-read p99 through the skip table, over 20k event-weighted
@@ -174,7 +185,11 @@ fn full_scale_seal_is_off_path_and_reads_fast() {
     let t = Instant::now();
     let mut active_events = 0u64;
     for &s in &sample {
-        active_events += active_pre.stream_entries(s).iter().map(|e| u64::from(e.frame_count)).sum::<u64>();
+        active_events += active_pre
+            .stream_entries(s)
+            .iter()
+            .map(|e| u64::from(e.frame_count))
+            .sum::<u64>();
     }
     let active_walk = t.elapsed();
     let t = Instant::now();
@@ -190,25 +205,49 @@ fn full_scale_seal_is_off_path_and_reads_fast() {
     let sealed_walk = t.elapsed();
     assert_eq!(active_events, sealed_events, "replay event counts differ");
 
-    let sidecar_bytes = std::fs::metadata(driver.sidecar_path(1)).unwrap().len();
+    let sidecar_bytes =
+        std::fs::metadata(driver.sidecar_path(1)).unwrap().len();
 
-    eprintln!("--- bn-20e full-scale seal ({EVENTS} events, {n_batches} batches, {N_STREAMS} streams) ---");
+    eprintln!(
+        "--- bn-20e full-scale seal ({EVENTS} events, {n_batches} batches, \
+         {N_STREAMS} streams) ---"
+    );
     eprintln!("seal wall (background)      : {seal_wall:?}");
-    eprintln!("append hot path p50/p99/max : {ap50:?} / {ap99:?} / {apmax:?}  ({} samples)", append_lat.len());
-    eprintln!("sealed point-read p50/p99   : {pr50:?} / {pr99:?}  (cached, skip table)");
-    eprintln!("stream replay active/sealed : {active_walk:?} / {sealed_walk:?}  ({} events each)", sealed_events);
-    eprintln!("sidecar size                : {sidecar_bytes} bytes ({:.3} B/event)", sidecar_bytes as f64 / EVENTS as f64);
+    eprintln!(
+        "append hot path p50/p99/max : {ap50:?} / {ap99:?} / {apmax:?}  ({} \
+         samples)",
+        append_lat.len()
+    );
+    eprintln!(
+        "sealed point-read p50/p99   : {pr50:?} / {pr99:?}  (cached, skip \
+         table)"
+    );
+    eprintln!(
+        "stream replay active/sealed : {active_walk:?} / {sealed_walk:?}  ({} \
+         events each)",
+        sealed_events
+    );
+    eprintln!(
+        "sidecar size                : {sidecar_bytes} bytes ({:.3} B/event)",
+        sidecar_bytes as f64 / EVENTS as f64
+    );
 
     // (2) assertion: sealed replay is at least competitive with the active walk
-    // (both are pure pointer decodes here; the active clone even skips a decode,
-    // so allow generous slack — the point is sealed is not pathologically slow).
+    // (both are pure pointer decodes here; the active clone even skips a
+    // decode, so allow generous slack — the point is sealed is not
+    // pathologically slow).
     assert!(
         sealed_walk < active_walk * 8 + Duration::from_millis(50),
-        "sealed stream replay far slower than active walk: {sealed_walk:?} vs {active_walk:?}"
+        "sealed stream replay far slower than active walk: {sealed_walk:?} vs \
+         {active_walk:?}"
     );
     // (3) assertion: cached point-read p99 well bounded. Target <2 µs; assert a
-    // loose 50 µs so CI load never flakes while still catching an O(n) regression.
-    assert!(pr99 < Duration::from_micros(50), "point-read p99 too slow: {pr99:?}");
+    // loose 50 µs so CI load never flakes while still catching an O(n)
+    // regression.
+    assert!(
+        pr99 < Duration::from_micros(50),
+        "point-read p99 too slow: {pr99:?}"
+    );
 
     sealer.shutdown();
 }

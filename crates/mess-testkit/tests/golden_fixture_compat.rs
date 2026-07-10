@@ -82,8 +82,11 @@ fn rename_without_upcaster_fails_fixture_compat() {
     // Read-only: this must exercise the decode failure against the *committed*
     // old bytes, never (under `UPDATE_FIXTURES`) overwrite them with the
     // renamed-shape sample.
-    let err = assert_fixture_compat::<AccountEventRenamed>(COMPAT_FIXTURE, &renamed)
-        .expect_err("renaming a field with no upcaster must break old bytes");
+    let err =
+        assert_fixture_compat::<AccountEventRenamed>(COMPAT_FIXTURE, &renamed)
+            .expect_err(
+                "renaming a field with no upcaster must break old bytes",
+            );
 
     assert!(
         matches!(err, FixtureError::CompatDecodeFailed { ref wire_name, .. }

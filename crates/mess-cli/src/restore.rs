@@ -58,7 +58,10 @@ pub fn run(src: &Path, dir: &Path, _opts: &RestoreOptions) -> Report {
             Severity::Error,
             "restore",
             "target-not-empty",
-            format!("refusing to restore into non-empty directory {}", dir.display()),
+            format!(
+                "refusing to restore into non-empty directory {}",
+                dir.display()
+            ),
         ));
         return report;
     }
@@ -73,21 +76,26 @@ pub fn run(src: &Path, dir: &Path, _opts: &RestoreOptions) -> Report {
                 "restore",
                 "torn-backup",
                 format!(
-                    "no readable {BACKUP_MANIFEST} at {} ({e}); backup is incomplete or corrupt",
+                    "no readable {BACKUP_MANIFEST} at {} ({e}); backup is \
+                     incomplete or corrupt",
                     src.display()
                 ),
             ));
             return report;
         }
     };
-    let manifest: BackupManifest = match serde_json::from_slice(&manifest_bytes) {
+    let manifest: BackupManifest = match serde_json::from_slice(&manifest_bytes)
+    {
         Ok(m) => m,
         Err(e) => {
             report.push_finding(Finding::new(
                 Severity::Error,
                 "restore",
                 "torn-backup",
-                format!("{BACKUP_MANIFEST} at {} failed to parse: {e}", src.display()),
+                format!(
+                    "{BACKUP_MANIFEST} at {} failed to parse: {e}",
+                    src.display()
+                ),
             ));
             return report;
         }
@@ -105,21 +113,27 @@ pub fn run(src: &Path, dir: &Path, _opts: &RestoreOptions) -> Report {
                         Severity::Error,
                         "restore",
                         "backup-file-missing",
-                        format!("backup file {} missing/unreadable: {e}", entry.path),
+                        format!(
+                            "backup file {} missing/unreadable: {e}",
+                            entry.path
+                        ),
                     )
                     .with("path", entry.path.clone()),
                 );
                 return report;
             }
         };
-        if bytes.len() as u64 != entry.len || crc32c_two(&bytes, &[]) != entry.crc32c {
+        if bytes.len() as u64 != entry.len
+            || crc32c_two(&bytes, &[]) != entry.crc32c
+        {
             report.push_finding(
                 Finding::new(
                     Severity::Error,
                     "restore",
                     "backup-file-mismatch",
                     format!(
-                        "backup file {} failed size/CRC check (len {} vs {}, corrupt copy)",
+                        "backup file {} failed size/CRC check (len {} vs {}, \
+                         corrupt copy)",
                         entry.path,
                         bytes.len(),
                         entry.len
@@ -158,13 +172,16 @@ pub fn run(src: &Path, dir: &Path, _opts: &RestoreOptions) -> Report {
         }
         restored += 1;
         restored_bytes += bytes.len() as u64;
-        report.push_row(json!({ "path": entry.path, "role": entry.role, "len": entry.len }));
+        report.push_row(
+            json!({ "path": entry.path, "role": entry.role, "len": entry.len }),
+        );
     }
     report.set("restored_files", json!(restored));
     report.set("restored_bytes", json!(restored_bytes));
 
     // 5. Full recovery + verify --full over the restored store.
-    let verify_report = verify::run(dir, &VerifyOptions { full: true, ..Default::default() });
+    let verify_report =
+        verify::run(dir, &VerifyOptions { full: true, ..Default::default() });
     let verify_clean = verify_report.worst() < Severity::Error;
     for f in &verify_report.findings {
         // Fold verify's findings into the restore report so a corruption
@@ -203,7 +220,8 @@ pub fn run(src: &Path, dir: &Path, _opts: &RestoreOptions) -> Report {
                 "restore",
                 "restore-complete",
                 format!(
-                    "restored {restored} file(s); verify --full clean; recovered watermark {}",
+                    "restored {restored} file(s); verify --full clean; \
+                     recovered watermark {}",
                     recovered.watermark
                 ),
             )

@@ -39,11 +39,10 @@ use axum::{
 use ident::Id;
 use serde::Deserialize;
 
-use crate::contracts::{ReadModels, WriteOps};
-
 use super::error::friendly;
 use super::views::{self, Flash};
 use super::{ACTING_COOKIE, AppState, PAGE_SIZE};
+use crate::contracts::{ReadModels, WriteOps};
 
 /// Build the application router. Generic over the backend: [`AppState<R,
 /// W>`](AppState) is monomorphized once per `(R, W)` pair, so every handler's
@@ -76,14 +75,14 @@ where
 #[derive(Debug, Default, Deserialize)]
 struct PageQuery {
     cursor: Option<String>,
-    flash: Option<String>,
-    kind: Option<String>,
+    flash:  Option<String>,
+    kind:   Option<String>,
 }
 
 impl PageQuery {
     fn flash(&self) -> Option<Flash> {
         self.flash.as_ref().map(|m| Flash {
-            msg: m.clone(),
+            msg:  m.clone(),
             kind: self.kind.clone().unwrap_or_else(|| "ok".into()),
         })
     }
@@ -96,7 +95,7 @@ struct PostForm {
 
 #[derive(Debug, Deserialize)]
 struct WhoamiForm {
-    handle: String,
+    handle:       String,
     #[serde(default)]
     display_name: String,
 }
@@ -140,7 +139,12 @@ fn enc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.'
+            b'a'..=b'z'
+            | b'A'..=b'Z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
             | b'~' => out.push(b as char),
             _ => out.push_str(&format!("%{b:02X}")),
         }
@@ -168,9 +172,9 @@ fn back(headers: &HeaderMap, fallback: &str) -> String {
         .map(|r| {
             // Keep only a same-origin absolute path; drop scheme/host and any
             // existing flash query so banners do not stack.
-            let path = r.strip_prefix("http://").map_or(r, |rest| {
-                rest.split_once('/').map_or("/", |(_, p)| p)
-            });
+            let path = r
+                .strip_prefix("http://")
+                .map_or(r, |rest| rest.split_once('/').map_or("/", |(_, p)| p));
             let path = if path.starts_with('/') { path } else { fallback };
             path.split('?').next().unwrap_or(fallback).to_string()
         })
@@ -197,10 +201,7 @@ where
 // ---------------------------------------------------------------------------
 
 async fn stylesheet() -> Response {
-    (
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        views::STYLESHEET,
-    )
+    ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], views::STYLESHEET)
         .into_response()
 }
 
@@ -215,10 +216,8 @@ where
 {
     match acting(&state, &headers).await {
         Some((id, handle)) => {
-            let page = state
-                .read
-                .home_timeline(id, q.cursor.clone(), PAGE_SIZE)
-                .await;
+            let page =
+                state.read.home_timeline(id, q.cursor.clone(), PAGE_SIZE).await;
             let body = views::feed(
                 "Home",
                 Some("Posts from you and the people you follow."),
@@ -371,7 +370,11 @@ where
 
 /// Redirect an unauthenticated POST to the picker with a nudge.
 fn require_login() -> Response {
-    redirect_flash("/whoami", "err", "Pick a user first — you are not signed in.")
+    redirect_flash(
+        "/whoami",
+        "err",
+        "Pick a user first — you are not signed in.",
+    )
 }
 
 async fn create_post<R, W>(
@@ -561,16 +564,14 @@ where
 /// with an ok flash.
 fn set_acting(handle: &str, path: &str, msg: &str) -> Response {
     let cookie = format!(
-        "{ACTING_COOKIE}={handle}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000"
+        "{ACTING_COOKIE}={handle}; Path=/; HttpOnly; SameSite=Lax; \
+         Max-Age=31536000"
     );
     let sep = if path.contains('?') { '&' } else { '?' };
     let location = format!("{path}{sep}flash={}&kind=ok", enc(msg));
     (
         StatusCode::SEE_OTHER,
-        [
-            (header::SET_COOKIE, cookie),
-            (header::LOCATION, location),
-        ],
+        [(header::SET_COOKIE, cookie), (header::LOCATION, location)],
     )
         .into_response()
 }

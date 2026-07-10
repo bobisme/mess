@@ -24,14 +24,15 @@ fn ref_v1(fold_version: u32, covers_empty_prefix: bool) -> Vec<u8> {
 /// Write a snapshot head for `stream_id` at `version` into the (closed) meta
 /// store, so the store presents a live snapshot for the retention decision.
 fn inject_snapshot(dir: &std::path::Path, stream_id: u64, version: u64) {
-    let meta = MetaStore::open(mess_cli::store::meta_dir(dir)).expect("open meta");
+    let meta =
+        MetaStore::open(mess_cli::store::meta_dir(dir)).expect("open meta");
     let mut group = CommitGroup::new(version + 2);
     group.snapshot_heads.push((
         StreamId(stream_id),
         SnapshotHead {
             covered_version: version,
             global_position: version,
-            snapshot_ref: ref_v1(1, false),
+            snapshot_ref:    ref_v1(1, false),
         },
     ));
     meta.apply_group(&group).expect("apply snapshot head");
@@ -64,7 +65,8 @@ fn deletable_matches_decision_function() {
     assert_eq!(row["verdict"], "deletable");
 
     // Independently confirm via the decision function the CLI wraps.
-    let idx = SealedSegmentIndex::open(&common::pidx(d.path())).expect("open sidecar");
+    let idx = SealedSegmentIndex::open(&common::pidx(d.path()))
+        .expect("open sidecar");
     assert_eq!(decide_segment(&idx, &[], &[]), RetentionDecision::Deletable);
     assert_eq!(report.exit_code(), 0);
 }
@@ -91,16 +93,23 @@ fn blocked_matches_decision_function() {
 
     // The same decision, computed directly against the sealed index with the
     // live set the store now carries.
-    let idx = SealedSegmentIndex::open(&common::pidx(d.path())).expect("open sidecar");
+    let idx = SealedSegmentIndex::open(&common::pidx(d.path()))
+        .expect("open sidecar");
     let live: Vec<_> = metaread::read(d.path())
         .unwrap()
         .snapshots
         .iter()
         .filter(|s| !s.covers_empty_prefix)
-        .map(|s| mess_index::sealed::retention::LiveSnapshotRef { stream_id: s.stream_id, version: s.version })
+        .map(|s| mess_index::sealed::retention::LiveSnapshotRef {
+            stream_id: s.stream_id,
+            version:   s.version,
+        })
         .collect();
     let decision = decide_segment(&idx, &live, &[]);
-    assert!(decision.is_blocked(), "decision function must block: {decision:?}");
+    assert!(
+        decision.is_blocked(),
+        "decision function must block: {decision:?}"
+    );
 
     // Blockers name stream `sid`, version 2, frames v and v+1.
     let blockers = row["blockers"].as_array().expect("blockers array");

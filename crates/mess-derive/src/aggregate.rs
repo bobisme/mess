@@ -11,7 +11,7 @@ use syn::{DeriveInput, LitInt, Type};
 
 /// Parsed `#[aggregate(event = Type, fold_version = N)]` attribute.
 struct AggregateAttr {
-    event_ty: Type,
+    event_ty:     Type,
     /// The `u32` semantic fold version (D4 / spec `05-fold-certificates.md`
     /// §9). Optional; defaults to `1`, matching `#[event(version = N)]`.
     fold_version: u32,

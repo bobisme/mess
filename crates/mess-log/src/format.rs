@@ -185,8 +185,8 @@ pub(crate) const FT_REPAIR_SIDECAR_REF_OFF: usize = 88;
 // forward-compatible: a reader walks sections by hopping `EXT_SECTION_HDR_LEN +
 // payload_len` and MUST advisory-skip any unknown `kind` (§3.3.2).
 
-/// `EXT_SECTION_HDR_LEN` (§3.3.2): the fixed section-header length that precedes
-/// each extension section's payload.
+/// `EXT_SECTION_HDR_LEN` (§3.3.2): the fixed section-header length that
+/// precedes each extension section's payload.
 pub const EXT_SECTION_HDR_LEN: usize = 16;
 
 // Extension section-header field offsets, relative to the section's first byte

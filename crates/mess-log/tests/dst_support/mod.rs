@@ -8,11 +8,11 @@
 //! # Why this lives in `tests/`, not `src/`
 //!
 //! Every type this module touches (`Committer`, `SegmentWriter`, `ReadView`,
-//! `Watermark`, `SimRuntime`/`SimFs`, `recover_segment`, `sealer::recover_fast`)
-//! is already `pub` on `mess-log`'s normal API. Nothing here needed a new
-//! production seam — it is pure test-side composition, so it belongs in
-//! `tests/`, matching `crash_harness.rs`/`sigkill_harness.rs`. It is a
-//! `tests/dst_support/mod.rs` (the `mod.rs` special case), not
+//! `Watermark`, `SimRuntime`/`SimFs`, `recover_segment`,
+//! `sealer::recover_fast`) is already `pub` on `mess-log`'s normal API. Nothing
+//! here needed a new production seam — it is pure test-side composition, so it
+//! belongs in `tests/`, matching `crash_harness.rs`/`sigkill_harness.rs`. It is
+//! a `tests/dst_support/mod.rs` (the `mod.rs` special case), not
 //! `tests/dst_support.rs`, so Cargo does not compile it as its own
 //! (harness-less, pointless) test binary; every `tests/dst_*.rs` pulls it in
 //! with `#[path = "dst_support/mod.rs"] mod dst_support;`.
@@ -29,27 +29,27 @@
 //!   `crash_harness.rs` shape, now additionally racing live readers.
 //! - **`Sealed`** — a raw [`SegmentWriter`] driven directly by the scenario
 //!   (append → periodic `sync` → **`seal`**), so the harness itself keeps
-//!   ownership of the writer and can call [`SegmentWriter::seal`] — the
-//!   sealer stand-in the bone asks for. Concurrent readers race the append
-//!   *and* the seal barrier itself (the "seal-race" the bone names).
+//!   ownership of the writer and can call [`SegmentWriter::seal`] — the sealer
+//!   stand-in the bone asks for. Concurrent readers race the append *and* the
+//!   seal barrier itself (the "seal-race" the bone names).
 //!
 //! Every segment composes fault injection from **production fault-injection
 //! primitives**, no test-only `Fs` wrapper needed:
 //!
-//! - **crash mid-barrier** — `SimFs::inject_enospc(path, EnospcSite::Fdatasync)`:
-//!   the barrier fails WITHOUT promoting durability (`sim_fs.rs`'s own
-//!   documented semantics), exactly the write-then-barrier crash window
-//!   `crash_harness.rs`'s `FireOnFsync` models — but reached here through the
-//!   real ENOSPC path rather than a bespoke wrapper.
+//! - **crash mid-barrier** — `SimFs::inject_enospc(path,
+//!   EnospcSite::Fdatasync)`: the barrier fails WITHOUT promoting durability
+//!   (`sim_fs.rs`'s own documented semantics), exactly the write-then-barrier
+//!   crash window `crash_harness.rs`'s `FireOnFsync` models — but reached here
+//!   through the real ENOSPC path rather than a bespoke wrapper.
 //! - **ENOSPC** — the same primitive at `EnospcSite::Pwrite` (a batch write
 //!   refused) or `EnospcSite::Fdatasync` (the barrier refused).
 //! - **torn sectors** — every segment runs on the `Fault::SECTOR_512` medium
 //!   (sector-granular reordering + tear, ported from `spikes/torn_write`) and
 //!   ends with a seeded `SimFs::crash_random` call: any batch that was
-//!   `pwrite`n but never covered by a returning `fdatasync` is torn exactly
-//!   as a real crash would leave it. On a segment that finished cleanly this
-//!   is a no-op (nothing pending) — the harness always calls it, so a
-//!   scenario that plans no explicit fault still gets this pass, cheaply.
+//!   `pwrite`n but never covered by a returning `fdatasync` is torn exactly as
+//!   a real crash would leave it. On a segment that finished cleanly this is a
+//!   no-op (nothing pending) — the harness always calls it, so a scenario that
+//!   plans no explicit fault still gets this pass, cheaply.
 //! - **reader races** — every segment's concurrent readers keep re-reading
 //!   (with a random virtual-time lag) for the segment's whole lifetime,
 //!   including through the seal barrier.
@@ -57,30 +57,30 @@
 //! # Invariants checked after every segment
 //!
 //! - **Well-formed recovery**: [`recover_segment`]'s prefix is
-//!   position/byte-contiguous, current-epoch, and never invents an event
-//!   that was never submitted (mirrors `crash_harness.rs`'s
+//!   position/byte-contiguous, current-epoch, and never invents an event that
+//!   was never submitted (mirrors `crash_harness.rs`'s
 //!   `assert_recovery_wellformed`).
 //! - **Acked ⟹ recovered**, per the [`Durability`] contract (§1 of
 //!   `03-durability.md`): every position the committer/writer durably
 //!   acknowledged (a real `Acked` outcome, or a raw-writer `sync()` that
-//!   returned `Ok`) is inside the recovered prefix. Scoped to `Os`/`Group`
-//!   (and every `Sealed`-kind segment, which only ever advances on a real
-//!   `sync()` `Ok`): `Durability::Process` is explicitly excluded, because
-//!   BY DESIGN it advances its watermark with no barrier at all (§1.1) —
-//!   see `SegOutcome::durability_guaranteed`.
+//!   returned `Ok`) is inside the recovered prefix. Scoped to `Os`/`Group` (and
+//!   every `Sealed`-kind segment, which only ever advances on a real `sync()`
+//!   `Ok`): `Durability::Process` is explicitly excluded, because BY DESIGN it
+//!   advances its watermark with no barrier at all (§1.1) — see
+//!   `SegOutcome::durability_guaranteed`.
 //! - **Reader-never-past-watermark, globally** — same scope: every reader
 //!   observation recorded during the LIVE run of a barrier-backed segment is
 //!   `<=` the position recovery later proves durable — i.e. nothing a
 //!   subscriber was ever shown evaporates on crash. This is the composed
-//!   property `dst_harness_self_test.rs` demonstrates the harness can
-//!   actually catch (a deliberately broken watermark).
+//!   property `dst_harness_self_test.rs` demonstrates the harness can actually
+//!   catch (a deliberately broken watermark).
 //! - **R2 agrees with the full scan**: [`sealer::recover_fast`]'s
 //!   `end_pos`/`batch_count`, whichever path it took (trusted trailer or
-//!   fallback scan), always equals the independent [`recover_segment`] call
-//!   — the A12 discipline (a fast path may only seed-and-skip, never accept
-//!   what a scan would reject).
-//! - **Idempotent re-recovery**: scanning the same durable image twice
-//!   yields identical [`Recovery`] values.
+//!   fallback scan), always equals the independent [`recover_segment`] call —
+//!   the A12 discipline (a fast path may only seed-and-skip, never accept what
+//!   a scan would reject).
+//! - **Idempotent re-recovery**: scanning the same durable image twice yields
+//!   identical [`Recovery`] values.
 //! - **Contiguous chain**: the next segment's `base_pos`/`epoch` are exactly
 //!   the previous segment's recovered `next_pos` / a strictly larger epoch —
 //!   whole-store continuity across the crash.
@@ -99,34 +99,34 @@
 //! # Deliberately out of scope (documented, not silently dropped)
 //!
 //! - **Scenario shrinking.** A failing seed reprints and re-runs
-//!   byte-identically (this module's whole determinism story), which is
-//!   enough to debug a failure by hand; automatically minimizing the FAILING
-//!   seed's scenario plan (fewer segments/batches while preserving the
-//!   failure) is real, valuable follow-up work this bone does not attempt.
+//!   byte-identically (this module's whole determinism story), which is enough
+//!   to debug a failure by hand; automatically minimizing the FAILING seed's
+//!   scenario plan (fewer segments/batches while preserving the failure) is
+//!   real, valuable follow-up work this bone does not attempt.
 //! - **True cross-segment overlap.** Segments in a chain run strictly
 //!   sequentially in this driver (segment `i+1`'s `Committer`/writer is not
-//!   constructed until segment `i`'s driver future — including its seal —
-//!   has resolved). Readers race a segment's own seal (the seal-race the
-//!   bone names), but "segment N's seal barrier literally overlaps segment
-//!   N+1's first append" is not modeled; doing that soundly means spawning
-//!   whole per-segment drivers as independent tasks with `Send` plumbing
-//!   throughout, a materially bigger lift than this bone's `m` size affords.
+//!   constructed until segment `i`'s driver future — including its seal — has
+//!   resolved). Readers race a segment's own seal (the seal-race the bone
+//!   names), but "segment N's seal barrier literally overlaps segment N+1's
+//!   first append" is not modeled; doing that soundly means spawning whole
+//!   per-segment drivers as independent tasks with `Send` plumbing throughout,
+//!   a materially bigger lift than this bone's `m` size affords.
 //! - **`model.rs` as a numeric oracle here.** [`mess_log::model`] is a
 //!   byte-format-optional abstraction (slots of 3 independently-persisted
 //!   parts) already exhaustively checked against the production acceptance
 //!   kernel by `tests/stateright.rs`. Wiring it as a second oracle for THIS
-//!   harness's concrete byte-level scenarios would need translating
-//!   `SimFs`'s actual per-sector pending/fate bookkeeping (private to
-//!   `sim_fs.rs`, not part of the public `Fs` seam) into the model's
-//!   header/body/marker `PartFate`s — a nontrivial, easy-to-get-subtly-wrong
-//!   mapping for a property (`acked ⟹ recovered`) this module already checks
-//!   directly against the real scanner. What DOES transfer, and is used
-//!   here: the exact PROPERTY `model.rs`'s `State::acked` field encodes
-//!   ("an ack is a promise") is the same property `assert_acked_implies_recovered`
-//!   below checks — model.rs proved it holds for the abstract kernel across
-//!   every reachable interleaving within its bounds; this harness checks it
-//!   holds for the concrete bytes across REAL concurrent schedules the model
-//!   does not represent (timing, subscriber races, multi-actor composition).
+//!   harness's concrete byte-level scenarios would need translating `SimFs`'s
+//!   actual per-sector pending/fate bookkeeping (private to `sim_fs.rs`, not
+//!   part of the public `Fs` seam) into the model's header/body/marker
+//!   `PartFate`s — a nontrivial, easy-to-get-subtly-wrong mapping for a
+//!   property (`acked ⟹ recovered`) this module already checks directly against
+//!   the real scanner. What DOES transfer, and is used here: the exact PROPERTY
+//!   `model.rs`'s `State::acked` field encodes ("an ack is a promise") is the
+//!   same property `assert_acked_implies_recovered` below checks — model.rs
+//!   proved it holds for the abstract kernel across every reachable
+//!   interleaving within its bounds; this harness checks it holds for the
+//!   concrete bytes across REAL concurrent schedules the model does not
+//!   represent (timing, subscriber races, multi-actor composition).
 //!
 //! [`docs/spec/01-log-format.md`]: ../../../../../docs/spec/01-log-format.md
 
@@ -139,14 +139,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mess_log::committer::{
-    AppendError, AppendOutcome, AppendRequest, Committer, Durability, EventInput,
+    AppendError, AppendOutcome, AppendRequest, Committer, Durability,
+    EventInput,
 };
 use mess_log::encode::Subframe;
 use mess_log::format::SEGMENT_HEADER_LEN;
 use mess_log::reader::ReadView;
-use mess_log::runtime::{Clock, EnospcSite, Fault, Fs, Rng, Runtime, SimFs, SimRuntime};
-use mess_log::scanner::{recover_segment, Recovery};
-use mess_log::sealer::{recover_fast, FastRecovery};
+use mess_log::runtime::{
+    Clock, EnospcSite, Fault, Fs, Rng, Runtime, SimFs, SimRuntime,
+};
+use mess_log::scanner::{Recovery, recover_segment};
+use mess_log::sealer::{FastRecovery, recover_fast};
 use mess_log::watermark::Watermark;
 use mess_log::writer::{BatchSpec, SegmentParams, SegmentWriter, WriteError};
 
@@ -173,41 +176,42 @@ pub enum FaultPhase {
 
 #[derive(Debug, Clone, Copy)]
 pub struct EnospcFault {
-    pub site: EnospcSite,
+    pub site:  EnospcSite,
     pub phase: FaultPhase,
 }
 
 #[derive(Debug, Clone)]
 pub struct PlannedBatch {
-    pub stream_id: u64,
+    pub stream_id:            u64,
     pub first_stream_version: u64,
-    pub events: Vec<Vec<u8>>,
+    pub events:               Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct SegPlan {
-    pub kind: SegKind,
-    pub durability: Durability,
-    /// Number of concurrent appenders (`Committer` kind only; `1` for `Sealed`).
-    pub writers: u64,
+    pub kind:              SegKind,
+    pub durability:        Durability,
+    /// Number of concurrent appenders (`Committer` kind only; `1` for
+    /// `Sealed`).
+    pub writers:           u64,
     /// Per-writer batch sequence for `Committer`; `batches[0]` is the whole
     /// flat sequence for `Sealed`.
-    pub batches: Vec<Vec<PlannedBatch>>,
-    pub n_readers: u64,
+    pub batches:           Vec<Vec<PlannedBatch>>,
+    pub n_readers:         u64,
     pub reader_lag_max_us: u64,
-    pub reader_seed_base: u64,
+    pub reader_seed_base:  u64,
     /// `Sealed` kind only: sync after every `sync_every` batches.
-    pub sync_every: usize,
-    pub enospc: Option<EnospcFault>,
+    pub sync_every:        usize,
+    pub enospc:            Option<EnospcFault>,
     /// Seeded tear probability for the always-on end-of-segment
     /// `crash_random` pass (torn sectors).
-    pub tear_prob: f64,
-    pub writer_seed: u64,
+    pub tear_prob:         f64,
+    pub writer_seed:       u64,
 }
 
 #[derive(Debug, Clone)]
 pub struct ScenarioPlan {
-    pub seed: u64,
+    pub seed:     u64,
     pub segments: Vec<SegPlan>,
 }
 
@@ -237,7 +241,11 @@ fn plan_segment(rng: &mut Rng, seg_idx: u64) -> SegPlan {
         let mut seq = Vec::new();
         for _ in 0..batches_per {
             let events = random_events(rng, 3, 48);
-            seq.push(PlannedBatch { stream_id: 10 * seg_idx + w, first_stream_version: version, events: events.clone() });
+            seq.push(PlannedBatch {
+                stream_id:            10 * seg_idx + w,
+                first_stream_version: version,
+                events:               events.clone(),
+            });
             version += events.len() as u64;
         }
         batches.push(seq);
@@ -251,7 +259,11 @@ fn plan_segment(rng: &mut Rng, seg_idx: u64) -> SegPlan {
             0 => EnospcSite::Pwrite,
             _ => EnospcSite::Fdatasync,
         };
-        let phase = if kind == SegKind::Sealed && rng.bool() { FaultPhase::Seal } else { FaultPhase::AppendSync };
+        let phase = if kind == SegKind::Sealed && rng.bool() {
+            FaultPhase::Seal
+        } else {
+            FaultPhase::AppendSync
+        };
         Some(EnospcFault { site, phase })
     } else {
         None
@@ -288,15 +300,15 @@ pub fn plan_scenario(seed: u64) -> ScenarioPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TraceEvent {
     SegmentDone {
-        seg_idx: usize,
+        seg_idx:            usize,
         recovered_next_pos: u64,
-        recovered_batches: u64,
-        recovered_epoch: u64,
-        image_crc32c: u32,
-        image_len: u64,
-        acked_end: u64,
-        max_reader_seen: u64,
-        sealed_via_r2: bool,
+        recovered_batches:  u64,
+        recovered_epoch:    u64,
+        image_crc32c:       u32,
+        image_len:          u64,
+        acked_end:          u64,
+        max_reader_seen:    u64,
+        sealed_via_r2:      bool,
     },
 }
 
@@ -321,7 +333,12 @@ pub struct Trace {
 /// WALL time, just expressed in nanosecond ticks. Racing a bounded
 /// `Watermark::wait_for` against a capped sleep bounds every idle cycle to
 /// `cap`, while still waking IMMEDIATELY on real progress.
-async fn wait_progress_or_cap(wm: &Watermark, at_least: u64, rt: &SimRuntime, cap: Duration) {
+async fn wait_progress_or_cap(
+    wm: &Watermark,
+    at_least: u64,
+    rt: &SimRuntime,
+    cap: Duration,
+) {
     let deadline = rt.now().saturating_add(cap);
     let mut wait_fut = std::pin::pin!(wm.wait_for(at_least));
     let mut sleep_fut = std::pin::pin!(rt.sleep_until(deadline));
@@ -352,7 +369,8 @@ async fn reader_loop(
         if let Ok(p) = view.read_committed() {
             assert!(
                 p.next_pos() <= p.watermark,
-                "reader observed past its own watermark snapshot: next_pos={} watermark={}",
+                "reader observed past its own watermark snapshot: next_pos={} \
+                 watermark={}",
                 p.next_pos(),
                 p.watermark
             );
@@ -368,7 +386,13 @@ async fn reader_loop(
             break;
         }
         let cap_us = if lag_max_us > 0 { 1 + rng.below(lag_max_us) } else { 1 };
-        wait_progress_or_cap(&wm, last_watermark + 1, &rt, Duration::from_micros(cap_us)).await;
+        wait_progress_or_cap(
+            &wm,
+            last_watermark + 1,
+            &rt,
+            Duration::from_micros(cap_us),
+        )
+        .await;
     }
 }
 
@@ -378,7 +402,8 @@ async fn reader_loop(
 // so this cannot be `'static` when called through a borrowed `&SimRuntime`.
 // Every reader is `.await`ed before the borrow ends, so a non-`'static`
 // bound costs nothing here.
-type BoxedFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+type BoxedFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
 
 fn spawn_readers<'a>(
     rt: &'a SimRuntime,
@@ -391,23 +416,30 @@ fn spawn_readers<'a>(
 ) -> Vec<BoxedFuture<'a>> {
     let mut readers: Vec<BoxedFuture<'a>> = Vec::new();
     for r in 0..plan.n_readers {
-        let view = ReadView::new(fs.clone(), path.to_path_buf(), watermark.clone());
+        let view =
+            ReadView::new(fs.clone(), path.to_path_buf(), watermark.clone());
         let rt2 = rt.clone();
         let done2 = done.clone();
         let max2 = max_seen.clone();
         let seed = plan.reader_seed_base.wrapping_add(r);
         let lag = plan.reader_lag_max_us;
-        readers.push(Box::pin(rt.spawn(reader_loop(view, rt2, lag, seed, done2, max2))));
+        readers.push(Box::pin(
+            rt.spawn(reader_loop(view, rt2, lag, seed, done2, max2)),
+        ));
     }
     readers
 }
 
 fn to_request(pb: &PlannedBatch) -> AppendRequest {
     AppendRequest {
-        stream_id: pb.stream_id,
-        category_id: 1000 + pb.stream_id,
+        stream_id:            pb.stream_id,
+        category_id:          1000 + pb.stream_id,
         first_stream_version: pb.first_stream_version,
-        events: pb.events.iter().map(|p| EventInput::plain(1, 1, 0, p.clone())).collect(),
+        events:               pb
+            .events
+            .iter()
+            .map(|p| EventInput::plain(1, 1, 0, p.clone()))
+            .collect(),
     }
 }
 
@@ -418,7 +450,7 @@ fn to_request(pb: &PlannedBatch) -> AppendRequest {
 struct SegOutcome {
     /// End of the durably-acknowledged prefix this segment produced, per its
     /// Durability contract (`base_pos + every guaranteed-acked event`).
-    acked_end: u64,
+    acked_end:              u64,
     /// Whether THIS segment's durability mode guarantees `acked_end`/
     /// `max_reader_seen` survive a crash: true for `Os`/`Group` (barrier-
     /// backed) and for a raw `Sealed`-kind writer (every advance here is
@@ -431,8 +463,8 @@ struct SegOutcome {
     /// flag is what keeps the acked-implies-recovered AND the
     /// reader-never-past-watermark checks honest about that documented
     /// exception, rather than papering over it.
-    durability_guaranteed: bool,
-    max_reader_seen: u64,
+    durability_guaranteed:  bool,
+    max_reader_seen:        u64,
     /// Whether this segment ended sealed with no fault having fired.
     attempted_seal_cleanly: bool,
 }
@@ -454,7 +486,8 @@ async fn run_committer_segment(
 
     let done = Arc::new(AtomicBool::new(false));
     let max_seen = Arc::new(AtomicU64::new(params.base_pos));
-    let readers = spawn_readers(rt, fs, path, &c.watermark(), plan, &done, &max_seen);
+    let readers =
+        spawn_readers(rt, fs, path, &c.watermark(), plan, &done, &max_seen);
 
     if let Some(fault) = &plan.enospc {
         // Fires on the first matching op reached from here on (best-effort
@@ -472,11 +505,18 @@ async fn run_committer_segment(
         joins.push(rt.spawn(async move {
             for pb in &batches {
                 match ap.append(to_request(pb)).await {
-                    Ok(AppendOutcome::Acked { first_position, last_position }) => {
-                        acked2.lock().unwrap().push((first_position, last_position));
+                    Ok(AppendOutcome::Acked {
+                        first_position,
+                        last_position,
+                    }) => {
+                        acked2
+                            .lock()
+                            .unwrap()
+                            .push((first_position, last_position));
                     }
                     Ok(AppendOutcome::Indeterminate) => {}
-                    Err(AppendError::StorePoisoned) | Err(AppendError::StoreFull) => {}
+                    Err(AppendError::StorePoisoned)
+                    | Err(AppendError::StoreFull) => {}
                     Err(e) => panic!("valid batch pre-flight rejected: {e}"),
                 }
             }
@@ -499,7 +539,8 @@ async fn run_committer_segment(
         expect = _last + 1;
     }
     let acked_end = expect;
-    let durability_guaranteed = matches!(plan.durability, Durability::Os | Durability::Group { .. });
+    let durability_guaranteed =
+        matches!(plan.durability, Durability::Os | Durability::Group { .. });
 
     SegOutcome {
         acked_end,
@@ -540,13 +581,14 @@ async fn run_sealed_segment(
     let mut acked_end = params.base_pos;
     let mut barrier_failed = false;
     for (i, pb) in flat.iter().enumerate() {
-        let subs: Vec<Subframe> = pb.events.iter().map(|p| Subframe::plain(1, 1, 0, p)).collect();
+        let subs: Vec<Subframe> =
+            pb.events.iter().map(|p| Subframe::plain(1, 1, 0, p)).collect();
         let spec = BatchSpec {
-            stream_id: pb.stream_id,
-            category_id: 1000 + pb.stream_id,
+            stream_id:            pb.stream_id,
+            category_id:          1000 + pb.stream_id,
             first_stream_version: pb.first_stream_version,
-            crypto_chain: None,
-            subframes: &subs,
+            crypto_chain:         None,
+            subframes:            &subs,
         };
         match writer.append(&spec) {
             Ok(_) => {}
@@ -586,7 +628,8 @@ async fn run_sealed_segment(
             fs.inject_enospc(path, fault.site);
         }
         rt.sleep(Duration::from_nanos(1)).await;
-        let had_fault = plan.enospc.as_ref().is_some_and(|f| f.phase == FaultPhase::Seal);
+        let had_fault =
+            plan.enospc.as_ref().is_some_and(|f| f.phase == FaultPhase::Seal);
         if writer.seal().is_ok() && !had_fault {
             attempted_seal_cleanly = true;
         }
@@ -599,7 +642,8 @@ async fn run_sealed_segment(
 
     SegOutcome {
         acked_end,
-        durability_guaranteed: true, // every counted position had a real sync() Ok
+        durability_guaranteed: true, /* every counted position had a real
+                                      * sync() Ok */
         max_reader_seen: max_seen.load(Ordering::Acquire),
         attempted_seal_cleanly,
     }
@@ -655,13 +699,18 @@ fn run_one_segment(
         epoch,
         prev_segment_epoch: prev_epoch,
         created_unix_nanos: 0,
-        segment_size: 4 * 1024 * 1024, // small: cheap in-memory images, still plenty of room
+        segment_size: 4 * 1024 * 1024, /* small: cheap in-memory images,
+                                        * still plenty of room */
     };
 
     let outcome = rt.block_on(async {
         match seg.kind {
-            SegKind::Committer => run_committer_segment(rt, fs, &path, params, seg).await,
-            SegKind::Sealed => run_sealed_segment(rt, fs, &path, params, seg).await,
+            SegKind::Committer => {
+                run_committer_segment(rt, fs, &path, params, seg).await
+            }
+            SegKind::Sealed => {
+                run_sealed_segment(rt, fs, &path, params, seg).await
+            }
         }
     });
 
@@ -669,10 +718,13 @@ fn run_one_segment(
     // by a returning fdatasync) is torn exactly as a real crash would leave
     // it. A clean segment has nothing pending: a no-op.
     rt.with_rng(|rng| fs.crash_random(&path, rng, seg.tear_prob))
-        .unwrap_or_else(|e| panic!("seed {seed} seg {seg_idx}: crash_random failed: {e}"));
+        .unwrap_or_else(|e| {
+            panic!("seed {seed} seg {seg_idx}: crash_random failed: {e}")
+        });
 
-    let rec = recover_segment(fs, &path)
-        .unwrap_or_else(|e| panic!("seed {seed} seg {seg_idx}: recover failed: {e}"));
+    let rec = recover_segment(fs, &path).unwrap_or_else(|e| {
+        panic!("seed {seed} seg {seg_idx}: recover failed: {e}")
+    });
     assert_recovery_wellformed(seed, seg_idx, &rec, base_pos, epoch);
 
     // acked ⟹ recovered, per the durability contract. Durability::Process
@@ -681,7 +733,8 @@ fn run_one_segment(
     if outcome.durability_guaranteed {
         assert!(
             rec.next_pos >= outcome.acked_end,
-            "seed {seed} seg {seg_idx}: LOST ACKED DATA: recovered next_pos={} < acked_end={}",
+            "seed {seed} seg {seg_idx}: LOST ACKED DATA: recovered \
+             next_pos={} < acked_end={}",
             rec.next_pos,
             outcome.acked_end
         );
@@ -694,8 +747,8 @@ fn run_one_segment(
     if outcome.durability_guaranteed {
         assert!(
             rec.next_pos >= outcome.max_reader_seen,
-            "seed {seed} seg {seg_idx}: a reader observed position {} as committed, \
-             but recovery only reconstructed up to {}",
+            "seed {seed} seg {seg_idx}: a reader observed position {} as \
+             committed, but recovery only reconstructed up to {}",
             outcome.max_reader_seen,
             rec.next_pos
         );
@@ -703,8 +756,9 @@ fn run_one_segment(
 
     // R2 (sealer) agrees with the authoritative full scan, whichever path
     // it took.
-    let fr = recover_fast(fs, &path)
-        .unwrap_or_else(|e| panic!("seed {seed} seg {seg_idx}: recover_fast failed: {e}"));
+    let fr = recover_fast(fs, &path).unwrap_or_else(|e| {
+        panic!("seed {seed} seg {seg_idx}: recover_fast failed: {e}")
+    });
     assert_eq!(
         fr.end_pos(),
         rec.next_pos,
@@ -713,28 +767,33 @@ fn run_one_segment(
     assert_eq!(
         fr.batch_count(),
         rec.accepted.len() as u64,
-        "seed {seed} seg {seg_idx}: R2 batch_count disagrees with the full scan"
+        "seed {seed} seg {seg_idx}: R2 batch_count disagrees with the full \
+         scan"
     );
     let sealed_via_r2 = matches!(fr, FastRecovery::Sealed { .. });
     if seg.kind == SegKind::Sealed && outcome.attempted_seal_cleanly {
         assert!(
             sealed_via_r2,
-            "seed {seed} seg {seg_idx}: a cleanly-sealed segment with no injected \
-             fault must be trusted via the R2 fast path"
+            "seed {seed} seg {seg_idx}: a cleanly-sealed segment with no \
+             injected fault must be trusted via the R2 fast path"
         );
     }
     if seg.kind == SegKind::Committer {
         assert!(
             !sealed_via_r2,
-            "seed {seed} seg {seg_idx}: a Committer-kind segment is never sealed; \
-             R2 must always fall back to a full scan"
+            "seed {seed} seg {seg_idx}: a Committer-kind segment is never \
+             sealed; R2 must always fall back to a full scan"
         );
     }
 
     // Idempotent re-recovery.
-    let rec2 = recover_segment(fs, &path)
-        .unwrap_or_else(|e| panic!("seed {seed} seg {seg_idx}: re-recover failed: {e}"));
-    assert_eq!(rec, rec2, "seed {seed} seg {seg_idx}: re-recovery not idempotent");
+    let rec2 = recover_segment(fs, &path).unwrap_or_else(|e| {
+        panic!("seed {seed} seg {seg_idx}: re-recover failed: {e}")
+    });
+    assert_eq!(
+        rec, rec2,
+        "seed {seed} seg {seg_idx}: re-recovery not idempotent"
+    );
 
     let img = image_bytes(fs, &path);
     let image_crc32c = crc32c::crc32c(&img);
@@ -772,8 +831,9 @@ pub fn run_scenario(seed: u64) -> Trace {
     let mut prev_epoch = 0u64;
 
     for (seg_idx, seg) in plan.segments.iter().enumerate() {
-        let (event, next_base, next_epoch) =
-            run_one_segment(&rt, &fs, seed, seg_idx, seg, base_pos, epoch, prev_epoch);
+        let (event, next_base, next_epoch) = run_one_segment(
+            &rt, &fs, seed, seg_idx, seg, base_pos, epoch, prev_epoch,
+        );
         trace.events.push(event);
         prev_epoch = epoch;
         base_pos = next_base;
@@ -792,30 +852,60 @@ pub fn run_scenario(seed: u64) -> Trace {
 pub fn run_single_segment_scenario(seed: u64, seg: SegPlan) -> Trace {
     let rt = SimRuntime::with_fault(seed, Fault::SECTOR_512);
     let fs = rt.fs();
-    let (event, _, _) = run_one_segment(&rt, &fs, seed, 0, &seg, 0, 1, 0);
+    let (event, ..) = run_one_segment(&rt, &fs, seed, 0, &seg, 0, 1, 0);
     Trace { events: vec![event] }
 }
 
 /// Structural invariants that hold for EVERY recovery in the chain: a valid
 /// header seeded from `base_pos`/`epoch`, a densely contiguous accepted
 /// prefix, `safe_offset` exactly past the accepted bytes.
-fn assert_recovery_wellformed(seed: u64, seg_idx: usize, rec: &Recovery, base_pos: u64, epoch: u64) {
-    let header = rec
-        .header
-        .unwrap_or_else(|| panic!("seed {seed} seg {seg_idx}: durable SegmentHeader must always survive"));
-    assert_eq!(header.base_pos, base_pos, "seed {seed} seg {seg_idx}: header base_pos");
+fn assert_recovery_wellformed(
+    seed: u64,
+    seg_idx: usize,
+    rec: &Recovery,
+    base_pos: u64,
+    epoch: u64,
+) {
+    let header = rec.header.unwrap_or_else(|| {
+        panic!(
+            "seed {seed} seg {seg_idx}: durable SegmentHeader must always \
+             survive"
+        )
+    });
+    assert_eq!(
+        header.base_pos, base_pos,
+        "seed {seed} seg {seg_idx}: header base_pos"
+    );
     assert_eq!(header.epoch, epoch, "seed {seed} seg {seg_idx}: header epoch");
 
     let mut expect_pos = base_pos;
     let mut off = SEGMENT_HEADER_LEN as u64;
     for b in &rec.accepted {
-        assert_eq!(b.first_global_pos, expect_pos, "seed {seed} seg {seg_idx}: not position-contiguous");
-        assert_eq!(b.offset, off, "seed {seed} seg {seg_idx}: not byte-contiguous");
-        assert_eq!(b.segment_epoch, epoch, "seed {seed} seg {seg_idx}: wrong epoch");
-        assert!(b.frame_count >= 1, "seed {seed} seg {seg_idx}: empty batch accepted (A5)");
+        assert_eq!(
+            b.first_global_pos, expect_pos,
+            "seed {seed} seg {seg_idx}: not position-contiguous"
+        );
+        assert_eq!(
+            b.offset, off,
+            "seed {seed} seg {seg_idx}: not byte-contiguous"
+        );
+        assert_eq!(
+            b.segment_epoch, epoch,
+            "seed {seed} seg {seg_idx}: wrong epoch"
+        );
+        assert!(
+            b.frame_count >= 1,
+            "seed {seed} seg {seg_idx}: empty batch accepted (A5)"
+        );
         expect_pos += u64::from(b.frame_count);
         off += b.total_len;
     }
-    assert_eq!(rec.next_pos, expect_pos, "seed {seed} seg {seg_idx}: next_pos != contiguous end");
-    assert_eq!(rec.safe_offset, off, "seed {seed} seg {seg_idx}: safe_offset != end of accepted bytes");
+    assert_eq!(
+        rec.next_pos, expect_pos,
+        "seed {seed} seg {seg_idx}: next_pos != contiguous end"
+    );
+    assert_eq!(
+        rec.safe_offset, off,
+        "seed {seed} seg {seg_idx}: safe_offset != end of accepted bytes"
+    );
 }

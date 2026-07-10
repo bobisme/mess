@@ -25,7 +25,8 @@ pub fn run(size: RunSize) -> Vec<Metric> {
     }
     black_box(h);
 
-    // frame_hash only (1x BLAKE3/event) — the baseline a frame-hashing store pays.
+    // frame_hash only (1x BLAKE3/event) — the baseline a frame-hashing store
+    // pays.
     let start = Instant::now();
     let mut acc = [0u8; 32];
     for v in 0..n {
@@ -53,7 +54,8 @@ pub fn run(size: RunSize) -> Vec<Metric> {
             full_ns - fh_ns,
             "ns/event",
             format!(
-                "chain_step delta: the second BLAKE3 (over 72 fixed bytes); {n} events, 250B payloads, single core"
+                "chain_step delta: the second BLAKE3 (over 72 fixed bytes); \
+                 {n} events, 250B payloads, single core"
             ),
         ),
         Metric::new(
@@ -61,7 +63,8 @@ pub fn run(size: RunSize) -> Vec<Metric> {
             1e9 / full_ns,
             "ev/s",
             format!(
-                "full chain (2x BLAKE3/event: frame_hash + chain_step); {full_ns:.1} ns/ev; {n} events, single core"
+                "full chain (2x BLAKE3/event: frame_hash + chain_step); \
+                 {full_ns:.1} ns/ev; {n} events, single core"
             ),
         ),
     ]

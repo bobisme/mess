@@ -88,19 +88,13 @@ impl Manifest {
     }
 
     /// The cached entries.
-    pub fn entries(&self) -> &[SegmentCatalogEntry] {
-        &self.entries
-    }
+    pub fn entries(&self) -> &[SegmentCatalogEntry] { &self.entries }
 
     /// The number of cached sealed segments.
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
+    pub fn len(&self) -> usize { self.entries.len() }
 
     /// Whether the manifest caches no segments.
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
+    pub fn is_empty(&self) -> bool { self.entries.is_empty() }
 
     /// The cached catalog entry for `segment_id`, if any. `O(n)` — recovery
     /// resolves each segment once, so a linear probe over the (small) sealed
@@ -115,7 +109,8 @@ impl Manifest {
 /// `manifest_crc` over everything before it (so any corruption anywhere in the
 /// file fails the CRC and the whole manifest is discarded — advisory-safe).
 pub fn build_manifest(entries: &[SegmentCatalogEntry]) -> Vec<u8> {
-    let mut b = vec![0u8; MANIFEST_HEADER_LEN + entries.len() * MANIFEST_ENTRY_LEN + 4];
+    let mut b =
+        vec![0u8; MANIFEST_HEADER_LEN + entries.len() * MANIFEST_ENTRY_LEN + 4];
     put_u32(&mut b, MH_MAGIC_OFF, MANIFEST_MAGIC);
     put_u16(&mut b, MH_VERSION_OFF, MANIFEST_VERSION);
     put_u16(&mut b, MH_FLAGS_OFF, 0);
@@ -172,15 +167,15 @@ pub fn decode_manifest(bytes: &[u8]) -> Option<Manifest> {
     for i in 0..entry_count {
         let o = MANIFEST_HEADER_LEN + i * MANIFEST_ENTRY_LEN;
         entries.push(SegmentCatalogEntry {
-            segment_id: rd_u64(bytes, o + ME_SEGMENT_ID_OFF),
-            epoch: rd_u64(bytes, o + ME_EPOCH_OFF),
-            base_pos: rd_u64(bytes, o + ME_BASE_POS_OFF),
-            end_pos: rd_u64(bytes, o + ME_END_POS_OFF),
+            segment_id:  rd_u64(bytes, o + ME_SEGMENT_ID_OFF),
+            epoch:       rd_u64(bytes, o + ME_EPOCH_OFF),
+            base_pos:    rd_u64(bytes, o + ME_BASE_POS_OFF),
+            end_pos:     rd_u64(bytes, o + ME_END_POS_OFF),
             batch_count: rd_u64(bytes, o + ME_BATCH_COUNT_OFF),
             event_count: rd_u64(bytes, o + ME_EVENT_COUNT_OFF),
-            ext_offset: rd_u64(bytes, o + ME_EXT_OFFSET_OFF),
-            ext_len: rd_u64(bytes, o + ME_EXT_LEN_OFF),
-            ext_crc: rd_u32(bytes, o + ME_EXT_CRC_OFF),
+            ext_offset:  rd_u64(bytes, o + ME_EXT_OFFSET_OFF),
+            ext_len:     rd_u64(bytes, o + ME_EXT_LEN_OFF),
+            ext_crc:     rd_u32(bytes, o + ME_EXT_CRC_OFF),
         });
     }
     Some(Manifest { entries })
@@ -191,14 +186,29 @@ pub fn decode_manifest(bytes: &[u8]) -> Option<Manifest> {
 /// to a temp name and [`rename`](Fs::rename) for atomicity; this helper writes
 /// in place (a torn manifest simply fails its CRC on the next read and is
 /// ignored).
-pub fn write_manifest<F: Fs>(fs: &F, path: &Path, entries: &[SegmentCatalogEntry]) -> io::Result<()> {
+pub fn write_manifest<F: Fs>(
+    fs: &F,
+    path: &Path,
+    entries: &[SegmentCatalogEntry],
+) -> io::Result<()> {
     let bytes = build_manifest(entries);
-    let file = fs.open(path, OpenOpts { read: true, write: true, create: true, truncate: true })?;
+    let file = fs.open(
+        path,
+        OpenOpts {
+            read:     true,
+            write:    true,
+            create:   true,
+            truncate: true,
+        },
+    )?;
     let mut off = 0usize;
     while off < bytes.len() {
         let n = file.pwrite(off as u64, &bytes[off..])?;
         if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::WriteZero, "short manifest write"));
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short manifest write",
+            ));
         }
         off += n;
     }
@@ -209,7 +219,10 @@ pub fn write_manifest<F: Fs>(fs: &F, path: &Path, entries: &[SegmentCatalogEntry
 /// `Ok(None)` when the file is missing (`NotFound`) or does not validate — in
 /// every such case recovery MUST fall back to reading trailers (§8.3, R2), so a
 /// missing/corrupt manifest is indistinguishable and equally harmless.
-pub fn read_manifest<F: Fs>(fs: &F, path: &Path) -> io::Result<Option<Manifest>> {
+pub fn read_manifest<F: Fs>(
+    fs: &F,
+    path: &Path,
+) -> io::Result<Option<Manifest>> {
     let file = match fs.open(path, OpenOpts::read_only()) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -258,7 +271,13 @@ fn rd_u64(d: &[u8], o: usize) -> u64 {
 mod tests {
     use super::*;
 
-    fn cat(segment_id: u64, epoch: u64, base_pos: u64, events: u64, batches: u64) -> SegmentCatalogEntry {
+    fn cat(
+        segment_id: u64,
+        epoch: u64,
+        base_pos: u64,
+        events: u64,
+        batches: u64,
+    ) -> SegmentCatalogEntry {
         SegmentCatalogEntry {
             segment_id,
             epoch,
@@ -274,7 +293,8 @@ mod tests {
 
     #[test]
     fn roundtrips_through_decode() {
-        let entries = vec![cat(1, 10, 0, 5, 3), cat(2, 11, 5, 4, 2), cat(3, 12, 9, 6, 4)];
+        let entries =
+            vec![cat(1, 10, 0, 5, 3), cat(2, 11, 5, 4, 2), cat(3, 12, 9, 6, 4)];
         let bytes = build_manifest(&entries);
         let m = decode_manifest(&bytes).expect("valid manifest decodes");
         assert_eq!(m.entries(), entries.as_slice());
@@ -295,7 +315,10 @@ mod tests {
         let mut bytes = build_manifest(&[cat(1, 10, 0, 5, 3)]);
         let i = MANIFEST_HEADER_LEN + ME_EPOCH_OFF; // flip a byte inside CRC coverage
         bytes[i] ^= 0xFF;
-        assert!(decode_manifest(&bytes).is_none(), "any corruption ⇒ discard the whole manifest");
+        assert!(
+            decode_manifest(&bytes).is_none(),
+            "any corruption ⇒ discard the whole manifest"
+        );
     }
 
     #[test]
@@ -305,17 +328,24 @@ mod tests {
         assert!(decode_manifest(&a).is_none());
         let mut b = build_manifest(&[cat(1, 10, 0, 5, 3)]);
         put_u16(&mut b, MH_VERSION_OFF, MANIFEST_VERSION + 1);
-        // recompute a *valid* CRC so only the version differs — must still reject.
+        // recompute a *valid* CRC so only the version differs — must still
+        // reject.
         let crc_off = b.len() - 4;
         let crc = crc32c::crc32c(&b[..crc_off]);
         put_u32(&mut b, crc_off, crc);
-        assert!(decode_manifest(&b).is_none(), "unknown version ⇒ treat as absent");
+        assert!(
+            decode_manifest(&b).is_none(),
+            "unknown version ⇒ treat as absent"
+        );
     }
 
     #[test]
     fn truncated_and_lying_count_rejected() {
         let bytes = build_manifest(&[cat(1, 10, 0, 5, 3), cat(2, 11, 5, 4, 2)]);
-        assert!(decode_manifest(&bytes[..bytes.len() - 1]).is_none(), "truncated ⇒ reject");
+        assert!(
+            decode_manifest(&bytes[..bytes.len() - 1]).is_none(),
+            "truncated ⇒ reject"
+        );
         // A count that does not match the byte length must be rejected before
         // it can drive an out-of-bounds entry read.
         let mut lie = bytes.clone();

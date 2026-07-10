@@ -5,10 +5,11 @@
 //! While a segment is active its pointers live in memory, tuned for cheap
 //! append (`spikes/perf_append`: keeping the index write off the critical path
 //! was the 4.7x lever). When the segment rolls, the seal pass rewrites that
-//! slice into a compact, immutable sidecar tuned for reads — packed varint-delta
-//! **pointer blocks** with an intra-block **skip table** — and hands readers
-//! over to it without ever exposing a gap. This turns the write-optimized
-//! representation into a read-optimized one *off the hot path* (D5).
+//! slice into a compact, immutable sidecar tuned for reads — packed
+//! varint-delta **pointer blocks** with an intra-block **skip table** — and
+//! hands readers over to it without ever exposing a gap. This turns the
+//! write-optimized representation into a read-optimized one *off the hot path*
+//! (D5).
 //!
 //! # Modules
 //!
@@ -29,9 +30,8 @@
 //!   stream replay and bypassed for point reads ([`BlockCache`]).
 //! - [`filter`] — the seal-time `BinaryFuse16` membership filter over a
 //!   segment's `stream_id`s (bn-1i7): consulted before the pointer index so a
-//!   segment definitely lacking a stream is skipped without a directory
-//!   lookup. Persisted as a sibling `.filter` file, independently
-//!   rebuildable (I5).
+//!   segment definitely lacking a stream is skipped without a directory lookup.
+//!   Persisted as a sibling `.filter` file, independently rebuildable (I5).
 //! - [`retention`] — the retention-blocking rule (bn-2ug,
 //!   `docs/spec/05-fold-certificates.md` §8.2): a segment MUST NOT be deleted
 //!   while it holds a live snapshot's certification frame (`v`/`v+1`) unless a
@@ -61,23 +61,29 @@ pub mod store;
 
 pub use block_cache::{BlockCache, CachedBlock};
 pub use driver::{
-    BackgroundSealer, FinalizeFn, SealDriver, SealError, SealMetrics, SealMetricsSnapshot,
+    BackgroundSealer, FinalizeFn, SealDriver, SealError, SealMetrics,
+    SealMetricsSnapshot,
 };
 pub use filter::{FilterError, SegmentFilter};
-pub use parity::{ParityConfig, ParityError, ParitySidecar, RepairPlan, generate as generate_parity, par_path};
+pub use parity::{
+    ParityConfig, ParityError, ParitySidecar, RepairPlan,
+    generate as generate_parity, par_path,
+};
 pub use payload::{
-    ARCHIVE_BLOCK_EVENTS, ARCHIVE_ZSTD_LEVEL, ArchivePolicy, BlockEntry, BlockKind, DictResolver,
-    NoDicts, PayloadError, PayloadSealOpts, ReblockError, ReblockOutcome, SealedPayloadIndex,
-    archive_reblock, encode_payload_sidecar, pcol_path, verify_reassembly,
+    ARCHIVE_BLOCK_EVENTS, ARCHIVE_ZSTD_LEVEL, ArchivePolicy, BlockEntry,
+    BlockKind, DictResolver, NoDicts, PayloadError, PayloadSealOpts,
+    ReblockError, ReblockOutcome, SealedPayloadIndex, archive_reblock,
+    encode_payload_sidecar, pcol_path, verify_reassembly,
 };
 pub use ptr_block::{BatchPtr, DecodeError, SKIP_K};
 pub use replay::{ReplaySet, global_checksum, stream_checksum};
 pub use retention::{
-    BackupLease, BlockingReason, CertFrame, LiveSnapshotRef, RetentionDecision, SegmentStreamSpan,
-    decide_segment, lease_holds, segment_deletable, segment_retention_decision, spans_for_segment,
+    BackupLease, BlockingReason, CertFrame, LiveSnapshotRef, RetentionDecision,
+    SegmentStreamSpan, decide_segment, lease_holds, segment_deletable,
+    segment_retention_decision, spans_for_segment,
 };
 pub use segment::{
-    SealBatch, SealInput, SealStream, SealedSegmentIndex, SealedSegmentRef, SidecarError,
-    encode_sidecar, filter_path_for,
+    SealBatch, SealInput, SealStream, SealedSegmentIndex, SealedSegmentRef,
+    SidecarError, encode_sidecar, filter_path_for,
 };
 pub use store::{SealedStore, resolve};

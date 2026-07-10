@@ -71,13 +71,13 @@ pub mod codec;
 use std::path::Path;
 use std::sync::Mutex;
 
-use fjall::{Database, Keyspace, KeyspaceCreateOptions};
-
 pub use codec::{DecodeError, Head, SnapshotHead, StreamId};
 use codec::{
-    decode_dedupe, decode_head, decode_pos, decode_snapshot, dedupe_key, encode_dedupe,
-    encode_head, encode_pos, encode_snapshot, order_key, stream_key,
+    decode_dedupe, decode_head, decode_pos, decode_snapshot, dedupe_key,
+    encode_dedupe, encode_head, encode_pos, encode_snapshot, order_key,
+    stream_key,
 };
+use fjall::{Database, Keyspace, KeyspaceCreateOptions};
 
 const P_STREAM_HEADS: &str = "stream_heads";
 const P_SNAPSHOT_HEADS: &str = "snapshot_heads";
@@ -175,13 +175,13 @@ pub enum MetaError {
 #[derive(Clone, Debug, Default)]
 pub struct CommitGroup {
     /// Exclusive log end reached after applying this group.
-    pub end_position: u64,
+    pub end_position:   u64,
     /// `stream_id → new head`.
-    pub stream_heads: Vec<(StreamId, Head)>,
+    pub stream_heads:   Vec<(StreamId, Head)>,
     /// `stream_id → new snapshot pointer`.
     pub snapshot_heads: Vec<(StreamId, SnapshotHead)>,
     /// `(stream_id, dedupe_key, committed global position)` to remember.
-    pub dedupe: Vec<(StreamId, Vec<u8>, u64)>,
+    pub dedupe:         Vec<(StreamId, Vec<u8>, u64)>,
 }
 
 impl CommitGroup {
@@ -195,7 +195,7 @@ impl CommitGroup {
 struct DedupeBounds {
     /// Seq of the oldest live entry (front of the FIFO). Equals `next_seq`
     /// when the window is empty.
-    min_seq: u64,
+    min_seq:  u64,
     /// Seq the next inserted entry will take (back of the FIFO). Live count is
     /// exactly `next_seq - min_seq`.
     next_seq: u64,
@@ -204,16 +204,16 @@ struct DedupeBounds {
 /// The metadata store: one fjall [`Database`] holding the four tables, opened
 /// at journal-buffered durability.
 pub struct MetaStore {
-    db: Database,
-    stream_heads: Keyspace,
-    snapshot_heads: Keyspace,
-    checkpoints: Keyspace,
-    dedupe: Keyspace,
-    dedupe_order: Keyspace,
-    hw: Keyspace,
-    stream_names: Keyspace,
-    type_names: Keyspace,
-    dedupe_bounds: Mutex<DedupeBounds>,
+    db:              Database,
+    stream_heads:    Keyspace,
+    snapshot_heads:  Keyspace,
+    checkpoints:     Keyspace,
+    dedupe:          Keyspace,
+    dedupe_order:    Keyspace,
+    hw:              Keyspace,
+    stream_names:    Keyspace,
+    type_names:      Keyspace,
+    dedupe_bounds:   Mutex<DedupeBounds>,
     dedupe_capacity: usize,
     /// Test/diagnostic: counts calls to [`Self::persist`] (bn-150). Lets a
     /// caller (the engine's name-durability regression tests) assert the
@@ -223,7 +223,7 @@ pub struct MetaStore {
     /// cannot be simulated portably in-process (an `fsync` survives a mere
     /// process crash/exit; only a real OS crash or power cut loses a
     /// page-cache write that was never `fsync`ed).
-    persist_calls: std::sync::atomic::AtomicU64,
+    persist_calls:   std::sync::atomic::AtomicU64,
 }
 
 impl MetaStore {
@@ -243,14 +243,20 @@ impl MetaStore {
         // Default builder => auto journal persist at PersistMode::Buffer:
         // journal-buffered, no per-commit fsync. That is the I5 contract.
         let db = Database::builder(path.as_ref()).open()?;
-        let stream_heads = db.keyspace(P_STREAM_HEADS, KeyspaceCreateOptions::default)?;
-        let snapshot_heads = db.keyspace(P_SNAPSHOT_HEADS, KeyspaceCreateOptions::default)?;
-        let checkpoints = db.keyspace(P_CHECKPOINTS, KeyspaceCreateOptions::default)?;
+        let stream_heads =
+            db.keyspace(P_STREAM_HEADS, KeyspaceCreateOptions::default)?;
+        let snapshot_heads =
+            db.keyspace(P_SNAPSHOT_HEADS, KeyspaceCreateOptions::default)?;
+        let checkpoints =
+            db.keyspace(P_CHECKPOINTS, KeyspaceCreateOptions::default)?;
         let dedupe = db.keyspace(P_DEDUPE, KeyspaceCreateOptions::default)?;
-        let dedupe_order = db.keyspace(P_DEDUPE_ORDER, KeyspaceCreateOptions::default)?;
+        let dedupe_order =
+            db.keyspace(P_DEDUPE_ORDER, KeyspaceCreateOptions::default)?;
         let hw = db.keyspace(P_HW, KeyspaceCreateOptions::default)?;
-        let stream_names = db.keyspace(P_STREAM_NAMES, KeyspaceCreateOptions::default)?;
-        let type_names = db.keyspace(P_TYPE_NAMES, KeyspaceCreateOptions::default)?;
+        let stream_names =
+            db.keyspace(P_STREAM_NAMES, KeyspaceCreateOptions::default)?;
+        let type_names =
+            db.keyspace(P_TYPE_NAMES, KeyspaceCreateOptions::default)?;
 
         // Recover the FIFO seq bounds from the order index: the window's live
         // seqs are the contiguous range [first_key, last_key].
@@ -298,10 +304,18 @@ impl MetaStore {
         let mut batch = self.db.batch();
 
         for (id, head) in &group.stream_heads {
-            batch.insert(&self.stream_heads, stream_key(*id), encode_head(*head));
+            batch.insert(
+                &self.stream_heads,
+                stream_key(*id),
+                encode_head(*head),
+            );
         }
         for (id, snap) in &group.snapshot_heads {
-            batch.insert(&self.snapshot_heads, stream_key(*id), encode_snapshot(snap));
+            batch.insert(
+                &self.snapshot_heads,
+                stream_key(*id),
+                encode_snapshot(snap),
+            );
         }
 
         for (stream, key, pos) in &group.dedupe {
@@ -349,14 +363,22 @@ impl MetaStore {
     /// Called by the engine the first time a stream name is interned, so a
     /// later reopen can resolve the name the log's numeric `stream_id` stands
     /// for.
-    pub fn put_stream_name(&self, stream_id: u64, name: &str) -> Result<(), MetaError> {
+    pub fn put_stream_name(
+        &self,
+        stream_id: u64,
+        name: &str,
+    ) -> Result<(), MetaError> {
         self.stream_names.insert(stream_id.to_be_bytes(), name.as_bytes())?;
         Ok(())
     }
 
     /// Persist an `event_type_id → name` interner mapping (see
     /// [`put_stream_name`](Self::put_stream_name)).
-    pub fn put_type_name(&self, event_type_id: u32, name: &str) -> Result<(), MetaError> {
+    pub fn put_type_name(
+        &self,
+        event_type_id: u32,
+        name: &str,
+    ) -> Result<(), MetaError> {
         self.type_names.insert(event_type_id.to_be_bytes(), name.as_bytes())?;
         Ok(())
     }
@@ -368,13 +390,18 @@ impl MetaStore {
         let mut out = Vec::new();
         for kv in self.stream_names.iter() {
             let (k, v) = kv.into_inner()?;
-            let id = u64::from_be_bytes(
-                k.as_ref().try_into().map_err(|_| {
-                    DecodeError::Corrupt { table: P_STREAM_NAMES, reason: "stream-name key must be 8 bytes".into() }
-                })?,
-            );
+            let id =
+                u64::from_be_bytes(k.as_ref().try_into().map_err(|_| {
+                    DecodeError::Corrupt {
+                        table:  P_STREAM_NAMES,
+                        reason: "stream-name key must be 8 bytes".into(),
+                    }
+                })?);
             let name = String::from_utf8(v.to_vec()).map_err(|e| {
-                DecodeError::Corrupt { table: P_STREAM_NAMES, reason: format!("name not utf-8: {e}") }
+                DecodeError::Corrupt {
+                    table:  P_STREAM_NAMES,
+                    reason: format!("name not utf-8: {e}"),
+                }
             })?;
             out.push((id, name));
         }
@@ -387,13 +414,18 @@ impl MetaStore {
         let mut out = Vec::new();
         for kv in self.type_names.iter() {
             let (k, v) = kv.into_inner()?;
-            let id = u32::from_be_bytes(
-                k.as_ref().try_into().map_err(|_| {
-                    DecodeError::Corrupt { table: P_TYPE_NAMES, reason: "type-name key must be 4 bytes".into() }
-                })?,
-            );
+            let id =
+                u32::from_be_bytes(k.as_ref().try_into().map_err(|_| {
+                    DecodeError::Corrupt {
+                        table:  P_TYPE_NAMES,
+                        reason: "type-name key must be 4 bytes".into(),
+                    }
+                })?);
             let name = String::from_utf8(v.to_vec()).map_err(|e| {
-                DecodeError::Corrupt { table: P_TYPE_NAMES, reason: format!("name not utf-8: {e}") }
+                DecodeError::Corrupt {
+                    table:  P_TYPE_NAMES,
+                    reason: format!("name not utf-8: {e}"),
+                }
             })?;
             out.push((id, name));
         }
@@ -402,8 +434,13 @@ impl MetaStore {
 
     /// Record a projection's checkpoint (the exclusive log position it has
     /// consumed through). The value is also this projection's high-water.
-    pub fn set_checkpoint(&self, projection_id: &str, position: u64) -> Result<(), MetaError> {
-        self.checkpoints.insert(projection_id.as_bytes(), encode_pos(position))?;
+    pub fn set_checkpoint(
+        &self,
+        projection_id: &str,
+        position: u64,
+    ) -> Result<(), MetaError> {
+        self.checkpoints
+            .insert(projection_id.as_bytes(), encode_pos(position))?;
         Ok(())
     }
 
@@ -432,7 +469,10 @@ impl MetaStore {
     // ---- reads --------------------------------------------------------
 
     /// The current head of `stream`, or `None` if the stream is unknown.
-    pub fn stream_head(&self, stream: StreamId) -> Result<Option<Head>, MetaError> {
+    pub fn stream_head(
+        &self,
+        stream: StreamId,
+    ) -> Result<Option<Head>, MetaError> {
         match self.stream_heads.get(stream_key(stream))? {
             Some(v) => Ok(Some(decode_head(&v)?)),
             None => Ok(None),
@@ -440,7 +480,10 @@ impl MetaStore {
     }
 
     /// The latest snapshot pointer for `stream`, or `None`.
-    pub fn snapshot_head(&self, stream: StreamId) -> Result<Option<SnapshotHead>, MetaError> {
+    pub fn snapshot_head(
+        &self,
+        stream: StreamId,
+    ) -> Result<Option<SnapshotHead>, MetaError> {
         match self.snapshot_heads.get(stream_key(stream))? {
             Some(v) => Ok(Some(decode_snapshot(&v)?)),
             None => Ok(None),
@@ -448,7 +491,10 @@ impl MetaStore {
     }
 
     /// A projection's checkpoint position, or `None` if it has none yet.
-    pub fn checkpoint(&self, projection_id: &str) -> Result<Option<u64>, MetaError> {
+    pub fn checkpoint(
+        &self,
+        projection_id: &str,
+    ) -> Result<Option<u64>, MetaError> {
         match self.checkpoints.get(projection_id.as_bytes())? {
             Some(v) => Ok(Some(decode_pos(P_CHECKPOINTS, &v)?)),
             None => Ok(None),

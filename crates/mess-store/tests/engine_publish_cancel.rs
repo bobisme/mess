@@ -70,7 +70,8 @@ async fn await_total(engine: &LogEngine, want: usize) {
         }
         assert!(
             Instant::now() < deadline,
-            "store never reached {want} events (got {}) — a stranded/stalled publish (bn-3nz)",
+            "store never reached {want} events (got {}) — a stranded/stalled \
+             publish (bn-3nz)",
             engine.total_events()
         );
         tokio::time::sleep(Duration::from_millis(2)).await;
@@ -82,24 +83,37 @@ async fn await_total(engine: &LogEngine, want: usize) {
 /// at quiescence (no append in flight).
 async fn assert_consistent(engine: &LogEngine, streams: &[String]) {
     let total = engine.total_events();
-    let all = engine.read_global(None, total + 1000).await.expect("read_global");
+    let all =
+        engine.read_global(None, total + 1000).await.expect("read_global");
     assert_eq!(all.len(), total, "read_global must expose every booked event");
     for (i, r) in all.iter().enumerate() {
-        assert_eq!(r.global_position, i as u64, "global positions must be dense 0..N");
+        assert_eq!(
+            r.global_position, i as u64,
+            "global positions must be dense 0..N"
+        );
     }
     for s in streams {
         let head = engine.head(s).await.expect("head");
-        let page = engine.read_stream(s, Version::NoStream, total + 1000).await.expect("read");
+        let page = engine
+            .read_stream(s, Version::NoStream, total + 1000)
+            .await
+            .expect("read");
         match head {
-            Version::NoStream => assert!(page.is_empty(), "NoStream head must read empty"),
+            Version::NoStream => {
+                assert!(page.is_empty(), "NoStream head must read empty")
+            }
             Version::At(v) => {
                 assert_eq!(
                     page.len() as u64,
                     v + 1,
-                    "stream {s} head At({v}) must expose exactly v+1 events (no torn publish)"
+                    "stream {s} head At({v}) must expose exactly v+1 events \
+                     (no torn publish)"
                 );
                 for (i, r) in page.iter().enumerate() {
-                    assert_eq!(r.stream_position, i as u64, "stream positions dense");
+                    assert_eq!(
+                        r.stream_position, i as u64,
+                        "stream positions dense"
+                    );
                 }
             }
         }
@@ -121,9 +135,13 @@ async fn dropped_append_future_does_not_gap_the_position_sequence() {
     // already interned: one poll then reaches the durable-commit await rather
     // than parking on a new-name persist flush first.
     const CANCELS: usize = 6;
-    let cancel_streams: Vec<String> = (0..CANCELS).map(|i| format!("cancel-{i}")).collect();
+    let cancel_streams: Vec<String> =
+        (0..CANCELS).map(|i| format!("cancel-{i}")).collect();
     for s in &cancel_streams {
-        engine.append_batch(s, Version::NoStream, &[rec("Ev", b"seed")]).await.expect("prime");
+        engine
+            .append_batch(s, Version::NoStream, &[rec("Ev", b"seed")])
+            .await
+            .expect("prime");
     }
 
     // Drop an in-flight append on each primed cancel-stream. Each one, once
@@ -148,7 +166,8 @@ async fn dropped_append_future_does_not_gap_the_position_sequence() {
     // one waits on the sequencer forever. Wrapped in a timeout: a stall shows
     // up as this timing out, not as a hang.
     const FOLLOWERS: usize = 40;
-    let follow_streams: Vec<String> = (0..FOLLOWERS).map(|i| format!("follow-{i}")).collect();
+    let follow_streams: Vec<String> =
+        (0..FOLLOWERS).map(|i| format!("follow-{i}")).collect();
     let progressed = tokio::time::timeout(Duration::from_secs(30), async {
         let mut handles = Vec::new();
         for s in follow_streams.clone() {
@@ -167,8 +186,8 @@ async fn dropped_append_future_does_not_gap_the_position_sequence() {
     .await;
     assert!(
         progressed.is_ok(),
-        "subsequent appends stalled after dropped in-flight appends — a gapped position sequence \
-         (the bn-3nz bug)"
+        "subsequent appends stalled after dropped in-flight appends — a \
+         gapped position sequence (the bn-3nz bug)"
     );
 
     // Reach quiescence: prime (CANCELS) + cancelled (CANCELS*2) + followers +
@@ -179,7 +198,11 @@ async fn dropped_append_future_does_not_gap_the_position_sequence() {
         .await
         .expect("barrier append");
     await_total(&engine, expected).await;
-    assert_eq!(engine.total_events(), expected, "no extra or missing events at quiescence");
+    assert_eq!(
+        engine.total_events(),
+        expected,
+        "no extra or missing events at quiescence"
+    );
 
     // Consistency: dense global order, and no torn stream.
     let mut all_streams = cancel_streams.clone();
@@ -192,7 +215,11 @@ async fn dropped_append_future_does_not_gap_the_position_sequence() {
     // (primed + the two cancelled events), never a partial At(1).
     for s in &cancel_streams {
         let head = engine.head(s).await.expect("head");
-        assert_eq!(head, Version::At(2), "cancelled append must publish fully (untorn) post-fix");
+        assert_eq!(
+            head,
+            Version::At(2),
+            "cancelled append must publish fully (untorn) post-fix"
+        );
     }
 }
 
@@ -205,7 +232,10 @@ async fn cancel_then_same_stream_retry_never_double_writes_version() {
     let engine = LogEngine::open(dir.path()).expect("open");
 
     // Prime stream + event type so the cancelled append is pure hot-path.
-    engine.append_batch("s", Version::NoStream, &[rec("Ev", b"seed")]).await.expect("prime");
+    engine
+        .append_batch("s", Version::NoStream, &[rec("Ev", b"seed")])
+        .await
+        .expect("prime");
 
     // Drop an in-flight append at Version::At(0). Its detached commit task will
     // (post-fix) publish, advancing the head to At(1), while still holding the
@@ -213,20 +243,32 @@ async fn cancel_then_same_stream_retry_never_double_writes_version() {
     // by the dropped future BEFORE the publish, a racing retry could pass its
     // own At(0) check against the still-stale head and both commits would claim
     // stream version 1.
-    let dropped =
-        poll_once_then_drop(engine.append_batch("s", Version::At(0), &[rec("Ev", b"a")]));
+    let dropped = poll_once_then_drop(engine.append_batch(
+        "s",
+        Version::At(0),
+        &[rec("Ev", b"a")],
+    ));
     assert!(dropped, "append must be dropped in flight");
 
     // Retry the same logical write, same expected version. Post-fix the gate
     // serialises it strictly after the cancelled publish, so it must observe
     // the head at At(1) and conflict — never win a second time at version 1.
-    let result = engine.append_batch("s", Version::At(0), &[rec("Retry", b"b")]).await;
+    let result =
+        engine.append_batch("s", Version::At(0), &[rec("Retry", b"b")]).await;
     match result {
         Err(mess_store::AppendError::Conflict { expected, actual }) => {
             assert_eq!(expected, Version::At(0));
-            assert_eq!(actual, Version::At(1), "retry must see the cancelled publish's head");
+            assert_eq!(
+                actual,
+                Version::At(1),
+                "retry must see the cancelled publish's head"
+            );
         }
-        Ok(a) => panic!("retry unexpectedly won at {:?} — the cancelled append double-wrote", a.version),
+        Ok(a) => panic!(
+            "retry unexpectedly won at {:?} — the cancelled append \
+             double-wrote",
+            a.version
+        ),
         Err(other) => panic!("unexpected error: {other:?}"),
     }
 
@@ -235,8 +277,13 @@ async fn cancel_then_same_stream_retry_never_double_writes_version() {
     await_total(&engine, 2).await;
     let head = engine.head("s").await.expect("head");
     assert_eq!(head, Version::At(1), "head must be exactly one past the prime");
-    let page = engine.read_stream("s", Version::NoStream, 100).await.expect("read");
-    assert_eq!(page.len(), 2, "exactly prime + one winner; no duplicate at version 1");
+    let page =
+        engine.read_stream("s", Version::NoStream, 100).await.expect("read");
+    assert_eq!(
+        page.len(),
+        2,
+        "exactly prime + one winner; no duplicate at version 1"
+    );
     assert_eq!(page[0].stream_position, 0);
     assert_eq!(page[1].stream_position, 1);
     // Global order dense across the whole store.

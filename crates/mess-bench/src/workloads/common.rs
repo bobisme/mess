@@ -12,10 +12,10 @@ use mess_log::writer::{SegmentParams, SegmentWriter};
 
 /// Result of a best-of-`reps` committer drive.
 pub(crate) struct CommitterResult {
-    pub best_ev_per_s: f64,
-    pub total_events: u64,
+    pub best_ev_per_s:         f64,
+    pub total_events:          u64,
     pub mean_fsync_us_of_best: f64,
-    pub fsyncs_of_best: u64,
+    pub fsyncs_of_best:        u64,
 }
 
 /// Drive `writers` concurrent appenders, each submitting `batches_per_writer`
@@ -36,7 +36,7 @@ pub(crate) fn drive_committer(
     let est_bytes = total_events.saturating_mul(320).saturating_add(1 << 20);
     let segment_size = est_bytes.max(16 * 1024 * 1024).next_power_of_two();
     std::fs::create_dir_all(scratch).expect("create scratch dir");
-    let payload: Vec<u8> = (0..250u32).map(|i| (i & 0xff) as u8).collect();
+    let payload: Vec<u8> = (0..250u32).map(|i| (i & 0xFF) as u8).collect();
 
     let mut best_ev_s = 0.0f64;
     let mut best_secs = f64::INFINITY;

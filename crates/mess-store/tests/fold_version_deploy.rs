@@ -6,8 +6,8 @@
 //! the *next* load of such a stream:
 //!
 //! - **(a) the stale snapshot is never used** — the load full-replays, so its
-//!   result reflects the *new* fold even though the stored blob was built by the
-//!   old one (and would decode to a wrong state if trusted);
+//!   result reflects the *new* fold even though the stored blob was built by
+//!   the old one (and would decode to a wrong state if trusted);
 //! - **(b) the rebuild happens exactly once** — the invalidation counter climbs
 //!   by one and then stops, because
 //! - **(c) a new snapshot is persisted with the new `fold_version`** — so the
@@ -54,7 +54,10 @@ impl Event for CounterEvent {
                 let b: [u8; 8] =
                     data.try_into().map_err(|_| CodecError::Decode {
                         event_name: name.to_string(),
-                        source: format!("expected 8 bytes, got {}", data.len()),
+                        source:     format!(
+                            "expected 8 bytes, got {}",
+                            data.len()
+                        ),
                     })?;
                 Ok(CounterEvent::Added(i64::from_le_bytes(b)))
             }
@@ -95,6 +98,7 @@ impl Counter {
 /// v1: `Marked` is ignored.
 impl Aggregate for Counter {
     type Event = CounterEvent;
+
     fn apply(&mut self, event: &CounterEvent) {
         if let CounterEvent::Added(n) = event {
             self.total = self.total.wrapping_add(*n);
@@ -104,9 +108,11 @@ impl Aggregate for Counter {
 
 impl Snapshottable for Counter {
     const FOLD_VERSION: u32 = 1;
+
     fn encode_state(&self) -> Result<Vec<u8>, StateCodecError> {
         Ok(self.encode())
     }
+
     fn decode_state(bytes: &[u8]) -> Result<Self, StateCodecError> {
         Counter::decode(bytes)
     }
@@ -118,6 +124,7 @@ struct CounterV2(Counter);
 
 impl Aggregate for CounterV2 {
     type Event = CounterEvent;
+
     fn apply(&mut self, event: &CounterEvent) {
         match event {
             CounterEvent::Marked => self.0.marks += 1,
@@ -128,9 +135,11 @@ impl Aggregate for CounterV2 {
 
 impl Snapshottable for CounterV2 {
     const FOLD_VERSION: u32 = 2;
+
     fn encode_state(&self) -> Result<Vec<u8>, StateCodecError> {
         Ok(self.0.encode())
     }
+
     fn decode_state(bytes: &[u8]) -> Result<Self, StateCodecError> {
         Counter::decode(bytes).map(CounterV2)
     }
@@ -185,7 +194,8 @@ async fn deploy_bump_invalidates_rebuilds_once_and_replaces() {
     assert_eq!(
         loaded.events_replayed,
         events.len(),
-        "invalidation rebuilds by FULL replay, proving the snapshot was skipped"
+        "invalidation rebuilds by FULL replay, proving the snapshot was \
+         skipped"
     );
 
     // (b) counted exactly once.
@@ -207,9 +217,10 @@ async fn deploy_bump_invalidates_rebuilds_once_and_replaces() {
         "the replacement snapshot carries the new fold_version"
     );
 
-    // A following load of the same stream is snapshot-accelerated again, and the
-    // invalidation counter does NOT climb a second time (rebuild-exactly-once).
-    // Append a tail so "used the snapshot" is observable as a short replay.
+    // A following load of the same stream is snapshot-accelerated again, and
+    // the invalidation counter does NOT climb a second time
+    // (rebuild-exactly-once). Append a tail so "used the snapshot" is
+    // observable as a short replay.
     let tail = vec![CounterEvent::Added(10), CounterEvent::Marked];
     store.append(stream, Version::At(3), &tail).await.unwrap();
 

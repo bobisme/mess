@@ -10,17 +10,16 @@
 //!
 //! # Concepts, in the order a newcomer meets them
 //!
-//! 1. **`#[derive(Event)]`** — the wire vocabulary a stream can hold. Each
-//!    enum variant becomes one dotted wire name; the derive generates
+//! 1. **`#[derive(Event)]`** — the wire vocabulary a stream can hold. Each enum
+//!    variant becomes one dotted wire name; the derive generates
 //!    `encode`/`decode` so you never hand-write codec plumbing.
-//! 2. **`#[derive(Aggregate)]`** — the folded read-model. The derive wires
-//!    the trait; you write one inherent `apply` method, which is the ONLY
-//!    place an event is allowed to mutate state.
+//! 2. **`#[derive(Aggregate)]`** — the folded read-model. The derive wires the
+//!    trait; you write one inherent `apply` method, which is the ONLY place an
+//!    event is allowed to mutate state.
 //! 3. **`Decide<Command>`** — one command handler per command type: pure,
 //!    synchronous, no I/O, no knowledge of storage or retries.
 //! 4. **A typed `Rejection`** per aggregate — the "why not" a command was
-//!    refused, matched exhaustively by callers instead of parsed from a
-//!    string.
+//!    refused, matched exhaustively by callers instead of parsed from a string.
 
 use mess_core::Decide;
 use mess_derive::{Aggregate, Event};
@@ -57,7 +56,7 @@ pub enum AccountEvent {
 #[derive(Debug, Default, Clone, PartialEq, Eq, Aggregate)]
 #[aggregate(event = AccountEvent)]
 pub struct Account {
-    pub open: bool,
+    pub open:    bool,
     pub balance: i64,
 }
 
@@ -103,7 +102,8 @@ impl std::fmt::Display for AccountError {
             }
             AccountError::InsufficientFunds { balance, requested } => write!(
                 f,
-                "insufficient funds: balance is {balance}, requested {requested}"
+                "insufficient funds: balance is {balance}, requested \
+                 {requested}"
             ),
         }
     }
@@ -162,7 +162,7 @@ impl Decide<Withdraw> for Account {
         }
         if cmd.amount > self.balance {
             return Err(AccountError::InsufficientFunds {
-                balance: self.balance,
+                balance:   self.balance,
                 requested: cmd.amount,
             });
         }

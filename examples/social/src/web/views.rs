@@ -13,7 +13,7 @@ use crate::contracts::{PostView, ProfileView, TimelinePage};
 /// A one-shot notification carried across a redirect via query params.
 #[derive(Debug, Clone)]
 pub struct Flash {
-    pub msg: String,
+    pub msg:  String,
     /// `"ok"` or `"err"` — styles the banner.
     pub kind: String,
 }

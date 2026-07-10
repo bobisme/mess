@@ -13,48 +13,49 @@
 //! behaves exactly as the spec (§7) requires.
 //!
 //! The durable head anchor `A(S)` (§5, Tier 1) is captured **before** the crash
-//! — it stands in for the sealed-footer `StreamHeadTable` that lives outside the
-//! truncatable tail. That is what lets Case C detect truncation the recovered
-//! (self-consistent, shortened) log cannot detect on its own (§5.1).
+//! — it stands in for the sealed-footer `StreamHeadTable` that lives outside
+//! the truncatable tail. That is what lets Case C detect truncation the
+//! recovered (self-consistent, shortened) log cannot detect on its own (§5.1).
 //!
 //! Cases:
 //!   A  honest full recovery, batch-boundary snapshot  -> ok  (Path A + Path B)
 //!   B  honest full recovery, mid-batch snapshot        -> ok  (first-partial)
 //!   C  torn tail (truncation) + trusted full anchor    -> HeadMismatch
 //!   D  tail payload tamper with a RECOMPUTED CRC (the
-//!      scanner accepts it; the fold chain must not)     -> ChainBreakPrev / HeadMismatch
-//!   E  prefix frame-v payload tamper (Path A operand)   -> PrefixHashMismatch{FromFrameV}
-//!   F  both certification frames compacted + Path-C
-//!      retention anchor                                 -> ok via Path C, then reject on tamper
+//!      scanner accepts it; the fold chain must not)     -> ChainBreakPrev /
+//! HeadMismatch   E  prefix frame-v payload tamper (Path A operand)   ->
+//! PrefixHashMismatch{FromFrameV}   F  both certification frames compacted +
+//! Path-C      retention anchor                                 -> ok via Path
+//! C, then reject on tamper
+
+use std::path::Path;
 
 use mess_log::certificates::{
-    build_cert, load_verified, take_snapshot, Aggregate, BatchRec, FrameRec, StreamCert,
-    VerifyError, VerifyPath,
+    Aggregate, BatchRec, FrameRec, StreamCert, VerifyError, VerifyPath,
+    build_cert, load_verified, take_snapshot,
 };
 use mess_log::crc::batch_crc;
+use mess_log::encode::Subframe;
+use mess_log::fold_chain::ChainHead;
 use mess_log::fold_chain::Hash;
 use mess_log::footer_ext::SnapshotAnchor;
 use mess_log::format::{CHAIN_LEN, HEADER_CRC_OFF, HEADER_LEN};
-use mess_log::runtime::{FileHandle, Fs, OpenOpts, SimFs, Fault};
-use mess_log::scanner::{scan_image, AcceptedBatch};
+use mess_log::runtime::{Fault, FileHandle, Fs, OpenOpts, SimFs};
+use mess_log::scanner::{AcceptedBatch, scan_image};
 use mess_log::writer::{BatchSpec, SegmentParams, SegmentWriter};
-use mess_log::encode::Subframe;
-use mess_log::fold_chain::ChainHead;
-
-use std::path::Path;
 
 // --- Reference aggregate (toy bank account, mirrors the fold_cert suite) -----
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Account {
-    balance: i64,
+    balance:  i64,
     tx_count: u64,
 }
 impl Aggregate for Account {
     const FOLD_VERSION: u32 = 1;
-    fn init() -> Self {
-        Account { balance: 0, tx_count: 0 }
-    }
+
+    fn init() -> Self { Account { balance: 0, tx_count: 0 } }
+
     fn apply(&mut self, payload: &[u8]) {
         let tag = payload[0];
         let amount = u64::from_le_bytes(payload[1..9].try_into().unwrap());
@@ -65,18 +66,20 @@ impl Aggregate for Account {
         }
         self.tx_count += 1;
     }
+
     fn to_bytes(&self) -> Vec<u8> {
         let mut o = Vec::with_capacity(16);
         o.extend_from_slice(&self.balance.to_le_bytes());
         o.extend_from_slice(&self.tx_count.to_le_bytes());
         o
     }
+
     fn from_bytes(b: &[u8]) -> Option<Self> {
         if b.len() != 16 {
             return None;
         }
         Some(Account {
-            balance: i64::from_le_bytes(b[0..8].try_into().ok()?),
+            balance:  i64::from_le_bytes(b[0..8].try_into().ok()?),
             tx_count: u64::from_le_bytes(b[8..16].try_into().ok()?),
         })
     }
@@ -103,7 +106,9 @@ const SEG_PATH: &str = "log/seg-0000";
 fn write_chained_log(payloads: &[Vec<u8>], batch_size: usize) -> Vec<u8> {
     let fs = SimFs::new(Fault::SECTOR_512);
     let path = Path::new(SEG_PATH);
-    let mut w = SegmentWriter::create(&fs, path, SegmentParams::new(1, 0, 7, 0)).unwrap();
+    let mut w =
+        SegmentWriter::create(&fs, path, SegmentParams::new(1, 0, 7, 0))
+            .unwrap();
 
     // The append-side running chain: each batch's crypto_chain is the head
     // ENTERING that batch (h[base-1]); the first batch's is the genesis.
@@ -114,11 +119,11 @@ fn write_chained_log(payloads: &[Vec<u8>], batch_size: usize) -> Vec<u8> {
         let subs: Vec<Subframe> =
             chunk.iter().map(|p| Subframe::plain(1, 0, 0, p)).collect();
         w.append(&BatchSpec {
-            stream_id: STREAM_ID,
-            category_id: 0,
+            stream_id:            STREAM_ID,
+            category_id:          0,
             first_stream_version: version,
-            crypto_chain: Some(&entry),
-            subframes: &subs,
+            crypto_chain:         Some(&entry),
+            subframes:            &subs,
         })
         .unwrap();
         for p in chunk {
@@ -128,7 +133,8 @@ fn write_chained_log(payloads: &[Vec<u8>], batch_size: usize) -> Vec<u8> {
     }
     w.sync().unwrap();
 
-    // Read the whole durable image back through the Fs (what the scanner reads).
+    // Read the whole durable image back through the Fs (what the scanner
+    // reads).
     let f = fs.open(path, OpenOpts::read_only()).unwrap();
     let len = f.len().unwrap() as usize;
     let mut buf = vec![0u8; len];
@@ -162,14 +168,24 @@ fn cert_from_recovered(
         }
         batches.push(recovered_batch(ab, image));
     }
-    StreamCert { stream_id: STREAM_ID, batches, head_anchor: anchor, snapshot_anchors }
+    StreamCert {
+        stream_id: STREAM_ID,
+        batches,
+        head_anchor: anchor,
+        snapshot_anchors,
+    }
 }
 
 fn recovered_batch(ab: &AcceptedBatch, image: &[u8]) -> BatchRec {
-    assert!(ab.has_crypto_chain, "chain-enabled stream must carry crypto_chain");
+    assert!(
+        ab.has_crypto_chain,
+        "chain-enabled stream must carry crypto_chain"
+    );
     let off = ab.offset as usize;
-    let crypto_chain: Hash =
-        image[off + HEADER_LEN..off + HEADER_LEN + CHAIN_LEN].try_into().unwrap();
+    let crypto_chain: Hash = image
+        [off + HEADER_LEN..off + HEADER_LEN + CHAIN_LEN]
+        .try_into()
+        .unwrap();
     let mut frames = Vec::new();
     for (k, fr) in ab.frames(image).unwrap().enumerate() {
         frames.push(FrameRec {
@@ -189,7 +205,8 @@ fn refresh_batch_crc(image: &mut [u8], ab: &AcceptedBatch) {
     let off = ab.offset as usize;
     let end = off + ab.total_len as usize;
     let crc = batch_crc(&image[off..end]);
-    image[off + HEADER_CRC_OFF..off + HEADER_CRC_OFF + 4].copy_from_slice(&crc.to_le_bytes());
+    image[off + HEADER_CRC_OFF..off + HEADER_CRC_OFF + 4]
+        .copy_from_slice(&crc.to_le_bytes());
     image[end - 4..end].copy_from_slice(&crc.to_le_bytes());
 }
 
@@ -206,7 +223,10 @@ fn recovered_prefix_verifies_at_batch_boundary() {
 
     // The recovered on-disk chain is byte-for-byte the in-memory reference:
     // proves the real crypto_chain round-trips through append + scanner.
-    assert_eq!(cert.batches, honest.batches, "recovered chain != reference chain");
+    assert_eq!(
+        cert.batches, honest.batches,
+        "recovered chain != reference chain"
+    );
     assert_eq!(cert.committed_count(), 50);
 
     let (r, blob) = take_snapshot::<Account>(&cert, 19); // batch boundary
@@ -216,8 +236,7 @@ fn recovered_prefix_verifies_at_batch_boundary() {
     assert!(out.paths_used.contains(&VerifyPath::FromFrameV));
     assert!(out.paths_used.contains(&VerifyPath::FromFrameVPlus1));
     // State equals a full verified replay of the recovered log.
-    let full =
-        load_verified::<Account>(&cert, None).unwrap();
+    let full = load_verified::<Account>(&cert, None).unwrap();
     assert_eq!(out.state, full.state);
 }
 
@@ -276,7 +295,11 @@ fn truncated_tail_is_caught_by_the_durable_head_anchor() {
     // Sanity: with the anchor that matches the truncated prefix (the self-
     // certifying, undetectable case), the same load succeeds — proving the
     // anchor is the sole truncation witness.
-    let self_cert = cert_from_recovered(torn, recovered_anchor(&payloads[..30]), Vec::new());
+    let self_cert = cert_from_recovered(
+        torn,
+        recovered_anchor(&payloads[..30]),
+        Vec::new(),
+    );
     let out = load_verified::<Account>(&self_cert, Some((&r, &blob))).unwrap();
     assert!(!out.rebuilt_by_replay);
     assert_eq!(out.tail_len, 10);
@@ -303,14 +326,20 @@ fn crc_valid_tail_tamper_is_caught_by_the_chain() {
     // so the scanner cannot tell. Locate the batch and its first frame payload.
     let rec = scan_image(&image, None);
     let target = rec.accepted[3];
-    let first_payload_off =
-        target.offset as usize + HEADER_LEN + CHAIN_LEN + mess_log::format::SUBFRAME_HDR_LEN;
+    let first_payload_off = target.offset as usize
+        + HEADER_LEN
+        + CHAIN_LEN
+        + mess_log::format::SUBFRAME_HDR_LEN;
     image[first_payload_off] ^= 0xFF;
     refresh_batch_crc(&mut image, &target);
 
     // The scanner still accepts every batch (CRC is valid again).
     let rec2 = scan_image(&image, None);
-    assert_eq!(rec2.accepted.len(), 5, "repaired CRC must keep the scanner happy");
+    assert_eq!(
+        rec2.accepted.len(),
+        5,
+        "repaired CRC must keep the scanner happy"
+    );
 
     let cert = cert_from_recovered(&image, honest.head_anchor, Vec::new());
 
@@ -320,9 +349,13 @@ fn crc_valid_tail_tamper_is_caught_by_the_chain() {
     let (r, blob) = take_snapshot::<Account>(&cert, 19);
     let err = load_verified::<Account>(&cert, Some((&r, &blob))).unwrap_err();
     match err {
-        VerifyError::ChainBreakPrev { at_version } => assert_eq!(at_version, 40),
+        VerifyError::ChainBreakPrev { at_version } => {
+            assert_eq!(at_version, 40)
+        }
         VerifyError::HeadMismatch { .. } => {}
-        other => panic!("CRC-valid tamper must be caught by the chain, got {other:?}"),
+        other => panic!(
+            "CRC-valid tamper must be caught by the chain, got {other:?}"
+        ),
     }
 }
 
@@ -346,7 +379,10 @@ fn prefix_frame_tamper_fails_path_a() {
     b.frames[5].payload[0] ^= 0xFF;
 
     let err = load_verified::<Account>(&cert, Some((&r, &blob))).unwrap_err();
-    assert_eq!(err, VerifyError::PrefixHashMismatch { path: VerifyPath::FromFrameV });
+    assert_eq!(
+        err,
+        VerifyError::PrefixHashMismatch { path: VerifyPath::FromFrameV }
+    );
 }
 
 // ===========================================================================
@@ -359,8 +395,11 @@ fn prefix_frame_tamper_fails_path_a() {
 #[test]
 fn path_c_retention_anchor_over_recovered_prefix() {
     let payloads = workload(50);
-    let recovered =
-        cert_from_recovered(&write_chained_log(&payloads, 10), None, Vec::new());
+    let recovered = cert_from_recovered(
+        &write_chained_log(&payloads, 10),
+        None,
+        Vec::new(),
+    );
     let full = build_cert(STREAM_ID, &payloads, 10, None);
 
     // Snapshot at v=49 == head: h[49] is the reference event_prefix_hash, and
@@ -372,10 +411,14 @@ fn path_c_retention_anchor_over_recovered_prefix() {
     // Full compaction: no frames retained at all. Path A (frame 49) and Path B
     // (frame 50, nonexistent) are both unavailable; only Path C remains.
     let cert = StreamCert {
-        stream_id: STREAM_ID,
-        batches: Vec::new(),
-        head_anchor: full.head_anchor, // durable (49, h[49])
-        snapshot_anchors: vec![SnapshotAnchor { stream_id: STREAM_ID, version: 49, chain_hash: h_v }],
+        stream_id:        STREAM_ID,
+        batches:          Vec::new(),
+        head_anchor:      full.head_anchor, // durable (49, h[49])
+        snapshot_anchors: vec![SnapshotAnchor {
+            stream_id:  STREAM_ID,
+            version:    49,
+            chain_hash: h_v,
+        }],
     };
 
     let out = load_verified::<Account>(&cert, Some((&r, &blob))).unwrap();
@@ -387,14 +430,19 @@ fn path_c_retention_anchor_over_recovered_prefix() {
     let mut bad = cert.clone();
     bad.snapshot_anchors[0].chain_hash[0] ^= 0xFF;
     let err = load_verified::<Account>(&bad, Some((&r, &blob))).unwrap_err();
-    assert_eq!(err, VerifyError::PrefixHashMismatch { path: VerifyPath::FromRetentionAnchor });
+    assert_eq!(
+        err,
+        VerifyError::PrefixHashMismatch {
+            path: VerifyPath::FromRetentionAnchor,
+        }
+    );
 }
 
 // ===========================================================================
 // Verify throughput bench (spec §7.2). ev/s of load_verified over a large
 // recovered tail. Run:
-//   cargo test -p mess-log --release --test crash_verify verify_throughput_bench \
-//     -- --ignored --nocapture
+//   cargo test -p mess-log --release --test crash_verify
+// verify_throughput_bench \     -- --ignored --nocapture
 // ===========================================================================
 
 #[test]
@@ -421,6 +469,10 @@ fn verify_throughput_bench() {
         best = best.min(dt);
     }
     eprintln!("=== load_verified throughput (1M-event tail, batch 100) ===");
-    eprintln!("  verify    {:.2} M ev/s ({:.1} ms best-of-3)", N as f64 / best / 1e6, best * 1e3);
+    eprintln!(
+        "  verify    {:.2} M ev/s ({:.1} ms best-of-3)",
+        N as f64 / best / 1e6,
+        best * 1e3
+    );
     eprintln!("  per-event {:.1} ns/ev", best * 1e9 / N as f64);
 }

@@ -12,11 +12,10 @@ use http_body_util::BodyExt;
 use ident::Id;
 use tower::ServiceExt;
 
+use super::{AppState, router};
 use crate::contracts::{FakeReadModels, WriteError, WriteOps};
 use crate::domain::post::PostError;
 use crate::domain::user::UserError;
-
-use super::{AppState, router};
 
 // ---------------------------------------------------------------------------
 // A programmable fake writer: returns a fixed result and records call names.
@@ -24,20 +23,21 @@ use super::{AppState, router};
 
 struct FakeWriteOps {
     response: Result<u64, WriteError>,
-    calls: Mutex<Vec<String>>,
+    calls:    Mutex<Vec<String>>,
 }
 
 impl FakeWriteOps {
-    fn ok() -> Self {
-        Self { response: Ok(1), calls: Mutex::new(Vec::new()) }
-    }
+    fn ok() -> Self { Self { response: Ok(1), calls: Mutex::new(Vec::new()) } }
+
     fn err(e: WriteError) -> Self {
         Self { response: Err(e), calls: Mutex::new(Vec::new()) }
     }
+
     fn record(&self, what: &str) -> Result<u64, WriteError> {
         self.calls.lock().unwrap().push(what.to_string());
         self.response.clone()
     }
+
     fn called(&self, what: &str) -> bool {
         self.calls.lock().unwrap().iter().any(|c| c == what)
     }
@@ -52,6 +52,7 @@ impl WriteOps for FakeWriteOps {
     ) -> Result<u64, WriteError> {
         self.record("register")
     }
+
     async fn set_display_name(
         &self,
         _u: Id,
@@ -59,12 +60,15 @@ impl WriteOps for FakeWriteOps {
     ) -> Result<u64, WriteError> {
         self.record("set_display_name")
     }
+
     async fn follow(&self, _f: Id, _t: Id) -> Result<u64, WriteError> {
         self.record("follow")
     }
+
     async fn unfollow(&self, _f: Id, _t: Id) -> Result<u64, WriteError> {
         self.record("unfollow")
     }
+
     async fn create_post(
         &self,
         _p: Id,
@@ -73,12 +77,15 @@ impl WriteOps for FakeWriteOps {
     ) -> Result<u64, WriteError> {
         self.record("create_post")
     }
+
     async fn delete_post(&self, _p: Id, _by: Id) -> Result<u64, WriteError> {
         self.record("delete_post")
     }
+
     async fn like(&self, _p: Id, _u: Id) -> Result<u64, WriteError> {
         self.record("like")
     }
+
     async fn unlike(&self, _p: Id, _u: Id) -> Result<u64, WriteError> {
         self.record("unlike")
     }
@@ -121,7 +128,10 @@ fn cookie_for(handle: &str) -> String {
     format!("{}={handle}", super::ACTING_COOKIE)
 }
 
-async fn send(app: &Router, req: Request<Body>) -> (StatusCode, String, Option<String>) {
+async fn send(
+    app: &Router,
+    req: Request<Body>,
+) -> (StatusCode, String, Option<String>) {
     let resp = app.clone().oneshot(req).await.unwrap();
     let status = resp.status();
     let location = resp
@@ -195,14 +205,13 @@ async fn firehose_shows_all_posts() {
 #[tokio::test]
 async fn profile_happy_and_not_found() {
     let (_w, app, _alice, ..) = world(FakeWriteOps::ok());
-    let (status, body, _) =
-        send(&app, get("/u/bob", Some("alice"))).await;
+    let (status, body, _) = send(&app, get("/u/bob", Some("alice"))).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("@bob"));
     // alice follows bob → the button reads "Following".
     assert!(body.contains("Following"));
 
-    let (status, _, _) = send(&app, get("/u/nobody", Some("alice"))).await;
+    let (status, ..) = send(&app, get("/u/nobody", Some("alice"))).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
@@ -214,17 +223,14 @@ async fn single_post_happy_and_not_found() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("bob first"));
 
-    let (status, _, _) = send(&app, get("/p/does-not-exist", None)).await;
+    let (status, ..) = send(&app, get("/p/does-not-exist", None)).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
 async fn stylesheet_is_css() {
     let (_w, app, ..) = world(FakeWriteOps::ok());
-    let resp = app
-        .oneshot(get("/style.css", None))
-        .await
-        .unwrap();
+    let resp = app.oneshot(get("/style.css", None)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let ct = resp.headers().get(header::CONTENT_TYPE).unwrap();
     assert!(ct.to_str().unwrap().starts_with("text/css"));
@@ -285,14 +291,16 @@ async fn post_requires_login() {
 async fn like_happy_then_already_liked() {
     let (w, app, _alice, _b, _c, _p1, _p2, p3) = world(FakeWriteOps::ok());
     let (status, _, loc) =
-        send(&app, post_form(&format!("/p/{p3}/like"), "", Some("alice"))).await;
+        send(&app, post_form(&format!("/p/{p3}/like"), "", Some("alice")))
+            .await;
     assert!(is_ok_redirect(status, &loc));
     assert!(w.called("like"));
 
     let (_w, app, _alice, _b, _c, p1, ..) =
         world(FakeWriteOps::err(WriteError::Post(PostError::AlreadyLiked)));
     let (status, _, loc) =
-        send(&app, post_form(&format!("/p/{p1}/like"), "", Some("alice"))).await;
+        send(&app, post_form(&format!("/p/{p1}/like"), "", Some("alice")))
+            .await;
     assert!(is_err_redirect(status, &loc));
 }
 
@@ -310,7 +318,8 @@ async fn unlike_happy() {
 async fn delete_happy_then_not_author() {
     let (w, app, _alice, _bob, _c, p1, ..) = world(FakeWriteOps::ok());
     let (status, _, loc) =
-        send(&app, post_form(&format!("/p/{p1}/delete"), "", Some("bob"))).await;
+        send(&app, post_form(&format!("/p/{p1}/delete"), "", Some("bob")))
+            .await;
     assert!(is_ok_redirect(status, &loc));
     assert!(w.called("delete_post"));
 
@@ -369,11 +378,7 @@ async fn whoami_switch_existing_and_register_new() {
     // New handle → register-on-first-use.
     let (w, app, ..) = world(FakeWriteOps::ok());
     let resp = app
-        .oneshot(post_form(
-            "/whoami",
-            "handle=dave&display_name=Dave",
-            None,
-        ))
+        .oneshot(post_form("/whoami", "handle=dave&display_name=Dave", None))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
@@ -390,9 +395,10 @@ async fn whoami_switch_existing_and_register_new() {
 
 #[tokio::test]
 async fn whoami_register_invalid_handle_renders_error() {
-    let (_w, app, ..) = world(FakeWriteOps::err(WriteError::User(
-        UserError::InvalidHandle { handle: "Bad Handle".into() },
-    )));
+    let (_w, app, ..) =
+        world(FakeWriteOps::err(WriteError::User(UserError::InvalidHandle {
+            handle: "Bad Handle".into(),
+        })));
     let (status, _, loc) =
         send(&app, post_form("/whoami", "handle=BadHandle", None)).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
@@ -414,10 +420,8 @@ async fn html_smoke_timeline_structure_order_and_escaping() {
         .with_post(q1, alice, "first <b>escaped</b> body")
         .with_post(q2, alice, "second body")
         .with_post(q3, alice, "third body");
-    let state = AppState {
-        read: Arc::new(rm),
-        write: Arc::new(FakeWriteOps::ok()),
-    };
+    let state =
+        AppState { read: Arc::new(rm), write: Arc::new(FakeWriteOps::ok()) };
     let app = router(state);
     let (status, body, _) = send(&app, get("/", Some("alice"))).await;
     assert_eq!(status, StatusCode::OK);

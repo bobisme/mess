@@ -38,15 +38,13 @@ impl Reopen for MockBackend {
     /// caller drops the old `EventStore`'s hot cache separately, modelling the
     /// process restart's lost in-process cache). Kept deliberately unchanged —
     /// the mock crash-reopen fidelity note lives in `differential_support`.
-    fn reopen(self) -> Self {
-        self
-    }
+    fn reopen(self) -> Self { self }
 }
 
 /// A backend `B` paired with the temp dir it is rooted in.
 pub struct Tmp<B> {
     backend: B,
-    _dir: Arc<TempDir>,
+    _dir:    Arc<TempDir>,
 }
 
 impl<B: Clone> Clone for Tmp<B> {
@@ -74,9 +72,7 @@ impl TestBackend {
 }
 
 impl Default for TestBackend {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
 impl TestSnapshotBackend {
@@ -90,16 +86,15 @@ impl TestSnapshotBackend {
     fn open_at(dir: TempDir) -> Self {
         let engine =
             LogEngine::open(dir.path().join("store")).expect("open engine");
-        let backend = FjallSnapshotBackend::open(engine, dir.path().join("snap"))
-            .expect("open snapshot backend");
+        let backend =
+            FjallSnapshotBackend::open(engine, dir.path().join("snap"))
+                .expect("open snapshot backend");
         Tmp { backend, _dir: Arc::new(dir) }
     }
 }
 
 impl Default for TestSnapshotBackend {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
 impl Reopen for TestSnapshotBackend {
@@ -137,7 +132,9 @@ impl Reopen for TestBackend {
 /// Open a snapshot-capable composed backend rooted at a caller-supplied dir,
 /// for the tests that assert reopen behaviour against a fixed path.
 #[must_use]
-pub fn open_snapshot(root: &std::path::Path) -> FjallSnapshotBackend<LogEngine> {
+pub fn open_snapshot(
+    root: &std::path::Path,
+) -> FjallSnapshotBackend<LogEngine> {
     std::fs::create_dir_all(root).expect("create root");
     let engine = LogEngine::open(root.join("store")).expect("open engine");
     FjallSnapshotBackend::open(engine, root.join("snap"))
@@ -159,7 +156,8 @@ impl<B: Backend + Clone> Backend for Tmp<B> {
         stream_id: &str,
         after: Version,
         limit: usize,
-    ) -> impl Future<Output = Result<Vec<StoredRecord>, Self::Error>> + Send {
+    ) -> impl Future<Output = Result<Vec<StoredRecord>, Self::Error>> + Send
+    {
         self.backend.read_stream(stream_id, after, limit)
     }
 
@@ -167,7 +165,8 @@ impl<B: Backend + Clone> Backend for Tmp<B> {
         &self,
         after: Option<u64>,
         limit: usize,
-    ) -> impl Future<Output = Result<Vec<StoredRecord>, Self::Error>> + Send {
+    ) -> impl Future<Output = Result<Vec<StoredRecord>, Self::Error>> + Send
+    {
         self.backend.read_global(after, limit)
     }
 

@@ -14,8 +14,9 @@
 //!
 //! Generic over `B: Backend` (not pinned to [`crate::store_backend::Store`])
 //! so the same generator seeds a real on-disk [`mess_store::LogEngine`] *and*
-//! an in-memory test store — [`tests::generate_is_deterministic_for_a_fixed_seed`]
-//! below exercises the latter.
+//! an in-memory test store —
+//! [`tests::generate_is_deterministic_for_a_fixed_seed`] below exercises the
+//! latter.
 //!
 //! # Determinism
 //!
@@ -46,25 +47,32 @@ use crate::contracts::WriteOps;
 
 /// Corpus shape. The `Default` is the bone's target shape (~50 users, ~500
 /// posts, …); override individual fields (e.g. in a fast test) via struct
-/// update syntax: `SeedConfig { users: 8, posts: 20, ..SeedConfig::default() }`.
+/// update syntax: `SeedConfig { users: 8, posts: 20, ..SeedConfig::default()
+/// }`.
 #[derive(Debug, Clone)]
 pub struct SeedConfig {
     /// The PRNG seed. Same seed, same corpus.
-    pub seed: u64,
+    pub seed:      u64,
     /// How many users to register.
-    pub users: usize,
+    pub users:     usize,
     /// How many posts to create.
-    pub posts: usize,
+    pub posts:     usize,
     /// How many posts to delete (author-authorized) after they have
     /// accumulated some likes.
-    pub deletes: usize,
+    pub deletes:   usize,
     /// How many follow edges to retract after the follow graph is built.
     pub unfollows: usize,
 }
 
 impl Default for SeedConfig {
     fn default() -> Self {
-        Self { seed: 1337, users: 50, posts: 500, deletes: 30, unfollows: 20 }
+        Self {
+            seed:      1337,
+            users:     50,
+            posts:     500,
+            deletes:   30,
+            unfollows: 20,
+        }
     }
 }
 
@@ -74,13 +82,13 @@ impl Default for SeedConfig {
 /// exceed it.
 #[derive(Debug, Default, Clone)]
 pub struct SeedReport {
-    pub users: usize,
-    pub follows: usize,
-    pub posts: usize,
-    pub likes: usize,
-    pub deletes: usize,
+    pub users:     usize,
+    pub follows:   usize,
+    pub posts:     usize,
+    pub likes:     usize,
+    pub deletes:   usize,
     pub unfollows: usize,
-    pub elapsed: Duration,
+    pub elapsed:   Duration,
 }
 
 // ===========================================================================
@@ -130,7 +138,11 @@ pub fn guard_fresh_dir(dir: &Path) -> Result<(), String> {
          wipe the directory first, or point --dir at a fresh path.",
         dir.display(),
         markers.join(", "),
-        if others > 0 { format!(", plus {others} other entr(ies)") } else { String::new() },
+        if others > 0 {
+            format!(", plus {others} other entr(ies)")
+        } else {
+            String::new()
+        },
     ))
 }
 
@@ -165,7 +177,9 @@ impl ZipfWeights {
     fn sample(&self, rng: &mut StdRng) -> usize {
         let total = *self.cumulative.last().expect("ZipfWeights::new(0, _)");
         let x: f64 = rng.random::<f64>() * total;
-        self.cumulative.partition_point(|&c| c < x).min(self.cumulative.len() - 1)
+        self.cumulative
+            .partition_point(|&c| c < x)
+            .min(self.cumulative.len() - 1)
     }
 }
 
@@ -176,42 +190,114 @@ impl ZipfWeights {
 const ADJ: &[&str] = &[
     "quiet", "brave", "lazy", "witty", "sunny", "cozy", "swift", "calm",
     "bold", "tiny", "spare", "loud", "dusty", "salty", "early", "late",
-    "fuzzy", "sharp", "mellow", "vivid", "stormy", "frosty", "rusty",
-    "plucky", "nimble", "sturdy", "gentle", "cranky", "sly", "chill",
+    "fuzzy", "sharp", "mellow", "vivid", "stormy", "frosty", "rusty", "plucky",
+    "nimble", "sturdy", "gentle", "cranky", "sly", "chill",
 ];
 
 const NOUN: &[&str] = &[
     "otter", "kestrel", "comet", "maple", "ember", "harbor", "quartz",
-    "willow", "badger", "canyon", "meridian", "juniper", "ferret",
-    "glacier", "thistle", "raven", "cobalt", "pixel", "lantern", "orchard",
-    "tundra", "cinder", "heron", "basil", "granite", "marlin", "clover",
-    "vapor", "anchor", "kettle",
+    "willow", "badger", "canyon", "meridian", "juniper", "ferret", "glacier",
+    "thistle", "raven", "cobalt", "pixel", "lantern", "orchard", "tundra",
+    "cinder", "heron", "basil", "granite", "marlin", "clover", "vapor",
+    "anchor", "kettle",
 ];
 
 const FIRST: &[&str] = &[
-    "Alex", "Priya", "Jordan", "Sam", "Morgan", "Riley", "Casey", "Devon",
-    "Taylor", "Jamie", "Robin", "Quinn", "Avery", "Charlie", "Skyler",
-    "Reese", "Rowan", "Kai", "Nadia", "Omar", "Yuki", "Leah", "Marcus",
-    "Elena", "Theo", "Priscilla", "Diego", "Ines", "Noah", "Zara",
+    "Alex",
+    "Priya",
+    "Jordan",
+    "Sam",
+    "Morgan",
+    "Riley",
+    "Casey",
+    "Devon",
+    "Taylor",
+    "Jamie",
+    "Robin",
+    "Quinn",
+    "Avery",
+    "Charlie",
+    "Skyler",
+    "Reese",
+    "Rowan",
+    "Kai",
+    "Nadia",
+    "Omar",
+    "Yuki",
+    "Leah",
+    "Marcus",
+    "Elena",
+    "Theo",
+    "Priscilla",
+    "Diego",
+    "Ines",
+    "Noah",
+    "Zara",
 ];
 
 const SURNAME: &[&str] = &[
-    "Vance", "Okafor", "Nakamura", "Petrov", "Silva", "Byrne", "Kessler",
-    "Odom", "Whitfield", "Marsh", "Delacroix", "Falk", "Ibarra", "Sokolov",
-    "Renner", "Achebe", "Lindqvist", "Duarte", "Hollis", "Bergstrom",
-    "Castellano", "Mbeki", "Winters", "Alavi", "Hargrove", "Novak",
-    "Osei", "Vidal", "Krantz", "Amadi",
+    "Vance",
+    "Okafor",
+    "Nakamura",
+    "Petrov",
+    "Silva",
+    "Byrne",
+    "Kessler",
+    "Odom",
+    "Whitfield",
+    "Marsh",
+    "Delacroix",
+    "Falk",
+    "Ibarra",
+    "Sokolov",
+    "Renner",
+    "Achebe",
+    "Lindqvist",
+    "Duarte",
+    "Hollis",
+    "Bergstrom",
+    "Castellano",
+    "Mbeki",
+    "Winters",
+    "Alavi",
+    "Hargrove",
+    "Novak",
+    "Osei",
+    "Vidal",
+    "Krantz",
+    "Amadi",
 ];
 
 const TOPICS: &[&str] = &[
-    "rust", "event sourcing", "cold brew", "trail running", "vinyl records",
-    "sourdough starters", "chess openings", "cloud costs", "cast iron pans",
-    "night hikes", "generative art", "keyboard layouts", "houseplants",
-    "vintage synths", "distributed systems", "bike commuting",
-    "tape backups", "urban gardening", "board games",
-    "static site generators", "espresso shots", "open source",
-    "terminal themes", "sea kayaking", "linux window managers",
-    "home labs", "3am debugging sessions", "stand mixers", "letterpress",
+    "rust",
+    "event sourcing",
+    "cold brew",
+    "trail running",
+    "vinyl records",
+    "sourdough starters",
+    "chess openings",
+    "cloud costs",
+    "cast iron pans",
+    "night hikes",
+    "generative art",
+    "keyboard layouts",
+    "houseplants",
+    "vintage synths",
+    "distributed systems",
+    "bike commuting",
+    "tape backups",
+    "urban gardening",
+    "board games",
+    "static site generators",
+    "espresso shots",
+    "open source",
+    "terminal themes",
+    "sea kayaking",
+    "linux window managers",
+    "home labs",
+    "3am debugging sessions",
+    "stand mixers",
+    "letterpress",
     "ultralight backpacking",
 ];
 
@@ -219,10 +305,20 @@ const TOPICS: &[&str] = &[
 /// bone asked for: since the domain has no `created_at` field, the *text*
 /// carries the sense of when a post happened instead.
 const TIME_FLAVORS: &[&str] = &[
-    "", "", "", // empty more often than not — most posts have no time cue
-    "3am and", "monday morning,", "still awake,", "fresh coffee in hand,",
-    "on the train,", "during lunch,", "after a long shift,", "sunday night,",
-    "first thing today,", "way too late,", "friday afternoon,",
+    "",
+    "",
+    "", // empty more often than not — most posts have no time cue
+    "3am and",
+    "monday morning,",
+    "still awake,",
+    "fresh coffee in hand,",
+    "on the train,",
+    "during lunch,",
+    "after a long shift,",
+    "sunday night,",
+    "first thing today,",
+    "way too late,",
+    "friday afternoon,",
 ];
 
 /// Draw one syntactically-valid, unique handle (see
@@ -236,7 +332,10 @@ fn gen_handle(rng: &mut StdRng, used: &mut HashSet<String>) -> String {
         if rng.random_bool(0.35) {
             handle.push_str(&rng.random_range(1..99u32).to_string());
         }
-        debug_assert!(crate::handle_is_valid(&handle), "generated invalid handle {handle:?}");
+        debug_assert!(
+            crate::handle_is_valid(&handle),
+            "generated invalid handle {handle:?}"
+        );
         if used.insert(handle.clone()) {
             return handle;
         }
@@ -277,7 +376,10 @@ fn gen_body(rng: &mut StdRng) -> String {
         11 => format!("note to self: stop buying more {topic} gear."),
         12 => format!("{topic} is why I haven't slept."),
         13 => format!("PSA: {topic} will change how you think about {topic2}."),
-        14 => format!("day {} of trying to get better at {topic}.", rng.random_range(1..90u32)),
+        14 => format!(
+            "day {} of trying to get better at {topic}.",
+            rng.random_range(1..90u32)
+        ),
         15 => format!("{topic} appreciation post."),
         16 => format!("what's everyone's favorite {topic} resource?"),
         17 => format!("started a {topic} log. day one: promising."),
@@ -311,10 +413,10 @@ where
         let handle = gen_handle(&mut rng, &mut used_handles);
         let display = gen_display_name(&mut rng);
         let id = Id::from_u128(rng.random::<u128>());
-        store
-            .register(id, handle, display)
-            .await
-            .expect("seed: register should never be rejected (handles are validated, ids are fresh)");
+        store.register(id, handle, display).await.expect(
+            "seed: register should never be rejected (handles are validated, \
+             ids are fresh)",
+        );
         user_ids.push(id);
         report.users += 1;
     }
@@ -324,7 +426,8 @@ where
     // Out-degree per follower is itself Zipf-skewed toward small numbers
     // (most users follow a few people; a few follow a lot).
     let out_degree = ZipfWeights::new(12, 1.5);
-    let mut following: Vec<HashSet<usize>> = vec![HashSet::new(); user_ids.len()];
+    let mut following: Vec<HashSet<usize>> =
+        vec![HashSet::new(); user_ids.len()];
     // Parallel to `following`, but insertion-ordered: the unfollow phase below
     // needs a stable draw order, and `HashSet`'s default hasher is randomized
     // per-process (not seeded by `cfg.seed`), so iterating `following` there
@@ -368,10 +471,10 @@ where
         let ai = author_weights.sample(&mut rng);
         let body = gen_body(&mut rng);
         let id = Id::from_u128(rng.random::<u128>());
-        store
-            .create_post(id, user_ids[ai], body)
-            .await
-            .expect("seed: create_post should never be rejected (bodies are 1..=500 chars)");
+        store.create_post(id, user_ids[ai], body).await.expect(
+            "seed: create_post should never be rejected (bodies are 1..=500 \
+             chars)",
+        );
         post_ids.push(id);
         post_author.push(ai);
         report.posts += 1;
@@ -380,10 +483,12 @@ where
     // --- likes (Zipf on posts: a handful go semi-viral) --------------------
     if !post_ids.is_empty() {
         let post_popularity = ZipfWeights::new(post_ids.len(), 1.1);
-        let mut liked: Vec<HashSet<usize>> = vec![HashSet::new(); post_ids.len()];
+        let mut liked: Vec<HashSet<usize>> =
+            vec![HashSet::new(); post_ids.len()];
         let target_likes = (cfg.posts as f64 * 1.6).round() as usize;
         let mut attempts = 0usize;
-        while report.likes < target_likes && attempts < target_likes.max(1) * 4 {
+        while report.likes < target_likes && attempts < target_likes.max(1) * 4
+        {
             attempts += 1;
             let pi = post_popularity.sample(&mut rng);
             let ui = rng.random_range(0..user_ids.len());
@@ -425,8 +530,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use mess_store::LogEngine;
+
+    use super::*;
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(

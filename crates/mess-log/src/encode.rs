@@ -34,29 +34,34 @@ use crate::format::*;
 #[derive(Debug, Clone, Copy)]
 pub struct Subframe<'a> {
     /// Interned event type id (§4.3; `04-registry.md`).
-    pub event_type_id: u32,
+    pub event_type_id:    u32,
     /// Schema version of the event type at write time.
-    pub schema_version: u16,
+    pub schema_version:   u16,
     /// Interned payload codec id (`0` = bootstrap codec).
-    pub codec_id: u16,
+    pub codec_id:         u16,
     /// `0` = no compression; nonzero = a registered algorithm.
-    pub compression_id: u8,
+    pub compression_id:   u8,
     /// Compression/codec dictionary id, or `0` = none.
-    pub dict_id: u16,
+    pub dict_id:          u16,
     /// Logical size after decompression; MUST equal `metadata_len + data_len`.
     pub uncompressed_len: u32,
     /// Byte length of the metadata region within the uncompressed payload.
-    pub metadata_len: u32,
+    pub metadata_len:     u32,
     /// Byte length of the domain-data region within the uncompressed payload.
-    pub data_len: u32,
+    pub data_len:         u32,
     /// The on-disk payload bytes; `compressed_len == payload.len()`.
-    pub payload: &'a [u8],
+    pub payload:          &'a [u8],
 }
 
 impl<'a> Subframe<'a> {
     /// An uncompressed subframe (`compression_id = 0`) whose whole payload is
     /// domain data (`metadata_len = 0`). The common Phase-3 shape.
-    pub fn plain(event_type_id: u32, schema_version: u16, codec_id: u16, payload: &'a [u8]) -> Self {
+    pub fn plain(
+        event_type_id: u32,
+        schema_version: u16,
+        codec_id: u16,
+        payload: &'a [u8],
+    ) -> Self {
         let len = payload.len() as u32;
         Subframe {
             event_type_id,
@@ -110,23 +115,23 @@ impl<'a> Subframe<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct BatchInput<'a, 'p> {
     /// A9 (§4.2): MUST equal the containing segment's `epoch`.
-    pub segment_epoch: u64,
+    pub segment_epoch:        u64,
     /// Per-segment batch sequence number (D-FMT-5).
-    pub batch_id: u64,
+    pub batch_id:             u64,
     /// A1 seed (§4.2): global position of this batch's first event.
-    pub first_global_pos: u64,
+    pub first_global_pos:     u64,
     /// Batch-constant stream id (D-FMT-6).
-    pub stream_id: u64,
+    pub stream_id:            u64,
     /// Batch-constant category id (hoisted, D-FMT-6).
-    pub category_id: u64,
+    pub category_id:          u64,
     /// Stream version of this batch's first event (§4.2).
     pub first_stream_version: u64,
     /// When `Some`, `flags.CRYPTO_CHAIN` is set and these 32 bytes are written
     /// at offset `HEADER_LEN`. Phase 3 provides only *placement* — the chain
     /// **value** is Phase 5 (`bn-1d0`); callers pass a placeholder or `None`.
-    pub crypto_chain: Option<&'a [u8; CHAIN_LEN]>,
+    pub crypto_chain:         Option<&'a [u8; CHAIN_LEN]>,
     /// The subframes, in on-disk order. A5: MUST be non-empty.
-    pub subframes: &'a [Subframe<'p>],
+    pub subframes:            &'a [Subframe<'p>],
 }
 
 /// A batch that could not be encoded. Pure (no I/O); the
@@ -137,7 +142,9 @@ pub enum EncodeError {
     #[error("empty batch: A5 forbids frame_count == 0")]
     EmptyBatch,
     /// A2 (§4.6): `total_len` exceeds `MAX_BATCH_LEN` (64 MiB).
-    #[error("batch too large: total_len {total_len} exceeds MAX_BATCH_LEN {max}")]
+    #[error(
+        "batch too large: total_len {total_len} exceeds MAX_BATCH_LEN {max}"
+    )]
     BatchTooLarge { total_len: u64, max: u64 },
     /// `frame_count` exceeds `u32::MAX` — not representable in the header.
     #[error("too many subframes: {count} exceeds u32::MAX")]
@@ -155,10 +162,20 @@ pub enum SubframeError {
     #[error("payload of {len} bytes exceeds u32::MAX compressed_len")]
     PayloadTooLarge { len: usize },
     /// D-FMT-7: `uncompressed_len != metadata_len + data_len`.
-    #[error("uncompressed_len {uncompressed} != metadata_len {metadata} + data_len {data}")]
-    LengthSumMismatch { uncompressed: u32, metadata: u32, data: u32 },
+    #[error(
+        "uncompressed_len {uncompressed} != metadata_len {metadata} + \
+         data_len {data}"
+    )]
+    LengthSumMismatch {
+        uncompressed: u32,
+        metadata:     u32,
+        data:         u32,
+    },
     /// D-FMT-7: `compression_id == 0` but `compressed_len != uncompressed_len`.
-    #[error("uncompressed frame (compression_id 0) has compressed_len {compressed} != uncompressed_len {uncompressed}")]
+    #[error(
+        "uncompressed frame (compression_id 0) has compressed_len \
+         {compressed} != uncompressed_len {uncompressed}"
+    )]
     UncompressedLenMismatch { compressed: u32, uncompressed: u32 },
 }
 
@@ -170,9 +187,7 @@ pub struct BatchEncoder {
 
 impl BatchEncoder {
     /// A fresh encoder with an empty buffer.
-    pub fn new() -> Self {
-        BatchEncoder { buf: Vec::new() }
-    }
+    pub fn new() -> Self { BatchEncoder { buf: Vec::new() } }
 
     /// An encoder whose buffer is pre-sized to `cap` bytes, so the first
     /// encode of a batch up to that size does not allocate.
@@ -188,19 +203,26 @@ impl BatchEncoder {
             return Err(EncodeError::EmptyBatch); // A5
         }
         if u32::try_from(input.subframes.len()).is_err() {
-            return Err(EncodeError::TooManyFrames { count: input.subframes.len() });
+            return Err(EncodeError::TooManyFrames {
+                count: input.subframes.len(),
+            });
         }
         for (index, sf) in input.subframes.iter().enumerate() {
             validate_subframe(index, sf)?;
         }
-        let chain_len = if input.crypto_chain.is_some() { CHAIN_LEN as u64 } else { 0 };
+        let chain_len =
+            if input.crypto_chain.is_some() { CHAIN_LEN as u64 } else { 0 };
         let mut frames_len: u64 = 0;
         for sf in input.subframes {
             frames_len += sf.on_disk_len();
         }
-        let total_len = HEADER_LEN as u64 + chain_len + frames_len + MARKER_LEN as u64;
+        let total_len =
+            HEADER_LEN as u64 + chain_len + frames_len + MARKER_LEN as u64;
         if total_len > MAX_BATCH_LEN {
-            return Err(EncodeError::BatchTooLarge { total_len, max: MAX_BATCH_LEN });
+            return Err(EncodeError::BatchTooLarge {
+                total_len,
+                max: MAX_BATCH_LEN,
+            });
         }
         Ok(total_len)
     }
@@ -213,7 +235,8 @@ impl BatchEncoder {
         let total_len = Self::total_len(input)?;
         let total_len_usize = total_len as usize;
 
-        let flags = if input.crypto_chain.is_some() { FLAG_CRYPTO_CHAIN } else { 0 };
+        let flags =
+            if input.crypto_chain.is_some() { FLAG_CRYPTO_CHAIN } else { 0 };
         let frame_count = input.subframes.len() as u32;
 
         let buf = &mut self.buf;
@@ -304,14 +327,12 @@ impl BatchEncoder {
 
     /// The last-encoded batch bytes (for a caller that encoded then wants to
     /// re-read without re-encoding). Empty before the first `encode`.
-    pub fn bytes(&self) -> &[u8] {
-        &self.buf
-    }
+    pub fn bytes(&self) -> &[u8] { &self.buf }
 }
 
 fn validate_subframe(index: usize, sf: &Subframe) -> Result<(), EncodeError> {
-    let compressed_len = u32::try_from(sf.payload.len())
-        .map_err(|_| EncodeError::Subframe {
+    let compressed_len =
+        u32::try_from(sf.payload.len()).map_err(|_| EncodeError::Subframe {
             index,
             reason: SubframeError::PayloadTooLarge { len: sf.payload.len() },
         })?;
@@ -321,17 +342,18 @@ fn validate_subframe(index: usize, sf: &Subframe) -> Result<(), EncodeError> {
             index,
             reason: SubframeError::LengthSumMismatch {
                 uncompressed: sf.uncompressed_len,
-                metadata: sf.metadata_len,
-                data: sf.data_len,
+                metadata:     sf.metadata_len,
+                data:         sf.data_len,
             },
         });
     }
-    // D-FMT-7: uncompressed frames are verbatim (compressed_len == uncompressed_len).
+    // D-FMT-7: uncompressed frames are verbatim (compressed_len ==
+    // uncompressed_len).
     if sf.compression_id == 0 && compressed_len != sf.uncompressed_len {
         return Err(EncodeError::Subframe {
             index,
             reason: SubframeError::UncompressedLenMismatch {
-                compressed: compressed_len,
+                compressed:   compressed_len,
                 uncompressed: sf.uncompressed_len,
             },
         });
@@ -343,7 +365,10 @@ fn validate_subframe(index: usize, sf: &Subframe) -> Result<(), EncodeError> {
 mod tests {
     use super::*;
 
-    fn input_1frame<'a>(payload: &'a [u8], subframes: &'a [Subframe<'a>]) -> BatchInput<'a, 'a> {
+    fn input_1frame<'a>(
+        payload: &'a [u8],
+        subframes: &'a [Subframe<'a>],
+    ) -> BatchInput<'a, 'a> {
         let _ = payload;
         BatchInput {
             segment_epoch: 1,
@@ -381,7 +406,10 @@ mod tests {
     fn empty_batch_rejected() {
         let sfs: [Subframe; 0] = [];
         let input = input_1frame(&[], &sfs);
-        assert_eq!(BatchEncoder::total_len(&input), Err(EncodeError::EmptyBatch));
+        assert_eq!(
+            BatchEncoder::total_len(&input),
+            Err(EncodeError::EmptyBatch)
+        );
     }
 
     #[test]
@@ -394,7 +422,10 @@ mod tests {
         let n = bytes.len();
         let header_crc = &bytes[HEADER_CRC_OFF..HEADER_CRC_OFF + 4];
         let echo_crc = &bytes[n - 4..];
-        assert_eq!(header_crc, echo_crc, "batch_crc and batch_crc_echo must match");
+        assert_eq!(
+            header_crc, echo_crc,
+            "batch_crc and batch_crc_echo must match"
+        );
         // And it must equal an independent split-coverage recomputation.
         assert_eq!(header_crc, batch_crc(bytes).to_le_bytes());
     }
@@ -403,21 +434,24 @@ mod tests {
     fn length_sum_mismatch_rejected() {
         let payload = [0u8; 8];
         let bad = Subframe {
-            event_type_id: 1,
-            schema_version: 0,
-            codec_id: 0,
-            compression_id: 0,
-            dict_id: 0,
+            event_type_id:    1,
+            schema_version:   0,
+            codec_id:         0,
+            compression_id:   0,
+            dict_id:          0,
             uncompressed_len: 9, // != 0 + 8
-            metadata_len: 0,
-            data_len: 8,
-            payload: &payload,
+            metadata_len:     0,
+            data_len:         8,
+            payload:          &payload,
         };
         let sfs = [bad];
         let input = input_1frame(&payload, &sfs);
         assert!(matches!(
             BatchEncoder::total_len(&input),
-            Err(EncodeError::Subframe { index: 0, reason: SubframeError::LengthSumMismatch { .. } })
+            Err(EncodeError::Subframe {
+                index:  0,
+                reason: SubframeError::LengthSumMismatch { .. },
+            })
         ));
     }
 }
@@ -429,18 +463,18 @@ mod tests {
 // - `total_len_closed_form_never_overflows_at_type_bounds` reasons about the
 //   arithmetic in the abstract, at the exact bounds the surrounding checks
 //   (`TooManyFrames`, `PayloadTooLarge`) enforce BEFORE this summation ever
-//   runs — `frame_count <= u32::MAX` and each subframe's on-disk length
-//   `<= SUBFRAME_HDR_LEN + u32::MAX`. It stands in for the real loop's worst
-//   case (every one of up to `u32::MAX` subframes at the longest
-//   representable length) without unwinding a multi-billion-iteration loop:
-//   the sum of `frame_count` terms each `<= max_len` is bounded above by
-//   `frame_count * max_len`, so if THAT doesn't overflow, no partial sum
-//   the real loop computes can either.
+//   runs — `frame_count <= u32::MAX` and each subframe's on-disk length `<=
+//   SUBFRAME_HDR_LEN + u32::MAX`. It stands in for the real loop's worst case
+//   (every one of up to `u32::MAX` subframes at the longest representable
+//   length) without unwinding a multi-billion-iteration loop: the sum of
+//   `frame_count` terms each `<= max_len` is bounded above by `frame_count *
+//   max_len`, so if THAT doesn't overflow, no partial sum the real loop
+//   computes can either.
 // - `total_len_matches_closed_form_bounded` instead drives the actual
 //   `BatchEncoder::total_len` function, over every batch shape up to
-//   `MAX_SUBFRAMES` subframes of up to `MAX_PAYLOAD` bytes each — small
-//   enough for Kani to enumerate the real code path exactly (not an
-//   abstraction of it) in seconds.
+//   `MAX_SUBFRAMES` subframes of up to `MAX_PAYLOAD` bytes each — small enough
+//   for Kani to enumerate the real code path exactly (not an abstraction of it)
+//   in seconds.
 //
 // Together they cover the same claim the bone asks for ("no-overflow
 // proofs for total_len computation ... bounded") from both ends: realistic
@@ -504,14 +538,18 @@ mod kani_proofs {
         // this worst-case total plus the fixed header/marker/chain
         // overhead fits in a `u64`, so does every prefix the real
         // accumulation ever computes.
-        let frames_len_upper_bound = frame_count
-            .checked_mul(max_per_frame_len)
-            .expect("frame_count * max_per_frame_len must not overflow u64 at realistic bounds");
+        let frames_len_upper_bound =
+            frame_count.checked_mul(max_per_frame_len).expect(
+                "frame_count * max_per_frame_len must not overflow u64 at \
+                 realistic bounds",
+            );
         let total = (HEADER_LEN as u64)
             .checked_add(chain_len)
             .and_then(|v| v.checked_add(frames_len_upper_bound))
             .and_then(|v| v.checked_add(MARKER_LEN as u64))
-            .expect("total_len's worst-case accumulation must not overflow u64");
+            .expect(
+                "total_len's worst-case accumulation must not overflow u64",
+            );
         assert!(total >= HEADER_LEN as u64 + MARKER_LEN as u64);
     }
 
@@ -547,8 +585,10 @@ mod kani_proofs {
         let n: usize = kani::any();
         kani::assume(n <= MAX_SUBFRAMES);
 
-        let sf0 = Subframe::plain(kani::any(), kani::any(), kani::any(), &p0[..l0]);
-        let sf1 = Subframe::plain(kani::any(), kani::any(), kani::any(), &p1[..l1]);
+        let sf0 =
+            Subframe::plain(kani::any(), kani::any(), kani::any(), &p0[..l0]);
+        let sf1 =
+            Subframe::plain(kani::any(), kani::any(), kani::any(), &p1[..l1]);
         let all = [sf0, sf1];
         let subframes = &all[..n];
 
@@ -574,7 +614,8 @@ mod kani_proofs {
         }
         if let Ok(total_len) = result {
             let chain_len = if with_chain { CHAIN_LEN as u64 } else { 0 };
-            let mut expected = HEADER_LEN as u64 + chain_len + MARKER_LEN as u64;
+            let mut expected =
+                HEADER_LEN as u64 + chain_len + MARKER_LEN as u64;
             for sf in subframes {
                 expected += SUBFRAME_HDR_LEN as u64 + sf.payload.len() as u64;
             }

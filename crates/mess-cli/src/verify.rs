@@ -26,7 +26,9 @@ use mess_index::sealed::segment::SealedSegmentIndex;
 use mess_log::fold_chain::{self, Hash as ChainHash};
 use mess_log::format::{CHAIN_LEN, HEADER_LEN};
 use mess_log::runtime::real::RealFs;
-use mess_log::scanner::{AcceptedBatch, ScanStop, recover_segment_with_image, scan_image};
+use mess_log::scanner::{
+    AcceptedBatch, ScanStop, recover_segment_with_image, scan_image,
+};
 use serde_json::json;
 
 use crate::lockprobe;
@@ -44,13 +46,14 @@ fn hex(h: &ChainHash) -> String {
 pub struct VerifyOptions {
     /// Run the full byte-integrity pass (payload reassembly), not just the
     /// structural scan.
-    pub full: bool,
-    /// Attempt Reed-Solomon repair of damaged sealed segments from their `.par`
-    /// parity sidecars (bn-2za). Reconstructs damaged byte blocks, re-verifies
-    /// them against the segment's own batch CRCs (+ fold chain) BEFORE writing,
-    /// keeps the damaged original as `.damaged-<ts>`, and reports exactly which
-    /// blocks were repaired. Refuses if the parity is itself damaged or the
-    /// damage exceeds the correction budget.
+    pub full:   bool,
+    /// Attempt Reed-Solomon repair of damaged sealed segments from their
+    /// `.par` parity sidecars (bn-2za). Reconstructs damaged byte blocks,
+    /// re-verifies them against the segment's own batch CRCs (+ fold
+    /// chain) BEFORE writing, keeps the damaged original as
+    /// `.damaged-<ts>`, and reports exactly which blocks were repaired.
+    /// Refuses if the parity is itself damaged or the damage exceeds the
+    /// correction budget.
     pub repair: bool,
 }
 
@@ -63,7 +66,10 @@ pub fn run(dir: &Path, opts: &VerifyOptions) -> Report {
 
     let lock = lockprobe::probe(dir);
     if lock.is_held() {
-        report.advise("store-locked", "store is locked by a live writer; verifying read-only");
+        report.advise(
+            "store-locked",
+            "store is locked by a live writer; verifying read-only",
+        );
     }
 
     let segments = store::discover_segments(dir);
@@ -121,7 +127,10 @@ pub fn run(dir: &Path, opts: &VerifyOptions) -> Report {
                     Severity::Warn,
                     "sidecar",
                     "orphan-sidecar",
-                    format!("sidecar {} has no matching .log segment", path.display()),
+                    format!(
+                        "sidecar {} has no matching .log segment",
+                        path.display()
+                    ),
                 )
                 .with("path", path.display().to_string()),
             );
@@ -160,7 +169,8 @@ fn verify_segment(report: &mut Report, scan: &SegmentScan) {
         Some(trailer) => {
             // Sealed: the trailer is checksummed ground truth. Compare the
             // scanned prefix against it. A body corruption makes the scan stop
-            // early, so accepted < batch_count and/or safe_offset < content len.
+            // early, so accepted < batch_count and/or safe_offset < content
+            // len.
             let mut mismatch = Vec::new();
             if scan.batch_count() as u64 != trailer.batch_count {
                 mismatch.push(format!(
@@ -177,7 +187,8 @@ fn verify_segment(report: &mut Report, scan: &SegmentScan) {
                 ));
             }
             // `ext_offset` is the first byte after the last commit marker: the
-            // segment's content length. The safe offset must land exactly there.
+            // segment's content length. The safe offset must land exactly
+            // there.
             if scan.recovery.safe_offset != trailer.ext_offset {
                 mismatch.push(format!(
                     "safe_offset {} != content_len {}",
@@ -185,7 +196,11 @@ fn verify_segment(report: &mut Report, scan: &SegmentScan) {
                 ));
             }
             if scan.epoch() != Some(trailer.epoch) {
-                mismatch.push(format!("header epoch {:?} != trailer {}", scan.epoch(), trailer.epoch));
+                mismatch.push(format!(
+                    "header epoch {:?} != trailer {}",
+                    scan.epoch(),
+                    trailer.epoch
+                ));
             }
 
             if mismatch.is_empty() {
@@ -194,12 +209,17 @@ fn verify_segment(report: &mut Report, scan: &SegmentScan) {
                         Severity::Ok,
                         "segment-scan",
                         "sealed-segment-verified",
-                        format!("segment {id}: sealed body matches trailer ({} batches)", trailer.batch_count),
+                        format!(
+                            "segment {id}: sealed body matches trailer ({} \
+                             batches)",
+                            trailer.batch_count
+                        ),
                     )
                     .with("segment_id", id),
                 );
             } else {
-                // The stop reason names the corruption class that halted the scan.
+                // The stop reason names the corruption class that halted the
+                // scan.
                 let kind = if scan.recovery.stop == ScanStop::EndOfSegment {
                     "sealed-body-shortfall"
                 } else {
@@ -210,7 +230,11 @@ fn verify_segment(report: &mut Report, scan: &SegmentScan) {
                         Severity::Error,
                         "segment-scan",
                         kind,
-                        format!("segment {id}: sealed body disagrees with trailer: {}", mismatch.join("; ")),
+                        format!(
+                            "segment {id}: sealed body disagrees with \
+                             trailer: {}",
+                            mismatch.join("; ")
+                        ),
                     )
                     .with("segment_id", id)
                     .with("stop", scan_stop_kind(scan.recovery.stop))
@@ -232,7 +256,8 @@ fn verify_segment(report: &mut Report, scan: &SegmentScan) {
                     "segment-scan",
                     "unsealed-segment-scanned",
                     format!(
-                        "segment {id}: unsealed, {} committed batch(es), tail stop = {}",
+                        "segment {id}: unsealed, {} committed batch(es), tail \
+                         stop = {}",
                         scan.batch_count(),
                         scan_stop_kind(scan.recovery.stop)
                     ),
@@ -255,7 +280,8 @@ fn verify_pidx(report: &mut Report, segment_id: u64, path: &Path) {
                         "sidecar",
                         "sidecar-segment-mismatch",
                         format!(
-                            "sidecar {} claims segment {} but is named for {segment_id}",
+                            "sidecar {} claims segment {} but is named for \
+                             {segment_id}",
                             path.display(),
                             idx.segment_id()
                         ),
@@ -269,7 +295,11 @@ fn verify_pidx(report: &mut Report, segment_id: u64, path: &Path) {
                         Severity::Ok,
                         "sidecar",
                         "pidx-verified",
-                        format!("sidecar {} verified ({} streams)", path.display(), idx.stream_count()),
+                        format!(
+                            "sidecar {} verified ({} streams)",
+                            path.display(),
+                            idx.stream_count()
+                        ),
                     )
                     .with("segment_id", idx.segment_id()),
                 );
@@ -301,7 +331,10 @@ fn verify_pcol(report: &mut Report, segment_id: u64, path: &Path, full: bool) {
                     Severity::Error,
                     "payload",
                     "pcol-io",
-                    format!("payload sidecar {} unreadable: {e}", path.display()),
+                    format!(
+                        "payload sidecar {} unreadable: {e}",
+                        path.display()
+                    ),
                 )
                 .with("segment_id", segment_id),
             );
@@ -316,7 +349,10 @@ fn verify_pcol(report: &mut Report, segment_id: u64, path: &Path, full: bool) {
                     Severity::Error,
                     "payload",
                     "pcol-corrupt",
-                    format!("payload sidecar {} failed CRC/parse: {e}", path.display()),
+                    format!(
+                        "payload sidecar {} failed CRC/parse: {e}",
+                        path.display()
+                    ),
                 )
                 .with("segment_id", segment_id)
                 .with("path", path.display().to_string()),
@@ -350,7 +386,10 @@ fn verify_pcol(report: &mut Report, segment_id: u64, path: &Path, full: bool) {
                         Severity::Error,
                         "payload",
                         "pcol-reassembly-failed",
-                        format!("payload sidecar {} failed to reassemble: {e}", path.display()),
+                        format!(
+                            "payload sidecar {} failed to reassemble: {e}",
+                            path.display()
+                        ),
                     )
                     .with("segment_id", index.segment_id())
                     .with("path", path.display().to_string()),
@@ -379,10 +418,10 @@ fn verify_pcol(report: &mut Report, segment_id: u64, path: &Path, full: bool) {
 ///
 /// 1. The stream's very first batch (`first_stream_version == 0`) must carry
 ///    the stream's [`fold_chain::genesis`] as its stored `crypto_chain`.
-/// 2. Each subsequent batch's stored `crypto_chain` must equal the batch
-///    **exit head** folded out of the *previous* batch's frames — recomputed
-///    via [`fold_chain::recompute_batch`] by walking that batch's payload
-///    bytes on disk (never trusted from storage).
+/// 2. Each subsequent batch's stored `crypto_chain` must equal the batch **exit
+///    head** folded out of the *previous* batch's frames — recomputed via
+///    [`fold_chain::recompute_batch`] by walking that batch's payload bytes on
+///    disk (never trusted from storage).
 ///
 /// A payload edited at rest with a recompute-repaired `batch_crc` (in both
 /// the header and the marker echo — exactly the attack `crash_verify.rs`
@@ -397,7 +436,8 @@ fn verify_pcol(report: &mut Report, segment_id: u64, path: &Path, full: bool) {
 /// the `crypto_chain` flag (bit 0) are skipped — the chain is opt-in (spec
 /// 05, D-FMT).
 fn verify_fold_chain(report: &mut Report, segment_id: u64, log_path: &Path) {
-    let (recovery, image) = match recover_segment_with_image(&RealFs, log_path) {
+    let (recovery, image) = match recover_segment_with_image(&RealFs, log_path)
+    {
         Ok(v) => v,
         Err(e) => {
             report.push_finding(
@@ -405,7 +445,10 @@ fn verify_fold_chain(report: &mut Report, segment_id: u64, log_path: &Path) {
                     Severity::Error,
                     "fold-chain",
                     "fold-chain-io",
-                    format!("segment {segment_id}: failed to re-read for fold-chain verification: {e}"),
+                    format!(
+                        "segment {segment_id}: failed to re-read for \
+                         fold-chain verification: {e}"
+                    ),
                 )
                 .with("segment_id", segment_id),
             );
@@ -433,7 +476,8 @@ fn verify_fold_chain(report: &mut Report, segment_id: u64, log_path: &Path) {
 
         for b in batches {
             let off = b.offset as usize;
-            let Some(stored_slice) = image.get(off + HEADER_LEN..off + HEADER_LEN + CHAIN_LEN)
+            let Some(stored_slice) =
+                image.get(off + HEADER_LEN..off + HEADER_LEN + CHAIN_LEN)
             else {
                 report.push_finding(
                     Finding::new(
@@ -441,8 +485,9 @@ fn verify_fold_chain(report: &mut Report, segment_id: u64, log_path: &Path) {
                         "fold-chain",
                         "fold-chain-io",
                         format!(
-                            "segment {segment_id}: batch at {off} claims crypto_chain but its \
-                             slot falls outside the recovered image"
+                            "segment {segment_id}: batch at {off} claims \
+                             crypto_chain but its slot falls outside the \
+                             recovered image"
                         ),
                     )
                     .with("segment_id", segment_id)
@@ -452,7 +497,8 @@ fn verify_fold_chain(report: &mut Report, segment_id: u64, log_path: &Path) {
                 had_error = true;
                 break;
             };
-            let stored: ChainHash = stored_slice.try_into().expect("slice is CHAIN_LEN bytes");
+            let stored: ChainHash =
+                stored_slice.try_into().expect("slice is CHAIN_LEN bytes");
 
             if b.first_stream_version == 0 {
                 let want = fold_chain::genesis(stream_id);
@@ -463,8 +509,9 @@ fn verify_fold_chain(report: &mut Report, segment_id: u64, log_path: &Path) {
                             "fold-chain",
                             "fold-chain-break",
                             format!(
-                                "segment {segment_id}: stream {stream_id} batch at {} carries a \
-                                 crypto_chain that does not match the stream genesis",
+                                "segment {segment_id}: stream {stream_id} \
+                                 batch at {} carries a crypto_chain that does \
+                                 not match the stream genesis",
                                 b.offset
                             ),
                         )
@@ -486,8 +533,9 @@ fn verify_fold_chain(report: &mut Report, segment_id: u64, log_path: &Path) {
                         "fold-chain",
                         "fold-chain-break",
                         format!(
-                            "segment {segment_id}: stream {stream_id} batch at {} carries a \
-                             crypto_chain that does not match the prior batch's exit head",
+                            "segment {segment_id}: stream {stream_id} batch \
+                             at {} carries a crypto_chain that does not match \
+                             the prior batch's exit head",
                             b.offset
                         ),
                     )
@@ -508,8 +556,9 @@ fn verify_fold_chain(report: &mut Report, segment_id: u64, log_path: &Path) {
                         "fold-chain",
                         "fold-chain-io",
                         format!(
-                            "segment {segment_id}: batch at {} failed to re-materialize its \
-                             frames for fold-chain recompute",
+                            "segment {segment_id}: batch at {} failed to \
+                             re-materialize its frames for fold-chain \
+                             recompute",
                             b.offset
                         ),
                     )
@@ -539,8 +588,9 @@ fn verify_fold_chain(report: &mut Report, segment_id: u64, log_path: &Path) {
                 "fold-chain",
                 "fold-chain-verified",
                 format!(
-                    "segment {segment_id}: fold chain verified ({batches_checked} chain-enabled \
-                     batch(es) across {stream_count} stream(s))"
+                    "segment {segment_id}: fold chain verified \
+                     ({batches_checked} chain-enabled batch(es) across \
+                     {stream_count} stream(s))"
                 ),
             )
             .with("segment_id", segment_id),
@@ -555,18 +605,22 @@ fn verify_fold_chain(report: &mut Report, segment_id: u64, log_path: &Path) {
 /// Attempt to repair a damaged sealed segment from its parity sidecar.
 ///
 /// Flow (all read-only until the very last step):
-/// 1. Open + CRC-validate the `.par`. A parity that fails its own content CRC is
-///    *itself* damaged — reported, no repair attempted.
+/// 1. Open + CRC-validate the `.par`. A parity that fails its own content CRC
+///    is *itself* damaged — reported, no repair attempted.
 /// 2. Localize damaged byte blocks (per-shard CRC) and reconstruct them via RS.
 ///    Refuse (typed finding, originals untouched) if any group's damage exceeds
 ///    its parity budget, or the segment length no longer matches the sidecar.
 /// 3. **Re-verify the reconstructed image against the segment's own batch CRCs
-///    and fold chain BEFORE writing anything** — parity proves erasure recovery,
-///    the batch CRC / chain prove the bytes are the committed bytes.
+///    and fold chain BEFORE writing anything** — parity proves erasure
+///    recovery, the batch CRC / chain prove the bytes are the committed bytes.
 /// 4. Only on a clean re-verify: keep the damaged original as `.damaged-<ts>`
 ///    and install the repaired image via temp → fsync → rename. Report exactly
 ///    which blocks were repaired.
-fn attempt_repair(report: &mut Report, seg: &crate::store::SegmentFile, scan: &SegmentScan) {
+fn attempt_repair(
+    report: &mut Report,
+    seg: &crate::store::SegmentFile,
+    scan: &SegmentScan,
+) {
     let segment_id = seg.segment_id;
 
     let current = match std::fs::read(&seg.log_path) {
@@ -577,7 +631,9 @@ fn attempt_repair(report: &mut Report, seg: &crate::store::SegmentFile, scan: &S
                     Severity::Error,
                     "repair",
                     "repair-io",
-                    format!("segment {segment_id}: failed to read for repair: {e}"),
+                    format!(
+                        "segment {segment_id}: failed to read for repair: {e}"
+                    ),
                 )
                 .with("segment_id", segment_id),
             );
@@ -595,8 +651,8 @@ fn attempt_repair(report: &mut Report, seg: &crate::store::SegmentFile, scan: &S
                     "repair",
                     "par-corrupt",
                     format!(
-                        "segment {segment_id}: parity sidecar {} is itself damaged (content CRC \
-                         mismatch); no repair attempted",
+                        "segment {segment_id}: parity sidecar {} is itself \
+                         damaged (content CRC mismatch); no repair attempted",
                         seg.par_path.display()
                     ),
                 )
@@ -612,7 +668,8 @@ fn attempt_repair(report: &mut Report, seg: &crate::store::SegmentFile, scan: &S
                     "repair",
                     "par-invalid",
                     format!(
-                        "segment {segment_id}: parity sidecar {} failed to parse: {e}",
+                        "segment {segment_id}: parity sidecar {} failed to \
+                         parse: {e}",
                         seg.par_path.display()
                     ),
                 )
@@ -626,7 +683,9 @@ fn attempt_repair(report: &mut Report, seg: &crate::store::SegmentFile, scan: &S
                     Severity::Error,
                     "repair",
                     "par-io",
-                    format!("segment {segment_id}: parity sidecar unreadable: {e}"),
+                    format!(
+                        "segment {segment_id}: parity sidecar unreadable: {e}"
+                    ),
                 )
                 .with("segment_id", segment_id),
             );
@@ -654,15 +713,21 @@ fn attempt_repair(report: &mut Report, seg: &crate::store::SegmentFile, scan: &S
     // 2. Plan the reconstruction (no writes).
     let plan = match sidecar.plan_repair(&current) {
         Ok(p) => p,
-        Err(ParityError::BeyondTolerance { group, damaged, tolerance, beyond_groups }) => {
+        Err(ParityError::BeyondTolerance {
+            group,
+            damaged,
+            tolerance,
+            beyond_groups,
+        }) => {
             report.push_finding(
                 Finding::new(
                     Severity::Error,
                     "repair",
                     "repair-beyond-tolerance",
                     format!(
-                        "segment {segment_id}: damage exceeds parity budget (group {group} lost \
-                         {damaged} shards, budget {tolerance}; {beyond_groups} group(s) beyond \
+                        "segment {segment_id}: damage exceeds parity budget \
+                         (group {group} lost {damaged} shards, budget \
+                         {tolerance}; {beyond_groups} group(s) beyond \
                          tolerance); refusing repair, originals untouched"
                     ),
                 )
@@ -681,8 +746,9 @@ fn attempt_repair(report: &mut Report, seg: &crate::store::SegmentFile, scan: &S
                     "repair",
                     "repair-length-mismatch",
                     format!(
-                        "segment {segment_id}: current length {actual} != parity source length \
-                         {expected}; RS block repair does not cover truncation/extension"
+                        "segment {segment_id}: current length {actual} != \
+                         parity source length {expected}; RS block repair \
+                         does not cover truncation/extension"
                     ),
                 )
                 .with("segment_id", segment_id)
@@ -712,7 +778,8 @@ fn attempt_repair(report: &mut Report, seg: &crate::store::SegmentFile, scan: &S
                 "repair",
                 "repair-clean",
                 format!(
-                    "segment {segment_id}: parity localized no damaged blocks; nothing to repair"
+                    "segment {segment_id}: parity localized no damaged \
+                     blocks; nothing to repair"
                 ),
             )
             .with("segment_id", segment_id),
@@ -721,15 +788,17 @@ fn attempt_repair(report: &mut Report, seg: &crate::store::SegmentFile, scan: &S
     }
 
     // 3. Prove the reconstruction restored the committed bytes BEFORE writing.
-    if let Err(reasons) = reverify_repaired_image(segment_id, &plan.image, scan) {
+    if let Err(reasons) = reverify_repaired_image(segment_id, &plan.image, scan)
+    {
         report.push_finding(
             Finding::new(
                 Severity::Error,
                 "repair",
                 "repair-reverify-failed",
                 format!(
-                    "segment {segment_id}: reconstructed image failed batch-CRC/fold-chain \
-                     re-verification; refusing to write (originals untouched): {reasons}"
+                    "segment {segment_id}: reconstructed image failed \
+                     batch-CRC/fold-chain re-verification; refusing to write \
+                     (originals untouched): {reasons}"
                 ),
             )
             .with("segment_id", segment_id),
@@ -737,7 +806,8 @@ fn attempt_repair(report: &mut Report, seg: &crate::store::SegmentFile, scan: &S
         return;
     }
 
-    // 4. Install: keep the damaged original, then atomically swap in the repair.
+    // 4. Install: keep the damaged original, then atomically swap in the
+    //    repair.
     match install_repaired(&seg.log_path, &plan.image) {
         Ok(damaged_path) => {
             report.push_finding(
@@ -746,8 +816,9 @@ fn attempt_repair(report: &mut Report, seg: &crate::store::SegmentFile, scan: &S
                     "repair",
                     "repaired",
                     format!(
-                        "segment {segment_id}: repaired {} block(s) {:?} from parity and \
-                         re-verified against batch CRCs + fold chain; damaged original kept at {}",
+                        "segment {segment_id}: repaired {} block(s) {:?} from \
+                         parity and re-verified against batch CRCs + fold \
+                         chain; damaged original kept at {}",
                         plan.repaired_blocks.len(),
                         plan.repaired_blocks,
                         damaged_path.display()
@@ -765,7 +836,10 @@ fn attempt_repair(report: &mut Report, seg: &crate::store::SegmentFile, scan: &S
                     Severity::Error,
                     "repair",
                     "repair-write-failed",
-                    format!("segment {segment_id}: repaired image re-verified but write failed: {e}"),
+                    format!(
+                        "segment {segment_id}: repaired image re-verified but \
+                         write failed: {e}"
+                    ),
                 )
                 .with("segment_id", segment_id),
             );
@@ -786,28 +860,37 @@ fn reverify_repaired_image(
 ) -> Result<(), String> {
     let recovery = scan_image(image, None);
 
-    // The recovery scanner is a prefix model: it accepts committed batches until
-    // it can go no further. On a *sealed* segment it naturally halts at the
-    // checksummed trailer (which is not a batch header), so the stop reason is
-    // not `EndOfSegment` — the authoritative "clean" proof is that the accepted
-    // prefix reaches the sealed content length and matches the trailer's
-    // batch/event counts. A mid-body batch-CRC failure would stop the scan
-    // early, short of `ext_offset`, and fail this cross-check.
-    let trailer = scan
-        .trailer
-        .as_ref()
-        .ok_or_else(|| "segment is not sealed (no checksummed trailer to prove against)".to_string())?;
+    // The recovery scanner is a prefix model: it accepts committed batches
+    // until it can go no further. On a *sealed* segment it naturally halts
+    // at the checksummed trailer (which is not a batch header), so the stop
+    // reason is not `EndOfSegment` — the authoritative "clean" proof is
+    // that the accepted prefix reaches the sealed content length and
+    // matches the trailer's batch/event counts. A mid-body batch-CRC
+    // failure would stop the scan early, short of `ext_offset`, and fail
+    // this cross-check.
+    let trailer = scan.trailer.as_ref().ok_or_else(|| {
+        "segment is not sealed (no checksummed trailer to prove against)"
+            .to_string()
+    })?;
     let batches = recovery.accepted.len() as u64;
-    let events: u64 = recovery.accepted.iter().map(|b| u64::from(b.frame_count)).sum();
+    let events: u64 =
+        recovery.accepted.iter().map(|b| u64::from(b.frame_count)).sum();
     if batches != trailer.batch_count {
-        return Err(format!("batch_count {batches} != trailer {}", trailer.batch_count));
+        return Err(format!(
+            "batch_count {batches} != trailer {}",
+            trailer.batch_count
+        ));
     }
     if events != trailer.event_count {
-        return Err(format!("event_count {events} != trailer {}", trailer.event_count));
+        return Err(format!(
+            "event_count {events} != trailer {}",
+            trailer.event_count
+        ));
     }
     if recovery.safe_offset != trailer.ext_offset {
         return Err(format!(
-            "recovered content length {} != trailer content length {} (batch CRC broke mid-body)",
+            "recovered content length {} != trailer content length {} (batch \
+             CRC broke mid-body)",
             recovery.safe_offset, trailer.ext_offset
         ));
     }
@@ -826,7 +909,9 @@ fn reverify_repaired_image(
             let off = b.offset as usize;
             let stored: ChainHash = image
                 .get(off + HEADER_LEN..off + HEADER_LEN + CHAIN_LEN)
-                .ok_or_else(|| format!("segment {segment_id}: chain slot outside image"))?
+                .ok_or_else(|| {
+                    format!("segment {segment_id}: chain slot outside image")
+                })?
                 .try_into()
                 .expect("slice is CHAIN_LEN bytes");
 
@@ -834,25 +919,34 @@ fn reverify_repaired_image(
                 let want = fold_chain::genesis(stream_id);
                 if stored != want {
                     return Err(format!(
-                        "stream {stream_id} genesis chain mismatch at offset {off}"
+                        "stream {stream_id} genesis chain mismatch at offset \
+                         {off}"
                     ));
                 }
             } else if let Some(want) = expected_entry
                 && stored != want
             {
                 return Err(format!(
-                    "stream {stream_id} chain break at offset {off} (want {}, found {})",
+                    "stream {stream_id} chain break at offset {off} (want {}, \
+                     found {})",
                     hex(&want),
                     hex(&stored)
                 ));
             }
 
-            let frames = b
-                .frames(image)
-                .map_err(|_| format!("stream {stream_id} batch at {off} failed to re-materialize"))?;
+            let frames = b.frames(image).map_err(|_| {
+                format!(
+                    "stream {stream_id} batch at {off} failed to \
+                     re-materialize"
+                )
+            })?;
             let payloads: Vec<&[u8]> = frames.map(|f| f.payload).collect();
-            expected_entry =
-                Some(fold_chain::recompute_batch(&stored, b.first_stream_version, payloads, |_| {}));
+            expected_entry = Some(fold_chain::recompute_batch(
+                &stored,
+                b.first_stream_version,
+                payloads,
+                |_| {},
+            ));
         }
     }
 
@@ -863,14 +957,18 @@ fn reverify_repaired_image(
 /// `<log>.damaged-<unix_nanos>` (preserved for forensics), then write the
 /// repaired bytes via temp → fsync → rename → dir-fsync. Returns the path the
 /// damaged original was preserved at.
-fn install_repaired(log_path: &Path, image: &[u8]) -> std::io::Result<std::path::PathBuf> {
+fn install_repaired(
+    log_path: &Path,
+    image: &[u8],
+) -> std::io::Result<std::path::PathBuf> {
     use std::io::Write;
 
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let mut damaged_name = log_path.file_name().unwrap_or_default().to_os_string();
+    let mut damaged_name =
+        log_path.file_name().unwrap_or_default().to_os_string();
     damaged_name.push(format!(".damaged-{ts}"));
     let damaged_path = log_path.with_file_name(damaged_name);
 

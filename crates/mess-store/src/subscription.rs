@@ -13,8 +13,9 @@
 //! # Catch-up → live handoff
 //!
 //! A subscription is a cursor `c` over the **global** position sequence: the
-//! next global position it will deliver. [`next_batch`](Subscription::next_batch)
-//! runs one step of the D11 state machine:
+//! next global position it will deliver.
+//! [`next_batch`](Subscription::next_batch) runs one step of the D11 state
+//! machine:
 //!
 //! 1. **Catch-up.** Read a page of history from `c` via `read_global`. If it is
 //!    non-empty, advance `c` past it and hand it back — the subscriber is
@@ -47,21 +48,22 @@
 //!
 //! # Cancellation / drop
 //!
-//! [`next_batch`](Subscription::next_batch) and [`next`](Subscription::next) are
-//! cancellation-safe: dropping the returned future before it resolves leaves the
-//! cursor unchanged (nothing was consumed) and deregisters the watermark waiter.
-//! Dropping the whole [`Subscription`] simply releases its backend handle and
-//! any parked waiter — it can **never** wedge the committer, because the
-//! watermark drains and re-wakes its waiter set on every advance regardless of
-//! which waiters are still alive. A store supports one writer and many
-//! independent subscribers this way; subscribers come and go freely.
+//! [`next_batch`](Subscription::next_batch) and [`next`](Subscription::next)
+//! are cancellation-safe: dropping the returned future before it resolves
+//! leaves the cursor unchanged (nothing was consumed) and deregisters the
+//! watermark waiter. Dropping the whole [`Subscription`] simply releases its
+//! backend handle and any parked waiter — it can **never** wedge the committer,
+//! because the watermark drains and re-wakes its waiter set on every advance
+//! regardless of which waiters are still alive. A store supports one writer and
+//! many independent subscribers this way; subscribers come and go freely.
 
 use std::collections::VecDeque;
 
 use crate::backend::{Backend, StoredRecord, SubscribeBackend};
 use crate::store::StoreError;
 
-/// A live catch-up → tail subscription over an [`EventStore`](crate::EventStore).
+/// A live catch-up → tail subscription over an
+/// [`EventStore`](crate::EventStore).
 ///
 /// Build one with [`EventStore::subscribe`](crate::EventStore::subscribe). Pull
 /// committed [`StoredRecord`]s in global order with
@@ -69,15 +71,15 @@ use crate::store::StoreError;
 /// (one at a time); both block — event-bounded — once caught up, until the next
 /// commit. See the [module docs](self) for the full delivery contract.
 pub struct Subscription<B: Backend> {
-    backend: B,
+    backend:   B,
     /// Next global position to deliver.
-    cursor: u64,
+    cursor:    u64,
     /// Catch-up page size for `read_global`.
     page_size: usize,
     /// One-at-a-time buffer for [`next`](Self::next): the unread tail of the
     /// last page fetched by `next`. Empty except while a `next` walk is in
     /// progress.
-    buffered: VecDeque<StoredRecord>,
+    buffered:  VecDeque<StoredRecord>,
 }
 
 impl<B: SubscribeBackend> Subscription<B> {
@@ -96,9 +98,7 @@ impl<B: SubscribeBackend> Subscription<B> {
     /// The next global position this subscription will deliver — its cursor.
     /// After delivering position `p` this reads `p + 1`.
     #[must_use]
-    pub fn position(&self) -> u64 {
-        self.cursor
-    }
+    pub fn position(&self) -> u64 { self.cursor }
 
     /// Deliver the next non-empty batch of committed records, in ascending
     /// global order starting at the cursor.
@@ -106,20 +106,23 @@ impl<B: SubscribeBackend> Subscription<B> {
     /// Replays history a page at a time until caught up, then parks
     /// (event-bounded) on the watermark and returns the next committed page as
     /// soon as a writer commits past the cursor. Never returns an empty batch:
-    /// it blocks until at least one record is available (or the backend errors).
+    /// it blocks until at least one record is available (or the backend
+    /// errors).
     ///
     /// Cancellation-safe — see the [module docs](self).
     pub async fn next_batch(
         &mut self,
     ) -> Result<Vec<StoredRecord>, StoreError<B::Error>> {
         // Drain any records a prior `next` walk fetched but did not hand out,
-        // so `next` and `next_batch` can be interleaved without dropping events.
+        // so `next` and `next_batch` can be interleaved without dropping
+        // events.
         if !self.buffered.is_empty() {
             return Ok(self.buffered.drain(..).collect());
         }
         loop {
-            // `read_global(after)` is exclusive of `after`; deliver-from `cursor`
-            // means read strictly after `cursor - 1` (or from the start at 0).
+            // `read_global(after)` is exclusive of `after`; deliver-from
+            // `cursor` means read strictly after `cursor - 1` (or
+            // from the start at 0).
             let after = self.cursor.checked_sub(1);
             let page = self
                 .backend
@@ -129,13 +132,15 @@ impl<B: SubscribeBackend> Subscription<B> {
             if let Some(last) = page.last() {
                 debug_assert_eq!(
                     page[0].global_position, self.cursor,
-                    "read_global must return a dense run beginning at the cursor",
+                    "read_global must return a dense run beginning at the \
+                     cursor",
                 );
                 self.cursor = last.global_position + 1;
                 return Ok(page);
             }
-            // Caught up to the watermark: block until a commit passes the cursor,
-            // then loop to read the newly-committed positions from history.
+            // Caught up to the watermark: block until a commit passes the
+            // cursor, then loop to read the newly-committed
+            // positions from history.
             self.backend
                 .await_watermark_past(self.cursor)
                 .await
@@ -154,9 +159,8 @@ impl<B: SubscribeBackend> Subscription<B> {
             return Ok(rec);
         }
         let mut page: VecDeque<StoredRecord> = self.next_batch().await?.into();
-        let first = page
-            .pop_front()
-            .expect("next_batch never returns an empty batch");
+        let first =
+            page.pop_front().expect("next_batch never returns an empty batch");
         self.buffered = page;
         Ok(first)
     }

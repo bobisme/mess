@@ -1,19 +1,20 @@
 //! [`FjallSnapshotBackend`]: the **production** snapshot path — snapshot *heads*
-//! in mess-index's fjall [`SnapshotHeads`](mess_index::meta::MetaTable::SnapshotHeads)
-//! table (O(1) point lookup, journal-buffered, rebuildable per I5) plus state
-//! **blobs** in a plain content-addressed directory.
+//! in mess-index's fjall
+//! [`SnapshotHeads`](mess_index::meta::MetaTable::SnapshotHeads) table (O(1)
+//! point lookup, journal-buffered, rebuildable per I5) plus state **blobs** in
+//! a plain content-addressed directory.
 //!
 //! # Why this shape, and why the API does not change
 //!
-//! Phase 1 shipped the snapshot *API* — [`SnapshotStore`], `save_snapshot::<A>`,
-//! `load_cached::<A>` — backed by an explicitly throwaway in-memory map on
-//! [`MockBackend`](crate::MockBackend). This module is the Phase 4 body behind
-//! that same API: a [`SnapshotStore`] whose internals are the real
-//! "`snapshot_head` lookup → blob read → tail replay" load path of
-//! `docs/spec/05-fold-certificates.md`. Because it is *another* [`SnapshotStore`]
-//! impl, nothing in [`EventStore`](crate::EventStore) changes:
-//! `save_snapshot` / `load_cached` are generic over the backend, the mock still
-//! serves the pure unit/property tests, and swapping the mock for
+//! Phase 1 shipped the snapshot *API* — [`SnapshotStore`],
+//! `save_snapshot::<A>`, `load_cached::<A>` — backed by an explicitly throwaway
+//! in-memory map on [`MockBackend`](crate::MockBackend). This module is the
+//! Phase 4 body behind that same API: a [`SnapshotStore`] whose internals are
+//! the real "`snapshot_head` lookup → blob read → tail replay" load path of
+//! `docs/spec/05-fold-certificates.md`. Because it is *another*
+//! [`SnapshotStore`] impl, nothing in [`EventStore`](crate::EventStore)
+//! changes: `save_snapshot` / `load_cached` are generic over the backend, the
+//! mock still serves the pure unit/property tests, and swapping the mock for
 //! `FjallSnapshotBackend<_>` is a construction-site choice, not an API change.
 //!
 //! # Composition, not a monolith
@@ -23,9 +24,9 @@
 //! types together). So the production snapshot store is a *wrapper*: it holds
 //! the real event-log [`Backend`] `B` and **delegates** every log operation to
 //! it, adding only the snapshot keyspace. Its error type
-//! [`SnapshotBackendError`] unifies `B`'s error with the fjall/blob failures the
-//! snapshot side can hit, so the whole thing is still one `Backend` with one
-//! `Error`. For tests, `FjallSnapshotBackend<MockBackend>` is a fully real
+//! [`SnapshotBackendError`] unifies `B`'s error with the fjall/blob failures
+//! the snapshot side can hit, so the whole thing is still one `Backend` with
+//! one `Error`. For tests, `FjallSnapshotBackend<MockBackend>` is a fully real
 //! snapshot store over the in-memory log.
 //!
 //! # Blob storage: a positional blob dir, deliberately **not** content-hashed
@@ -102,16 +103,16 @@ const BLOB_HEADER: usize = 4 + 8 + 8;
 /// clone-is-share contract.
 #[derive(Clone)]
 pub struct FjallSnapshotBackend<B> {
-    inner: B,
-    meta: Arc<MetaStore>,
+    inner:     B,
+    meta:      Arc<MetaStore>,
     blob_root: Arc<PathBuf>,
     /// Monotonic pseudo-global position stamped on each saved head. The event
     /// [`Backend`] seam exposes no global position for a stream head, so saves
     /// carry a strictly increasing counter instead — enough to keep the fjall
-    /// high-water monotonic and to order snapshots; the true log position lands
-    /// with the Phase 5 certificate. Seeded from the persisted high-water on
-    /// open so it stays monotonic across a reopen.
-    next_pos: Arc<AtomicU64>,
+    /// high-water monotonic and to order snapshots; the true log position
+    /// lands with the Phase 5 certificate. Seeded from the persisted
+    /// high-water on open so it stays monotonic across a reopen.
+    next_pos:  Arc<AtomicU64>,
 }
 
 impl<B: std::fmt::Debug> std::fmt::Debug for FjallSnapshotBackend<B> {
@@ -147,9 +148,7 @@ impl<B> FjallSnapshotBackend<B> {
     }
 
     /// Borrow the wrapped event-log backend.
-    pub fn inner(&self) -> &B {
-        &self.inner
-    }
+    pub fn inner(&self) -> &B { &self.inner }
 
     /// Force the snapshot-heads table's buffered writes to disk (fsync).
     ///
@@ -157,9 +156,7 @@ impl<B> FjallSnapshotBackend<B> {
     /// full replay (I5) — but useful for a clean shutdown and to make a
     /// reopen-persistence test deterministic. Blobs are written+renamed
     /// eagerly, so only the fjall head buffer is at issue here.
-    pub fn persist(&self) -> Result<(), MetaError> {
-        self.meta.persist()
-    }
+    pub fn persist(&self) -> Result<(), MetaError> { self.meta.persist() }
 
     /// Path to the blob file for `(id, version)`:
     /// `<blobs>/<stream_id_hex>/<version>.blob`.
@@ -232,8 +229,8 @@ fn decode_blob(raw: &[u8]) -> Option<Vec<u8>> {
 /// security hash; it only needs to catch a torn or truncated file (a corrupt
 /// blob must degrade to full replay, never to a wrong answer).
 fn checksum(bytes: &[u8]) -> u64 {
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    const OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01B3;
     let mut h = OFFSET;
     for b in bytes {
         h ^= u64::from(*b);
@@ -261,10 +258,10 @@ const REF_V1_LEN: usize = 1 + 4 + 1 + 8;
 /// (`covered_version`, `global_position`) do not already hold.
 ///
 /// Layout: `tag(1) || fold_version(4 LE) || flags(1) || snapshot_ptr(8 LE)`.
-/// The leading `tag` is [`REF_FORMAT_V1`]; `flags` bit 0 = `covers_empty_prefix`.
-/// The interned `stream_id`, `stream_version`, and the reserved hashes are all
-/// recovered without being stored (id from the stream name, version from the
-/// head, hashes are `None`).
+/// The leading `tag` is [`REF_FORMAT_V1`]; `flags` bit 0 =
+/// `covers_empty_prefix`. The interned `stream_id`, `stream_version`, and the
+/// reserved hashes are all recovered without being stored (id from the stream
+/// name, version from the head, hashes are `None`).
 fn encode_ref(snap: &SnapshotRef) -> Vec<u8> {
     let mut out = Vec::with_capacity(REF_V1_LEN);
     out.push(REF_FORMAT_V1);
@@ -333,9 +330,9 @@ impl<B: Backend> Backend for FjallSnapshotBackend<B> {
             Err(AppendError::Conflict { expected, actual }) => {
                 Err(AppendError::Conflict { expected, actual })
             }
-            Err(AppendError::Backend(e)) => Err(AppendError::Backend(
-                SnapshotBackendError::Inner(e),
-            )),
+            Err(AppendError::Backend(e)) => {
+                Err(AppendError::Backend(SnapshotBackendError::Inner(e)))
+            }
         }
     }
 }
@@ -382,7 +379,8 @@ impl<B: Backend> SnapshotStore for FjallSnapshotBackend<B> {
         let Some((fold_version, covers_empty_prefix, snapshot_ptr)) =
             decode_ref(&head.snapshot_ref)
         else {
-            // A garbled head reads as "no usable snapshot": self-heal by replay.
+            // A garbled head reads as "no usable snapshot": self-heal by
+            // replay.
             return Ok(None);
         };
         // 2. blob read — missing/corrupt blob => fall back to full replay (I5).
@@ -420,7 +418,7 @@ mod tests {
 
         // Flip a payload byte: checksum mismatch -> None (no wrong answer).
         let mut torn = raw.clone();
-        *torn.last_mut().unwrap() ^= 0xff;
+        *torn.last_mut().unwrap() ^= 0xFF;
         assert_eq!(decode_blob(&torn), None);
 
         // Truncated header / wrong magic -> None.
@@ -433,21 +431,24 @@ mod tests {
     #[test]
     fn ref_roundtrip() {
         let snap = SnapshotRef {
-            stream_id: 42,
-            stream_version: 7,
-            fold_version: 3,
+            stream_id:           42,
+            stream_version:      7,
+            fold_version:        3,
             covers_empty_prefix: true,
-            event_prefix_hash: None,
-            state_hash: None,
-            snapshot_ptr: BlobPtr(0xdead_beef),
+            event_prefix_hash:   None,
+            state_hash:          None,
+            snapshot_ptr:        BlobPtr(0xDEAD_BEEF),
         };
         let encoded = encode_ref(&snap);
         assert_eq!(encoded.len(), REF_V1_LEN);
-        assert_eq!(encoded[0], REF_FORMAT_V1, "record must carry the format tag");
+        assert_eq!(
+            encoded[0], REF_FORMAT_V1,
+            "record must carry the format tag"
+        );
         let (fv, empty, ptr) = decode_ref(&encoded).unwrap();
         assert_eq!(fv, 3);
         assert!(empty);
-        assert_eq!(ptr, 0xdead_beef);
+        assert_eq!(ptr, 0xDEAD_BEEF);
     }
 
     /// §9 back-compat: a record this binary does not understand — a legacy
@@ -461,30 +462,35 @@ mod tests {
         assert_eq!(decode_ref(&[]), None);
         assert_eq!(decode_ref(&[REF_FORMAT_V1]), None);
 
-        // A plausible LEGACY layout: the pre-tag `fold_version(4) || flags(1) ||
-        // ptr(8)` = 13 bytes, with no format tag. It must NOT be trusted just
-        // because it is 13 bytes of the right general shape.
+        // A plausible LEGACY layout: the pre-tag `fold_version(4) || flags(1)
+        // || ptr(8)` = 13 bytes, with no format tag. It must NOT be
+        // trusted just because it is 13 bytes of the right general
+        // shape.
         let legacy = {
             let mut v = Vec::new();
             v.extend_from_slice(&7u32.to_le_bytes());
             v.push(1);
-            v.extend_from_slice(&0xdead_beefu64.to_le_bytes());
+            v.extend_from_slice(&0xDEAD_BEEFu64.to_le_bytes());
             v
         };
         assert_eq!(legacy.len(), 13);
-        assert_eq!(decode_ref(&legacy), None, "untagged legacy record → unknown");
+        assert_eq!(
+            decode_ref(&legacy),
+            None,
+            "untagged legacy record → unknown"
+        );
 
         // Right length, wrong tag (a future/foreign format).
         let mut wrong_tag = encode_ref(&SnapshotRef {
-            stream_id: 1,
-            stream_version: 0,
-            fold_version: 2,
+            stream_id:           1,
+            stream_version:      0,
+            fold_version:        2,
             covers_empty_prefix: false,
-            event_prefix_hash: None,
-            state_hash: None,
-            snapshot_ptr: BlobPtr(0),
+            event_prefix_hash:   None,
+            state_hash:          None,
+            snapshot_ptr:        BlobPtr(0),
         });
-        wrong_tag[0] = 0xff;
+        wrong_tag[0] = 0xFF;
         assert_eq!(decode_ref(&wrong_tag), None, "unknown tag → unknown");
     }
 }

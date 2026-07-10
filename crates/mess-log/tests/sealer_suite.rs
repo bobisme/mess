@@ -14,10 +14,16 @@ use std::path::{Path, PathBuf};
 
 use mess_log::encode::{BatchEncoder, BatchInput, Subframe};
 use mess_log::format::*;
-use mess_log::runtime::{Fault, FileHandle, Fs, OpenOpts, RealRuntime, Runtime, SimFs, SimRuntime};
-use mess_log::scanner::{recover_segment, ScanStop};
-use mess_log::sealer::{decode_trailer, read_trailer, recover_fast, FastRecovery};
-use mess_log::writer::{read_segment_header_epoch, BatchSpec, SegmentParams, SegmentWriter};
+use mess_log::runtime::{
+    Fault, FileHandle, Fs, OpenOpts, RealRuntime, Runtime, SimFs, SimRuntime,
+};
+use mess_log::scanner::{ScanStop, recover_segment};
+use mess_log::sealer::{
+    FastRecovery, decode_trailer, read_trailer, recover_fast,
+};
+use mess_log::writer::{
+    BatchSpec, SegmentParams, SegmentWriter, read_segment_header_epoch,
+};
 
 // Trailer-relative field offsets (§3.3.1), used only to corrupt on-disk bytes.
 const T_MAGIC_OFF: u64 = 0;
@@ -27,7 +33,11 @@ const T_EPOCH_OFF: u64 = 16; // inside footer_crc coverage, not the magic/versio
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn spec<'a, 'p>(stream_id: u64, first_v: u64, subframes: &'a [Subframe<'p>]) -> BatchSpec<'a, 'p> {
+fn spec<'a, 'p>(
+    stream_id: u64,
+    first_v: u64,
+    subframes: &'a [Subframe<'p>],
+) -> BatchSpec<'a, 'p> {
     BatchSpec {
         stream_id,
         category_id: 100 + stream_id,
@@ -40,7 +50,8 @@ fn spec<'a, 'p>(stream_id: u64, first_v: u64, subframes: &'a [Subframe<'p>]) -> 
 /// Append three batches (2, 1, 2 events = 5 events, 3 batches) to `w`.
 fn append_three<F: Fs>(w: &mut SegmentWriter<F>) {
     let p = [0u8; 4];
-    let two = [Subframe::plain(0x11, 0, 0, &p), Subframe::plain(0x11, 0, 0, &p)];
+    let two =
+        [Subframe::plain(0x11, 0, 0, &p), Subframe::plain(0x11, 0, 0, &p)];
     let one = [Subframe::plain(0x11, 0, 0, &p)];
     w.append(&spec(1, 0, &two)).unwrap();
     w.append(&spec(1, 2, &one)).unwrap();
@@ -71,7 +82,9 @@ fn flip_byte<F: Fs>(fs: &F, path: &Path, off: u64) {
 /// pread-from-EOF (R2). The trailer's catalog fields equal the writer summary.
 fn seal_roundtrips<R: Runtime>(rt: &R, path: &Path) {
     let fs = rt.fs();
-    let mut w = SegmentWriter::create(&fs, path, SegmentParams::new(3, 1000, 42, 7)).unwrap();
+    let mut w =
+        SegmentWriter::create(&fs, path, SegmentParams::new(3, 1000, 42, 7))
+            .unwrap();
     append_three(&mut w);
     let summary = w.seal().unwrap();
 
@@ -84,7 +97,9 @@ fn seal_roundtrips<R: Runtime>(rt: &R, path: &Path) {
 
     // R2 pread-from-EOF: the trailer validates and its catalog matches the
     // writer's summary (§3.3.1 fields).
-    let cat = read_trailer(&fs, path).unwrap().expect("sealed segment has a valid trailer");
+    let cat = read_trailer(&fs, path)
+        .unwrap()
+        .expect("sealed segment has a valid trailer");
     assert_eq!(cat.segment_id, 3);
     assert_eq!(cat.epoch, 42); // R3: the trailer carries the A9 epoch
     assert_eq!(cat.base_pos, 1000);
@@ -101,7 +116,9 @@ fn seal_roundtrips<R: Runtime>(rt: &R, path: &Path) {
 /// fast-path/full-recovery equivalence).
 fn fast_path_matches_full_scan<R: Runtime>(rt: &R, path: &Path) {
     let fs = rt.fs();
-    let mut w = SegmentWriter::create(&fs, path, SegmentParams::new(5, 0, 9, 0)).unwrap();
+    let mut w =
+        SegmentWriter::create(&fs, path, SegmentParams::new(5, 0, 9, 0))
+            .unwrap();
     append_three(&mut w);
     w.seal().unwrap();
 
@@ -117,7 +134,11 @@ fn fast_path_matches_full_scan<R: Runtime>(rt: &R, path: &Path) {
     // Scanning a sealed file walks every batch, then stops on the trailer's
     // FOOTER_MAGIC (not a BatchHeader magic) at content_len.
     let full = recover_segment(&fs, path).unwrap();
-    assert_eq!(full.batch_count() as u64, catalog.batch_count, "§8.4 equivalence");
+    assert_eq!(
+        full.batch_count() as u64,
+        catalog.batch_count,
+        "§8.4 equivalence"
+    );
     assert_eq!(full.next_pos, catalog.end_pos);
     assert_eq!(full.accepted.last().unwrap().first_global_pos, 3); // 3rd batch at pos 3
     assert_eq!(fast.end_pos(), full.next_pos);
@@ -130,7 +151,9 @@ fn fast_path_matches_full_scan<R: Runtime>(rt: &R, path: &Path) {
 /// batch.
 fn corrupt_footer_falls_back_to_scan<R: Runtime>(rt: &R, path: &Path) {
     let fs = rt.fs();
-    let mut w = SegmentWriter::create(&fs, path, SegmentParams::new(6, 0, 11, 0)).unwrap();
+    let mut w =
+        SegmentWriter::create(&fs, path, SegmentParams::new(6, 0, 11, 0))
+            .unwrap();
     append_three(&mut w);
     let summary = w.seal().unwrap();
 
@@ -140,7 +163,10 @@ fn corrupt_footer_falls_back_to_scan<R: Runtime>(rt: &R, path: &Path) {
     flip_byte(&fs, path, trailer_off + T_EPOCH_OFF);
 
     // The trailer no longer validates.
-    assert!(read_trailer(&fs, path).unwrap().is_none(), "corrupt footer_crc ⇒ no trailer");
+    assert!(
+        read_trailer(&fs, path).unwrap().is_none(),
+        "corrupt footer_crc ⇒ no trailer"
+    );
 
     // recover_fast falls back to a full scan and still recovers every batch.
     let rec = recover_fast(&fs, path).unwrap();
@@ -158,7 +184,9 @@ fn corrupt_footer_falls_back_to_scan<R: Runtime>(rt: &R, path: &Path) {
 /// `base_pos == E`, and a strictly larger `epoch` (A9).
 fn a9_chain_across_sealed_roll<R: Runtime>(rt: &R, p0: &Path, p1: &Path) {
     let fs = rt.fs();
-    let mut w0 = SegmentWriter::create(&fs, p0, SegmentParams::new(10, 0, 100, 0)).unwrap();
+    let mut w0 =
+        SegmentWriter::create(&fs, p0, SegmentParams::new(10, 0, 100, 0))
+            .unwrap();
     append_three(&mut w0); // 5 events ⇒ end_pos 5
     let e_k = w0.epoch();
 
@@ -213,7 +241,12 @@ fn decode_header_seed(img: &[u8]) -> (u64, u64, u64) {
 
 /// Encode a standalone batch with a caller-chosen epoch (the writer would never
 /// emit a stale epoch — this synthesizes the resurrected prior generation).
-fn encode_batch(epoch: u64, batch_id: u64, first_global_pos: u64, first_v: u64) -> Vec<u8> {
+fn encode_batch(
+    epoch: u64,
+    batch_id: u64,
+    first_global_pos: u64,
+    first_v: u64,
+) -> Vec<u8> {
     let p = [0xAAu8; 4];
     let sfs = [Subframe::plain(0x11, 0, 0, &p)];
     BatchEncoder::new()
@@ -236,7 +269,12 @@ fn encode_batch(epoch: u64, batch_id: u64, first_global_pos: u64, first_v: u64) 
 fn fresh_header_image(segment_id: u64, base_pos: u64, epoch: u64) -> Vec<u8> {
     let fs = SimFs::new(Fault::SECTOR_512);
     let path = Path::new("mk");
-    SegmentWriter::create(&fs, path, SegmentParams::new(segment_id, base_pos, epoch, 0)).unwrap();
+    SegmentWriter::create(
+        &fs,
+        path,
+        SegmentParams::new(segment_id, base_pos, epoch, 0),
+    )
+    .unwrap();
     read_all(&fs, path, SEGMENT_HEADER_LEN)
 }
 
@@ -256,8 +294,15 @@ fn recycled_region_stale_batches_rejected_by_epoch() {
     fs.seed(path, Fault::SECTOR_512, img);
     let rec = recover_segment(&fs, path).unwrap();
 
-    assert!(rec.accepted.is_empty(), "no stale-generation batch may be accepted");
-    assert_eq!(rec.stop, ScanStop::EpochMismatch, "A9 rejects the recycled generation");
+    assert!(
+        rec.accepted.is_empty(),
+        "no stale-generation batch may be accepted"
+    );
+    assert_eq!(
+        rec.stop,
+        ScanStop::EpochMismatch,
+        "A9 rejects the recycled generation"
+    );
     assert_eq!(rec.safe_offset, SEGMENT_HEADER_LEN as u64);
 }
 
@@ -277,7 +322,8 @@ fn recycled_stale_trailer_not_trusted_by_fast_path() {
     // A perfectly valid trailer, but from the STALE generation (epoch 5,
     // segment_id 1 — same slot, older epoch). Its own footer_crc is correct.
     let content_len = img.len() as u64;
-    let stale = mess_log::sealer::TrailerFields::phase3(1, 5, 0, 1, 1, content_len);
+    let stale =
+        mess_log::sealer::TrailerFields::phase3(1, 5, 0, 1, 1, content_len);
     img.extend_from_slice(&mess_log::sealer::encode_trailer(&stale));
 
     let fs = SimFs::new(Fault::SECTOR_512);
@@ -285,15 +331,22 @@ fn recycled_stale_trailer_not_trusted_by_fast_path() {
     fs.seed(path, Fault::SECTOR_512, img);
 
     // The stale trailer is self-consistent and decodes...
-    let cat = read_trailer(&fs, path).unwrap().expect("stale trailer is self-valid");
+    let cat =
+        read_trailer(&fs, path).unwrap().expect("stale trailer is self-valid");
     assert_eq!(cat.epoch, 5);
 
     // ...but recover_fast refuses to trust it against the epoch-9 header.
     let rec = recover_fast(&fs, path).unwrap();
     let FastRecovery::Scanned(r) = &rec else {
-        panic!("a stale trailer must not be trusted; expected a full-scan fallback, got {rec:?}");
+        panic!(
+            "a stale trailer must not be trusted; expected a full-scan \
+             fallback, got {rec:?}"
+        );
     };
-    assert!(r.accepted.is_empty(), "the stale batch is rejected by A9 on the scan");
+    assert!(
+        r.accepted.is_empty(),
+        "the stale batch is rejected by A9 on the scan"
+    );
     assert_eq!(r.stop, ScanStop::EpochMismatch);
 }
 
@@ -304,10 +357,15 @@ fn recycled_stale_trailer_not_trusted_by_fast_path() {
 fn coherent_trailer_is_trusted() {
     let fs = SimFs::new(Fault::SECTOR_512);
     let path = Path::new("good");
-    let mut w = SegmentWriter::create(&fs, path, SegmentParams::new(1, 0, 9, 0)).unwrap();
+    let mut w =
+        SegmentWriter::create(&fs, path, SegmentParams::new(1, 0, 9, 0))
+            .unwrap();
     append_three(&mut w);
     w.seal().unwrap();
-    assert!(matches!(recover_fast(&fs, path).unwrap(), FastRecovery::Sealed { .. }));
+    assert!(matches!(
+        recover_fast(&fs, path).unwrap(),
+        FastRecovery::Sealed { .. }
+    ));
 }
 
 /// An unsealed (trailer-less) segment takes the full-scan path, never the fast
@@ -316,7 +374,9 @@ fn coherent_trailer_is_trusted() {
 fn unsealed_segment_is_scanned() {
     let fs = SimFs::new(Fault::SECTOR_512);
     let path = Path::new("active");
-    let mut w = SegmentWriter::create(&fs, path, SegmentParams::new(1, 0, 9, 0)).unwrap();
+    let mut w =
+        SegmentWriter::create(&fs, path, SegmentParams::new(1, 0, 9, 0))
+            .unwrap();
     append_three(&mut w);
     w.close().unwrap(); // close leaves it unsealed (no trailer)
 
@@ -334,11 +394,17 @@ fn unsealed_segment_is_scanned() {
 fn whole_file_image_trailer_decodes() {
     let fs = SimFs::new(Fault::SECTOR_512);
     let path = Path::new("whole");
-    let mut w = SegmentWriter::create(&fs, path, SegmentParams::new(2, 500, 33, 0)).unwrap();
+    let mut w =
+        SegmentWriter::create(&fs, path, SegmentParams::new(2, 500, 33, 0))
+            .unwrap();
     append_three(&mut w);
     let summary = w.seal().unwrap();
 
-    let img = read_all(&fs, path, (summary.content_len + SEGMENT_TRAILER_LEN as u64) as usize);
+    let img = read_all(
+        &fs,
+        path,
+        (summary.content_len + SEGMENT_TRAILER_LEN as u64) as usize,
+    );
     let cat = decode_trailer(&img).expect("trailer at file tail decodes");
     assert_eq!(cat.segment_id, 2);
     assert_eq!(cat.base_pos, 500);
@@ -421,10 +487,17 @@ fn sim_fast_path_matches_full_scan() {
 
 #[test]
 fn sim_corrupt_footer_falls_back_to_scan() {
-    corrupt_footer_falls_back_to_scan(&SimRuntime::new(1), Path::new("/corrupt"));
+    corrupt_footer_falls_back_to_scan(
+        &SimRuntime::new(1),
+        Path::new("/corrupt"),
+    );
 }
 
 #[test]
 fn sim_a9_chain_across_sealed_roll() {
-    a9_chain_across_sealed_roll(&SimRuntime::new(1), Path::new("/roll0"), Path::new("/roll1"));
+    a9_chain_across_sealed_roll(
+        &SimRuntime::new(1),
+        Path::new("/roll0"),
+        Path::new("/roll1"),
+    );
 }

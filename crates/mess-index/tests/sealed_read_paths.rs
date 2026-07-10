@@ -12,8 +12,8 @@ use std::sync::Arc;
 use mess_index::sealed::block_cache::BlockCache;
 use mess_index::sealed::replay::{ReplaySet, global_checksum, stream_checksum};
 use mess_index::sealed::segment::{
-    SealBatch, SealInput, SealStream, SealedSegmentIndex, SealedSegmentRef, SidecarError,
-    encode_sidecar,
+    SealBatch, SealInput, SealStream, SealedSegmentIndex, SealedSegmentRef,
+    SidecarError, encode_sidecar,
 };
 
 // ---------------------------------------------------------------------------
@@ -39,10 +39,11 @@ fn build_segment(
             let batches = (0..batches_per_stream)
                 .map(|i| {
                     let b = SealBatch {
-                        first_version: first_version_base + (i as u64) * u64::from(FRAMES),
-                        frame_count: FRAMES,
+                        first_version:    first_version_base
+                            + (i as u64) * u64::from(FRAMES),
+                        frame_count:      FRAMES,
                         first_global_pos: g,
-                        offset: 4096 + (i as u64) * 512,
+                        offset:           4096 + (i as u64) * 512,
                     };
                     g += u64::from(FRAMES);
                     b
@@ -51,8 +52,11 @@ fn build_segment(
             SealStream { stream_id: sid, batches }
         })
         .collect();
-    let input = SealInput { segment_id, base_pos: base, streams, payloads: None };
-    let idx = Arc::new(SealedSegmentIndex::from_bytes(encode_sidecar(&input)).unwrap());
+    let input =
+        SealInput { segment_id, base_pos: base, streams, payloads: None };
+    let idx = Arc::new(
+        SealedSegmentIndex::from_bytes(encode_sidecar(&input)).unwrap(),
+    );
     (idx, g)
 }
 
@@ -84,7 +88,10 @@ fn build_corpus(
 struct Lcg(u64);
 impl Lcg {
     fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         self.0
     }
 }
@@ -93,8 +100,8 @@ impl Lcg {
 // SIGBUS / corruptor stance
 // ---------------------------------------------------------------------------
 
-/// A truncated sealed sidecar surfaces as a **typed** [`SidecarError`] at open —
-/// never a panic, never a `SIGBUS` (the reader owns the bytes and CRC-checks
+/// A truncated sealed sidecar surfaces as a **typed** [`SidecarError`] at open
+/// — never a panic, never a `SIGBUS` (the reader owns the bytes and CRC-checks
 /// them before any query; it maps nothing). The corrupt segment is simply not
 /// admitted to the [`ReplaySet`], and replay over the survivors is exact.
 #[test]
@@ -112,21 +119,21 @@ fn truncated_sidecar_is_typed_error_and_replay_falls_back_exact() {
     // Persist the "bad" one, then truncate it mid-body and try to reopen.
     let bad_bytes = encode_sidecar(&SealInput {
         segment_id: 2,
-        base_pos: b2,
-        streams: (0..8)
+        base_pos:   b2,
+        streams:    (0..8)
             .map(|sid| SealStream {
                 stream_id: sid,
-                batches: (0..3)
+                batches:   (0..3)
                     .map(|i| SealBatch {
-                        first_version: 60 + i as u64 * 10,
-                        frame_count: 10,
+                        first_version:    60 + i as u64 * 10,
+                        frame_count:      10,
                         first_global_pos: b2 + sid * 30 + i as u64 * 10,
-                        offset: 4096 + i as u64 * 512,
+                        offset:           4096 + i as u64 * 512,
                     })
                     .collect(),
             })
             .collect(),
-        payloads: None,
+        payloads:   None,
     });
     let path = dir.path().join("seg-2.pidx");
     std::fs::write(&path, &bad_bytes).unwrap();
@@ -138,7 +145,10 @@ fn truncated_sidecar_is_typed_error_and_replay_falls_back_exact() {
     // Opening the truncated file is a typed error, not a crash.
     let reopened = SealedSegmentIndex::open(&path);
     assert!(
-        matches!(reopened, Err(SidecarError::Corrupt(_)) | Err(SidecarError::Io(_))),
+        matches!(
+            reopened,
+            Err(SidecarError::Corrupt(_)) | Err(SidecarError::Io(_))
+        ),
         "truncated sidecar must be a typed SidecarError, got {reopened:?}"
     );
     // (Silence unused: `bad` stands for the in-memory twin we did NOT admit.)
@@ -150,7 +160,8 @@ fn truncated_sidecar_is_typed_error_and_replay_falls_back_exact() {
     let cache = BlockCache::disabled();
     let streams: Vec<u64> = (0..8).collect();
     let plain = survivors.stream_replay_many(&streams, &cache).unwrap();
-    let verified = survivors.stream_replay_many_verified(&streams, &cache).unwrap();
+    let verified =
+        survivors.stream_replay_many_verified(&streams, &cache).unwrap();
     let seq = survivors.stream_replay_many_seq(&streams, &cache).unwrap();
     assert_eq!(plain, seq);
     assert_eq!(verified, seq);
@@ -164,7 +175,10 @@ fn truncated_sidecar_is_typed_error_and_replay_falls_back_exact() {
 // Benchmark
 // ---------------------------------------------------------------------------
 
-fn best_of<T, F: FnMut() -> T>(reps: usize, mut f: F) -> (T, std::time::Duration) {
+fn best_of<T, F: FnMut() -> T>(
+    reps: usize,
+    mut f: F,
+) -> (T, std::time::Duration) {
     let mut best = std::time::Duration::MAX;
     let mut last = None;
     for _ in 0..reps {
@@ -187,7 +201,8 @@ fn bench_sealed_read_paths() {
     const N_STREAMS: u64 = 2_000;
     const BATCHES_PER_STREAM: usize = 5;
 
-    let (set, stream_ids) = build_corpus(N_SEGMENTS, N_STREAMS, BATCHES_PER_STREAM);
+    let (set, stream_ids) =
+        build_corpus(N_SEGMENTS, N_STREAMS, BATCHES_PER_STREAM);
     let total_events = set.event_count();
     eprintln!(
         "\n=== bn-1hx sealed read paths — corpus: {N_SEGMENTS} segments, \
@@ -203,22 +218,25 @@ fn bench_sealed_read_paths() {
     assert_eq!(g_par, g_seq, "global scan: parallel != sequential");
     assert_eq!(global_checksum(&g_par), global_checksum(&g_seq));
     eprintln!(
-        "global scan (parallel, {N_SEGMENTS}-way): {g_events} events in {:.3} ms => {:.1}M ev/s \
-         [checksum {:#018x}, byte-identical to seq]",
+        "global scan (parallel, {N_SEGMENTS}-way): {g_events} events in {:.3} \
+         ms => {:.1}M ev/s [checksum {:#018x}, byte-identical to seq]",
         g_dt.as_secs_f64() * 1e3,
         g_evps / 1e6,
         global_checksum(&g_par),
     );
 
-    // --- coalesced stream replay (1000 random streams, each across all segments) ---
+    // --- coalesced stream replay (1000 random streams, each across all
+    // segments) ---
     const R: usize = 1_000;
     let mut rng = Lcg(0x5EED_00B1_1A11_0001);
-    let picks: Vec<u64> =
-        (0..R).map(|_| stream_ids[(rng.next_u64() % N_STREAMS) as usize]).collect();
+    let picks: Vec<u64> = (0..R)
+        .map(|_| stream_ids[(rng.next_u64() % N_STREAMS) as usize])
+        .collect();
 
     // Cold: fresh (disabled) cache, decode every block; batched parallel path.
     let cold_cache = BlockCache::disabled();
-    let (batched, s_dt) = best_of(5, || set.stream_replay_many(&picks, &cold_cache).unwrap());
+    let (batched, s_dt) =
+        best_of(5, || set.stream_replay_many(&picks, &cold_cache).unwrap());
     // Byte-identity gate: batched parallel == sequential reference.
     let seq = set.stream_replay_many_seq(&picks, &cold_cache).unwrap();
     assert_eq!(batched, seq, "stream replay: parallel != sequential");
@@ -232,15 +250,19 @@ fn bench_sealed_read_paths() {
         .fold(0u64, |acc, (_, es)| acc.wrapping_add(stream_checksum(es)));
     let s_evps = s_events as f64 / s_dt.as_secs_f64();
     eprintln!(
-        "stream replay (coalesced, {R} streams x {N_SEGMENTS} segments): {s_events} events in \
-         {:.3} ms => {:.1}M ev/s [checksum {s_ck:#018x}, byte-identical to seq]",
+        "stream replay (coalesced, {R} streams x {N_SEGMENTS} segments): \
+         {s_events} events in {:.3} ms => {:.1}M ev/s [checksum {s_ck:#018x}, \
+         byte-identical to seq]",
         s_dt.as_secs_f64() * 1e3,
         s_evps / 1e6,
     );
 
     // --- cache hit-rate on repeat replay ---
     // Budget: enough for the touched blocks (R streams x N_SEGMENTS blocks).
-    let cache = BlockCache::with_budget_bytes(64 << 20, (R as u64 * N_SEGMENTS) as usize);
+    let cache = BlockCache::with_budget_bytes(
+        64 << 20,
+        (R as u64 * N_SEGMENTS) as usize,
+    );
     // Pass 1: cold — all misses. Pass 2: warm — all hits. Two identical passes
     // over the same working set land the hit rate at ~50% (perf_replay's "48%
     // hit on repeat replay"). Both passes go through the real replay path.
@@ -252,8 +274,8 @@ fn bench_sealed_read_paths() {
         let _ = set.stream_replay(sid, &cache).unwrap();
     }
     eprintln!(
-        "cache hit-rate on repeat replay: {:.1}% ({} hits / {} lookups); resident {:.1} MiB, \
-         {} blocks [cold pass misses: {}]",
+        "cache hit-rate on repeat replay: {:.1}% ({} hits / {} lookups); \
+         resident {:.1} MiB, {} blocks [cold pass misses: {}]",
         cache.hit_rate() * 100.0,
         cache.hits(),
         cache.hits() + cache.misses(),
@@ -265,7 +287,8 @@ fn bench_sealed_read_paths() {
     // Acceptance floors.
     assert!(s_evps >= 2.5e6, "stream replay {s_evps:.0} ev/s below 2.5M floor");
     eprintln!(
-        "PASS: stream replay {:.1}M ev/s >= 2.5M floor; global scan {:.1}M ev/s\n",
+        "PASS: stream replay {:.1}M ev/s >= 2.5M floor; global scan {:.1}M \
+         ev/s\n",
         s_evps / 1e6,
         g_evps / 1e6,
     );

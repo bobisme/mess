@@ -24,15 +24,15 @@
 //!   full replay (§9). This is the snapshot-invalidation-on-deploy story, and
 //!   it is exercised by the acceptance test.
 //! - [`stream_version`](SnapshotRef::stream_version) /
-//!   [`covers_empty_prefix`](SnapshotRef::covers_empty_prefix) — **live.**
-//!   They pin the 0-based last index the snapshot summarizes (§4).
+//!   [`covers_empty_prefix`](SnapshotRef::covers_empty_prefix) — **live.** They
+//!   pin the 0-based last index the snapshot summarizes (§4).
 //! - [`event_prefix_hash`](SnapshotRef::event_prefix_hash) /
 //!   [`state_hash`](SnapshotRef::state_hash) — **reserved** (`None`). These are
-//!   the BLAKE3 fold-chain and blob-integrity hashes; the chain machinery
-//!   lands in Phase 5. They are typed and documented now so the struct never
-//!   changes shape, but the interim store computes neither: per this bone,
-//!   *correctness comes from the law (the snapshot-equivalence property test),
-//!   not from a trusted store.*
+//!   the BLAKE3 fold-chain and blob-integrity hashes; the chain machinery lands
+//!   in Phase 5. They are typed and documented now so the struct never changes
+//!   shape, but the interim store computes neither: per this bone, *correctness
+//!   comes from the law (the snapshot-equivalence property test), not from a
+//!   trusted store.*
 //!
 //! No BLAKE3 dependency is pulled in for Phase 1 precisely because nothing
 //! here trusts a stored hash yet.
@@ -70,27 +70,27 @@ pub struct SnapshotRef {
     /// The registry that assigns interned ids is Phase 4 work, so the interim
     /// store derives a stable placeholder from the stream **name** via
     /// [`interim_stream_id`]. Documented as a stand-in; not load-bearing.
-    pub stream_id: u64,
+    pub stream_id:           u64,
     /// 0-based index of the **last** event summarized (§4.1). Ignored when
     /// [`covers_empty_prefix`](Self::covers_empty_prefix) is set.
-    pub stream_version: u64,
+    pub stream_version:      u64,
     /// Explicit, human-bumped semantic version of the fold (§9). Copied from
     /// [`Snapshottable::FOLD_VERSION`] at save time; a mismatch against the
     /// aggregate's current value invalidates the snapshot.
-    pub fold_version: u32,
-    /// `flags` bit 0 (§4.2): the snapshot summarizes the **empty** prefix, i.e.
-    /// the aggregate's initial state having applied nothing. `stream_version`
-    /// is then `0` and ignored.
+    pub fold_version:        u32,
+    /// `flags` bit 0 (§4.2): the snapshot summarizes the **empty** prefix,
+    /// i.e. the aggregate's initial state having applied nothing.
+    /// `stream_version` is then `0` and ignored.
     pub covers_empty_prefix: bool,
     /// The fold-chain value `h[stream_version]` (§3) — **reserved** (`None`)
     /// until the Phase 5 chain machinery lands.
-    pub event_prefix_hash: Option<Hash256>,
+    pub event_prefix_hash:   Option<Hash256>,
     /// `BLAKE3(state_blob)` (§2.1) — **reserved** (`None`) until Phase 5. The
     /// interim store is trusted (throwaway); blob integrity is a Phase 5
     /// concern.
-    pub state_hash: Option<Hash256>,
+    pub state_hash:          Option<Hash256>,
     /// Pointer to the state blob (§2.1). Interim: co-located, see [`BlobPtr`].
-    pub snapshot_ptr: BlobPtr,
+    pub snapshot_ptr:        BlobPtr,
 }
 
 /// A [`SnapshotRef`] together with its serialized aggregate-state blob, as the
@@ -101,7 +101,7 @@ pub struct StoredSnapshot {
     /// The certificate.
     pub snapshot_ref: SnapshotRef,
     /// The serialized aggregate state (`Snapshottable::encode_state`).
-    pub state_blob: Vec<u8>,
+    pub state_blob:   Vec<u8>,
 }
 
 /// A failure to (de)serialize aggregate **state** for the interim snapshot
@@ -128,13 +128,13 @@ impl std::error::Error for StateCodecError {}
 /// is the least-invasive design available:
 ///
 /// - `mess-core`'s `Aggregate` stays pristine — folding and command handling
-///   carry no snapshot or serialization obligations, so an aggregate that
-///   never snapshots pays nothing.
+///   carry no snapshot or serialization obligations, so an aggregate that never
+///   snapshots pays nothing.
 /// - Snapshotting bundles the two things the interim store needs — the
 ///   [`FOLD_VERSION`](Self::FOLD_VERSION) declared per aggregate type (§9) and
 ///   a **state codec** — into one opt-in trait, so `save_snapshot` and the
-///   accelerated load require exactly `A: Snapshottable` and nothing leaks
-///   into the base traits.
+///   accelerated load require exactly `A: Snapshottable` and nothing leaks into
+///   the base traits.
 /// - The state codec is expressed as explicit `encode`/`decode` methods rather
 ///   than a `serde` bound, so `mess-store` pulls in **no** new serialization
 ///   dependency; the aggregate author picks the representation. (A
@@ -198,8 +198,8 @@ pub trait SnapshotStore: Backend {
 /// from the registry (D3) in Phase 4; this is a documented placeholder.
 #[must_use]
 pub fn interim_stream_id(stream_id: &str) -> u64 {
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    const OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01B3;
     let mut hash = OFFSET;
     for byte in stream_id.as_bytes() {
         hash ^= u64::from(*byte);

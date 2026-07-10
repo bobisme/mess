@@ -21,10 +21,10 @@ use serde::{Deserialize, Serialize};
 /// in whole seconds.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 struct TripCompletedV1 {
-    trip_id: u64,
-    driver: String,
+    trip_id:        u64,
+    driver:         String,
     distance_miles: f64,
-    completed_at: i64, // unix seconds
+    completed_at:   i64, // unix seconds
 }
 
 /// V2: semantic migration #1 — field rename `driver` -> `driver_name`
@@ -32,21 +32,21 @@ struct TripCompletedV1 {
 /// bytes still say "driver" and only V1's struct ever reads them).
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 struct TripCompletedV2 {
-    trip_id: u64,
-    driver_name: String,
+    trip_id:        u64,
+    driver_name:    String,
     distance_miles: f64,
-    completed_at: i64, // unix seconds
+    completed_at:   i64, // unix seconds
 }
 
 /// V3: semantic migration #2 — unit changes (miles -> meters, seconds ->
 /// milliseconds) plus an additive optional field.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 struct TripCompletedV3 {
-    trip_id: u64,
-    driver_name: String,
-    distance_m: f64,
+    trip_id:         u64,
+    driver_name:     String,
+    distance_m:      f64,
     completed_at_ms: i64,
-    rating: Option<u8>,
+    rating:          Option<u8>,
 }
 
 const METERS_PER_MILE: f64 = 1609.344;
@@ -54,10 +54,10 @@ const METERS_PER_MILE: f64 = 1609.344;
 impl Upcast<TripCompletedV1> for TripCompletedV2 {
     fn upcast(v1: TripCompletedV1) -> Self {
         TripCompletedV2 {
-            trip_id: v1.trip_id,
-            driver_name: v1.driver, // the rename, expressed in code
+            trip_id:        v1.trip_id,
+            driver_name:    v1.driver, // the rename, expressed in code
             distance_miles: v1.distance_miles,
-            completed_at: v1.completed_at,
+            completed_at:   v1.completed_at,
         }
     }
 }
@@ -65,9 +65,9 @@ impl Upcast<TripCompletedV1> for TripCompletedV2 {
 impl Upcast<TripCompletedV2> for TripCompletedV3 {
     fn upcast(v2: TripCompletedV2) -> Self {
         TripCompletedV3 {
-            trip_id: v2.trip_id,
-            driver_name: v2.driver_name,
-            distance_m: v2.distance_miles * METERS_PER_MILE, // unit change
+            trip_id:         v2.trip_id,
+            driver_name:     v2.driver_name,
+            distance_m:      v2.distance_miles * METERS_PER_MILE, /* unit change */
             // Regression (bn-meo fuzzing): a plain `*` here panicked
             // ("attempt to multiply with overflow") on an old-version
             // event whose `completed_at` (an attacker/corruption-supplied
@@ -83,7 +83,7 @@ impl Upcast<TripCompletedV2> for TripCompletedV3 {
             // here: for every value this multiplication does NOT overflow
             // for (all real timestamps), it's bit-for-bit identical to `*`.
             completed_at_ms: v2.completed_at.saturating_mul(1000),
-            rating: None,
+            rating:          None,
         }
     }
 }
@@ -102,32 +102,34 @@ event_versions! {
 // attributes, or the codec drift in a way that breaks old stored events,
 // these tests fail.
 
-// TripCompletedV1 { trip_id: 42, driver: "maria", distance_miles: 12.5, completed_at: 1_750_000_000 }
+// TripCompletedV1 { trip_id: 42, driver: "maria", distance_miles: 12.5,
+// completed_at: 1_750_000_000 }
 const V1_FIXTURE: &[u8] = &[
-    0x84, 0xa7, 0x74, 0x72, 0x69, 0x70, 0x5f, 0x69, 0x64, 0x2a, 0xa6, 0x64,
-    0x72, 0x69, 0x76, 0x65, 0x72, 0xa5, 0x6d, 0x61, 0x72, 0x69, 0x61, 0xae,
-    0x64, 0x69, 0x73, 0x74, 0x61, 0x6e, 0x63, 0x65, 0x5f, 0x6d, 0x69, 0x6c,
-    0x65, 0x73, 0xcb, 0x40, 0x29, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xac,
-    0x63, 0x6f, 0x6d, 0x70, 0x6c, 0x65, 0x74, 0x65, 0x64, 0x5f, 0x61, 0x74,
-    0xce, 0x68, 0x4e, 0xe1, 0x80,
+    0x84, 0xA7, 0x74, 0x72, 0x69, 0x70, 0x5F, 0x69, 0x64, 0x2A, 0xA6, 0x64,
+    0x72, 0x69, 0x76, 0x65, 0x72, 0xA5, 0x6D, 0x61, 0x72, 0x69, 0x61, 0xAE,
+    0x64, 0x69, 0x73, 0x74, 0x61, 0x6E, 0x63, 0x65, 0x5F, 0x6D, 0x69, 0x6C,
+    0x65, 0x73, 0xCB, 0x40, 0x29, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xAC,
+    0x63, 0x6F, 0x6D, 0x70, 0x6C, 0x65, 0x74, 0x65, 0x64, 0x5F, 0x61, 0x74,
+    0xCE, 0x68, 0x4E, 0xE1, 0x80,
 ];
 
-// TripCompletedV2 { trip_id: 43, driver_name: "yusuf", distance_miles: 3.2, completed_at: 1_750_000_100 }
+// TripCompletedV2 { trip_id: 43, driver_name: "yusuf", distance_miles: 3.2,
+// completed_at: 1_750_000_100 }
 const V2_FIXTURE: &[u8] = &[
-    0x84, 0xa7, 0x74, 0x72, 0x69, 0x70, 0x5f, 0x69, 0x64, 0x2b, 0xab, 0x64,
-    0x72, 0x69, 0x76, 0x65, 0x72, 0x5f, 0x6e, 0x61, 0x6d, 0x65, 0xa5, 0x79,
-    0x75, 0x73, 0x75, 0x66, 0xae, 0x64, 0x69, 0x73, 0x74, 0x61, 0x6e, 0x63,
-    0x65, 0x5f, 0x6d, 0x69, 0x6c, 0x65, 0x73, 0xcb, 0x40, 0x09, 0x99, 0x99,
-    0x99, 0x99, 0x99, 0x9a, 0xac, 0x63, 0x6f, 0x6d, 0x70, 0x6c, 0x65, 0x74,
-    0x65, 0x64, 0x5f, 0x61, 0x74, 0xce, 0x68, 0x4e, 0xe1, 0xe4,
+    0x84, 0xA7, 0x74, 0x72, 0x69, 0x70, 0x5F, 0x69, 0x64, 0x2B, 0xAB, 0x64,
+    0x72, 0x69, 0x76, 0x65, 0x72, 0x5F, 0x6E, 0x61, 0x6D, 0x65, 0xA5, 0x79,
+    0x75, 0x73, 0x75, 0x66, 0xAE, 0x64, 0x69, 0x73, 0x74, 0x61, 0x6E, 0x63,
+    0x65, 0x5F, 0x6D, 0x69, 0x6C, 0x65, 0x73, 0xCB, 0x40, 0x09, 0x99, 0x99,
+    0x99, 0x99, 0x99, 0x9A, 0xAC, 0x63, 0x6F, 0x6D, 0x70, 0x6C, 0x65, 0x74,
+    0x65, 0x64, 0x5F, 0x61, 0x74, 0xCE, 0x68, 0x4E, 0xE1, 0xE4,
 ];
 
 fn stored(version: u16, payload: &[u8]) -> StoredEvent {
     StoredEvent {
-        event_name: "trip.completed".to_string(),
+        event_name:     "trip.completed".to_string(),
         schema_version: version,
-        codec_id: mess_core::codec::CODEC_ID_MSGPACK_NAMED,
-        payload: payload.to_vec(),
+        codec_id:       mess_core::codec::CODEC_ID_MSGPACK_NAMED,
+        payload:        payload.to_vec(),
     }
 }
 
@@ -137,11 +139,11 @@ fn v1_fixture_upcasts_to_correct_v3() {
     assert_eq!(
         v3,
         TripCompletedV3 {
-            trip_id: 42,
-            driver_name: "maria".to_string(), // renamed by V1->V2 upcast
-            distance_m: 12.5 * METERS_PER_MILE, // 20116.8 — unit change
-            completed_at_ms: 1_750_000_000_000, // s -> ms
-            rating: None,
+            trip_id:         42,
+            driver_name:     "maria".to_string(), // renamed by V1->V2 upcast
+            distance_m:      12.5 * METERS_PER_MILE, // 20116.8 — unit change
+            completed_at_ms: 1_750_000_000_000,   // s -> ms
+            rating:          None,
         }
     );
 }
@@ -159,11 +161,11 @@ fn v2_fixture_upcasts_to_correct_v3() {
 #[test]
 fn v3_decodes_directly_without_upcasting() {
     let v3 = TripCompletedV3 {
-        trip_id: 44,
-        driver_name: "kenji".to_string(),
-        distance_m: 800.0,
+        trip_id:         44,
+        driver_name:     "kenji".to_string(),
+        distance_m:      800.0,
         completed_at_ms: 1_750_000_200_000,
-        rating: Some(5),
+        rating:          Some(5),
     };
     let ev = StoredEvent::encode("trip.completed", 3, &v3).unwrap();
     assert_eq!(decode_trip_completed(&ev).unwrap(), v3);
@@ -174,10 +176,10 @@ fn round_trip_through_every_version() {
     // Write-path sanity: encode each version's struct, decode through the
     // pipeline, verify semantic equivalence.
     let v1 = TripCompletedV1 {
-        trip_id: 7,
-        driver: "ana".to_string(),
+        trip_id:        7,
+        driver:         "ana".to_string(),
         distance_miles: 1.0,
-        completed_at: 1_700_000_000,
+        completed_at:   1_700_000_000,
     };
     let ev = StoredEvent::encode("trip.completed", 1, &v1).unwrap();
     let out = decode_trip_completed(&ev).unwrap();
@@ -196,10 +198,10 @@ fn round_trip_through_every_version() {
 #[test]
 fn old_version_event_with_overflowing_field_does_not_panic() {
     let v2 = TripCompletedV2 {
-        trip_id: 1,
-        driver_name: "x".to_string(),
+        trip_id:        1,
+        driver_name:    "x".to_string(),
         distance_miles: 1.0,
-        completed_at: i64::MAX / 2, // * 1000 overflows i64
+        completed_at:   i64::MAX / 2, // * 1000 overflows i64
     };
     let ev = StoredEvent::encode("trip.completed", 2, &v2).unwrap();
     let out = decode_trip_completed(&ev).unwrap();
@@ -274,20 +276,20 @@ fn corrupt_payload_fails_loudly() {
 #[test]
 fn encoder_still_produces_fixture_bytes() {
     let v1 = TripCompletedV1 {
-        trip_id: 42,
-        driver: "maria".to_string(),
+        trip_id:        42,
+        driver:         "maria".to_string(),
         distance_miles: 12.5,
-        completed_at: 1_750_000_000,
+        completed_at:   1_750_000_000,
     };
     assert_eq!(
         StoredEvent::encode("trip.completed", 1, &v1).unwrap().payload,
         V1_FIXTURE
     );
     let v2 = TripCompletedV2 {
-        trip_id: 43,
-        driver_name: "yusuf".to_string(),
+        trip_id:        43,
+        driver_name:    "yusuf".to_string(),
         distance_miles: 3.2,
-        completed_at: 1_750_000_100,
+        completed_at:   1_750_000_100,
     };
     assert_eq!(
         StoredEvent::encode("trip.completed", 2, &v2).unwrap().payload,
@@ -299,10 +301,10 @@ fn encoder_still_produces_fixture_bytes() {
 #[test]
 fn encoder_determinism_guard() {
     let v1 = TripCompletedV1 {
-        trip_id: 42,
-        driver: "maria".to_string(),
+        trip_id:        42,
+        driver:         "maria".to_string(),
         distance_miles: 12.5,
-        completed_at: 1_750_000_000,
+        completed_at:   1_750_000_000,
     };
     let a = StoredEvent::encode("trip.completed", 1, &v1).unwrap();
     let b = StoredEvent::encode("trip.completed", 1, &v1).unwrap();

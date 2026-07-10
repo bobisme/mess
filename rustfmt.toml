@@ -1,3 +1,19 @@
+# bn-3mc: this config uses options that are nightly-only in rustfmt
+# (condense_wildcard_suffixes, enum_discrim_align_threshold, fn_single_line,
+# format_code_in_doc_comments, format_strings, group_imports,
+# hex_literal_case, reorder_impl_items, struct_field_align_threshold,
+# trailing_semicolon, wrap_comments). Stable rustfmt silently drops each of
+# these (with a warning) and falls back to its own default for that setting,
+# which produces diffs against files formatted under the full config below —
+# i.e. `cargo fmt --check` on stable is not a valid gate for this repo.
+#
+# Always format/check with the nightly toolchain:
+#
+#   cargo +nightly fmt --all
+#   cargo +nightly fmt --all --check
+#
+# (`just fmt` / `just fmt-check` do this for you.) Requires:
+#   rustup toolchain install nightly
 condense_wildcard_suffixes = true
 enum_discrim_align_threshold = 30
 fn_single_line = true

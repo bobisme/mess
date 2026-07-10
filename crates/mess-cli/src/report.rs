@@ -60,13 +60,13 @@ impl Severity {
 pub struct Finding {
     pub severity: Severity,
     /// Which check produced this (e.g. `lock`, `segment-scan`, `sidecar`).
-    pub check: String,
+    pub check:    String,
     /// Stable kebab-case finding type for programmatic matching.
-    pub kind: String,
+    pub kind:     String,
     /// One-line human/agent message.
-    pub message: String,
+    pub message:  String,
     /// Structured detail (stable field names).
-    pub fields: Map<String, Value>,
+    pub fields:   Map<String, Value>,
 }
 
 impl Finding {
@@ -107,7 +107,13 @@ impl Finding {
 
     /// Token-efficient one-line text form: `severity  kind  check  message`.
     fn to_text_line(&self) -> String {
-        format!("{}  {}  {}  {}", self.severity.as_str(), self.kind, self.check, self.message)
+        format!(
+            "{}  {}  {}  {}",
+            self.severity.as_str(),
+            self.kind,
+            self.check,
+            self.message
+        )
     }
 }
 
@@ -117,18 +123,18 @@ impl Finding {
 pub struct Report {
     /// The command name (`doctor`, `verify`, ...), used as a header in
     /// pretty/text output and never in the JSON envelope keys.
-    pub command: String,
+    pub command:        String,
     /// The named data collection key (`checks`, `segments`, `verdicts`, ...).
     pub collection_key: String,
     /// The command-specific structured payload (rows of the collection).
-    pub collection: Vec<Value>,
+    pub collection:     Vec<Value>,
     /// Extra top-level scalar/object fields folded into every envelope
     /// (e.g. `dir`, `summary`).
-    pub extra: BTreeMap<String, Value>,
+    pub extra:          BTreeMap<String, Value>,
     /// The typed findings.
-    pub findings: Vec<Finding>,
+    pub findings:       Vec<Finding>,
     /// Advisory notes (kebab `type`), CLI-conventions `advice` array.
-    pub advice: Vec<Value>,
+    pub advice:         Vec<Value>,
     /// Display caps applied ONLY when rendering `text`/`pretty` (`json`
     /// always carries the complete data — see the backward-compatibility
     /// note on [`Report::to_json`]). Keyed by dotted path from the top of
@@ -142,32 +148,32 @@ pub struct Report {
 
 impl Report {
     #[must_use]
-    pub fn new(command: impl Into<String>, collection_key: impl Into<String>) -> Self {
+    pub fn new(
+        command: impl Into<String>,
+        collection_key: impl Into<String>,
+    ) -> Self {
         Report {
-            command: command.into(),
+            command:        command.into(),
             collection_key: collection_key.into(),
-            collection: Vec::new(),
-            extra: BTreeMap::new(),
-            findings: Vec::new(),
-            advice: Vec::new(),
+            collection:     Vec::new(),
+            extra:          BTreeMap::new(),
+            findings:       Vec::new(),
+            advice:         Vec::new(),
             display_limits: BTreeMap::new(),
         }
     }
 
-    pub fn push_row(&mut self, row: Value) {
-        self.collection.push(row);
-    }
+    pub fn push_row(&mut self, row: Value) { self.collection.push(row); }
 
-    pub fn push_finding(&mut self, f: Finding) {
-        self.findings.push(f);
-    }
+    pub fn push_finding(&mut self, f: Finding) { self.findings.push(f); }
 
     pub fn set(&mut self, key: &str, value: impl Into<Value>) {
         self.extra.insert(key.to_string(), value.into());
     }
 
     pub fn advise(&mut self, kind: &str, message: &str) {
-        self.advice.push(json!({ "level": "warn", "type": kind, "message": message }));
+        self.advice
+            .push(json!({ "level": "warn", "type": kind, "message": message }));
     }
 
     /// Cap how many array items a `text`/`pretty` render shows before it
@@ -204,7 +210,10 @@ impl Report {
         for (k, v) in &self.extra {
             obj.insert(k.clone(), v.clone());
         }
-        obj.insert(self.collection_key.clone(), Value::Array(self.collection.clone()));
+        obj.insert(
+            self.collection_key.clone(),
+            Value::Array(self.collection.clone()),
+        );
         obj.insert(
             "findings".into(),
             Value::Array(self.findings.iter().map(Finding::to_json).collect()),
@@ -265,7 +274,12 @@ impl Report {
         }
         out.push('\n');
         for f in &self.findings {
-            out.push_str(&format!("{} {}: {}\n", f.severity.tag(), f.kind, f.message));
+            out.push_str(&format!(
+                "{} {}: {}\n",
+                f.severity.tag(),
+                f.kind,
+                f.message
+            ));
         }
         if !self.advice.is_empty() {
             out.push('\n');
@@ -322,25 +336,45 @@ fn render_extra_entry(
         Value::Bool(_) | Value::Number(_) | Value::String(_) => {
             let _ = writeln!(out, "{indent}{key}: {}", scalar_str(value));
         }
-        Value::Array(items) => render_extra_array(out, key, items, indent, limits.get(path).copied()),
+        Value::Array(items) => render_extra_array(
+            out,
+            key,
+            items,
+            indent,
+            limits.get(path).copied(),
+        ),
         Value::Object(map) => {
             let _ = writeln!(out, "{indent}{key}:");
             let child_indent = format!("{indent}  ");
             for (k, v) in map {
                 let child_path = format!("{path}.{k}");
-                render_extra_entry(out, k, v, &child_indent, &child_path, limits);
+                render_extra_entry(
+                    out,
+                    k,
+                    v,
+                    &child_indent,
+                    &child_path,
+                    limits,
+                );
             }
         }
     }
 }
 
-fn render_extra_array(out: &mut String, key: &str, items: &[Value], indent: &str, limit: Option<usize>) {
+fn render_extra_array(
+    out: &mut String,
+    key: &str,
+    items: &[Value],
+    indent: &str,
+    limit: Option<usize>,
+) {
     if items.is_empty() {
         let _ = writeln!(out, "{indent}{key}: (none)");
         return;
     }
     if items.iter().all(is_scalar) {
-        let joined = items.iter().map(scalar_str).collect::<Vec<_>>().join(", ");
+        let joined =
+            items.iter().map(scalar_str).collect::<Vec<_>>().join(", ");
         let _ = writeln!(out, "{indent}{key}: {joined}");
         return;
     }
@@ -361,7 +395,8 @@ fn render_extra_array(out: &mut String, key: &str, items: &[Value], indent: &str
     if shown < total {
         let _ = writeln!(
             out,
-            "{child_indent}... and {} more (showing {shown} of {total}; see --format json or a filter flag for the rest)",
+            "{child_indent}... and {} more (showing {shown} of {total}; see \
+             --format json or a filter flag for the rest)",
             total - shown
         );
     }
@@ -384,10 +419,14 @@ fn scalar_str(v: &Value) -> String {
 /// per the CLI text-format convention) and the rest alphabetical (`Map`'s
 /// natural key order).
 fn render_row(obj: &Map<String, Value>) -> String {
-    const PRIORITY: [&str; 5] = ["stream_id", "segment_id", "event_type_id", "id", "name"];
+    const PRIORITY: [&str; 5] =
+        ["stream_id", "segment_id", "event_type_id", "id", "name"];
     let mut keys: Vec<&String> = obj.keys().collect();
     keys.sort_by_key(|k| {
-        let p = PRIORITY.iter().position(|&pk| pk == k.as_str()).unwrap_or(PRIORITY.len());
+        let p = PRIORITY
+            .iter()
+            .position(|&pk| pk == k.as_str())
+            .unwrap_or(PRIORITY.len());
         (p, k.as_str())
     });
     keys.into_iter()

@@ -3,7 +3,8 @@
 //! store obeys, plus the capabilities the interim store never had —
 //! O(1)-ish head lookup with a tail-only load (no prefix scan), snapshots that
 //! survive a process restart, and the I5 self-heal (a wiped meta dir or a
-//! corrupt blob still loads the *correct* state by falling back to full replay).
+//! corrupt blob still loads the *correct* state by falling back to full
+//! replay).
 //!
 //! These tests hit the real filesystem and fjall, so they are `miri`-ignored.
 
@@ -42,10 +43,11 @@ impl Event for CounterEvent {
     }
 
     fn decode(name: &str, data: &[u8]) -> Result<Self, CodecError> {
-        let bytes: [u8; 8] = data.try_into().map_err(|_| CodecError::Decode {
-            event_name: name.to_string(),
-            source: format!("expected 8 bytes, got {}", data.len()),
-        })?;
+        let bytes: [u8; 8] =
+            data.try_into().map_err(|_| CodecError::Decode {
+                event_name: name.to_string(),
+                source:     format!("expected 8 bytes, got {}", data.len()),
+            })?;
         let n = i64::from_le_bytes(bytes);
         match name {
             "counter.added" => Ok(CounterEvent::Added(n)),
@@ -95,16 +97,17 @@ struct CounterV2(Counter);
 
 impl Aggregate for CounterV2 {
     type Event = CounterEvent;
-    fn apply(&mut self, event: &CounterEvent) {
-        self.0.apply(event);
-    }
+
+    fn apply(&mut self, event: &CounterEvent) { self.0.apply(event); }
 }
 
 impl Snapshottable for CounterV2 {
     const FOLD_VERSION: u32 = 2;
+
     fn encode_state(&self) -> Result<Vec<u8>, StateCodecError> {
         self.0.encode_state()
     }
+
     fn decode_state(bytes: &[u8]) -> Result<Self, StateCodecError> {
         Counter::decode_state(bytes).map(CounterV2)
     }
@@ -178,7 +181,10 @@ async fn snapshot_plus_tail_equals_full_replay_on_fjall() {
         let expected = fold(&events);
 
         if p > 0 {
-            store.append(&stream, Version::NoStream, &events[..p]).await.unwrap();
+            store
+                .append(&stream, Version::NoStream, &events[..p])
+                .await
+                .unwrap();
         }
         let snap = store.save_snapshot::<Counter>(&stream).await.unwrap();
         if p == 0 {
@@ -336,8 +342,7 @@ async fn snapshots_survive_reopen() {
 async fn wiped_meta_dir_falls_back_to_full_replay() {
     let dir = tempfile::tempdir().unwrap();
     let stream = "wipe-meta";
-    let events: Vec<CounterEvent> =
-        (1..=8).map(CounterEvent::Added).collect();
+    let events: Vec<CounterEvent> = (1..=8).map(CounterEvent::Added).collect();
     let expected = fold(&events);
 
     {
@@ -374,8 +379,7 @@ async fn wiped_meta_dir_falls_back_to_full_replay() {
 async fn corrupt_blob_falls_back_to_full_replay() {
     let dir = tempfile::tempdir().unwrap();
     let stream = "corrupt-blob";
-    let events: Vec<CounterEvent> =
-        (1..=6).map(CounterEvent::Scaled).collect();
+    let events: Vec<CounterEvent> = (1..=6).map(CounterEvent::Scaled).collect();
     let expected = fold(&events);
 
     let store = open(dir.path());
@@ -406,8 +410,7 @@ async fn fold_version_bump_invalidates_and_replaces_persisted_snapshot() {
     let store = open(dir.path());
     let stream = "deploy-fjall";
 
-    let events: Vec<CounterEvent> =
-        (1..=6).map(CounterEvent::Added).collect();
+    let events: Vec<CounterEvent> = (1..=6).map(CounterEvent::Added).collect();
     let expected = fold(&events);
 
     // Old binary (v1): snapshot the whole stream and flush it to disk.
@@ -420,7 +423,10 @@ async fn fold_version_bump_invalidates_and_replaces_persisted_snapshot() {
     // Deploy: load the same stream as v2. The persisted v1 head must be
     // invalidated (never used) and rebuilt by a full replay off the log.
     let loaded = store.load_cached::<CounterV2>(stream).await.unwrap();
-    assert_eq!(loaded.state.0, expected, "rebuild must yield the correct state");
+    assert_eq!(
+        loaded.state.0, expected,
+        "rebuild must yield the correct state"
+    );
     assert_eq!(
         loaded.events_replayed,
         events.len(),
@@ -475,9 +481,9 @@ fn corrupt_all_blobs(dir: &std::path::Path) {
         } else if path.extension().and_then(|e| e.to_str()) == Some("blob") {
             let mut bytes = std::fs::read(&path).unwrap();
             if let Some(last) = bytes.last_mut() {
-                *last ^= 0xff;
+                *last ^= 0xFF;
             } else {
-                bytes.push(0xff);
+                bytes.push(0xFF);
             }
             std::fs::write(&path, &bytes).unwrap();
         }

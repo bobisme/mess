@@ -29,7 +29,8 @@ fn main() {
     assert_eq!(
         args.len(),
         7,
-        "usage: soak-child <dir> <seed> <streams> <writers> <segment-size> <round>"
+        "usage: soak-child <dir> <seed> <streams> <writers> <segment-size> \
+         <round>"
     );
     let dir = PathBuf::from(&args[1]);
     let seed: u64 = args[2].parse().expect("seed");
@@ -55,7 +56,8 @@ fn main() {
     let reporter = std::thread::spawn(move || {
         let mut out = std::io::stdout();
         while let Ok((stream_idx, first_sp, first_global, count)) = rx.recv() {
-            let line = format!("A {stream_idx} {first_sp} {first_global} {count}\n");
+            let line =
+                format!("A {stream_idx} {first_sp} {first_global} {count}\n");
             if out.write_all(line.as_bytes()).is_err() {
                 break;
             }
@@ -75,7 +77,8 @@ fn main() {
             let engine = engine.clone();
             let tx = tx.clone();
             handles.push(tokio::spawn(async move {
-                writer_loop(engine, tx, w, writers, streams, seed ^ round).await;
+                writer_loop(engine, tx, w, writers, streams, seed ^ round)
+                    .await;
             }));
         }
         drop(tx);
@@ -96,7 +99,8 @@ async fn writer_loop(
     seed: u64,
 ) {
     // This writer's streams: every idx with idx % writers == writer.
-    let my_streams: Vec<u64> = (0..streams).filter(|i| i % writers == writer).collect();
+    let my_streams: Vec<u64> =
+        (0..streams).filter(|i| i % writers == writer).collect();
     if my_streams.is_empty() {
         return;
     }
@@ -121,7 +125,10 @@ async fn writer_loop(
             let mut data = Vec::with_capacity(16);
             data.extend_from_slice(&nonce.to_le_bytes());
             data.extend_from_slice(&(first_sp + k).to_le_bytes());
-            recs.push(RecordToAppend { message_type: "soak.event".into(), data });
+            recs.push(RecordToAppend {
+                message_type: "soak.event".into(),
+                data,
+            });
         }
 
         match engine.append_batch(&name, expected, &recs).await {
@@ -131,7 +138,8 @@ async fn writer_loop(
                 // Report the ack ONLY now — strictly after the committer acked
                 // and fdatasync returned. A send error means the parent closed
                 // the pipe (it is killing us); nothing left to do.
-                if tx.send((stream_idx, first_sp, first_global, count)).is_err() {
+                if tx.send((stream_idx, first_sp, first_global, count)).is_err()
+                {
                     return;
                 }
             }

@@ -1,10 +1,10 @@
 //! Append-path chain-maintenance cost (bn-1d0, spec 05 §10). Measures the
 //! per-event overhead of maintaining the crypto chain (two BLAKE3 invocations,
 //! §6.3) and checks it lands in the measured envelope (~165 ns/event; the spec
-//! reports +33% CPU over a store that already hashes frames, ~3% of the composed
-//! append budget). The bound here is deliberately loose so the gate is not
-//! flaky on a loaded machine — the point is to prove the order of magnitude and
-//! that the chain is nearly free, not to micro-benchmark.
+//! reports +33% CPU over a store that already hashes frames, ~3% of the
+//! composed append budget). The bound here is deliberately loose so the gate is
+//! not flaky on a loaded machine — the point is to prove the order of magnitude
+//! and that the chain is nearly free, not to micro-benchmark.
 
 use std::hint::black_box;
 use std::time::Instant;
@@ -30,7 +30,8 @@ fn chain_append_overhead_is_in_envelope() {
     }
     black_box(h);
 
-    // Baseline: frame_hash only (the 1× BLAKE3/event a frame-hashing store pays).
+    // Baseline: frame_hash only (the 1× BLAKE3/event a frame-hashing store
+    // pays).
     let start = Instant::now();
     let mut acc = 0u8;
     for v in 0..n {
@@ -50,8 +51,9 @@ fn chain_append_overhead_is_in_envelope() {
 
     let delta = full - fh_only;
     eprintln!(
-        "chain append overhead: frame_hash {fh_only:.1} ns/ev, full {full:.1} ns/ev, \
-         chain_step delta {delta:.1} ns/ev (spec §10 envelope ~165 ns/ev)"
+        "chain append overhead: frame_hash {fh_only:.1} ns/ev, full {full:.1} \
+         ns/ev, chain_step delta {delta:.1} ns/ev (spec §10 envelope ~165 \
+         ns/ev)"
     );
 
     // Generous ceiling: the measured target is ~165 ns; 2 µs leaves ~12× slack
@@ -61,12 +63,13 @@ fn chain_append_overhead_is_in_envelope() {
         "chain_step delta {delta:.1} ns/event is far outside the ~165 ns \
          envelope — a real regression"
     );
-    // The chain_step input is fixed-width (72 B), so it MUST be cheaper than the
-    // payload hash over a realistic 250 B event (a sanity check on §10's claim
-    // that "the second BLAKE3 is far cheaper than the payload hash").
+    // The chain_step input is fixed-width (72 B), so it MUST be cheaper than
+    // the payload hash over a realistic 250 B event (a sanity check on
+    // §10's claim that "the second BLAKE3 is far cheaper than the payload
+    // hash").
     assert!(
         delta < fh_only + 100.0,
-        "chain_step ({delta:.1} ns) should be no costlier than the payload hash \
-         ({fh_only:.1} ns) — §10"
+        "chain_step ({delta:.1} ns) should be no costlier than the payload \
+         hash ({fh_only:.1} ns) — §10"
     );
 }

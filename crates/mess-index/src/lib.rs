@@ -52,7 +52,9 @@ pub mod columnar;
 // sidecar rationale vs. a footer extension section is in `sealed::segment`.
 pub mod sealed;
 
-pub use active::{ActiveIndex, BatchEntry, EventPtr, GlobalEntry, IndexSnapshot, StreamEntry};
+pub use active::{
+    ActiveIndex, BatchEntry, EventPtr, GlobalEntry, IndexSnapshot, StreamEntry,
+};
 pub use rebuild::{RebuildReport, rebuild, rebuild_into};
 
 // bn-1ku: exact-KV metadata tables (stream/snapshot heads, projection

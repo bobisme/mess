@@ -3,22 +3,21 @@
 //! recovery guard.
 //!
 //! Structure:
-//! - `production_kernel_is_safe_within_bounds` — the theorem. BFS over
-//!   every writer/fsync/crash/recycle/recovery interleaving within
-//!   [`BOUNDS`]; safety properties must hold in every state, and the
-//!   coverage ("sometimes") properties must all be reachable, proving
-//!   the state space actually contains the adversarial shapes.
-//! - `teeth_*` — differentials. Each wires a deliberately weakened
-//!   kernel (A9 off, A1 off, resync-past-holes) into the same model
-//!   and demands the checker FIND a counterexample. If the checker
-//!   passes a broken kernel, the model has no teeth and the theorem
-//!   above is vacuous.
+//! - `production_kernel_is_safe_within_bounds` — the theorem. BFS over every
+//!   writer/fsync/crash/recycle/recovery interleaving within [`BOUNDS`]; safety
+//!   properties must hold in every state, and the coverage ("sometimes")
+//!   properties must all be reachable, proving the state space actually
+//!   contains the adversarial shapes.
+//! - `teeth_*` — differentials. Each wires a deliberately weakened kernel (A9
+//!   off, A1 off, resync-past-holes) into the same model and demands the
+//!   checker FIND a counterexample. If the checker passes a broken kernel, the
+//!   model has no teeth and the theorem above is vacuous.
 
 use mess_log::acceptance::{
     Candidate, CandidateStatus, ScanOutcome, StopReason,
 };
 use mess_log::model::{
-    production_kernel, Action, Bounds, Part, ProtocolModel, State,
+    Action, Bounds, Part, ProtocolModel, State, production_kernel,
 };
 use stateright::{Checker, Model, Property};
 
@@ -83,41 +82,47 @@ impl Model for Formal {
                         .enumerate()
                         .all(|(i, a)| specs[i] == Some(*a))
             }),
-            Property::<Self>::always("accepted only authentic writes", |m, s| {
-                // No partial, torn, garbage, or stale-generation batch
-                // is ever accepted: every accepted slot holds the exact
-                // bytes of a write from the CURRENT epoch (surfacing an
-                // unacked complete write is A6's permitted outcome).
-                if !s.crashed {
-                    return true;
-                }
-                let out = m.0.scan(s);
-                let (_, specs) = ProtocolModel::decode_durable(s);
-                out.accepted.iter().enumerate().all(|(i, c)| {
-                    match specs[i] {
-                        Some(spec) => {
-                            spec.cand == *c && s.written.contains(&spec)
-                        }
-                        None => false,
+            Property::<Self>::always(
+                "accepted only authentic writes",
+                |m, s| {
+                    // No partial, torn, garbage, or stale-generation batch
+                    // is ever accepted: every accepted slot holds the exact
+                    // bytes of a write from the CURRENT epoch (surfacing an
+                    // unacked complete write is A6's permitted outcome).
+                    if !s.crashed {
+                        return true;
                     }
-                })
-            }),
-            Property::<Self>::always("accepted history is contiguous", |m, s| {
-                // Kernel-output contract, recomputed independently:
-                // positions tile from the segment base with no holes or
-                // overlaps, all in the current epoch, no empty batches.
-                if !s.crashed {
-                    return true;
-                }
-                let mut expected = 0u64;
-                m.0.scan(s).accepted.iter().all(|c| {
-                    let ok = c.epoch == s.epoch
-                        && c.frame_count > 0
-                        && c.first_global_pos == expected;
-                    expected += u64::from(c.frame_count);
-                    ok
-                })
-            }),
+                    let out = m.0.scan(s);
+                    let (_, specs) = ProtocolModel::decode_durable(s);
+                    out.accepted.iter().enumerate().all(|(i, c)| {
+                        match specs[i] {
+                            Some(spec) => {
+                                spec.cand == *c && s.written.contains(&spec)
+                            }
+                            None => false,
+                        }
+                    })
+                },
+            ),
+            Property::<Self>::always(
+                "accepted history is contiguous",
+                |m, s| {
+                    // Kernel-output contract, recomputed independently:
+                    // positions tile from the segment base with no holes or
+                    // overlaps, all in the current epoch, no empty batches.
+                    if !s.crashed {
+                        return true;
+                    }
+                    let mut expected = 0u64;
+                    m.0.scan(s).accepted.iter().all(|c| {
+                        let ok = c.epoch == s.epoch
+                            && c.frame_count > 0
+                            && c.first_global_pos == expected;
+                        expected += u64::from(c.frame_count);
+                        ok
+                    })
+                },
+            ),
             Property::<Self>::always("recovery is idempotent", |m, s| {
                 // Recovery mutates nothing the kernel reads, so
                 // re-running the scan (a crash during/just after
@@ -249,8 +254,8 @@ fn assert_finds_violation(kernel: mess_log::model::Kernel, label: &str) {
     let found = SAFETY.iter().any(|name| checker.discovery(name).is_some());
     assert!(
         found,
-        "{label}: checker passed a deliberately broken kernel — the \
-         model has no teeth"
+        "{label}: checker passed a deliberately broken kernel — the model has \
+         no teeth"
     );
 }
 

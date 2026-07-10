@@ -46,8 +46,9 @@ fn main() {
     };
 
     let total_events = writers * batches_per_writer * (batch as u64);
-    // ~250 B payload + framing; size the (preallocated) segment with headroom so
-    // the whole run lands in one segment (the committer owns exactly one).
+    // ~250 B payload + framing; size the (preallocated) segment with headroom
+    // so the whole run lands in one segment (the committer owns exactly
+    // one).
     let est_bytes = total_events.saturating_mul(320).saturating_add(1 << 20);
     let segment_size = est_bytes.max(256 * 1024 * 1024).next_power_of_two();
 
@@ -57,7 +58,7 @@ fn main() {
     std::fs::create_dir_all(&scratch).expect("create scratch dir");
 
     // ~250 B payload, the measured production event size.
-    let payload: Vec<u8> = (0..250u32).map(|i| (i & 0xff) as u8).collect();
+    let payload: Vec<u8> = (0..250u32).map(|i| (i & 0xFF) as u8).collect();
 
     println!(
         "durable_bench mode={mode} writers={writers} batch={batch} \
@@ -74,11 +75,13 @@ fn main() {
     for rep in 0..reps {
         let rt = RealRuntime::new();
         let fs = rt.fs();
-        let path = scratch.join(format!("bench-{mode}-{}-{rep}.seg", std::process::id()));
+        let path = scratch
+            .join(format!("bench-{mode}-{}-{rep}.seg", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let mut params = SegmentParams::new(1, 0, 1, 0);
         params.segment_size = segment_size;
-        let writer = SegmentWriter::create(&fs, &path, params).expect("create segment");
+        let writer =
+            SegmentWriter::create(&fs, &path, params).expect("create segment");
 
         let secs = rt.block_on(async {
             let c = Committer::spawn(&rt, writer, durability);
@@ -90,7 +93,9 @@ fn main() {
                 joins.push(rt.spawn(async move {
                     for b in 0..batches_per_writer {
                         let events: Vec<EventInput> = (0..batch)
-                            .map(|_| EventInput::plain(1, 0, 0, payload.clone()))
+                            .map(|_| {
+                                EventInput::plain(1, 0, 0, payload.clone())
+                            })
                             .collect();
                         let req = AppendRequest {
                             stream_id: w,
@@ -128,9 +133,10 @@ fn main() {
         let _ = std::fs::remove_file(&path);
     }
 
-    let reps_str = all.iter().map(|v| format!("{v:.0}")).collect::<Vec<_>>().join(" / ");
+    let reps_str =
+        all.iter().map(|v| format!("{v:.0}")).collect::<Vec<_>>().join(" / ");
     println!(
-        "RESULT mode={mode} writers={writers}x{batch} BEST {best_ev_s:.0} ev/s \
-         (best {best_secs:.4}s)  all reps: [{reps_str}]"
+        "RESULT mode={mode} writers={writers}x{batch} BEST {best_ev_s:.0} \
+         ev/s (best {best_secs:.4}s)  all reps: [{reps_str}]"
     );
 }

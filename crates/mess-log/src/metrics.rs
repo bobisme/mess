@@ -45,7 +45,8 @@ pub const SUB_COUNT: usize = 1 << SUB_BITS;
 const MAX_OCTAVE: u32 = 63;
 /// Total fixed bucket count: the `[0, SUB_COUNT)` linear region plus one block
 /// of `SUB_COUNT` sub-buckets per octave from `SUB_BITS..=MAX_OCTAVE`.
-pub const BUCKET_COUNT: usize = ((MAX_OCTAVE - SUB_BITS + 1) as usize) * SUB_COUNT + SUB_COUNT;
+pub const BUCKET_COUNT: usize =
+    ((MAX_OCTAVE - SUB_BITS + 1) as usize) * SUB_COUNT + SUB_COUNT;
 
 /// The bucket index a nanosecond value falls into. Monotonic in `v`.
 #[inline]
@@ -88,9 +89,7 @@ fn bucket_width(i: usize) -> u64 {
 /// percentile estimate — true value is within `± bucket_width/2`, i.e. the
 /// `1 / SUB_COUNT` relative bound above.
 #[inline]
-fn bucket_midpoint(i: usize) -> u64 {
-    bucket_lower(i) + bucket_width(i) / 2
-}
+fn bucket_midpoint(i: usize) -> u64 { bucket_lower(i) + bucket_width(i) / 2 }
 
 // ---------------------------------------------------------------------------
 // Latency histogram
@@ -104,18 +103,19 @@ fn bucket_midpoint(i: usize) -> u64 {
 /// alongside the bucketed distribution so mean and max are not subject to the
 /// histogram's bucket quantisation.
 pub struct LatencyHistogram {
-    buckets: Box<[AtomicU64]>,
-    count: AtomicU64,
+    buckets:   Box<[AtomicU64]>,
+    count:     AtomicU64,
     sum_nanos: AtomicU64,
     max_nanos: AtomicU64,
 }
 
 impl Default for LatencyHistogram {
     fn default() -> Self {
-        let buckets = (0..BUCKET_COUNT).map(|_| AtomicU64::new(0)).collect::<Vec<_>>();
+        let buckets =
+            (0..BUCKET_COUNT).map(|_| AtomicU64::new(0)).collect::<Vec<_>>();
         LatencyHistogram {
-            buckets: buckets.into_boxed_slice(),
-            count: AtomicU64::new(0),
+            buckets:   buckets.into_boxed_slice(),
+            count:     AtomicU64::new(0),
             sum_nanos: AtomicU64::new(0),
             max_nanos: AtomicU64::new(0),
         }
@@ -124,16 +124,16 @@ impl Default for LatencyHistogram {
 
 impl std::fmt::Debug for LatencyHistogram {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LatencyHistogram").field("snapshot", &self.snapshot()).finish()
+        f.debug_struct("LatencyHistogram")
+            .field("snapshot", &self.snapshot())
+            .finish()
     }
 }
 
 impl LatencyHistogram {
     /// A fresh, empty histogram.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
+    pub fn new() -> Self { Self::default() }
 
     /// Record one observed latency. The single mutating call on the hot path.
     #[inline]
@@ -165,9 +165,7 @@ impl LatencyHistogram {
 
     /// Number of samples recorded so far.
     #[must_use]
-    pub fn count(&self) -> u64 {
-        self.count.load(Ordering::Relaxed)
-    }
+    pub fn count(&self) -> u64 { self.count.load(Ordering::Relaxed) }
 
     /// The estimated value (nanoseconds) at quantile `q ∈ [0, 1]`. Returns `0`
     /// for an empty histogram. The estimate is the midpoint of the bucket the
@@ -203,19 +201,17 @@ impl LatencyHistogram {
 
     /// The largest sample seen (exact), `0` if empty.
     #[must_use]
-    pub fn max_nanos(&self) -> u64 {
-        self.max_nanos.load(Ordering::Relaxed)
-    }
+    pub fn max_nanos(&self) -> u64 { self.max_nanos.load(Ordering::Relaxed) }
 
     /// A consistent-enough point-in-time read of the standard percentiles.
     #[must_use]
     pub fn snapshot(&self) -> LatencySnapshot {
         LatencySnapshot {
-            count: self.count(),
-            p50_nanos: self.quantile_nanos(0.50),
-            p95_nanos: self.quantile_nanos(0.95),
-            p99_nanos: self.quantile_nanos(0.99),
-            max_nanos: self.max_nanos(),
+            count:      self.count(),
+            p50_nanos:  self.quantile_nanos(0.50),
+            p95_nanos:  self.quantile_nanos(0.95),
+            p99_nanos:  self.quantile_nanos(0.99),
+            max_nanos:  self.max_nanos(),
             mean_nanos: self.mean_nanos(),
         }
     }
@@ -225,15 +221,15 @@ impl LatencyHistogram {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LatencySnapshot {
     /// Samples recorded.
-    pub count: u64,
+    pub count:      u64,
     /// Estimated 50th percentile.
-    pub p50_nanos: u64,
+    pub p50_nanos:  u64,
     /// Estimated 95th percentile.
-    pub p95_nanos: u64,
+    pub p95_nanos:  u64,
     /// Estimated 99th percentile.
-    pub p99_nanos: u64,
+    pub p99_nanos:  u64,
     /// Largest sample (exact).
-    pub max_nanos: u64,
+    pub max_nanos:  u64,
     /// Mean (exact).
     pub mean_nanos: u64,
 }
@@ -249,27 +245,19 @@ pub struct Counter(AtomicU64);
 impl Counter {
     /// A counter starting at zero.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
+    pub fn new() -> Self { Self::default() }
 
     /// Add one.
     #[inline]
-    pub fn incr(&self) {
-        self.0.fetch_add(1, Ordering::Relaxed);
-    }
+    pub fn incr(&self) { self.0.fetch_add(1, Ordering::Relaxed); }
 
     /// Add `n`.
     #[inline]
-    pub fn add(&self, n: u64) {
-        self.0.fetch_add(n, Ordering::Relaxed);
-    }
+    pub fn add(&self, n: u64) { self.0.fetch_add(n, Ordering::Relaxed); }
 
     /// The current value.
     #[must_use]
-    pub fn get(&self) -> u64 {
-        self.0.load(Ordering::Relaxed)
-    }
+    pub fn get(&self) -> u64 { self.0.load(Ordering::Relaxed) }
 }
 
 // ---------------------------------------------------------------------------
@@ -298,14 +286,14 @@ const LOG_RATE_LIMIT: Duration = Duration::from_secs(5);
 /// the live p99 tell them whether it is ongoing.
 pub struct DegradationAlarm {
     threshold_nanos: AtomicU64,
-    tripped: AtomicBool,
-    trips: AtomicU64,
+    tripped:         AtomicBool,
+    trips:           AtomicU64,
     /// Wall-clock instant of the last emitted log line, for rate limiting.
     /// `None` until the first trip. Behind a `Mutex` only because `Instant`
     /// is not atomic; it is never touched on a non-tripping observe.
-    last_log: Mutex<Option<Instant>>,
+    last_log:        Mutex<Option<Instant>>,
     /// A human label for the signal, used in the loud log line.
-    label: &'static str,
+    label:           &'static str,
 }
 
 impl DegradationAlarm {
@@ -325,8 +313,10 @@ impl DegradationAlarm {
 
     /// Reconfigure the trip threshold at runtime.
     pub fn set_threshold(&self, threshold: Duration) {
-        self.threshold_nanos
-            .store(u64::try_from(threshold.as_nanos()).unwrap_or(u64::MAX), Ordering::Relaxed);
+        self.threshold_nanos.store(
+            u64::try_from(threshold.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
     }
 
     /// The current trip threshold, in nanoseconds.
@@ -350,30 +340,29 @@ impl DegradationAlarm {
 
     /// Whether the alarm has ever tripped (the sticky store-status flag).
     #[must_use]
-    pub fn is_tripped(&self) -> bool {
-        self.tripped.load(Ordering::Relaxed)
-    }
+    pub fn is_tripped(&self) -> bool { self.tripped.load(Ordering::Relaxed) }
 
     /// How many samples have crossed the threshold.
     #[must_use]
-    pub fn trips(&self) -> u64 {
-        self.trips.load(Ordering::Relaxed)
-    }
+    pub fn trips(&self) -> u64 { self.trips.load(Ordering::Relaxed) }
 
     /// Emit the loud line if the rate limit allows. Separate so tests can
     /// exercise the latch without asserting on stderr.
     fn maybe_log(&self, nanos: u64, trips: u64) {
         let now = Instant::now();
-        let mut last = self.last_log.lock().expect("degradation alarm log lock");
+        let mut last =
+            self.last_log.lock().expect("degradation alarm log lock");
         let due = last.is_none_or(|t| now.duration_since(t) >= LOG_RATE_LIMIT);
         if due {
             *last = Some(now);
             drop(last);
-            let threshold_ms = self.threshold_nanos.load(Ordering::Relaxed) as f64 / 1e6;
+            let threshold_ms =
+                self.threshold_nanos.load(Ordering::Relaxed) as f64 / 1e6;
             eprintln!(
-                "!!! mess DEGRADED: {} latency {:.1} ms crossed {:.1} ms threshold \
-                 ({} crossings) — near-full/contended device fdatasync stall \
-                 (docs/spec/03-durability.md §2.6); durable appends are stalling",
+                "!!! mess DEGRADED: {} latency {:.1} ms crossed {:.1} ms \
+                 threshold ({} crossings) — near-full/contended device \
+                 fdatasync stall (docs/spec/03-durability.md §2.6); durable \
+                 appends are stalling",
                 self.label,
                 nanos as f64 / 1e6,
                 threshold_ms,
@@ -405,7 +394,10 @@ mod tests {
         let mut last = 0usize;
         for v in 0..10_000u64 {
             let i = bucket_index(v);
-            assert!(i >= last, "index must be monotonic: v={v} i={i} last={last}");
+            assert!(
+                i >= last,
+                "index must be monotonic: v={v} i={i} last={last}"
+            );
             last = i;
         }
         // Boundary: the first sub-bucketed value lands right after the linear
@@ -416,7 +408,9 @@ mod tests {
 
     #[test]
     fn bucket_bounds_contain_their_values() {
-        for v in [0u64, 1, 15, 16, 31, 1000, 1_000_000, 150_000_000, u64::MAX / 2] {
+        for v in
+            [0u64, 1, 15, 16, 31, 1000, 1_000_000, 150_000_000, u64::MAX / 2]
+        {
             let i = bucket_index(v);
             let lo = bucket_lower(i);
             let hi = lo + bucket_width(i);
@@ -436,21 +430,27 @@ mod tests {
         let approx = |got: u64, want_ms: f64| {
             let got_ms = got as f64 / 1e6;
             let rel = (got_ms - want_ms).abs() / want_ms;
-            assert!(rel <= 0.07, "got {got_ms:.2} ms want {want_ms} ms (rel {rel:.3})");
+            assert!(
+                rel <= 0.07,
+                "got {got_ms:.2} ms want {want_ms} ms (rel {rel:.3})"
+            );
         };
         approx(h.quantile_nanos(0.50), 500.0);
         approx(h.quantile_nanos(0.95), 950.0);
         approx(h.quantile_nanos(0.99), 990.0);
         // Mean and max are exact (tracked outside the buckets).
-        assert_eq!(h.max_nanos(), Duration::from_millis(1000).as_nanos() as u64);
+        assert_eq!(
+            h.max_nanos(),
+            Duration::from_millis(1000).as_nanos() as u64
+        );
         approx(h.mean_nanos(), 500.5);
     }
 
     #[test]
     fn percentiles_capture_a_bimodal_tail() {
-        // 980 fast barriers (~3 ms) and 20 degraded ones (~150 ms): the p99 must
-        // land in the degraded mode, not the fast one — the exact shape §2.6
-        // says the metric MUST reveal.
+        // 980 fast barriers (~3 ms) and 20 degraded ones (~150 ms): the p99
+        // must land in the degraded mode, not the fast one — the exact
+        // shape §2.6 says the metric MUST reveal.
         let h = LatencyHistogram::new();
         for _ in 0..980 {
             h.record(Duration::from_micros(3300));
@@ -460,8 +460,14 @@ mod tests {
         }
         let p50 = h.quantile_nanos(0.50) as f64 / 1e6;
         let p99 = h.quantile_nanos(0.99) as f64 / 1e6;
-        assert!((3.0..4.0).contains(&p50), "p50 {p50:.2} ms should be the fast mode");
-        assert!(p99 >= 140.0, "p99 {p99:.2} ms should reveal the degraded tail");
+        assert!(
+            (3.0..4.0).contains(&p50),
+            "p50 {p50:.2} ms should be the fast mode"
+        );
+        assert!(
+            p99 >= 140.0,
+            "p99 {p99:.2} ms should reveal the degraded tail"
+        );
     }
 
     #[test]

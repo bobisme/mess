@@ -24,9 +24,7 @@ fn rec(t: &str, d: &[u8]) -> RecordToAppend {
     RecordToAppend { message_type: t.to_string(), data: d.to_vec() }
 }
 
-fn opts() -> InspectOptions {
-    InspectOptions::default()
-}
+fn opts() -> InspectOptions { InspectOptions::default() }
 
 /// Build a small real store with `n_streams` named streams (`user-0`,
 /// `user-1`, ...), one event each. The engine (and its D9 lock) is dropped
@@ -63,17 +61,26 @@ async fn text_format_renders_extra_sections() {
     let text = format::render(&report, Format::Text);
 
     for needle in ["dir:", "lock:", "metrics", "registry", "stream_heads"] {
-        assert!(text.contains(needle), "text output missing {needle:?} section:\n{text}");
+        assert!(
+            text.contains(needle),
+            "text output missing {needle:?} section:\n{text}"
+        );
     }
     // A named stream must be visible BY NAME in the text render, not just as
     // an interned integer — proves name resolution reached the text path too.
-    assert!(text.contains("user-0"), "expected a resolved stream name in text output:\n{text}");
+    assert!(
+        text.contains("user-0"),
+        "expected a resolved stream name in text output:\n{text}"
+    );
 
     // pretty must render the same sections (it dumped raw JSON before this
     // fix — same underlying renderer as text now).
     let pretty = format::render(&report, Format::Pretty);
     for needle in ["dir:", "lock:", "registry", "stream_heads", "user-0"] {
-        assert!(pretty.contains(needle), "pretty output missing {needle:?} section:\n{pretty}");
+        assert!(
+            pretty.contains(needle),
+            "pretty output missing {needle:?} section:\n{pretty}"
+        );
     }
 }
 
@@ -92,21 +99,37 @@ async fn stream_heads_resolve_names_and_truncate_by_default() {
     // json is always complete, with every head's name resolved.
     let json = json_of(&report);
     let heads = json["stream_heads"].as_array().expect("stream_heads array");
-    assert_eq!(heads.len(), n, "json stream_heads must be complete, not truncated");
-    assert!(heads.iter().all(|h| h["name"].is_string()), "every head resolved a name: {heads:?}");
+    assert_eq!(
+        heads.len(),
+        n,
+        "json stream_heads must be complete, not truncated"
+    );
+    assert!(
+        heads.iter().all(|h| h["name"].is_string()),
+        "every head resolved a name: {heads:?}"
+    );
 
     // text/pretty truncate by default with a "... and K more" line, and stop
     // short of dumping all `n` rows.
     let text = format::render(&report, Format::Text);
-    assert!(text.contains("more"), "text stream_heads must truncate at app scale:\n{text}");
+    assert!(
+        text.contains("more"),
+        "text stream_heads must truncate at app scale:\n{text}"
+    );
     let pretty = format::render(&report, Format::Pretty);
-    assert!(pretty.contains("more"), "pretty stream_heads must truncate at app scale:\n{pretty}");
+    assert!(
+        pretty.contains("more"),
+        "pretty stream_heads must truncate at app scale:\n{pretty}"
+    );
 
     // --all-streams disables the render-time cap (json was never capped).
     let all = InspectOptions { all_streams: true, ..InspectOptions::default() };
     let report_all = inspect::run(dir.path(), &all);
     let text_all = format::render(&report_all, Format::Text);
-    assert!(!text_all.contains("more"), "--all-streams must show every head:\n{text_all}");
+    assert!(
+        !text_all.contains("more"),
+        "--all-streams must show every head:\n{text_all}"
+    );
     for i in 0..n {
         assert!(
             text_all.contains(&format!("user-{i}")),
@@ -124,15 +147,25 @@ async fn stream_filter_accepts_name_or_id() {
     let dir = tempfile::tempdir().unwrap();
     build_named_corpus(dir.path(), 4).await;
 
-    let by_name = InspectOptions { stream: Some("user-2".to_string()), ..InspectOptions::default() };
+    let by_name = InspectOptions {
+        stream: Some("user-2".to_string()),
+        ..InspectOptions::default()
+    };
     let report = inspect::run(dir.path(), &by_name);
     let json = json_of(&report);
     let heads = json["stream_heads"].as_array().unwrap();
-    assert_eq!(heads.len(), 1, "name filter must match exactly one stream: {heads:?}");
+    assert_eq!(
+        heads.len(),
+        1,
+        "name filter must match exactly one stream: {heads:?}"
+    );
     assert_eq!(heads[0]["name"], "user-2");
 
     let sid = heads[0]["stream_id"].as_u64().unwrap();
-    let by_id = InspectOptions { stream: Some(sid.to_string()), ..InspectOptions::default() };
+    let by_id = InspectOptions {
+        stream: Some(sid.to_string()),
+        ..InspectOptions::default()
+    };
     let report2 = inspect::run(dir.path(), &by_id);
     let json2 = json_of(&report2);
     let heads2 = json2["stream_heads"].as_array().unwrap();
@@ -170,7 +203,11 @@ async fn json_field_names_are_lock_state_independent() {
         v.as_object().unwrap().keys().cloned().collect()
     }
 
-    assert_eq!(keys(&free), keys(&locked), "top-level envelope field names must not depend on lock state");
+    assert_eq!(
+        keys(&free),
+        keys(&locked),
+        "top-level envelope field names must not depend on lock state"
+    );
     assert_eq!(
         keys(&free["registry"]),
         keys(&locked["registry"]),
@@ -192,7 +229,11 @@ async fn json_field_names_are_lock_state_independent() {
     // stream_heads are recovered straight from the log and stay available
     // regardless of the meta lock — just without resolved names.
     let locked_heads = locked["stream_heads"].as_array().unwrap();
-    assert_eq!(locked_heads.len(), 3, "stream heads recovered from the log even when meta is locked");
+    assert_eq!(
+        locked_heads.len(),
+        3,
+        "stream heads recovered from the log even when meta is locked"
+    );
     assert!(locked_heads.iter().all(|h| h["name"].is_null()));
 
     let free_heads = free["stream_heads"].as_array().unwrap();

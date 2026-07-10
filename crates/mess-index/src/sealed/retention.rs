@@ -71,9 +71,9 @@ use crate::sealed::segment::SealedSegmentIndex;
 /// representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentStreamSpan {
-    pub stream_id: u64,
+    pub stream_id:     u64,
     pub first_version: u64,
-    pub last_version: u64,
+    pub last_version:  u64,
 }
 
 impl SegmentStreamSpan {
@@ -97,7 +97,7 @@ pub struct LiveSnapshotRef {
     /// Interned stream id (D3).
     pub stream_id: u64,
     /// `v`, the snapshot's `stream_version` (§4.1, 0-based last-index).
-    pub version: u64,
+    pub version:   u64,
 }
 
 /// Which certification frame of a [`LiveSnapshotRef`] a segment holds.
@@ -116,8 +116,8 @@ pub enum CertFrame {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockingReason {
     pub stream_id: u64,
-    pub version: u64,
-    pub frame: CertFrame,
+    pub version:   u64,
+    pub frame:     CertFrame,
 }
 
 impl std::fmt::Display for BlockingReason {
@@ -158,7 +158,9 @@ impl RetentionDecision {
     pub fn explain(&self) -> Vec<String> {
         match self {
             RetentionDecision::Deletable => Vec::new(),
-            RetentionDecision::Blocked(reasons) => reasons.iter().map(ToString::to_string).collect(),
+            RetentionDecision::Blocked(reasons) => {
+                reasons.iter().map(ToString::to_string).collect()
+            }
         }
     }
 }
@@ -173,12 +175,12 @@ impl RetentionDecision {
 /// - `spans` — this segment's per-stream frame coverage (one entry per stream
 ///   present in the segment; a stream absent from `spans` has none of its
 ///   frames here).
-/// - `live` — every currently-live snapshot's certification requirement.
-///   Empty (or a requirement whose snapshot was superseded/dropped and thus
-///   omitted) never blocks.
+/// - `live` — every currently-live snapshot's certification requirement. Empty
+///   (or a requirement whose snapshot was superseded/dropped and thus omitted)
+///   never blocks.
 /// - `anchors` — every durable `SnapshotAnchor` known across the retained log
-///   (§8.2 rule 2); a `(stream_id, version)` match discharges that
-///   requirement via Path C regardless of which segment recorded the anchor.
+///   (§8.2 rule 2); a `(stream_id, version)` match discharges that requirement
+///   via Path C regardless of which segment recorded the anchor.
 #[must_use]
 pub fn segment_retention_decision(
     spans: &[SegmentStreamSpan],
@@ -187,19 +189,21 @@ pub fn segment_retention_decision(
 ) -> RetentionDecision {
     let mut reasons = Vec::new();
     for req in live {
-        let anchored =
-            anchors.iter().any(|a| a.stream_id == req.stream_id && a.version == req.version);
+        let anchored = anchors
+            .iter()
+            .any(|a| a.stream_id == req.stream_id && a.version == req.version);
         if anchored {
             continue; // Path C discharges this requirement; no frame needed.
         }
-        let Some(span) = spans.iter().find(|s| s.stream_id == req.stream_id) else {
+        let Some(span) = spans.iter().find(|s| s.stream_id == req.stream_id)
+        else {
             continue; // this segment holds none of the stream's frames
         };
         if span.contains(req.version) {
             reasons.push(BlockingReason {
                 stream_id: req.stream_id,
-                version: req.version,
-                frame: CertFrame::V,
+                version:   req.version,
+                frame:     CertFrame::V,
             });
         }
         if let Some(v_plus_1) = req.version.checked_add(1)
@@ -207,8 +211,8 @@ pub fn segment_retention_decision(
         {
             reasons.push(BlockingReason {
                 stream_id: req.stream_id,
-                version: req.version,
-                frame: CertFrame::VPlus1,
+                version:   req.version,
+                frame:     CertFrame::VPlus1,
             });
         }
     }
@@ -227,12 +231,9 @@ pub fn spans_for_segment(seg: &SealedSegmentIndex) -> Vec<SegmentStreamSpan> {
     seg.stream_ids()
         .iter()
         .filter_map(|&stream_id| {
-            seg.stream_range(stream_id)
-                .map(|(first_version, last_version)| SegmentStreamSpan {
-                    stream_id,
-                    first_version,
-                    last_version,
-                })
+            seg.stream_range(stream_id).map(|(first_version, last_version)| {
+                SegmentStreamSpan { stream_id, first_version, last_version }
+            })
         })
         .collect()
 }
@@ -264,8 +265,9 @@ pub fn decide_segment(
 /// [`segment_retention_decision`] is for the snapshot rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackupLease {
-    /// The backup that holds this lease (its `BACKUP_MANIFEST` / lease-file id).
-    pub backup_id: String,
+    /// The backup that holds this lease (its `BACKUP_MANIFEST` / lease-file
+    /// id).
+    pub backup_id:              String,
     /// Lowest segment id the cut protects (inclusive).
     pub protect_min_segment_id: u64,
     /// Highest segment id the cut protects (inclusive).
@@ -276,7 +278,8 @@ impl BackupLease {
     /// Whether this lease pins `segment_id` against deletion.
     #[must_use]
     pub fn pins(&self, segment_id: u64) -> bool {
-        segment_id >= self.protect_min_segment_id && segment_id <= self.protect_max_segment_id
+        segment_id >= self.protect_min_segment_id
+            && segment_id <= self.protect_max_segment_id
     }
 }
 
@@ -286,7 +289,10 @@ impl BackupLease {
 /// this returns any lease; `mess retention explain` surfaces each as a
 /// `lease-hold` blocker.
 #[must_use]
-pub fn lease_holds(segment_id: u64, leases: &[BackupLease]) -> Vec<&BackupLease> {
+pub fn lease_holds(
+    segment_id: u64,
+    leases: &[BackupLease],
+) -> Vec<&BackupLease> {
     leases.iter().filter(|l| l.pins(segment_id)).collect()
 }
 
@@ -309,10 +315,16 @@ pub fn segment_deletable(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sealed::segment::{SealBatch, SealInput, SealStream, encode_sidecar};
+    use crate::sealed::segment::{
+        SealBatch, SealInput, SealStream, encode_sidecar,
+    };
 
     fn span(stream_id: u64, first: u64, last: u64) -> SegmentStreamSpan {
-        SegmentStreamSpan { stream_id, first_version: first, last_version: last }
+        SegmentStreamSpan {
+            stream_id,
+            first_version: first,
+            last_version: last,
+        }
     }
 
     fn live(stream_id: u64, version: u64) -> LiveSnapshotRef {
@@ -331,11 +343,19 @@ mod tests {
         let live_refs = [live(1, 5)];
         let decision = segment_retention_decision(&spans, &live_refs, &[]);
         assert!(decision.is_blocked());
-        let RetentionDecision::Blocked(reasons) = &decision else { unreachable!() };
-        assert!(reasons.contains(&BlockingReason { stream_id: 1, version: 5, frame: CertFrame::V }));
-        assert!(
-            reasons.contains(&BlockingReason { stream_id: 1, version: 5, frame: CertFrame::VPlus1 })
-        );
+        let RetentionDecision::Blocked(reasons) = &decision else {
+            unreachable!()
+        };
+        assert!(reasons.contains(&BlockingReason {
+            stream_id: 1,
+            version:   5,
+            frame:     CertFrame::V,
+        }));
+        assert!(reasons.contains(&BlockingReason {
+            stream_id: 1,
+            version:   5,
+            frame:     CertFrame::VPlus1,
+        }));
         assert!(!decision.explain().is_empty());
     }
 
@@ -363,17 +383,34 @@ mod tests {
         let segment_b_spans = [span(1, 6, 10)]; // holds v+1=6 (segment B's first frame)
         let live_refs = [live(1, 5)];
 
-        let decision_a = segment_retention_decision(&segment_a_spans, &live_refs, &[]);
-        let decision_b = segment_retention_decision(&segment_b_spans, &live_refs, &[]);
+        let decision_a =
+            segment_retention_decision(&segment_a_spans, &live_refs, &[]);
+        let decision_b =
+            segment_retention_decision(&segment_b_spans, &live_refs, &[]);
         assert!(decision_a.is_blocked(), "segment A holds frame v");
         assert!(decision_b.is_blocked(), "segment B holds frame v+1");
 
-        let RetentionDecision::Blocked(reasons_a) = &decision_a else { unreachable!() };
-        assert_eq!(reasons_a, &[BlockingReason { stream_id: 1, version: 5, frame: CertFrame::V }]);
-        let RetentionDecision::Blocked(reasons_b) = &decision_b else { unreachable!() };
+        let RetentionDecision::Blocked(reasons_a) = &decision_a else {
+            unreachable!()
+        };
+        assert_eq!(
+            reasons_a,
+            &[BlockingReason {
+                stream_id: 1,
+                version:   5,
+                frame:     CertFrame::V,
+            }]
+        );
+        let RetentionDecision::Blocked(reasons_b) = &decision_b else {
+            unreachable!()
+        };
         assert_eq!(
             reasons_b,
-            &[BlockingReason { stream_id: 1, version: 5, frame: CertFrame::VPlus1 }]
+            &[BlockingReason {
+                stream_id: 1,
+                version:   5,
+                frame:     CertFrame::VPlus1,
+            }]
         );
     }
 
@@ -385,16 +422,21 @@ mod tests {
         let spans = [span(1, 0, 9)];
         let live_refs = [live(1, 5)];
 
-        let without_anchor = segment_retention_decision(&spans, &live_refs, &[]);
+        let without_anchor =
+            segment_retention_decision(&spans, &live_refs, &[]);
         assert!(without_anchor.is_blocked());
 
         let anchors = [anchor(1, 5)];
-        let with_anchor = segment_retention_decision(&spans, &live_refs, &anchors);
+        let with_anchor =
+            segment_retention_decision(&spans, &live_refs, &anchors);
         assert_eq!(with_anchor, RetentionDecision::Deletable);
 
         // An anchor for a *different* version doesn't discharge this one.
         let wrong_version = [anchor(1, 4)];
-        assert!(segment_retention_decision(&spans, &live_refs, &wrong_version).is_blocked());
+        assert!(
+            segment_retention_decision(&spans, &live_refs, &wrong_version)
+                .is_blocked()
+        );
     }
 
     /// A live snapshot whose stream is entirely absent from the segment never
@@ -409,13 +451,13 @@ mod tests {
     fn seal_stream(id: u64, batches: &[(u64, u32, u64, u64)]) -> SealStream {
         SealStream {
             stream_id: id,
-            batches: batches
+            batches:   batches
                 .iter()
                 .map(|&(v, fc, g, off)| SealBatch {
-                    first_version: v,
-                    frame_count: fc,
+                    first_version:    v,
+                    frame_count:      fc,
                     first_global_pos: g,
-                    offset: off,
+                    offset:           off,
                 })
                 .collect(),
         }
@@ -429,12 +471,12 @@ mod tests {
     fn decide_segment_matches_pure_function_over_real_sidecar() {
         let input = SealInput {
             segment_id: 7,
-            base_pos: 1000,
-            streams: vec![
-                seal_stream(10, &[(0, 3, 1000, 4096), (3, 2, 1003, 8192)]), // versions 0..=4
-                seal_stream(20, &[(0, 1, 1005, 12288)]),                   // version 0..=0
+            base_pos:   1000,
+            streams:    vec![
+                seal_stream(10, &[(0, 3, 1000, 4096), (3, 2, 1003, 8192)]), /* versions 0..=4 */
+                seal_stream(20, &[(0, 1, 1005, 12288)]), // version 0..=0
             ],
-            payloads: None,
+            payloads:   None,
         };
         let bytes = encode_sidecar(&input);
         let seg = SealedSegmentIndex::from_bytes(bytes).unwrap();
@@ -444,16 +486,26 @@ mod tests {
         let live_refs = [live(10, 2)];
         let decision = decide_segment(&seg, &live_refs, &[]);
         assert!(decision.is_blocked());
-        assert_eq!(decision, segment_retention_decision(&spans_for_segment(&seg), &live_refs, &[]));
+        assert_eq!(
+            decision,
+            segment_retention_decision(
+                &spans_for_segment(&seg),
+                &live_refs,
+                &[]
+            )
+        );
 
         // A snapshot on a stream not present in this segment never blocks.
         let unrelated = [live(999, 0)];
-        assert_eq!(decide_segment(&seg, &unrelated, &[]), RetentionDecision::Deletable);
+        assert_eq!(
+            decide_segment(&seg, &unrelated, &[]),
+            RetentionDecision::Deletable
+        );
     }
 
     fn lease(id: &str, min: u64, max: u64) -> BackupLease {
         BackupLease {
-            backup_id: id.to_string(),
+            backup_id:              id.to_string(),
             protect_min_segment_id: min,
             protect_max_segment_id: max,
         }
@@ -479,7 +531,13 @@ mod tests {
         let held = lease_holds(3, &leases);
         assert_eq!(held.len(), 2);
         // segment 6 only in b2.
-        assert_eq!(lease_holds(6, &leases).iter().map(|l| l.backup_id.as_str()).collect::<Vec<_>>(), ["b2"]);
+        assert_eq!(
+            lease_holds(6, &leases)
+                .iter()
+                .map(|l| l.backup_id.as_str())
+                .collect::<Vec<_>>(),
+            ["b2"]
+        );
         // segment 12 in neither.
         assert!(lease_holds(12, &leases).is_empty());
     }
@@ -491,11 +549,12 @@ mod tests {
     fn segment_deletable_respects_active_lease() {
         let input = SealInput {
             segment_id: 5,
-            base_pos: 0,
-            streams: vec![seal_stream(10, &[(0, 1, 0, 4096)])],
-            payloads: None,
+            base_pos:   0,
+            streams:    vec![seal_stream(10, &[(0, 1, 0, 4096)])],
+            payloads:   None,
         };
-        let seg = SealedSegmentIndex::from_bytes(encode_sidecar(&input)).unwrap();
+        let seg =
+            SealedSegmentIndex::from_bytes(encode_sidecar(&input)).unwrap();
 
         // No snapshots, no leases -> deletable.
         assert!(segment_deletable(&seg, &[], &[], &[]));

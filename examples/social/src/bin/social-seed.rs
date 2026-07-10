@@ -28,18 +28,17 @@ fn default_dir() -> PathBuf {
 }
 
 struct Args {
-    dir: PathBuf,
-    seed: u64,
+    dir:   PathBuf,
+    seed:  u64,
     force: bool,
 }
 
 fn print_usage() {
     eprintln!(
-        "Usage: social-seed [--dir PATH] [--seed N] [--force]\n\n\
-         Options:\n  \
-         --dir PATH   store directory to seed (default: {})\n  \
-         --seed N     PRNG seed; same seed -> same corpus (default: 1337)\n  \
-         --force      wipe --dir first if it already holds a store\n",
+        "Usage: social-seed [--dir PATH] [--seed N] [--force]\n\nOptions:\n  \
+         --dir PATH   store directory to seed (default: {})\n  --seed N     \
+         PRNG seed; same seed -> same corpus (default: 1337)\n  --force      \
+         wipe --dir first if it already holds a store\n",
         default_dir().display()
     );
 }
@@ -103,16 +102,13 @@ async fn main() {
     });
     let store = EventStore::new(backend);
 
-    println!(
-        "seeding {} (seed={}) ...",
-        args.dir.display(),
-        args.seed
-    );
+    println!("seeding {} (seed={}) ...", args.dir.display(), args.seed);
     let cfg = SeedConfig { seed: args.seed, ..SeedConfig::default() };
     let report = seed::generate(&store, &cfg).await;
 
     println!(
-        "done in {:.2}s: {} users, {} follows, {} posts, {} likes, {} deletes, {} unfollows",
+        "done in {:.2}s: {} users, {} follows, {} posts, {} likes, {} \
+         deletes, {} unfollows",
         report.elapsed.as_secs_f64(),
         report.users,
         report.follows,

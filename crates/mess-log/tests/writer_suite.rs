@@ -8,8 +8,13 @@ use std::path::{Path, PathBuf};
 
 use mess_log::encode::Subframe;
 use mess_log::format::*;
-use mess_log::runtime::{Fs, FileHandle, OpenOpts, RealRuntime, Runtime, SimRuntime};
-use mess_log::writer::{read_segment_header_epoch, BatchSpec, SegmentParams, SegmentWriter, WriteError};
+use mess_log::runtime::{
+    FileHandle, Fs, OpenOpts, RealRuntime, Runtime, SimRuntime,
+};
+use mess_log::writer::{
+    BatchSpec, SegmentParams, SegmentWriter, WriteError,
+    read_segment_header_epoch,
+};
 
 /// The §4.7 one-frame batch, re-derived through the full write path (same
 /// bytes as `tests/golden.rs` fixture 1 when the segment has `epoch = 1`,
@@ -51,18 +56,30 @@ fn read_all<R: Runtime>(rt: &R, path: &Path, off: u64, len: usize) -> Vec<u8> {
 /// lands the golden bytes at offset 52, and the header epoch reads back.
 fn writer_header_and_batch_golden<R: Runtime>(rt: &R, path: &Path) {
     let fs = rt.fs();
-    let mut w = SegmentWriter::create(&fs, path, SegmentParams::new(1, 0, 1, 0)).unwrap();
+    let mut w =
+        SegmentWriter::create(&fs, path, SegmentParams::new(1, 0, 1, 0))
+            .unwrap();
 
     // SegmentHeader golden at [0, 52).
     let hdr = read_all(rt, path, 0, SEGMENT_HEADER_LEN);
-    assert_eq!(hdr, hx(SEG_HEADER_HEX), "SegmentHeader bytes must match the spec-derived golden");
+    assert_eq!(
+        hdr,
+        hx(SEG_HEADER_HEX),
+        "SegmentHeader bytes must match the spec-derived golden"
+    );
     assert_eq!(read_segment_header_epoch(&hdr), Some(1));
 
     // Append the §4.7 batch; the writer stamps epoch=1, batch_id=0, pos=0.
     let payload: Vec<u8> = (0u8..12).collect();
     let sfs = [Subframe::plain(0x11, 0, 0, &payload)];
     let receipt = w
-        .append(&BatchSpec { stream_id: 0, category_id: 0, first_stream_version: 0, crypto_chain: None, subframes: &sfs })
+        .append(&BatchSpec {
+            stream_id:            0,
+            category_id:          0,
+            first_stream_version: 0,
+            crypto_chain:         None,
+            subframes:            &sfs,
+        })
         .unwrap();
     assert_eq!(receipt.offset, SEGMENT_HEADER_LEN as u64);
     assert_eq!(receipt.total_len, 128);
@@ -71,18 +88,33 @@ fn writer_header_and_batch_golden<R: Runtime>(rt: &R, path: &Path) {
     w.sync().unwrap();
 
     let batch = read_all(rt, path, SEGMENT_HEADER_LEN as u64, 128);
-    assert_eq!(batch, f1_hex(), "batch bytes on disk must match golden fixture 1");
+    assert_eq!(
+        batch,
+        f1_hex(),
+        "batch bytes on disk must match golden fixture 1"
+    );
 }
 
 /// A5: an empty batch is rejected without touching the file offset.
 fn writer_rejects_empty_batch<R: Runtime>(rt: &R, path: &Path) {
     let fs = rt.fs();
-    let mut w = SegmentWriter::create(&fs, path, SegmentParams::new(2, 0, 5, 0)).unwrap();
+    let mut w =
+        SegmentWriter::create(&fs, path, SegmentParams::new(2, 0, 5, 0))
+            .unwrap();
     let empty: [Subframe; 0] = [];
     let err = w
-        .append(&BatchSpec { stream_id: 1, category_id: 0, first_stream_version: 0, crypto_chain: None, subframes: &empty })
+        .append(&BatchSpec {
+            stream_id:            1,
+            category_id:          0,
+            first_stream_version: 0,
+            crypto_chain:         None,
+            subframes:            &empty,
+        })
         .unwrap_err();
-    assert!(matches!(err, WriteError::Encode(mess_log::encode::EncodeError::EmptyBatch)));
+    assert!(matches!(
+        err,
+        WriteError::Encode(mess_log::encode::EncodeError::EmptyBatch)
+    ));
     // Offset unchanged: nothing was written past the header.
     assert_eq!(w.summary().content_len, SEGMENT_HEADER_LEN as u64);
 }
@@ -92,7 +124,9 @@ fn writer_rejects_empty_batch<R: Runtime>(rt: &R, path: &Path) {
 fn writer_position_accounting<R: Runtime>(rt: &R, path: &Path) {
     let fs = rt.fs();
     let base = 1000u64;
-    let mut w = SegmentWriter::create(&fs, path, SegmentParams::new(3, base, 9, 0)).unwrap();
+    let mut w =
+        SegmentWriter::create(&fs, path, SegmentParams::new(3, base, 9, 0))
+            .unwrap();
 
     let p2 = [0u8; 2];
     let s2 = [Subframe::plain(1, 0, 0, &p2), Subframe::plain(1, 0, 0, &p2)]; // 2 frames
@@ -102,9 +136,18 @@ fn writer_position_accounting<R: Runtime>(rt: &R, path: &Path) {
     let r1 = w.append(&spec(&s1)).unwrap();
     let r2 = w.append(&spec(&s2)).unwrap();
 
-    assert_eq!((r0.batch_id, r0.first_global_pos, r0.frame_count), (0, base, 2));
-    assert_eq!((r1.batch_id, r1.first_global_pos, r1.frame_count), (1, base + 2, 1));
-    assert_eq!((r2.batch_id, r2.first_global_pos, r2.frame_count), (2, base + 3, 2));
+    assert_eq!(
+        (r0.batch_id, r0.first_global_pos, r0.frame_count),
+        (0, base, 2)
+    );
+    assert_eq!(
+        (r1.batch_id, r1.first_global_pos, r1.frame_count),
+        (1, base + 2, 1)
+    );
+    assert_eq!(
+        (r2.batch_id, r2.first_global_pos, r2.frame_count),
+        (2, base + 3, 2)
+    );
 
     let sum = w.summary();
     assert_eq!(sum.batch_count, 3);
@@ -140,7 +183,11 @@ fn writer_rolls_on_segment_full<R: Runtime>(rt: &R, p0: &Path, p1: &Path) {
         }
         other => panic!("expected SegmentFull, got {other:?}"),
     }
-    assert_eq!(w.summary(), before, "a rejected append must not advance the writer");
+    assert_eq!(
+        w.summary(),
+        before,
+        "a rejected append must not advance the writer"
+    );
     assert!(!w.would_fit(&spec(&sfs)).unwrap());
 
     // Roll: close p0 unsealed, open p1 continuing the chain.
@@ -164,7 +211,9 @@ fn writer_rolls_on_segment_full<R: Runtime>(rt: &R, p0: &Path, p1: &Path) {
 /// trailer-less segment as the active/unsealed segment (02 §8.3).
 fn writer_close_leaves_unsealed<R: Runtime>(rt: &R, path: &Path) {
     let fs = rt.fs();
-    let mut w = SegmentWriter::create(&fs, path, SegmentParams::new(4, 0, 7, 0)).unwrap();
+    let mut w =
+        SegmentWriter::create(&fs, path, SegmentParams::new(4, 0, 7, 0))
+            .unwrap();
     let payload = [0u8; 12];
     let sfs = [Subframe::plain(1, 0, 0, &payload)];
     w.append(&spec(&sfs)).unwrap();
@@ -176,7 +225,13 @@ fn writer_close_leaves_unsealed<R: Runtime>(rt: &R, path: &Path) {
 }
 
 fn spec<'a, 'p>(subframes: &'a [Subframe<'p>]) -> BatchSpec<'a, 'p> {
-    BatchSpec { stream_id: 1, category_id: 0, first_stream_version: 0, crypto_chain: None, subframes }
+    BatchSpec {
+        stream_id: 1,
+        category_id: 0,
+        first_stream_version: 0,
+        crypto_chain: None,
+        subframes,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -257,7 +312,10 @@ fn real_writer_close_leaves_unsealed() {
 
 #[test]
 fn sim_writer_header_and_batch_golden() {
-    writer_header_and_batch_golden(&SimRuntime::new(1), Path::new("/seg-golden"));
+    writer_header_and_batch_golden(
+        &SimRuntime::new(1),
+        Path::new("/seg-golden"),
+    );
 }
 
 #[test]
@@ -272,10 +330,17 @@ fn sim_writer_position_accounting() {
 
 #[test]
 fn sim_writer_rolls_on_segment_full() {
-    writer_rolls_on_segment_full(&SimRuntime::new(1), Path::new("/seg-roll-0"), Path::new("/seg-roll-1"));
+    writer_rolls_on_segment_full(
+        &SimRuntime::new(1),
+        Path::new("/seg-roll-0"),
+        Path::new("/seg-roll-1"),
+    );
 }
 
 #[test]
 fn sim_writer_close_leaves_unsealed() {
-    writer_close_leaves_unsealed(&SimRuntime::new(1), Path::new("/seg-unsealed"));
+    writer_close_leaves_unsealed(
+        &SimRuntime::new(1),
+        Path::new("/seg-unsealed"),
+    );
 }

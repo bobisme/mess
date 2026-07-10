@@ -9,11 +9,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use mess_index::ActiveIndex;
 use mess_index::active::{BatchEntry, EventPtr};
-use mess_index::sealed::segment::{SealBatch, SealInput, SealStream, SealedSegmentIndex, encode_sidecar};
+use mess_index::sealed::segment::{
+    SealBatch, SealInput, SealStream, SealedSegmentIndex, encode_sidecar,
+};
 use mess_index::sealed::store::{SealedStore, resolve};
 
-/// Build the active index and matching seal input for one segment of `n_streams`
-/// streams, each with `batches_per` contiguous batches of `fc` events.
+/// Build the active index and matching seal input for one segment of
+/// `n_streams` streams, each with `batches_per` contiguous batches of `fc`
+/// events.
 fn build(
     segment_id: u64,
     n_streams: u64,
@@ -27,16 +30,17 @@ fn build(
     // Interleave batches across streams in commit order so the active index and
     // the seal input see the same global ordering.
     let mut per_stream_ver = vec![0u64; n_streams as usize];
-    let mut seal_batches: Vec<Vec<SealBatch>> = vec![Vec::new(); n_streams as usize];
+    let mut seal_batches: Vec<Vec<SealBatch>> =
+        vec![Vec::new(); n_streams as usize];
     for _round in 0..batches_per {
         for s in 0..n_streams {
             let v = per_stream_ver[s as usize];
             let be = BatchEntry {
-                stream_id: s,
+                stream_id:            s,
                 first_stream_version: v,
-                frame_count: fc,
-                first_global_pos: global,
-                ptr: EventPtr { segment_id, offset },
+                frame_count:          fc,
+                first_global_pos:     global,
+                ptr:                  EventPtr { segment_id, offset },
             };
             active.apply_committed(global + u64::from(fc), &[be]);
             seal_batches[s as usize].push(SealBatch {
@@ -51,7 +55,10 @@ fn build(
         }
     }
     let streams_vec: Vec<SealStream> = (0..n_streams)
-        .map(|s| SealStream { stream_id: s, batches: seal_batches[s as usize].clone() })
+        .map(|s| SealStream {
+            stream_id: s,
+            batches:   seal_batches[s as usize].clone(),
+        })
         .collect();
     streams.extend(streams_vec);
     (active, SealInput { segment_id, base_pos: 0, streams, payloads: None })
@@ -68,11 +75,14 @@ fn swap_never_exposes_a_gap() {
     let active = Arc::new(active);
     let last_version = batches_per * u64::from(fc) - 1;
 
-    // Run many swap iterations; each installs a fresh sealed index while readers
-    // hammer resolves. A gap (None for a key that must exist) fails the test.
+    // Run many swap iterations; each installs a fresh sealed index while
+    // readers hammer resolves. A gap (None for a key that must exist) fails
+    // the test.
     for iter in 0..50 {
         let store = Arc::new(SealedStore::new());
-        let index = Arc::new(SealedSegmentIndex::from_bytes(encode_sidecar(&input)).unwrap());
+        let index = Arc::new(
+            SealedSegmentIndex::from_bytes(encode_sidecar(&input)).unwrap(),
+        );
 
         let stop = Arc::new(AtomicBool::new(false));
         let gaps = Arc::new(AtomicU64::new(0));
@@ -86,8 +96,10 @@ fn swap_never_exposes_a_gap() {
             let gaps = gaps.clone();
             let reads = reads.clone();
             readers.push(std::thread::spawn(move || {
-                // Deterministic per-reader probe sequence over (stream, version).
-                let mut seed = 0x9E37_79B9u64.wrapping_mul(r + 1).wrapping_add(iter);
+                // Deterministic per-reader probe sequence over (stream,
+                // version).
+                let mut seed =
+                    0x9E37_79B9u64.wrapping_mul(r + 1).wrapping_add(iter);
                 while !stop.load(Ordering::Relaxed) {
                     seed ^= seed << 13;
                     seed ^= seed >> 7;
@@ -123,7 +135,11 @@ fn swap_never_exposes_a_gap() {
         for h in readers {
             h.join().unwrap();
         }
-        assert_eq!(gaps.load(Ordering::Relaxed), 0, "iter {iter}: reader saw a gap during the swap");
+        assert_eq!(
+            gaps.load(Ordering::Relaxed),
+            0,
+            "iter {iter}: reader saw a gap during the swap"
+        );
     }
 }
 
@@ -134,7 +150,8 @@ fn sealed_resolves_agree_with_active_for_all_keys() {
     // active index it replaced.
     let segment_id = 5u64;
     let (active, input) = build(segment_id, 32, 20, 3);
-    let sealed = SealedSegmentIndex::from_bytes(encode_sidecar(&input)).unwrap();
+    let sealed =
+        SealedSegmentIndex::from_bytes(encode_sidecar(&input)).unwrap();
     let last_version = 20 * 3 - 1;
     for s in 0..32u64 {
         for v in 0..=last_version {

@@ -12,19 +12,19 @@
 //! reads**: a point read seeks one version through the intra-block skip table
 //! (O([`SKIP_K`](crate::sealed::ptr_block::SKIP_K)) varints straight off the
 //! in-memory sidecar bytes) and never materializes the whole block, so caching
-//! the decoded list would only evict genuinely hot replay blocks for no benefit.
-//! Point reads therefore **do not touch this cache** — see
+//! the decoded list would only evict genuinely hot replay blocks for no
+//! benefit. Point reads therefore **do not touch this cache** — see
 //! [`crate::sealed::segment::SealedSegmentIndex::resolve`], which is unchanged.
 //!
 //! # The Phase-5 decompress seam
 //!
 //! Pointer blocks are **uncompressed** until Phase 5, so today "load a block"
-//! is `slice → decode_ptr_block`. Phase 5 inserts a decompress stage between the
-//! slice and the decode (per-category dictionaries, `spikes/perf_compress`).
-//! This cache stores the **post-decode** product — exactly what a decompressed-
-//! block cache holds — so when the decompress stage lands, the cached value and
-//! this API are unchanged; only the miss path inside
-//! [`SealedSegmentIndex::stream_entries`] grows a decompress step.
+//! is `slice → decode_ptr_block`. Phase 5 inserts a decompress stage between
+//! the slice and the decode (per-category dictionaries,
+//! `spikes/perf_compress`). This cache stores the **post-decode** product —
+//! exactly what a decompressed- block cache holds — so when the decompress
+//! stage lands, the cached value and this API are unchanged; only the miss path
+//! inside [`SealedSegmentIndex::stream_entries`] grows a decompress step.
 //!
 //! # Bounding by bytes, not count
 //!
@@ -71,7 +71,8 @@ const BLOCK_OVERHEAD_BYTES: u64 = 64;
 impl Weighter<BlockKey, CachedBlock> for BlockWeighter {
     #[inline]
     fn weight(&self, _key: &BlockKey, val: &CachedBlock) -> u64 {
-        (val.len() * std::mem::size_of::<StreamEntry>()) as u64 + BLOCK_OVERHEAD_BYTES
+        (val.len() * std::mem::size_of::<StreamEntry>()) as u64
+            + BLOCK_OVERHEAD_BYTES
     }
 }
 
@@ -98,18 +99,14 @@ impl std::fmt::Debug for BlockCache {
 
 impl Default for BlockCache {
     /// Disabled — keeps a reader that did not opt in allocation-free.
-    fn default() -> Self {
-        Self::disabled()
-    }
+    fn default() -> Self { Self::disabled() }
 }
 
 impl BlockCache {
     /// The off-switch: stores nothing, always misses. A replay run against a
     /// disabled cache takes the identical decode-every-block path.
     #[must_use]
-    pub fn disabled() -> Self {
-        Self { inner: None }
-    }
+    pub fn disabled() -> Self { Self { inner: None } }
 
     /// An enabled cache holding at most `budget_bytes` of decoded block weight
     /// (clamped to at least one block's worth). `est_blocks` seeds the shard
@@ -118,27 +115,22 @@ impl BlockCache {
     #[must_use]
     pub fn with_budget_bytes(budget_bytes: u64, est_blocks: usize) -> Self {
         let budget = budget_bytes.max(BLOCK_OVERHEAD_BYTES);
-        let cache = Cache::with_weighter(est_blocks.max(1), budget, BlockWeighter);
+        let cache =
+            Cache::with_weighter(est_blocks.max(1), budget, BlockWeighter);
         Self { inner: Some(Arc::new(cache)) }
     }
 
     /// Whether this cache actually stores entries.
     #[must_use]
-    pub fn is_enabled(&self) -> bool {
-        self.inner.is_some()
-    }
+    pub fn is_enabled(&self) -> bool { self.inner.is_some() }
 
     /// Number of live cached blocks (0 when disabled).
     #[must_use]
-    pub fn len(&self) -> usize {
-        self.inner.as_ref().map_or(0, |c| c.len())
-    }
+    pub fn len(&self) -> usize { self.inner.as_ref().map_or(0, |c| c.len()) }
 
     /// Whether the cache holds no blocks.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
 
     /// Current resident weight in bytes (0 when disabled).
     #[must_use]
@@ -148,9 +140,7 @@ impl BlockCache {
 
     /// Cumulative cache hits since creation (0 when disabled).
     #[must_use]
-    pub fn hits(&self) -> u64 {
-        self.inner.as_ref().map_or(0, |c| c.hits())
-    }
+    pub fn hits(&self) -> u64 { self.inner.as_ref().map_or(0, |c| c.hits()) }
 
     /// Cumulative cache misses since creation (0 when disabled).
     #[must_use]
@@ -158,8 +148,8 @@ impl BlockCache {
         self.inner.as_ref().map_or(0, |c| c.misses())
     }
 
-    /// Hit rate over all lookups so far in `[0, 1]`; `0.0` when disabled or when
-    /// nothing has been looked up yet.
+    /// Hit rate over all lookups so far in `[0, 1]`; `0.0` when disabled or
+    /// when nothing has been looked up yet.
     #[must_use]
     pub fn hit_rate(&self) -> f64 {
         let (h, m) = (self.hits(), self.misses());
@@ -176,8 +166,8 @@ impl BlockCache {
     ///
     /// A decode error is returned typed and is **not** cached (the sidecar is
     /// advisory; the log stays truth): the caller can fall back to rebuilding.
-    /// An absent stream caches an empty block, so repeated negative lookups stay
-    /// cheap.
+    /// An absent stream caches an empty block, so repeated negative lookups
+    /// stay cheap.
     pub fn get_or_load(
         &self,
         index: &SealedSegmentIndex,
@@ -201,25 +191,33 @@ impl BlockCache {
 mod tests {
     use super::*;
     use crate::active::EventPtr;
-    use crate::sealed::segment::{SealBatch, SealInput, SealStream, encode_sidecar};
+    use crate::sealed::segment::{
+        SealBatch, SealInput, SealStream, encode_sidecar,
+    };
 
-    fn seg(segment_id: u64, streams: &[(u64, usize)]) -> Arc<SealedSegmentIndex> {
+    fn seg(
+        segment_id: u64,
+        streams: &[(u64, usize)],
+    ) -> Arc<SealedSegmentIndex> {
         let streams = streams
             .iter()
             .map(|&(sid, n)| SealStream {
                 stream_id: sid,
-                batches: (0..n)
+                batches:   (0..n)
                     .map(|i| SealBatch {
-                        first_version: (i * 10) as u64,
-                        frame_count: 10,
+                        first_version:    (i * 10) as u64,
+                        frame_count:      10,
                         first_global_pos: (i * 10) as u64,
-                        offset: 4096 + (i * 512) as u64,
+                        offset:           4096 + (i * 512) as u64,
                     })
                     .collect(),
             })
             .collect();
-        let input = SealInput { segment_id, base_pos: 0, streams, payloads: None };
-        Arc::new(SealedSegmentIndex::from_bytes(encode_sidecar(&input)).unwrap())
+        let input =
+            SealInput { segment_id, base_pos: 0, streams, payloads: None };
+        Arc::new(
+            SealedSegmentIndex::from_bytes(encode_sidecar(&input)).unwrap(),
+        )
     }
 
     #[test]
@@ -261,7 +259,8 @@ mod tests {
     fn byte_budget_evicts() {
         // Budget for ~2 five-batch blocks; loading many distinct streams must
         // keep resident weight under the budget (eviction runs).
-        let per_block = 5 * std::mem::size_of::<StreamEntry>() as u64 + BLOCK_OVERHEAD_BYTES;
+        let per_block = 5 * std::mem::size_of::<StreamEntry>() as u64
+            + BLOCK_OVERHEAD_BYTES;
         let budget = per_block * 2;
         let cache = BlockCache::with_budget_bytes(budget, 2);
         let idx = seg(1, &(0..64).map(|s| (s as u64, 5)).collect::<Vec<_>>());

@@ -72,9 +72,7 @@ impl Instant {
     pub const ORIGIN: Instant = Instant { nanos: 0 };
 
     /// Nanoseconds since the origin.
-    pub fn as_nanos(self) -> u64 {
-        self.nanos
-    }
+    pub fn as_nanos(self) -> u64 { self.nanos }
 
     /// `self + dur`, saturating at `u64::MAX` nanos.
     pub fn saturating_add(self, dur: Duration) -> Instant {
@@ -92,21 +90,31 @@ impl Instant {
 /// (read+write, create) or reopens one for recovery (read).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenOpts {
-    pub read: bool,
-    pub write: bool,
-    pub create: bool,
+    pub read:     bool,
+    pub write:    bool,
+    pub create:   bool,
     pub truncate: bool,
 }
 
 impl OpenOpts {
     /// Create-or-open for the active segment: readable and writable.
     pub fn create_rw() -> Self {
-        OpenOpts { read: true, write: true, create: true, truncate: false }
+        OpenOpts {
+            read:     true,
+            write:    true,
+            create:   true,
+            truncate: false,
+        }
     }
 
     /// Reopen an existing file read-only (recovery scan / sealed reads).
     pub fn read_only() -> Self {
-        OpenOpts { read: true, write: false, create: false, truncate: false }
+        OpenOpts {
+            read:     true,
+            write:    false,
+            create:   false,
+            truncate: false,
+        }
     }
 }
 
@@ -148,7 +156,8 @@ pub trait Fs: Clone {
     /// avoids `remove` on the hot path; this exists for exactly ONE cleanup
     /// (`bn-36y`): a segment whose preallocation ([`FileHandle::allocate`])
     /// failed with `ENOSPC` at roll time must not be left behind as a
-    /// zero-length husk, so [`SegmentWriter::create`](crate::writer::SegmentWriter::create)
+    /// zero-length husk, so
+    /// [`SegmentWriter::create`](crate::writer::SegmentWriter::create)
     /// removes the never-headered file it just opened. The default returns
     /// `Unsupported`; [`RealFs`] and the sim fs override it. Callers of the
     /// cleanup path treat any error as best-effort (the husk carries no
@@ -201,9 +210,7 @@ pub trait FileHandle {
     /// when the reservation cannot be satisfied. The default is a no-op
     /// (`Ok(())`) for handles that do not model space exhaustion; [`RealFile`]
     /// and the sim fs override it (the sim as a fault-injection point).
-    fn allocate(&self, _len: u64) -> io::Result<()> {
-        Ok(())
-    }
+    fn allocate(&self, _len: u64) -> io::Result<()> { Ok(()) }
 }
 
 /// A whole runtime: a [`Clock`], a way to [`spawn`](Runtime::spawn) actor

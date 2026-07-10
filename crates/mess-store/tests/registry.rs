@@ -2,20 +2,21 @@
 //! against the in-memory [`MockBackend`] through the [`Backend`] seam.
 //!
 //! - **Restore-from-bytes-alone (I5 proof).** A fresh [`Registry::bootstrap`]
-//!   over a backend that already holds `$registry` records — built either by
-//!   a live writer or by hand-appending raw `codec_id 0` bytes — resolves
-//!   every name identically to the registry that wrote them, with zero
-//!   carried-over state.
+//!   over a backend that already holds `$registry` records — built either by a
+//!   live writer or by hand-appending raw `codec_id 0` bytes — resolves every
+//!   name identically to the registry that wrote them, with zero carried-over
+//!   state.
 //! - **Bootstrap acyclicity (§7).** Decoding `$registry`'s own records never
 //!   consults a `RegistryState` — proven by bootstrapping directly from
 //!   hand-encoded bytes with no writer-side `Registry` ever having existed.
-//! - **Rename is alias, not mutation (§5).** The old name keeps resolving
-//!   after a `NameAliased`.
+//! - **Rename is alias, not mutation (§5).** The old name keeps resolving after
+//!   a `NameAliased`.
 //! - **REG-rule enforcement.** Registered-before-referenced (REG12),
 //!   no-reserved-reuse (REG2), double-registration (REG14), name rebinding
-//!   (REG16), reserved-alias-target (REG17), and the D-REG-E
-//!   zero-extension rule are all typed-error rejections.
+//!   (REG16), reserved-alias-target (REG17), and the D-REG-E zero-extension
+//!   rule are all typed-error rejections.
 
+use mess_store::Version;
 use mess_store::backend::{Backend, RecordToAppend};
 use mess_store::registry::{
     REGISTRY_EVENT_TYPE_NAME, REGISTRY_STREAM, RESERVED_CATEGORY_ID,
@@ -24,7 +25,6 @@ use mess_store::registry::{
     RegistryRecord, TARGET_KIND_CATEGORY, TARGET_KIND_EVENT_TYPE,
     TARGET_KIND_STREAM,
 };
-use mess_store::Version;
 
 mod common;
 use common::TestBackend;
@@ -165,7 +165,7 @@ async fn bootstrap_from_hand_encoded_bytes_needs_no_prior_registry() {
     // entirely, or hand-crafted for a corruption/compat test.
     let category_record = RegistryRecord::CategoryRegistered {
         category_id: 1,
-        name: "orders".to_string(),
+        name:        "orders".to_string(),
     };
     let payload = category_record.encode();
     assert_eq!(
@@ -182,7 +182,7 @@ async fn bootstrap_from_hand_encoded_bytes_needs_no_prior_registry() {
             Version::NoStream,
             &[RecordToAppend {
                 message_type: REGISTRY_EVENT_TYPE_NAME.to_string(),
-                data: payload,
+                data:         payload,
             }],
         )
         .await
@@ -257,7 +257,10 @@ async fn stream_referencing_unregistered_category_is_rejected() {
         .expect_err("category 999 was never registered");
     assert_eq!(
         err,
-        RegistryError::UnregisteredReference { namespace: "category", id: 999 }
+        RegistryError::UnregisteredReference {
+            namespace: "category",
+            id:        999,
+        }
     );
 }
 
@@ -282,7 +285,10 @@ async fn dict_referencing_unregistered_scope_is_rejected() {
         .expect_err("category 42 was never registered");
     assert_eq!(
         err,
-        RegistryError::UnregisteredReference { namespace: "category", id: 42 }
+        RegistryError::UnregisteredReference {
+            namespace: "category",
+            id:        42,
+        }
     );
 }
 
@@ -296,7 +302,10 @@ async fn alias_of_unregistered_stream_is_rejected() {
         .expect_err("stream 12345 was never registered");
     assert_eq!(
         err,
-        RegistryError::UnregisteredReference { namespace: "stream", id: 12345 }
+        RegistryError::UnregisteredReference {
+            namespace: "stream",
+            id:        12345,
+        }
     );
 }
 
@@ -362,8 +371,8 @@ async fn event_type_alias_with_nonzero_high_bits_is_rejected() {
     let corrupted_target = (u64::from(et)) | (1u64 << 32);
     let record = RegistryRecord::NameAliased {
         target_kind: TARGET_KIND_EVENT_TYPE,
-        target_id: corrupted_target,
-        new_name: "renamed".to_string(),
+        target_id:   corrupted_target,
+        new_name:    "renamed".to_string(),
     };
     let mut state = registry.state().clone();
     let err = state
@@ -384,9 +393,9 @@ async fn registering_reserved_stream_id_is_rejected_at_decode_state_level() {
     let mut state = mess_store::registry::RegistryState::new();
     let err = state
         .apply::<std::convert::Infallible>(RegistryRecord::StreamRegistered {
-            stream_id: RESERVED_STREAM_ID,
+            stream_id:   RESERVED_STREAM_ID,
             category_id: 0,
-            name: "nope".to_string(),
+            name:        "nope".to_string(),
         })
         .expect_err("stream_id 0 must never be registered (REG2)");
     assert_eq!(err, RegistryError::ReservedIdRegistered { record_kind: 0x01 });
@@ -398,18 +407,21 @@ async fn double_registration_of_same_category_id_is_corruption() {
     state
         .apply::<std::convert::Infallible>(RegistryRecord::CategoryRegistered {
             category_id: 1,
-            name: "orders".to_string(),
+            name:        "orders".to_string(),
         })
         .unwrap();
     let err = state
         .apply::<std::convert::Infallible>(RegistryRecord::CategoryRegistered {
             category_id: 1,
-            name: "orders-again".to_string(),
+            name:        "orders-again".to_string(),
         })
         .expect_err("category 1 was already registered (REG14)");
     assert_eq!(
         err,
-        RegistryError::AlreadyRegistered { namespace: "category", id: 1 }
+        RegistryError::AlreadyRegistered {
+            namespace: "category",
+            id:        1,
+        }
     );
 }
 
@@ -435,7 +447,7 @@ async fn rebinding_a_name_to_a_different_id_is_rejected() {
         err,
         RegistryError::NameAlreadyBound {
             namespace: "category",
-            name: "alpha".to_string()
+            name:      "alpha".to_string(),
         }
     );
     // `a` is untouched.
@@ -540,11 +552,8 @@ async fn rejected_registration_never_touches_the_backend_and_never_desyncs_head(
     let mut registry =
         Registry::bootstrap(TestBackend::new()).await.expect("bootstrap");
 
-    let head_before = registry
-        .backend()
-        .head(REGISTRY_STREAM)
-        .await
-        .expect("head read");
+    let head_before =
+        registry.backend().head(REGISTRY_STREAM).await.expect("head read");
 
     // A REG12-violating call: category 999 was never registered.
     let err = registry
@@ -553,17 +562,17 @@ async fn rejected_registration_never_touches_the_backend_and_never_desyncs_head(
         .expect_err("category 999 was never registered");
     assert_eq!(
         err,
-        RegistryError::UnregisteredReference { namespace: "category", id: 999 }
+        RegistryError::UnregisteredReference {
+            namespace: "category",
+            id:        999,
+        }
     );
 
     // REG13: the invalid record must not have been durably appended —
     // $registry is append-only and never compacted (REG4/I1), so any write
     // here would be permanent even though the caller got an `Err`.
-    let head_after_reject = registry
-        .backend()
-        .head(REGISTRY_STREAM)
-        .await
-        .expect("head read");
+    let head_after_reject =
+        registry.backend().head(REGISTRY_STREAM).await.expect("head read");
     assert_eq!(
         head_before, head_after_reject,
         "a rejected record must never be appended to $registry"
@@ -573,10 +582,9 @@ async fn rejected_registration_never_touches_the_backend_and_never_desyncs_head(
     // it must not panic via the D9-conflict branch, which would fire if
     // the earlier failure had advanced the backend without advancing
     // `Registry`'s in-memory head to match.
-    let category_id = registry
-        .register_category("valid")
-        .await
-        .expect("ordinary write after an unrelated validation failure must \
-                 succeed, not panic");
+    let category_id = registry.register_category("valid").await.expect(
+        "ordinary write after an unrelated validation failure must succeed, \
+         not panic",
+    );
     assert_eq!(registry.state().category_name(category_id), Some("valid"));
 }

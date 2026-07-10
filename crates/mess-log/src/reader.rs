@@ -52,7 +52,7 @@ use std::path::{Path, PathBuf};
 
 use crate::format::SEGMENT_HEADER_LEN;
 use crate::runtime::Fs;
-use crate::scanner::{recover_segment, AcceptedBatch};
+use crate::scanner::{AcceptedBatch, recover_segment};
 use crate::watermark::Watermark;
 
 /// The committed prefix of a segment as of one watermark snapshot: exactly
@@ -65,13 +65,13 @@ pub struct CommittedPrefix {
     /// The exclusive durable end this prefix was clamped to — the watermark
     /// value snapshotted at the start of the read. Every served position is
     /// `< watermark`; nothing at or past it is included.
-    pub watermark: u64,
+    pub watermark:   u64,
     /// The segment's base position (`SegmentHeader.base_pos`), i.e. the
     /// position of this prefix's first event. `0` for a fresh segment.
-    pub base_pos: u64,
+    pub base_pos:    u64,
     /// The clamped batches, in on-disk (== position) order. Dense: batch
     /// `i+1` begins exactly where batch `i` ends.
-    pub batches: Vec<AcceptedBatch>,
+    pub batches:     Vec<AcceptedBatch>,
     /// Byte length of the durable prefix: the offset one past the last
     /// served batch (the segment-header length when the prefix is empty).
     /// A caller wanting a bounded `pread` of only committed bytes reads
@@ -81,10 +81,10 @@ pub struct CommittedPrefix {
 
 impl CommittedPrefix {
     /// The position following the last served event: `base_pos` plus the
-    /// events in this prefix. Equal to [`watermark`](CommittedPrefix::watermark)
-    /// whenever the prefix reaches the watermark (the normal case: the
-    /// watermark always sits on a batch boundary), and equal to `base_pos`
-    /// when empty.
+    /// events in this prefix. Equal to
+    /// [`watermark`](CommittedPrefix::watermark) whenever the prefix
+    /// reaches the watermark (the normal case: the watermark always sits on
+    /// a batch boundary), and equal to `base_pos` when empty.
     pub fn next_pos(&self) -> u64 {
         self.batches
             .last()
@@ -93,19 +93,13 @@ impl CommittedPrefix {
     }
 
     /// The number of events (not batches) in the committed prefix.
-    pub fn event_count(&self) -> u64 {
-        self.next_pos() - self.base_pos
-    }
+    pub fn event_count(&self) -> u64 { self.next_pos() - self.base_pos }
 
     /// The number of batches in the committed prefix.
-    pub fn len(&self) -> usize {
-        self.batches.len()
-    }
+    pub fn len(&self) -> usize { self.batches.len() }
 
     /// Whether the committed prefix carries no batches.
-    pub fn is_empty(&self) -> bool {
-        self.batches.is_empty()
-    }
+    pub fn is_empty(&self) -> bool { self.batches.is_empty() }
 }
 
 /// A cheap-to-clone read handle over one active segment, bounded by the
@@ -119,8 +113,8 @@ impl CommittedPrefix {
 /// fault-injecting fs.
 #[derive(Clone)]
 pub struct ReadView<F: Fs> {
-    fs: F,
-    path: PathBuf,
+    fs:        F,
+    path:      PathBuf,
     watermark: Watermark,
 }
 
@@ -134,14 +128,10 @@ impl<F: Fs> ReadView<F> {
 
     /// A clone of the underlying durable watermark — for callers that want
     /// to [`await_past`](Watermark::await_past) a position directly.
-    pub fn watermark(&self) -> Watermark {
-        self.watermark.clone()
-    }
+    pub fn watermark(&self) -> Watermark { self.watermark.clone() }
 
     /// The current durable end (exclusive): the watermark's value now.
-    pub fn durable_end(&self) -> u64 {
-        self.watermark.get()
-    }
+    pub fn durable_end(&self) -> u64 { self.watermark.get() }
 
     /// Snapshot the durable watermark and return the committed prefix below
     /// it. Never returns a batch that reaches into in-flight (at-or-past-
@@ -158,7 +148,10 @@ impl<F: Fs> ReadView<F> {
     /// (`docs/spec/06-subscriptions.md`): a subscriber blocks until the
     /// watermark passes `position`, then reads the now-larger committed
     /// prefix. The returned prefix's watermark is `> position`.
-    pub async fn read_past(&self, position: u64) -> io::Result<CommittedPrefix> {
+    pub async fn read_past(
+        &self,
+        position: u64,
+    ) -> io::Result<CommittedPrefix> {
         self.watermark.await_past(position).await;
         self.read_committed()
     }
@@ -185,38 +178,42 @@ impl<F: Fs> ReadView<F> {
                 break;
             }
         }
-        Ok(CommittedPrefix { watermark: target, base_pos, batches, durable_len })
+        Ok(CommittedPrefix {
+            watermark: target,
+            base_pos,
+            batches,
+            durable_len,
+        })
     }
 }
 
 impl<F: Fs> ReadView<F> {
     /// The segment path this view reads.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
+    pub fn path(&self) -> &Path { &self.path }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
     use crate::committer::{
         AppendOutcome, AppendRequest, Committer, Durability, EventInput,
     };
     use crate::runtime::{RealRuntime, Runtime, SimRuntime};
     use crate::writer::{SegmentParams, SegmentWriter};
-    use std::collections::BTreeMap;
-    use std::path::Path;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Arc;
 
     // Batch `n_events` events for `stream` starting at stream-version
     // `version`; payloads are irrelevant to reader coordination.
     fn req(stream: u64, version: u64, n_events: usize) -> AppendRequest {
         AppendRequest {
-            stream_id: stream,
-            category_id: 0,
+            stream_id:            stream,
+            category_id:          0,
             first_stream_version: version,
-            events: (0..n_events)
+            events:               (0..n_events)
                 .map(|i| EventInput::plain(1, 1, 0, vec![(i as u8) ^ 0x5A; 12]))
                 .collect(),
         }
@@ -248,7 +245,10 @@ mod tests {
     // Assert a snapshot is exactly the committed prefix [base, watermark):
     // dense, position-ordered, clamped to the watermark, and every batch a
     // genuine plan batch with monotone per-stream versions.
-    fn assert_prefix_is_committed(p: &CommittedPrefix, plan: &BTreeMap<(u64, u64), u32>) {
+    fn assert_prefix_is_committed(
+        p: &CommittedPrefix,
+        plan: &BTreeMap<(u64, u64), u32>,
+    ) {
         assert_eq!(p.base_pos, 0, "test segments seed at base_pos 0");
         // Never serve at or past the durable end.
         assert!(
@@ -281,7 +281,10 @@ mod tests {
                         b.stream_id, b.first_stream_version,
                     )
                 });
-            assert_eq!(b.frame_count, frames, "frame count must match the plan");
+            assert_eq!(
+                b.frame_count, frames,
+                "frame count must match the plan"
+            );
             let want_ver = stream_next_ver.entry(b.stream_id).or_insert(0);
             assert_eq!(
                 b.first_stream_version, *want_ver,
@@ -306,7 +309,9 @@ mod tests {
         let rt = SimRuntime::new(1);
         let fs = rt.fs();
         let path = Path::new("/seg-seq");
-        let writer = SegmentWriter::create(&fs, path, SegmentParams::new(0, 0, 1, 0)).unwrap();
+        let writer =
+            SegmentWriter::create(&fs, path, SegmentParams::new(0, 0, 1, 0))
+                .unwrap();
         let prefix = rt.block_on(async {
             let c = Committer::spawn(&rt, writer, Durability::Os);
             let view = ReadView::new(fs.clone(), path, c.watermark());
@@ -344,11 +349,16 @@ mod tests {
             let rt = SimRuntime::new(seed);
             let fs = rt.fs();
             let path = Path::new("/seg-conc");
-            let writer =
-                SegmentWriter::create(&fs, path, SegmentParams::new(0, 0, 1, 0)).unwrap();
+            let writer = SegmentWriter::create(
+                &fs,
+                path,
+                SegmentParams::new(0, 0, 1, 0),
+            )
+            .unwrap();
 
             let (max_seen, final_prefix, final_wm) = rt.block_on(async {
-                let c = Committer::spawn(&rt, writer, Durability::group_default());
+                let c =
+                    Committer::spawn(&rt, writer, Durability::group_default());
                 let view = ReadView::new(fs.clone(), path, c.watermark());
 
                 // Two subscription-style readers, driven by the watermark
@@ -404,7 +414,10 @@ mod tests {
                 (max_seen, final_prefix, final_wm)
             });
 
-            assert_eq!(final_wm, TOTAL_EVENTS, "seed {seed}: all events durable");
+            assert_eq!(
+                final_wm, TOTAL_EVENTS,
+                "seed {seed}: all events durable"
+            );
             assert_prefix_is_committed(&final_prefix, &plan);
             assert_eq!(
                 final_prefix.event_count(),
@@ -417,7 +430,10 @@ mod tests {
                 "seed {seed}: every planned batch is served",
             );
             // Readers observed live growth, not just the final state.
-            assert!(max_seen > 0, "seed {seed}: readers observed committed events");
+            assert!(
+                max_seen > 0,
+                "seed {seed}: readers observed committed events"
+            );
         }
     }
 
@@ -444,9 +460,7 @@ mod tests {
 
     struct Cleanup(PathBuf);
     impl Drop for Cleanup {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
+        fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
     }
 
     #[test]
@@ -461,7 +475,10 @@ mod tests {
         let writer = SegmentWriter::create(
             &fs,
             &path,
-            SegmentParams { segment_size: 64 * 1024 * 1024, ..SegmentParams::new(0, 0, 1, 0) },
+            SegmentParams {
+                segment_size: 64 * 1024 * 1024,
+                ..SegmentParams::new(0, 0, 1, 0)
+            },
         )
         .unwrap();
 
@@ -533,7 +550,8 @@ mod tests {
         let rt = RealRuntime::new();
         let fs = rt.fs();
         let writer =
-            SegmentWriter::create(&fs, &path, SegmentParams::new(0, 0, 1, 0)).unwrap();
+            SegmentWriter::create(&fs, &path, SegmentParams::new(0, 0, 1, 0))
+                .unwrap();
 
         let saw = rt.block_on(async {
             let c = Committer::spawn(&rt, writer, Durability::Os);

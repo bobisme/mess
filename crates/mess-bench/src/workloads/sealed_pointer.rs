@@ -34,11 +34,11 @@ fn build_segment(
             let batches = (0..batches_per_stream)
                 .map(|i| {
                     let b = SealBatch {
-                        first_version: first_version_base
+                        first_version:    first_version_base
                             + (i as u64) * u64::from(FRAMES),
-                        frame_count: FRAMES,
+                        frame_count:      FRAMES,
                         first_global_pos: g,
-                        offset: 4096 + (i as u64) * 512,
+                        offset:           4096 + (i as u64) * 512,
                     };
                     g += u64::from(FRAMES);
                     b
@@ -123,7 +123,8 @@ pub fn run(size: RunSize) -> Vec<Metric> {
     assert_eq!(g_par, g_seq, "global scan: parallel != sequential");
     assert_eq!(global_checksum(&g_par), global_checksum(&g_seq));
 
-    // --- coalesced stream replay (R random streams, each across all segments) ---
+    // --- coalesced stream replay (R random streams, each across all segments)
+    // ---
     let mut rng = Lcg(0x5EED_00B1_1A11_0001);
     let picks: Vec<u64> = (0..r_streams)
         .map(|_| stream_ids[(rng.next_u64() % n_streams) as usize])
@@ -150,8 +151,9 @@ pub fn run(size: RunSize) -> Vec<Metric> {
             g_evps,
             "ev/s",
             format!(
-                "{n_segments}-way parallel per-segment decode, concatenated in base_pos order; \
-                 {total_events} events; byte-identical to sequential; best-of-{reps}"
+                "{n_segments}-way parallel per-segment decode, concatenated \
+                 in base_pos order; {total_events} events; byte-identical to \
+                 sequential; best-of-{reps}"
             ),
         ),
         Metric::new(
@@ -159,8 +161,9 @@ pub fn run(size: RunSize) -> Vec<Metric> {
             s_evps,
             "ev/s",
             format!(
-                "coalesced replay of {r_streams} random streams x {n_segments} segments ({s_events} \
-                 events); byte-identical to sequential; best-of-{reps}"
+                "coalesced replay of {r_streams} random streams x \
+                 {n_segments} segments ({s_events} events); byte-identical to \
+                 sequential; best-of-{reps}"
             ),
         ),
     ]

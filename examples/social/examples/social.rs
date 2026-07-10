@@ -24,8 +24,8 @@ async fn main() -> Result<(), WriteError> {
     // `EventStore` over the composed production engine (`LogEngine`:
     // `mess-log` + `mess-index`). Nothing below this line names the backend —
     // that is the API-first payoff. See `examples/bank/examples/bank.rs`.
-    let dir =
-        std::env::temp_dir().join(format!("mess-social-{}", std::process::id()));
+    let dir = std::env::temp_dir()
+        .join(format!("mess-social-{}", std::process::id()));
     let store = EventStore::new(LogEngine::open(&dir).expect("open engine"));
 
     let alice = Id::new();
@@ -65,10 +65,8 @@ async fn main() -> Result<(), WriteError> {
 
     // Read the folded aggregates straight back — the same replay `command`
     // does internally before it decides.
-    let loaded_alice = store
-        .load::<User>(&user_stream(alice))
-        .await
-        .expect("load alice");
+    let loaded_alice =
+        store.load::<User>(&user_stream(alice)).await.expect("load alice");
     assert!(loaded_alice.state.following.contains(&bob));
     println!(
         "alice's aggregate: handle={:?} following {} user(s)",

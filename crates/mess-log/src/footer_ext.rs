@@ -30,18 +30,18 @@
 
 use crate::fold_chain::Hash;
 use crate::format::*;
-use crate::sealer::{encode_trailer, TrailerFields};
+use crate::sealer::{TrailerFields, encode_trailer};
 
 /// One `StreamHeadEntry` (§3.3.2): the durable Tier-1 head anchor `A(S)` for a
 /// stream with ≥1 committed event in the sealed segment (§5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamHeadEntry {
     /// Interned stream id (`04-registry.md`).
-    pub stream_id: u64,
+    pub stream_id:    u64,
     /// Stream version of the stream's **last** event in this segment.
     pub last_version: u64,
     /// `h[last_version]` — the fold-chain value after that event.
-    pub head_hash: Hash,
+    pub head_hash:    Hash,
 }
 
 /// One `SnapshotAnchor` (§3.3.2): the Path-C retention certificate recorded at
@@ -49,9 +49,9 @@ pub struct StreamHeadEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotAnchor {
     /// Interned stream id (`04-registry.md`).
-    pub stream_id: u64,
+    pub stream_id:  u64,
     /// The snapshot's `stream_version` `v` (0-based last-index).
-    pub version: u64,
+    pub version:    u64,
     /// `h[v]` — the fold-chain value certifying the prefix `0..=v`.
     pub chain_hash: Hash,
 }
@@ -61,7 +61,7 @@ pub struct SnapshotAnchor {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParsedExtension {
     /// `StreamHeadTable` entries (kind `1`), in stored order.
-    pub heads: Vec<StreamHeadEntry>,
+    pub heads:   Vec<StreamHeadEntry>,
     /// `SnapshotAnchorList` entries (kind `2`), in stored order.
     pub anchors: Vec<SnapshotAnchor>,
 }
@@ -85,7 +85,12 @@ fn rd_u64(d: &[u8], o: usize) -> u64 {
     u64::from_le_bytes(d[o..o + 8].try_into().unwrap())
 }
 
-fn push_section_header(buf: &mut Vec<u8>, kind: u16, entry_count: u32, payload_len: u64) {
+fn push_section_header(
+    buf: &mut Vec<u8>,
+    kind: u16,
+    entry_count: u32,
+    payload_len: u64,
+) {
     put_u16(buf, kind); // EXT_KIND_OFF
     put_u16(buf, 0); // EXT_SECTION_FLAGS_OFF — MUST be 0 in v3
     put_u32(buf, entry_count); // EXT_ENTRY_COUNT_OFF
@@ -98,11 +103,19 @@ fn push_section_header(buf: &mut Vec<u8>, kind: u16, entry_count: u32, payload_l
 /// are empty the region is empty (`Vec::new()`), the Phase-3 `ext_len == 0`
 /// shape. `payload_len == entry_count * 48` for each known kind.
 #[must_use]
-pub fn encode_extension(heads: &[StreamHeadEntry], anchors: &[SnapshotAnchor]) -> Vec<u8> {
+pub fn encode_extension(
+    heads: &[StreamHeadEntry],
+    anchors: &[SnapshotAnchor],
+) -> Vec<u8> {
     let mut buf = Vec::new();
     if !heads.is_empty() {
         let payload_len = (heads.len() * EXT_ENTRY_LEN) as u64;
-        push_section_header(&mut buf, EXT_KIND_STREAM_HEAD_TABLE, heads.len() as u32, payload_len);
+        push_section_header(
+            &mut buf,
+            EXT_KIND_STREAM_HEAD_TABLE,
+            heads.len() as u32,
+            payload_len,
+        );
         for e in heads {
             put_u64(&mut buf, e.stream_id);
             put_u64(&mut buf, e.last_version);
@@ -111,7 +124,12 @@ pub fn encode_extension(heads: &[StreamHeadEntry], anchors: &[SnapshotAnchor]) -
     }
     if !anchors.is_empty() {
         let payload_len = (anchors.len() * EXT_ENTRY_LEN) as u64;
-        push_section_header(&mut buf, EXT_KIND_SNAPSHOT_ANCHOR_LIST, anchors.len() as u32, payload_len);
+        push_section_header(
+            &mut buf,
+            EXT_KIND_SNAPSHOT_ANCHOR_LIST,
+            anchors.len() as u32,
+            payload_len,
+        );
         for a in anchors {
             put_u64(&mut buf, a.stream_id);
             put_u64(&mut buf, a.version);
@@ -126,11 +144,7 @@ pub fn encode_extension(heads: &[StreamHeadEntry], anchors: &[SnapshotAnchor]) -
 /// the Phase-3 invariant.
 #[must_use]
 pub fn extension_crc(ext: &[u8]) -> u32 {
-    if ext.is_empty() {
-        0
-    } else {
-        crc32c::crc32c(ext)
-    }
+    if ext.is_empty() { 0 } else { crc32c::crc32c(ext) }
 }
 
 /// Walk the extension region, collecting the known sections and advisory-
@@ -163,9 +177,9 @@ pub fn decode_extension(ext: &[u8]) -> ParsedExtension {
                 }
                 for c in payload.chunks_exact(EXT_ENTRY_LEN) {
                     out.heads.push(StreamHeadEntry {
-                        stream_id: rd_u64(c, 0),
+                        stream_id:    rd_u64(c, 0),
                         last_version: rd_u64(c, 8),
-                        head_hash: c[16..48].try_into().unwrap(),
+                        head_hash:    c[16..48].try_into().unwrap(),
                     });
                 }
             }
@@ -175,8 +189,8 @@ pub fn decode_extension(ext: &[u8]) -> ParsedExtension {
                 }
                 for c in payload.chunks_exact(EXT_ENTRY_LEN) {
                     out.anchors.push(SnapshotAnchor {
-                        stream_id: rd_u64(c, 0),
-                        version: rd_u64(c, 8),
+                        stream_id:  rd_u64(c, 0),
+                        version:    rd_u64(c, 8),
                         chain_hash: c[16..48].try_into().unwrap(),
                     });
                 }
@@ -194,11 +208,11 @@ pub fn decode_extension(ext: &[u8]) -> ParsedExtension {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SealSummary {
     /// MUST equal the `SegmentHeader.segment_id`.
-    pub segment_id: u64,
+    pub segment_id:  u64,
     /// The A9 epoch (R3), MUST equal the header's `epoch`.
-    pub epoch: u64,
+    pub epoch:       u64,
     /// MUST equal the header's `base_pos`.
-    pub base_pos: u64,
+    pub base_pos:    u64,
     /// Number of accepted batches in the segment.
     pub batch_count: u64,
     /// Total events (Σ `frame_count`) in the segment.
@@ -243,7 +257,10 @@ pub fn encode_sealed_footer(
 /// entry from the latest sealed segment that lists the stream (§5.2); a caller
 /// scanning newest-first takes the first hit.
 #[must_use]
-pub fn head_anchor_for(ext: &ParsedExtension, stream_id: u64) -> Option<(u64, Hash)> {
+pub fn head_anchor_for(
+    ext: &ParsedExtension,
+    stream_id: u64,
+) -> Option<(u64, Hash)> {
     ext.heads
         .iter()
         .find(|e| e.stream_id == stream_id)
@@ -267,13 +284,28 @@ mod tests {
     #[test]
     fn heads_and_anchors_roundtrip() {
         let heads = vec![
-            StreamHeadEntry { stream_id: 7, last_version: 49, head_hash: genesis(7) },
-            StreamHeadEntry { stream_id: 9, last_version: 3, head_hash: genesis(9) },
+            StreamHeadEntry {
+                stream_id:    7,
+                last_version: 49,
+                head_hash:    genesis(7),
+            },
+            StreamHeadEntry {
+                stream_id:    9,
+                last_version: 3,
+                head_hash:    genesis(9),
+            },
         ];
-        let anchors = vec![SnapshotAnchor { stream_id: 7, version: 19, chain_hash: genesis(7) }];
+        let anchors = vec![SnapshotAnchor {
+            stream_id:  7,
+            version:    19,
+            chain_hash: genesis(7),
+        }];
         let ext = encode_extension(&heads, &anchors);
         // payload_len == entry_count * 48 for each section, plus two headers.
-        assert_eq!(ext.len(), EXT_SECTION_HDR_LEN * 2 + (2 + 1) * EXT_ENTRY_LEN);
+        assert_eq!(
+            ext.len(),
+            EXT_SECTION_HDR_LEN * 2 + (2 + 1) * EXT_ENTRY_LEN
+        );
         let parsed = decode_extension(&ext);
         assert_eq!(parsed.heads, heads);
         assert_eq!(parsed.anchors, anchors);
@@ -284,14 +316,21 @@ mod tests {
     #[test]
     fn unknown_section_kind_is_skipped() {
         // Build: [unknown kind 999 with 16-byte payload][StreamHeadTable].
-        let heads = vec![StreamHeadEntry { stream_id: 1, last_version: 0, head_hash: [0xAB; 32] }];
+        let heads = vec![StreamHeadEntry {
+            stream_id:    1,
+            last_version: 0,
+            head_hash:    [0xAB; 32],
+        }];
         let known = encode_extension(&heads, &[]);
         let mut ext = Vec::new();
         push_section_header(&mut ext, 999, 0, 16);
         ext.extend_from_slice(&[0xEE; 16]);
         ext.extend_from_slice(&known);
         let parsed = decode_extension(&ext);
-        assert_eq!(parsed.heads, heads, "known section after an unknown one is still read");
+        assert_eq!(
+            parsed.heads, heads,
+            "known section after an unknown one is still read"
+        );
     }
 
     #[test]
@@ -306,7 +345,11 @@ mod tests {
 
     #[test]
     fn sealed_footer_locates_and_covers_the_extension() {
-        let heads = vec![StreamHeadEntry { stream_id: 7, last_version: 49, head_hash: [0x11; 32] }];
+        let heads = vec![StreamHeadEntry {
+            stream_id:    7,
+            last_version: 49,
+            head_hash:    [0x11; 32],
+        }];
         let content_len = SEGMENT_HEADER_LEN as u64 + 500;
         let summary = SealSummary {
             segment_id: 7,
@@ -323,7 +366,8 @@ mod tests {
         assert_eq!(t.ext_len as usize, ext_bytes.len());
         assert_eq!(t.ext_crc, crc32c::crc32c(ext_bytes));
         // The trailer decodes and its locator fields point at the extension.
-        let cat = decode_trailer(&footer[footer.len() - SEGMENT_TRAILER_LEN..]).unwrap();
+        let cat = decode_trailer(&footer[footer.len() - SEGMENT_TRAILER_LEN..])
+            .unwrap();
         assert_eq!(cat.ext_offset, content_len);
         assert_eq!(cat.ext_len as usize, ext_bytes.len());
         assert_eq!(cat.ext_crc, t.ext_crc);

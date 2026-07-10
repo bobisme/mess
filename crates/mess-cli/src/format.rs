@@ -23,7 +23,11 @@ impl Format {
     /// (`None` if unset); `json_shorthand` is the hidden `--json` alias.
     /// `is_tty` is whether stdout is a terminal.
     #[must_use]
-    pub fn resolve(flag: Option<Format>, json_shorthand: bool, is_tty: bool) -> Format {
+    pub fn resolve(
+        flag: Option<Format>,
+        json_shorthand: bool,
+        is_tty: bool,
+    ) -> Format {
         if json_shorthand {
             return Format::Json;
         }
@@ -58,7 +62,9 @@ impl Format {
 pub fn render(report: &Report, format: Format) -> String {
     match format {
         Format::Json => serde_json::to_string_pretty(&report.to_json())
-            .unwrap_or_else(|e| format!("{{\"error\":\"json render failed: {e}\"}}")),
+            .unwrap_or_else(|e| {
+                format!("{{\"error\":\"json render failed: {e}\"}}")
+            }),
         Format::Text => report.to_text(),
         Format::Pretty => report.to_pretty(),
     }

@@ -7,14 +7,13 @@
 //!   five [`RegistryRecord`](codec::RegistryRecord) shapes, byte-exact,
 //!   golden-tested against the spec's §3.9 worked example.
 //! - [`state`] — [`RegistryState`], the pure replay/apply state machine
-//!   (§4-§7): id<->name maps, the dictionary table, and the four
-//!   high-water marks, built by folding decoded records with no backend
-//!   dependency at all.
-//! - This module — [`Registry`], the async wrapper that drives `state`
-//!   against a live [`Backend`]: [`Registry::bootstrap`] replays `$registry`
-//!   from genesis (§7.2 step 2), and the `register_*`/`alias_*` methods are
-//!   the writer-assigned allocation path (§4.1) that appends new records and
-//!   folds them into the same state on success.
+//!   (§4-§7): id<->name maps, the dictionary table, and the four high-water
+//!   marks, built by folding decoded records with no backend dependency at all.
+//! - This module — [`Registry`], the async wrapper that drives `state` against
+//!   a live [`Backend`]: [`Registry::bootstrap`] replays `$registry` from
+//!   genesis (§7.2 step 2), and the `register_*`/`alias_*` methods are the
+//!   writer-assigned allocation path (§4.1) that appends new records and folds
+//!   them into the same state on success.
 //!
 //! # Bootstrap acyclicity (§7, the first acceptance criterion)
 //!
@@ -103,8 +102,8 @@ pub async fn replay<B: Backend>(
 /// [`AppendError::Conflict`] from the backend, same as any other stream.
 pub struct Registry<B: Backend> {
     backend: B,
-    state: RegistryState,
-    head: Version,
+    state:   RegistryState,
+    head:    Version,
 }
 
 impl<B: Backend> Registry<B> {
@@ -123,14 +122,10 @@ impl<B: Backend> Registry<B> {
     /// The materialized state (id<->name maps, dictionary table, high-water
     /// marks) — read-only access for resolution.
     #[must_use]
-    pub fn state(&self) -> &RegistryState {
-        &self.state
-    }
+    pub fn state(&self) -> &RegistryState { &self.state }
 
     /// Borrow the underlying backend.
-    pub fn backend(&self) -> &B {
-        &self.backend
-    }
+    pub fn backend(&self) -> &B { &self.backend }
 
     /// Append one already-built [`RegistryRecord`] to `$registry` at the
     /// current head, then fold it into `state` on success. `state.apply`
@@ -178,9 +173,9 @@ impl<B: Backend> Registry<B> {
                 // loudly rather than silently mismodeling it as a REG
                 // violation.
                 AppendError::Conflict { expected, actual } => panic!(
-                    "concurrent write to $registry detected (D9 \
-                     violation): expected version {expected:?}, actual \
-                     {actual:?} — $registry must have exactly one writer"
+                    "concurrent write to $registry detected (D9 violation): \
+                     expected version {expected:?}, actual {actual:?} — \
+                     $registry must have exactly one writer"
                 ),
                 AppendError::Backend(e) => RegistryError::Backend(e),
             })?;
@@ -277,8 +272,8 @@ impl<B: Backend> Registry<B> {
     ) -> Result<(), RegistryError<B::Error>> {
         self.append(RegistryRecord::NameAliased {
             target_kind: TARGET_KIND_STREAM,
-            target_id: stream_id,
-            new_name: new_name.into(),
+            target_id:   stream_id,
+            new_name:    new_name.into(),
         })
         .await
     }
@@ -291,8 +286,8 @@ impl<B: Backend> Registry<B> {
     ) -> Result<(), RegistryError<B::Error>> {
         self.append(RegistryRecord::NameAliased {
             target_kind: TARGET_KIND_CATEGORY,
-            target_id: category_id,
-            new_name: new_name.into(),
+            target_id:   category_id,
+            new_name:    new_name.into(),
         })
         .await
     }
@@ -306,8 +301,8 @@ impl<B: Backend> Registry<B> {
     ) -> Result<(), RegistryError<B::Error>> {
         self.append(RegistryRecord::NameAliased {
             target_kind: TARGET_KIND_EVENT_TYPE,
-            target_id: u64::from(event_type_id),
-            new_name: new_name.into(),
+            target_id:   u64::from(event_type_id),
+            new_name:    new_name.into(),
         })
         .await
     }

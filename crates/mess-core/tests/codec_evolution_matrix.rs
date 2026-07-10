@@ -14,7 +14,8 @@
 //! Cells:
 //!   Ok           — decode succeeded AND values match semantic expectation
 //!   Error        — decode failed loudly (acceptable: caller sees a problem)
-//!   SilentWrong  — decode succeeded but data is garbage/swapped (disqualifying)
+//!   SilentWrong  — decode succeeded but data is garbage/swapped
+//! (disqualifying)
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -130,9 +131,9 @@ where
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 struct V1 {
-    id: u32,
-    name: String,
-    count: u32,
+    id:     u32,
+    name:   String,
+    count:  u32,
     active: bool,
 }
 
@@ -140,23 +141,24 @@ fn v1_sample() -> V1 {
     V1 { id: 7, name: "alice".into(), count: 42, active: true }
 }
 
-// (a) added Option field (no serde attribute; serde treats missing Option as None)
+// (a) added Option field (no serde attribute; serde treats missing Option as
+// None)
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 struct V2AddedOption {
-    id: u32,
-    name: String,
-    count: u32,
+    id:     u32,
+    name:   String,
+    count:  u32,
     active: bool,
-    note: Option<String>,
+    note:   Option<String>,
 }
 
 // (b) added field with #[serde(default)]
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 struct V2AddedDefault {
-    id: u32,
-    name: String,
-    count: u32,
-    active: bool,
+    id:      u32,
+    name:    String,
+    count:   u32,
+    active:  bool,
     #[serde(default)]
     retries: u32,
 }
@@ -164,17 +166,17 @@ struct V2AddedDefault {
 // (c) removed field (`count` dropped)
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 struct V2Removed {
-    id: u32,
-    name: String,
+    id:     u32,
+    name:   String,
     active: bool,
 }
 
 // (d) renamed field (`name` -> `title`, no #[serde(rename)])
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 struct V2Renamed {
-    id: u32,
-    title: String,
-    count: u32,
+    id:     u32,
+    title:  String,
+    count:  u32,
     active: bool,
 }
 
@@ -183,19 +185,19 @@ struct V2Renamed {
 //      decode succeeds with width/height silently swapped.
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 struct V1Dims {
-    id: u32,
-    name: String,
-    width: u32,
+    id:     u32,
+    name:   String,
+    width:  u32,
     height: u32,
     active: bool,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 struct V2DimsSwapped {
-    id: u32,
-    name: String,
+    id:     u32,
+    name:   String,
     height: u32, // declaration order swapped vs V1Dims
-    width: u32,
+    width:  u32,
     active: bool,
 }
 
@@ -203,18 +205,18 @@ struct V2DimsSwapped {
 //      String where a u32 was, etc. Usually errors (by luck, not by design).
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 struct V2ReorderedMixed {
-    count: u32,
-    id: u32,
-    name: String,
+    count:  u32,
+    id:     u32,
+    name:   String,
     active: bool,
 }
 
 // (h) int widened u32 -> u64 (`count`)
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 struct V2Widened {
-    id: u32,
-    name: String,
-    count: u64,
+    id:     u32,
+    name:   String,
+    count:  u64,
     active: bool,
 }
 
@@ -258,11 +260,11 @@ fn run_matrix() -> Vec<ScenarioResult> {
                 c,
                 &v1_sample(),
                 &V2AddedOption {
-                    id: 7,
-                    name: "alice".into(),
-                    count: 42,
+                    id:     7,
+                    name:   "alice".into(),
+                    count:  42,
                     active: true,
-                    note: None,
+                    note:   None,
                 },
             )
         }),
@@ -271,10 +273,10 @@ fn run_matrix() -> Vec<ScenarioResult> {
                 c,
                 &v1_sample(),
                 &V2AddedDefault {
-                    id: 7,
-                    name: "alice".into(),
-                    count: 42,
-                    active: true,
+                    id:      7,
+                    name:    "alice".into(),
+                    count:   42,
+                    active:  true,
                     retries: 0,
                 },
             )
@@ -292,9 +294,9 @@ fn run_matrix() -> Vec<ScenarioResult> {
                 c,
                 &v1_sample(),
                 &V2Renamed {
-                    id: 7,
-                    title: "alice".into(),
-                    count: 42,
+                    id:     7,
+                    title:  "alice".into(),
+                    count:  42,
                     active: true,
                 },
             )
@@ -303,17 +305,17 @@ fn run_matrix() -> Vec<ScenarioResult> {
             check(
                 c,
                 &V1Dims {
-                    id: 7,
-                    name: "alice".into(),
-                    width: 1920,
+                    id:     7,
+                    name:   "alice".into(),
+                    width:  1920,
                     height: 1080,
                     active: true,
                 },
                 &V2DimsSwapped {
-                    id: 7,
-                    name: "alice".into(),
+                    id:     7,
+                    name:   "alice".into(),
                     height: 1080,
-                    width: 1920,
+                    width:  1920,
                     active: true,
                 },
             )
@@ -323,9 +325,9 @@ fn run_matrix() -> Vec<ScenarioResult> {
                 c,
                 &v1_sample(),
                 &V2ReorderedMixed {
-                    count: 42,
-                    id: 7,
-                    name: "alice".into(),
+                    count:  42,
+                    id:     7,
+                    name:   "alice".into(),
                     active: true,
                 },
             )
@@ -341,9 +343,9 @@ fn run_matrix() -> Vec<ScenarioResult> {
                 c,
                 &v1_sample(),
                 &V2Widened {
-                    id: 7,
-                    name: "alice".into(),
-                    count: 42,
+                    id:     7,
+                    name:   "alice".into(),
+                    count:  42,
                     active: true,
                 },
             )

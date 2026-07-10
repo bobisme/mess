@@ -1,15 +1,17 @@
 //! Adversarial conformance suite for the recovery scanner (bn-39n).
 //!
 //! Every case drives [`recover_segment`] through the runtime [`Fs`] seam on the
-//! **sim fault fs** — that is the conformance mechanism. Fixtures are built with
-//! the real [`SegmentWriter`]/[`BatchEncoder`] and then either mutated (byte
-//! corruption classes) or crashed through the fault media (torn-tail /
-//! sector-reorder classes), so the bytes are current spec-v3, not the spikes' v1.
+//! **sim fault fs** — that is the conformance mechanism. Fixtures are built
+//! with the real [`SegmentWriter`]/[`BatchEncoder`] and then either mutated
+//! (byte corruption classes) or crashed through the fault media (torn-tail /
+//! sector-reorder classes), so the bytes are current spec-v3, not the spikes'
+//! v1.
 //!
 //! Coverage:
-//! - the 19 deterministic edge cases ported from `spikes/crash_log` (§2, A1–A5);
-//! - the A9 stale-generation and A10 resync-bait cases from
-//!   `spikes/torn_write` (§3, §5);
+//! - the 19 deterministic edge cases ported from `spikes/crash_log` (§2,
+//!   A1–A5);
+//! - the A9 stale-generation and A10 resync-bait cases from `spikes/torn_write`
+//!   (§3, §5);
 //! - re-recovery idempotence (§1 / formal-model property 4).
 
 use std::path::Path;
@@ -19,7 +21,9 @@ use mess_log::format::*;
 use mess_log::runtime::{
     CrashPlan, Fault, FileHandle, Fs, OpenOpts, SectorPlan, SimFs, TailPlan,
 };
-use mess_log::scanner::{recover_segment, recover_segment_anchored, EpochAnchor, ScanStop};
+use mess_log::scanner::{
+    EpochAnchor, ScanStop, recover_segment, recover_segment_anchored,
+};
 use mess_log::writer::{BatchSpec, SegmentParams, SegmentWriter};
 
 // ---------------------------------------------------------------------------
@@ -28,14 +32,18 @@ use mess_log::writer::{BatchSpec, SegmentParams, SegmentWriter};
 
 /// A batch description the writer will stamp epoch/batch_id/pos onto.
 struct Batch {
-    stream_id: u64,
-    category_id: u64,
+    stream_id:            u64,
+    category_id:          u64,
     first_stream_version: u64,
-    payloads: Vec<Vec<u8>>,
+    payloads:             Vec<Vec<u8>>,
 }
 
 impl Batch {
-    fn new(stream_id: u64, first_stream_version: u64, payloads: &[&[u8]]) -> Self {
+    fn new(
+        stream_id: u64,
+        first_stream_version: u64,
+        payloads: &[&[u8]],
+    ) -> Self {
         Batch {
             stream_id,
             category_id: 100 + stream_id,
@@ -60,20 +68,21 @@ fn read_all(fs: &SimFs, path: &Path) -> Vec<u8> {
 fn build_segment(epoch: u64, base_pos: u64, batches: &[Batch]) -> Vec<u8> {
     let fs = SimFs::new(Fault::SECTOR_512);
     let path = Path::new("build.seg");
-    let mut w =
-        SegmentWriter::create(&fs, path, SegmentParams::new(1, base_pos, epoch, 0)).unwrap();
+    let mut w = SegmentWriter::create(
+        &fs,
+        path,
+        SegmentParams::new(1, base_pos, epoch, 0),
+    )
+    .unwrap();
     for b in batches {
-        let sfs: Vec<Subframe> = b
-            .payloads
-            .iter()
-            .map(|p| Subframe::plain(0x11, 0, 0, p))
-            .collect();
+        let sfs: Vec<Subframe> =
+            b.payloads.iter().map(|p| Subframe::plain(0x11, 0, 0, p)).collect();
         w.append(&BatchSpec {
-            stream_id: b.stream_id,
-            category_id: b.category_id,
+            stream_id:            b.stream_id,
+            category_id:          b.category_id,
             first_stream_version: b.first_stream_version,
-            crypto_chain: None,
-            subframes: &sfs,
+            crypto_chain:         None,
+            subframes:            &sfs,
         })
         .unwrap();
     }
@@ -92,7 +101,8 @@ fn encode_batch(
     first_stream_version: u64,
     payloads: &[&[u8]],
 ) -> Vec<u8> {
-    let sfs: Vec<Subframe> = payloads.iter().map(|p| Subframe::plain(0x11, 0, 0, p)).collect();
+    let sfs: Vec<Subframe> =
+        payloads.iter().map(|p| Subframe::plain(0x11, 0, 0, p)).collect();
     let mut enc = BatchEncoder::new();
     enc.encode(&BatchInput {
         segment_epoch: epoch,
@@ -325,22 +335,28 @@ fn c14_insane_total_len() {
 fn c15_crash_mid_header() {
     let fs = SimFs::new(Fault::Tail);
     let path = Path::new("seg");
-    let mut w = SegmentWriter::create(&fs, path, SegmentParams::new(1, 0, 1, 0)).unwrap();
+    let mut w =
+        SegmentWriter::create(&fs, path, SegmentParams::new(1, 0, 1, 0))
+            .unwrap();
     let p0 = b"alpha".to_vec();
     let p1 = b"bravo-longer".to_vec();
-    let sfs = [Subframe::plain(0x11, 0, 0, &p0), Subframe::plain(0x11, 0, 0, &p1)];
+    let sfs =
+        [Subframe::plain(0x11, 0, 0, &p0), Subframe::plain(0x11, 0, 0, &p1)];
     w.append(&BatchSpec {
-        stream_id: 0,
-        category_id: 100,
+        stream_id:            0,
+        category_id:          100,
         first_stream_version: 0,
-        crypto_chain: None,
-        subframes: &sfs,
+        crypto_chain:         None,
+        subframes:            &sfs,
     })
     .unwrap();
     // Header fdatasync'd (synced == 52); the batch pwrite is unsynced. Keep
     // only 36 more bytes: the batch header is torn.
-    fs.crash(path, CrashPlan::Tail(TailPlan { keep: B0_OFF + 36, scramble: vec![] }))
-        .unwrap();
+    fs.crash(
+        path,
+        CrashPlan::Tail(TailPlan { keep: B0_OFF + 36, scramble: vec![] }),
+    )
+    .unwrap();
     let rec = recover_segment(&fs, path).unwrap();
     assert!(rec.accepted.is_empty());
     assert_eq!(rec.stop, ScanStop::TornHeader);
@@ -352,20 +368,29 @@ fn c15_crash_mid_header() {
 fn c16_crash_mid_frames() {
     let fs = SimFs::new(Fault::Tail);
     let path = Path::new("seg");
-    let mut w = SegmentWriter::create(&fs, path, SegmentParams::new(1, 0, 1, 0)).unwrap();
+    let mut w =
+        SegmentWriter::create(&fs, path, SegmentParams::new(1, 0, 1, 0))
+            .unwrap();
     let p0 = b"alpha".to_vec();
     let p1 = b"bravo-longer".to_vec();
-    let sfs = [Subframe::plain(0x11, 0, 0, &p0), Subframe::plain(0x11, 0, 0, &p1)];
+    let sfs =
+        [Subframe::plain(0x11, 0, 0, &p0), Subframe::plain(0x11, 0, 0, &p1)];
     w.append(&BatchSpec {
-        stream_id: 0,
-        category_id: 100,
+        stream_id:            0,
+        category_id:          100,
         first_stream_version: 0,
-        crypto_chain: None,
-        subframes: &sfs,
+        crypto_chain:         None,
+        subframes:            &sfs,
     })
     .unwrap();
-    fs.crash(path, CrashPlan::Tail(TailPlan { keep: B0_OFF + HEADER_LEN + 6, scramble: vec![] }))
-        .unwrap();
+    fs.crash(
+        path,
+        CrashPlan::Tail(TailPlan {
+            keep:     B0_OFF + HEADER_LEN + 6,
+            scramble: vec![],
+        }),
+    )
+    .unwrap();
     let rec = recover_segment(&fs, path).unwrap();
     assert!(rec.accepted.is_empty());
     assert_eq!(rec.stop, ScanStop::Incomplete);
@@ -377,20 +402,29 @@ fn c17_crash_mid_marker() {
     let len = b0_len();
     let fs = SimFs::new(Fault::Tail);
     let path = Path::new("seg");
-    let mut w = SegmentWriter::create(&fs, path, SegmentParams::new(1, 0, 1, 0)).unwrap();
+    let mut w =
+        SegmentWriter::create(&fs, path, SegmentParams::new(1, 0, 1, 0))
+            .unwrap();
     let p0 = b"alpha".to_vec();
     let p1 = b"bravo-longer".to_vec();
-    let sfs = [Subframe::plain(0x11, 0, 0, &p0), Subframe::plain(0x11, 0, 0, &p1)];
+    let sfs =
+        [Subframe::plain(0x11, 0, 0, &p0), Subframe::plain(0x11, 0, 0, &p1)];
     w.append(&BatchSpec {
-        stream_id: 0,
-        category_id: 100,
+        stream_id:            0,
+        category_id:          100,
         first_stream_version: 0,
-        crypto_chain: None,
-        subframes: &sfs,
+        crypto_chain:         None,
+        subframes:            &sfs,
     })
     .unwrap();
-    fs.crash(path, CrashPlan::Tail(TailPlan { keep: B0_OFF + len - 5, scramble: vec![] }))
-        .unwrap();
+    fs.crash(
+        path,
+        CrashPlan::Tail(TailPlan {
+            keep:     B0_OFF + len - 5,
+            scramble: vec![],
+        }),
+    )
+    .unwrap();
     let rec = recover_segment(&fs, path).unwrap();
     assert!(rec.accepted.is_empty());
     assert_eq!(rec.stop, ScanStop::Incomplete);
@@ -404,20 +438,26 @@ fn c18_crash_after_marker_before_fsync() {
     let build = |keep: usize| {
         let fs = SimFs::new(Fault::Tail);
         let path = Path::new("seg");
-        let mut w = SegmentWriter::create(&fs, path, SegmentParams::new(1, 0, 1, 0)).unwrap();
+        let mut w =
+            SegmentWriter::create(&fs, path, SegmentParams::new(1, 0, 1, 0))
+                .unwrap();
         let p0 = b"alpha".to_vec();
         let p1 = b"bravo-longer".to_vec();
-        let sfs = [Subframe::plain(0x11, 0, 0, &p0), Subframe::plain(0x11, 0, 0, &p1)];
+        let sfs = [
+            Subframe::plain(0x11, 0, 0, &p0),
+            Subframe::plain(0x11, 0, 0, &p1),
+        ];
         w.append(&BatchSpec {
-            stream_id: 0,
-            category_id: 100,
+            stream_id:            0,
+            category_id:          100,
             first_stream_version: 0,
-            crypto_chain: None,
-            subframes: &sfs,
+            crypto_chain:         None,
+            subframes:            &sfs,
         })
         .unwrap();
         // No sync after append: the batch is unacknowledged.
-        fs.crash(path, CrashPlan::Tail(TailPlan { keep, scramble: vec![] })).unwrap();
+        fs.crash(path, CrashPlan::Tail(TailPlan { keep, scramble: vec![] }))
+            .unwrap();
         recover_segment(&fs, path).unwrap()
     };
 
@@ -439,32 +479,38 @@ fn c19_crash_after_fsync() {
     let len0 = b0_len();
     let fs = SimFs::new(Fault::Tail);
     let path = Path::new("seg");
-    let mut w = SegmentWriter::create(&fs, path, SegmentParams::new(1, 0, 1, 0)).unwrap();
+    let mut w =
+        SegmentWriter::create(&fs, path, SegmentParams::new(1, 0, 1, 0))
+            .unwrap();
     let p0 = b"alpha".to_vec();
     let p1 = b"bravo-longer".to_vec();
-    let sfs0 = [Subframe::plain(0x11, 0, 0, &p0), Subframe::plain(0x11, 0, 0, &p1)];
+    let sfs0 =
+        [Subframe::plain(0x11, 0, 0, &p0), Subframe::plain(0x11, 0, 0, &p1)];
     w.append(&BatchSpec {
-        stream_id: 0,
-        category_id: 100,
+        stream_id:            0,
+        category_id:          100,
         first_stream_version: 0,
-        crypto_chain: None,
-        subframes: &sfs0,
+        crypto_chain:         None,
+        subframes:            &sfs0,
     })
     .unwrap();
     w.sync().unwrap(); // batch0 ACKED (synced == 52 + len0)
     let p2 = b"charlie".to_vec();
     let sfs1 = [Subframe::plain(0x11, 0, 0, &p2)];
     w.append(&BatchSpec {
-        stream_id: 0,
-        category_id: 100,
+        stream_id:            0,
+        category_id:          100,
         first_stream_version: 2,
-        crypto_chain: None,
-        subframes: &sfs1,
+        crypto_chain:         None,
+        subframes:            &sfs1,
     })
     .unwrap();
     // Crash keeping only the acked prefix: batch1 lost.
-    fs.crash(path, CrashPlan::Tail(TailPlan { keep: B0_OFF + len0, scramble: vec![] }))
-        .unwrap();
+    fs.crash(
+        path,
+        CrashPlan::Tail(TailPlan { keep: B0_OFF + len0, scramble: vec![] }),
+    )
+    .unwrap();
     let rec = recover_segment(&fs, path).unwrap();
     assert_eq!(rec.accepted.len(), 1, "acked batch0 must recover");
     assert_eq!(rec.accepted[0].batch_id, 0);
@@ -498,7 +544,10 @@ fn a9_stale_generation_at_coincident_position_rejected() {
     recycled.extend_from_slice(&stale);
 
     let rec = recover_image(recycled);
-    assert!(rec.accepted.is_empty(), "the stale prior-generation batch must be rejected");
+    assert!(
+        rec.accepted.is_empty(),
+        "the stale prior-generation batch must be rejected"
+    );
     assert_eq!(rec.stop, ScanStop::EpochMismatch);
     assert_eq!(rec.safe_offset, SEGMENT_HEADER_LEN as u64);
     assert_eq!(rec.next_pos, base_pos);
@@ -536,7 +585,8 @@ fn a9_anchor_newer_than_header_yields_no_batches() {
     // With an anchor naming epoch 6 (the manifest/predecessor knows the segment
     // was rolled to a newer generation whose header did not survive here):
     let anchored =
-        recover_segment_anchored(&fs, path, Some(EpochAnchor { epoch: 6 })).unwrap();
+        recover_segment_anchored(&fs, path, Some(EpochAnchor { epoch: 6 }))
+            .unwrap();
     assert!(anchored.accepted.is_empty());
     assert_eq!(anchored.stop, ScanStop::EpochMismatch);
 }
@@ -550,9 +600,17 @@ fn a9_anchor_newer_than_header_yields_no_batches() {
 // to the next HEADER_MAGIC would resurrect batch2 and punch a hole in history.
 #[test]
 fn a10_hole_then_valid_bait_must_not_resync() {
-    let img_clean = build_segment(1, 0, &[batch0(), batch1(), Batch::new(0, 3, &[b"delta"])]);
+    let img_clean = build_segment(
+        1,
+        0,
+        &[batch0(), batch1(), Batch::new(0, 3, &[b"delta"])],
+    );
     let rec_clean = recover_image(img_clean.clone());
-    assert_eq!(rec_clean.accepted.len(), 3, "sanity: the clean image accepts all three");
+    assert_eq!(
+        rec_clean.accepted.len(),
+        3,
+        "sanity: the clean image accepts all three"
+    );
 
     let b1_off = rec_clean.accepted[1].offset as usize;
     let b2_off = rec_clean.accepted[2].offset as usize;
@@ -562,10 +620,17 @@ fn a10_hole_then_valid_bait_must_not_resync() {
     holed[b1_off + HEADER_LEN + SUBFRAME_HDR_LEN] ^= 0x80;
 
     let rec = recover_image(holed);
-    assert_eq!(rec.accepted.len(), 1, "only batch0 is committed; must stop at the hole");
+    assert_eq!(
+        rec.accepted.len(),
+        1,
+        "only batch0 is committed; must stop at the hole"
+    );
     assert_eq!(rec.accepted[0].batch_id, 0);
     assert_eq!(rec.stop, ScanStop::BadCrc);
-    assert_eq!(rec.safe_offset, b1_off as u64, "safe offset is the hole, not past batch2");
+    assert_eq!(
+        rec.safe_offset, b1_off as u64,
+        "safe offset is the hole, not past batch2"
+    );
 
     // Prove batch2 (the bait) IS intrinsically valid: standing alone at its own
     // position it is accepted — only A10's stop-at-first-failure kept it dead.
@@ -584,28 +649,31 @@ fn a10_hole_then_valid_bait_must_not_resync() {
 fn a10_sector_reorder_hole_must_not_resync() {
     let fs = SimFs::new(Fault::SECTOR_512);
     let path = Path::new("seg");
-    // Big batches so each spans several 512-byte sectors distinct from the other.
+    // Big batches so each spans several 512-byte sectors distinct from the
+    // other.
     let big0 = vec![0x11u8; 1200];
     let big1 = vec![0x22u8; 1200];
-    let mut w = SegmentWriter::create(&fs, path, SegmentParams::new(1, 0, 1, 0)).unwrap();
+    let mut w =
+        SegmentWriter::create(&fs, path, SegmentParams::new(1, 0, 1, 0))
+            .unwrap();
     let sfs0 = [Subframe::plain(0x11, 0, 0, &big0)];
     let r0 = w
         .append(&BatchSpec {
-            stream_id: 0,
-            category_id: 100,
+            stream_id:            0,
+            category_id:          100,
             first_stream_version: 0,
-            crypto_chain: None,
-            subframes: &sfs0,
+            crypto_chain:         None,
+            subframes:            &sfs0,
         })
         .unwrap();
     let sfs1 = [Subframe::plain(0x11, 0, 0, &big1)];
     let r1 = w
         .append(&BatchSpec {
-            stream_id: 0,
-            category_id: 100,
+            stream_id:            0,
+            category_id:          100,
             first_stream_version: 1,
-            crypto_chain: None,
-            subframes: &sfs1,
+            crypto_chain:         None,
+            subframes:            &sfs1,
         })
         .unwrap();
     // Persist only the sectors fully inside batch1; drop batch0's body sectors.
@@ -619,7 +687,8 @@ fn a10_sector_reorder_hole_must_not_resync() {
     let persist: Vec<usize> = (first_full..=last_full).collect();
     // Ensure we are genuinely leaving a hole in batch0's body.
     assert!(b0_start / ss < first_full);
-    fs.crash(path, CrashPlan::Sector(SectorPlan { persist, tear: None })).unwrap();
+    fs.crash(path, CrashPlan::Sector(SectorPlan { persist, tear: None }))
+        .unwrap();
 
     let rec = recover_segment(&fs, path).unwrap();
     // batch0's body is a hole; the scan must accept nothing past it.
@@ -627,7 +696,10 @@ fn a10_sector_reorder_hole_must_not_resync() {
         rec.accepted.is_empty() || rec.accepted.iter().all(|b| b.batch_id == 0),
         "must never accept batch1 by resyncing past batch0's hole"
     );
-    assert!(rec.accepted.iter().all(|b| b.batch_id != 1), "batch1 must not resurface via resync");
+    assert!(
+        rec.accepted.iter().all(|b| b.batch_id != 1),
+        "batch1 must not resurface via resync"
+    );
 }
 
 // ===========================================================================
@@ -637,7 +709,11 @@ fn a10_sector_reorder_hole_must_not_resync() {
 #[test]
 fn idempotence_scan_twice_no_truncate_identical() {
     // An image with a hole so the scan actually stops mid-segment.
-    let img_clean = build_segment(1, 0, &[batch0(), batch1(), Batch::new(0, 3, &[b"delta"])]);
+    let img_clean = build_segment(
+        1,
+        0,
+        &[batch0(), batch1(), Batch::new(0, 3, &[b"delta"])],
+    );
     let b1_off = recover_image(img_clean.clone()).accepted[1].offset as usize;
     let mut holed = img_clean;
     holed[b1_off + HEADER_LEN + SUBFRAME_HDR_LEN] ^= 0x80;
@@ -648,12 +724,19 @@ fn idempotence_scan_twice_no_truncate_identical() {
 
     let first = recover_segment(&fs, path).unwrap();
     let second = recover_segment(&fs, path).unwrap();
-    assert_eq!(first, second, "scanning the same durable image twice must be identical");
+    assert_eq!(
+        first, second,
+        "scanning the same durable image twice must be identical"
+    );
 }
 
 #[test]
 fn idempotence_truncate_to_safe_offset_then_rescan_identical() {
-    let img_clean = build_segment(1, 0, &[batch0(), batch1(), Batch::new(0, 3, &[b"delta"])]);
+    let img_clean = build_segment(
+        1,
+        0,
+        &[batch0(), batch1(), Batch::new(0, 3, &[b"delta"])],
+    );
     let b1_off = recover_image(img_clean.clone()).accepted[1].offset as usize;
     let mut holed = img_clean;
     holed[b1_off + HEADER_LEN + SUBFRAME_HDR_LEN] ^= 0x80;
@@ -677,6 +760,10 @@ fn idempotence_truncate_to_safe_offset_then_rescan_identical() {
     assert_eq!(after.next_pos, first.next_pos);
     assert_eq!(after.next_batch_id, first.next_batch_id);
     assert_eq!(after.safe_offset, first.safe_offset);
-    assert_eq!(after.stop, ScanStop::EndOfSegment, "truncation turns the hole into a clean tail");
+    assert_eq!(
+        after.stop,
+        ScanStop::EndOfSegment,
+        "truncation turns the hole into a clean tail"
+    );
     assert_eq!(after.stream_heads, first.stream_heads);
 }

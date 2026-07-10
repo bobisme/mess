@@ -39,13 +39,13 @@ pub struct BackupOptions {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackupFileEntry {
     /// Destination-relative path (e.g. `seg-00000001.log`, `sealed/...pidx`).
-    pub path: String,
+    pub path:       String,
     /// The number of bytes that make up this file in the backup.
-    pub len: u64,
+    pub len:        u64,
     /// CRC32C over exactly those `len` bytes.
-    pub crc32c: u32,
+    pub crc32c:     u32,
     /// `sealed` | `active` | `sidecar` | `meta`.
-    pub role: String,
+    pub role:       String,
     /// Bytes copied from the source (for the active segment, the cut
     /// `safe_offset`; for a whole file, equal to `len`).
     pub copied_len: u64,
@@ -55,28 +55,28 @@ pub struct BackupFileEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackupManifest {
     /// Format tag ([`BACKUP_FORMAT`]).
-    pub format: String,
+    pub format:       String,
     /// Wall-clock creation time (unix seconds).
     pub created_unix: u64,
     /// The cut's durable watermark (doc 07 §1.3).
-    pub watermark: u64,
+    pub watermark:    u64,
     /// Whether this run was incremental.
-    pub incremental: bool,
+    pub incremental:  bool,
     /// Every file in the backup.
-    pub files: Vec<BackupFileEntry>,
+    pub files:        Vec<BackupFileEntry>,
 }
 
 /// One member of the consistent cut, resolved from the source store.
 #[derive(Debug, Clone)]
 pub struct CutFile {
     /// Absolute source path.
-    pub src: PathBuf,
+    pub src:            PathBuf,
     /// Destination-relative path.
-    pub rel: String,
+    pub rel:            String,
     /// Bytes to copy (whole file, or the active prefix `safe_offset`).
-    pub copied_len: u64,
+    pub copied_len:     u64,
     /// `sealed` | `active` | `sidecar` | `meta`.
-    pub role: &'static str,
+    pub role:           &'static str,
     /// Content-stable (immutable) files can be skipped on an incremental run;
     /// the active prefix cannot.
     pub content_stable: bool,
@@ -87,16 +87,16 @@ pub struct CutFile {
 #[derive(Debug, Clone, Default)]
 pub struct Cut {
     /// Files that make up the cut, in copy order (sealed first, active last).
-    pub files: Vec<CutFile>,
+    pub files:          Vec<CutFile>,
     /// The cut's durable watermark (doc 07 §1.3).
-    pub watermark: u64,
+    pub watermark:      u64,
     /// Lowest segment id in the cut (for the retention lease).
     pub min_segment_id: u64,
     /// Highest segment id in the cut (for the retention lease).
     pub max_segment_id: u64,
     /// Non-fatal problems encountered computing the cut (e.g. a segment that
     /// failed to scan). Surfaced as findings by the caller.
-    pub problems: Vec<String>,
+    pub problems:       Vec<String>,
 }
 
 /// Compute the consistent cut of the store at `dir` (doc 07 §1). Pure with
@@ -119,7 +119,10 @@ pub fn compute_cut(dir: &Path) -> Cut {
         let scan = match scan_segment(seg.segment_id, &seg.log_path) {
             Ok(s) => s,
             Err(e) => {
-                cut.problems.push(format!("segment {} unreadable: {e}", seg.segment_id));
+                cut.problems.push(format!(
+                    "segment {} unreadable: {e}",
+                    seg.segment_id
+                ));
                 continue;
             }
         };
@@ -135,7 +138,8 @@ pub fn compute_cut(dir: &Path) -> Cut {
 
         match &scan.trailer {
             Some(trailer) => {
-                // Sealed: copy the whole immutable file; watermark tracks its end.
+                // Sealed: copy the whole immutable file; watermark tracks its
+                // end.
                 cut.watermark = cut.watermark.max(trailer.end_pos);
                 cut.files.push(CutFile {
                     src: seg.log_path.clone(),
@@ -169,10 +173,13 @@ pub fn compute_cut(dir: &Path) -> Cut {
         ] {
             if present && let Ok(meta) = std::fs::metadata(path) {
                 cut.files.push(CutFile {
-                    src: path.clone(),
-                    rel: format!("sealed/{}", path.file_name().and_then(|n| n.to_str()).unwrap_or("")),
-                    copied_len: meta.len(),
-                    role: "sidecar",
+                    src:            path.clone(),
+                    rel:            format!(
+                        "sealed/{}",
+                        path.file_name().and_then(|n| n.to_str()).unwrap_or("")
+                    ),
+                    copied_len:     meta.len(),
+                    role:           "sidecar",
                     content_stable: true,
                 });
             }
@@ -219,10 +226,10 @@ fn collect_meta(dir: &Path, files: &mut Vec<CutFile>) {
                 && let Some(rel) = rel.to_str()
             {
                 files.push(CutFile {
-                    src: path.clone(),
-                    rel: rel.replace('\\', "/"),
-                    copied_len: meta.len(),
-                    role: "meta",
+                    src:            path.clone(),
+                    rel:            rel.replace('\\', "/"),
+                    copied_len:     meta.len(),
+                    role:           "meta",
                     content_stable: false,
                 });
             }
@@ -334,7 +341,10 @@ pub fn run(dir: &Path, dest: &Path, opts: &BackupOptions) -> Report {
         }
     };
     report.set("lease_id", json!(backup_id));
-    report.advise("retention-lease-held", "segments in the cut are pinned against retention for the copy");
+    report.advise(
+        "retention-lease-held",
+        "segments in the cut are pinned against retention for the copy",
+    );
 
     // 3. Copy each cut file (temp + rename). Incremental skips content-stable
     //    files already present with matching size + CRC.
@@ -402,11 +412,11 @@ pub fn run(dir: &Path, dest: &Path, opts: &BackupOptions) -> Report {
 
     // 4. Write the manifest LAST (its presence proves completeness).
     let manifest = BackupManifest {
-        format: BACKUP_FORMAT.to_string(),
+        format:       BACKUP_FORMAT.to_string(),
         created_unix: lease::now_unix(),
-        watermark: cut.watermark,
-        incremental: opts.incremental,
-        files: manifest_files,
+        watermark:    cut.watermark,
+        incremental:  opts.incremental,
+        files:        manifest_files,
     };
     let manifest_bytes = match serde_json::to_vec_pretty(&manifest) {
         Ok(b) => b,
@@ -440,7 +450,8 @@ pub fn run(dir: &Path, dest: &Path, opts: &BackupOptions) -> Report {
             "backup",
             "backup-complete",
             format!(
-                "backup complete: {copied} file(s) copied, {skipped} skipped, watermark {}",
+                "backup complete: {copied} file(s) copied, {skipped} skipped, \
+                 watermark {}",
                 cut.watermark
             ),
         )

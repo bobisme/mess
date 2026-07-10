@@ -8,17 +8,16 @@
 use std::path::Path;
 use std::time::Instant;
 
+use mess_log::committer::Durability;
 use mess_store::backend::{Backend, RecordToAppend};
 use mess_store::{EngineOptions, EventStore, LogEngine, Version};
-
-use mess_log::committer::Durability;
 
 use crate::{Metric, RunSize};
 
 fn rec(i: usize) -> RecordToAppend {
     RecordToAppend {
         message_type: "account.deposited".to_string(),
-        data: (i as u64).to_le_bytes().to_vec(),
+        data:         (i as u64).to_le_bytes().to_vec(),
     }
 }
 
@@ -87,9 +86,10 @@ pub fn run(size: RunSize, scratch: &Path) -> Vec<Metric> {
             append_ev_per_s,
             "ev/s",
             format!(
-                "full composed engine append path (LogEngine::append_batch, real mess-log \
-                 committer), Durability::Process; {batches} x {per_batch}-event batches = {total} \
-                 events; ~24B payload; real-fs scratch; single run"
+                "full composed engine append path (LogEngine::append_batch, \
+                 real mess-log committer), Durability::Process; {batches} x \
+                 {per_batch}-event batches = {total} events; ~24B payload; \
+                 real-fs scratch; single run"
             ),
         ),
         Metric::new(
@@ -97,9 +97,10 @@ pub fn run(size: RunSize, scratch: &Path) -> Vec<Metric> {
             replay_ev_per_s,
             "ev/s",
             format!(
-                "EventStore load of a {total}-event sealed corpus: read_stream routes through the \
-                 real mess-index ReplaySet cold path, then materialises StoredRecords; single \
-                 stream; single run"
+                "EventStore load of a {total}-event sealed corpus: \
+                 read_stream routes through the real mess-index ReplaySet \
+                 cold path, then materialises StoredRecords; single stream; \
+                 single run"
             ),
         ),
     ]

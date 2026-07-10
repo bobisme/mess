@@ -28,16 +28,16 @@
 //! mode's contract (`docs/spec/03-durability.md` §1):
 //!
 //! - **`Os` / `Group`**: acked implies recovered. Every acked batch's
-//!   `last_position` MUST be `< recovery.next_pos` (the recovered
-//!   watermark) — the ack means the covering barrier returned and the
-//!   durable watermark advanced past the batch (§1.2/§1.3); recovery MUST
-//!   reconstruct at least that prefix.
+//!   `last_position` MUST be `< recovery.next_pos` (the recovered watermark) —
+//!   the ack means the covering barrier returned and the durable watermark
+//!   advanced past the batch (§1.2/§1.3); recovery MUST reconstruct at least
+//!   that prefix.
 //! - **`Process`**: no such guarantee (§1.1 — a bare page-cache write, no
-//!   barrier). The harness asserts *only* prefix consistency: the
-//!   recovered batches tile `[base_pos, next_pos)` with no gap or overlap,
-//!   which is what "the log is a well-formed prefix" means independent of
-//!   what happened to be acked. This holds for every mode, and is
-//!   asserted for all three below, not only `Process`.
+//!   barrier). The harness asserts *only* prefix consistency: the recovered
+//!   batches tile `[base_pos, next_pos)` with no gap or overlap, which is what
+//!   "the log is a well-formed prefix" means independent of what happened to be
+//!   acked. This holds for every mode, and is asserted for all three below, not
+//!   only `Process`.
 //!
 //! 3 rounds/mode run unconditionally (`cargo test -p mess-log`) — see the
 //! per-round budget in [`run_round`]; totals a few seconds. The 15-round
@@ -80,12 +80,11 @@ use mess_log::scanner::recover_segment;
 struct CleanupGuard<'a>(&'a Path);
 
 impl Drop for CleanupGuard<'_> {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(self.0);
-    }
+    fn drop(&mut self) { let _ = fs::remove_file(self.0); }
 }
 
-/// How the child process ended, established from its [`std::process::ExitStatus`].
+/// How the child process ended, established from its
+/// [`std::process::ExitStatus`].
 enum ChildDeath {
     /// Died to the signal we sent it — the expected outcome of every round.
     Killed,
@@ -104,7 +103,9 @@ enum ChildDeath {
 fn real_tmp_dir(name: &str) -> PathBuf {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    let base = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let base = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
     let mut dir = base;
     dir.push(".cache");
     dir.push("mess-sigkill-scratch");
@@ -132,10 +133,10 @@ fn seed_for(mode: &str, round: u64) -> u64 {
 }
 
 struct RoundResult {
-    acked: usize,
-    recovered_batches: usize,
+    acked:              usize,
+    recovered_batches:  usize,
     recovered_next_pos: u64,
-    kill_after: Duration,
+    kill_after:         Duration,
 }
 
 /// Run one SIGKILL round for `mode`: spawn the child, read acks off its
@@ -145,7 +146,12 @@ struct RoundResult {
 /// round is only accepted as vacuously-reconciling when the child died to
 /// our `SIGKILL` (see [`ChildDeath`]) — if it exited on its own instead,
 /// that is a real bug and still hard-fails the round.
-fn run_round(mode: &str, seed: u64, min_kill_ms: u64, max_kill_ms: u64) -> RoundResult {
+fn run_round(
+    mode: &str,
+    seed: u64,
+    min_kill_ms: u64,
+    max_kill_ms: u64,
+) -> RoundResult {
     let seg_path = real_tmp_dir(&format!("seg-{mode}-{seed:016x}.log"));
     fs::create_dir_all(seg_path.parent().unwrap()).unwrap();
     let _ = fs::remove_file(&seg_path);
@@ -187,11 +193,14 @@ fn run_round(mode: &str, seed: u64, min_kill_ms: u64, max_kill_ms: u64) -> Round
                 Ok(_) => {
                     let trimmed = line.trim_end_matches('\n');
                     let mut parts = trimmed.split(' ');
-                    let (Some(a), Some(b), None) = (parts.next(), parts.next(), parts.next())
+                    let (Some(a), Some(b), None) =
+                        (parts.next(), parts.next(), parts.next())
                     else {
                         continue; // torn/partial trailing line at kill time: drop it (safe direction).
                     };
-                    if let (Ok(first), Ok(last)) = (a.parse::<u64>(), b.parse::<u64>()) {
+                    if let (Ok(first), Ok(last)) =
+                        (a.parse::<u64>(), b.parse::<u64>())
+                    {
                         acks_reader.lock().unwrap().push((first, last));
                     }
                 }
@@ -200,7 +209,8 @@ fn run_round(mode: &str, seed: u64, min_kill_ms: u64, max_kill_ms: u64) -> Round
         }
     });
 
-    let jitter = min_kill_ms + (splitmix64(seed) % (max_kill_ms - min_kill_ms + 1));
+    let jitter =
+        min_kill_ms + (splitmix64(seed) % (max_kill_ms - min_kill_ms + 1));
     let kill_after = Duration::from_millis(jitter);
     thread::sleep(kill_after);
     child.kill().expect("SIGKILL child");
@@ -230,9 +240,10 @@ fn run_round(mode: &str, seed: u64, min_kill_ms: u64, max_kill_ms: u64) -> Round
         }
         ChildDeath::DiedOnItsOwn { status, stderr } => {
             panic!(
-                "{mode} seed {seed:016x}: child exited on its own before being killed \
-                 (status={status:?}, kill_after={kill_after:?}, acked={acked_len}) — this is \
-                 NOT a legitimate vacuous round; child stderr:\n{stderr}",
+                "{mode} seed {seed:016x}: child exited on its own before \
+                 being killed (status={status:?}, kill_after={kill_after:?}, \
+                 acked={acked_len}) — this is NOT a legitimate vacuous round; \
+                 child stderr:\n{stderr}",
                 acked_len = acked.len()
             );
         }
@@ -249,13 +260,21 @@ fn run_round(mode: &str, seed: u64, min_kill_ms: u64, max_kill_ms: u64) -> Round
         // nothing to reconcile against. Only accepted when the child died
         // to our SIGKILL and produced no acks; any other combination (e.g.
         // acks recorded but the file vanished) is a real bug.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound
-            && matches!(death, ChildDeath::Killed)
-            && acked.is_empty() =>
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && matches!(death, ChildDeath::Killed)
+                && acked.is_empty() =>
         {
-            return RoundResult { acked: 0, recovered_batches: 0, recovered_next_pos: 0, kill_after };
+            return RoundResult {
+                acked: 0,
+                recovered_batches: 0,
+                recovered_next_pos: 0,
+                kill_after,
+            };
         }
-        Err(e) => panic!("{mode} seed {seed:016x}: recover_segment failed: {e}"),
+        Err(e) => {
+            panic!("{mode} seed {seed:016x}: recover_segment failed: {e}")
+        }
     };
 
     // Prefix consistency (holds for every mode, unconditionally): the
@@ -264,7 +283,8 @@ fn run_round(mode: &str, seed: u64, min_kill_ms: u64, max_kill_ms: u64) -> Round
     for b in &recovery.accepted {
         assert_eq!(
             b.first_global_pos, expected_next,
-            "{mode} seed {seed:016x}: recovered prefix has a gap/overlap at batch_id={}",
+            "{mode} seed {seed:016x}: recovered prefix has a gap/overlap at \
+             batch_id={}",
             b.batch_id
         );
         expected_next += u64::from(b.frame_count);
@@ -280,8 +300,9 @@ fn run_round(mode: &str, seed: u64, min_kill_ms: u64, max_kill_ms: u64) -> Round
         for &(first, last) in &acked {
             assert!(
                 last < recovery.next_pos,
-                "{mode} seed {seed:016x}: acked batch [{first},{last}] did NOT survive recovery \
-                 (recovered watermark next_pos={}) — contract violation",
+                "{mode} seed {seed:016x}: acked batch [{first},{last}] did \
+                 NOT survive recovery (recovered watermark next_pos={}) — \
+                 contract violation",
                 recovery.next_pos
             );
         }
@@ -303,57 +324,57 @@ fn run_round(mode: &str, seed: u64, min_kill_ms: u64, max_kill_ms: u64) -> Round
     }
 }
 
-fn run_rounds(mode: &'static str, rounds: u64, min_kill_ms: u64, max_kill_ms: u64, salt: u64) {
+fn run_rounds(
+    mode: &'static str,
+    rounds: u64,
+    min_kill_ms: u64,
+    max_kill_ms: u64,
+    salt: u64,
+) {
     for round in 0..rounds {
         let seed = seed_for(mode, round ^ salt);
         let r = run_round(mode, seed, min_kill_ms, max_kill_ms);
         eprintln!(
-            "sigkill {mode} round {round}: kill_after={:?} acked={} recovered_batches={} next_pos={}",
+            "sigkill {mode} round {round}: kill_after={:?} acked={} \
+             recovered_batches={} next_pos={}",
             r.kill_after, r.acked, r.recovered_batches, r.recovered_next_pos
         );
     }
 }
 
-// -- Smoke: 3 rounds/mode, short kill delays, runs in `cargo test -p mess-log` --
+// -- Smoke: 3 rounds/mode, short kill delays, runs in `cargo test -p mess-log`
+// --
 
 #[test]
 #[cfg_attr(miri, ignore)] // real process spawn + real fs; Miri cannot do either.
-fn sigkill_smoke_process() {
-    run_rounds("process", 3, 80, 300, 0);
-}
+fn sigkill_smoke_process() { run_rounds("process", 3, 80, 300, 0); }
 
 #[test]
 #[cfg_attr(miri, ignore)]
-fn sigkill_smoke_os() {
-    run_rounds("os", 3, 80, 300, 1);
-}
+fn sigkill_smoke_os() { run_rounds("os", 3, 80, 300, 1); }
 
 #[test]
 #[cfg_attr(miri, ignore)]
-fn sigkill_smoke_group() {
-    run_rounds("group", 3, 80, 300, 2);
-}
+fn sigkill_smoke_group() { run_rounds("group", 3, 80, 300, 2); }
 
-// -- Nightly: 15 rounds/mode, wider kill-delay window (.github/workflows/sigkill.yml) --
+// -- Nightly: 15 rounds/mode, wider kill-delay window
+// (.github/workflows/sigkill.yml) --
 
 // Already unconditionally `#[ignore]`d, so no separate `#[cfg_attr(miri,
 // ignore)]` is needed here (unlike the smoke tests below) — it would only
 // produce an "unused attribute" warning under `cargo miri test -- --ignored`.
 
 #[test]
-#[ignore = "nightly: 15 real SIGKILL rounds, seconds each; see .github/workflows/sigkill.yml"]
-fn sigkill_nightly_process() {
-    run_rounds("process", 15, 200, 2500, 100);
-}
+#[ignore = "nightly: 15 real SIGKILL rounds, seconds each; see \
+            .github/workflows/sigkill.yml"]
+fn sigkill_nightly_process() { run_rounds("process", 15, 200, 2500, 100); }
 
 #[test]
-#[ignore = "nightly: 15 real SIGKILL rounds, seconds each; see .github/workflows/sigkill.yml"]
-fn sigkill_nightly_os() {
-    run_rounds("os", 15, 200, 2500, 101);
-}
+#[ignore = "nightly: 15 real SIGKILL rounds, seconds each; see \
+            .github/workflows/sigkill.yml"]
+fn sigkill_nightly_os() { run_rounds("os", 15, 200, 2500, 101); }
 
 #[test]
-#[ignore = "nightly: 15 real SIGKILL rounds, seconds each; see .github/workflows/sigkill.yml"]
-fn sigkill_nightly_group() {
-    run_rounds("group", 15, 200, 2500, 102);
-}
+#[ignore = "nightly: 15 real SIGKILL rounds, seconds each; see \
+            .github/workflows/sigkill.yml"]
+fn sigkill_nightly_group() { run_rounds("group", 15, 200, 2500, 102); }

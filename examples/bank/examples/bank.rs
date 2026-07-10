@@ -22,7 +22,8 @@ async fn main() {
     // `mess-index` (hot/sealed index + fjall meta tables). The interim
     // in-memory backend is behind mess-store's `mock` feature. Nothing below
     // this line changes with the backend — that is the API-first payoff.
-    let dir = std::env::temp_dir().join(format!("mess-bank-{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("mess-bank-{}", std::process::id()));
     let store = EventStore::new(LogEngine::open(&dir).expect("open engine"));
     let stream = "account-alice";
 
@@ -59,7 +60,9 @@ async fn main() {
                 "withdrawal of {requested} rejected: balance is only {balance}"
             );
         }
-        other => panic!("expected an insufficient-funds rejection, got {other:?}"),
+        other => {
+            panic!("expected an insufficient-funds rejection, got {other:?}")
+        }
     }
 
     let commit = store

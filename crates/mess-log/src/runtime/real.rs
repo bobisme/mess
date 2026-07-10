@@ -65,13 +65,9 @@ impl FileHandle for RealFile {
         self.file.read_at(buf, off)
     }
 
-    fn fdatasync(&self) -> io::Result<()> {
-        self.file.sync_data()
-    }
+    fn fdatasync(&self) -> io::Result<()> { self.file.sync_data() }
 
-    fn len(&self) -> io::Result<u64> {
-        Ok(self.file.metadata()?.len())
-    }
+    fn len(&self) -> io::Result<u64> { Ok(self.file.metadata()?.len()) }
 
     /// `fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, len)` (`bn-36y`): reserve `len`
     /// bytes of blocks WITHOUT extending `st_size`, so a segment preallocated
@@ -84,17 +80,20 @@ impl FileHandle for RealFile {
         if len == 0 {
             return Ok(());
         }
-        let len = i64::try_from(len)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "allocate len overflow"))?;
+        let len = i64::try_from(len).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "allocate len overflow")
+        })?;
         // SAFETY: `self.file` owns a valid, open fd for the duration of this
         // call; `fallocate` reads no user memory. Errors are read via errno.
-        let ret =
-            unsafe { libc::fallocate(self.file.as_raw_fd(), libc::FALLOC_FL_KEEP_SIZE, 0, len) };
-        if ret == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
+        let ret = unsafe {
+            libc::fallocate(
+                self.file.as_raw_fd(),
+                libc::FALLOC_FL_KEEP_SIZE,
+                0,
+                len,
+            )
+        };
+        if ret == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
     }
 }
 
@@ -102,13 +101,11 @@ impl FileHandle for RealFile {
 #[derive(Clone)]
 pub struct RealRuntime {
     origin: StdInstant,
-    fs: RealFs,
+    fs:     RealFs,
 }
 
 impl Default for RealRuntime {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
 impl RealRuntime {
@@ -121,7 +118,7 @@ impl RealRuntime {
 /// A real sleep: blocks the calling task's thread until the deadline. Each
 /// spawned task owns its thread, so this never stalls another task.
 struct RealSleep {
-    origin: StdInstant,
+    origin:   StdInstant,
     deadline: Instant,
 }
 
@@ -157,7 +154,7 @@ impl Clock for RealRuntime {
 /// The future returned by [`Runtime::spawn`] on the real runtime; resolves
 /// when the task's OS thread finishes.
 pub struct RealJoin<T> {
-    slot: Arc<Mutex<Option<T>>>,
+    slot:  Arc<Mutex<Option<T>>>,
     waker: Arc<Mutex<Option<Waker>>>,
 }
 
@@ -179,9 +176,7 @@ impl<T> Future for RealJoin<T> {
 impl Runtime for RealRuntime {
     type Fs = RealFs;
 
-    fn fs(&self) -> RealFs {
-        self.fs
-    }
+    fn fs(&self) -> RealFs { self.fs }
 
     fn spawn<F>(&self, fut: F) -> impl Future<Output = F::Output> + Send
     where
@@ -202,17 +197,16 @@ impl Runtime for RealRuntime {
         RealJoin { slot, waker }
     }
 
-    fn block_on<F: Future>(&self, fut: F) -> F::Output {
-        block_on(fut)
-    }
+    fn block_on<F: Future>(&self, fut: F) -> F::Output { block_on(fut) }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::runtime::testsuite;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+    use crate::runtime::testsuite;
 
     // A unique temp path per test invocation so parallel test threads and
     // repeated runs never collide.
@@ -260,9 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn real_clock_advances() {
-        testsuite::clock_advances(&RealRuntime::new());
-    }
+    fn real_clock_advances() { testsuite::clock_advances(&RealRuntime::new()); }
 
     // bn-25j: real fs (see note above).
     #[test]

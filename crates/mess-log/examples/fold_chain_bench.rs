@@ -21,7 +21,8 @@ fn main() {
     }
     black_box(h);
 
-    // frame_hash only (1× BLAKE3/event) — the baseline a frame-hashing store pays.
+    // frame_hash only (1× BLAKE3/event) — the baseline a frame-hashing store
+    // pays.
     let start = Instant::now();
     let mut acc = [0u8; 32];
     for v in 0..n {
@@ -43,16 +44,14 @@ fn main() {
     let fh_ns = fh_only.as_nanos() as f64 / n as f64;
     let full_ns = full.as_nanos() as f64 / n as f64;
     println!("events: {n}, payload: {} B", payload.len());
-    println!(
-        "frame_hash only : {fh_ns:7.1} ns/ev  ({:.0} ev/s)",
-        1e9 / fh_ns
-    );
+    println!("frame_hash only : {fh_ns:7.1} ns/ev  ({:.0} ev/s)", 1e9 / fh_ns);
     println!(
         "full chain      : {full_ns:7.1} ns/ev  ({:.0} ev/s)",
         1e9 / full_ns
     );
     println!(
-        "chain_step delta: {:7.1} ns/ev  (the second BLAKE3 over 72 fixed bytes)",
+        "chain_step delta: {:7.1} ns/ev  (the second BLAKE3 over 72 fixed \
+         bytes)",
         full_ns - fh_ns
     );
 }

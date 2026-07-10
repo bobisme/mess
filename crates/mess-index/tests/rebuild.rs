@@ -12,16 +12,16 @@ use std::path::PathBuf;
 
 use mess_index::{ActiveIndex, BatchEntry, EventPtr, rebuild};
 use mess_log::encode::Subframe;
-use mess_log::runtime::{Fs, FileHandle, OpenOpts, Runtime, SimRuntime};
+use mess_log::runtime::{FileHandle, Fs, OpenOpts, Runtime, SimRuntime};
 use mess_log::writer::{BatchSpec, SegmentParams, SegmentWriter};
 
 /// A batch in a test plan: `n` events for `stream_id` starting at
 /// `first_version`.
 #[derive(Clone, Copy)]
 struct PlannedBatch {
-    stream_id: u64,
+    stream_id:     u64,
     first_version: u64,
-    n: usize,
+    n:             usize,
 }
 
 fn pb(stream_id: u64, first_version: u64, n: usize) -> PlannedBatch {
@@ -44,28 +44,33 @@ fn write_unsealed_segment<F: Fs>(
         prev_segment_epoch: prev_epoch,
         ..SegmentParams::new(segment_id, base_pos, epoch, prev_epoch)
     };
-    let mut writer = SegmentWriter::create(fs, path, params).expect("create segment");
+    let mut writer =
+        SegmentWriter::create(fs, path, params).expect("create segment");
     let mut entries = Vec::new();
     for b in batches {
         // Distinct payloads; content is irrelevant to pointer indexing.
-        let payloads: Vec<Vec<u8>> =
-            (0..b.n).map(|i| vec![(b.stream_id as u8) ^ (i as u8) ^ 0x5A; 16]).collect();
+        let payloads: Vec<Vec<u8>> = (0..b.n)
+            .map(|i| vec![(b.stream_id as u8) ^ (i as u8) ^ 0x5A; 16])
+            .collect();
         let subframes: Vec<Subframe> =
             payloads.iter().map(|p| Subframe::plain(1, 1, 0, p)).collect();
         let spec = BatchSpec {
-            stream_id: b.stream_id,
-            category_id: 0,
+            stream_id:            b.stream_id,
+            category_id:          0,
             first_stream_version: b.first_version,
-            crypto_chain: None,
-            subframes: &subframes,
+            crypto_chain:         None,
+            subframes:            &subframes,
         };
         let receipt = writer.append(&spec).expect("append batch");
         entries.push(BatchEntry {
-            stream_id: b.stream_id,
+            stream_id:            b.stream_id,
             first_stream_version: b.first_version,
-            frame_count: receipt.frame_count,
-            first_global_pos: receipt.first_global_pos,
-            ptr: EventPtr { segment_id, offset: receipt.offset },
+            frame_count:          receipt.frame_count,
+            first_global_pos:     receipt.first_global_pos,
+            ptr:                  EventPtr {
+                segment_id,
+                offset: receipt.offset,
+            },
         });
     }
     let summary = writer.close().expect("close (unsealed)");
@@ -99,7 +104,8 @@ fn rebuild_of_single_unsealed_segment_equals_incremental() {
     let rt = SimRuntime::new(1);
     let fs = rt.fs();
     let p: PathBuf = PathBuf::from("seg-0001.log");
-    let plan = [pb(10, 0, 3), pb(20, 0, 1), pb(10, 3, 2), pb(30, 0, 4), pb(20, 1, 2)];
+    let plan =
+        [pb(10, 0, 3), pb(20, 0, 1), pb(10, 3, 2), pb(30, 0, 4), pb(20, 1, 2)];
     let seg = write_unsealed_segment(&fs, &p, 1, 0, 1, 0, &plan);
 
     let reference = incremental_index(std::slice::from_ref(&seg));
@@ -138,7 +144,11 @@ fn kill9_two_unsealed_segments_both_rebuilt_heads_exact() {
     all.extend(seg2.0.clone());
     let heads = ground_truth_heads(&all);
     for (&stream, &head) in &heads {
-        assert_eq!(rebuilt.stream_head(stream), Some(head), "stream {stream} head");
+        assert_eq!(
+            rebuilt.stream_head(stream),
+            Some(head),
+            "stream {stream} head"
+        );
     }
     // Stream 10 spans both segments: head is the last version in segment 2.
     assert_eq!(rebuilt.stream_head(10), Some(8)); // versions 0..=6 then 7,8
@@ -208,13 +218,14 @@ fn sealed_segment_skipped_unsealed_successor_rebuilt() {
     let mut w1 = SegmentWriter::create(&fs, &p1, params1).unwrap();
     for b in [pb(10, 0, 3), pb(20, 0, 2)] {
         let payloads: Vec<Vec<u8>> = (0..b.n).map(|_| vec![1u8; 8]).collect();
-        let subs: Vec<Subframe> = payloads.iter().map(|p| Subframe::plain(1, 1, 0, p)).collect();
+        let subs: Vec<Subframe> =
+            payloads.iter().map(|p| Subframe::plain(1, 1, 0, p)).collect();
         w1.append(&BatchSpec {
-            stream_id: b.stream_id,
-            category_id: 0,
+            stream_id:            b.stream_id,
+            category_id:          0,
             first_stream_version: b.first_version,
-            crypto_chain: None,
-            subframes: &subs,
+            crypto_chain:         None,
+            subframes:            &subs,
         })
         .unwrap();
     }
@@ -222,7 +233,8 @@ fn sealed_segment_skipped_unsealed_successor_rebuilt() {
 
     // Segment 2: unsealed, continues stream 10.
     let plan2 = [pb(10, 3, 2), pb(30, 0, 1)];
-    let seg2 = write_unsealed_segment(&fs, &p2, 2, summary1.end_pos, 2, 1, &plan2);
+    let seg2 =
+        write_unsealed_segment(&fs, &p2, 2, summary1.end_pos, 2, 1, &plan2);
 
     let (rebuilt, report) = rebuild(&fs, &[p1, p2]).expect("rebuild");
     assert_eq!(report.sealed_skipped, vec![1], "segment 1 sealed → skipped");

@@ -3,18 +3,18 @@
 //! Two failure modes that are otherwise *silent at runtime* are made **loud
 //! at CI time** by golden tests whose fixtures are committed to the repo:
 //!
-//! 1. **fixture-compat** ([`check_fixture_compat`]): bytes written by an
-//!    older version of the code must decode *forever*. Renaming or removing a
-//!    field, or changing its type, without an upcaster breaks old payloads —
-//!    a defect that would otherwise only surface when a real old event is
-//!    replayed in production. See `docs/spec/05-fold-certificates.md` and the
+//! 1. **fixture-compat** ([`check_fixture_compat`]): bytes written by an older
+//!    version of the code must decode *forever*. Renaming or removing a field,
+//!    or changing its type, without an upcaster breaks old payloads — a defect
+//!    that would otherwise only surface when a real old event is replayed in
+//!    production. See `docs/spec/05-fold-certificates.md` and the
 //!    `spikes/codec_bakeoff` evolution matrix.
 //! 2. **fold-drift** ([`check_fold_drift`]): fixture events fold to a pinned
 //!    expected state. Changing `apply` semantics without bumping
 //!    `#[aggregate(fold_version = N)]` silently invalidates every stored
-//!    snapshot (D4); the golden test catches it with a
-//!    *"bump `fold_version` or fix your fold"* message. See spec §9 and the
-//!    `spikes/fold_cert` cfg-flagged drift demo.
+//!    snapshot (D4); the golden test catches it with a *"bump `fold_version` or
+//!    fix your fold"* message. See spec §9 and the `spikes/fold_cert`
+//!    cfg-flagged drift demo.
 //!
 //! # Snapshot-test ergonomics, committed fixtures
 //!
@@ -25,12 +25,12 @@
 //!
 //! - If the fixture file is **missing**, the check fails and tells you to run
 //!   with `UPDATE_FIXTURES=1` to scaffold it.
-//! - With `UPDATE_FIXTURES=1` set, the check (re)writes the fixture **and
-//!   still fails** — scaffolding is never a green run, so a freshly generated
-//!   or regenerated fixture always shows up as a red test that must be
-//!   reviewed and committed before the suite goes green.
-//! - With the fixture present and no env var, the check asserts and passes
-//!   only when the committed bytes/state still match.
+//! - With `UPDATE_FIXTURES=1` set, the check (re)writes the fixture **and still
+//!   fails** — scaffolding is never a green run, so a freshly generated or
+//!   regenerated fixture always shows up as a red test that must be reviewed
+//!   and committed before the suite goes green.
+//! - With the fixture present and no env var, the check asserts and passes only
+//!   when the committed bytes/state still match.
 //!
 //! # Why testkit helpers rather than a proc-macro
 //!
@@ -71,17 +71,21 @@ pub enum FixtureError {
     /// `apply` semantics drifted: fixture events fold to a different state
     /// than the pinned one, while `fold_version` was left unchanged.
     FoldDrift {
-        aggregate: String,
-        fold_version: u32,
+        aggregate:      String,
+        fold_version:   u32,
         expected_state: String,
-        actual_state: String,
+        actual_state:   String,
     },
     /// `A::FOLD_VERSION` differs from the version pinned in the fixture. A
     /// legitimate bump must regenerate the fixture (`UPDATE_FIXTURES=1`).
     FoldVersionChanged { aggregate: String, pinned: u32, current: u32 },
     /// Committed old bytes no longer decode under the current type: a
     /// breaking wire change (renamed/removed/retyped field) with no upcaster.
-    CompatDecodeFailed { label: String, wire_name: String, source: String },
+    CompatDecodeFailed {
+        label:     String,
+        wire_name: String,
+        source:    String,
+    },
     /// Committed bytes still decode, but to a different value than pinned —
     /// a silent semantic change in what those bytes *mean*.
     CompatValueDrift { label: String, expected: String, actual: String },
@@ -97,22 +101,21 @@ impl std::fmt::Display for FixtureError {
         match self {
             FixtureError::Missing { path, kind } => write!(
                 f,
-                "{kind} fixture is missing: {}\n\
-                 => run with `{UPDATE_ENV}=1` to scaffold it, then review and \
-                 commit the generated file.",
+                "{kind} fixture is missing: {}\n=> run with `{UPDATE_ENV}=1` \
+                 to scaffold it, then review and commit the generated file.",
                 path.display()
             ),
             FixtureError::Scaffolded { path, kind } => write!(
                 f,
-                "{kind} fixture was (re)generated at {}\n\
-                 => this run fails on purpose: review the generated file and \
-                 commit it. Fixtures are never regenerated silently.",
+                "{kind} fixture was (re)generated at {}\n=> this run fails on \
+                 purpose: review the generated file and commit it. Fixtures \
+                 are never regenerated silently.",
                 path.display()
             ),
             FixtureError::Corrupt { path, detail } => write!(
                 f,
-                "fixture file is corrupt: {} ({detail})\n\
-                 => fix it by hand or regenerate with `{UPDATE_ENV}=1`.",
+                "fixture file is corrupt: {} ({detail})\n=> fix it by hand or \
+                 regenerate with `{UPDATE_ENV}=1`.",
                 path.display()
             ),
             FixtureError::FoldDrift {
@@ -123,19 +126,17 @@ impl std::fmt::Display for FixtureError {
             } => write!(
                 f,
                 "FOLD DRIFT DETECTED for `{aggregate}` (fold_version = \
-                 {fold_version}):\n  \
-                 expected state: {expected_state}\n  \
-                 actual state:   {actual_state}\n\
-                 apply() semantics changed but fold_version did not.\n\
-                 => bump `#[aggregate(fold_version = N)]` (invalidating \
-                 existing snapshots) or fix your fold."
+                 {fold_version}):\n  expected state: {expected_state}\n  \
+                 actual state:   {actual_state}\napply() semantics changed \
+                 but fold_version did not.\n=> bump `#[aggregate(fold_version \
+                 = N)]` (invalidating existing snapshots) or fix your fold."
             ),
             FixtureError::FoldVersionChanged { aggregate, pinned, current } => {
                 write!(
                     f,
                     "FOLD_VERSION for `{aggregate}` changed {pinned} -> \
-                     {current}: this is the legitimate bump path.\n\
-                     => regenerate the golden fixture with `{UPDATE_ENV}=1` so \
+                     {current}: this is the legitimate bump path.\n=> \
+                     regenerate the golden fixture with `{UPDATE_ENV}=1` so \
                      it re-pins to the new version and state."
                 )
             }
@@ -144,28 +145,28 @@ impl std::fmt::Display for FixtureError {
                     f,
                     "FIXTURE-COMPAT BROKEN for `{label}` (wire \
                      `{wire_name}`): committed bytes no longer decode under \
-                     the current type:\n  {source}\n\
-                     => you made a breaking wire change (renamed/removed/\
-                     retyped a field) without an upcaster. Add an upcaster \
-                     that reads the old shape, or — only if the old data is \
-                     truly gone — regenerate with `{UPDATE_ENV}=1`."
+                     the current type:\n  {source}\n=> you made a breaking \
+                     wire change (renamed/removed/retyped a field) without an \
+                     upcaster. Add an upcaster that reads the old shape, or — \
+                     only if the old data is truly gone — regenerate with \
+                     `{UPDATE_ENV}=1`."
                 )
             }
             FixtureError::CompatValueDrift { label, expected, actual } => {
                 write!(
                     f,
-                    "FIXTURE-COMPAT DRIFT for `{label}`: committed bytes still \
-                     decode, but to a different value:\n  \
-                     expected: {expected}\n  actual:   {actual}\n\
-                     => the meaning of stored bytes changed. Fix the decode \
-                     path or regenerate with `{UPDATE_ENV}=1`."
+                    "FIXTURE-COMPAT DRIFT for `{label}`: committed bytes \
+                     still decode, but to a different value:\n  expected: \
+                     {expected}\n  actual:   {actual}\n=> the meaning of \
+                     stored bytes changed. Fix the decode path or regenerate \
+                     with `{UPDATE_ENV}=1`."
                 )
             }
             FixtureError::CompatShapeChanged { detail } => write!(
                 f,
-                "FIXTURE-COMPAT sample set changed: {detail}\n\
-                 => a new event variant/sample is not covered by the committed \
-                 fixture. Regenerate with `{UPDATE_ENV}=1` to re-pin."
+                "FIXTURE-COMPAT sample set changed: {detail}\n=> a new event \
+                 variant/sample is not covered by the committed fixture. \
+                 Regenerate with `{UPDATE_ENV}=1` to re-pin."
             ),
             FixtureError::Io { path, detail } => {
                 write!(f, "fixture I/O error at {}: {detail}", path.display())
@@ -187,12 +188,12 @@ fn update_requested() -> bool {
 fn write_fixture(path: &Path, contents: &str) -> Result<(), FixtureError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| FixtureError::Io {
-            path: parent.to_path_buf(),
+            path:   parent.to_path_buf(),
             detail: e.to_string(),
         })?;
     }
     std::fs::write(path, contents).map_err(|e| FixtureError::Io {
-        path: path.to_path_buf(),
+        path:   path.to_path_buf(),
         detail: e.to_string(),
     })
 }
@@ -286,8 +287,8 @@ pub fn assert_fold_drift(
     if pinned.fold_version != fold_version {
         return Err(FixtureError::FoldVersionChanged {
             aggregate: aggregate.to_string(),
-            pinned: pinned.fold_version,
-            current: fold_version,
+            pinned:    pinned.fold_version,
+            current:   fold_version,
         });
     }
     if pinned.state != state_debug {
@@ -302,9 +303,9 @@ pub fn assert_fold_drift(
 }
 
 struct FoldFixture {
-    aggregate: String,
+    aggregate:    String,
     fold_version: u32,
-    state: String,
+    state:        String,
 }
 
 impl FoldFixture {
@@ -312,20 +313,16 @@ impl FoldFixture {
         // Line-oriented header + verbatim (possibly multi-line) state body,
         // reviewable in a PR diff. The `---` sentinel separates them.
         format!(
-            "# mess fold-drift golden fixture (bn-3ui) — DO NOT EDIT BY HAND.\n\
-             # Regenerate with `{UPDATE_ENV}=1`; a bump must re-pin here.\n\
-             aggregate: {}\n\
-             fold_version: {}\n\
-             ---\n\
-             {}\n",
+            "# mess fold-drift golden fixture (bn-3ui) — DO NOT EDIT BY \
+             HAND.\n# Regenerate with `{UPDATE_ENV}=1`; a bump must re-pin \
+             here.\naggregate: {}\nfold_version: {}\n---\n{}\n",
             self.aggregate, self.fold_version, self.state
         )
     }
 
     fn parse(raw: &str) -> Result<Self, String> {
-        let (header, body) = raw
-            .split_once("\n---\n")
-            .ok_or("missing `---` state separator")?;
+        let (header, body) =
+            raw.split_once("\n---\n").ok_or("missing `---` state separator")?;
         let mut aggregate = None;
         let mut fold_version = None;
         for line in header.lines() {
@@ -333,24 +330,24 @@ impl FoldFixture {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let (key, val) =
-                line.split_once(':').ok_or_else(|| format!("bad line: {line}"))?;
+            let (key, val) = line
+                .split_once(':')
+                .ok_or_else(|| format!("bad line: {line}"))?;
             match key.trim() {
                 "aggregate" => aggregate = Some(val.trim().to_string()),
                 "fold_version" => {
-                    fold_version = Some(
-                        val.trim()
-                            .parse::<u32>()
-                            .map_err(|_| "fold_version not a u32".to_string())?,
-                    )
+                    fold_version =
+                        Some(val.trim().parse::<u32>().map_err(|_| {
+                            "fold_version not a u32".to_string()
+                        })?)
                 }
                 other => return Err(format!("unknown key `{other}`")),
             }
         }
         Ok(FoldFixture {
-            aggregate: aggregate.ok_or("missing `aggregate`")?,
+            aggregate:    aggregate.ok_or("missing `aggregate`")?,
             fold_version: fold_version.ok_or("missing `fold_version`")?,
-            state: body.trim_end_matches('\n').to_string(),
+            state:        body.trim_end_matches('\n').to_string(),
         })
     }
 }
@@ -421,7 +418,9 @@ where
 
 /// Build live entries (label, wire name, encoded bytes, decoded `Debug`) from
 /// the current-type samples. Labels are the wire name plus a per-name ordinal.
-fn build_live_entries<E>(samples: &[E]) -> Result<Vec<CompatEntry>, FixtureError>
+fn build_live_entries<E>(
+    samples: &[E],
+) -> Result<Vec<CompatEntry>, FixtureError>
 where
     E: Event + Debug,
 {
@@ -433,11 +432,14 @@ where
         let ordinal = seen.entry(wire).or_insert(0);
         let label = format!("{wire}#{ordinal}");
         *ordinal += 1;
-        let bytes = s.encode().map_err(|e| FixtureError::CompatDecodeFailed {
-            label: label.clone(),
-            wire_name: wire.to_string(),
-            source: format!("current type failed to ENCODE the sample: {e}"),
-        })?;
+        let bytes =
+            s.encode().map_err(|e| FixtureError::CompatDecodeFailed {
+                label:     label.clone(),
+                wire_name: wire.to_string(),
+                source:    format!(
+                    "current type failed to ENCODE the sample: {e}"
+                ),
+            })?;
         live.push(CompatEntry {
             label,
             wire_name: wire.to_string(),
@@ -469,7 +471,8 @@ where
 
     // The live label set must still match the committed one; a new/removed
     // sample means the pinned coverage no longer matches the code.
-    let live_labels: Vec<&str> = live.iter().map(|e| e.label.as_str()).collect();
+    let live_labels: Vec<&str> =
+        live.iter().map(|e| e.label.as_str()).collect();
     let committed_labels: Vec<&str> =
         committed.iter().map(|e| e.label.as_str()).collect();
     if live_labels != committed_labels {
@@ -489,9 +492,9 @@ where
         match E::decode(&entry.wire_name, &bytes) {
             Err(e) => {
                 return Err(FixtureError::CompatDecodeFailed {
-                    label: entry.label.clone(),
+                    label:     entry.label.clone(),
                     wire_name: entry.wire_name.clone(),
-                    source: e.to_string(),
+                    source:    e.to_string(),
                 });
             }
             Ok(decoded) => {
@@ -513,16 +516,17 @@ where
 }
 
 struct CompatEntry {
-    label: String,
-    wire_name: String,
-    payload_hex: String,
+    label:         String,
+    wire_name:     String,
+    payload_hex:   String,
     decoded_debug: String,
 }
 
 fn serialize_compat(entries: &[CompatEntry]) -> String {
     let mut out = String::new();
     out.push_str(
-        "# mess fixture-compat golden fixture (bn-3ui) — DO NOT EDIT BY HAND.\n",
+        "# mess fixture-compat golden fixture (bn-3ui) — DO NOT EDIT BY \
+         HAND.\n",
     );
     out.push_str(
         "# Committed old bytes MUST decode forever. Regenerate only with \
@@ -551,8 +555,9 @@ fn parse_compat(raw: &str) -> Result<Vec<CompatEntry>, String> {
             if line.trim().is_empty() || line.starts_with('#') {
                 continue;
             }
-            let (k, v) =
-                line.split_once(':').ok_or_else(|| format!("bad line: {line}"))?;
+            let (k, v) = line
+                .split_once(':')
+                .ok_or_else(|| format!("bad line: {line}"))?;
             match k.trim() {
                 "label" => label = Some(v.trim().to_string()),
                 "wire" => wire = Some(v.trim().to_string()),
@@ -562,9 +567,9 @@ fn parse_compat(raw: &str) -> Result<Vec<CompatEntry>, String> {
             }
         }
         entries.push(CompatEntry {
-            label: label.ok_or("missing `label`")?,
-            wire_name: wire.ok_or("missing `wire`")?,
-            payload_hex: payload_hex.ok_or("missing `payload_hex`")?,
+            label:         label.ok_or("missing `label`")?,
+            wire_name:     wire.ok_or("missing `wire`")?,
+            payload_hex:   payload_hex.ok_or("missing `payload_hex`")?,
             decoded_debug: decoded.ok_or("missing `decoded`")?,
         });
     }
@@ -576,7 +581,7 @@ fn to_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for &b in bytes {
         s.push(HEX[(b >> 4) as usize] as char);
-        s.push(HEX[(b & 0x0f) as usize] as char);
+        s.push(HEX[(b & 0x0F) as usize] as char);
     }
     s
 }

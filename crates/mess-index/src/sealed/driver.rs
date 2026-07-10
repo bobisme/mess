@@ -3,9 +3,9 @@
 //! path**, then hands readers over to it gaplessly.
 //!
 //! `spikes/perf_append` measured the cost of doing this inline: rolling a full
-//! segment stalled the append path ~1.4 s. Moving the seal to a dedicated thread
-//! removes that stall entirely — the committer's `apply_committed` never waits
-//! on a seal. This module is that thread plus the synchronous
+//! segment stalled the append path ~1.4 s. Moving the seal to a dedicated
+//! thread removes that stall entirely — the committer's `apply_committed` never
+//! waits on a seal. This module is that thread plus the synchronous
 //! [`SealDriver::seal`] it runs per segment.
 //!
 //! # Seal steps (per segment)
@@ -14,16 +14,17 @@
 //!    ([`crate::sealed::segment::encode_sidecar`]).
 //! 2. **Durably write** them: temp file → fsync → rename → fsync the directory,
 //!    so a crash leaves either no sidecar or a complete one (never a torn one).
-//! 3. **Finalize the footer**: call back into mess-log's
-//!    `SegmentWriter::seal` (the single seal `fdatasync`, §6) so recovery's R2
-//!    fast path can trust the segment.
+//! 3. **Finalize the footer**: call back into mess-log's `SegmentWriter::seal`
+//!    (the single seal `fdatasync`, §6) so recovery's R2 fast path can trust
+//!    the segment.
 //! 4. **Install** the sealed index into the [`SealedStore`] (publish to
 //!    readers) and then **evict** the segment's active entries — in that order,
 //!    so the sealed-or-active invariant never gaps ([`crate::sealed::store`]).
 //!
 //! The finalize step is a caller-supplied closure returning [`io::Result`] so
 //! this crate need not construct a `SegmentWriter` (which is generic over
-//! mess-log's `Fs`); the caller passes `|| writer.seal().map(drop).map_err(..)`.
+//! mess-log's `Fs`); the caller passes `||
+//! writer.seal().map(drop).map_err(..)`.
 //!
 //! # Measured (bn-20e, `tests/sealed_scale.rs`, release, this machine)
 //!
@@ -51,7 +52,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use mess_log::metrics::{
-    Counter, DEFAULT_FSYNC_THRESHOLD, DegradationAlarm, LatencyHistogram, LatencySnapshot,
+    Counter, DEFAULT_FSYNC_THRESHOLD, DegradationAlarm, LatencyHistogram,
+    LatencySnapshot,
 };
 
 use crate::sealed::filter::SegmentFilter;
@@ -60,7 +62,8 @@ use crate::sealed::payload::{
     self, PayloadError, PayloadSealOpts, SealedPayloadIndex,
 };
 use crate::sealed::segment::{
-    SealInput, SealedSegmentIndex, SealedSegmentRef, SidecarError, encode_sidecar, filter_path_for,
+    SealInput, SealedSegmentIndex, SealedSegmentRef, SidecarError,
+    encode_sidecar, filter_path_for,
 };
 use crate::sealed::store::SealedStore;
 
@@ -101,14 +104,14 @@ pub enum SealError {
 /// counts aggregate into a single operational surface.
 pub struct SealMetrics {
     /// Seal-path durability-barrier (`fsync`) latency distribution.
-    fsync: LatencyHistogram,
+    fsync:         LatencyHistogram,
     /// The degradation alarm on seal-path barrier latency (§2.6), latching +
     /// rate-limited-loud, exactly like the committer's.
-    fsync_alarm: DegradationAlarm,
+    fsync_alarm:   DegradationAlarm,
     /// Seal wall-clock duration (encode → durable write → finalize → install).
     seal_duration: LatencyHistogram,
     /// Segments sealed.
-    seals: Counter,
+    seals:         Counter,
     /// Seals skipped rather than completed (`bn-u6o`): the background
     /// roll-sealer's bounded wait for the hot index/book to publish a rolled
     /// segment's tail was exceeded, or the bounded total shutdown wait
@@ -119,18 +122,21 @@ pub struct SealMetrics {
     /// logged loudly (see [`Self::record_seal_skipped`]).
     seals_skipped: Counter,
     /// Rate-limits the loud skip line (see [`Self::record_seal_skipped`]), the
-    /// same `Instant`-gated cadence [`DegradationAlarm`] uses, so a store stuck
-    /// skipping seals does not flood stderr.
+    /// same `Instant`-gated cadence [`DegradationAlarm`] uses, so a store
+    /// stuck skipping seals does not flood stderr.
     skip_last_log: Mutex<Option<Instant>>,
 }
 
 impl Default for SealMetrics {
     fn default() -> Self {
         SealMetrics {
-            fsync: LatencyHistogram::new(),
-            fsync_alarm: DegradationAlarm::new("seal-fsync", DEFAULT_FSYNC_THRESHOLD),
+            fsync:         LatencyHistogram::new(),
+            fsync_alarm:   DegradationAlarm::new(
+                "seal-fsync",
+                DEFAULT_FSYNC_THRESHOLD,
+            ),
             seal_duration: LatencyHistogram::new(),
-            seals: Counter::new(),
+            seals:         Counter::new(),
             seals_skipped: Counter::new(),
             skip_last_log: Mutex::new(None),
         }
@@ -143,16 +149,16 @@ const SKIP_LOG_RATE_LIMIT: Duration = Duration::from_secs(5);
 
 impl std::fmt::Debug for SealMetrics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SealMetrics").field("snapshot", &self.snapshot()).finish()
+        f.debug_struct("SealMetrics")
+            .field("snapshot", &self.snapshot())
+            .finish()
     }
 }
 
 impl SealMetrics {
     /// A fresh, empty metrics sink.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
+    pub fn new() -> Self { Self::default() }
 
     /// Record one seal-path durability-barrier (`fsync`) latency and feed the
     /// degradation alarm (§2.6) — the same lock-free `fetch_add` + alarm the
@@ -173,13 +179,13 @@ impl SealMetrics {
     #[must_use]
     pub fn snapshot(&self) -> SealMetricsSnapshot {
         SealMetricsSnapshot {
-            fsync: self.fsync.snapshot(),
-            fsync_degraded: self.fsync_alarm.is_tripped(),
-            fsync_degraded_trips: self.fsync_alarm.trips(),
+            fsync:                 self.fsync.snapshot(),
+            fsync_degraded:        self.fsync_alarm.is_tripped(),
+            fsync_degraded_trips:  self.fsync_alarm.trips(),
             fsync_threshold_nanos: self.fsync_alarm.threshold_nanos(),
-            seal_duration: self.seal_duration.snapshot(),
-            seals: self.seals.get(),
-            seals_skipped: self.seals_skipped.get(),
+            seal_duration:         self.seal_duration.snapshot(),
+            seals:                 self.seals.get(),
+            seals_skipped:         self.seals_skipped.get(),
         }
     }
 
@@ -193,55 +199,60 @@ impl SealMetrics {
     pub fn record_seal_skipped(&self, reason: &str) {
         self.seals_skipped.incr();
         let now = Instant::now();
-        let mut last = self.skip_last_log.lock().expect("seal metrics skip-log lock");
-        let due = last.is_none_or(|t| now.duration_since(t) >= SKIP_LOG_RATE_LIMIT);
+        let mut last =
+            self.skip_last_log.lock().expect("seal metrics skip-log lock");
+        let due =
+            last.is_none_or(|t| now.duration_since(t) >= SKIP_LOG_RATE_LIMIT);
         if due {
             *last = Some(now);
             drop(last);
             eprintln!(
-                "!!! mess SEAL SKIPPED: {reason} — segment stays durable and unsealed \
-                 (served from the log) until it is resealed or the store reopens \
-                 ({} skipped so far)",
+                "!!! mess SEAL SKIPPED: {reason} — segment stays durable and \
+                 unsealed (served from the log) until it is resealed or the \
+                 store reopens ({} skipped so far)",
                 self.seals_skipped.get(),
             );
         }
     }
 }
 
-/// A point-in-time read of [`SealMetrics`] (`bn-e2y`). Latencies are nanoseconds.
+/// A point-in-time read of [`SealMetrics`] (`bn-e2y`). Latencies are
+/// nanoseconds.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SealMetricsSnapshot {
     /// Seal-path `fsync` barrier latency (p50/p95/p99/max/mean).
-    pub fsync: LatencySnapshot,
+    pub fsync:                 LatencySnapshot,
     /// Whether seal-path barrier latency has crossed the degradation threshold
     /// — the sticky store-status flag (§2.6) for the seal durability site.
-    pub fsync_degraded: bool,
+    pub fsync_degraded:        bool,
     /// Seal-path barriers that crossed the threshold.
-    pub fsync_degraded_trips: u64,
+    pub fsync_degraded_trips:  u64,
     /// The active seal-fsync degradation threshold, in nanoseconds.
     pub fsync_threshold_nanos: u64,
     /// Seal duration (`roll → sealed installed`) distribution.
-    pub seal_duration: LatencySnapshot,
+    pub seal_duration:         LatencySnapshot,
     /// Segments sealed.
-    pub seals: u64,
+    pub seals:                 u64,
     /// Seals skipped rather than completed (`bn-u6o`) — see
     /// [`SealMetrics::record_seal_skipped`].
-    pub seals_skipped: u64,
+    pub seals_skipped:         u64,
 }
 
 /// Seal orchestration for one store + sidecar directory. Cheap to clone
 /// (`Arc` inside); share it with the background thread.
 #[derive(Clone)]
 pub struct SealDriver {
-    store: Arc<SealedStore>,
-    dir: Arc<PathBuf>,
-    /// Optional shared seal-path metrics sink (`bn-e2y`). `None` keeps a driver
-    /// (and every existing caller/test) allocation- and instrumentation-free;
-    /// the engine attaches a shared sink via [`Self::with_metrics`].
+    store:   Arc<SealedStore>,
+    dir:     Arc<PathBuf>,
+    /// Optional shared seal-path metrics sink (`bn-e2y`). `None` keeps a
+    /// driver (and every existing caller/test) allocation- and
+    /// instrumentation-free; the engine attaches a shared sink via
+    /// [`Self::with_metrics`].
     metrics: Option<Arc<SealMetrics>>,
-    /// Reed-Solomon parity-sidecar policy (bn-2za). Default disabled: the `.par`
-    /// sidecar is written at seal only when the engine opts in (evidence-gated).
-    parity: ParityConfig,
+    /// Reed-Solomon parity-sidecar policy (bn-2za). Default disabled: the
+    /// `.par` sidecar is written at seal only when the engine opts in
+    /// (evidence-gated).
+    parity:  ParityConfig,
 }
 
 impl SealDriver {
@@ -255,10 +266,11 @@ impl SealDriver {
         }
     }
 
-    /// Attach a shared seal-path metrics sink (`bn-e2y`): this driver then times
-    /// its seal-path durability barriers (feeding the histogram + degradation
-    /// alarm) and its seal durations. Chainable; share one `Arc<SealMetrics>`
-    /// across the store's drivers so the counts aggregate.
+    /// Attach a shared seal-path metrics sink (`bn-e2y`): this driver then
+    /// times its seal-path durability barriers (feeding the histogram +
+    /// degradation alarm) and its seal durations. Chainable; share one
+    /// `Arc<SealMetrics>` across the store's drivers so the counts
+    /// aggregate.
     #[must_use]
     pub fn with_metrics(mut self, metrics: Arc<SealMetrics>) -> Self {
         self.metrics = Some(metrics);
@@ -280,14 +292,15 @@ impl SealDriver {
         parity::par_path(&self.dir, segment_id)
     }
 
-    /// Generate and durably write the Reed-Solomon parity sidecar (`.par`) for a
-    /// **sealed** segment whose finalized `.log` bytes live at `seg_path`
+    /// Generate and durably write the Reed-Solomon parity sidecar (`.par`) for
+    /// a **sealed** segment whose finalized `.log` bytes live at `seg_path`
     /// (bn-2za). No-op returning `Ok(None)` when parity is disabled. Written
     /// with the same temp → fsync → rename → dir-fsync discipline as the other
-    /// sidecars ([`write_durable`]). Best-effort by design (like the `.filter`):
-    /// callers ignore the error so a parity-write failure never fails the seal —
-    /// the segment is fully durable and detectable without parity, just not
-    /// repairable. Returns the sidecar byte length on success.
+    /// sidecars ([`write_durable`]). Best-effort by design (like the
+    /// `.filter`): callers ignore the error so a parity-write failure never
+    /// fails the seal — the segment is fully durable and detectable without
+    /// parity, just not repairable. Returns the sidecar byte length on
+    /// success.
     pub fn write_parity_sidecar(
         &self,
         seg_path: &Path,
@@ -305,9 +318,7 @@ impl SealDriver {
     }
 
     /// The shared sealed store.
-    pub fn store(&self) -> &Arc<SealedStore> {
-        &self.store
-    }
+    pub fn store(&self) -> &Arc<SealedStore> { &self.store }
 
     /// The sidecar path for `segment_id`: `<dir>/seg-<id>.pidx`.
     pub fn sidecar_path(&self, segment_id: u64) -> PathBuf {
@@ -336,13 +347,15 @@ impl SealDriver {
     /// payloads in stored (global-position) order.
     ///
     /// [`encode_payload_sidecar`](payload::encode_payload_sidecar) runs the
-    /// **permanent verify-on-seal**: every block is reassembled and byte-compared
-    /// against `events` before the bytes are written; a mismatch returns
-    /// [`SealError::Payload`] and writes nothing. On success the sidecar is
-    /// written crash-atomically and the parsed index returned.
+    /// **permanent verify-on-seal**: every block is reassembled and
+    /// byte-compared against `events` before the bytes are written; a
+    /// mismatch returns [`SealError::Payload`] and writes nothing. On
+    /// success the sidecar is written crash-atomically and the parsed index
+    /// returned.
     ///
     /// This is a separate artifact from the pointer sidecar
-    /// ([`Self::seal`]); a caller that has the payload bytes in hand seals both.
+    /// ([`Self::seal`]); a caller that has the payload bytes in hand seals
+    /// both.
     pub fn seal_payload(
         &self,
         segment_id: u64,
@@ -355,9 +368,10 @@ impl SealDriver {
     /// Encode the D6 payload sidecar (running verify-on-seal), durably write it
     /// to the segment's `.pcol` path, and return the parsed index. Shared by
     /// [`Self::seal_payload`] and [`Self::seal`] (the run-loop path that emits
-    /// `.pcol` when [`SealInput::payloads`](crate::sealed::segment::SealInput::payloads)
-    /// is present). A verify-on-seal mismatch returns [`SealError::Payload`] and
-    /// writes nothing.
+    /// `.pcol` when
+    /// [`SealInput::payloads`](crate::sealed::segment::SealInput::payloads)
+    /// is present). A verify-on-seal mismatch returns [`SealError::Payload`]
+    /// and writes nothing.
     fn encode_and_write_payload(
         &self,
         segment_id: u64,
@@ -378,7 +392,11 @@ impl SealDriver {
     /// evicted; returns the installed index. **Ordering guarantee:** install
     /// precedes eviction, so readers using [`crate::sealed::store::resolve`]
     /// never see a gap.
-    pub fn seal<Fin>(&self, input: SealInput, finalize: Fin) -> Result<SealedSegmentRef, SealError>
+    pub fn seal<Fin>(
+        &self,
+        input: SealInput,
+        finalize: Fin,
+    ) -> Result<SealedSegmentRef, SealError>
     where
         Fin: FnOnce() -> io::Result<()>,
     {
@@ -400,7 +418,8 @@ impl SealDriver {
         // skip-ahead optimization (`might_contain_stream` degrades to
         // always-`true`). Built over the segment's *distinct* stream ids —
         // one key per `SealStream`, already deduplicated by construction.
-        let stream_ids: Vec<u64> = input.streams.iter().map(|s| s.stream_id).collect();
+        let stream_ids: Vec<u64> =
+            input.streams.iter().map(|s| s.stream_id).collect();
         let filter = SegmentFilter::build(segment_id, &stream_ids);
         if let Some(f) = &filter {
             let _ = write_durable_metered(
@@ -420,7 +439,8 @@ impl SealDriver {
         // `None` payloads seal the pointer sidecar only.
         let payload_index = match &input.payloads {
             Some(payloads) => {
-                let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
+                let refs: Vec<&[u8]> =
+                    payloads.iter().map(Vec::as_slice).collect();
                 Some(self.encode_and_write_payload(
                     segment_id,
                     &refs,
@@ -521,14 +541,18 @@ pub(crate) fn write_durable_metered(
 pub type FinalizeFn = Box<dyn FnOnce() -> io::Result<()> + Send>;
 
 enum Msg {
-    Seal { input: SealInput, finalize: FinalizeFn, done: SyncSender<Result<SealedSegmentRef, SealError>> },
+    Seal {
+        input:    SealInput,
+        finalize: FinalizeFn,
+        done:     SyncSender<Result<SealedSegmentRef, SealError>>,
+    },
 }
 
 /// A dedicated background thread that seals segments off the append path. Drop
 /// (or [`shutdown`](Self::shutdown)) joins the thread after draining queued
 /// requests.
 pub struct BackgroundSealer {
-    tx: Option<std::sync::mpsc::Sender<Msg>>,
+    tx:     Option<std::sync::mpsc::Sender<Msg>>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -565,9 +589,7 @@ impl BackgroundSealer {
     }
 
     /// Stop accepting work and join the thread, draining what is queued.
-    pub fn shutdown(mut self) {
-        self.join_inner();
-    }
+    pub fn shutdown(mut self) { self.join_inner(); }
 
     fn join_inner(&mut self) {
         drop(self.tx.take());
@@ -578,9 +600,7 @@ impl BackgroundSealer {
 }
 
 impl Drop for BackgroundSealer {
-    fn drop(&mut self) {
-        self.join_inner();
-    }
+    fn drop(&mut self) { self.join_inner(); }
 }
 
 fn run(driver: SealDriver, rx: std::sync::mpsc::Receiver<Msg>) {
@@ -596,10 +616,11 @@ fn run(driver: SealDriver, rx: std::sync::mpsc::Receiver<Msg>) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use crate::sealed::segment::{SealBatch, SealStream};
     use crate::sealed::store::resolve;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn input(segment_id: u64) -> SealInput {
         SealInput {
@@ -607,11 +628,11 @@ mod tests {
             base_pos: 0,
             streams: vec![SealStream {
                 stream_id: 10,
-                batches: vec![SealBatch {
-                    first_version: 0,
-                    frame_count: 3,
+                batches:   vec![SealBatch {
+                    first_version:    0,
+                    frame_count:      3,
                     first_global_pos: 0,
-                    offset: 4096,
+                    offset:           4096,
                 }],
             }],
             payloads: None,
@@ -640,7 +661,8 @@ mod tests {
         assert!(store.is_evicted(7), "evicted after install");
 
         // Reopen from disk round-trips.
-        let reopened = SealedSegmentIndex::open(&driver.sidecar_path(7)).unwrap();
+        let reopened =
+            SealedSegmentIndex::open(&driver.sidecar_path(7)).unwrap();
         assert_eq!(reopened.resolve(10, 2).unwrap().unwrap().offset, 4096);
     }
 
@@ -657,9 +679,13 @@ mod tests {
         let idx = driver.seal(input(7), || Ok(())).unwrap();
 
         assert!(driver.filter_path(7).exists(), "filter file written");
-        assert!(idx.might_contain_stream(10), "present stream must never be a false negative");
+        assert!(
+            idx.might_contain_stream(10),
+            "present stream must never be a false negative"
+        );
 
-        let reopened = SealedSegmentIndex::open(&driver.sidecar_path(7)).unwrap();
+        let reopened =
+            SealedSegmentIndex::open(&driver.sidecar_path(7)).unwrap();
         assert!(
             reopened.might_contain_stream(10),
             "reopened index must re-attach the filter and answer correctly"
@@ -680,20 +706,40 @@ mod tests {
 
         // Missing filter file.
         std::fs::remove_file(driver.filter_path(7)).unwrap();
-        let reopened = SealedSegmentIndex::open(&driver.sidecar_path(7)).unwrap();
-        assert!(reopened.might_contain_stream(10), "missing filter degrades to always-maybe");
-        assert_eq!(reopened.resolve(10, 1).unwrap().unwrap().offset, 4096, "resolve still correct");
-        assert_eq!(reopened.resolve(10, 99).unwrap(), None, "absent version still correctly absent");
+        let reopened =
+            SealedSegmentIndex::open(&driver.sidecar_path(7)).unwrap();
+        assert!(
+            reopened.might_contain_stream(10),
+            "missing filter degrades to always-maybe"
+        );
+        assert_eq!(
+            reopened.resolve(10, 1).unwrap().unwrap().offset,
+            4096,
+            "resolve still correct"
+        );
+        assert_eq!(
+            reopened.resolve(10, 99).unwrap(),
+            None,
+            "absent version still correctly absent"
+        );
 
         // Corrupt filter file (seal again to recreate it, then flip a byte).
         driver.seal(input(8), || Ok(())).unwrap();
         let fp = driver.filter_path(8);
         let mut bytes = std::fs::read(&fp).unwrap();
-        bytes[0] ^= 0xff;
+        bytes[0] ^= 0xFF;
         std::fs::write(&fp, &bytes).unwrap();
-        let reopened8 = SealedSegmentIndex::open(&driver.sidecar_path(8)).unwrap();
-        assert!(reopened8.might_contain_stream(10), "corrupt filter degrades to always-maybe");
-        assert_eq!(reopened8.resolve(10, 1).unwrap().unwrap().offset, 4096, "resolve still correct");
+        let reopened8 =
+            SealedSegmentIndex::open(&driver.sidecar_path(8)).unwrap();
+        assert!(
+            reopened8.might_contain_stream(10),
+            "corrupt filter degrades to always-maybe"
+        );
+        assert_eq!(
+            reopened8.resolve(10, 1).unwrap().unwrap().offset,
+            4096,
+            "resolve still correct"
+        );
     }
 
     /// bn-e2y: a metered seal records the seal-path durability barriers (the
@@ -709,8 +755,8 @@ mod tests {
         let store = Arc::new(SealedStore::new());
         let metrics = Arc::new(SealMetrics::new());
         metrics.set_fsync_alarm_threshold(Duration::ZERO);
-        let driver =
-            SealDriver::new(store.clone(), dir.path()).with_metrics(Arc::clone(&metrics));
+        let driver = SealDriver::new(store.clone(), dir.path())
+            .with_metrics(Arc::clone(&metrics));
 
         // Nothing recorded before the first seal.
         let s0 = metrics.snapshot();
@@ -723,14 +769,20 @@ mod tests {
 
         let s = metrics.snapshot();
         assert_eq!(s.seals, 1, "one seal recorded");
-        assert!(s.seal_duration.count >= 1, "seal duration timed (roll → installed)");
+        assert!(
+            s.seal_duration.count >= 1,
+            "seal duration timed (roll → installed)"
+        );
         // The pointer sidecar (and its `.filter` sibling) each issue a
         // temp-file fsync + a directory fsync — real seal-path barriers, now
         // observable.
         assert!(s.fsync.count >= 1, "seal-path fsync barriers recorded");
         // Threshold 0: every barrier crosses it, so the mandatory §2.6 flag
         // latches for the seal durability site too.
-        assert!(s.fsync_degraded, "seal-fsync degradation alarm latches past threshold");
+        assert!(
+            s.fsync_degraded,
+            "seal-fsync degradation alarm latches past threshold"
+        );
         assert!(s.fsync_degraded_trips >= 1);
         assert_eq!(s.fsync_threshold_nanos, 0);
     }
@@ -760,9 +812,9 @@ mod tests {
         assert!(!store.is_evicted(7));
     }
 
-    /// bn-zge / D6: `seal_payload` writes a `.pcol` sidecar next to the `.pidx`,
-    /// runs verify-on-seal, and the reopened index reassembles byte-exact across
-    /// a mixed (columnar + row-fallback) segment.
+    /// bn-zge / D6: `seal_payload` writes a `.pcol` sidecar next to the
+    /// `.pidx`, runs verify-on-seal, and the reopened index reassembles
+    /// byte-exact across a mixed (columnar + row-fallback) segment.
     #[test]
     #[cfg_attr(miri, ignore)]
     fn seal_payload_writes_verified_pcol_sidecar() {
@@ -784,7 +836,7 @@ mod tests {
             evs.push(m);
         }
         for i in 0..40u8 {
-            evs.push(vec![0xff, 0x00, i, 0xca, 0x99]); // unshreddable
+            evs.push(vec![0xFF, 0x00, i, 0xCA, 0x99]); // unshreddable
         }
         let refs: Vec<&[u8]> = evs.iter().map(Vec::as_slice).collect();
 
@@ -792,14 +844,23 @@ mod tests {
         let idx = driver.seal_payload(9, &refs, &opts).unwrap();
         assert!(driver.payload_sidecar_path(9).exists(), "pcol written");
         assert_eq!(idx.event_count() as usize, evs.len());
-        let kinds: Vec<BlockKind> = idx.blocks().iter().map(|b| b.kind).collect();
-        assert!(kinds.contains(&BlockKind::Columnar) && kinds.contains(&BlockKind::Row));
+        let kinds: Vec<BlockKind> =
+            idx.blocks().iter().map(|b| b.kind).collect();
+        assert!(
+            kinds.contains(&BlockKind::Columnar)
+                && kinds.contains(&BlockKind::Row)
+        );
 
         // Reopen from disk and reassemble byte-exact.
         let reopened =
-            SealedPayloadIndex::open(&driver.payload_sidecar_path(9)).unwrap().unwrap();
+            SealedPayloadIndex::open(&driver.payload_sidecar_path(9))
+                .unwrap()
+                .unwrap();
         for (i, ev) in evs.iter().enumerate() {
-            assert_eq!(&reopened.reassemble_event(i as u64, &NoDicts).unwrap(), ev);
+            assert_eq!(
+                &reopened.reassemble_event(i as u64, &NoDicts).unwrap(),
+                ev
+            );
         }
     }
 
@@ -821,11 +882,11 @@ mod tests {
         let driver = SealDriver::new(store.clone(), dir.path());
 
         // 260 events at global positions 0..260 in one stream: 130 shreddable
-        // msgpack maps then 130 unshreddable blobs. Since one unshreddable event
-        // routes a whole 128-event block to raw, this clustered layout yields a
-        // MIX under the default block size — the first block columnar, the later
-        // blocks row-fallback — exercising both reassembly paths through the
-        // installed segment.
+        // msgpack maps then 130 unshreddable blobs. Since one unshreddable
+        // event routes a whole 128-event block to raw, this clustered
+        // layout yields a MIX under the default block size — the first
+        // block columnar, the later blocks row-fallback — exercising
+        // both reassembly paths through the installed segment.
         let mut payloads: Vec<Vec<u8>> = Vec::new();
         for i in 0..130u64 {
             let mut m = vec![0x82];
@@ -836,21 +897,28 @@ mod tests {
             payloads.push(m);
         }
         for i in 0..130u16 {
-            payloads.push(vec![0xff, 0x00, i as u8, (i >> 8) as u8, 0xca, 0x99]);
+            payloads.push(vec![
+                0xFF,
+                0x00,
+                i as u8,
+                (i >> 8) as u8,
+                0xCA,
+                0x99,
+            ]);
         }
         let input = SealInput {
             segment_id: 5,
-            base_pos: 0,
-            streams: vec![SealStream {
+            base_pos:   0,
+            streams:    vec![SealStream {
                 stream_id: 1,
-                batches: vec![SealBatch {
-                    first_version: 0,
-                    frame_count: payloads.len() as u32,
+                batches:   vec![SealBatch {
+                    first_version:    0,
+                    frame_count:      payloads.len() as u32,
                     first_global_pos: 0,
-                    offset: 4096,
+                    offset:           4096,
                 }],
             }],
-            payloads: Some(payloads.clone()),
+            payloads:   Some(payloads.clone()),
         };
 
         // Seal through the normal live path (`driver.seal`, the same call
@@ -858,14 +926,24 @@ mod tests {
         let idx = driver.seal(input, || Ok(())).unwrap();
 
         // The `.pcol` sidecar was written next to the `.pidx`.
-        assert!(driver.payload_sidecar_path(5).exists(), ".pcol emitted by seal()");
+        assert!(
+            driver.payload_sidecar_path(5).exists(),
+            ".pcol emitted by seal()"
+        );
         // The installed segment carries the attached payload index.
         assert!(idx.has_payload(), "seal attached the payload index");
         let pidx = idx.payload_index().unwrap();
         assert_eq!(pidx.event_count() as usize, payloads.len());
-        let kinds: Vec<BlockKind> = pidx.blocks().iter().map(|b| b.kind).collect();
-        assert!(kinds.contains(&BlockKind::Columnar), "expected a columnar block");
-        assert!(kinds.contains(&BlockKind::Row), "expected a row-fallback block");
+        let kinds: Vec<BlockKind> =
+            pidx.blocks().iter().map(|b| b.kind).collect();
+        assert!(
+            kinds.contains(&BlockKind::Columnar),
+            "expected a columnar block"
+        );
+        assert!(
+            kinds.contains(&BlockKind::Row),
+            "expected a row-fallback block"
+        );
 
         // The installed segment reassembles every payload byte-exact.
         for (i, ev) in payloads.iter().enumerate() {
@@ -877,7 +955,8 @@ mod tests {
         }
 
         // A fresh reopen from disk re-attaches the sibling `.pcol`.
-        let reopened = SealedSegmentIndex::open(&driver.sidecar_path(5)).unwrap();
+        let reopened =
+            SealedSegmentIndex::open(&driver.sidecar_path(5)).unwrap();
         assert!(reopened.has_payload(), "open() re-attached the .pcol");
         assert_eq!(
             reopened.reassemble_payload(0, &NoDicts).unwrap().as_deref(),
@@ -894,12 +973,15 @@ mod tests {
         let store = Arc::new(SealedStore::new());
         let driver = SealDriver::new(store.clone(), dir.path());
         let idx = driver.seal(input(7), || Ok(())).unwrap();
-        assert!(!driver.payload_sidecar_path(7).exists(), "no .pcol for pointer-only seal");
+        assert!(
+            !driver.payload_sidecar_path(7).exists(),
+            "no .pcol for pointer-only seal"
+        );
         assert!(!idx.has_payload());
     }
 
-    /// The background thread path (`BackgroundSealer::run` → `driver.seal`) also
-    /// emits and attaches the `.pcol` when payloads are present.
+    /// The background thread path (`BackgroundSealer::run` → `driver.seal`)
+    /// also emits and attaches the `.pcol` when payloads are present.
     #[test]
     #[cfg_attr(miri, ignore)]
     fn background_sealer_emits_pcol() {
@@ -911,24 +993,28 @@ mod tests {
         let driver = SealDriver::new(store.clone(), dir.path());
         let sealer = BackgroundSealer::spawn(driver.clone());
 
-        let payloads: Vec<Vec<u8>> = (0..8u8).map(|i| vec![0xde, 0xad, i]).collect();
+        let payloads: Vec<Vec<u8>> =
+            (0..8u8).map(|i| vec![0xDE, 0xAD, i]).collect();
         let input = SealInput {
             segment_id: 4,
-            base_pos: 0,
-            streams: vec![SealStream {
+            base_pos:   0,
+            streams:    vec![SealStream {
                 stream_id: 1,
-                batches: vec![SealBatch {
-                    first_version: 0,
-                    frame_count: 8,
+                batches:   vec![SealBatch {
+                    first_version:    0,
+                    frame_count:      8,
                     first_global_pos: 0,
-                    offset: 4096,
+                    offset:           4096,
                 }],
             }],
-            payloads: Some(payloads.clone()),
+            payloads:   Some(payloads.clone()),
         };
         let rx = sealer.submit(input, || Ok(()));
         let idx = rx.recv().unwrap().unwrap();
-        assert!(driver.payload_sidecar_path(4).exists(), "bg seal emitted .pcol");
+        assert!(
+            driver.payload_sidecar_path(4).exists(),
+            "bg seal emitted .pcol"
+        );
         assert!(idx.has_payload());
         assert_eq!(
             idx.reassemble_payload(3, &NoDicts).unwrap().as_deref(),

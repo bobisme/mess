@@ -16,15 +16,13 @@ use std::time::Duration;
 #[derive(Debug, Clone)]
 pub struct LatencyHist {
     buckets: [u64; 64],
-    count: u64,
-    sum_us: u128,
-    max_us: u64,
+    count:   u64,
+    sum_us:  u128,
+    max_us:  u64,
 }
 
 impl Default for LatencyHist {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
 impl LatencyHist {
@@ -43,14 +41,10 @@ impl LatencyHist {
     }
 
     #[must_use]
-    pub fn count(&self) -> u64 {
-        self.count
-    }
+    pub fn count(&self) -> u64 { self.count }
 
     #[must_use]
-    pub fn max(&self) -> Duration {
-        Duration::from_micros(self.max_us)
-    }
+    pub fn max(&self) -> Duration { Duration::from_micros(self.max_us) }
 
     #[must_use]
     pub fn mean(&self) -> Duration {
@@ -124,8 +118,16 @@ mod tests {
             h.record(Duration::from_millis(100));
         }
         assert_eq!(h.count(), 100);
-        assert!(h.percentile(50.0) < Duration::from_millis(8), "p50={:?}", h.percentile(50.0));
-        assert!(h.percentile(99.0) >= Duration::from_millis(64), "p99={:?}", h.percentile(99.0));
+        assert!(
+            h.percentile(50.0) < Duration::from_millis(8),
+            "p50={:?}",
+            h.percentile(50.0)
+        );
+        assert!(
+            h.percentile(99.0) >= Duration::from_millis(64),
+            "p99={:?}",
+            h.percentile(99.0)
+        );
         assert!(h.max() >= Duration::from_millis(100), "max={:?}", h.max());
     }
 

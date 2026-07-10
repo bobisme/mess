@@ -14,8 +14,10 @@
 //! # Layout
 //!
 //! - [`config`] — every `--flag` and resource ceiling.
-//! - [`prng`] — seeded SplitMix64 + a Zipf stream sampler (determinism per seed).
-//! - [`shadow`] — the source-of-truth model the probes check the engine against.
+//! - [`prng`] — seeded SplitMix64 + a Zipf stream sampler (determinism per
+//!   seed).
+//! - [`shadow`] — the source-of-truth model the probes check the engine
+//!   against.
 //! - [`probe`] — the invariant checks, as pure functions (each unit-tested by
 //!   feeding it a doctored input; see the module's tests).
 //! - [`metrics`] — the bounded-memory fsync-latency histogram.
@@ -30,8 +32,8 @@
 pub mod config;
 pub mod driver;
 pub mod metrics;
-pub mod probe;
 pub mod prng;
+pub mod probe;
 pub mod resource;
 pub mod shadow;
 
@@ -44,7 +46,7 @@ pub use probe::Violation;
 pub async fn run(cfg: Config) -> Result<SoakReport, Aborted> {
     let mut driver = Driver::open(cfg).map_err(|e| Aborted {
         violation: Violation::RecoveryLoss { detail: e.clone() },
-        dump: format!("startup failed: {e}"),
+        dump:      format!("startup failed: {e}"),
     })?;
     driver.run().await
 }

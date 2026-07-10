@@ -9,15 +9,15 @@
 //!
 //! An earlier version of this module hand-wrote `Send`-boxed mirror traits
 //! (`DynRead`/`DynWrite`) purely to route around a gap in
-//! [`ReadModels`](crate::contracts::ReadModels)/[`WriteOps`](crate::contracts::WriteOps):
-//! those traits used bare `async fn`, whose futures carry no `Send` bound, so
-//! a router generic over `R: ReadModels` would not compile — axum's
-//! [`Handler`](axum::handler::Handler) requires handler futures to be `Send`,
-//! and the compiler cannot prove that for an unconstrained generic `R`'s
-//! async-fn futures. The shim traded that gap away by wrapping every call in
-//! `Box::pin(..)`, provably `Send` only because each macro expansion
-//! (`impl_dyn_read!`/`impl_dyn_write!`) fixed a single *concrete* backing
-//! type — one hand-written impl per backend, plus
+//! [`ReadModels`](crate::contracts::ReadModels)/
+//! [`WriteOps`](crate::contracts::WriteOps): those traits used bare `async fn`,
+//! whose futures carry no `Send` bound, so a router generic over `R:
+//! ReadModels` would not compile — axum's [`Handler`](axum::handler::Handler)
+//! requires handler futures to be `Send`, and the compiler cannot prove that
+//! for an unconstrained generic `R`'s async-fn futures. The shim traded that
+//! gap away by wrapping every call in `Box::pin(..)`, provably `Send` only
+//! because each macro expansion (`impl_dyn_read!`/`impl_dyn_write!`) fixed a
+//! single *concrete* backing type — one hand-written impl per backend, plus
 //! `Arc<dyn DynRead>`/`Arc<dyn DynWrite>` dynamic dispatch on every call.
 //!
 //! Now that `ReadModels`/`WriteOps` state their futures' `Send`-ness directly
@@ -48,10 +48,10 @@
 //!
 //! - The acting-user cookie ([`ACTING_COOKIE`]) stores the handle itself, not
 //!   an id — trivial to render ("@" + the cookie value, no lookup) and
-//!   trivially resolved to an id with one `resolve` call wherever a write
-//!   needs one.
-//! - A handle typed into a URL (`/u/alice/follow`) resolves to a target id
-//!   the same way.
+//!   trivially resolved to an id with one `resolve` call wherever a write needs
+//!   one.
+//! - A handle typed into a URL (`/u/alice/follow`) resolves to a target id the
+//!   same way.
 //!
 //! No boot-time bulk directory is needed either, which is why
 //! `Projections::directory` — previously `pub`, called once at server startup
@@ -88,7 +88,7 @@ pub const ACTING_COOKIE: &str = "acting_user";
 /// See the module docs for why this replaced a trait-object `AppState` plus a
 /// `Directory`.
 pub struct AppState<R, W> {
-    pub read: Arc<R>,
+    pub read:  Arc<R>,
     pub write: Arc<W>,
 }
 
@@ -103,7 +103,5 @@ impl<R, W> Clone for AppState<R, W> {
 impl<R, W> AppState<R, W> {
     /// Build state from a reader and a writer.
     #[must_use]
-    pub fn new(read: Arc<R>, write: Arc<W>) -> Self {
-        Self { read, write }
-    }
+    pub fn new(read: Arc<R>, write: Arc<W>) -> Self { Self { read, write } }
 }

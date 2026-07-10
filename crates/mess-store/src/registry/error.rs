@@ -5,8 +5,8 @@
 //! both can occur while replaying `$registry` (§7.2) and a caller generally
 //! wants to treat either as "this log/record is not trustworthy":
 //!
-//! - **decode corruption** — the bytes are not a legal `codec_id 0` payload
-//!   at all (REG7/REG8's frozen tables reject anything else), and
+//! - **decode corruption** — the bytes are not a legal `codec_id 0` payload at
+//!   all (REG7/REG8's frozen tables reject anything else), and
 //! - **REG-rule violations** — the bytes decode fine but describe a state
 //!   transition the spec forbids (double registration, an unregistered
 //!   reference, a reserved ID being targeted, ...).
@@ -27,9 +27,9 @@ pub enum RegistryError<E = std::convert::Infallible> {
         /// empty, so not even the tag byte was present).
         record_kind: Option<u8>,
         /// Bytes needed at minimum.
-        need: usize,
+        need:        usize,
         /// Bytes actually present.
-        got: usize,
+        got:         usize,
     },
     /// `record_kind` byte was `0x00` or `>= 0x06` (REG8: closed, frozen tag
     /// set).
@@ -45,9 +45,9 @@ pub enum RegistryError<E = std::convert::Infallible> {
         /// Which record kind was being decoded.
         record_kind: u8,
         /// Bytes the length prefix promised.
-        need: usize,
+        need:        usize,
         /// Bytes actually remaining in the payload.
-        got: usize,
+        got:         usize,
     },
 
     // -- REG-rule violations (§4, §5, §6) -----------------------------
@@ -65,7 +65,7 @@ pub enum RegistryError<E = std::convert::Infallible> {
         /// `"dict"`).
         namespace: &'static str,
         /// The ID that was registered twice.
-        id: u64,
+        id:        u64,
     },
     /// REG12: a record referenced an ID (as a category, a scope, or an
     /// alias target) that is not yet visible in replay order.
@@ -73,7 +73,7 @@ pub enum RegistryError<E = std::convert::Infallible> {
         /// Which namespace the missing ID lives in.
         namespace: &'static str,
         /// The missing ID.
-        id: u64,
+        id:        u64,
     },
     /// REG17: a `NameAliased` record targeted a reserved ID (`0`).
     ReservedIdTargeted {
@@ -86,7 +86,7 @@ pub enum RegistryError<E = std::convert::Infallible> {
         /// Which namespace the name lives in.
         namespace: &'static str,
         /// The name in question.
-        name: String,
+        name:      String,
     },
     /// `NameAliased.target_kind` was `0` or `>= 4` (§3.7).
     InvalidTargetKind(u8),
@@ -125,7 +125,8 @@ impl<E: fmt::Display> fmt::Display for RegistryError<E> {
             RegistryError::PayloadTooShort { record_kind, need, got } => {
                 write!(
                     f,
-                    "registry payload too short (record_kind {record_kind:?}): need {need}, got {got}"
+                    "registry payload too short (record_kind \
+                     {record_kind:?}): need {need}, got {got}"
                 )
             }
             RegistryError::UnknownRecordKind(k) => {
@@ -141,11 +142,13 @@ impl<E: fmt::Display> fmt::Display for RegistryError<E> {
                 got,
             } => write!(
                 f,
-                "registry record_kind {record_kind:#04x} length prefix claimed {need} bytes, only {got} remain"
+                "registry record_kind {record_kind:#04x} length prefix \
+                 claimed {need} bytes, only {got} remain"
             ),
             RegistryError::ReservedIdRegistered { record_kind } => write!(
                 f,
-                "registry record_kind {record_kind:#04x} attempted to register reserved ID 0"
+                "registry record_kind {record_kind:#04x} attempted to \
+                 register reserved ID 0"
             ),
             RegistryError::AlreadyRegistered { namespace, id } => {
                 write!(f, "{namespace} ID {id} was already registered (REG14)")
@@ -153,7 +156,8 @@ impl<E: fmt::Display> fmt::Display for RegistryError<E> {
             RegistryError::UnregisteredReference { namespace, id } => {
                 write!(
                     f,
-                    "{namespace} ID {id} was referenced before being registered (REG12)"
+                    "{namespace} ID {id} was referenced before being \
+                     registered (REG12)"
                 )
             }
             RegistryError::ReservedIdTargeted { namespace } => write!(
@@ -162,22 +166,26 @@ impl<E: fmt::Display> fmt::Display for RegistryError<E> {
             ),
             RegistryError::NameAlreadyBound { namespace, name } => write!(
                 f,
-                "{namespace} name {name:?} is already bound to a different ID (REG16)"
+                "{namespace} name {name:?} is already bound to a different ID \
+                 (REG16)"
             ),
             RegistryError::InvalidTargetKind(k) => {
                 write!(f, "invalid NameAliased target_kind {k}")
             }
             RegistryError::NonZeroHighBits { target_id } => write!(
                 f,
-                "event_type alias target_id {target_id:#x} has nonzero high 32 bits (D-REG-E)"
+                "event_type alias target_id {target_id:#x} has nonzero high \
+                 32 bits (D-REG-E)"
             ),
             RegistryError::ScopeIdNonZeroHighBits { scope_id } => write!(
                 f,
-                "DictRegistered event_type scope_id {scope_id:#x} has nonzero high 32 bits (D-REG-E)"
+                "DictRegistered event_type scope_id {scope_id:#x} has nonzero \
+                 high 32 bits (D-REG-E)"
             ),
             RegistryError::ReservedCodecId { record_kind } => write!(
                 f,
-                "registry record_kind {record_kind:#04x} declared reserved codec_id 0"
+                "registry record_kind {record_kind:#04x} declared reserved \
+                 codec_id 0"
             ),
             RegistryError::InvalidScopeKind(k) => {
                 write!(f, "invalid DictRegistered scope_kind {k}")

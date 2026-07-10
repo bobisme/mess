@@ -1,9 +1,9 @@
 //! bn-2za — seal-time Reed-Solomon parity sidecar wiring.
 //!
-//! The background roll-sealer emits a `.par` sidecar next to each sealed segment
-//! **only when `EngineOptions::parity` is enabled** (evidence-gated, off by
-//! default). These tests pin both halves of that contract against a real engine
-//! that rolls (and therefore seals) several tiny segments under load.
+//! The background roll-sealer emits a `.par` sidecar next to each sealed
+//! segment **only when `EngineOptions::parity` is enabled** (evidence-gated,
+//! off by default). These tests pin both halves of that contract against a real
+//! engine that rolls (and therefore seals) several tiny segments under load.
 
 use std::path::Path;
 
@@ -12,10 +12,14 @@ use mess_store::backend::{Backend, RecordToAppend};
 use mess_store::{EngineOptions, LogEngine, Version};
 
 fn rec(data: &[u8]) -> RecordToAppend {
-    RecordToAppend { message_type: "ev".to_string(), data: data.to_vec() }
+    RecordToAppend {
+        message_type: "ev".to_string(),
+        data:         data.to_vec(),
+    }
 }
 
-/// Force many rolls (and thus many background seals) with a tiny active segment.
+/// Force many rolls (and thus many background seals) with a tiny active
+/// segment.
 fn rolling_opts() -> EngineOptions {
     EngineOptions { segment_size: 16 * 1024, ..EngineOptions::default() }
 }
@@ -24,7 +28,11 @@ async fn fill(engine: &LogEngine, n: usize) {
     let mut expected = Version::NoStream;
     for i in 0..n {
         let out = engine
-            .append_batch("s", expected, &[rec(format!("event-{i:05}").as_bytes())])
+            .append_batch(
+                "s",
+                expected,
+                &[rec(format!("event-{i:05}").as_bytes())],
+            )
             .await
             .expect("append");
         expected = out.version;
@@ -36,7 +44,9 @@ fn count_par(sealed: &Path) -> usize {
     std::fs::read_dir(sealed)
         .map(|rd| {
             rd.flatten()
-                .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("par"))
+                .filter(|e| {
+                    e.path().extension().and_then(|x| x.to_str()) == Some("par")
+                })
                 .count()
         })
         .unwrap_or(0)
@@ -64,7 +74,10 @@ async fn parity_sidecar_written_only_when_enabled() {
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
-    assert!(pars > 0, "parity enabled ⇒ at least one .par sidecar must be written");
+    assert!(
+        pars > 0,
+        "parity enabled ⇒ at least one .par sidecar must be written"
+    );
 
     // Every .par must parse + CRC-validate and match a real sealed .log by id.
     for entry in std::fs::read_dir(&sealed).unwrap().flatten() {
@@ -72,7 +85,8 @@ async fn parity_sidecar_written_only_when_enabled() {
         if path.extension().and_then(|x| x.to_str()) != Some("par") {
             continue;
         }
-        let side = ParitySidecar::open(&path).expect("read par").expect("valid par");
+        let side =
+            ParitySidecar::open(&path).expect("read par").expect("valid par");
         // The sidecar covers the finalized .log byte-for-byte.
         let log = on_store.join(format!("seg-{:08}.log", side.segment_id()));
         let bytes = std::fs::read(&log).expect("read sealed log");
@@ -84,7 +98,8 @@ async fn parity_sidecar_written_only_when_enabled() {
         // Undamaged: parity localizes zero damaged blocks.
         assert!(
             side.damaged_shards(&bytes).is_empty(),
-            "a freshly sealed segment has no damaged blocks under its own parity"
+            "a freshly sealed segment has no damaged blocks under its own \
+             parity"
         );
     }
     drop(engine);
@@ -92,7 +107,8 @@ async fn parity_sidecar_written_only_when_enabled() {
     // --- disabled (default) ---
     let off_dir = tempfile::tempdir().expect("tempdir");
     let off_store = off_dir.path().join("store");
-    let engine = LogEngine::open_with(&off_store, rolling_opts()).expect("open");
+    let engine =
+        LogEngine::open_with(&off_store, rolling_opts()).expect("open");
     fill(&engine, 400).await;
     // Give the sealer the same opportunity to run.
     std::thread::sleep(std::time::Duration::from_millis(300));

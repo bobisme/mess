@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     ops::{Deref, DerefMut},
     path::Path,
-    sync::{atomic::AtomicU64, Mutex},
+    sync::{Mutex, atomic::AtomicU64},
 };
 
 use rocksdb::{ColumnFamilyDescriptor, ColumnFamilyRef, Options};
@@ -11,17 +11,17 @@ use tracing::debug;
 use crate::error::Result;
 
 pub struct DB {
-    db: ::rocksdb::DB,
+    db:                           ::rocksdb::DB,
     /// Last written global position. 0 = unknown; lazily filled by scanning
     /// the global CF, advanced on every successful write.
-    pub(crate) cached_global: AtomicU64,
+    pub(crate) cached_global:     AtomicU64,
     /// Authoritative in-memory last-written stream position per stream, keyed
     /// by stream name. The actor is the sole writer for this DB's lifetime, so
     /// this map is complete for every stream this process has written to. It
     /// lets `ExpectedVersion::Any` appends assign the next stream position
     /// without a disk head read (dx_api friction #3). Absence means "no event
     /// written to this stream yet" (empty stream).
-    pub(crate) stream_heads: Mutex<HashMap<String, u64>>,
+    pub(crate) stream_heads:      Mutex<HashMap<String, u64>>,
     /// Count of disk stream-head reads (`get_last_stream_position`). Real
     /// instrumentation, not a comment: the write-path tests assert an
     /// `ExpectedVersion::Any` append performs zero of these.
@@ -87,26 +87,22 @@ impl DB {
             .or_insert(pos);
     }
 
-    /// Number of disk stream-head reads performed so far (test instrumentation).
+    /// Number of disk stream-head reads performed so far (test
+    /// instrumentation).
     #[cfg(test)]
     pub(crate) fn stream_head_reads(&self) -> u64 {
-        self.stream_head_reads
-            .load(std::sync::atomic::Ordering::Acquire)
+        self.stream_head_reads.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
 impl Deref for DB {
     type Target = ::rocksdb::DB;
 
-    fn deref(&self) -> &Self::Target {
-        &self.db
-    }
+    fn deref(&self) -> &Self::Target { &self.db }
 }
 
 impl DerefMut for DB {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.db
-    }
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.db }
 }
 
 #[cfg(test)]
@@ -128,9 +124,7 @@ pub(crate) mod test {
     impl std::ops::Deref for SelfDestructingDB {
         type Target = DB;
 
-        fn deref(&self) -> &Self::Target {
-            self.0.as_ref().unwrap()
-        }
+        fn deref(&self) -> &Self::Target { self.0.as_ref().unwrap() }
     }
 
     impl std::ops::DerefMut for SelfDestructingDB {

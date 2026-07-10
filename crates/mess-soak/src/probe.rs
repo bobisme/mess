@@ -27,11 +27,11 @@ pub enum Violation {
     /// A read-back record disagreed with the shadow model at a known position
     /// (index/log divergence — the read tier lied about durable history).
     IndexMismatch {
-        stream: String,
+        stream:     String,
         stream_pos: u64,
-        field: &'static str,
-        expected: String,
-        got: String,
+        field:      &'static str,
+        expected:   String,
+        got:        String,
     },
     /// The engine's head for a stream disagreed with the shadow head.
     HeadMismatch { stream: String, expected: Version, got: Version },
@@ -57,18 +57,28 @@ impl std::fmt::Display for Violation {
             Violation::Density { stream, detail } => {
                 write!(f, "DENSITY[{stream}]: {detail}")
             }
-            Violation::IndexMismatch { stream, stream_pos, field, expected, got } => write!(
+            Violation::IndexMismatch {
+                stream,
+                stream_pos,
+                field,
+                expected,
+                got,
+            } => write!(
                 f,
-                "INDEX!=LOG[{stream}@{stream_pos}] {field}: expected {expected}, got {got}"
+                "INDEX!=LOG[{stream}@{stream_pos}] {field}: expected \
+                 {expected}, got {got}"
             ),
             Violation::HeadMismatch { stream, expected, got } => {
                 write!(f, "HEAD[{stream}]: expected {expected:?}, got {got:?}")
             }
             Violation::SubscriptionGap { subscriber, expected, got } => write!(
                 f,
-                "SUBSCRIPTION[{subscriber}]: expected global {expected}, got {got}"
+                "SUBSCRIPTION[{subscriber}]: expected global {expected}, got \
+                 {got}"
             ),
-            Violation::RecoveryLoss { detail } => write!(f, "RECOVERY: {detail}"),
+            Violation::RecoveryLoss { detail } => {
+                write!(f, "RECOVERY: {detail}")
+            }
             Violation::Rss { rss_bytes, ceiling_bytes } => {
                 write!(f, "RSS: {rss_bytes} bytes > ceiling {ceiling_bytes}")
             }
@@ -95,9 +105,15 @@ pub fn check_density(stream: &str, positions: &[u64]) -> Result<(), Violation> {
             let detail = if pos > want {
                 format!("gap: expected position {want} at index {i}, saw {pos}")
             } else {
-                format!("duplicate/out-of-order: expected position {want} at index {i}, saw {pos}")
+                format!(
+                    "duplicate/out-of-order: expected position {want} at \
+                     index {i}, saw {pos}"
+                )
             };
-            return Err(Violation::Density { stream: stream.to_string(), detail });
+            return Err(Violation::Density {
+                stream: stream.to_string(),
+                detail,
+            });
         }
     }
     Ok(())
@@ -151,11 +167,19 @@ pub fn check_record(
 }
 
 /// Compare an engine head to the shadow head.
-pub fn check_head(stream: &str, expected: Version, got: Version) -> Result<(), Violation> {
+pub fn check_head(
+    stream: &str,
+    expected: Version,
+    got: Version,
+) -> Result<(), Violation> {
     if expected == got {
         Ok(())
     } else {
-        Err(Violation::HeadMismatch { stream: stream.to_string(), expected, got })
+        Err(Violation::HeadMismatch {
+            stream: stream.to_string(),
+            expected,
+            got,
+        })
     }
 }
 
@@ -165,7 +189,7 @@ pub fn check_head(stream: &str, expected: Version, got: Version) -> Result<(), V
 /// full subscriber starts with `next_expected == 0`).
 #[derive(Debug, Clone)]
 pub struct SubCursor {
-    pub name: String,
+    pub name:          String,
     pub next_expected: u64,
 }
 
@@ -182,8 +206,8 @@ impl SubCursor {
         if global_pos != self.next_expected {
             return Err(Violation::SubscriptionGap {
                 subscriber: self.name.clone(),
-                expected: self.next_expected,
-                got: global_pos,
+                expected:   self.next_expected,
+                got:        global_pos,
             });
         }
         self.next_expected += 1;
@@ -199,30 +223,30 @@ pub enum ExtraKind {
     /// A6 candidate), consumed here. **Legal** (spec 02 §6): recovery MAY
     /// surface a complete, unacknowledged batch.
     SubmittedUnacked,
-    /// Byte-matches an event that is ALSO present at its own acked position: the
-    /// same acked event surfaced a second time — a recovery **double-replay**
-    /// bug (Z1-family), never legal.
+    /// Byte-matches an event that is ALSO present at its own acked position:
+    /// the same acked event surfaced a second time — a recovery
+    /// **double-replay** bug (Z1-family), never legal.
     DuplicateOfAcked,
-    /// Byte-matches no submitted append at all — a **fabricated** event recovery
-    /// invented from nowhere (or resurfaced a conflicted, never-durable write).
+    /// Byte-matches no submitted append at all — a **fabricated** event
+    /// recovery invented from nowhere (or resurfaced a conflicted,
+    /// never-durable write).
     Fabricated,
 }
 
 /// Running tally of the [`ExtraKind`]s over all extras after a reopen.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ExtraCounts {
-    pub submitted_unacked: u64,
+    pub submitted_unacked:  u64,
     pub duplicate_of_acked: u64,
-    pub fabricated: u64,
+    pub fabricated:         u64,
 }
 
 impl ExtraCounts {
     /// The count that makes recovery **wrong**: duplicates + fabrications. Zero
     /// iff every extra was a legal A6 candidate.
     #[must_use]
-    pub fn illegal(&self) -> u64 {
-        self.duplicate_of_acked + self.fabricated
-    }
+    pub fn illegal(&self) -> u64 { self.duplicate_of_acked + self.fabricated }
+
     pub(crate) fn record(&mut self, kind: ExtraKind) {
         match kind {
             ExtraKind::SubmittedUnacked => self.submitted_unacked += 1,
@@ -234,11 +258,12 @@ impl ExtraCounts {
 
 /// Classify one post-reopen extra (an engine event at a position the shadow
 /// never acked) against the acked-payload index and the submitted-but-unacked
-/// candidate multiset. Consumes one candidate on a [`SubmittedUnacked`](ExtraKind::SubmittedUnacked)
-/// match so no candidate excuses two extras. Because every driver payload embeds
-/// a unique write nonce, a payload that appears in `acked` is necessarily a
-/// duplicate of that acked event (spec-02 A6 forbids duplicating an *acked*
-/// batch), and a payload in neither set was never submitted at all.
+/// candidate multiset. Consumes one candidate on a
+/// [`SubmittedUnacked`](ExtraKind::SubmittedUnacked) match so no candidate
+/// excuses two extras. Because every driver payload embeds a unique write
+/// nonce, a payload that appears in `acked` is necessarily a duplicate of that
+/// acked event (spec-02 A6 forbids duplicating an *acked* batch), and a payload
+/// in neither set was never submitted at all.
 pub fn classify_extra(
     payload: &[u8],
     acked: &HashMap<Vec<u8>, Vec<u64>>,
@@ -273,7 +298,10 @@ pub fn check_fd(count: usize, ceiling: usize) -> Result<(), Violation> {
 }
 
 /// fsync p99 ceiling. `ceiling == ZERO` disables the check.
-pub fn check_fsync_p99(p99: Duration, ceiling: Duration) -> Result<(), Violation> {
+pub fn check_fsync_p99(
+    p99: Duration,
+    ceiling: Duration,
+) -> Result<(), Violation> {
     if ceiling != Duration::ZERO && p99 > ceiling {
         Err(Violation::FsyncP99 { p99, ceiling })
     } else {
@@ -301,9 +329,9 @@ mod tests {
     }
     fn rec(stream: &str, pos: u64, t: &str, d: &[u8]) -> StoredRecord {
         StoredRecord {
-            stream_id: stream.into(),
-            message_type: t.into(),
-            data: d.into(),
+            stream_id:       stream.into(),
+            message_type:    t.into(),
+            data:            d.into(),
             stream_position: pos,
             global_position: 0,
         }
@@ -330,22 +358,46 @@ mod tests {
     // ---- index == log ----
     #[test]
     fn record_matches() {
-        assert!(check_record("s", 2, &ev("t", b"abc"), &rec("s", 2, "t", b"abc")).is_ok());
+        assert!(
+            check_record("s", 2, &ev("t", b"abc"), &rec("s", 2, "t", b"abc"))
+                .is_ok()
+        );
     }
     #[test]
     fn record_fires_on_payload_divergence() {
-        let v = check_record("s", 2, &ev("t", b"abc"), &rec("s", 2, "t", b"XYZ")).unwrap_err();
-        assert!(matches!(v, Violation::IndexMismatch { field: "data", .. }), "{v}");
+        let v =
+            check_record("s", 2, &ev("t", b"abc"), &rec("s", 2, "t", b"XYZ"))
+                .unwrap_err();
+        assert!(
+            matches!(v, Violation::IndexMismatch { field: "data", .. }),
+            "{v}"
+        );
     }
     #[test]
     fn record_fires_on_type_divergence() {
-        let v = check_record("s", 0, &ev("opened", b""), &rec("s", 0, "closed", b"")).unwrap_err();
-        assert!(matches!(v, Violation::IndexMismatch { field: "message_type", .. }), "{v}");
+        let v = check_record(
+            "s",
+            0,
+            &ev("opened", b""),
+            &rec("s", 0, "closed", b""),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(v, Violation::IndexMismatch { field: "message_type", .. }),
+            "{v}"
+        );
     }
     #[test]
     fn record_fires_on_position_divergence() {
-        let v = check_record("s", 5, &ev("t", b""), &rec("s", 6, "t", b"")).unwrap_err();
-        assert!(matches!(v, Violation::IndexMismatch { field: "stream_position", .. }), "{v}");
+        let v = check_record("s", 5, &ev("t", b""), &rec("s", 6, "t", b""))
+            .unwrap_err();
+        assert!(
+            matches!(
+                v,
+                Violation::IndexMismatch { field: "stream_position", .. }
+            ),
+            "{v}"
+        );
     }
 
     // ---- head ----
@@ -382,7 +434,10 @@ mod tests {
         c.observe(0).unwrap();
         c.observe(1).unwrap();
         let v = c.observe(1).unwrap_err();
-        assert!(matches!(v, Violation::SubscriptionGap { expected: 2, got: 1, .. }), "{v}");
+        assert!(
+            matches!(v, Violation::SubscriptionGap { expected: 2, got: 1, .. }),
+            "{v}"
+        );
     }
 
     // ---- A6 extra classification ----
@@ -420,7 +475,8 @@ mod tests {
         assert_eq!(
             classify_extra(b"acked", &acked, &mut c),
             ExtraKind::DuplicateOfAcked,
-            "a payload already present at its acked position surfacing again is a duplicate"
+            "a payload already present at its acked position surfacing again \
+             is a duplicate"
         );
     }
 
@@ -439,7 +495,11 @@ mod tests {
         let mut e = ExtraCounts::default();
         e.record(ExtraKind::SubmittedUnacked);
         e.record(ExtraKind::SubmittedUnacked);
-        assert_eq!(e.illegal(), 0, "legal A6 candidates never count as illegal");
+        assert_eq!(
+            e.illegal(),
+            0,
+            "legal A6 candidates never count as illegal"
+        );
         e.record(ExtraKind::DuplicateOfAcked);
         e.record(ExtraKind::Fabricated);
         assert_eq!(e.illegal(), 2);
@@ -453,7 +513,10 @@ mod tests {
     fn rss_ceiling() {
         assert!(check_rss(100, 0).is_ok()); // disabled
         assert!(check_rss(100, 200).is_ok());
-        assert!(matches!(check_rss(300, 200).unwrap_err(), Violation::Rss { .. }));
+        assert!(matches!(
+            check_rss(300, 200).unwrap_err(),
+            Violation::Rss { .. }
+        ));
     }
     #[test]
     fn fd_ceiling() {
@@ -463,9 +526,21 @@ mod tests {
     }
     #[test]
     fn fsync_ceiling() {
-        assert!(check_fsync_p99(Duration::from_millis(5), Duration::ZERO).is_ok());
-        assert!(check_fsync_p99(Duration::from_millis(5), Duration::from_millis(10)).is_ok());
-        let v = check_fsync_p99(Duration::from_millis(50), Duration::from_millis(10)).unwrap_err();
+        assert!(
+            check_fsync_p99(Duration::from_millis(5), Duration::ZERO).is_ok()
+        );
+        assert!(
+            check_fsync_p99(
+                Duration::from_millis(5),
+                Duration::from_millis(10)
+            )
+            .is_ok()
+        );
+        let v = check_fsync_p99(
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+        )
+        .unwrap_err();
         assert!(matches!(v, Violation::FsyncP99 { .. }), "{v}");
     }
 }

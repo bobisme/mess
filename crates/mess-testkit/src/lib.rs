@@ -25,9 +25,9 @@
 //! # Scope
 //!
 //! - the Given-When-Then kit above (bn-2cn)
-//! - verification support for commit authority and recovery (D1) and
-//!   batch framing (D2) invariants, shared across crates' test suites
-//!   (lands separately as Phase 1 work continues)
+//! - verification support for commit authority and recovery (D1) and batch
+//!   framing (D2) invariants, shared across crates' test suites (lands
+//!   separately as Phase 1 work continues)
 
 use std::fmt::Debug;
 
@@ -57,9 +57,7 @@ impl<A: Aggregate> AggregateTest<A> {
 
     /// Start from a blank (never-written) aggregate. Equivalent to
     /// `given([])`; spells out intent at call sites.
-    pub fn given_no_events() -> Self {
-        Self { given: Vec::new() }
-    }
+    pub fn given_no_events() -> Self { Self { given: Vec::new() } }
 
     /// Act: fold the given events, then run the command through `decide`.
     pub fn when<C>(self, cmd: C) -> WhenOutcome<A, C>
@@ -100,9 +98,9 @@ where
                 }
             }
             Err(err) => panic!(
-                "expected the command to emit events, but it was rejected\n\
-                 expected events: {expected:#?}\n\
-                 rejection:       {err:?}"
+                "expected the command to emit events, but it was \
+                 rejected\nexpected events: {expected:#?}\nrejection:       \
+                 {err:?}"
             ),
         }
     }
@@ -200,7 +198,7 @@ pub fn matching<R>(
     ErrorMatch {
         kind: MatchKind::Predicate {
             label: label.into(),
-            test: Box::new(test),
+            test:  Box::new(test),
         },
     }
 }
@@ -258,9 +256,7 @@ mod tests {
     }
 
     impl mess_core::Event for CounterEvent {
-        fn name(&self) -> &'static str {
-            "counter.bumped"
-        }
+        fn name(&self) -> &'static str { "counter.bumped" }
 
         fn encode(&self) -> Result<Vec<u8>, CodecError> {
             let CounterEvent::Bumped { by } = self;
@@ -274,7 +270,7 @@ mod tests {
             let arr: [u8; 8] =
                 data.try_into().map_err(|_| CodecError::Decode {
                     event_name: name.to_string(),
-                    source: "expected 8 payload bytes".to_string(),
+                    source:     "expected 8 payload bytes".to_string(),
                 })?;
             Ok(CounterEvent::Bumped { by: i64::from_le_bytes(arr) })
         }
@@ -316,7 +312,7 @@ mod tests {
             if self.value + cmd.0 < 0 {
                 return Err(CounterError::WouldGoNegative {
                     value: self.value,
-                    by: cmd.0,
+                    by:    cmd.0,
                 });
             }
             Ok(vec![CounterEvent::Bumped { by: cmd.0 }])
@@ -397,9 +393,9 @@ mod tests {
     #[test]
     #[should_panic(expected = "wrong error")]
     fn then_error_panics_on_exact_value_mismatch() {
-        AggregateTest::<Counter>::given_no_events()
-            .when(Bump(-1))
-            .then_error(CounterError::WouldGoNegative { value: 999, by: -1 });
+        AggregateTest::<Counter>::given_no_events().when(Bump(-1)).then_error(
+            CounterError::WouldGoNegative { value: 999, by: -1 },
+        );
     }
 
     #[test]

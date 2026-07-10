@@ -28,7 +28,7 @@ enum AccountEvent {
 #[derive(Debug, Default, Clone, PartialEq, Eq, Aggregate)]
 #[aggregate(event = AccountEvent)]
 struct Account {
-    open: bool,
+    open:    bool,
     balance: i64,
 }
 
@@ -133,8 +133,14 @@ fn wire_names_match_ground_truth() {
         AccountEvent::Opened { owner: "a".into() }.name(),
         "account.opened"
     );
-    assert_eq!(AccountEvent::Deposited { amount: 1 }.name(), "account.deposited");
-    assert_eq!(AccountEvent::Withdrawn { amount: 1 }.name(), "account.withdrawn");
+    assert_eq!(
+        AccountEvent::Deposited { amount: 1 }.name(),
+        "account.deposited"
+    );
+    assert_eq!(
+        AccountEvent::Withdrawn { amount: 1 }.name(),
+        "account.withdrawn"
+    );
 
     assert_eq!(
         AccountEvent::EVENT_NAMES,
@@ -164,7 +170,8 @@ fn encode_decode_round_trips_every_variant() {
 
 #[test]
 fn decode_rejects_unknown_name() {
-    let bytes = AccountEvent::Opened { owner: "alice".into() }.encode().unwrap();
+    let bytes =
+        AccountEvent::Opened { owner: "alice".into() }.encode().unwrap();
     let err = AccountEvent::decode("account.frobnicated", &bytes).unwrap_err();
     assert!(
         matches!(err, mess_core::CodecError::UnknownEventName(ref n) if n == "account.frobnicated"),
@@ -178,7 +185,8 @@ fn payload_carries_only_variant_fields_not_the_enum_tag() {
     // serializes only the variant's fields. Prove the payload does NOT
     // embed the Rust variant name "Opened" — dispatch lives entirely in the
     // stored wire name.
-    let bytes = AccountEvent::Opened { owner: "alice".into() }.encode().unwrap();
+    let bytes =
+        AccountEvent::Opened { owner: "alice".into() }.encode().unwrap();
     let as_text = String::from_utf8_lossy(&bytes);
     assert!(
         !as_text.contains("Opened"),
@@ -225,8 +233,7 @@ fn wire_names_stable_under_variant_reorder() {
         // Bytes from the original enum decode to the semantically equal
         // variant of the reordered enum — no index-based swap.
         let bytes = orig.encode().unwrap();
-        let got =
-            AccountEventReordered::decode(orig.name(), &bytes).unwrap();
+        let got = AccountEventReordered::decode(orig.name(), &bytes).unwrap();
         assert_eq!(&got, want);
     }
 }
@@ -330,7 +337,8 @@ fn schema_fingerprint_is_per_variant_and_stable() {
     // Stable across variant reorder: same name + version + shape.
     assert_eq!(
         opened.schema_fingerprint(),
-        AccountEventReordered::Opened { owner: "a".into() }.schema_fingerprint()
+        AccountEventReordered::Opened { owner: "a".into() }
+            .schema_fingerprint()
     );
 }
 

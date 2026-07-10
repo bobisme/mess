@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use mess_log::encode::Subframe;
-use mess_log::recover_all::{recover_whole_log, RecoverOptions, RecoveryMode, SegmentFile};
+use mess_log::recover_all::{
+    RecoverOptions, RecoveryMode, SegmentFile, recover_whole_log,
+};
 use mess_log::runtime::real::RealFs;
 use mess_log::writer::{BatchSpec, SegmentParams, SegmentWriter};
 
@@ -32,11 +34,11 @@ fn build(dir: &Path, n_segs: usize, seg_bytes: u64) -> (Vec<SegmentFile>, u64) {
     let payload = vec![0x5Au8; 60 * 1024];
     let subs = [Subframe::plain(0x11, 0, 0, &payload)];
     let mk_spec = |v: u64| BatchSpec {
-        stream_id: 1,
-        category_id: 101,
+        stream_id:            1,
+        category_id:          101,
         first_stream_version: v,
-        crypto_chain: None,
-        subframes: &subs,
+        crypto_chain:         None,
+        subframes:            &subs,
     };
 
     let mut segs = Vec::new();
@@ -61,7 +63,8 @@ fn build(dir: &Path, n_segs: usize, seg_bytes: u64) -> (Vec<SegmentFile>, u64) {
         let summary = cur.seal().unwrap();
         if i + 1 < n_segs {
             let id = (i + 2) as u64;
-            let mut np = SegmentParams::new(id, summary.end_pos, 10 + id, summary.epoch);
+            let mut np =
+                SegmentParams::new(id, summary.end_pos, 10 + id, summary.epoch);
             np.segment_size = seg_bytes;
             w = Some(SegmentWriter::create(&fs, &path(i + 1), np).unwrap());
             segs.push(SegmentFile::new(id, path(i + 1)));
@@ -70,7 +73,11 @@ fn build(dir: &Path, n_segs: usize, seg_bytes: u64) -> (Vec<SegmentFile>, u64) {
     (segs, total_content)
 }
 
-fn time_recovery(fs: &RealFs, segs: &[SegmentFile], parallel: bool) -> std::time::Duration {
+fn time_recovery(
+    fs: &RealFs,
+    segs: &[SegmentFile],
+    parallel: bool,
+) -> std::time::Duration {
     let opts = RecoverOptions { mode: RecoveryMode::Full, parallel };
     let start = Instant::now();
     let whole = recover_whole_log(fs, segs, None, opts).unwrap();
@@ -91,10 +98,16 @@ fn main() {
         p
     };
 
-    eprintln!("building corpus: {n_segs} segments × ~{} MiB ...", seg_bytes / (1024 * 1024));
+    eprintln!(
+        "building corpus: {n_segs} segments × ~{} MiB ...",
+        seg_bytes / (1024 * 1024)
+    );
     let (segs, total_content) = build(&dir, n_segs, seg_bytes);
     let gib = total_content as f64 / (1024.0 * 1024.0 * 1024.0);
-    eprintln!("corpus: {segs_len} segments, {gib:.3} GiB of content", segs_len = segs.len());
+    eprintln!(
+        "corpus: {segs_len} segments, {gib:.3} GiB of content",
+        segs_len = segs.len()
+    );
 
     let fs = RealFs;
     // Warm the page cache so both runs measure CPU scan, not first-touch I/O.
@@ -119,7 +132,10 @@ fn main() {
         parallel.as_secs_f64() / gib,
         n = n_segs,
     );
-    println!("speedup: {:.2}×", serial.as_secs_f64() / parallel.as_secs_f64().max(1e-9));
+    println!(
+        "speedup: {:.2}×",
+        serial.as_secs_f64() / parallel.as_secs_f64().max(1e-9)
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

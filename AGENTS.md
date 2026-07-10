@@ -118,6 +118,7 @@ All commands support JSON output with `--format json` for parsing. If a command 
 - Create a bone before starting work. Update state: `open` → `doing` → `done`.
 - Post progress comments during work for crash recovery.
 - **Run checks before committing**: `just test`. Fix any failures before proceeding.
+- **Formatting**: `just fmt-check` (equivalently `cargo +nightly fmt --all --check`). rustfmt.toml uses nightly-only options, so this always targets `+nightly`, not the default toolchain — see rustfmt.toml's header comment. Run `just fmt` to apply.
 - After finishing a bone, follow [finish.md](.agents/edict/finish.md). **Workers: do NOT push** — the lead handles merges and pushes.
 ### Identity
 

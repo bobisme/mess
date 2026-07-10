@@ -24,7 +24,10 @@ use mess_store::version::Version;
 pub const SEG_ID: u64 = 1;
 
 fn rec(message_type: &str, data: &[u8]) -> RecordToAppend {
-    RecordToAppend { message_type: message_type.into(), data: data.to_vec() }
+    RecordToAppend {
+        message_type: message_type.into(),
+        data:         data.to_vec(),
+    }
 }
 
 /// Build a corpus at `dir`: append `n_batches` single-event batches to one
@@ -44,10 +47,15 @@ pub fn build_corpus(dir: &Path, n_batches: u64) {
         };
         let engine = LogEngine::open_with(dir, opts).expect("open engine");
         for i in 0..n_batches {
-            let expected = if i == 0 { Version::NoStream } else { Version::At(i - 1) };
+            let expected =
+                if i == 0 { Version::NoStream } else { Version::At(i - 1) };
             let payload = format!("event-{i}").into_bytes();
             engine
-                .append_batch("acct-1", expected, &[rec("account.happened", &payload)])
+                .append_batch(
+                    "acct-1",
+                    expected,
+                    &[rec("account.happened", &payload)],
+                )
                 .await
                 .expect("append");
         }
@@ -70,19 +78,27 @@ pub fn seal_log_trailer(dir: &Path) {
     let epoch = scan.epoch().expect("epoch");
     let base_pos = scan.base_pos().expect("base_pos");
 
-    let mut f = std::fs::OpenOptions::new().read(true).write(true).open(&log).expect("open log");
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&log)
+        .expect("open log");
     f.set_len(content_len).expect("truncate to content");
     f.seek(SeekFrom::Start(content_len)).expect("seek");
-    let trailer =
-        encode_trailer(&TrailerFields::phase3(SEG_ID, epoch, base_pos, batch_count, event_count, content_len));
+    let trailer = encode_trailer(&TrailerFields::phase3(
+        SEG_ID,
+        epoch,
+        base_pos,
+        batch_count,
+        event_count,
+        content_len,
+    ));
     f.write_all(&trailer).expect("write trailer");
     f.sync_all().expect("sync");
 }
 
 /// The sealed pointer-sidecar path for the corpus segment.
-pub fn pidx(dir: &Path) -> std::path::PathBuf {
-    store::pidx_path(dir, SEG_ID)
-}
+pub fn pidx(dir: &Path) -> std::path::PathBuf { store::pidx_path(dir, SEG_ID) }
 
 /// The payload-sidecar path for the corpus segment.
 pub fn pcol(dir: &Path) -> std::path::PathBuf {
@@ -95,7 +111,11 @@ pub fn pcol(dir: &Path) -> std::path::PathBuf {
 pub fn flip_byte(path: &Path, offset: u64) {
     let mut bytes = std::fs::read(path).expect("read");
     let i = offset as usize;
-    assert!(i < bytes.len(), "flip offset {i} out of range (len {})", bytes.len());
+    assert!(
+        i < bytes.len(),
+        "flip offset {i} out of range (len {})",
+        bytes.len()
+    );
     bytes[i] ^= 0xFF;
     std::fs::write(path, bytes).expect("write");
 }
@@ -118,7 +138,12 @@ use mess_index::sealed::parity::{ParityConfig, generate as generate_parity};
 /// A small-shard parity config for the tiny corpus (so a few hundred bytes span
 /// several groups): 64-byte shards, 4 data + 2 parity per group.
 pub fn parity_test_cfg() -> ParityConfig {
-    ParityConfig { enabled: true, shard_size: 64, data_per_group: 4, parity_per_group: 2 }
+    ParityConfig {
+        enabled:          true,
+        shard_size:       64,
+        data_per_group:   4,
+        parity_per_group: 2,
+    }
 }
 
 /// Generate a `.par` parity sidecar over the (already sealed) segment's current
@@ -127,15 +152,15 @@ pub fn parity_test_cfg() -> ParityConfig {
 pub fn write_parity(dir: &Path, cfg: ParityConfig) -> u64 {
     let log = store::log_path(dir, SEG_ID);
     let bytes = std::fs::read(&log).expect("read log");
-    let par_bytes = generate_parity(SEG_ID, &bytes, &cfg).expect("generate parity");
+    let par_bytes =
+        generate_parity(SEG_ID, &bytes, &cfg).expect("generate parity");
     let path = store::par_path(dir, SEG_ID);
-    std::fs::create_dir_all(path.parent().expect("sealed parent")).expect("mkdir sealed");
+    std::fs::create_dir_all(path.parent().expect("sealed parent"))
+        .expect("mkdir sealed");
     let len = par_bytes.len() as u64;
     std::fs::write(&path, par_bytes).expect("write par");
     len
 }
 
 /// The parity-sidecar path for the corpus segment.
-pub fn par(dir: &Path) -> std::path::PathBuf {
-    store::par_path(dir, SEG_ID)
-}
+pub fn par(dir: &Path) -> std::path::PathBuf { store::par_path(dir, SEG_ID) }

@@ -49,14 +49,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::degraded::{Degraded, PoisonCause};
+pub use crate::degraded::{
+    Degraded as StoreDegraded, PoisonCause as BarrierPoisonCause,
+};
 use crate::encode::{BatchEncoder, BatchInput, EncodeError, Subframe};
 use crate::fold_chain::ChainHead;
 use crate::runtime::{Fs, Runtime};
 use crate::watermark::Watermark;
-use crate::writer::{BatchSpec, SegmentSummary, SegmentWriter, WriteError};
-
-pub use crate::degraded::{Degraded as StoreDegraded, PoisonCause as BarrierPoisonCause};
 pub use crate::watermark::Watermark as DurableWatermark;
+use crate::writer::{BatchSpec, SegmentSummary, SegmentWriter, WriteError};
 
 // ---------------------------------------------------------------------------
 // Public config + request/outcome types
@@ -91,7 +92,10 @@ impl Durability {
     /// The spec's fixed defaults for `Group` (§2.2): `max_delay = 1 ms`,
     /// `max_bytes = 8 MiB` (≈5× the measured knee).
     pub fn group_default() -> Self {
-        Durability::Group { max_delay: Duration::from_millis(1), max_bytes: 8 * 1024 * 1024 }
+        Durability::Group {
+            max_delay: Duration::from_millis(1),
+            max_bytes: 8 * 1024 * 1024,
+        }
     }
 }
 
@@ -102,9 +106,10 @@ impl Durability {
 /// did before this feature existed. When [`enabled`](Self::enabled) is set, the
 /// committer maintains one running [`ChainHead`] per stream (G10 per-batch
 /// chain): before each batch it stamps the head's current value (`h[base-1]`)
-/// into the batch's `crypto_chain` slot (offset [`HEADER_LEN`](crate::format::HEADER_LEN),
-/// §4.4), then folds the batch's on-disk payloads into the head so the next
-/// batch of that stream continues the chain.
+/// into the batch's `crypto_chain` slot (offset
+/// [`HEADER_LEN`](crate::format::HEADER_LEN), §4.4), then folds the batch's
+/// on-disk payloads into the head so the next batch of that stream continues
+/// the chain.
 ///
 /// `heads` seeds the per-stream state on open: fresh stores pass an empty map
 /// (every stream starts at [`ChainHead::genesis`] on first sight); recovery
@@ -113,22 +118,20 @@ impl Durability {
 /// prefix left off.
 #[derive(Debug, Clone, Default)]
 pub struct ChainInit {
-    /// Whether to materialize `crypto_chain` into each batch. `false` keeps the
-    /// on-disk bytes byte-identical to a non-chained store.
+    /// Whether to materialize `crypto_chain` into each batch. `false` keeps
+    /// the on-disk bytes byte-identical to a non-chained store.
     pub enabled: bool,
     /// Per-stream resumed heads (`stream_id → head`), from recovery. A stream
     /// absent here starts at its [`ChainHead::genesis`] the first time it is
     /// appended.
-    pub heads: HashMap<u64, ChainHead>,
+    pub heads:   HashMap<u64, ChainHead>,
 }
 
 impl ChainInit {
     /// Chain disabled — the default. On-disk bytes stay identical to a store
     /// that never knew about the fold chain.
     #[must_use]
-    pub fn off() -> Self {
-        ChainInit { enabled: false, heads: HashMap::new() }
-    }
+    pub fn off() -> Self { ChainInit { enabled: false, heads: HashMap::new() } }
 
     /// Chain enabled, seeded with `heads` (empty for a fresh store, or the
     /// per-stream heads rehydrated by recovery).
@@ -144,18 +147,23 @@ impl ChainInit {
 #[derive(Debug, Clone)]
 pub struct EventInput {
     /// Interned event type id (§4.3).
-    pub event_type_id: u32,
+    pub event_type_id:  u32,
     /// Schema version at write time.
     pub schema_version: u16,
     /// Interned payload codec id (`0` = bootstrap).
-    pub codec_id: u16,
+    pub codec_id:       u16,
     /// The uncompressed, verbatim payload bytes.
-    pub payload: Vec<u8>,
+    pub payload:        Vec<u8>,
 }
 
 impl EventInput {
     /// A plain uncompressed event carrying `payload`.
-    pub fn plain(event_type_id: u32, schema_version: u16, codec_id: u16, payload: Vec<u8>) -> Self {
+    pub fn plain(
+        event_type_id: u32,
+        schema_version: u16,
+        codec_id: u16,
+        payload: Vec<u8>,
+    ) -> Self {
         EventInput { event_type_id, schema_version, codec_id, payload }
     }
 }
@@ -166,13 +174,13 @@ impl EventInput {
 #[derive(Debug, Clone)]
 pub struct AppendRequest {
     /// Batch-constant stream id.
-    pub stream_id: u64,
+    pub stream_id:            u64,
     /// Batch-constant category id.
-    pub category_id: u64,
+    pub category_id:          u64,
     /// Stream version of this batch's first event (§4.2).
     pub first_stream_version: u64,
     /// The events, in order. A5: MUST be non-empty.
-    pub events: Vec<EventInput>,
+    pub events:               Vec<EventInput>,
 }
 
 /// The durability outcome of an [`append`](Committer::append), per
@@ -186,7 +194,7 @@ pub enum AppendOutcome {
         /// Global position of the batch's first event (A1).
         first_position: u64,
         /// Global position of the batch's last event.
-        last_position: u64,
+        last_position:  u64,
     },
     /// The barrier that would cover this batch did not complete (an
     /// `fdatasync` fault, or the crash window §6/§7): the batch MAY still
@@ -210,7 +218,7 @@ pub enum AppendError {
     #[error("segment full: batch needs {needed} bytes, {remaining} remain")]
     SegmentFull {
         /// The batch's `total_len`.
-        needed: u64,
+        needed:    u64,
         /// Bytes left before `segment_size`.
         remaining: u64,
     },
@@ -251,8 +259,8 @@ pub enum AppendError {
 // Fsync metric (§2.6: barrier-latency metric MUST be exposed)
 // ---------------------------------------------------------------------------
 
-pub use crate::metrics::{DEFAULT_FSYNC_THRESHOLD, LatencySnapshot};
 use crate::metrics::{Counter, DegradationAlarm, LatencyHistogram};
+pub use crate::metrics::{DEFAULT_FSYNC_THRESHOLD, LatencySnapshot};
 
 /// Barrier (`fdatasync`) instrumentation the store exposes per §2.6 — "a store
 /// that cannot show its own p50/p99 barrier latency cannot be operated." The
@@ -261,28 +269,31 @@ use crate::metrics::{Counter, DegradationAlarm, LatencyHistogram};
 /// loudly), and the append-throughput counters, all lock-free.
 struct Metrics {
     /// `fdatasync` barrier latency distribution.
-    fsync: LatencyHistogram,
+    fsync:   LatencyHistogram,
     /// The mandatory degradation alarm on barrier latency (§2.6).
-    alarm: DegradationAlarm,
+    alarm:   DegradationAlarm,
     /// Commit groups committed (one barrier each in a barriered mode).
-    groups: Counter,
+    groups:  Counter,
     /// Batches durably written.
     batches: Counter,
     /// Events durably written.
-    events: Counter,
+    events:  Counter,
     /// Payload+framing bytes durably written (the `encoded_len` sum).
-    bytes: Counter,
+    bytes:   Counter,
 }
 
 impl Default for Metrics {
     fn default() -> Self {
         Metrics {
-            fsync: LatencyHistogram::new(),
-            alarm: DegradationAlarm::new("fdatasync", DEFAULT_FSYNC_THRESHOLD),
-            groups: Counter::new(),
+            fsync:   LatencyHistogram::new(),
+            alarm:   DegradationAlarm::new(
+                "fdatasync",
+                DEFAULT_FSYNC_THRESHOLD,
+            ),
+            groups:  Counter::new(),
             batches: Counter::new(),
-            events: Counter::new(),
-            bytes: Counter::new(),
+            events:  Counter::new(),
+            bytes:   Counter::new(),
         }
     }
 }
@@ -305,23 +316,23 @@ impl Metrics {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CommitterMetrics {
     /// `fdatasync` barrier latency (p50/p95/p99/max/mean, nanoseconds).
-    pub fsync: LatencySnapshot,
+    pub fsync:                 LatencySnapshot,
     /// Whether barrier latency has crossed the degradation threshold — the
     /// sticky store-status flag (§2.6). `true` means the device has shown
     /// degraded-load `fdatasync` latency at least once.
-    pub fsync_degraded: bool,
+    pub fsync_degraded:        bool,
     /// Number of barriers that crossed the threshold.
-    pub fsync_degraded_trips: u64,
+    pub fsync_degraded_trips:  u64,
     /// The active degradation threshold, in nanoseconds.
     pub fsync_threshold_nanos: u64,
     /// Commit groups committed.
-    pub groups: u64,
+    pub groups:                u64,
     /// Batches durably written.
-    pub batches: u64,
+    pub batches:               u64,
     /// Events durably written.
-    pub events: u64,
+    pub events:                u64,
     /// Payload+framing bytes durably written.
-    pub bytes: u64,
+    pub bytes:                 u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -330,7 +341,7 @@ pub struct CommitterMetrics {
 
 struct AckState {
     outcome: Option<Result<AppendOutcome, AppendError>>,
-    waker: Option<std::task::Waker>,
+    waker:   Option<std::task::Waker>,
 }
 
 type Ack = Arc<Mutex<AckState>>;
@@ -353,7 +364,7 @@ fn fulfill(ack: &Ack, outcome: Result<AppendOutcome, AppendError>) {
 // ---------------------------------------------------------------------------
 
 struct DoneState {
-    done: bool,
+    done:   bool,
     /// Every waiter currently parked on this signal. Plural — unlike a
     /// single-shot `shutdown()`/`Drop` join (the original, sole use of this
     /// signal), [`AckOrClosed`] below also races an arbitrary number of
@@ -386,7 +397,10 @@ struct DoneWait {
 impl Future for DoneWait {
     type Output = ();
 
-    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
         let mut st = self.done.lock().unwrap();
         if st.done {
             std::task::Poll::Ready(())
@@ -411,14 +425,17 @@ impl Future for DoneWait {
 /// always wins the race; only a request the loop never got to gather at all
 /// ever observes `done` first.
 struct AckOrClosed {
-    ack: Ack,
+    ack:  Ack,
     done: Done,
 }
 
 impl Future for AckOrClosed {
     type Output = Result<AppendOutcome, AppendError>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
         {
             let mut st = self.ack.lock().unwrap();
             if let Some(out) = st.outcome.take() {
@@ -460,9 +477,7 @@ impl Gate {
     }
 
     /// A writer entered `append`.
-    fn enter(&self) {
-        self.count.fetch_add(1, Ordering::Relaxed);
-    }
+    fn enter(&self) { self.count.fetch_add(1, Ordering::Relaxed); }
 
     /// A writer submitted. If it was the last in flight (count → 0), wake
     /// the committer's gather.
@@ -474,9 +489,7 @@ impl Gate {
         }
     }
 
-    fn is_zero(&self) -> bool {
-        self.count.load(Ordering::Relaxed) == 0
-    }
+    fn is_zero(&self) -> bool { self.count.load(Ordering::Relaxed) == 0 }
 
     /// Register the committer's waker to be notified on the next count → 0.
     fn register(&self, w: &std::task::Waker) {
@@ -489,9 +502,9 @@ impl Gate {
 // ---------------------------------------------------------------------------
 
 struct ChanInner<T> {
-    queue: std::collections::VecDeque<T>,
+    queue:      std::collections::VecDeque<T>,
     recv_waker: Option<std::task::Waker>,
-    senders: usize,
+    senders:    usize,
 }
 
 struct Sender<T> {
@@ -504,9 +517,9 @@ struct Receiver<T> {
 
 fn channel<T>() -> (Sender<T>, Receiver<T>) {
     let inner = Arc::new(Mutex::new(ChanInner {
-        queue: std::collections::VecDeque::new(),
+        queue:      std::collections::VecDeque::new(),
         recv_waker: None,
-        senders: 1,
+        senders:    1,
     }));
     (Sender { inner: inner.clone() }, Receiver { inner })
 }
@@ -561,9 +574,7 @@ impl<T> Receiver<T> {
 
     /// Await one item; resolves `None` once the queue is drained and every
     /// [`Sender`] has dropped (channel closed).
-    fn recv(&self) -> Recv<'_, T> {
-        Recv { inner: &self.inner }
-    }
+    fn recv(&self) -> Recv<'_, T> { Recv { inner: &self.inner } }
 }
 
 struct Recv<'a, T> {
@@ -573,7 +584,10 @@ struct Recv<'a, T> {
 impl<T> Future for Recv<'_, T> {
     type Output = Option<T>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<T>> {
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<T>> {
         let mut st = self.inner.lock().unwrap();
         if let Some(v) = st.queue.pop_front() {
             std::task::Poll::Ready(Some(v))
@@ -591,25 +605,25 @@ impl<T> Future for Recv<'_, T> {
 // ---------------------------------------------------------------------------
 
 struct CommitReq {
-    stream_id: u64,
-    category_id: u64,
+    stream_id:            u64,
+    category_id:          u64,
     first_stream_version: u64,
-    events: Vec<EventInput>,
+    events:               Vec<EventInput>,
     /// Precomputed on-disk `total_len`, for the `max_bytes` window bound
     /// (computed once by the appender at submit time, §2.1's "committer
     /// does not re-encode" spirit — it does not recompute the length
     /// either, it reuses this).
-    encoded_len: u64,
-    ack: Ack,
+    encoded_len:          u64,
+    ack:                  Ack,
 }
 
 /// The gather behaviour distilled from a [`Durability`] mode.
 #[derive(Debug, Clone, Copy)]
 struct Policy {
     /// Gather concurrently-arriving batches into one group (`Group` only).
-    coalesce: bool,
+    coalesce:  bool,
     /// Issue an `fdatasync` barrier (`Os` and `Group`; not `Process`).
-    barrier: bool,
+    barrier:   bool,
     max_delay: Duration,
     max_bytes: u64,
 }
@@ -617,12 +631,18 @@ struct Policy {
 impl From<Durability> for Policy {
     fn from(d: Durability) -> Self {
         match d {
-            Durability::Process => {
-                Policy { coalesce: false, barrier: false, max_delay: Duration::ZERO, max_bytes: 0 }
-            }
-            Durability::Os => {
-                Policy { coalesce: false, barrier: true, max_delay: Duration::ZERO, max_bytes: 0 }
-            }
+            Durability::Process => Policy {
+                coalesce:  false,
+                barrier:   false,
+                max_delay: Duration::ZERO,
+                max_bytes: 0,
+            },
+            Durability::Os => Policy {
+                coalesce:  false,
+                barrier:   true,
+                max_delay: Duration::ZERO,
+                max_bytes: 0,
+            },
             Durability::Group { max_delay, max_bytes } => {
                 Policy { coalesce: true, barrier: true, max_delay, max_bytes }
             }
@@ -633,7 +653,14 @@ impl From<Durability> for Policy {
 fn subframes_of(events: &[EventInput]) -> Vec<Subframe<'_>> {
     events
         .iter()
-        .map(|e| Subframe::plain(e.event_type_id, e.schema_version, e.codec_id, &e.payload))
+        .map(|e| {
+            Subframe::plain(
+                e.event_type_id,
+                e.schema_version,
+                e.codec_id,
+                &e.payload,
+            )
+        })
         .collect()
 }
 
@@ -652,7 +679,10 @@ fn subframes_of(events: &[EventInput]) -> Vec<Subframe<'_>> {
 /// [`Committer`]'s `Drop` impl) is actually implemented: nothing here ever
 /// discards a request out of the queue, it just stops picking up NEW ones
 /// once closed.
-async fn recv_unless_closed(rx: &Receiver<CommitReq>, closed: &AtomicBool) -> Option<CommitReq> {
+async fn recv_unless_closed(
+    rx: &Receiver<CommitReq>,
+    closed: &AtomicBool,
+) -> Option<CommitReq> {
     std::future::poll_fn(|cx| {
         let mut recv = std::pin::pin!(rx.recv());
         if let std::task::Poll::Ready(v) = recv.as_mut().poll(cx) {
@@ -788,16 +818,16 @@ async fn gather<R: Runtime>(
 /// waits on the sealer.
 pub struct Roller {
     /// Produces the on-disk path for a segment id (the store's naming scheme).
-    path_for: Box<dyn Fn(u64) -> PathBuf + Send>,
+    path_for:  Box<dyn Fn(u64) -> PathBuf + Send>,
     /// Reports each rolled (durable, still-unsealed) segment for background
-    /// sealing. Dropped when the committer task exits, which closes the channel
-    /// and lets the owner's sealer drain queued work and stop.
+    /// sealing. Dropped when the committer task exits, which closes the
+    /// channel and lets the owner's sealer drain queued work and stop.
     on_rolled: std::sync::mpsc::Sender<SegmentSummary>,
 }
 
 impl Roller {
-    /// Wire auto-roll: `path_for` names segment files, `on_rolled` receives each
-    /// rolled segment's summary for background sealing.
+    /// Wire auto-roll: `path_for` names segment files, `on_rolled` receives
+    /// each rolled segment's summary for background sealing.
     pub fn new(
         path_for: impl Fn(u64) -> PathBuf + Send + 'static,
         on_rolled: std::sync::mpsc::Sender<SegmentSummary>,
@@ -812,7 +842,10 @@ impl Roller {
 /// for background sealing. On `Err` the swap did not happen and the live writer
 /// is left intact and usable (the current segment stays durable and readable) —
 /// e.g. `bn-36y` `StoreFull` if the next segment could not be preallocated.
-fn roll_segment<F: Fs>(writer: &mut SegmentWriter<F>, roller: &Roller) -> Result<(), WriteError> {
+fn roll_segment<F: Fs>(
+    writer: &mut SegmentWriter<F>,
+    roller: &Roller,
+) -> Result<(), WriteError> {
     let summary = writer.sync_and_summary()?; // old segment durable + unsealed
     let next_id = writer.segment_id() + 1;
     let next_epoch = writer.epoch() + 1;
@@ -833,7 +866,8 @@ fn roll_segment<F: Fs>(writer: &mut SegmentWriter<F>, roller: &Roller) -> Result
 /// `roller` (`bn-1vu`): when a batch would overflow the active segment (A8),
 /// the committer rolls to a fresh segment and retries the batch once, so a
 /// full segment is transparent to appenders. A batch larger than a whole empty
-/// segment still cannot fit and is surfaced as `SegmentFull` (no infinite roll).
+/// segment still cannot fit and is surfaced as `SegmentFull` (no infinite
+/// roll).
 #[allow(clippy::too_many_arguments)] // internal seam; each arg is a distinct shared handle
 fn commit_group<R: Runtime, F: Fs>(
     rt: &R,
@@ -849,7 +883,8 @@ fn commit_group<R: Runtime, F: Fs>(
 ) {
     // Steps 2–3: assign positions centrally + write each batch. `next_pos`
     // advances only for successfully written batches.
-    let mut acks: Vec<(Ack, Result<AppendOutcome, AppendError>)> = Vec::with_capacity(group.len());
+    let mut acks: Vec<(Ack, Result<AppendOutcome, AppendError>)> =
+        Vec::with_capacity(group.len());
     let mut wrote_any = false;
     for req in &group {
         let subs = subframes_of(&req.events);
@@ -878,16 +913,16 @@ fn commit_group<R: Runtime, F: Fs>(
         };
         let entry_bytes = entry.map(|h| h.entry());
         let spec = BatchSpec {
-            stream_id: req.stream_id,
-            category_id: req.category_id,
+            stream_id:            req.stream_id,
+            category_id:          req.category_id,
             first_stream_version: req.first_stream_version,
-            crypto_chain: entry_bytes.as_ref(),
-            subframes: &subs,
+            crypto_chain:         entry_bytes.as_ref(),
+            subframes:            &subs,
         };
         // `bn-1vu`: try the append; on A8 SegmentFull with auto-roll wired,
         // roll to a fresh segment and retry the SAME batch once. Positions stay
-        // dense — the new segment's `base_pos == next_pos`, so the retried batch
-        // gets the exact global position it would have had.
+        // dense — the new segment's `base_pos == next_pos`, so the retried
+        // batch gets the exact global position it would have had.
         //
         // `bn-u6o`: a batch bigger than an EMPTY segment can never fit no
         // matter how many times we roll — every fresh segment has exactly
@@ -896,7 +931,8 @@ fn commit_group<R: Runtime, F: Fs>(
         // retrying caller would proliferate one such segment per attempt. Check
         // BEFORE rolling and surface the typed error immediately instead.
         let mut outcome = writer.append(&spec);
-        if let (Err(WriteError::SegmentFull { needed, .. }), Some(roller)) = (&outcome, roller)
+        if let (Err(WriteError::SegmentFull { needed, .. }), Some(roller)) =
+            (&outcome, roller)
             && *needed <= writer.empty_segment_capacity()
         {
             outcome = match roll_segment(writer, roller) {
@@ -922,10 +958,13 @@ fn commit_group<R: Runtime, F: Fs>(
                     let head = heads
                         .get_mut(&req.stream_id)
                         .expect("chain head inserted above");
-                    head.absorb_batch(req.events.iter().map(|e| e.payload.as_slice()));
+                    head.absorb_batch(
+                        req.events.iter().map(|e| e.payload.as_slice()),
+                    );
                 }
                 let first_position = receipt.first_global_pos;
-                let last_position = first_position + u64::from(receipt.frame_count) - 1;
+                let last_position =
+                    first_position + u64::from(receipt.frame_count) - 1;
                 Ok(AppendOutcome::Acked { first_position, last_position })
             }
             Err(WriteError::Encode(e)) => Err(AppendError::Encode(e)),
@@ -951,7 +990,9 @@ fn commit_group<R: Runtime, F: Fs>(
             // still trips this match at compile time instead of silently
             // falling through here.
             Err(WriteError::InvalidResume { .. }) => {
-                unreachable!("InvalidResume is only returned by SegmentWriter::resume")
+                unreachable!(
+                    "InvalidResume is only returned by SegmentWriter::resume"
+                )
             }
         };
         acks.push((req.ack.clone(), res));
@@ -996,7 +1037,8 @@ fn commit_group<R: Runtime, F: Fs>(
             res
         } else {
             match res {
-                Ok(AppendOutcome::Acked { .. }) | Ok(AppendOutcome::Indeterminate) => {
+                Ok(AppendOutcome::Acked { .. })
+                | Ok(AppendOutcome::Indeterminate) => {
                     Ok(AppendOutcome::Indeterminate)
                 }
                 other => other,
@@ -1119,14 +1161,14 @@ async fn submit(
     let total_len = {
         let subs = subframes_of(&req.events);
         let input = BatchInput {
-            segment_epoch: 0,
-            batch_id: 0,
-            first_global_pos: 0,
-            stream_id: req.stream_id,
-            category_id: req.category_id,
+            segment_epoch:        0,
+            batch_id:             0,
+            first_global_pos:     0,
+            stream_id:            req.stream_id,
+            category_id:          req.category_id,
             first_stream_version: req.first_stream_version,
-            crypto_chain: None,
-            subframes: &subs,
+            crypto_chain:         None,
+            subframes:            &subs,
         };
         BatchEncoder::total_len(&input)
     };
@@ -1171,12 +1213,12 @@ async fn submit(
 /// of hanging.
 #[derive(Clone)]
 pub struct Appender {
-    tx: Sender<CommitReq>,
-    gate: Arc<Gate>,
+    tx:        Sender<CommitReq>,
+    gate:      Arc<Gate>,
     watermark: Watermark,
-    degraded: Degraded,
-    closed: Arc<AtomicBool>,
-    done: Done,
+    degraded:  Degraded,
+    closed:    Arc<AtomicBool>,
+    done:      Done,
 }
 
 impl Appender {
@@ -1185,8 +1227,19 @@ impl Appender {
     /// [`AppendError::StorePoisoned`] if the store has been poisoned by a
     /// prior barrier failure (D8, §2.6), or with [`AppendError::Closed`] if
     /// the owning [`Committer`] has shut down (`bn-3da`) — never hangs.
-    pub async fn append(&self, req: AppendRequest) -> Result<AppendOutcome, AppendError> {
-        submit(&self.tx, &self.gate, &self.degraded, &self.closed, &self.done, req).await
+    pub async fn append(
+        &self,
+        req: AppendRequest,
+    ) -> Result<AppendOutcome, AppendError> {
+        submit(
+            &self.tx,
+            &self.gate,
+            &self.degraded,
+            &self.closed,
+            &self.done,
+            req,
+        )
+        .await
     }
 
     /// A clone of the durable watermark this committer advances. After a
@@ -1194,24 +1247,18 @@ impl Appender {
     /// holding this watermark can still serve the pre-poison committed prefix
     /// (degraded reads) but never anything past the last known-durable
     /// position.
-    pub fn watermark(&self) -> Watermark {
-        self.watermark.clone()
-    }
+    pub fn watermark(&self) -> Watermark { self.watermark.clone() }
 
     /// Whether the store is poisoned/degraded (D8, §2.6): a prior barrier
     /// failed, writes now fail fast, and reads are clamped to the frozen
     /// watermark. Sticky for the committer's lifetime — restart + recovery is
     /// the only exit.
-    pub fn is_degraded(&self) -> bool {
-        self.degraded.is_poisoned()
-    }
+    pub fn is_degraded(&self) -> bool { self.degraded.is_poisoned() }
 
     /// A clone of the shared [`Degraded`] flag, so a reader built from this
     /// appender's [`watermark`](Appender::watermark) can *observe* that it is
     /// reading a degraded store rather than a live one.
-    pub fn degraded(&self) -> Degraded {
-        self.degraded.clone()
-    }
+    pub fn degraded(&self) -> Degraded { self.degraded.clone() }
 }
 
 /// A running committer. Owns the committer task's join handle and the
@@ -1221,18 +1268,18 @@ impl Appender {
 /// segment — usually `F == R::Fs`, decoupled so tests can wrap the
 /// segment's fs independently.
 pub struct Committer<R: Runtime> {
-    tx: Option<Sender<CommitReq>>,
-    gate: Arc<Gate>,
+    tx:        Option<Sender<CommitReq>>,
+    gate:      Arc<Gate>,
     watermark: Watermark,
-    metrics: Arc<Metrics>,
-    degraded: Degraded,
+    metrics:   Arc<Metrics>,
+    degraded:  Degraded,
     /// Forced-shutdown flag (`bn-3da`): set by [`Drop`]/[`shutdown`]
     /// (`begin_shutdown`) so the committer loop and any in-flight/future
     /// [`Appender::append`] observe closure deterministically, independent
     /// of how many `Appender` clones are still alive (plain sender
     /// ref-counting alone cannot express "the owner says stop").
-    closed: Arc<AtomicBool>,
-    done: Done,
+    closed:    Arc<AtomicBool>,
+    done:      Done,
     /// Owned so [`Drop`] can call [`Runtime::block_on`] to join the
     /// committer task synchronously — correct on both runtimes: on
     /// [`crate::runtime::real::RealRuntime`] the task runs on its own OS
@@ -1241,14 +1288,18 @@ pub struct Committer<R: Runtime> {
     /// *something* steps the shared single-threaded executor, so `Drop`
     /// must drive it itself rather than block-parking a thread nothing else
     /// will ever wake.
-    rt: R,
+    rt:        R,
 }
 
 impl<R: Runtime> Committer<R> {
     /// Spawn the committer over `writer` in the given [`Durability`] mode.
     /// The committer thread/task takes ownership of `writer` and runs until
     /// [`shutdown`](Committer::shutdown) (or the handle drops).
-    pub fn spawn<F>(rt: &R, writer: SegmentWriter<F>, durability: Durability) -> Self
+    pub fn spawn<F>(
+        rt: &R,
+        writer: SegmentWriter<F>,
+        durability: Durability,
+    ) -> Self
     where
         F: Fs + Send + 'static,
         F::File: Send,
@@ -1258,7 +1309,8 @@ impl<R: Runtime> Committer<R> {
 
     /// Spawn the committer with the fold chain enabled (`bn-3l0`, spec 05 §6):
     /// every batch carries its real on-disk `crypto_chain`, per-stream heads
-    /// seeded from `chain.heads`. Otherwise identical to [`spawn`](Committer::spawn).
+    /// seeded from `chain.heads`. Otherwise identical to
+    /// [`spawn`](Committer::spawn).
     pub fn spawn_chained<F>(
         rt: &R,
         writer: SegmentWriter<F>,
@@ -1286,7 +1338,13 @@ impl<R: Runtime> Committer<R> {
         F: Fs + Send + 'static,
         F::File: Send,
     {
-        Self::spawn_inner(rt, writer, durability, Some(roller), ChainInit::off())
+        Self::spawn_inner(
+            rt,
+            writer,
+            durability,
+            Some(roller),
+            ChainInit::off(),
+        )
     }
 
     /// Spawn with both live segment auto-roll (`bn-1vu`) and the fold chain
@@ -1366,12 +1424,12 @@ impl<R: Runtime> Committer<R> {
         Appender {
             // `tx` is `Some` for the whole life of a live `Committer`; it is
             // only cleared by `shutdown`/`Drop` (`begin_shutdown`).
-            tx: self.tx.as_ref().expect("committer is live").clone(),
-            gate: self.gate.clone(),
+            tx:        self.tx.as_ref().expect("committer is live").clone(),
+            gate:      self.gate.clone(),
             watermark: self.watermark.clone(),
-            degraded: self.degraded.clone(),
-            closed: self.closed.clone(),
-            done: self.done.clone(),
+            degraded:  self.degraded.clone(),
+            closed:    self.closed.clone(),
+            done:      self.done.clone(),
         }
     }
 
@@ -1380,9 +1438,7 @@ impl<R: Runtime> Committer<R> {
     /// barrier poisons the store the committer stops advancing it (D8, §2.6),
     /// so it stays frozen at the last known-durable position and reads clamp
     /// there.
-    pub fn watermark(&self) -> Watermark {
-        self.watermark.clone()
-    }
+    pub fn watermark(&self) -> Watermark { self.watermark.clone() }
 
     /// Whether the store is poisoned/degraded (D8, §2.6): a prior barrier
     /// (`fdatasync`) failed — with `EIO`, `ENOSPC`, or other — so the durable
@@ -1391,35 +1447,25 @@ impl<R: Runtime> Committer<R> {
     /// to the frozen [`watermark`](Committer::watermark). Sticky for the
     /// committer's lifetime with no reset — the only exit is process restart +
     /// recovery ([`docs/spec/02-recovery.md`]).
-    pub fn is_degraded(&self) -> bool {
-        self.degraded.is_poisoned()
-    }
+    pub fn is_degraded(&self) -> bool { self.degraded.is_poisoned() }
 
     /// The [`PoisonCause`] if the store is degraded, else `None`. Diagnostics
     /// only: every cause carries the identical permanent policy.
-    pub fn poison_cause(&self) -> Option<PoisonCause> {
-        self.degraded.cause()
-    }
+    pub fn poison_cause(&self) -> Option<PoisonCause> { self.degraded.cause() }
 
     /// A clone of the shared [`Degraded`] flag. Hand it to a
     /// [`ReadView`](crate::reader::ReadView) built from this committer's
     /// [`watermark`](Committer::watermark) so the reader can *observe* it is
     /// serving a degraded store (the flag readers query, D8, §2.6).
-    pub fn degraded(&self) -> Degraded {
-        self.degraded.clone()
-    }
+    pub fn degraded(&self) -> Degraded { self.degraded.clone() }
 
     /// Number of `fdatasync` barriers issued so far (§2.6 metric; the
     /// denominator for events-per-fsync).
-    pub fn fsync_count(&self) -> u64 {
-        self.metrics.fsync.count()
-    }
+    pub fn fsync_count(&self) -> u64 { self.metrics.fsync.count() }
 
     /// Mean barrier latency in nanoseconds so far, or `0` before any
     /// barrier (§2.6: barrier latency MUST be observable).
-    pub fn mean_fsync_nanos(&self) -> u64 {
-        self.metrics.fsync.mean_nanos()
-    }
+    pub fn mean_fsync_nanos(&self) -> u64 { self.metrics.fsync.mean_nanos() }
 
     /// A point-in-time snapshot of this committer's runtime metrics
     /// (`bn-e2y`): barrier-latency percentiles (p50/p95/p99), the mandatory
@@ -1428,14 +1474,14 @@ impl<R: Runtime> Committer<R> {
     pub fn metrics(&self) -> CommitterMetrics {
         let m = &*self.metrics;
         CommitterMetrics {
-            fsync: m.fsync.snapshot(),
-            fsync_degraded: m.alarm.is_tripped(),
-            fsync_degraded_trips: m.alarm.trips(),
+            fsync:                 m.fsync.snapshot(),
+            fsync_degraded:        m.alarm.is_tripped(),
+            fsync_degraded_trips:  m.alarm.trips(),
             fsync_threshold_nanos: m.alarm.threshold_nanos(),
-            groups: m.groups.get(),
-            batches: m.batches.get(),
-            events: m.events.get(),
-            bytes: m.bytes.get(),
+            groups:                m.groups.get(),
+            batches:               m.batches.get(),
+            events:                m.events.get(),
+            bytes:                 m.bytes.get(),
         }
     }
 
@@ -1443,9 +1489,7 @@ impl<R: Runtime> Committer<R> {
     /// once — the sticky store-status flag §2.6 makes mandatory. `true` means
     /// the device has demonstrably shown degraded-load `fdatasync` latency
     /// (a near-full/contended consumer SSD's ~50× stall).
-    pub fn is_fsync_degraded(&self) -> bool {
-        self.metrics.alarm.is_tripped()
-    }
+    pub fn is_fsync_degraded(&self) -> bool { self.metrics.alarm.is_tripped() }
 
     /// Reconfigure the fsync-degradation alarm threshold at runtime
     /// (default [`DEFAULT_FSYNC_THRESHOLD`], 50 ms).
@@ -1458,9 +1502,22 @@ impl<R: Runtime> Committer<R> {
     /// gather channel, and `await`s the ack — which the committer delivers
     /// strictly after the covering barrier returns and the watermark
     /// advances past this batch (`Process` mode: after the write, §1.1).
-    pub async fn append(&self, req: AppendRequest) -> Result<AppendOutcome, AppendError> {
+    pub async fn append(
+        &self,
+        req: AppendRequest,
+    ) -> Result<AppendOutcome, AppendError> {
         match &self.tx {
-            Some(tx) => submit(tx, &self.gate, &self.degraded, &self.closed, &self.done, req).await,
+            Some(tx) => {
+                submit(
+                    tx,
+                    &self.gate,
+                    &self.degraded,
+                    &self.closed,
+                    &self.done,
+                    req,
+                )
+                .await
+            }
             None => Err(AppendError::Closed),
         }
     }
@@ -1494,9 +1551,7 @@ impl<R: Runtime> Committer<R> {
     /// async-friendly form for a caller already inside an executor —
     /// dropping the `Committer` (see the `Drop` impl) has the identical
     /// effect but blocks the calling thread to join.
-    pub async fn shutdown(mut self) {
-        self.begin_shutdown().await;
-    }
+    pub async fn shutdown(mut self) { self.begin_shutdown().await; }
 }
 
 impl<R: Runtime> Drop for Committer<R> {
@@ -1525,8 +1580,9 @@ impl<R: Runtime> Drop for Committer<R> {
     /// against the completion signal — never a hang.
     ///
     /// Joining blocks the calling thread via [`Runtime::block_on`] (not a
-    /// bespoke thread-park): on [`RealRuntime`](crate::runtime::real::RealRuntime)
-    /// the committer already runs on its own OS thread, so this just parks
+    /// bespoke thread-park): on
+    /// [`RealRuntime`](crate::runtime::real::RealRuntime) the committer
+    /// already runs on its own OS thread, so this just parks
     /// until it signals done; on
     /// [`SimRuntime`](crate::runtime::sim::SimRuntime) — a single-threaded
     /// cooperative executor with no independent progress of its own — a
@@ -1540,21 +1596,31 @@ impl<R: Runtime> Drop for Committer<R> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::runtime::{FileHandle, OpenOpts, RealRuntime, SimFs, SimRuntime};
-    use crate::runtime::{CrashPlan, EnospcSite, Fault, TailPlan};
-    use crate::writer::SegmentParams;
     use std::io;
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicI32};
 
+    use super::*;
+    use crate::runtime::{CrashPlan, EnospcSite, Fault, TailPlan};
+    use crate::runtime::{
+        FileHandle, OpenOpts, RealRuntime, SimFs, SimRuntime,
+    };
+    use crate::writer::SegmentParams;
+
     fn req(stream: u64, version: u64, n_events: usize) -> AppendRequest {
         AppendRequest {
-            stream_id: stream,
-            category_id: 0,
+            stream_id:            stream,
+            category_id:          0,
             first_stream_version: version,
-            events: (0..n_events)
-                .map(|i| EventInput::plain(1, 1, 0, vec![(i as u8).wrapping_add(0xA0); 16]))
+            events:               (0..n_events)
+                .map(|i| {
+                    EventInput::plain(
+                        1,
+                        1,
+                        0,
+                        vec![(i as u8).wrapping_add(0xA0); 16],
+                    )
+                })
                 .collect(),
         }
     }
@@ -1588,13 +1654,15 @@ mod tests {
         // already covered the batch (ack strictly after barrier + advance).
         let mut expect_first = 0u64;
         for (out, wm_now) in &outcomes {
-            let AppendOutcome::Acked { first_position, last_position } = *out else {
+            let AppendOutcome::Acked { first_position, last_position } = *out
+            else {
                 panic!("Os must ack every batch");
             };
             assert_eq!(first_position, expect_first, "positions must be dense");
             assert!(
                 *wm_now > last_position,
-                "ack delivered before watermark covered it: wm={wm_now} last={last_position}"
+                "ack delivered before watermark covered it: wm={wm_now} \
+                 last={last_position}"
             );
             expect_first = last_position + 1;
         }
@@ -1619,7 +1687,10 @@ mod tests {
             c.shutdown().await;
             n
         });
-        assert_eq!(fsyncs, 0, "Process mode must not issue a barrier before shutdown");
+        assert_eq!(
+            fsyncs, 0,
+            "Process mode must not issue a barrier before shutdown"
+        );
     }
 
     // -- Metrics: throughput counters + degradation alarm (bn-e2y) -------
@@ -1631,7 +1702,8 @@ mod tests {
         let writer = seg(&fs, Path::new("/seg-metrics"));
         let m = rt.block_on(async {
             let c = Committer::spawn(&rt, writer, Durability::Os);
-            // 3 batches: 3, 5, 2 events = 10 events, 3 batches, 3 barriers (Os).
+            // 3 batches: 3, 5, 2 events = 10 events, 3 batches, 3 barriers
+            // (Os).
             for (v, n) in [(0u64, 3usize), (3, 5), (8, 2)] {
                 c.append(req(1, v, n)).await.unwrap();
             }
@@ -1651,10 +1723,11 @@ mod tests {
 
     #[test]
     fn degradation_alarm_fires_on_slow_barrier() {
-        // Inject "slowness" deterministically by dropping the threshold to zero:
-        // every real barrier latency (>= 0) then crosses it, so the mandatory
-        // §2.6 store-status flag latches — the alarm wiring is exercised
-        // end-to-end through the committer without a flaky real-time slow fsync.
+        // Inject "slowness" deterministically by dropping the threshold to
+        // zero: every real barrier latency (>= 0) then crosses it, so
+        // the mandatory §2.6 store-status flag latches — the alarm
+        // wiring is exercised end-to-end through the committer without
+        // a flaky real-time slow fsync.
         let rt = SimRuntime::new(5);
         let fs = rt.fs();
         let writer = seg(&fs, Path::new("/seg-degraded"));
@@ -1663,7 +1736,10 @@ mod tests {
             c.set_fsync_alarm_threshold(Duration::ZERO);
             assert!(!c.is_fsync_degraded(), "clean before any barrier");
             c.append(req(1, 0, 2)).await.unwrap();
-            assert!(c.is_fsync_degraded(), "a barrier past threshold must latch the flag");
+            assert!(
+                c.is_fsync_degraded(),
+                "a barrier past threshold must latch the flag"
+            );
             let m = c.metrics();
             c.shutdown().await;
             m
@@ -1693,23 +1769,34 @@ mod tests {
         // 128-byte batch fits and a second copy of it does not.
         let mut params = SegmentParams::new(10, 0, 100, 0);
         params.segment_size = 180;
-        let writer = SegmentWriter::create(&fs, Path::new("/seg-oversized"), params).unwrap();
+        let writer =
+            SegmentWriter::create(&fs, Path::new("/seg-oversized"), params)
+                .unwrap();
 
         let (roll_tx, roll_rx) = std::sync::mpsc::channel();
-        let roller = Roller::new(|id| PathBuf::from(format!("/seg-oversized-{id}")), roll_tx);
+        let roller = Roller::new(
+            |id| PathBuf::from(format!("/seg-oversized-{id}")),
+            roll_tx,
+        );
 
         // A single batch with a 512-byte payload: its encoded length is well
         // past 128 bytes (the capacity of this writer's segment_size EMPTY),
         // so it can never fit even a fresh segment.
         let big = AppendRequest {
-            stream_id: 1,
-            category_id: 0,
+            stream_id:            1,
+            category_id:          0,
             first_stream_version: 0,
-            events: vec![EventInput::plain(1, 1, 0, vec![0xABu8; 512])],
+            events:               vec![EventInput::plain(
+                1,
+                1,
+                0,
+                vec![0xABu8; 512],
+            )],
         };
 
         let err = rt.block_on(async {
-            let c = Committer::spawn_with_roll(&rt, writer, Durability::Os, roller);
+            let c =
+                Committer::spawn_with_roll(&rt, writer, Durability::Os, roller);
             let err = c.append(big).await.unwrap_err();
             c.shutdown().await;
             err
@@ -1717,13 +1804,18 @@ mod tests {
 
         match err {
             AppendError::SegmentFull { needed, .. } => {
-                assert!(needed > 128, "the batch must genuinely exceed an empty segment: needed={needed}");
+                assert!(
+                    needed > 128,
+                    "the batch must genuinely exceed an empty segment: \
+                     needed={needed}"
+                );
             }
             other => panic!("expected a typed SegmentFull, got {other:?}"),
         }
         assert!(
             roll_rx.try_recv().is_err(),
-            "an oversized batch must not roll at all — no SegmentSummary should ever be reported"
+            "an oversized batch must not roll at all — no SegmentSummary \
+             should ever be reported"
         );
     }
 
@@ -1738,7 +1830,8 @@ mod tests {
             let path = Path::new("/seg-grp");
             let writer = seg(&fs, path);
             let total = rt.block_on(async {
-                let c = Committer::spawn(&rt, writer, Durability::group_default());
+                let c =
+                    Committer::spawn(&rt, writer, Durability::group_default());
                 let wm = c.watermark();
                 // 4 concurrent writers, distinct streams, 3 batches each.
                 let mut joins = Vec::new();
@@ -1747,8 +1840,11 @@ mod tests {
                     let wm = wm.clone();
                     joins.push(rt.spawn(async move {
                         for b in 0..3u64 {
-                            let out = ap.append(req(w, b * 4, 4)).await.unwrap();
-                            let AppendOutcome::Acked { last_position, .. } = out else {
+                            let out =
+                                ap.append(req(w, b * 4, 4)).await.unwrap();
+                            let AppendOutcome::Acked { last_position, .. } =
+                                out
+                            else {
                                 panic!("group must ack");
                             };
                             assert!(
@@ -1780,12 +1876,12 @@ mod tests {
 
     #[derive(Clone)]
     struct FreezeFs {
-        inner: SimFs,
+        inner:  SimFs,
         frozen: Arc<AtomicBool>,
     }
     #[derive(Clone)]
     struct FreezeFile {
-        inner: <SimFs as Fs>::File,
+        inner:  <SimFs as Fs>::File,
         frozen: Arc<AtomicBool>,
     }
 
@@ -1804,14 +1900,14 @@ mod tests {
         let len1 = {
             let subs = subframes_of(&b1.events);
             let input = BatchInput {
-                segment_epoch: 1,
-                batch_id: 0,
-                first_global_pos: 0,
-                stream_id: b1.stream_id,
-                category_id: b1.category_id,
+                segment_epoch:        1,
+                batch_id:             0,
+                first_global_pos:     0,
+                stream_id:            b1.stream_id,
+                category_id:          b1.category_id,
                 first_stream_version: b1.first_stream_version,
-                crypto_chain: None,
-                subframes: &subs,
+                crypto_chain:         None,
+                subframes:            &subs,
             };
             BatchEncoder::total_len(&input).unwrap()
         };
@@ -1828,7 +1924,10 @@ mod tests {
         });
 
         assert!(
-            matches!(o1, AppendOutcome::Acked { first_position: 0, last_position: 2 }),
+            matches!(
+                o1,
+                AppendOutcome::Acked { first_position: 0, last_position: 2 }
+            ),
             "batch 1 got a real barrier: {o1:?}"
         );
         assert_eq!(
@@ -1841,7 +1940,10 @@ mod tests {
         // fdatasync watermark, which is batch 1's end — batch 2 was never
         // synced).
         sim_fs
-            .crash(path, CrashPlan::Tail(TailPlan { keep: 0, scramble: vec![] }))
+            .crash(
+                path,
+                CrashPlan::Tail(TailPlan { keep: 0, scramble: vec![] }),
+            )
             .unwrap();
 
         let g = sim_fs.open(path, OpenOpts::read_only()).unwrap();
@@ -1865,9 +1967,14 @@ mod tests {
 
     impl Fs for FreezeFs {
         type File = FreezeFile;
+
         fn open(&self, path: &Path, opts: OpenOpts) -> io::Result<FreezeFile> {
-            Ok(FreezeFile { inner: self.inner.open(path, opts)?, frozen: self.frozen.clone() })
+            Ok(FreezeFile {
+                inner:  self.inner.open(path, opts)?,
+                frozen: self.frozen.clone(),
+            })
         }
+
         fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
             self.inner.rename(from, to)
         }
@@ -1877,20 +1984,24 @@ mod tests {
         fn pwrite(&self, off: u64, buf: &[u8]) -> io::Result<usize> {
             self.inner.pwrite(off, buf)
         }
+
         fn pread(&self, off: u64, buf: &mut [u8]) -> io::Result<usize> {
             self.inner.pread(off, buf)
         }
+
         fn fdatasync(&self) -> io::Result<()> {
             if self.frozen.load(Ordering::SeqCst) {
                 // Barrier fault: bytes are NOT made durable.
-                Err(io::Error::new(io::ErrorKind::Interrupted, "frozen barrier"))
+                Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "frozen barrier",
+                ))
             } else {
                 self.inner.fdatasync()
             }
         }
-        fn len(&self) -> io::Result<u64> {
-            self.inner.len()
-        }
+
+        fn len(&self) -> io::Result<u64> { self.inner.len() }
     }
 
     // -- D8: fsync-EIO/ENOSPC poisoning + degraded reads (bn-25e) ---------
@@ -1922,16 +2033,23 @@ mod tests {
 
     impl Fs for BarrierFaultFs {
         type File = BarrierFaultFile;
-        fn open(&self, path: &Path, opts: OpenOpts) -> io::Result<BarrierFaultFile> {
+
+        fn open(
+            &self,
+            path: &Path,
+            opts: OpenOpts,
+        ) -> io::Result<BarrierFaultFile> {
             Ok(BarrierFaultFile {
                 inner: self.inner.open(path, opts)?,
                 errno: self.errno.clone(),
                 syncs: self.syncs.clone(),
             })
         }
+
         fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
             self.inner.rename(from, to)
         }
+
         fn remove(&self, path: &Path) -> io::Result<()> {
             self.inner.remove(path)
         }
@@ -1941,9 +2059,11 @@ mod tests {
         fn pwrite(&self, off: u64, buf: &[u8]) -> io::Result<usize> {
             self.inner.pwrite(off, buf)
         }
+
         fn pread(&self, off: u64, buf: &mut [u8]) -> io::Result<usize> {
             self.inner.pread(off, buf)
         }
+
         fn fdatasync(&self) -> io::Result<()> {
             self.syncs.fetch_add(1, Ordering::SeqCst);
             let errno = self.errno.load(Ordering::SeqCst);
@@ -1954,9 +2074,9 @@ mod tests {
                 self.inner.fdatasync()
             }
         }
-        fn len(&self) -> io::Result<u64> {
-            self.inner.len()
-        }
+
+        fn len(&self) -> io::Result<u64> { self.inner.len() }
+
         fn allocate(&self, len: u64) -> io::Result<()> {
             self.inner.allocate(len)
         }
@@ -1975,7 +2095,11 @@ mod tests {
         let sim_fs = SimFs::new(Fault::Tail);
         let errno = Arc::new(AtomicI32::new(0));
         let syncs = Arc::new(AtomicUsize::new(0));
-        let bfs = BarrierFaultFs { inner: sim_fs, errno: errno.clone(), syncs: syncs.clone() };
+        let bfs = BarrierFaultFs {
+            inner: sim_fs,
+            errno: errno.clone(),
+            syncs: syncs.clone(),
+        };
         let path = Path::new("/seg-eio");
         let writer = seg(&bfs, path);
 
@@ -2000,37 +2124,78 @@ mod tests {
             let mut later = Vec::new();
             for v in [7u64, 9, 11] {
                 later.push(c.append(req(1, v, 2)).await);
-                assert!(c.is_degraded(), "poison is sticky across the lifetime");
+                assert!(
+                    c.is_degraded(),
+                    "poison is sticky across the lifetime"
+                );
             }
 
             c.shutdown().await;
             let syncs_after_shutdown = syncs.load(Ordering::SeqCst);
-            (o1, o2, degraded, cause, wm_good, wm_frozen, later, syncs_at_poison, syncs_after_shutdown)
+            (
+                o1,
+                o2,
+                degraded,
+                cause,
+                wm_good,
+                wm_frozen,
+                later,
+                syncs_at_poison,
+                syncs_after_shutdown,
+            )
         });
-        let (o1, o2, degraded, cause, wm_good, wm_frozen, later, syncs_at_poison, syncs_after) = r;
+        let (
+            o1,
+            o2,
+            degraded,
+            cause,
+            wm_good,
+            wm_frozen,
+            later,
+            syncs_at_poison,
+            syncs_after,
+        ) = r;
 
         assert!(
-            matches!(o1, AppendOutcome::Acked { first_position: 0, last_position: 2 }),
+            matches!(
+                o1,
+                AppendOutcome::Acked { first_position: 0, last_position: 2 }
+            ),
             "batch 1 earned a real barrier: {o1:?}"
         );
         assert_eq!(wm_good, 3, "watermark covers the acked prefix [0,3)");
         assert_eq!(
             o2,
             AppendOutcome::Indeterminate,
-            "the failed barrier's group is Indeterminate, never Acked (fsyncgate)"
+            "the failed barrier's group is Indeterminate, never Acked \
+             (fsyncgate)"
         );
         assert!(degraded, "an EIO barrier poisons the whole store");
-        assert_eq!(cause, Some(PoisonCause::Eio), "cause is retained for diagnostics");
-        assert_eq!(wm_frozen, 3, "watermark is FROZEN at the last known-durable position");
+        assert_eq!(
+            cause,
+            Some(PoisonCause::Eio),
+            "cause is retained for diagnostics"
+        );
+        assert_eq!(
+            wm_frozen, 3,
+            "watermark is FROZEN at the last known-durable position"
+        );
         assert!(
             later.iter().all(|r| *r == Err(AppendError::StorePoisoned)),
-            "every write after poison fails fast with a typed StorePoisoned: {later:?}"
+            "every write after poison fails fast with a typed StorePoisoned: \
+             {later:?}"
         );
         // header(1) + o1 barrier(1) + o2 faulted barrier(1) = 3, and NOTHING
         // after: the failed barrier is never retried, not by a later append
         // (they fail before the writer) nor by close() at shutdown.
-        assert_eq!(syncs_at_poison, 3, "one barrier per: header, o1, o2's fault");
-        assert_eq!(syncs_after, 3, "poisoned shutdown drops the writer WITHOUT re-issuing fdatasync");
+        assert_eq!(
+            syncs_at_poison, 3,
+            "one barrier per: header, o1, o2's fault"
+        );
+        assert_eq!(
+            syncs_after, 3,
+            "poisoned shutdown drops the writer WITHOUT re-issuing fdatasync"
+        );
     }
 
     /// The SAME policy via the `ENOSPC`-at-barrier path, injected through the
@@ -2059,11 +2224,22 @@ mod tests {
             (o2, degraded, cause, wm_frozen, o3)
         });
 
-        assert_eq!(o2, AppendOutcome::Indeterminate, "ENOSPC barrier group is Indeterminate");
-        assert!(degraded, "an ENOSPC barrier poisons the store, same policy as EIO");
+        assert_eq!(
+            o2,
+            AppendOutcome::Indeterminate,
+            "ENOSPC barrier group is Indeterminate"
+        );
+        assert!(
+            degraded,
+            "an ENOSPC barrier poisons the store, same policy as EIO"
+        );
         assert_eq!(cause, Some(PoisonCause::Enospc));
         assert_eq!(wm_frozen, 3, "watermark frozen at the durable prefix");
-        assert_eq!(o3, Err(AppendError::StorePoisoned), "writes fail fast after ENOSPC poison");
+        assert_eq!(
+            o3,
+            Err(AppendError::StorePoisoned),
+            "writes fail fast after ENOSPC poison"
+        );
     }
 
     /// Degraded reads: after a barrier poisons the store, a `ReadView` on the
@@ -2106,9 +2282,21 @@ mod tests {
         });
 
         assert_eq!(prefix.watermark, 5, "clamped to the frozen durable end");
-        assert_eq!(prefix.next_pos(), 5, "reads reach exactly the last durable position");
-        assert_eq!(prefix.event_count(), 5, "only the two pre-poison batches (3+2 events)");
-        assert_eq!(prefix.len(), 2, "the never-durable third batch is NOT served");
+        assert_eq!(
+            prefix.next_pos(),
+            5,
+            "reads reach exactly the last durable position"
+        );
+        assert_eq!(
+            prefix.event_count(),
+            5,
+            "only the two pre-poison batches (3+2 events)"
+        );
+        assert_eq!(
+            prefix.len(),
+            2,
+            "the never-durable third batch is NOT served"
+        );
         assert!(degraded_flag, "a reader can query the degraded flag");
     }
 
@@ -2134,7 +2322,9 @@ mod tests {
             let mut joins = Vec::new();
             for w in 0..4u64 {
                 let ap = c.appender();
-                joins.push(rt.spawn(async move { ap.append(req(w, 0, 3)).await }));
+                joins.push(
+                    rt.spawn(async move { ap.append(req(w, 0, 3)).await }),
+                );
             }
             let mut outs = Vec::new();
             for j in joins {
@@ -2150,8 +2340,11 @@ mod tests {
         // arrived after the poison tripped (StorePoisoned) — none is Acked.
         for o in &outs {
             match o {
-                Ok(AppendOutcome::Indeterminate) | Err(AppendError::StorePoisoned) => {}
-                other => panic!("no batch may be acked after a failed barrier: {other:?}"),
+                Ok(AppendOutcome::Indeterminate)
+                | Err(AppendError::StorePoisoned) => {}
+                other => panic!(
+                    "no batch may be acked after a failed barrier: {other:?}"
+                ),
             }
         }
     }
@@ -2186,9 +2379,7 @@ mod tests {
 
     struct Cleanup(std::path::PathBuf);
     impl Drop for Cleanup {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
+        fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
     }
 
     /// Run `writers × batches` appends of `events_per` events each under
@@ -2205,7 +2396,10 @@ mod tests {
         let writer = SegmentWriter::create(
             &fs,
             path,
-            SegmentParams { segment_size: 4 * 1024 * 1024 * 1024, ..SegmentParams::new(0, 0, 1, 0) },
+            SegmentParams {
+                segment_size: 4 * 1024 * 1024 * 1024,
+                ..SegmentParams::new(0, 0, 1, 0)
+            },
         )
         .unwrap();
         // Pre-build every request BEFORE timing, so the measured window is
@@ -2216,7 +2410,9 @@ mod tests {
         // and fragments the group (§2.4).
         let mut pool: Vec<Vec<AppendRequest>> = (0..writers)
             .map(|w| {
-                (0..batches).map(|b| req(w, b * events_per as u64, events_per)).collect()
+                (0..batches)
+                    .map(|b| req(w, b * events_per as u64, events_per))
+                    .collect()
             })
             .collect();
 
@@ -2251,7 +2447,8 @@ mod tests {
         let _c1 = Cleanup(p_os.clone());
         let _c2 = Cleanup(p_grp.clone());
 
-        let (os_t, os_fsyncs, _) = run_real_workload(&p_os, Durability::Os, 4, 60, 100);
+        let (os_t, os_fsyncs, _) =
+            run_real_workload(&p_os, Durability::Os, 4, 60, 100);
         let (grp_t, grp_fsyncs, _) =
             run_real_workload(&p_grp, Durability::group_default(), 4, 60, 100);
 
@@ -2261,11 +2458,13 @@ mod tests {
         // finish faster. Generous margins to avoid CI/scheduler flakiness.
         assert!(
             grp_fsyncs < os_fsyncs,
-            "group commit must issue fewer barriers than sync-per-batch: grp={grp_fsyncs} os={os_fsyncs}"
+            "group commit must issue fewer barriers than sync-per-batch: \
+             grp={grp_fsyncs} os={os_fsyncs}"
         );
         assert!(
             grp_t < os_t,
-            "early-close group commit must beat sync-per-batch: grp={grp_t:?} os={os_t:?}"
+            "early-close group commit must beat sync-per-batch: grp={grp_t:?} \
+             os={os_t:?}"
         );
     }
 
@@ -2288,35 +2487,47 @@ mod tests {
         // Warm the device/page cache.
         let wpath = real_tmp("perf-warm");
         let _cw = Cleanup(wpath.clone());
-        let _ = run_real_workload(&wpath, Durability::group_default(), 4, 100, 100);
+        let _ =
+            run_real_workload(&wpath, Durability::group_default(), 4, 100, 100);
 
         let mut best_ev_per_s = 0.0f64;
         let mut best_per_fsync = 0.0f64;
         for pass in 0..5 {
             let path = real_tmp("perf-4x100");
             let _c = Cleanup(path.clone());
-            let (elapsed, fsyncs, events) =
-                run_real_workload(&path, Durability::group_default(), 4, 1500, 100);
+            let (elapsed, fsyncs, events) = run_real_workload(
+                &path,
+                Durability::group_default(),
+                4,
+                1500,
+                100,
+            );
             let ev_per_s = events as f64 / elapsed.as_secs_f64();
             let per_fsync = events as f64 / fsyncs.max(1) as f64;
             eprintln!(
-                "perf 4x100 pass {pass}: {ev_per_s:.0} durable ev/s, {fsyncs} fsyncs ({per_fsync:.1} ev/fsync), {elapsed:?}"
+                "perf 4x100 pass {pass}: {ev_per_s:.0} durable ev/s, {fsyncs} \
+                 fsyncs ({per_fsync:.1} ev/fsync), {elapsed:?}"
             );
             if ev_per_s > best_ev_per_s {
                 best_ev_per_s = ev_per_s;
                 best_per_fsync = per_fsync;
             }
         }
-        eprintln!("perf 4x100 BEST: {best_ev_per_s:.0} durable ev/s at {best_per_fsync:.1} ev/fsync");
+        eprintln!(
+            "perf 4x100 BEST: {best_ev_per_s:.0} durable ev/s at \
+             {best_per_fsync:.1} ev/fsync"
+        );
         // Coalescing must be near-ideal (≈4 batches/group for 4 writers)
         // independent of device drift — this is the committer's own quantity.
         assert!(
             best_per_fsync >= 350.0,
-            "expected near-ideal coalescing (~4 batches/group), got {best_per_fsync:.1} ev/fsync"
+            "expected near-ideal coalescing (~4 batches/group), got \
+             {best_per_fsync:.1} ev/fsync"
         );
         assert!(
             best_ev_per_s >= 100_000.0,
-            "expected >=100k durable ev/s on a settled device, got {best_ev_per_s:.0}"
+            "expected >=100k durable ev/s on a settled device, got \
+             {best_ev_per_s:.0}"
         );
     }
 
@@ -2341,7 +2552,9 @@ mod tests {
         let fs = rt.fs();
         let path = real_tmp("drop-join");
         let _cleanup = Cleanup(path.clone());
-        let writer = SegmentWriter::create(&fs, &path, SegmentParams::new(0, 0, 1, 0)).unwrap();
+        let writer =
+            SegmentWriter::create(&fs, &path, SegmentParams::new(0, 0, 1, 0))
+                .unwrap();
 
         let c = Committer::spawn(&rt, writer, Durability::Os);
         let ap = c.appender();
@@ -2355,7 +2568,10 @@ mod tests {
             std::thread::spawn(move || rt2.block_on(ap2.append(req(1, 0, 2))))
         };
         let out = pending.join().unwrap().unwrap();
-        assert!(matches!(out, AppendOutcome::Acked { .. }), "store must be live before the drop");
+        assert!(
+            matches!(out, AppendOutcome::Acked { .. }),
+            "store must be live before the drop"
+        );
 
         // Drop the Committer on its own thread while `ap` is STILL ALIVE.
         // Bounded: if `Drop` regressed to "only closes the channel", `ap`
@@ -2366,9 +2582,9 @@ mod tests {
             drop(c);
             let _ = done_tx.send(());
         });
-        done_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("Committer::drop must join the committer thread promptly, not hang");
+        done_rx.recv_timeout(Duration::from_secs(5)).expect(
+            "Committer::drop must join the committer thread promptly, not hang",
+        );
 
         // The committer is gone. The lingering `Appender` clone did NOT
         // keep it alive (bn-3da): its next append must fail typed and
@@ -2379,13 +2595,15 @@ mod tests {
             let r = rt.block_on(ap.append(req(1, 2, 1)));
             let _ = err_tx.send(r);
         });
-        let err = err_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("a lingering Appender's append after Committer::drop must return, not hang");
+        let err = err_rx.recv_timeout(Duration::from_secs(5)).expect(
+            "a lingering Appender's append after Committer::drop must return, \
+             not hang",
+        );
         assert_eq!(
             err,
             Err(AppendError::Closed),
-            "post-drop append on a lingering Appender must be a typed Closed error"
+            "post-drop append on a lingering Appender must be a typed Closed \
+             error"
         );
     }
 
@@ -2423,7 +2641,8 @@ mod tests {
         assert_eq!(
             closed_err,
             Err(AppendError::Closed),
-            "a lingering Appender's append after Committer::drop must be a typed Closed error"
+            "a lingering Appender's append after Committer::drop must be a \
+             typed Closed error"
         );
     }
 }

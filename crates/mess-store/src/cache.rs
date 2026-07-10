@@ -49,9 +49,10 @@
 //! state *is* a snapshot (Phase 4/5, with certificates), which this is
 //! deliberately not. A crash drops it and the next load rebuilds from the log.
 //! Under a **Buffered** durability mode a backend may ack an append before it
-//! is durable; the write-through fold then reflects an acked-but-not-yet-durable
-//! event — exactly the documented D7 read-cursor caveat, and no worse: a crash
-//! that loses the tail also drops the cache, so the two heal together.
+//! is durable; the write-through fold then reflects an
+//! acked-but-not-yet-durable event — exactly the documented D7 read-cursor
+//! caveat, and no worse: a crash that loses the tail also drops the cache, so
+//! the two heal together.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -65,7 +66,7 @@ use crate::version::Version;
 #[derive(Clone)]
 struct Entry {
     version: Version,
-    state: Arc<dyn Any + Send + Sync>,
+    state:   Arc<dyn Any + Send + Sync>,
 }
 
 /// A capacity-bounded, in-memory cache of hot aggregate state keyed by stream.
@@ -93,21 +94,18 @@ impl std::fmt::Debug for StateCache {
 impl Default for StateCache {
     /// Disabled — the default keeps [`EventStore::new`](crate::EventStore::new)
     /// behavior (and every existing test) unchanged until a caller opts in.
-    fn default() -> Self {
-        Self::disabled()
-    }
+    fn default() -> Self { Self::disabled() }
 }
 
 impl StateCache {
     /// The off-switch: a cache that stores nothing and always misses.
     #[must_use]
-    pub fn disabled() -> Self {
-        Self { inner: None }
-    }
+    pub fn disabled() -> Self { Self { inner: None } }
 
-    /// An enabled cache holding at most `capacity` hot aggregates (clamped to at
-    /// least 1). Eviction is `quick_cache`'s LRU-ish policy; an evicted stream
-    /// simply falls back to the snapshot + tail load on its next touch.
+    /// An enabled cache holding at most `capacity` hot aggregates (clamped to
+    /// at least 1). Eviction is `quick_cache`'s LRU-ish policy; an evicted
+    /// stream simply falls back to the snapshot + tail load on its next
+    /// touch.
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self { inner: Some(Arc::new(Cache::new(capacity.max(1)))) }
@@ -115,21 +113,15 @@ impl StateCache {
 
     /// Whether this cache actually stores entries (the off-switch is off).
     #[must_use]
-    pub fn is_enabled(&self) -> bool {
-        self.inner.is_some()
-    }
+    pub fn is_enabled(&self) -> bool { self.inner.is_some() }
 
     /// Number of live entries (0 when disabled).
     #[must_use]
-    pub fn len(&self) -> usize {
-        self.inner.as_ref().map_or(0, |c| c.len())
-    }
+    pub fn len(&self) -> usize { self.inner.as_ref().map_or(0, |c| c.len()) }
 
     /// Whether the cache holds no entries (always true when disabled).
     #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
 
     /// The warm-path read: the cached `(version, state)` for `stream_id`, if a
     /// live entry of the requested aggregate type `A` exists.

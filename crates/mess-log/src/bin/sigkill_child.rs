@@ -8,7 +8,8 @@
 //! ack must be reported strictly *after* the committer acks, not before).
 //!
 //! Usage (positional, all required):
-//!   sigkill_child <segment-path> <process|os|group> <writers> <events-per-batch>
+//!   sigkill_child <segment-path> <process|os|group> <writers>
+//! <events-per-batch>
 //!
 //! Never exits on its own (loops appending forever, bounded only by
 //! `SEGMENT_SIZE`, chosen large enough that no realistic kill-delay window
@@ -19,7 +20,9 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::mpsc;
 
-use mess_log::committer::{AppendOutcome, AppendRequest, Committer, Durability, EventInput};
+use mess_log::committer::{
+    AppendOutcome, AppendRequest, Committer, Durability, EventInput,
+};
 use mess_log::runtime::{RealRuntime, Runtime};
 use mess_log::writer::{SegmentParams, SegmentWriter};
 
@@ -33,14 +36,17 @@ fn parse_mode(s: &str) -> Durability {
         "process" => Durability::Process,
         "os" => Durability::Os,
         "group" => Durability::group_default(),
-        other => panic!("unknown durability mode {other:?} (want process|os|group)"),
+        other => {
+            panic!("unknown durability mode {other:?} (want process|os|group)")
+        }
     }
 }
 
 fn make_events(n: usize, writer: u64, batch: u64) -> Vec<EventInput> {
     (0..n)
         .map(|i| {
-            let payload = format!("sigkill-harness w{writer} b{batch} e{i}").into_bytes();
+            let payload =
+                format!("sigkill-harness w{writer} b{batch} e{i}").into_bytes();
             EventInput::plain(1, 1, 0, payload)
         })
         .collect()
@@ -51,7 +57,8 @@ fn main() {
     assert_eq!(
         args.len(),
         5,
-        "usage: sigkill_child <segment-path> <process|os|group> <writers> <events-per-batch>"
+        "usage: sigkill_child <segment-path> <process|os|group> <writers> \
+         <events-per-batch>"
     );
     let path = PathBuf::from(&args[1]);
     let mode = parse_mode(&args[2]);
@@ -63,7 +70,10 @@ fn main() {
     let writer = SegmentWriter::create(
         &fs,
         &path,
-        SegmentParams { segment_size: SEGMENT_SIZE, ..SegmentParams::new(0, 0, 1, 0) },
+        SegmentParams {
+            segment_size: SEGMENT_SIZE,
+            ..SegmentParams::new(0, 0, 1, 0)
+        },
     )
     .expect("create segment");
 
@@ -105,16 +115,21 @@ fn main() {
                         events,
                     };
                     match appender.append(req).await {
-                        Ok(AppendOutcome::Acked { first_position, last_position }) => {
+                        Ok(AppendOutcome::Acked {
+                            first_position,
+                            last_position,
+                        }) => {
                             // A send error means the reporter thread is
                             // gone (stdout write failed, e.g. parent
                             // closed its read end) — nothing more to do.
-                            let _ = ack_tx.send((first_position, last_position));
+                            let _ =
+                                ack_tx.send((first_position, last_position));
                         }
                         Ok(AppendOutcome::Indeterminate) => {
                             // No ack earned (§7.2) — correctly not counted.
                         }
-                        Err(_) => break, // SegmentFull or Closed: stop this writer.
+                        Err(_) => break, /* SegmentFull or Closed: stop this
+                                          * writer. */
                     }
                     version += events_per as u64;
                     batch += 1;

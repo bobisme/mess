@@ -29,7 +29,7 @@ pub struct RecordToAppend {
     /// message type.
     pub message_type: String,
     /// The encoded event payload (`mess_core::Event::encode`).
-    pub data: Vec<u8>,
+    pub data:         Vec<u8>,
 }
 
 /// One event as read back from a backend: the stored bytes plus the positions
@@ -37,11 +37,11 @@ pub struct RecordToAppend {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredRecord {
     /// The stream this event belongs to.
-    pub stream_id: String,
+    pub stream_id:       String,
     /// The event's stored message type (its `mess_core::Event::name`).
-    pub message_type: String,
+    pub message_type:    String,
     /// The encoded event payload.
-    pub data: Vec<u8>,
+    pub data:            Vec<u8>,
     /// 0-based position of this event within its stream.
     pub stream_position: u64,
     /// Monotonic position of this event across the whole store.
@@ -53,7 +53,7 @@ pub struct StoredRecord {
 pub struct Appended {
     /// The stream's version after the append (position of the last event
     /// written).
-    pub version: Version,
+    pub version:              Version,
     /// Global position of the last event written.
     pub last_global_position: u64,
 }
@@ -71,7 +71,7 @@ pub enum AppendError<E> {
         /// The version the append expected the stream to be at.
         expected: Version,
         /// The version the stream was actually at.
-        actual: Version,
+        actual:   Version,
     },
     /// An engine-level failure with no optimistic-retry semantics.
     Backend(E),
@@ -177,7 +177,9 @@ pub trait Backend: Send + Sync + 'static {
 pub trait SubscribeBackend: Backend {
     /// The current committed global watermark (see the trait docs): the
     /// exclusive end of the readable global-position sequence.
-    fn watermark(&self) -> impl Future<Output = Result<u64, Self::Error>> + Send;
+    fn watermark(
+        &self,
+    ) -> impl Future<Output = Result<u64, Self::Error>> + Send;
 
     /// Resolve once the committed watermark has advanced strictly **past**
     /// global position `pos` — i.e. once `watermark > pos`, so position `pos`

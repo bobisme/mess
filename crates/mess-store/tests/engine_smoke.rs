@@ -19,7 +19,11 @@ async fn append_read_head_conflict() {
 
     // First append at NoStream.
     let a = engine
-        .append_batch("acct-1", Version::NoStream, &[rec("Opened", b"x"), rec("Deposited", b"5")])
+        .append_batch(
+            "acct-1",
+            Version::NoStream,
+            &[rec("Opened", b"x"), rec("Deposited", b"5")],
+        )
         .await
         .expect("append");
     assert_eq!(a.version, Version::At(1));
@@ -54,7 +58,8 @@ async fn append_read_head_conflict() {
         .unwrap();
 
     // read_stream on acct-1.
-    let page = engine.read_stream("acct-1", Version::NoStream, 100).await.unwrap();
+    let page =
+        engine.read_stream("acct-1", Version::NoStream, 100).await.unwrap();
     assert_eq!(page.len(), 3);
     assert_eq!(page[0].message_type, "Opened");
     assert_eq!(page[0].stream_position, 0);
@@ -81,12 +86,10 @@ async fn drives_the_facade() {
     let dir = tempfile::tempdir().unwrap();
     let store = EventStore::new(LogEngine::open(dir.path()).expect("open"));
     let recs = [rec("A", b"1"), rec("B", b"2")];
-    // append via the raw backend to prove read-back through the facade's page loop
-    store
-        .backend()
-        .append_batch("s", Version::NoStream, &recs)
-        .await
-        .unwrap();
-    let page = store.backend().read_stream("s", Version::NoStream, 1).await.unwrap();
+    // append via the raw backend to prove read-back through the facade's page
+    // loop
+    store.backend().append_batch("s", Version::NoStream, &recs).await.unwrap();
+    let page =
+        store.backend().read_stream("s", Version::NoStream, 1).await.unwrap();
     assert_eq!(page.len(), 1);
 }

@@ -10,12 +10,11 @@
 //!
 //! - [`Aggregate::apply`] is **infallible**: replaying committed history never
 //!   fails.
-//! - [`Decide::decide`] returns a **typed rejection** ([`Decide::Rejection`],
-//!   a `std::error::Error`) instead of the spike's stringly-typed
-//!   `DomainError`.
-//! - No proc macros here. The `#[derive(Event)]` / `#[derive(Aggregate)]`
-//!   layer (bn-hy7) lands separately and expands to hand-writable impls of
-//!   *these* traits, so every trait surface is kept small and mechanical.
+//! - [`Decide::decide`] returns a **typed rejection** ([`Decide::Rejection`], a
+//!   `std::error::Error`) instead of the spike's stringly-typed `DomainError`.
+//! - No proc macros here. The `#[derive(Event)]` / `#[derive(Aggregate)]` layer
+//!   (bn-hy7) lands separately and expands to hand-writable impls of *these*
+//!   traits, so every trait surface is kept small and mechanical.
 //! - **Purity.** `mess-core` depends on no backend crate; a store supplies the
 //!   `S` type parameter of [`CommandError`], never the other way around.
 //!

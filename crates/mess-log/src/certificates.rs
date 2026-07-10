@@ -15,11 +15,11 @@
 //! # The verification model (log-side)
 //!
 //! This module owns the *algorithm* over an in-memory view of a stream's
-//! retained batches ([`StreamCert`]); wiring the real `mess-store` `SnapshotRef`
-//! and on-disk reads into it is the dependent snapshot-certificate bone. The
-//! chain values are real (BLAKE3, byte-exact to §3); the tail replay is
-//! **batch-granular** (§7.0) because the G10 layout (§6.2) stores no per-frame
-//! hash.
+//! retained batches ([`StreamCert`]); wiring the real `mess-store`
+//! `SnapshotRef` and on-disk reads into it is the dependent
+//! snapshot-certificate bone. The chain values are real (BLAKE3, byte-exact to
+//! §3); the tail replay is **batch-granular** (§7.0) because the G10 layout
+//! (§6.2) stores no per-frame hash.
 //!
 //! # Certification paths (§7.1) and why replay is never skipped
 //!
@@ -35,7 +35,9 @@
 //!
 //! [`docs/spec/05-fold-certificates.md`]: ../../../../docs/spec/05-fold-certificates.md
 
-use crate::fold_chain::{self, blob_hash, chain_at, chain_step, frame_hash, genesis, Hash};
+use crate::fold_chain::{
+    self, Hash, blob_hash, chain_at, chain_step, frame_hash, genesis,
+};
 use crate::footer_ext::SnapshotAnchor;
 
 /// An aggregate: the fold that snapshots summarize (§9). In the real system
@@ -51,7 +53,8 @@ pub trait Aggregate: Sized {
     fn apply(&mut self, payload: &[u8]);
     /// Serialize the state to the snapshot blob.
     fn to_bytes(&self) -> Vec<u8>;
-    /// Deserialize a snapshot blob, or `None` on a malformed blob (`StateDecode`).
+    /// Deserialize a snapshot blob, or `None` on a malformed blob
+    /// (`StateDecode`).
     fn from_bytes(bytes: &[u8]) -> Option<Self>;
 }
 
@@ -76,13 +79,14 @@ pub struct BatchRec {
     /// batch containing frame 0 this is the genesis `h[-1]`.
     pub crypto_chain: Hash,
     /// The batch's frames, in ascending version order.
-    pub frames: Vec<FrameRec>,
+    pub frames:       Vec<FrameRec>,
 }
 
 impl BatchRec {
     fn last_version(&self) -> Option<u64> {
         self.frames.last().map(|f| f.version)
     }
+
     fn payload_refs(&self) -> impl Iterator<Item = &[u8]> + Clone {
         self.frames.iter().map(|f| f.payload.as_slice())
     }
@@ -94,15 +98,15 @@ impl BatchRec {
 #[derive(Debug, Clone)]
 pub struct StreamCert {
     /// Interned stream id (D3); the genesis binding derives from it (§3.1).
-    pub stream_id: u64,
+    pub stream_id:        u64,
     /// Retained batches in ascending version order (contiguous within the
     /// retained range).
-    pub batches: Vec<BatchRec>,
+    pub batches:          Vec<BatchRec>,
     /// The durable head anchor `A(S) = (head_version, head_hash)` (§5), read
-    /// from the sealed footer's `StreamHeadTable` (or the active in-memory head
-    /// for an unsealed tail). `None` only for a chain-disabled / anchorless
-    /// stream (degraded verification, §8.1).
-    pub head_anchor: Option<(u64, Hash)>,
+    /// from the sealed footer's `StreamHeadTable` (or the active in-memory
+    /// head for an unsealed tail). `None` only for a chain-disabled /
+    /// anchorless stream (degraded verification, §8.1).
+    pub head_anchor:      Option<(u64, Hash)>,
     /// Durable Path-C retention anchors (§8.2), one per certified snapshot
     /// version whose frames were compacted.
     pub snapshot_anchors: Vec<SnapshotAnchor>,
@@ -111,9 +115,7 @@ pub struct StreamCert {
 impl StreamCert {
     /// The genesis `h[-1]` for this stream (§3.1).
     #[must_use]
-    pub fn genesis(&self) -> Hash {
-        genesis(self.stream_id)
-    }
+    pub fn genesis(&self) -> Hash { genesis(self.stream_id) }
 
     /// The highest retained frame version, or `None` if no frames are retained.
     #[must_use]
@@ -121,9 +123,10 @@ impl StreamCert {
         self.batches.iter().filter_map(BatchRec::last_version).max()
     }
 
-    /// The committed event count used by the §7 step-3 bound check: one past the
-    /// highest retained frame version (matching the spike's `next_version`), or,
-    /// when no frames are retained (pure Path-C), one past the anchor's head.
+    /// The committed event count used by the §7 step-3 bound check: one past
+    /// the highest retained frame version (matching the spike's
+    /// `next_version`), or, when no frames are retained (pure Path-C), one
+    /// past the anchor's head.
     #[must_use]
     pub fn committed_count(&self) -> u64 {
         match self.last_retained_version() {
@@ -141,7 +144,8 @@ impl StreamCert {
     }
 }
 
-/// The certification path that discharged (or rejected) the prefix claim (§7.1).
+/// The certification path that discharged (or rejected) the prefix claim
+/// (§7.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerifyPath {
     /// Path A — recompute `h[v]` from frame `v`'s payload + `prev_stream_hash`
@@ -162,32 +166,36 @@ pub enum VerifyPath {
 pub struct SnapshotRef {
     /// Interned stream id. Cheap first-line check; the genesis binding (§3.1)
     /// is the real protection.
-    pub stream_id: u64,
+    pub stream_id:           u64,
     /// 0-based index of the **last** event summarized (§4.1). Ignored when
     /// `covers_empty_prefix`.
-    pub stream_version: u64,
+    pub stream_version:      u64,
     /// Explicit, human-bumped semantic version of the fold (§9).
-    pub fold_version: u32,
+    pub fold_version:        u32,
     /// `flags` bit 0 = `covers_empty_prefix` (§4.2). Modeled as a bool.
     pub covers_empty_prefix: bool,
     /// The chain value `h[stream_version]` (or the genesis when
     /// `covers_empty_prefix`). Proves prefix identity (§2.1).
-    pub event_prefix_hash: Hash,
+    pub event_prefix_hash:   Hash,
     /// `BLAKE3(state_blob)`. Proves blob integrity (§2.1).
-    pub state_hash: Hash,
+    pub state_hash:          Hash,
 }
 
 /// The typed outcomes of `load_verified` (§11). `ChainBreakFrameHash` is
 /// **retired** (§7.0): the G10 layout stores no per-frame hash, so payload
-/// tampering is localized to the **batch**, surfaced as [`VerifyError::ChainBreakPrev`]
-/// (or [`VerifyError::HeadMismatch`] for the final tail batch).
+/// tampering is localized to the **batch**, surfaced as
+/// [`VerifyError::ChainBreakPrev`] (or [`VerifyError::HeadMismatch`] for the
+/// final tail batch).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum VerifyError {
     /// `ref.stream_id` names a different stream (§7 step 1).
     #[error("stream id mismatch: expected {expected}, got {got}")]
     StreamIdMismatch { expected: u64, got: u64 },
     /// `ref.stream_version >= committed count` (§7 step 3).
-    #[error("snapshot beyond head: snapshot_version {snapshot_version}, head {head:?}")]
+    #[error(
+        "snapshot beyond head: snapshot_version {snapshot_version}, head \
+         {head:?}"
+    )]
     SnapshotBeyondHead { snapshot_version: u64, head: Option<u64> },
     /// Blob does not hash to `state_hash` (§7 step 4).
     #[error("state hash mismatch: blob does not match state_hash")]
@@ -202,21 +210,23 @@ pub enum VerifyError {
     /// No frame and no `SnapshotAnchor` can certify the prefix (§7 step 5).
     #[error("no certification path for version {version}")]
     NoCertificationPath { version: u64 },
-    /// A tail frame at position `i` claims a different version (reorder, §7 step 6).
+    /// A tail frame at position `i` claims a different version (reorder, §7
+    /// step 6).
     #[error("version out of order: expected {expected}, got {got}")]
     VersionOutOfOrder { expected: u64, got: u64 },
-    /// At a tail **batch boundary**, the batch whose base version is `at_version`
-    /// carries a stored `crypto_chain` that does not equal the running chain
-    /// value carried out of the previous batch (§7 step 6). Batch-granular
-    /// (§7.0): it localizes any divergence to the region ending at this boundary
-    /// — a payload tamper in the preceding tail batch(es) or a spliced/reordered
-    /// batch. Never raised with `at_version == base_B0` for a mid-batch first
-    /// tail batch (that boundary check is skipped, §7 step 6).
+    /// At a tail **batch boundary**, the batch whose base version is
+    /// `at_version` carries a stored `crypto_chain` that does not equal the
+    /// running chain value carried out of the previous batch (§7 step 6).
+    /// Batch-granular (§7.0): it localizes any divergence to the region
+    /// ending at this boundary — a payload tamper in the preceding tail
+    /// batch(es) or a spliced/reordered batch. Never raised with
+    /// `at_version == base_B0` for a mid-batch first tail batch (that
+    /// boundary check is skipped, §7 step 6).
     #[error("chain break at batch boundary, base version {at_version}")]
     ChainBreakPrev { at_version: u64 },
     /// Final chain value != the durable head anchor (§7 step 7): truncation, a
-    /// consistent whole-suffix rewrite, or a payload tamper in the **final** tail
-    /// batch (§7.0).
+    /// consistent whole-suffix rewrite, or a payload tamper in the **final**
+    /// tail batch (§7.0).
     #[error("head mismatch: computed != durable head anchor")]
     HeadMismatch { computed: Hash, expected: Hash },
 }
@@ -225,11 +235,11 @@ pub enum VerifyError {
 #[derive(Debug)]
 pub struct LoadOutcome<A> {
     /// The verified aggregate state (snapshot + tail replay, or full rebuild).
-    pub state: A,
+    pub state:             A,
     /// Which prefix-certification paths were checked (all available were run).
-    pub paths_used: Vec<VerifyPath>,
+    pub paths_used:        Vec<VerifyPath>,
     /// Number of tail events replayed after the snapshot.
-    pub tail_len: u64,
+    pub tail_len:          u64,
     /// True if the snapshot was unusable (`fold_version` mismatch / missing)
     /// and the state was rebuilt by full verified replay (§7 step 2).
     pub rebuilt_by_replay: bool,
@@ -238,19 +248,26 @@ pub struct LoadOutcome<A> {
 /// Discharge the prefix claim `r.event_prefix_hash == h[v]` by every available
 /// path (§7.1), requiring at least one. All available paths are run and any
 /// mismatch is a hard [`VerifyError::PrefixHashMismatch`].
-fn certify_prefix(cert: &StreamCert, r: &SnapshotRef) -> Result<Vec<VerifyPath>, VerifyError> {
+fn certify_prefix(
+    cert: &StreamCert,
+    r: &SnapshotRef,
+) -> Result<Vec<VerifyPath>, VerifyError> {
     let v = r.stream_version;
     let mut paths = Vec::new();
 
-    // Path A: recompute h[v] from frame v (payload) + prev_stream_hash (from the
-    // batch's crypto_chain, §6.4). frame_hash is ALWAYS recomputed (§3.2).
+    // Path A: recompute h[v] from frame v (payload) + prev_stream_hash (from
+    // the batch's crypto_chain, §6.4). frame_hash is ALWAYS recomputed
+    // (§3.2).
     if let Some(b) = cert.batch_of(v) {
-        let Some((_prev, h_v)) = chain_at(&b.crypto_chain, b.base_version, b.payload_refs(), v)
+        let Some((_prev, h_v)) =
+            chain_at(&b.crypto_chain, b.base_version, b.payload_refs(), v)
         else {
             return Err(VerifyError::NoCertificationPath { version: v });
         };
         if h_v != r.event_prefix_hash {
-            return Err(VerifyError::PrefixHashMismatch { path: VerifyPath::FromFrameV });
+            return Err(VerifyError::PrefixHashMismatch {
+                path: VerifyPath::FromFrameV,
+            });
         }
         paths.push(VerifyPath::FromFrameV);
     }
@@ -262,7 +279,9 @@ fn certify_prefix(cert: &StreamCert, r: &SnapshotRef) -> Result<Vec<VerifyPath>,
             chain_at(&b.crypto_chain, b.base_version, b.payload_refs(), v + 1)
     {
         if prev != r.event_prefix_hash {
-            return Err(VerifyError::PrefixHashMismatch { path: VerifyPath::FromFrameVPlus1 });
+            return Err(VerifyError::PrefixHashMismatch {
+                path: VerifyPath::FromFrameVPlus1,
+            });
         }
         paths.push(VerifyPath::FromFrameVPlus1);
     }
@@ -270,7 +289,9 @@ fn certify_prefix(cert: &StreamCert, r: &SnapshotRef) -> Result<Vec<VerifyPath>,
     // Path C: a durable SnapshotAnchor records h[v] (§8.2). No frame reads.
     if let Some(a) = cert.snapshot_anchors.iter().find(|a| a.version == v) {
         if a.chain_hash != r.event_prefix_hash {
-            return Err(VerifyError::PrefixHashMismatch { path: VerifyPath::FromRetentionAnchor });
+            return Err(VerifyError::PrefixHashMismatch {
+                path: VerifyPath::FromRetentionAnchor,
+            });
         }
         paths.push(VerifyPath::FromRetentionAnchor);
     }
@@ -317,13 +338,17 @@ fn replay_tail<A: Aggregate>(
         }
         for (k, frame) in b.frames.iter().enumerate() {
             let pos_v = base + k as u64;
-            // Skip the already-summarized prefix of a mid-batch first tail batch
-            // (re-applying would double-apply state; the seed already == h[v]).
+            // Skip the already-summarized prefix of a mid-batch first tail
+            // batch (re-applying would double-apply state; the seed
+            // already == h[v]).
             if pos_v < start_version {
                 continue;
             }
             if frame.version != expected {
-                return Err(VerifyError::VersionOutOfOrder { expected, got: frame.version });
+                return Err(VerifyError::VersionOutOfOrder {
+                    expected,
+                    got: frame.version,
+                });
             }
             let fh = frame_hash(expected, &frame.payload);
             h = chain_step(&h, &fh, expected);
@@ -335,19 +360,25 @@ fn replay_tail<A: Aggregate>(
     }
 
     // Head anchor (§7 step 7): catches truncation and any consistent whole-
-    // suffix rewrite, and is the surfacing point for a tamper in the final batch.
+    // suffix rewrite, and is the surfacing point for a tamper in the final
+    // batch.
     if let Some((_hv, head_hash)) = cert.head_anchor
         && h != head_hash
     {
-        return Err(VerifyError::HeadMismatch { computed: h, expected: head_hash });
+        return Err(VerifyError::HeadMismatch {
+            computed: h,
+            expected: head_hash,
+        });
     }
     Ok(applied)
 }
 
-/// Full verified replay from genesis (no usable snapshot): the §7 step-2 rebuild
-/// path and the from-scratch load. Seeds at the genesis `h[-1]` and replays the
-/// whole retained log, ending at the head anchor.
-pub fn full_replay_verified<A: Aggregate>(cert: &StreamCert) -> Result<A, VerifyError> {
+/// Full verified replay from genesis (no usable snapshot): the §7 step-2
+/// rebuild path and the from-scratch load. Seeds at the genesis `h[-1]` and
+/// replays the whole retained log, ending at the head anchor.
+pub fn full_replay_verified<A: Aggregate>(
+    cert: &StreamCert,
+) -> Result<A, VerifyError> {
     let mut state = A::init();
     replay_tail(cert, 0, cert.genesis(), &mut state)?;
     Ok(state)
@@ -368,20 +399,34 @@ pub fn load_verified<A: Aggregate>(
         // No snapshot: full verified replay from genesis.
         let state = full_replay_verified::<A>(cert)?;
         let tail_len = cert.committed_count();
-        return Ok(LoadOutcome { state, paths_used: vec![], tail_len, rebuilt_by_replay: true });
+        return Ok(LoadOutcome {
+            state,
+            paths_used: vec![],
+            tail_len,
+            rebuilt_by_replay: true,
+        });
     };
 
-    // Step 1 — stream identity (redundant with the genesis binding, clearer error).
+    // Step 1 — stream identity (redundant with the genesis binding, clearer
+    // error).
     if r.stream_id != cert.stream_id {
-        return Err(VerifyError::StreamIdMismatch { expected: cert.stream_id, got: r.stream_id });
+        return Err(VerifyError::StreamIdMismatch {
+            expected: cert.stream_id,
+            got:      r.stream_id,
+        });
     }
 
-    // Step 2 — fold version. A mismatch is NOT an error: invalidate + rebuild by
-    // full verified replay (§7 step 2, the deploy story).
+    // Step 2 — fold version. A mismatch is NOT an error: invalidate + rebuild
+    // by full verified replay (§7 step 2, the deploy story).
     if r.fold_version != A::FOLD_VERSION {
         let state = full_replay_verified::<A>(cert)?;
         let tail_len = cert.committed_count();
-        return Ok(LoadOutcome { state, paths_used: vec![], tail_len, rebuilt_by_replay: true });
+        return Ok(LoadOutcome {
+            state,
+            paths_used: vec![],
+            tail_len,
+            rebuilt_by_replay: true,
+        });
     }
 
     // Step 4 (blob integrity) is shared; do it once. Decode after the bound
@@ -395,7 +440,7 @@ pub fn load_verified<A: Aggregate>(
     if r.stream_version >= count {
         return Err(VerifyError::SnapshotBeyondHead {
             snapshot_version: r.stream_version,
-            head: cert.last_retained_version(),
+            head:             cert.last_retained_version(),
         });
     }
 
@@ -410,13 +455,18 @@ pub fn load_verified<A: Aggregate>(
 
     // Steps 6 + 7 — batch-granular tail replay seeded at the certified h[v],
     // then the durable head anchor.
-    let tail_len = replay_tail(cert, r.stream_version + 1, r.event_prefix_hash, &mut state)?;
+    let tail_len = replay_tail(
+        cert,
+        r.stream_version + 1,
+        r.event_prefix_hash,
+        &mut state,
+    )?;
 
     Ok(LoadOutcome { state, paths_used, tail_len, rebuilt_by_replay: false })
 }
 
-/// The empty-prefix load (§4.2): `event_prefix_hash == genesis`, blob decodes to
-/// `fold_init`, then replay the **entire** log `0..=head` as the tail.
+/// The empty-prefix load (§4.2): `event_prefix_hash == genesis`, blob decodes
+/// to `fold_init`, then replay the **entire** log `0..=head` as the tail.
 fn load_empty_prefix<A: Aggregate>(
     cert: &StreamCert,
     r: &SnapshotRef,
@@ -424,7 +474,9 @@ fn load_empty_prefix<A: Aggregate>(
 ) -> Result<LoadOutcome<A>, VerifyError> {
     // event_prefix_hash MUST equal the genesis (§4.2).
     if r.event_prefix_hash != cert.genesis() {
-        return Err(VerifyError::PrefixHashMismatch { path: VerifyPath::EmptyPrefix });
+        return Err(VerifyError::PrefixHashMismatch {
+            path: VerifyPath::EmptyPrefix,
+        });
     }
     // Blob integrity + decode; the certified state MUST be fold_init.
     if blob_hash(blob) != r.state_hash {
@@ -434,8 +486,8 @@ fn load_empty_prefix<A: Aggregate>(
     if decoded.to_bytes() != A::init().to_bytes() {
         return Err(VerifyError::StateDecode);
     }
-    // Replay the whole log 0..=head, seeded at genesis (still exercises the head
-    // anchor). Start fresh from init so no prefix is double-counted.
+    // Replay the whole log 0..=head, seeded at genesis (still exercises the
+    // head anchor). Start fresh from init so no prefix is double-counted.
     let mut state = A::init();
     let tail_len = replay_tail(cert, 0, cert.genesis(), &mut state)?;
     Ok(LoadOutcome {
@@ -452,8 +504,8 @@ fn load_empty_prefix<A: Aggregate>(
 
 /// Build a [`StreamCert`] from a flat payload list by chopping it into batches
 /// of `batch_size`, materializing each batch's real `crypto_chain` via
-/// [`fold_chain::ChainHead`] and recording the true durable head anchor. This is
-/// the honest, spec-conformant construction the attack suite mutates.
+/// [`fold_chain::ChainHead`] and recording the true durable head anchor. This
+/// is the honest, spec-conformant construction the attack suite mutates.
 ///
 /// `genesis_override` seeds the chain from an arbitrary genesis instead of the
 /// stream's `genesis(stream_id)` — used only to model the §3.1 counterfactual
@@ -491,25 +543,29 @@ pub fn build_cert(
 /// fold `0..=version`, capturing the real `event_prefix_hash = h[version]` and
 /// `state_hash`. Returns the `(SnapshotRef, blob)`.
 #[must_use]
-pub fn take_snapshot<A: Aggregate>(cert: &StreamCert, version: u64) -> (SnapshotRef, Vec<u8>) {
+pub fn take_snapshot<A: Aggregate>(
+    cert: &StreamCert,
+    version: u64,
+) -> (SnapshotRef, Vec<u8>) {
     let mut state = A::init();
     let mut h = cert.genesis();
     for v in 0..=version {
         let b = cert.batch_of(v).expect("frame retained for snapshot");
-        let (_prev, h_v) = chain_at(&b.crypto_chain, b.base_version, b.payload_refs(), v)
-            .expect("frame in batch");
+        let (_prev, h_v) =
+            chain_at(&b.crypto_chain, b.base_version, b.payload_refs(), v)
+                .expect("frame in batch");
         h = h_v;
         let idx = (v - b.base_version) as usize;
         state.apply(&b.frames[idx].payload);
     }
     let blob = state.to_bytes();
     let r = SnapshotRef {
-        stream_id: cert.stream_id,
-        stream_version: version,
-        fold_version: A::FOLD_VERSION,
+        stream_id:           cert.stream_id,
+        stream_version:      version,
+        fold_version:        A::FOLD_VERSION,
         covers_empty_prefix: false,
-        event_prefix_hash: h,
-        state_hash: blob_hash(&blob),
+        event_prefix_hash:   h,
+        state_hash:          blob_hash(&blob),
     };
     (r, blob)
 }
@@ -522,14 +578,14 @@ mod tests {
     /// byte 0 = tag (0 deposit, 1 withdraw), bytes 1..9 = u64 LE amount.
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct Account {
-        pub balance: i64,
+        pub balance:  i64,
         pub tx_count: u64,
     }
     impl Aggregate for Account {
         const FOLD_VERSION: u32 = 1;
-        fn init() -> Self {
-            Account { balance: 0, tx_count: 0 }
-        }
+
+        fn init() -> Self { Account { balance: 0, tx_count: 0 } }
+
         fn apply(&mut self, payload: &[u8]) {
             let tag = payload[0];
             let amount = u64::from_le_bytes(payload[1..9].try_into().unwrap());
@@ -540,18 +596,20 @@ mod tests {
             }
             self.tx_count += 1;
         }
+
         fn to_bytes(&self) -> Vec<u8> {
             let mut o = Vec::with_capacity(16);
             o.extend_from_slice(&self.balance.to_le_bytes());
             o.extend_from_slice(&self.tx_count.to_le_bytes());
             o
         }
+
         fn from_bytes(b: &[u8]) -> Option<Self> {
             if b.len() != 16 {
                 return None;
             }
             Some(Account {
-                balance: i64::from_le_bytes(b[0..8].try_into().ok()?),
+                balance:  i64::from_le_bytes(b[0..8].try_into().ok()?),
                 tx_count: u64::from_le_bytes(b[8..16].try_into().ok()?),
             })
         }
@@ -565,7 +623,8 @@ mod tests {
     }
 
     fn stream(id: u64, n: u64, batch_size: usize) -> StreamCert {
-        let payloads: Vec<Vec<u8>> = (0..n).map(|i| ev((i % 3 == 2) as u8, 10 + i)).collect();
+        let payloads: Vec<Vec<u8>> =
+            (0..n).map(|i| ev((i % 3 == 2) as u8, 10 + i)).collect();
         build_cert(id, &payloads, batch_size, None)
     }
 
@@ -612,12 +671,12 @@ mod tests {
         let s = stream(4, 10, 4);
         let blob = Account::init().to_bytes();
         let r = SnapshotRef {
-            stream_id: 4,
-            stream_version: 0,
-            fold_version: Account::FOLD_VERSION,
+            stream_id:           4,
+            stream_version:      0,
+            fold_version:        Account::FOLD_VERSION,
             covers_empty_prefix: true,
-            event_prefix_hash: s.genesis(),
-            state_hash: blob_hash(&blob),
+            event_prefix_hash:   s.genesis(),
+            state_hash:          blob_hash(&blob),
         };
         let out = load_verified::<Account>(&s, Some((&r, &blob))).unwrap();
         assert_eq!(out.paths_used, vec![VerifyPath::EmptyPrefix]);
@@ -630,15 +689,18 @@ mod tests {
         let s = stream(5, 5, 2);
         let blob = Account::init().to_bytes();
         let r = SnapshotRef {
-            stream_id: 5,
-            stream_version: 0,
-            fold_version: Account::FOLD_VERSION,
+            stream_id:           5,
+            stream_version:      0,
+            fold_version:        Account::FOLD_VERSION,
             covers_empty_prefix: true,
-            event_prefix_hash: [0xAB; 32], // not the genesis
-            state_hash: blob_hash(&blob),
+            event_prefix_hash:   [0xAB; 32], // not the genesis
+            state_hash:          blob_hash(&blob),
         };
         let err = load_verified::<Account>(&s, Some((&r, &blob))).unwrap_err();
-        assert_eq!(err, VerifyError::PrefixHashMismatch { path: VerifyPath::EmptyPrefix });
+        assert_eq!(
+            err,
+            VerifyError::PrefixHashMismatch { path: VerifyPath::EmptyPrefix }
+        );
     }
 
     #[test]

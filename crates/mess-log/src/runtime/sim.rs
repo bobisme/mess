@@ -42,9 +42,7 @@ pub struct Rng {
 
 impl Rng {
     /// Seed the generator.
-    pub fn new(seed: u64) -> Self {
-        Rng { state: seed }
-    }
+    pub fn new(seed: u64) -> Self { Rng { state: seed } }
 
     /// Next 64-bit value.
     pub fn next_u64(&mut self) -> u64 {
@@ -62,9 +60,7 @@ impl Rng {
     }
 
     /// A fair coin.
-    pub fn bool(&mut self) -> bool {
-        self.next_u64() & 1 == 1
-    }
+    pub fn bool(&mut self) -> bool { self.next_u64() & 1 == 1 }
 
     /// True with probability `p` (clamped to `[0, 1]`).
     pub fn chance(&mut self, p: f64) -> bool {
@@ -81,17 +77,17 @@ struct TaskSlot {
 }
 
 struct Exec {
-    tasks: Vec<TaskSlot>,
+    tasks:  Vec<TaskSlot>,
     /// Pending virtual-time timers: `(deadline, waker to fire)`.
     timers: Vec<(Instant, Waker)>,
-    now: Instant,
-    rng: Rng,
+    now:    Instant,
+    rng:    Rng,
     /// Spawned task ids known to be runnable.
-    ready: Vec<usize>,
+    ready:  Vec<usize>,
 }
 
 struct SimCore {
-    exec: Mutex<Exec>,
+    exec:  Mutex<Exec>,
     /// Task ids woken by their wakers since the last scheduling step. A
     /// separate lock so a [`TaskWaker`] can push without touching `exec`.
     woken: Arc<Mutex<Vec<usize>>>,
@@ -106,10 +102,11 @@ impl SimCore {
     /// A spawned task's future lives in `Exec.tasks`, reachable from the
     /// shared `Arc<SimCore>`. That future routinely captures a
     /// [`SimRuntime`] handle (the group-commit timer at
-    /// `committer.rs` does `rt.spawn(async move { rt_sleep.sleep_until(..).await })`),
-    /// and a `SimRuntime` handle owns a **strong** `Arc<SimCore>`. So the
-    /// graph contains a cycle: `Arc<SimCore>` → `Exec.tasks` → future →
-    /// captured `SimRuntime` → `Arc<SimCore>`.
+    /// `committer.rs` does `rt.spawn(async move {
+    /// rt_sleep.sleep_until(..).await })`), and a `SimRuntime` handle owns
+    /// a **strong** `Arc<SimCore>`. So the graph contains a cycle:
+    /// `Arc<SimCore>` → `Exec.tasks` → future → captured `SimRuntime` →
+    /// `Arc<SimCore>`.
     ///
     /// A fire-and-forget task that never completes (the group-commit timer
     /// when its convoy closes early: its [`SimJoin`] handle is dropped but
@@ -218,14 +215,13 @@ impl SimCore {
 
 /// Waker for a spawned task: records the task id as runnable.
 struct TaskWaker {
-    id: usize,
+    id:    usize,
     woken: Arc<Mutex<Vec<usize>>>,
 }
 
 impl Wake for TaskWaker {
-    fn wake(self: Arc<Self>) {
-        self.woken.lock().unwrap().push(self.id);
-    }
+    fn wake(self: Arc<Self>) { self.woken.lock().unwrap().push(self.id); }
+
     fn wake_by_ref(self: &Arc<Self>) {
         self.woken.lock().unwrap().push(self.id);
     }
@@ -237,9 +233,8 @@ struct FlagWaker {
 }
 
 impl Wake for FlagWaker {
-    fn wake(self: Arc<Self>) {
-        self.ready.store(true, Ordering::Release);
-    }
+    fn wake(self: Arc<Self>) { self.ready.store(true, Ordering::Release); }
+
     fn wake_by_ref(self: &Arc<Self>) {
         self.ready.store(true, Ordering::Release);
     }
@@ -251,7 +246,7 @@ impl Wake for FlagWaker {
 
 /// The future returned by [`Clock::sleep_until`] on the sim clock.
 pub struct Sleep {
-    core: Arc<SimCore>,
+    core:     Arc<SimCore>,
     deadline: Instant,
 }
 
@@ -276,7 +271,7 @@ impl Future for Sleep {
 /// The future returned by [`Runtime::spawn`] on the sim runtime; resolves
 /// with the task's output once the deterministic executor completes it.
 pub struct SimJoin<T> {
-    slot: Arc<Mutex<Option<T>>>,
+    slot:  Arc<Mutex<Option<T>>>,
     waker: Arc<Mutex<Option<Waker>>>,
 }
 
@@ -307,7 +302,8 @@ impl<T> Future for SimJoin<T> {
 ///
 /// Modeled on tokio's `Runtime` (an owner that tears the executor down when
 /// dropped) versus its `Handle` (freely cloned, captured into tasks). The
-/// handle returned by [`new`](SimRuntime::new)/[`with_fault`](SimRuntime::with_fault)
+/// handle returned by
+/// [`new`](SimRuntime::new)/[`with_fault`](SimRuntime::with_fault)
 /// is the **owner** (`owner == true`); [`Clone`] always yields a non-owning
 /// handle (`owner == false`). Spawned task futures only ever capture
 /// non-owning clones (`rt.clone()`), so no task can keep the executor alive.
@@ -318,8 +314,8 @@ impl<T> Future for SimJoin<T> {
 /// `let rt = SimRuntime::new(..)` at the top of a test, clones handed to
 /// committers/tasks below it).
 pub struct SimRuntime {
-    core: Arc<SimCore>,
-    fs: SimFs,
+    core:  Arc<SimCore>,
+    fs:    SimFs,
     /// `true` only for the handle from `new`/`with_fault`; `Clone` sets it
     /// `false`. Exactly one owner exists per executor, and it is never
     /// captured into a spawned task, so its `Drop` is a reliable teardown
@@ -330,24 +326,22 @@ pub struct SimRuntime {
 impl SimRuntime {
     /// A runtime seeded with `seed`, whose files default to the
     /// [`Fault::SECTOR_512`] block-reordering model.
-    pub fn new(seed: u64) -> Self {
-        Self::with_fault(seed, Fault::SECTOR_512)
-    }
+    pub fn new(seed: u64) -> Self { Self::with_fault(seed, Fault::SECTOR_512) }
 
     /// A runtime whose files default to `fault`.
     pub fn with_fault(seed: u64, fault: Fault) -> Self {
         SimRuntime {
-            core: Arc::new(SimCore {
-                exec: Mutex::new(Exec {
-                    tasks: Vec::new(),
+            core:  Arc::new(SimCore {
+                exec:  Mutex::new(Exec {
+                    tasks:  Vec::new(),
                     timers: Vec::new(),
-                    now: Instant::ORIGIN,
-                    rng: Rng::new(seed),
-                    ready: Vec::new(),
+                    now:    Instant::ORIGIN,
+                    rng:    Rng::new(seed),
+                    ready:  Vec::new(),
                 }),
                 woken: Arc::new(Mutex::new(Vec::new())),
             }),
-            fs: SimFs::new(fault),
+            fs:    SimFs::new(fault),
             owner: true,
         }
     }
@@ -364,7 +358,11 @@ impl Clone for SimRuntime {
     /// handle (including every one captured into a spawned task) must not be
     /// able to tear the executor down. See the type-level docs.
     fn clone(&self) -> Self {
-        SimRuntime { core: self.core.clone(), fs: self.fs.clone(), owner: false }
+        SimRuntime {
+            core:  self.core.clone(),
+            fs:    self.fs.clone(),
+            owner: false,
+        }
     }
 }
 
@@ -384,9 +382,7 @@ impl Drop for SimRuntime {
 }
 
 impl Clock for SimRuntime {
-    fn now(&self) -> Instant {
-        self.core.exec.lock().unwrap().now
-    }
+    fn now(&self) -> Instant { self.core.exec.lock().unwrap().now }
 
     fn sleep_until(
         &self,
@@ -399,9 +395,7 @@ impl Clock for SimRuntime {
 impl Runtime for SimRuntime {
     type Fs = SimFs;
 
-    fn fs(&self) -> SimFs {
-        self.fs.clone()
-    }
+    fn fs(&self) -> SimFs { self.fs.clone() }
 
     fn spawn<F>(&self, fut: F) -> impl Future<Output = F::Output> + Send
     where
@@ -436,7 +430,8 @@ impl Runtime for SimRuntime {
             }
             if !self.core.step() && !ready.load(Ordering::Acquire) {
                 panic!(
-                    "sim runtime deadlock: root pending with no runnable task or timer"
+                    "sim runtime deadlock: root pending with no runnable task \
+                     or timer"
                 );
             }
         }
@@ -445,12 +440,13 @@ impl Runtime for SimRuntime {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
     use crate::runtime::testsuite;
     use crate::runtime::{
         CrashPlan, FileHandle, Fs, OpenOpts, SectorPlan, TailPlan,
     };
-    use std::path::Path;
 
     // -- the shared runtime-agnostic suite, on the sim runtime -------------
 
@@ -552,7 +548,10 @@ mod tests {
         // Persist sectors 0 and 2 but NOT 1 — reordering hole.
         fs.crash(
             path,
-            CrashPlan::Sector(SectorPlan { persist: vec![0, 2], tear: None }),
+            CrashPlan::Sector(SectorPlan {
+                persist: vec![0, 2],
+                tear:    None,
+            }),
         )
         .unwrap();
 

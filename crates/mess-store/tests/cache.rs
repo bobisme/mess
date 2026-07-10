@@ -25,8 +25,8 @@ use mess_store::backend::{
 };
 use mess_store::snapshot::{SnapshotStore, StoredSnapshot};
 use mess_store::{
-    EventStore, RetryPolicy, StateCache, StateCodecError,
-    Snapshottable, Version,
+    EventStore, RetryPolicy, Snapshottable, StateCache, StateCodecError,
+    Version,
 };
 
 mod common;
@@ -40,9 +40,9 @@ use common::TestSnapshotBackend;
 
 #[derive(Clone)]
 struct Counting<B> {
-    inner: B,
-    events_read: Arc<AtomicU64>,
-    head_calls: Arc<AtomicU64>,
+    inner:        B,
+    events_read:  Arc<AtomicU64>,
+    head_calls:   Arc<AtomicU64>,
     stream_reads: Arc<AtomicU64>,
 }
 
@@ -56,19 +56,13 @@ impl<B> Counting<B> {
         }
     }
 
-    fn events_read(&self) -> u64 {
-        self.events_read.load(Ordering::Relaxed)
-    }
+    fn events_read(&self) -> u64 { self.events_read.load(Ordering::Relaxed) }
 
-    fn head_calls(&self) -> u64 {
-        self.head_calls.load(Ordering::Relaxed)
-    }
+    fn head_calls(&self) -> u64 { self.head_calls.load(Ordering::Relaxed) }
 
     /// Number of `read_stream` *calls* (page fetches), distinct from the number
     /// of events those pages returned.
-    fn stream_reads(&self) -> u64 {
-        self.stream_reads.load(Ordering::Relaxed)
-    }
+    fn stream_reads(&self) -> u64 { self.stream_reads.load(Ordering::Relaxed) }
 }
 
 impl<B: Backend> Backend for Counting<B> {
@@ -153,7 +147,9 @@ impl Event for AccountEvent {
         Ok(match self {
             AccountEvent::Opened { owner } => owner.as_bytes().to_vec(),
             AccountEvent::Deposited { amount }
-            | AccountEvent::Withdrawn { amount } => amount.to_le_bytes().to_vec(),
+            | AccountEvent::Withdrawn { amount } => {
+                amount.to_le_bytes().to_vec()
+            }
         })
     }
 
@@ -162,7 +158,7 @@ impl Event for AccountEvent {
             let bytes: [u8; 8] =
                 data.try_into().map_err(|_| CodecError::Decode {
                     event_name: name.to_string(),
-                    source: format!("expected 8 bytes, got {}", data.len()),
+                    source:     format!("expected 8 bytes, got {}", data.len()),
                 })?;
             Ok(i64::from_le_bytes(bytes))
         };
@@ -171,7 +167,7 @@ impl Event for AccountEvent {
                 owner: String::from_utf8(data.to_vec()).map_err(|e| {
                     CodecError::Decode {
                         event_name: name.to_string(),
-                        source: e.to_string(),
+                        source:     e.to_string(),
                     }
                 })?,
             }),
@@ -188,7 +184,7 @@ impl Event for AccountEvent {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct Account {
-    open: bool,
+    open:    bool,
     balance: i64,
 }
 
@@ -240,7 +236,9 @@ impl fmt::Display for AccountError {
         match self {
             AccountError::AlreadyOpen => write!(f, "already open"),
             AccountError::NotOpen => write!(f, "not open"),
-            AccountError::NonPositiveDeposit => write!(f, "non-positive deposit"),
+            AccountError::NonPositiveDeposit => {
+                write!(f, "non-positive deposit")
+            }
             AccountError::InsufficientFunds { balance, requested } => {
                 write!(f, "insufficient: {balance} < {requested}")
             }
@@ -299,7 +297,7 @@ impl Decide<Withdraw> for Account {
         }
         if cmd.amount > self.balance {
             return Err(AccountError::InsufficientFunds {
-                balance: self.balance,
+                balance:   self.balance,
                 requested: cmd.amount,
             });
         }
@@ -310,22 +308,26 @@ impl Decide<Withdraw> for Account {
 /// A counting store, cache on or off. Returns the store and its counter handle.
 ///
 /// Uses `no_backoff(64)` so the *single-threaded* tests retry deterministically
-/// with no sleeps. Do NOT reuse this under genuine multi-thread contention: with
-/// zero backoff, many workers retry in lockstep and a thundering herd can starve
-/// one writer into exhausting its whole budget. The 8-writer bench therefore
-/// builds its store via [`counting_store_with_policy`] with real jittered
-/// backoff (see [`eight_writer_bench`]).
-fn counting_store(cache_on: bool) -> (EventStore<Counting<TestSnapshotBackend>>, Counting<TestSnapshotBackend>) {
+/// with no sleeps. Do NOT reuse this under genuine multi-thread contention:
+/// with zero backoff, many workers retry in lockstep and a thundering herd can
+/// starve one writer into exhausting its whole budget. The 8-writer bench
+/// therefore builds its store via [`counting_store_with_policy`] with real
+/// jittered backoff (see [`eight_writer_bench`]).
+fn counting_store(
+    cache_on: bool,
+) -> (EventStore<Counting<TestSnapshotBackend>>, Counting<TestSnapshotBackend>)
+{
     counting_store_with_policy(cache_on, RetryPolicy::no_backoff(64))
 }
 
-/// A counting store with an explicit retry policy — lets the contended bench opt
-/// into real jittered backoff while the single-threaded tests keep no-sleep
+/// A counting store with an explicit retry policy — lets the contended bench
+/// opt into real jittered backoff while the single-threaded tests keep no-sleep
 /// determinism.
 fn counting_store_with_policy(
     cache_on: bool,
     policy: RetryPolicy,
-) -> (EventStore<Counting<TestSnapshotBackend>>, Counting<TestSnapshotBackend>) {
+) -> (EventStore<Counting<TestSnapshotBackend>>, Counting<TestSnapshotBackend>)
+{
     let backend = Counting::new(TestSnapshotBackend::new());
     let mut store = EventStore::new(backend.clone()).with_retry_policy(policy);
     if cache_on {
@@ -369,7 +371,8 @@ async fn warm_command_reads_zero_events() {
     assert_eq!(
         backend.head_calls() - head_before,
         0,
-        "warm command_cached must not even call head — the append checks version"
+        "warm command_cached must not even call head — the append checks \
+         version"
     );
 
     // Sanity: state is correct.
@@ -467,7 +470,8 @@ async fn eight_writer_bench(cache_on: bool) -> (u64, u64, i64) {
     // back-to-back and a thundering herd can starve one writer into exhausting
     // its whole 64-attempt budget (a `Conflict`, not a measurement). The
     // default policy's fully-jittered backoff spreads writers out — the same
-    // choice the reliable analog `concurrent_commands_on_one_stream_all_succeed`
+    // choice the reliable analog
+    // `concurrent_commands_on_one_stream_all_succeed`
     // makes in bank_account.rs. Note the cache actually *sharpens* this need:
     // its delta-only retries are so cheap they re-collide faster than the
     // uncached full-reload path, which incidentally spaces writers out.
@@ -510,9 +514,9 @@ async fn eight_writer_bench(cache_on: bool) -> (u64, u64, i64) {
         (TASKS * DEPOSITS_PER_TASK) as i64 * AMOUNT,
         "final balance must be exact — cache on or off"
     );
-    // Subtract the load() we just did to measure only the command traffic... but
-    // load()'s reads are part of the returned events_read; the caller compares
-    // the two modes so the constant final load cancels out.
+    // Subtract the load() we just did to measure only the command traffic...
+    // but load()'s reads are part of the returned events_read; the caller
+    // compares the two modes so the constant final load cancels out.
     (backend.events_read(), u64::from(total_attempts), loaded.state.balance)
 }
 
@@ -531,8 +535,7 @@ async fn eight_writer_contention_reads_collapse() {
     println!(
         "8-writer bench: uncached read {uncached_reads} events over \
          {uncached_attempts} attempts; cached read {cached_reads} events over \
-         {cached_attempts} attempts; \
-         reduction ratio = {:.1}x",
+         {cached_attempts} attempts; reduction ratio = {:.1}x",
         uncached_reads as f64 / cached_reads.max(1) as f64
     );
     assert!(
@@ -561,8 +564,8 @@ async fn eight_writer_contention_reads_collapse() {
 /// point of the cache). Results must not.
 #[derive(Debug, PartialEq, Eq)]
 struct Observed {
-    balance: i64,
-    version: Version,
+    balance:    i64,
+    version:    Version,
     // A transcript of per-command outcomes (Ok(events_appended) or an error
     // label), so a divergence in behavior — not just final state — is caught.
     transcript: Vec<Result<usize, String>>,
@@ -571,10 +574,7 @@ struct Observed {
 /// Run one scripted scenario against a store built at the given cache setting.
 /// Returns the observable result. `bn-3az` adopts this by adding scenarios to
 /// [`scenarios`] and reusing this runner.
-async fn run_scenario(
-    cache_on: bool,
-    script: &Script,
-) -> Observed {
+async fn run_scenario(cache_on: bool, script: &Script) -> Observed {
     let (store, _backend) = counting_store(cache_on);
     let stream = "acct-diff";
     let mut transcript = Vec::new();
@@ -582,15 +582,24 @@ async fn run_scenario(
     for step in &script.0 {
         let outcome = match step {
             Step::Open(owner) => store
-                .command_cached::<Account, _>(stream, Open { owner: owner.clone() })
+                .command_cached::<Account, _>(
+                    stream,
+                    Open { owner: owner.clone() },
+                )
                 .await
                 .map(|c| c.events_appended),
             Step::Deposit(amount) => store
-                .command_cached::<Account, _>(stream, Deposit { amount: *amount })
+                .command_cached::<Account, _>(
+                    stream,
+                    Deposit { amount: *amount },
+                )
                 .await
                 .map(|c| c.events_appended),
             Step::Withdraw(amount) => store
-                .command_cached::<Account, _>(stream, Withdraw { amount: *amount })
+                .command_cached::<Account, _>(
+                    stream,
+                    Withdraw { amount: *amount },
+                )
                 .await
                 .map(|c| c.events_appended),
             // Interleave a warm READ to exercise load_hot in the differential.
@@ -603,7 +612,11 @@ async fn run_scenario(
     }
 
     let loaded = store.load_hot::<Account>(stream).await.unwrap();
-    Observed { balance: loaded.state.balance, version: loaded.version, transcript }
+    Observed {
+        balance: loaded.state.balance,
+        version: loaded.version,
+        transcript,
+    }
 }
 
 #[derive(Debug)]
@@ -686,7 +699,11 @@ async fn off_switch_is_the_cache_miss_path() {
     // caller's fallthrough is the identical cache-miss code.
     let cache = StateCache::disabled();
     assert!(!cache.is_enabled());
-    cache.put::<Account>("x", Version::At(0), Account { open: true, balance: 9 });
+    cache.put::<Account>(
+        "x",
+        Version::At(0),
+        Account { open: true, balance: 9 },
+    );
     assert_eq!(cache.get::<Account>("x"), None, "disabled cache never stores");
 
     // Behavior: with the cache OFF, every command re-loads (the cache-miss
@@ -756,7 +773,12 @@ async fn load_hot_warm_read_is_head_check_only() {
     // Now move the stream behind the cache's back and read again: only the
     // delta must be folded.
     let other = EventStore::new(backend.clone());
-    other.append(stream, Version::At(1), &[AccountEvent::Deposited { amount: 2 }])
+    other
+        .append(
+            stream,
+            Version::At(1),
+            &[AccountEvent::Deposited { amount: 2 }],
+        )
         .await
         .unwrap();
     let ev_before = backend.events_read();
@@ -784,6 +806,7 @@ impl Backend for AlwaysConflict {
     async fn head(&self, _stream_id: &str) -> Result<Version, Self::Error> {
         Ok(Version::NoStream)
     }
+
     async fn read_stream(
         &self,
         _stream_id: &str,
@@ -792,6 +815,7 @@ impl Backend for AlwaysConflict {
     ) -> Result<Vec<StoredRecord>, Self::Error> {
         Ok(Vec::new())
     }
+
     async fn read_global(
         &self,
         _after: Option<u64>,
@@ -799,6 +823,7 @@ impl Backend for AlwaysConflict {
     ) -> Result<Vec<StoredRecord>, Self::Error> {
         Ok(Vec::new())
     }
+
     async fn append_batch(
         &self,
         _stream_id: &str,
@@ -817,6 +842,7 @@ impl SnapshotStore for AlwaysConflict {
     ) -> Result<(), Self::Error> {
         Ok(())
     }
+
     async fn load_snapshot(
         &self,
         _stream_id: &str,

@@ -37,11 +37,10 @@ pub const RESERVED_EVENT_TYPE_NAME: &str = "RegistryEventV1";
 
 /// A bidirectional name<->id table for one namespace.
 ///
-/// - `id -> name` is single-valued and always the *most recent* name
-///   (REG15): a fresh registration sets it, and each `NameAliased`
-///   overwrites it.
-/// - `name -> id` is permanent (REG16): once bound, a name is never rebound
-///   to a different ID, even after the ID's current name has moved on.
+/// - `id -> name` is single-valued and always the *most recent* name (REG15): a
+///   fresh registration sets it, and each `NameAliased` overwrites it.
+/// - `name -> id` is permanent (REG16): once bound, a name is never rebound to
+///   a different ID, even after the ID's current name has moved on.
 #[derive(Debug, Clone, Default)]
 struct NameTable<Id> {
     id_to_name: HashMap<Id, String>,
@@ -52,9 +51,7 @@ impl<Id> NameTable<Id>
 where
     Id: Copy + Eq + std::hash::Hash + Into<u64>,
 {
-    fn contains(&self, id: Id) -> bool {
-        self.id_to_name.contains_key(&id)
-    }
+    fn contains(&self, id: Id) -> bool { self.id_to_name.contains_key(&id) }
 
     fn current_name(&self, id: Id) -> Option<&str> {
         self.id_to_name.get(&id).map(String::as_str)
@@ -114,7 +111,7 @@ where
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventTypeMeta {
     /// The codec its frames are declared to use (`>= 1`; REG9).
-    pub codec_id: u16,
+    pub codec_id:           u16,
     /// Digest of `schema_version 1`'s shape (opaque to the registry).
     pub schema_fingerprint: [u8; 32],
 }
@@ -125,10 +122,10 @@ pub struct DictMeta {
     /// `TARGET_KIND_CATEGORY` or `TARGET_KIND_EVENT_TYPE`.
     pub scope_kind: u8,
     /// The `category_id` or `event_type_id` this dictionary applies to.
-    pub scope_id: u64,
+    pub scope_id:   u64,
     /// The codec whose byte shapes this dictionary was trained against
     /// (`>= 1`; REG20).
-    pub codec_id: u16,
+    pub codec_id:   u16,
     /// The trained dictionary bytes, opaque to the registry (D-REG-F).
     pub dict_bytes: Vec<u8>,
 }
@@ -143,46 +140,39 @@ pub struct DictMeta {
 /// base case).
 #[derive(Debug, Clone, Default)]
 pub struct RegistryState {
-    streams: NameTable<u64>,
+    streams:         NameTable<u64>,
     /// `stream_id -> category_id`, populated alongside `streams`.
     stream_category: HashMap<u64, u64>,
-    categories: NameTable<u64>,
-    event_types: NameTable<u32>,
+    categories:      NameTable<u64>,
+    event_types:     NameTable<u32>,
     event_type_meta: HashMap<u32, EventTypeMeta>,
-    dicts: HashMap<u16, DictMeta>,
+    dicts:           HashMap<u16, DictMeta>,
 
-    hwm_stream: u64,
-    hwm_category: u64,
+    hwm_stream:     u64,
+    hwm_category:   u64,
     hwm_event_type: u32,
-    hwm_dict: u16,
+    hwm_dict:       u16,
 }
 
 impl RegistryState {
     /// The empty state — no records replayed yet. Only the four reserved
     /// IDs (REG1) resolve; everything else is `$registry` replay away.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
+    pub fn new() -> Self { Self::default() }
 
     // -- high-water marks (§4.1) --------------------------------------
 
     #[must_use]
-    pub fn stream_high_water_mark(&self) -> u64 {
-        self.hwm_stream
-    }
+    pub fn stream_high_water_mark(&self) -> u64 { self.hwm_stream }
+
     #[must_use]
-    pub fn category_high_water_mark(&self) -> u64 {
-        self.hwm_category
-    }
+    pub fn category_high_water_mark(&self) -> u64 { self.hwm_category }
+
     #[must_use]
-    pub fn event_type_high_water_mark(&self) -> u32 {
-        self.hwm_event_type
-    }
+    pub fn event_type_high_water_mark(&self) -> u32 { self.hwm_event_type }
+
     #[must_use]
-    pub fn dict_high_water_mark(&self) -> u16 {
-        self.hwm_dict
-    }
+    pub fn dict_high_water_mark(&self) -> u16 { self.hwm_dict }
 
     // -- resolution (§5), reserved IDs baked in per REG2 ---------------
 
@@ -252,9 +242,7 @@ impl RegistryState {
     }
 
     #[must_use]
-    pub fn dict(&self, id: u16) -> Option<&DictMeta> {
-        self.dicts.get(&id)
-    }
+    pub fn dict(&self, id: u16) -> Option<&DictMeta> { self.dicts.get(&id) }
 
     // -- replay (§7.2) --------------------------------------------------
 
@@ -277,7 +265,7 @@ impl RegistryState {
                 if self.categories.contains(category_id) {
                     return Err(RegistryError::AlreadyRegistered {
                         namespace: "category",
-                        id: category_id,
+                        id:        category_id,
                     });
                 }
                 self.categories.register("category", category_id, name)?;
@@ -297,7 +285,7 @@ impl RegistryState {
                 if self.streams.contains(stream_id) {
                     return Err(RegistryError::AlreadyRegistered {
                         namespace: "stream",
-                        id: stream_id,
+                        id:        stream_id,
                     });
                 }
                 // REG12: category_id must already be visible (0 = reserved
@@ -307,7 +295,7 @@ impl RegistryState {
                 {
                     return Err(RegistryError::UnregisteredReference {
                         namespace: "category",
-                        id: category_id,
+                        id:        category_id,
                     });
                 }
                 self.streams.register("stream", stream_id, name)?;
@@ -334,7 +322,7 @@ impl RegistryState {
                 if self.event_types.contains(event_type_id) {
                     return Err(RegistryError::AlreadyRegistered {
                         namespace: "event_type",
-                        id: u64::from(event_type_id),
+                        id:        u64::from(event_type_id),
                     });
                 }
                 self.event_types.register("event_type", event_type_id, name)?;
@@ -370,7 +358,7 @@ impl RegistryState {
                 if self.dicts.contains_key(&dict_id) {
                     return Err(RegistryError::AlreadyRegistered {
                         namespace: "dict",
-                        id: u64::from(dict_id),
+                        id:        u64::from(dict_id),
                     });
                 }
                 // REG20: scope_id must already be registered, per scope_kind.
@@ -381,7 +369,7 @@ impl RegistryState {
                         {
                             return Err(RegistryError::UnregisteredReference {
                                 namespace: "category",
-                                id: scope_id,
+                                id:        scope_id,
                             });
                         }
                     }
@@ -397,7 +385,7 @@ impl RegistryState {
                         {
                             return Err(RegistryError::UnregisteredReference {
                                 namespace: "event_type",
-                                id: scope_id,
+                                id:        scope_id,
                             });
                         }
                     }

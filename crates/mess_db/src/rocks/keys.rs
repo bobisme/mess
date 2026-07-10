@@ -1,8 +1,8 @@
 use std::borrow::Cow;
 
+use crate::StreamPos;
 use crate::error::Error;
 use crate::error::Result;
-use crate::StreamPos;
 
 pub(crate) const SEPARATOR: u8 = b'|';
 pub(crate) const SEPARATOR_CHAR: char = '|';
@@ -12,14 +12,10 @@ pub struct GlobalKey(pub(crate) u64);
 
 impl GlobalKey {
     #[must_use]
-    pub const fn new(position: u64) -> Self {
-        GlobalKey(position)
-    }
+    pub const fn new(position: u64) -> Self { GlobalKey(position) }
 
     #[must_use]
-    pub const fn as_bytes(&self) -> [u8; 8] {
-        self.0.to_be_bytes()
-    }
+    pub const fn as_bytes(&self) -> [u8; 8] { self.0.to_be_bytes() }
 
     pub fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self> {
         let position = u64::from_be_bytes(
@@ -29,14 +25,12 @@ impl GlobalKey {
     }
 
     #[must_use]
-    pub const fn next(&self) -> Self {
-        Self(self.0 + 1)
-    }
+    pub const fn next(&self) -> Self { Self(self.0 + 1) }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StreamKey<'a> {
-    pub(crate) stream: Cow<'a, str>,
+    pub(crate) stream:   Cow<'a, str>,
     pub(crate) position: StreamPos,
 }
 
@@ -66,9 +60,7 @@ impl<'a> StreamKey<'a> {
     }
 
     #[must_use]
-    pub fn to_bytes(self) -> Vec<u8> {
-        self.as_bytes()
-    }
+    pub fn to_bytes(self) -> Vec<u8> { self.as_bytes() }
 
     pub fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self> {
         let (stream, sep_position) =
@@ -84,7 +76,7 @@ impl<'a> StreamKey<'a> {
             position.try_into().map_err(|_| Error::ParseKeyError)?,
         );
         Ok(StreamKey {
-            stream: String::from_utf8(stream.to_vec())
+            stream:   String::from_utf8(stream.to_vec())
                 .map_err(|_| Error::ParseKeyError)?
                 .into(),
             position: StreamPos::decode(position),
@@ -97,8 +89,9 @@ const _: () = {};
 
 #[cfg(test)]
 mod test_global_key {
-    use super::*;
     use assert2::assert;
+
+    use super::*;
 
     #[test]
     fn test_as_bytes() {
@@ -124,8 +117,9 @@ mod test_global_key {
 
 #[cfg(test)]
 mod test_stream_key {
-    use super::*;
     use assert2::assert;
+
+    use super::*;
 
     #[test]
     fn test_as_bytes() {
@@ -136,15 +130,16 @@ mod test_stream_key {
     }
 
     mod from_bytes {
-        use super::*;
         use assert2::assert;
+
+        use super::*;
 
         #[test]
         fn it_works() {
             // Test case 1: Valid input
             let bytes = b"test_stream|\x00\x00\x00\x00\x00\x00\x00\x0D";
             let expected_result = StreamKey {
-                stream: "test_stream".into(),
+                stream:   "test_stream".into(),
                 position: StreamPos::new(13),
             };
             assert!(StreamKey::from_bytes(bytes).unwrap() == expected_result);

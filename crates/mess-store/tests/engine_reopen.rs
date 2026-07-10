@@ -15,12 +15,18 @@ use mess_store::backend::{Backend, RecordToAppend};
 use mess_store::{LogEngine, Version};
 
 fn rec(message_type: &str, data: &[u8]) -> RecordToAppend {
-    RecordToAppend { message_type: message_type.to_string(), data: data.to_vec() }
+    RecordToAppend {
+        message_type: message_type.to_string(),
+        data:         data.to_vec(),
+    }
 }
 
 /// Assert the three read paths agree with the expected `(stream, type, data,
 /// stream_pos, global_pos)` tuples for the whole global order.
-async fn assert_global(engine: &LogEngine, expected: &[(&str, &str, Vec<u8>, u64, u64)]) {
+async fn assert_global(
+    engine: &LogEngine,
+    expected: &[(&str, &str, Vec<u8>, u64, u64)],
+) {
     let g = engine.read_global(None, 1000).await.unwrap();
     assert_eq!(g.len(), expected.len(), "global event count");
     for (got, (stream, ty, data, sp, gp)) in g.iter().zip(expected) {
@@ -44,16 +50,27 @@ async fn genuine_reopen_returns_exact_pre_crash_data_then_continues() {
             .append_batch(
                 "acct-1",
                 Version::NoStream,
-                &[rec("account.opened", b"alice"), rec("account.deposited", &10i64.to_le_bytes())],
+                &[
+                    rec("account.opened", b"alice"),
+                    rec("account.deposited", &10i64.to_le_bytes()),
+                ],
             )
             .await
             .expect("append acct-1 b0");
         engine
-            .append_batch("acct-2", Version::NoStream, &[rec("account.opened", b"bob")])
+            .append_batch(
+                "acct-2",
+                Version::NoStream,
+                &[rec("account.opened", b"bob")],
+            )
             .await
             .expect("append acct-2 b0");
         engine
-            .append_batch("acct-1", Version::At(1), &[rec("account.withdrawn", &3i64.to_le_bytes())])
+            .append_batch(
+                "acct-1",
+                Version::At(1),
+                &[rec("account.withdrawn", &3i64.to_le_bytes())],
+            )
             .await
             .expect("append acct-1 b1");
         // Drop the engine: releases the StoreLock and the in-process book.
@@ -70,12 +87,21 @@ async fn genuine_reopen_returns_exact_pre_crash_data_then_continues() {
     let engine = LogEngine::open(&store_path).expect("reopen 1");
 
     // head: exactly the pre-crash heads, not NoStream.
-    assert_eq!(engine.head("acct-1").await.unwrap(), Version::At(2), "acct-1 head survives");
-    assert_eq!(engine.head("acct-2").await.unwrap(), Version::At(0), "acct-2 head survives");
+    assert_eq!(
+        engine.head("acct-1").await.unwrap(),
+        Version::At(2),
+        "acct-1 head survives"
+    );
+    assert_eq!(
+        engine.head("acct-2").await.unwrap(),
+        Version::At(0),
+        "acct-2 head survives"
+    );
     assert_eq!(engine.head("never-seen").await.unwrap(), Version::NoStream);
 
     // read_stream: exact payloads + names, not silent-empty.
-    let s1 = engine.read_stream("acct-1", Version::NoStream, 100).await.unwrap();
+    let s1 =
+        engine.read_stream("acct-1", Version::NoStream, 100).await.unwrap();
     assert_eq!(s1.len(), 3);
     assert_eq!(s1[0].message_type, "account.opened");
     assert_eq!(s1[0].data, b"alice");
@@ -89,24 +115,45 @@ async fn genuine_reopen_returns_exact_pre_crash_data_then_continues() {
 
     // ---- Phase 3: keep appending post-reopen (dense-position invariant). ----
     engine
-        .append_batch("acct-2", Version::At(0), &[rec("account.deposited", &50i64.to_le_bytes())])
+        .append_batch(
+            "acct-2",
+            Version::At(0),
+            &[rec("account.deposited", &50i64.to_le_bytes())],
+        )
         .await
         .expect("append acct-2 after reopen");
     engine
-        .append_batch("acct-1", Version::At(2), &[rec("account.deposited", &7i64.to_le_bytes())])
+        .append_batch(
+            "acct-1",
+            Version::At(2),
+            &[rec("account.deposited", &7i64.to_le_bytes())],
+        )
         .await
         .expect("append acct-1 after reopen");
 
     let mut all = pre_crash.clone();
-    all.push(("acct-2", "account.deposited", 50i64.to_le_bytes().to_vec(), 1, 4));
-    all.push(("acct-1", "account.deposited", 7i64.to_le_bytes().to_vec(), 3, 5));
+    all.push((
+        "acct-2",
+        "account.deposited",
+        50i64.to_le_bytes().to_vec(),
+        1,
+        4,
+    ));
+    all.push((
+        "acct-1",
+        "account.deposited",
+        7i64.to_le_bytes().to_vec(),
+        3,
+        5,
+    ));
 
     assert_eq!(engine.head("acct-2").await.unwrap(), Version::At(1));
     assert_eq!(engine.head("acct-1").await.unwrap(), Version::At(3));
     assert_global(&engine, &all).await;
 
     // ---- Phase 4: a SECOND reopen — proves resume-in-place is durable across
-    // cycles (the post-reopen appends became part of the one contiguous log). ----
+    // cycles (the post-reopen appends became part of the one contiguous log).
+    // ----
     drop(engine);
     let engine = LogEngine::open(&store_path).expect("reopen 2");
     assert_eq!(engine.head("acct-1").await.unwrap(), Version::At(3));
@@ -115,10 +162,20 @@ async fn genuine_reopen_returns_exact_pre_crash_data_then_continues() {
 
     // And it still appends densely after the second reopen.
     engine
-        .append_batch("acct-2", Version::At(1), &[rec("account.withdrawn", &5i64.to_le_bytes())])
+        .append_batch(
+            "acct-2",
+            Version::At(1),
+            &[rec("account.withdrawn", &5i64.to_le_bytes())],
+        )
         .await
         .expect("append after second reopen");
-    all.push(("acct-2", "account.withdrawn", 5i64.to_le_bytes().to_vec(), 2, 6));
+    all.push((
+        "acct-2",
+        "account.withdrawn",
+        5i64.to_le_bytes().to_vec(),
+        2,
+        6,
+    ));
     assert_global(&engine, &all).await;
     let s2 = engine.read_stream("acct-2", Version::At(0), 100).await.unwrap();
     // After version 0: deposited(50) then withdrawn(5).
@@ -149,12 +206,19 @@ async fn reopen_loads_sealed_sidecars_and_serves_from_sealed_tier() {
             .append_batch(
                 "acct-1",
                 Version::NoStream,
-                &[rec("account.opened", b"alice"), rec("account.deposited", &10i64.to_le_bytes())],
+                &[
+                    rec("account.opened", b"alice"),
+                    rec("account.deposited", &10i64.to_le_bytes()),
+                ],
             )
             .await
             .expect("append b0");
         engine
-            .append_batch("acct-1", Version::At(1), &[rec("account.withdrawn", &3i64.to_le_bytes())])
+            .append_batch(
+                "acct-1",
+                Version::At(1),
+                &[rec("account.withdrawn", &3i64.to_le_bytes())],
+            )
             .await
             .expect("append b1");
         // Seal the active segment into the cold tier, writing durable sidecars.
@@ -181,7 +245,11 @@ async fn reopen_loads_sealed_sidecars_and_serves_from_sealed_tier() {
     assert_eq!(s[2].message_type, "account.withdrawn");
     assert_eq!(s[2].data, 3i64.to_le_bytes());
     assert_eq!(s[2].global_position, 2);
-    assert_eq!(engine.head("acct-1").await.unwrap(), Version::At(2), "head survives");
+    assert_eq!(
+        engine.head("acct-1").await.unwrap(),
+        Version::At(2),
+        "head survives"
+    );
 
     // read_global still returns the whole durable order.
     let expected: Vec<(&str, &str, Vec<u8>, u64, u64)> = vec![
@@ -209,11 +277,19 @@ async fn crash_mid_seal_leaves_recoverable_state_served_from_log() {
     {
         let engine = LogEngine::open(&store_path).expect("open fresh");
         engine
-            .append_batch("acct-1", Version::NoStream, &[rec("account.opened", b"alice")])
+            .append_batch(
+                "acct-1",
+                Version::NoStream,
+                &[rec("account.opened", b"alice")],
+            )
             .await
             .expect("append b0");
         engine
-            .append_batch("acct-1", Version::At(0), &[rec("account.deposited", &10i64.to_le_bytes())])
+            .append_batch(
+                "acct-1",
+                Version::At(0),
+                &[rec("account.deposited", &10i64.to_le_bytes())],
+            )
             .await
             .expect("append b1");
         // Do NOT complete a seal. Fabricate the two partial-seal crash shapes
@@ -236,7 +312,8 @@ async fn crash_mid_seal_leaves_recoverable_state_served_from_log() {
 
     // Reopen must succeed, install neither partial artifact, and serve reads
     // from the durable log.
-    let engine = LogEngine::open(&store_path).expect("reopen after crash mid-seal");
+    let engine =
+        LogEngine::open(&store_path).expect("reopen after crash mid-seal");
     assert_eq!(
         engine.sealed_segment_count(),
         0,
@@ -256,7 +333,8 @@ async fn crash_mid_seal_leaves_recoverable_state_served_from_log() {
 /// interner from the meta name tables). `#[ignore]`d — run explicitly to
 /// refresh the `docs/perf/envelope.md` row. Prints events, wall time, ev/s.
 #[tokio::test]
-#[ignore = "measurement: run with --release --ignored --nocapture to refresh the envelope"]
+#[ignore = "measurement: run with --release --ignored --nocapture to refresh \
+            the envelope"]
 async fn measure_open_with_rehydration_wall_time() {
     let dir = tempfile::tempdir().expect("tempdir");
     let store_path = dir.path().join("store");
@@ -264,7 +342,8 @@ async fn measure_open_with_rehydration_wall_time() {
     const STREAMS: usize = 200;
     const BATCHES_PER_STREAM: u64 = 100;
     const EVENTS_PER_BATCH: usize = 50;
-    let total_events = STREAMS as u64 * BATCHES_PER_STREAM * EVENTS_PER_BATCH as u64;
+    let total_events =
+        STREAMS as u64 * BATCHES_PER_STREAM * EVENTS_PER_BATCH as u64;
 
     {
         let engine = LogEngine::open(&store_path).expect("open fresh");
@@ -275,7 +354,10 @@ async fn measure_open_with_rehydration_wall_time() {
                 let recs: Vec<RecordToAppend> = (0..EVENTS_PER_BATCH)
                     .map(|i| rec("evt.t", &(b * 100 + i as u64).to_le_bytes()))
                     .collect();
-                let out = engine.append_batch(&stream, expected, &recs).await.unwrap();
+                let out = engine
+                    .append_batch(&stream, expected, &recs)
+                    .await
+                    .unwrap();
                 expected = out.version;
             }
         }
@@ -284,11 +366,16 @@ async fn measure_open_with_rehydration_wall_time() {
     let t0 = std::time::Instant::now();
     let engine = LogEngine::open(&store_path).expect("reopen");
     let elapsed = t0.elapsed();
-    assert_eq!(engine.total_events(), total_events as usize, "rehydrated every event");
+    assert_eq!(
+        engine.total_events(),
+        total_events as usize,
+        "rehydrated every event"
+    );
 
     let ev_per_s = total_events as f64 / elapsed.as_secs_f64();
     println!(
-        "engine open-with-rehydration: {total_events} events in {:.4} s ({:.0} ev/s)",
+        "engine open-with-rehydration: {total_events} events in {:.4} s \
+         ({:.0} ev/s)",
         elapsed.as_secs_f64(),
         ev_per_s
     );

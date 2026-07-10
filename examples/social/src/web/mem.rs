@@ -37,13 +37,13 @@ use crate::domain::user::{
 };
 
 struct UserRow {
-    id: Id,
+    id:  Id,
     agg: User,
 }
 
 struct PostRow {
-    id: Id,
-    agg: Post,
+    id:          Id,
+    agg:         Post,
     created_pos: u64,
 }
 
@@ -51,7 +51,7 @@ struct PostRow {
 struct Inner {
     users: Vec<UserRow>,
     posts: Vec<PostRow>,
-    pos: u64,
+    pos:   u64,
 }
 
 /// A coherent in-memory backend implementing both [`ReadModels`] and
@@ -63,9 +63,7 @@ pub struct MemBackend {
 
 impl MemBackend {
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
+    pub fn new() -> Self { Self::default() }
 }
 
 impl Inner {
@@ -78,9 +76,11 @@ impl Inner {
     fn user(&self, id: Id) -> Option<&UserRow> {
         self.users.iter().find(|r| r.id == id)
     }
+
     fn user_mut(&mut self, id: Id) -> Option<&mut UserRow> {
         self.users.iter_mut().find(|r| r.id == id)
     }
+
     fn post_mut(&mut self, id: Id) -> Option<&mut PostRow> {
         self.posts.iter_mut().find(|r| r.id == id)
     }
@@ -128,6 +128,7 @@ impl ReadModels for MemBackend {
         let snap = self.inner.lock().unwrap().snapshot();
         snap.home_timeline(user, cursor, limit).await
     }
+
     async fn user_posts(
         &self,
         handle: &str,
@@ -137,6 +138,7 @@ impl ReadModels for MemBackend {
         let snap = self.inner.lock().unwrap().snapshot();
         snap.user_posts(handle, cursor, limit).await
     }
+
     async fn firehose(
         &self,
         cursor: Option<String>,
@@ -145,6 +147,7 @@ impl ReadModels for MemBackend {
         let snap = self.inner.lock().unwrap().snapshot();
         snap.firehose(cursor, limit).await
     }
+
     async fn profile(
         &self,
         handle: &str,
@@ -153,14 +156,17 @@ impl ReadModels for MemBackend {
         let snap = self.inner.lock().unwrap().snapshot();
         snap.profile(handle, viewer).await
     }
+
     async fn post(&self, id: Id, viewer: Option<Id>) -> Option<PostView> {
         let snap = self.inner.lock().unwrap().snapshot();
         snap.post(id, viewer).await
     }
+
     async fn resolve(&self, handle: &str) -> Option<Id> {
         let g = self.inner.lock().unwrap();
         g.users.iter().find(|r| r.agg.handle == handle).map(|r| r.id)
     }
+
     async fn wait_for(&self, _position: u64) {
         // Synchronously consistent: a write mutates state in place.
     }
@@ -199,8 +205,7 @@ impl WriteOps for MemBackend {
         display_name: String,
     ) -> Result<u64, WriteError> {
         let mut g = self.inner.lock().unwrap();
-        let mut agg =
-            g.user(user).map(|r| r.agg.clone()).unwrap_or_default();
+        let mut agg = g.user(user).map(|r| r.agg.clone()).unwrap_or_default();
         let events = agg
             .decide(SetDisplayName { display_name })
             .map_err(WriteError::User)?;
@@ -283,11 +288,7 @@ impl WriteOps for MemBackend {
         Ok(pos)
     }
 
-    async fn delete_post(
-        &self,
-        post: Id,
-        by: Id,
-    ) -> Result<u64, WriteError> {
+    async fn delete_post(&self, post: Id, by: Id) -> Result<u64, WriteError> {
         self.mutate_post(post, |p| p.decide(DeletePost { by }))
     }
 
@@ -301,14 +302,17 @@ impl WriteOps for MemBackend {
 }
 
 impl MemBackend {
-    /// Shared body for post commands on an existing stream: fold, decide, apply.
+    /// Shared body for post commands on an existing stream: fold, decide,
+    /// apply.
     fn mutate_post(
         &self,
         post: Id,
         decide: impl FnOnce(
             &Post,
-        )
-            -> Result<Vec<crate::domain::post::PostEvent>, crate::domain::post::PostError>,
+        ) -> Result<
+            Vec<crate::domain::post::PostEvent>,
+            crate::domain::post::PostError,
+        >,
     ) -> Result<u64, WriteError> {
         let mut g = self.inner.lock().unwrap();
         let mut agg =

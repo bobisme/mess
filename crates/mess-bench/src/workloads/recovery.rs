@@ -24,11 +24,11 @@ fn build(dir: &Path, n_segs: usize, seg_bytes: u64) -> (Vec<SegmentFile>, u64) {
     let payload = vec![0x5Au8; 60 * 1024];
     let subs = [Subframe::plain(0x11, 0, 0, &payload)];
     let mk_spec = |v: u64| BatchSpec {
-        stream_id: 1,
-        category_id: 101,
+        stream_id:            1,
+        category_id:          101,
         first_stream_version: v,
-        crypto_chain: None,
-        subframes: &subs,
+        crypto_chain:         None,
+        subframes:            &subs,
     };
 
     let mut segs = Vec::new();
@@ -78,7 +78,8 @@ pub fn run(size: RunSize, scratch: &Path) -> Vec<Metric> {
         RecoverOptions { mode: RecoveryMode::Full, parallel: false };
     let parallel_opts =
         RecoverOptions { mode: RecoveryMode::Full, parallel: true };
-    // Warm the page cache so the measured runs time CPU scan, not first-touch I/O.
+    // Warm the page cache so the measured runs time CPU scan, not first-touch
+    // I/O.
     let _ = recover_whole_log(&fs, &segs, None, serial_opts).unwrap();
 
     let start = Instant::now();
@@ -111,9 +112,10 @@ pub fn run(size: RunSize, scratch: &Path) -> Vec<Metric> {
             parallel_s_per_gib,
             "s/GiB",
             format!(
-                "full recovery (RecoveryMode::Full, per-segment parallel / R1), {n_segs} segments \
-                 x ~{seg_mib}MiB (~60KiB payloads, CPU-bound scan), {gib:.3} GiB content, page \
-                 cache warmed; real-fs scratch"
+                "full recovery (RecoveryMode::Full, per-segment parallel / \
+                 R1), {n_segs} segments x ~{seg_mib}MiB (~60KiB payloads, \
+                 CPU-bound scan), {gib:.3} GiB content, page cache warmed; \
+                 real-fs scratch"
             ),
         ),
         Metric::new(
@@ -127,8 +129,8 @@ pub fn run(size: RunSize, scratch: &Path) -> Vec<Metric> {
             serial_s_per_gib,
             "s/GiB",
             format!(
-                "same corpus, RecoveryMode::Full serial (parallel: false) — informational, not \
-                 floor-gated; {gib:.3} GiB content"
+                "same corpus, RecoveryMode::Full serial (parallel: false) — \
+                 informational, not floor-gated; {gib:.3} GiB content"
             ),
         ),
     ]

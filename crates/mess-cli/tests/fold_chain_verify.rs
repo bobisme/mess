@@ -19,7 +19,9 @@ use mess_cli::verify::{self, VerifyOptions};
 use mess_log::crc::batch_crc;
 use mess_log::encode::Subframe;
 use mess_log::fold_chain::{ChainHead, Hash};
-use mess_log::format::{CHAIN_LEN, HEADER_CRC_OFF, HEADER_LEN, SUBFRAME_HDR_LEN};
+use mess_log::format::{
+    CHAIN_LEN, HEADER_CRC_OFF, HEADER_LEN, SUBFRAME_HDR_LEN,
+};
 use mess_log::runtime::real::RealFs;
 use mess_log::scanner::{AcceptedBatch, scan_image};
 use mess_log::writer::{BatchSpec, SegmentParams, SegmentWriter};
@@ -27,9 +29,7 @@ use mess_log::writer::{BatchSpec, SegmentParams, SegmentWriter};
 const SEG_ID: u64 = 1;
 const STREAM_ID: u64 = 42;
 
-fn tmp() -> tempfile::TempDir {
-    tempfile::tempdir().expect("tempdir")
-}
+fn tmp() -> tempfile::TempDir { tempfile::tempdir().expect("tempdir") }
 
 /// A 32-byte payload: tag byte + u64 amount + filler (mirrors crash_verify.rs).
 fn ev(tag: u8, amount: u64) -> Vec<u8> {
@@ -47,19 +47,25 @@ fn workload(n: u64) -> Vec<Vec<u8>> {
 /// real `crypto_chain`) to `dir`'s active segment, over the real fs.
 fn write_chained_corpus(dir: &Path, payloads: &[Vec<u8>], batch_size: usize) {
     let path = store::log_path(dir, SEG_ID);
-    let mut w = SegmentWriter::create(&RealFs, &path, SegmentParams::new(SEG_ID, 0, 1, 0)).unwrap();
+    let mut w = SegmentWriter::create(
+        &RealFs,
+        &path,
+        SegmentParams::new(SEG_ID, 0, 1, 0),
+    )
+    .unwrap();
 
     let mut head = ChainHead::genesis(STREAM_ID);
     let mut version = 0u64;
     for chunk in payloads.chunks(batch_size) {
         let entry: Hash = head.entry();
-        let subs: Vec<Subframe> = chunk.iter().map(|p| Subframe::plain(1, 0, 0, p)).collect();
+        let subs: Vec<Subframe> =
+            chunk.iter().map(|p| Subframe::plain(1, 0, 0, p)).collect();
         w.append(&BatchSpec {
-            stream_id: STREAM_ID,
-            category_id: 0,
+            stream_id:            STREAM_ID,
+            category_id:          0,
             first_stream_version: version,
-            crypto_chain: Some(&entry),
-            subframes: &subs,
+            crypto_chain:         Some(&entry),
+            subframes:            &subs,
         })
         .unwrap();
         for p in chunk {
@@ -78,7 +84,8 @@ fn refresh_batch_crc(image: &mut [u8], ab: &AcceptedBatch) {
     let off = ab.offset as usize;
     let end = off + ab.total_len as usize;
     let crc = batch_crc(&image[off..end]);
-    image[off + HEADER_CRC_OFF..off + HEADER_CRC_OFF + 4].copy_from_slice(&crc.to_le_bytes());
+    image[off + HEADER_CRC_OFF..off + HEADER_CRC_OFF + 4]
+        .copy_from_slice(&crc.to_le_bytes());
     image[end - 4..end].copy_from_slice(&crc.to_le_bytes());
 }
 
@@ -107,8 +114,14 @@ fn clean_chained_corpus_verifies_full_clean() {
     let d = tmp();
     write_chained_corpus(d.path(), &workload(50), 10);
 
-    let report = verify::run(d.path(), &VerifyOptions { full: true, repair: false });
-    assert_eq!(report.exit_code(), 0, "clean chained corpus must exit 0: {:#?}", report.findings);
+    let report =
+        verify::run(d.path(), &VerifyOptions { full: true, repair: false });
+    assert_eq!(
+        report.exit_code(),
+        0,
+        "clean chained corpus must exit 0: {:#?}",
+        report.findings
+    );
     assert!(
         !report.findings.iter().any(|f| f.severity == Severity::Error),
         "clean chained corpus must have no error findings: {:#?}",
@@ -133,7 +146,8 @@ fn crc_repaired_tamper_passes_structural_but_fails_full() {
 
     // Structural (no --full): the batch CRC and marker are self-consistent
     // again, so the byte-layer scan sees nothing wrong.
-    let structural = verify::run(d.path(), &VerifyOptions { full: false, repair: false });
+    let structural =
+        verify::run(d.path(), &VerifyOptions { full: false, repair: false });
     assert_eq!(
         structural.exit_code(),
         0,
@@ -142,15 +156,24 @@ fn crc_repaired_tamper_passes_structural_but_fails_full() {
     );
     assert!(
         !structural.findings.iter().any(|f| f.severity == Severity::Error),
-        "structural verify must have no error findings on a CRC-repaired tamper: {:#?}",
+        "structural verify must have no error findings on a CRC-repaired \
+         tamper: {:#?}",
         structural.findings
     );
 
     // --full: the fold chain catches what the CRC could not.
-    let full = verify::run(d.path(), &VerifyOptions { full: true, repair: false });
-    assert_ne!(full.exit_code(), 0, "fold-chain tamper must exit non-zero under --full");
+    let full =
+        verify::run(d.path(), &VerifyOptions { full: true, repair: false });
+    assert_ne!(
+        full.exit_code(),
+        0,
+        "fold-chain tamper must exit non-zero under --full"
+    );
     assert!(
-        full.findings.iter().any(|f| f.severity == Severity::Error && f.kind == "fold-chain-break"),
+        full.findings
+            .iter()
+            .any(|f| f.severity == Severity::Error
+                && f.kind == "fold-chain-break"),
         "expected a fold-chain-break finding under --full, got: {:#?}",
         full.findings
     );

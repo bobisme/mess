@@ -2,17 +2,17 @@
 //! engine (`mess_store::LogEngine`) measured against the three envelope gates.
 //!
 //!   1. buffered append          >= 1_000_000 ev/s  (full engine append path)
-//!   2. sealed stream replay     >= 2_500_000 ev/s  (EventStore load, sealed corpus)
-//!   3. recovery fast path        <= 0.5 s          (recover_whole_log + manifest)
+//!   2. sealed stream replay     >= 2_500_000 ev/s  (EventStore load, sealed
+//!      corpus)
+//!   3. recovery fast path        <= 0.5 s          (recover_whole_log +
+//!      manifest)
 //!
 //! Release + real ext4 scratch (`$HOME/.cache/...`, never /tmp tmpfs). Run:
-//!   CLANG_PATH=/usr/bin/clang cargo bench -p mess-store --bench engine_envelope
+//!   CLANG_PATH=/usr/bin/clang cargo bench -p mess-store --bench
+//! engine_envelope
 
 use std::path::PathBuf;
 use std::time::Instant;
-
-use mess_store::backend::{Backend, RecordToAppend};
-use mess_store::{EngineOptions, EventStore, LogEngine, Version};
 
 use mess_log::committer::Durability;
 use mess_log::encode::Subframe;
@@ -22,6 +22,8 @@ use mess_log::recover_all::{
 };
 use mess_log::runtime::{RealRuntime, Runtime};
 use mess_log::writer::{BatchSpec, SegmentParams, SegmentWriter};
+use mess_store::backend::{Backend, RecordToAppend};
+use mess_store::{EngineOptions, EventStore, LogEngine, Version};
 
 fn scratch_root() -> PathBuf {
     let home = std::env::var("HOME").expect("HOME");
@@ -36,7 +38,7 @@ fn scratch_root() -> PathBuf {
 fn rec(i: usize) -> RecordToAppend {
     RecordToAppend {
         message_type: "account.deposited".to_string(),
-        data: (i as u64).to_le_bytes().to_vec(),
+        data:         (i as u64).to_le_bytes().to_vec(),
     }
 }
 
@@ -181,11 +183,11 @@ fn bench_recovery(root: &std::path::Path) -> f64 {
         let mut version = 0u64;
         for _ in 0..BATCHES_PER_SEG {
             let spec = BatchSpec {
-                stream_id: stream,
-                category_id: 0,
+                stream_id:            stream,
+                category_id:          0,
                 first_stream_version: version,
-                crypto_chain: None,
-                subframes: &subframes,
+                crypto_chain:         None,
+                subframes:            &subframes,
             };
             w.append(&spec).expect("append batch");
             version += u64::from(EVENTS_PER_BATCH);
@@ -208,7 +210,8 @@ fn bench_recovery(root: &std::path::Path) -> f64 {
         .expect("full recover");
     let manifest = Manifest::new(manifest_entries(&whole));
     let manifest_bytes = build_manifest(manifest.entries());
-    let manifest = decode_manifest(&manifest_bytes).expect("manifest roundtrip");
+    let manifest =
+        decode_manifest(&manifest_bytes).expect("manifest roundtrip");
 
     let started = Instant::now();
     let recovered =
@@ -217,7 +220,8 @@ fn bench_recovery(root: &std::path::Path) -> f64 {
     let elapsed = started.elapsed();
     assert_eq!(recovered.total_events as usize, total_events);
     println!(
-        "  gate 3 recovery fast   : {SEGMENTS} segs / {total_events} ev recovered in {:?}",
+        "  gate 3 recovery fast   : {SEGMENTS} segs / {total_events} ev \
+         recovered in {:?}",
         elapsed
     );
     elapsed.as_secs_f64()

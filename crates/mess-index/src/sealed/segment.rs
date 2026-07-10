@@ -1,7 +1,7 @@
 //! The sealed per-segment pointer index: the on-disk **sidecar** that replaces
 //! a sealed segment's slice of the in-memory active index (D5). One sidecar per
-//! sealed segment, built once by the background sealer ([`crate::sealed::driver`])
-//! and thereafter read-only.
+//! sealed segment, built once by the background sealer
+//! ([`crate::sealed::driver`]) and thereafter read-only.
 //!
 //! # Why a sidecar, not a footer extension section
 //!
@@ -18,21 +18,21 @@
 //! reasons, all consistent with the advisory-skip rule:
 //!
 //! 1. **Crate ownership.** mess-log owns the segment bytes and the footer
-//!    section *framing* (§3.3.2); this crate owns the sealed-index *bytes*
-//!    (the bone's split). mess-log's `SegmentWriter::seal` finalizes an empty
-//!    (or fold-anchor-only) extension in one seal `fdatasync`; making it accept
-//!    a large, index-crate-owned section would invert that ownership. A sidecar
-//!    keeps each crate's bytes on its own side of the seam without restructuring
-//!    mess-log.
+//!    section *framing* (§3.3.2); this crate owns the sealed-index *bytes* (the
+//!    bone's split). mess-log's `SegmentWriter::seal` finalizes an empty (or
+//!    fold-anchor-only) extension in one seal `fdatasync`; making it accept a
+//!    large, index-crate-owned section would invert that ownership. A sidecar
+//!    keeps each crate's bytes on its own side of the seam without
+//!    restructuring mess-log.
 //! 2. **R2 fast path.** The footer trailer is read by a fixed `pread` from EOF
-//!    (R2, §02). A multi-hundred-KiB pointer index in the extension region would
-//!    bloat the seal write and sit in front of the trailer for no fast-path
-//!    benefit; out of band it never touches R2.
+//!    (R2, §02). A multi-hundred-KiB pointer index in the extension region
+//!    would bloat the seal write and sit in front of the trailer for no
+//!    fast-path benefit; out of band it never touches R2.
 //! 3. **Same forward-compat guarantee, stronger.** An old reader ignores an
 //!    unknown section by skipping its `payload_len`; it ignores a sidecar by
 //!    simply not opening it. Both fall back to scanning/rebuilding. The sidecar
-//!    is the out-of-band analogue of the repair sidecar (D-FMT-3), which spec 01
-//!    already blesses.
+//!    is the out-of-band analogue of the repair sidecar (D-FMT-3), which spec
+//!    01 already blesses.
 //!
 //! # File layout
 //!
@@ -113,23 +113,23 @@ pub const FORMAT_VERSION: u16 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SealBatch {
     /// Stream version of the batch's first event.
-    pub first_version: u64,
+    pub first_version:    u64,
     /// Number of events in the batch.
-    pub frame_count: u32,
+    pub frame_count:      u32,
     /// Global position (A1) of the batch's first event.
     pub first_global_pos: u64,
     /// Byte offset of the batch within the segment.
-    pub offset: u64,
+    pub offset:           u64,
 }
 
 impl SealBatch {
     #[inline]
     fn as_batch_ptr(&self) -> BatchPtr {
         BatchPtr {
-            first_version: self.first_version,
-            frame_count: self.frame_count,
+            first_version:    self.first_version,
+            frame_count:      self.frame_count,
             first_global_pos: self.first_global_pos,
-            offset: self.offset,
+            offset:           self.offset,
         }
     }
 }
@@ -140,7 +140,7 @@ pub struct SealStream {
     /// The stream id.
     pub stream_id: u64,
     /// The stream's batches in this segment, version-ascending.
-    pub batches: Vec<SealBatch>,
+    pub batches:   Vec<SealBatch>,
 }
 
 /// The seal INPUT: everything the sealer needs to turn one segment's slice of
@@ -151,20 +151,22 @@ pub struct SealInput {
     /// The segment being sealed (all pointers resolve into it).
     pub segment_id: u64,
     /// The segment's A1 base position.
-    pub base_pos: u64,
+    pub base_pos:   u64,
     /// Per-stream batch lists, ascending by `stream_id`.
-    pub streams: Vec<SealStream>,
+    pub streams:    Vec<SealStream>,
     /// The segment's event **payloads** in stored / global-position order:
     /// index `i` is the payload of the event at global position
-    /// `base_pos + i`. When `Some`, [`crate::sealed::driver::SealDriver::seal`]
-    /// also emits the D6 payload-block sidecar (`.pcol`) — columnar by default,
-    /// row fallback where the codec cannot shred, verify-on-seal — and attaches
+    /// `base_pos + i`. When `Some`,
+    /// [`crate::sealed::driver::SealDriver::seal`] also emits the D6
+    /// payload-block sidecar (`.pcol`) — columnar by default, row fallback
+    /// where the codec cannot shred, verify-on-seal — and attaches
     /// the resulting [`crate::sealed::payload::SealedPayloadIndex`] to the
     /// installed segment so the sealed read path
-    /// ([`ReplaySet`](crate::sealed::replay::ReplaySet)) can reassemble payloads
-    /// without touching the raw log. `None` seals the pointer sidecar only (the
-    /// caller has no payload bytes in hand — e.g. a pointer-only rebuild).
-    pub payloads: Option<Vec<Vec<u8>>>,
+    /// ([`ReplaySet`](crate::sealed::replay::ReplaySet)) can reassemble
+    /// payloads without touching the raw log. `None` seals the pointer
+    /// sidecar only (the caller has no payload bytes in hand — e.g. a
+    /// pointer-only rebuild).
+    pub payloads:   Option<Vec<Vec<u8>>>,
 }
 
 impl SealInput {
@@ -188,11 +190,11 @@ impl SealInput {
     }
 
     /// Build the seal input for `segment_id` from a committed
-    /// [`crate::IndexSnapshot`], keeping only the entries whose pointer lands in
-    /// that segment. Streams end up ascending by id (the snapshot's `BTreeMap`
-    /// order), each stream's batches version-ascending (the snapshot preserves
-    /// insert order). `base_pos` is the segment's A1 base (from the segment
-    /// header / trailer).
+    /// [`crate::IndexSnapshot`], keeping only the entries whose pointer lands
+    /// in that segment. Streams end up ascending by id (the snapshot's
+    /// `BTreeMap` order), each stream's batches version-ascending (the
+    /// snapshot preserves insert order). `base_pos` is the segment's A1
+    /// base (from the segment header / trailer).
     pub fn from_snapshot(
         snapshot: &crate::IndexSnapshot,
         segment_id: u64,
@@ -204,10 +206,10 @@ impl SealInput {
                 .iter()
                 .filter(|e| e.ptr.segment_id == segment_id)
                 .map(|e: &StreamEntry| SealBatch {
-                    first_version: e.first_version,
-                    frame_count: e.frame_count,
+                    first_version:    e.first_version,
+                    frame_count:      e.frame_count,
                     first_global_pos: e.first_global_pos,
-                    offset: e.ptr.offset,
+                    offset:           e.ptr.offset,
                 })
                 .collect();
             if !batches.is_empty() {
@@ -248,8 +250,8 @@ pub fn filter_path_for(sidecar_path: &Path) -> std::path::PathBuf {
 /// The D6 payload-block sidecar (`.pcol`) path for a given pointer-sidecar path
 /// (bn-zge): same directory and stem, `.pcol` extension in place of `.pidx`.
 /// The single source of truth for the pairing, used by both
-/// [`crate::sealed::driver::SealDriver`] (write) and [`SealedSegmentIndex::open`]
-/// (re-attach) so the two files can never drift.
+/// [`crate::sealed::driver::SealDriver`] (write) and
+/// [`SealedSegmentIndex::open`] (re-attach) so the two files can never drift.
 pub fn payload_path_for(sidecar_path: &Path) -> std::path::PathBuf {
     sidecar_path.with_extension("pcol")
 }
@@ -276,17 +278,18 @@ pub fn encode_sidecar(input: &SealInput) -> Vec<u8> {
     // Encode all pointer blocks and skip tables first, tracking per-stream
     // spans; then lay out header, PTR region, SKIP region, DIR region, footer.
     struct Enc {
-        stream_id: u64,
+        stream_id:     u64,
         first_version: u64,
-        last_version: u64,
-        n_batches: u32,
-        block: Vec<u8>,
-        skips: Vec<u8>,
+        last_version:  u64,
+        n_batches:     u32,
+        block:         Vec<u8>,
+        skips:         Vec<u8>,
     }
     let mut encs: Vec<Enc> = Vec::with_capacity(input.streams.len());
     for s in &input.streams {
         debug_assert!(!s.batches.is_empty());
-        let ptrs: Vec<BatchPtr> = s.batches.iter().map(SealBatch::as_batch_ptr).collect();
+        let ptrs: Vec<BatchPtr> =
+            s.batches.iter().map(SealBatch::as_batch_ptr).collect();
         let mut skips: Vec<SkipEntry> = Vec::new();
         let block = encode_ptr_block(&ptrs, &mut skips);
         let last = ptrs.last().unwrap();
@@ -371,62 +374,55 @@ pub fn encode_sidecar(input: &SealInput) -> Vec<u8> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DirEntry {
     first_version: u64,
-    last_version: u64,
-    ptr_off: u64,
-    ptr_len: u32,
-    n_batches: u32,
-    skip_off: u64,
-    skip_len: u32,
+    last_version:  u64,
+    ptr_off:       u64,
+    ptr_len:       u32,
+    n_batches:     u32,
+    skip_off:      u64,
+    skip_len:      u32,
 }
 
 /// The read-only sealed pointer index for one segment. Owns the sidecar bytes
 /// in memory; every query is a slice + decode with no further I/O.
 #[derive(Debug)]
 pub struct SealedSegmentIndex {
-    segment_id: u64,
-    base_pos: u64,
+    segment_id:  u64,
+    base_pos:    u64,
     event_count: u64,
-    bytes: Vec<u8>,
-    dir: HashMap<u64, DirEntry>,
+    bytes:       Vec<u8>,
+    dir:         HashMap<u64, DirEntry>,
     /// Stream ids ascending — for global replay and deterministic iteration.
-    stream_ids: Vec<u64>,
+    stream_ids:  Vec<u64>,
     /// The seal-time `BinaryFuse16` stream-id membership filter (bn-1i7), if
     /// one is attached — see [`Self::might_contain_stream`]. `None` when no
     /// filter was built (e.g. an empty segment) or none was found/valid on
     /// disk; callers must treat that exactly like a filter that always
     /// answers "maybe" (I5 — never a wrong answer, only lost skip-ahead).
-    filter: Option<SegmentFilter>,
-    /// The D6 payload-block sidecar (`.pcol`) for this segment (bn-zge), if one
-    /// was emitted at seal and attached here (or re-attached by [`Self::open`]
-    /// from the sibling file). `None` for a pointer-only seal. When present, the
-    /// sealed read path reassembles payloads from it
-    /// ([`Self::reassemble_payload`]) instead of the raw log.
-    payload: Option<SealedPayloadIndex>,
+    filter:      Option<SegmentFilter>,
+    /// The D6 payload-block sidecar (`.pcol`) for this segment (bn-zge), if
+    /// one was emitted at seal and attached here (or re-attached by
+    /// [`Self::open`] from the sibling file). `None` for a pointer-only
+    /// seal. When present, the sealed read path reassembles payloads from
+    /// it ([`Self::reassemble_payload`]) instead of the raw log.
+    payload:     Option<SealedPayloadIndex>,
 }
 
 impl SealedSegmentIndex {
     /// The segment this index covers.
-    pub fn segment_id(&self) -> u64 {
-        self.segment_id
-    }
+    pub fn segment_id(&self) -> u64 { self.segment_id }
+
     /// The segment's A1 base position.
-    pub fn base_pos(&self) -> u64 {
-        self.base_pos
-    }
+    pub fn base_pos(&self) -> u64 { self.base_pos }
+
     /// Total events indexed.
-    pub fn event_count(&self) -> u64 {
-        self.event_count
-    }
+    pub fn event_count(&self) -> u64 { self.event_count }
+
     /// Number of streams present in this segment.
-    pub fn stream_count(&self) -> usize {
-        self.stream_ids.len()
-    }
+    pub fn stream_count(&self) -> usize { self.stream_ids.len() }
 
     /// The stream ids present in this segment, ascending (bn-2ug's retention
     /// rule walks these to build a segment's per-stream frame spans).
-    pub fn stream_ids(&self) -> &[u64] {
-        &self.stream_ids
-    }
+    pub fn stream_ids(&self) -> &[u64] { &self.stream_ids }
 
     /// `(first_version, last_version)` — the inclusive committed version range
     /// of `stream_id`'s frames within this segment, or `None` if the stream is
@@ -460,7 +456,9 @@ impl SealedSegmentIndex {
             return Err(SidecarError::Corrupt("bad footer magic"));
         }
         if rd_u32(foot, 32) as usize != n_streams {
-            return Err(SidecarError::Corrupt("footer/header n_streams disagree"));
+            return Err(SidecarError::Corrupt(
+                "footer/header n_streams disagree",
+            ));
         }
         let dir_off = rd_u64(foot, 0) as usize;
         let stored_crc = rd_u32(foot, 24);
@@ -483,12 +481,12 @@ impl SealedSegmentIndex {
             let stream_id = rd_u64(&bytes, b);
             let entry = DirEntry {
                 first_version: rd_u64(&bytes, b + 8),
-                last_version: rd_u64(&bytes, b + 16),
-                ptr_off: rd_u64(&bytes, b + 24),
-                ptr_len: rd_u32(&bytes, b + 32),
-                n_batches: rd_u32(&bytes, b + 36),
-                skip_off: rd_u64(&bytes, b + 40),
-                skip_len: rd_u32(&bytes, b + 48),
+                last_version:  rd_u64(&bytes, b + 16),
+                ptr_off:       rd_u64(&bytes, b + 24),
+                ptr_len:       rd_u32(&bytes, b + 32),
+                n_batches:     rd_u32(&bytes, b + 36),
+                skip_off:      rd_u64(&bytes, b + 40),
+                skip_len:      rd_u32(&bytes, b + 48),
             };
             // Bounds-check the spans so later slicing cannot panic.
             let ptr_end = entry.ptr_off as usize + entry.ptr_len as usize;
@@ -533,7 +531,8 @@ impl SealedSegmentIndex {
         // raw log remains the payload authority, D1). The driver attaches the
         // in-memory index directly at seal, so this path matters only for a
         // fresh reopen from disk.
-        if let Ok(Ok(payload)) = SealedPayloadIndex::open(&payload_path_for(path))
+        if let Ok(Ok(payload)) =
+            SealedPayloadIndex::open(&payload_path_for(path))
             && payload.segment_id() == index.segment_id
         {
             index.payload = Some(payload);
@@ -550,22 +549,20 @@ impl SealedSegmentIndex {
     }
 
     /// Attach the D6 payload-block sidecar for this segment (bn-zge). Called by
-    /// [`crate::sealed::driver::SealDriver::seal`] right after it durably writes
-    /// the `.pcol`, and by [`Self::open`] when a valid sibling `.pcol` is found.
-    /// The attached index is what the sealed read path reassembles payloads
-    /// from ([`Self::reassemble_payload`] /
+    /// [`crate::sealed::driver::SealDriver::seal`] right after it durably
+    /// writes the `.pcol`, and by [`Self::open`] when a valid sibling
+    /// `.pcol` is found. The attached index is what the sealed read path
+    /// reassembles payloads from ([`Self::reassemble_payload`] /
     /// [`ReplaySet`](crate::sealed::replay::ReplaySet)).
     pub fn attach_payload(&mut self, payload: SealedPayloadIndex) {
         self.payload = Some(payload);
     }
 
-    /// Whether a D6 payload sidecar (`.pcol`) is attached to this segment — i.e.
-    /// the sealed read path can reassemble this segment's payloads columnar-side
-    /// rather than from the raw log.
+    /// Whether a D6 payload sidecar (`.pcol`) is attached to this segment —
+    /// i.e. the sealed read path can reassemble this segment's payloads
+    /// columnar-side rather than from the raw log.
     #[inline]
-    pub fn has_payload(&self) -> bool {
-        self.payload.is_some()
-    }
+    pub fn has_payload(&self) -> bool { self.payload.is_some() }
 
     /// The attached payload-block index, if any.
     #[inline]
@@ -611,9 +608,11 @@ impl SealedSegmentIndex {
     fn ptr_slice(&self, e: &DirEntry) -> &[u8] {
         &self.bytes[e.ptr_off as usize..e.ptr_off as usize + e.ptr_len as usize]
     }
+
     #[inline]
     fn skip_slice(&self, e: &DirEntry) -> &[u8] {
-        &self.bytes[e.skip_off as usize..e.skip_off as usize + e.skip_len as usize]
+        &self.bytes
+            [e.skip_off as usize..e.skip_off as usize + e.skip_len as usize]
     }
 
     /// The committed head version of `stream_id` in this segment (its last
@@ -627,7 +626,11 @@ impl SealedSegmentIndex {
     /// Resolve `(stream_id, version)` to the batch's [`EventPtr`], or `None`
     /// when the stream/version is not in this segment. `Err` only on corrupt
     /// bytes (a defensive path; a validated sidecar never errors here).
-    pub fn resolve(&self, stream_id: u64, version: u64) -> Result<Option<EventPtr>, DecodeError> {
+    pub fn resolve(
+        &self,
+        stream_id: u64,
+        version: u64,
+    ) -> Result<Option<EventPtr>, DecodeError> {
         let Some(e) = self.dir.get(&stream_id) else {
             return Ok(None);
         };
@@ -640,12 +643,18 @@ impl SealedSegmentIndex {
             e.n_batches as usize,
             version,
         )?;
-        Ok(bp.map(|b| EventPtr { segment_id: self.segment_id, offset: b.offset }))
+        Ok(bp.map(|b| EventPtr {
+            segment_id: self.segment_id,
+            offset:     b.offset,
+        }))
     }
 
     /// All of `stream_id`'s batch entries in this segment, version order — the
     /// sealed-path stream replay. Returns an empty vec if the stream is absent.
-    pub fn stream_entries(&self, stream_id: u64) -> Result<Vec<StreamEntry>, DecodeError> {
+    pub fn stream_entries(
+        &self,
+        stream_id: u64,
+    ) -> Result<Vec<StreamEntry>, DecodeError> {
         let Some(e) = self.dir.get(&stream_id) else {
             return Ok(Vec::new());
         };
@@ -653,10 +662,13 @@ impl SealedSegmentIndex {
         Ok(batches
             .into_iter()
             .map(|b| StreamEntry {
-                first_version: b.first_version,
-                frame_count: b.frame_count,
+                first_version:    b.first_version,
+                frame_count:      b.frame_count,
                 first_global_pos: b.first_global_pos,
-                ptr: EventPtr { segment_id: self.segment_id, offset: b.offset },
+                ptr:              EventPtr {
+                    segment_id: self.segment_id,
+                    offset:     b.offset,
+                },
             })
             .collect())
     }
@@ -673,9 +685,12 @@ impl SealedSegmentIndex {
             for b in ptr_block::decode_ptr_block(self.ptr_slice(e))? {
                 out.push(GlobalEntry {
                     first_global_pos: b.first_global_pos,
-                    frame_count: b.frame_count,
-                    stream_id: sid,
-                    ptr: EventPtr { segment_id: self.segment_id, offset: b.offset },
+                    frame_count:      b.frame_count,
+                    stream_id:        sid,
+                    ptr:              EventPtr {
+                        segment_id: self.segment_id,
+                        offset:     b.offset,
+                    },
                 });
             }
         }
@@ -694,13 +709,13 @@ mod tests {
     fn seal_stream(id: u64, batches: &[(u64, u32, u64, u64)]) -> SealStream {
         SealStream {
             stream_id: id,
-            batches: batches
+            batches:   batches
                 .iter()
                 .map(|&(v, fc, g, off)| SealBatch {
-                    first_version: v,
-                    frame_count: fc,
+                    first_version:    v,
+                    frame_count:      fc,
                     first_global_pos: g,
-                    offset: off,
+                    offset:           off,
                 })
                 .collect(),
         }
@@ -709,13 +724,13 @@ mod tests {
     fn sample_input() -> SealInput {
         SealInput {
             segment_id: 7,
-            base_pos: 1000,
-            streams: vec![
+            base_pos:   1000,
+            streams:    vec![
                 seal_stream(10, &[(0, 3, 1000, 4096), (3, 2, 1003, 8192)]),
                 seal_stream(20, &[(0, 1, 1005, 12288)]),
                 seal_stream(30, &[(0, 5, 1006, 16384), (5, 5, 1011, 20480)]),
             ],
-            payloads: None,
+            payloads:   None,
         }
     }
 
@@ -747,7 +762,8 @@ mod tests {
     #[test]
     fn stream_and_global_replay() {
         let input = sample_input();
-        let idx = SealedSegmentIndex::from_bytes(encode_sidecar(&input)).unwrap();
+        let idx =
+            SealedSegmentIndex::from_bytes(encode_sidecar(&input)).unwrap();
 
         let s10 = idx.stream_entries(10).unwrap();
         assert_eq!(s10.len(), 2);
@@ -767,7 +783,7 @@ mod tests {
     fn corrupt_crc_is_rejected() {
         let mut bytes = encode_sidecar(&sample_input());
         // Flip a byte in the PTR region.
-        bytes[HEADER_LEN] ^= 0xff;
+        bytes[HEADER_LEN] ^= 0xFF;
         assert!(matches!(
             SealedSegmentIndex::from_bytes(bytes),
             Err(SidecarError::Corrupt(_))
@@ -793,29 +809,38 @@ mod tests {
         idx.apply_committed(
             3,
             &[BatchEntry {
-                stream_id: 10,
+                stream_id:            10,
                 first_stream_version: 0,
-                frame_count: 3,
-                first_global_pos: 0,
-                ptr: EventPtr { segment_id: 1, offset: 100 },
+                frame_count:          3,
+                first_global_pos:     0,
+                ptr:                  EventPtr {
+                    segment_id: 1,
+                    offset:     100,
+                },
             }],
         );
         idx.apply_committed(
             7,
             &[
                 BatchEntry {
-                    stream_id: 10,
+                    stream_id:            10,
                     first_stream_version: 3,
-                    frame_count: 2,
-                    first_global_pos: 3,
-                    ptr: EventPtr { segment_id: 2, offset: 200 },
+                    frame_count:          2,
+                    first_global_pos:     3,
+                    ptr:                  EventPtr {
+                        segment_id: 2,
+                        offset:     200,
+                    },
                 },
                 BatchEntry {
-                    stream_id: 20,
+                    stream_id:            20,
                     first_stream_version: 0,
-                    frame_count: 2,
-                    first_global_pos: 5,
-                    ptr: EventPtr { segment_id: 2, offset: 300 },
+                    frame_count:          2,
+                    first_global_pos:     5,
+                    ptr:                  EventPtr {
+                        segment_id: 2,
+                        offset:     300,
+                    },
                 },
             ],
         );
@@ -831,7 +856,8 @@ mod tests {
         assert_eq!(seg2.streams.len(), 2);
         assert_eq!(seg2.event_count(), 4);
         // Sealing seg 2 and resolving matches the active index.
-        let sidx = SealedSegmentIndex::from_bytes(encode_sidecar(&seg2)).unwrap();
+        let sidx =
+            SealedSegmentIndex::from_bytes(encode_sidecar(&seg2)).unwrap();
         assert_eq!(sidx.resolve(10, 4).unwrap().unwrap().offset, 200);
         assert_eq!(sidx.resolve(20, 1).unwrap().unwrap().offset, 300);
     }
@@ -841,9 +867,14 @@ mod tests {
     /// there is nothing to consult.
     #[test]
     fn no_filter_attached_is_always_maybe() {
-        let idx = SealedSegmentIndex::from_bytes(encode_sidecar(&sample_input())).unwrap();
+        let idx =
+            SealedSegmentIndex::from_bytes(encode_sidecar(&sample_input()))
+                .unwrap();
         assert!(idx.might_contain_stream(10));
-        assert!(idx.might_contain_stream(999), "absent stream is still \"maybe\" without a filter");
+        assert!(
+            idx.might_contain_stream(999),
+            "absent stream is still \"maybe\" without a filter"
+        );
     }
 
     /// bn-1i7 acceptance: with a real filter attached, every present stream
@@ -857,24 +888,34 @@ mod tests {
         let streams: Vec<SealStream> = (0..n_streams)
             .map(|i| seal_stream(i * 2, &[(0, 3, i, 4096 + i)])) // even ids only
             .collect();
-        let input = SealInput { segment_id: 1, base_pos: 0, streams, payloads: None };
-        let stream_ids: Vec<u64> = input.streams.iter().map(|s| s.stream_id).collect();
-        let filter = crate::sealed::filter::SegmentFilter::build(1, &stream_ids).unwrap();
+        let input =
+            SealInput { segment_id: 1, base_pos: 0, streams, payloads: None };
+        let stream_ids: Vec<u64> =
+            input.streams.iter().map(|s| s.stream_id).collect();
+        let filter =
+            crate::sealed::filter::SegmentFilter::build(1, &stream_ids)
+                .unwrap();
 
-        let mut idx = SealedSegmentIndex::from_bytes(encode_sidecar(&input)).unwrap();
+        let mut idx =
+            SealedSegmentIndex::from_bytes(encode_sidecar(&input)).unwrap();
         idx.attach_filter(filter);
 
         for &id in &stream_ids {
-            assert!(idx.might_contain_stream(id), "false negative for present stream {id}");
+            assert!(
+                idx.might_contain_stream(id),
+                "false negative for present stream {id}"
+            );
         }
 
         // Odd ids were never inserted -- definitely absent.
         let absent: Vec<u64> = (0..n_streams).map(|i| i * 2 + 1).collect();
-        let skipped = absent.iter().filter(|&&id| !idx.might_contain_stream(id)).count();
+        let skipped =
+            absent.iter().filter(|&&id| !idx.might_contain_stream(id)).count();
         let skip_rate = skipped as f64 / absent.len() as f64;
         assert!(
             skip_rate > 0.99,
-            "filter should skip the overwhelming majority of absent streams: {skip_rate}"
+            "filter should skip the overwhelming majority of absent streams: \
+             {skip_rate}"
         );
     }
 }

@@ -1,8 +1,8 @@
 //! Acceptance: `mess verify` MUST detect every corruption class the existing
-//! harnesses inject. Each case builds a real sealed corpus, applies a byte-level
-//! corruptor reused from the mess-log crash/torn harnesses (flip/truncate) and
-//! the engine_reopen sidecar tests (overwrite/flip), then asserts a non-zero
-//! exit and a typed finding of the expected kind.
+//! harnesses inject. Each case builds a real sealed corpus, applies a
+//! byte-level corruptor reused from the mess-log crash/torn harnesses
+//! (flip/truncate) and the engine_reopen sidecar tests (overwrite/flip), then
+//! asserts a non-zero exit and a typed finding of the expected kind.
 
 mod common;
 
@@ -16,13 +16,12 @@ use mess_log::format::{HEADER_LEN, SEGMENT_HEADER_LEN};
 fn has_error(report: &Report, kind: &str) -> bool {
     report.findings.iter().any(|f| {
         f.severity == Severity::Error
-            && (f.kind == kind || f.fields.get("stop").and_then(|v| v.as_str()) == Some(kind))
+            && (f.kind == kind
+                || f.fields.get("stop").and_then(|v| v.as_str()) == Some(kind))
     })
 }
 
-fn tmp() -> tempfile::TempDir {
-    tempfile::tempdir().expect("tempdir")
-}
+fn tmp() -> tempfile::TempDir { tempfile::tempdir().expect("tempdir") }
 
 fn verify_full(dir: &std::path::Path) -> Report {
     verify::run(dir, &VerifyOptions { full: true, repair: false })
@@ -36,7 +35,12 @@ fn clean_corpus_verifies_clean() {
     common::seal_log_trailer(d.path());
 
     let report = verify_full(d.path());
-    assert_eq!(report.exit_code(), 0, "clean corpus must exit 0: {:#?}", report.findings);
+    assert_eq!(
+        report.exit_code(),
+        0,
+        "clean corpus must exit 0: {:#?}",
+        report.findings
+    );
     assert!(
         !report.findings.iter().any(|f| f.severity == Severity::Error),
         "clean corpus must have no error findings: {:#?}",
@@ -56,7 +60,10 @@ fn detects_log_batch_crc_corruption() {
     // Flip a byte inside the FIRST batch's payload region (past both the
     // segment header and the batch header, so it is a pure payload flip).
     let off = (SEGMENT_HEADER_LEN + HEADER_LEN + 2) as u64;
-    common::flip_byte(&mess_cli::store::log_path(d.path(), common::SEG_ID), off);
+    common::flip_byte(
+        &mess_cli::store::log_path(d.path(), common::SEG_ID),
+        off,
+    );
 
     let report = verify_full(d.path());
     assert_ne!(report.exit_code(), 0, "log CRC corruption must exit non-zero");
@@ -94,7 +101,10 @@ fn detects_pidx_garbage() {
     let d = tmp();
     common::build_corpus(d.path(), 3);
 
-    common::overwrite(&common::pidx(d.path()), b"not a real sidecar - fails magic/CRC");
+    common::overwrite(
+        &common::pidx(d.path()),
+        b"not a real sidecar - fails magic/CRC",
+    );
 
     let report = verify_full(d.path());
     assert_ne!(report.exit_code(), 0, "garbage .pidx must exit non-zero");
@@ -143,7 +153,8 @@ fn detects_pcol_corruption() {
     assert!(
         report.findings.iter().any(|f| {
             f.severity == Severity::Error
-                && (f.kind == "pcol-corrupt" || f.kind == "pcol-reassembly-failed")
+                && (f.kind == "pcol-corrupt"
+                    || f.kind == "pcol-reassembly-failed")
         }),
         "expected pcol-corrupt/pcol-reassembly-failed, got: {:#?}",
         report.findings

@@ -6,7 +6,7 @@ use syn::{Data, DeriveInput, Fields, Ident, LitInt, LitStr};
 
 /// Parsed `#[event(name = "...", version = N)]` attribute.
 struct EventAttr {
-    name: LitStr,
+    name:    LitStr,
     version: u16,
 }
 
@@ -45,8 +45,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         let wire_lit = LitStr::new(&wire, vident.span());
         wire_names.push(wire_lit.clone());
 
-        let fingerprint =
-            variant_fingerprint(&wire, version, &variant.fields);
+        let fingerprint = variant_fingerprint(&wire, version, &variant.fields);
 
         match &variant.fields {
             Fields::Named(named) if !named.named.is_empty() => {

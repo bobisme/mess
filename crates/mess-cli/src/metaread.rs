@@ -11,11 +11,11 @@ use mess_index::meta::{MetaStore, StreamId};
 /// One live snapshot decoded from the `snapshot_heads` table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LiveSnapshot {
-    pub stream_id: u64,
+    pub stream_id:           u64,
     /// The stream version this snapshot folds up to (its `covered_version`).
-    pub version: u64,
+    pub version:             u64,
     /// The fold used to produce it (from the opaque snapshot ref, §9).
-    pub fold_version: u32,
+    pub fold_version:        u32,
     /// A §4.2 empty-prefix snapshot has no certification frames.
     pub covers_empty_prefix: bool,
 }
@@ -24,11 +24,11 @@ pub struct LiveSnapshot {
 #[derive(Debug, Default)]
 pub struct MetaFacts {
     /// Live snapshots (one per stream that has a snapshot head).
-    pub snapshots: Vec<LiveSnapshot>,
+    pub snapshots:    Vec<LiveSnapshot>,
     /// `(stream_id, name)` interned pairs.
     pub stream_names: Vec<(u64, String)>,
     /// `(event_type_id, name)` interned pairs.
-    pub type_names: Vec<(u32, String)>,
+    pub type_names:   Vec<(u32, String)>,
 }
 
 /// The opaque snapshot-ref v1 layout (mirrors `mess_store::fjall_snapshot`):

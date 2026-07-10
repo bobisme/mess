@@ -48,10 +48,10 @@ pub enum RegistryRecord {
     StreamRegistered { stream_id: u64, category_id: u64, name: String },
     /// §3.5.
     EventTypeRegistered {
-        event_type_id: u32,
-        codec_id: u16,
+        event_type_id:      u32,
+        codec_id:           u16,
         schema_fingerprint: [u8; 32],
-        name: String,
+        name:               String,
     },
     /// §3.6.
     CategoryRegistered { category_id: u64, name: String },
@@ -63,10 +63,10 @@ pub enum RegistryRecord {
     /// `TARGET_KIND_CATEGORY` / `TARGET_KIND_EVENT_TYPE` (stream is not a
     /// legal dictionary scope).
     DictRegistered {
-        dict_id: u16,
+        dict_id:    u16,
         scope_kind: u8,
-        scope_id: u64,
-        codec_id: u16,
+        scope_id:   u64,
+        codec_id:   u16,
         dict_bytes: Vec<u8>,
     },
 }
@@ -172,8 +172,8 @@ impl RegistryRecord {
         let Some(&record_kind) = payload.first() else {
             return Err(RegistryError::PayloadTooShort {
                 record_kind: None,
-                need: 1,
-                got: 0,
+                need:        1,
+                got:         0,
             });
         };
         match record_kind {
@@ -249,8 +249,8 @@ fn need<E>(
     if payload.len() < min_len {
         return Err(RegistryError::PayloadTooShort {
             record_kind: Some(record_kind),
-            need: min_len,
-            got: payload.len(),
+            need:        min_len,
+            got:         payload.len(),
         });
     }
     Ok(())
@@ -353,7 +353,7 @@ mod tests {
     fn golden_worked_example_category_registered() {
         let record = RegistryRecord::CategoryRegistered {
             category_id: 1,
-            name: "orders".to_string(),
+            name:        "orders".to_string(),
         };
         let bytes = record.encode();
         let expected: [u8; 17] = [
@@ -375,9 +375,9 @@ mod tests {
     #[test]
     fn round_trips_stream_registered() {
         let record = RegistryRecord::StreamRegistered {
-            stream_id: 7,
+            stream_id:   7,
             category_id: 1,
-            name: "orders.stream-42".to_string(),
+            name:        "orders.stream-42".to_string(),
         };
         let bytes = record.encode();
         assert_eq!(bytes.len(), 19 + "orders.stream-42".len());
@@ -389,10 +389,10 @@ mod tests {
     #[test]
     fn round_trips_event_type_registered() {
         let record = RegistryRecord::EventTypeRegistered {
-            event_type_id: 3,
-            codec_id: 1,
+            event_type_id:      3,
+            codec_id:           1,
             schema_fingerprint: [0xAB; 32],
-            name: "orders.OrderPlaced".to_string(),
+            name:               "orders.OrderPlaced".to_string(),
         };
         let bytes = record.encode();
         assert_eq!(bytes.len(), 41 + "orders.OrderPlaced".len());
@@ -405,8 +405,8 @@ mod tests {
     fn round_trips_name_aliased() {
         let record = RegistryRecord::NameAliased {
             target_kind: TARGET_KIND_STREAM,
-            target_id: 7,
-            new_name: "orders.renamed".to_string(),
+            target_id:   7,
+            new_name:    "orders.renamed".to_string(),
         };
         let bytes = record.encode();
         assert_eq!(bytes.len(), 12 + "orders.renamed".len());
@@ -418,10 +418,10 @@ mod tests {
     #[test]
     fn round_trips_dict_registered() {
         let record = RegistryRecord::DictRegistered {
-            dict_id: 1,
+            dict_id:    1,
             scope_kind: TARGET_KIND_CATEGORY,
-            scope_id: 1,
-            codec_id: 1,
+            scope_id:   1,
+            codec_id:   1,
             dict_bytes: vec![1, 2, 3, 4, 5],
         };
         let bytes = record.encode();
@@ -456,8 +456,8 @@ mod tests {
             err,
             RegistryError::PayloadTooShort {
                 record_kind: None,
-                need: 1,
-                got: 0
+                need:        1,
+                got:         0,
             }
         );
     }
@@ -486,7 +486,7 @@ mod tests {
         assert_eq!(
             err,
             RegistryError::InvalidUtf8 {
-                record_kind: RECORD_KIND_CATEGORY_REGISTERED
+                record_kind: RECORD_KIND_CATEGORY_REGISTERED,
             }
         );
     }

@@ -70,7 +70,10 @@ async fn subscribe_from_zero_replays_then_tails_live() {
 
     let got = consumer.await.unwrap();
     let expected: Vec<u64> = (0..TOTAL).collect();
-    assert_eq!(got, expected, "gap-free, in-order, exactly-once global delivery");
+    assert_eq!(
+        got, expected,
+        "gap-free, in-order, exactly-once global delivery"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -125,7 +128,10 @@ async fn subscribe_from_midlog_replays_only_the_suffix() {
 
     // First batch must begin exactly at FROM, never earlier.
     let first = sub.next_batch().await.unwrap();
-    assert_eq!(first[0].global_position, FROM, "suffix starts at the requested cursor");
+    assert_eq!(
+        first[0].global_position, FROM,
+        "suffix starts at the requested cursor"
+    );
 
     // Drain the rest of the suffix [FROM, PRE). No writer, so once we have the
     // suffix the next call would block — we stop exactly at the suffix length.
@@ -135,7 +141,10 @@ async fn subscribe_from_midlog_replays_only_the_suffix() {
         got.extend(batch.iter().map(|r| r.global_position));
     }
     let expected: Vec<u64> = (FROM..PRE).collect();
-    assert_eq!(got, expected, "replays exactly the suffix, nothing before FROM");
+    assert_eq!(
+        got, expected,
+        "replays exactly the suffix, nothing before FROM"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -177,9 +186,12 @@ async fn dropping_a_subscription_does_not_wedge_the_committer() {
 
     // The committer must be perfectly healthy: 20 more appends all commit and
     // the watermark advances to cover them. Bound it so a wedge fails loudly.
-    tokio::time::timeout(Duration::from_secs(20), append_n(&engine, "s", 5, 20))
-        .await
-        .expect("appends wedged after subscriptions were dropped");
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        append_n(&engine, "s", 5, 20),
+    )
+    .await
+    .expect("appends wedged after subscriptions were dropped");
     assert_eq!(store.watermark().await.unwrap(), 25);
 
     // And a fresh subscription still delivers the whole (gap-free) log.
@@ -226,7 +238,11 @@ async fn mock_backend_subscribe_catches_up_and_tails() {
 
     for v in 10..25u64 {
         backend
-            .append_batch("s", Version::At(v - 1), &[rec("E", &v.to_le_bytes())])
+            .append_batch(
+                "s",
+                Version::At(v - 1),
+                &[rec("E", &v.to_le_bytes())],
+            )
             .await
             .unwrap();
     }

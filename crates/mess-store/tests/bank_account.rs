@@ -54,7 +54,7 @@ impl Event for AccountEvent {
             let bytes: [u8; 8] =
                 data.try_into().map_err(|_| CodecError::Decode {
                     event_name: name.to_string(),
-                    source: format!(
+                    source:     format!(
                         "expected 8 payload bytes, got {}",
                         data.len()
                     ),
@@ -66,7 +66,7 @@ impl Event for AccountEvent {
                 owner: String::from_utf8(data.to_vec()).map_err(|e| {
                     CodecError::Decode {
                         event_name: name.to_string(),
-                        source: e.to_string(),
+                        source:     e.to_string(),
                     }
                 })?,
             }),
@@ -83,7 +83,7 @@ impl Event for AccountEvent {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct Account {
-    open: bool,
+    open:    bool,
     balance: i64,
 }
 
@@ -118,7 +118,8 @@ impl fmt::Display for AccountError {
             }
             AccountError::InsufficientFunds { balance, requested } => write!(
                 f,
-                "insufficient funds: balance is {balance}, requested {requested}"
+                "insufficient funds: balance is {balance}, requested \
+                 {requested}"
             ),
         }
     }
@@ -175,7 +176,7 @@ impl Decide<Withdraw> for Account {
         }
         if cmd.amount > self.balance {
             return Err(AccountError::InsufficientFunds {
-                balance: self.balance,
+                balance:   self.balance,
                 requested: cmd.amount,
             });
         }
@@ -183,9 +184,7 @@ impl Decide<Withdraw> for Account {
     }
 }
 
-fn store() -> EventStore<TestBackend> {
-    EventStore::new(TestBackend::new())
-}
+fn store() -> EventStore<TestBackend> { EventStore::new(TestBackend::new()) }
 
 // ---------------------------------------------------------------------------
 // End-to-end against the mock.
@@ -405,8 +404,8 @@ async fn concurrent_commands_on_one_stream_all_succeed() {
 
     let commands = (TASKS * DEPOSITS_PER_TASK) as u32;
     println!(
-        "concurrency: {commands} commands took {attempts_total} attempts \
-         (max {attempts_max} for a single command)"
+        "concurrency: {commands} commands took {attempts_total} attempts (max \
+         {attempts_max} for a single command)"
     );
     // Every command is at least one attempt; genuine contention pushes the
     // total above the command count.

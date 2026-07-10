@@ -38,7 +38,9 @@ fn bench_head_and_dedupe_lookup() {
     // Warm the cache.
     for i in 0..N {
         let _ = store.stream_head(StreamId(i + 1)).unwrap();
-        let _ = store.dedupe_lookup(StreamId(i + 1), format!("dk{i}").as_bytes()).unwrap();
+        let _ = store
+            .dedupe_lookup(StreamId(i + 1), format!("dk{i}").as_bytes())
+            .unwrap();
     }
 
     // Measure head lookups.
@@ -59,7 +61,11 @@ fn bench_head_and_dedupe_lookup() {
     for i in 0..ITERS {
         let k = i % N;
         let id = StreamId(k + 1);
-        if store.dedupe_lookup(id, format!("dk{k}").as_bytes()).unwrap().is_some() {
+        if store
+            .dedupe_lookup(id, format!("dk{k}").as_bytes())
+            .unwrap()
+            .is_some()
+        {
             hits += 1;
         }
     }

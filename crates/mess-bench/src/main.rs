@@ -24,7 +24,6 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-
 use mess_bench::{
     Ledger, MachineProfile, RunSize, assert_real_fs, compare,
     default_scratch_root, load_floors, load_ledger, run_all, today,
@@ -45,24 +44,24 @@ enum Command {
         /// "full" (gated envelope sizes, compared against floors by default)
         /// or "smoke" (reduced sizes, floors never enforced).
         #[arg(long, default_value = "full")]
-        mode: String,
+        mode:        String,
         /// Where to write the ledger JSON.
         #[arg(long, default_value = "ledger.json")]
-        out: PathBuf,
+        out:         PathBuf,
         /// Scratch root for the fs-backed workloads. Defaults to
         /// `MESS_BENCH_DIR` or `$HOME/.cache/mess-bench` — never `/tmp`.
         #[arg(long)]
-        scratch: Option<PathBuf>,
+        scratch:     Option<PathBuf>,
         /// Seconds to sleep between workloads (full mode only). See the
         /// crate docs' "Settle-pacing" section.
         #[arg(long, default_value_t = mess_bench::DEFAULT_SETTLE_SECS)]
         settle_secs: u64,
         /// Floors file to compare against (full mode only).
         #[arg(long, default_value = "floors.json")]
-        floors: PathBuf,
+        floors:      PathBuf,
         /// Skip the floors comparison even in full mode.
         #[arg(long)]
-        no_compare: bool,
+        no_compare:  bool,
     },
     /// Compare an existing ledger JSON against a floors file.
     Compare {
@@ -125,8 +124,8 @@ fn main() -> ExitCode {
 
             if size == RunSize::Smoke || no_compare {
                 eprintln!(
-                    "(smoke mode or --no-compare: floors not enforced; run `compare` explicitly \
-                     for a gated check)"
+                    "(smoke mode or --no-compare: floors not enforced; run \
+                     `compare` explicitly for a gated check)"
                 );
                 return ExitCode::SUCCESS;
             }

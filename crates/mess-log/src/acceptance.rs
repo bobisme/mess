@@ -14,15 +14,15 @@
 //! This kernel then makes every accept/stop decision:
 //!
 //! - **A5**: empty batches (`frame_count == 0`) are rejected.
-//! - **A9**: a batch whose segment epoch differs from the scanned
-//!   segment's current epoch is rejected — this is what stops a recycled
-//!   segment's stale prior-generation batch at a coincident position from
-//!   resurrecting deleted data.
+//! - **A9**: a batch whose segment epoch differs from the scanned segment's
+//!   current epoch is rejected — this is what stops a recycled segment's stale
+//!   prior-generation batch at a coincident position from resurrecting deleted
+//!   data.
 //! - **A1**: `first_global_pos` must equal the expected next position.
-//! - **A10**: the first rejection is TERMINAL. The kernel latches the
-//!   stop; feeding it further candidates — however valid — can never
-//!   yield another acceptance. Resynchronization is impossible by
-//!   construction, not by scanner discipline.
+//! - **A10**: the first rejection is TERMINAL. The kernel latches the stop;
+//!   feeding it further candidates — however valid — can never yield another
+//!   acceptance. Resynchronization is impossible by construction, not by
+//!   scanner discipline.
 //!
 //! # Contract with the scanner
 //!
@@ -38,10 +38,10 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Candidate {
     /// Segment epoch / generation stamped in the header (A9, R3).
-    pub epoch: u64,
-    pub batch_id: u64,
+    pub epoch:            u64,
+    pub batch_id:         u64,
     pub first_global_pos: u64,
-    pub frame_count: u32,
+    pub frame_count:      u32,
 }
 
 /// Byte-layer verdict for one candidate slot, in on-disk order.
@@ -266,8 +266,7 @@ mod tests {
     fn a1_position_discontinuity_rejected() {
         // Stale batch in recycled space past the last good batch, at a
         // non-matching position (crash_log's original A1 case).
-        let out =
-            accepted_prefix(0, 0, [valid(0, 0, 0, 2), valid(0, 9, 7, 1)]);
+        let out = accepted_prefix(0, 0, [valid(0, 0, 0, 2), valid(0, 9, 7, 1)]);
         assert_eq!(out.accepted.len(), 1);
         assert_eq!(out.stop, StopReason::PositionDiscontinuity);
     }
@@ -305,10 +304,10 @@ mod kani_proofs {
 
     fn any_candidate() -> Candidate {
         Candidate {
-            epoch: kani::any(),
-            batch_id: kani::any(),
+            epoch:            kani::any(),
+            batch_id:         kani::any(),
             first_global_pos: kani::any(),
-            frame_count: kani::any(),
+            frame_count:      kani::any(),
         }
     }
 
@@ -346,8 +345,11 @@ mod kani_proofs {
     fn step_accept_implies_contiguous_and_nonempty() {
         let expected_pos: u64 = kani::any();
         kani::assume(expected_pos <= POSITION_BOUND);
-        let mut state =
-            AcceptState { expected_epoch: kani::any(), expected_pos, stopped: None };
+        let mut state = AcceptState {
+            expected_epoch: kani::any(),
+            expected_pos,
+            stopped: None,
+        };
         let pre_epoch = state.expected_epoch;
         let pre_pos = state.expected_pos;
 
@@ -355,8 +357,14 @@ mod kani_proofs {
 
         if let Step::Accept(c) = result {
             assert_ne!(c.frame_count, 0, "A5: accepted an empty batch");
-            assert_eq!(c.epoch, pre_epoch, "A9: accepted a mismatched-epoch batch");
-            assert_eq!(c.first_global_pos, pre_pos, "A1: accepted a discontinuous batch");
+            assert_eq!(
+                c.epoch, pre_epoch,
+                "A9: accepted a mismatched-epoch batch"
+            );
+            assert_eq!(
+                c.first_global_pos, pre_pos,
+                "A1: accepted a discontinuous batch"
+            );
         }
     }
 
@@ -374,7 +382,8 @@ mod kani_proofs {
         // that arithmetic's overflow-freedom is `POSITION_BOUND`'s job, not
         // this rejection-focused proof's.
         kani::assume(expected_pos <= POSITION_BOUND);
-        let mut state = AcceptState { expected_epoch, expected_pos, stopped: None };
+        let mut state =
+            AcceptState { expected_epoch, expected_pos, stopped: None };
 
         let cand = any_candidate();
         let violates = cand.frame_count == 0
@@ -399,13 +408,17 @@ mod kani_proofs {
         let reason = any_stop_reason();
         let expected_epoch: u64 = kani::any();
         let expected_pos: u64 = kani::any();
-        let mut state = AcceptState { expected_epoch, expected_pos, stopped: Some(reason) };
+        let mut state =
+            AcceptState { expected_epoch, expected_pos, stopped: Some(reason) };
 
         let bait = any_status();
         let result = state.step(bait);
 
         assert_eq!(result, Step::Stopped(reason));
-        assert_eq!(state.expected_pos, expected_pos, "a latched stop must never advance position");
+        assert_eq!(
+            state.expected_pos, expected_pos,
+            "a latched stop must never advance position"
+        );
         assert_eq!(state.stopped, Some(reason));
     }
 
@@ -425,7 +438,8 @@ mod kani_proofs {
         let expected_epoch: u64 = kani::any();
         let expected_pos: u64 = kani::any();
         kani::assume(expected_pos <= POSITION_BOUND);
-        let mut state = AcceptState { expected_epoch, expected_pos, stopped: None };
+        let mut state =
+            AcceptState { expected_epoch, expected_pos, stopped: None };
 
         let frame_count: u32 = kani::any();
         let cand = Candidate {
@@ -439,7 +453,10 @@ mod kani_proofs {
         if let Step::Accept(_) = result {
             // No panic above (Kani's overflow checks are on) is itself part
             // of the proof; this pins the resulting value too.
-            assert_eq!(state.expected_pos, expected_pos + u64::from(frame_count));
+            assert_eq!(
+                state.expected_pos,
+                expected_pos + u64::from(frame_count)
+            );
         }
     }
 

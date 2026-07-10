@@ -4,11 +4,11 @@
 //!
 //! Three things live here:
 //!
-//! 1. **DTOs** ([`PostView`], [`ProfileView`], [`TimelinePage`]) — the shapes
-//!    a frontend renders. They are *not* aggregates: an aggregate
+//! 1. **DTOs** ([`PostView`], [`ProfileView`], [`TimelinePage`]) — the shapes a
+//!    frontend renders. They are *not* aggregates: an aggregate
 //!    ([`crate::domain::post::Post`]) is the write-side fold of one stream; a
-//!    [`PostView`] is a denormalized, viewer-relative projection joining a
-//!    post with its author's profile and the viewer's own like state.
+//!    [`PostView`] is a denormalized, viewer-relative projection joining a post
+//!    with its author's profile and the viewer's own like state.
 //! 2. **[`ReadModels`]** — the query trait the frontend calls. Real impls read
 //!    from projections built by tailing the event log; the [`FakeReadModels`]
 //!    here is a deterministic in-memory stand-in for frontend tests.
@@ -43,41 +43,41 @@ use crate::{post_stream, user_stream};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PostView {
     /// The post's id (also its stream id, `post-<id>`, less the prefix).
-    pub id: Id,
+    pub id:             Id,
     /// The author's id, joined from their profile. Compare this — not
     /// [`author_handle`](Self::author_handle) — for author-only UI logic
     /// (e.g. "show the delete button"): an id compare cannot be fooled by two
     /// users momentarily sharing a display string, and needs no string
     /// allocation.
-    pub author_id: Id,
+    pub author_id:      Id,
     /// The author's handle, joined from their profile.
-    pub author_handle: String,
+    pub author_handle:  String,
     /// The author's current display name, joined from their profile.
     pub author_display: String,
     /// The post body.
-    pub body: String,
+    pub body:           String,
     /// Total number of likes.
-    pub likes: u64,
+    pub likes:          u64,
     /// Whether the requesting viewer likes this post. `false` for an
     /// anonymous viewer.
-    pub liked_by_me: bool,
+    pub liked_by_me:    bool,
     /// The post's global-log sequence — stable feed sort key and cursor.
-    pub created_seq: u64,
+    pub created_seq:    u64,
 }
 
 /// A user's profile, viewer-relative.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileView {
-    pub handle: String,
-    pub display_name: String,
+    pub handle:          String,
+    pub display_name:    String,
     /// Number of (non-deleted) posts this user has authored.
-    pub post_count: u64,
+    pub post_count:      u64,
     /// Number of users who follow this user.
-    pub follower_count: u64,
+    pub follower_count:  u64,
     /// Number of users this user follows.
     pub following_count: u64,
     /// Whether the requesting viewer follows this user. `false` for anonymous.
-    pub followed_by_me: bool,
+    pub followed_by_me:  bool,
 }
 
 /// One page of a feed, plus an opaque cursor for the next page.
@@ -88,7 +88,7 @@ pub struct ProfileView {
 /// as opaque.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimelinePage {
-    pub entries: Vec<PostView>,
+    pub entries:     Vec<PostView>,
     pub next_cursor: Option<String>,
 }
 
@@ -349,7 +349,11 @@ where
         Ok(commit.last_global_position.unwrap_or(0))
     }
 
-    async fn follow(&self, follower: Id, target: Id) -> Result<u64, WriteError> {
+    async fn follow(
+        &self,
+        follower: Id,
+        target: Id,
+    ) -> Result<u64, WriteError> {
         let commit = self
             .command::<User, _>(
                 &user_stream(follower),
@@ -417,23 +421,23 @@ where
 /// A user row in the fake, mirroring the folded [`User`] aggregate.
 #[derive(Debug, Clone)]
 struct FakeUser {
-    id: Id,
-    handle: String,
+    id:           Id,
+    handle:       String,
     display_name: String,
     /// Ids this user follows.
-    following: Vec<Id>,
+    following:    Vec<Id>,
 }
 
 /// A post row in the fake, mirroring the folded [`Post`] aggregate plus its
 /// global sequence.
 #[derive(Debug, Clone)]
 struct FakePost {
-    id: Id,
-    author: Id,
-    body: String,
-    likes: Vec<Id>,
+    id:      Id,
+    author:  Id,
+    body:    String,
+    likes:   Vec<Id>,
     deleted: bool,
-    seq: u64,
+    seq:     u64,
 }
 
 /// A deterministic, synchronously-consistent [`ReadModels`] for frontend
@@ -446,8 +450,8 @@ struct FakePost {
 /// a cursor that is the stringified `seq` to page *before*.
 #[derive(Debug, Clone, Default)]
 pub struct FakeReadModels {
-    users: Vec<FakeUser>,
-    posts: Vec<FakePost>,
+    users:    Vec<FakeUser>,
+    posts:    Vec<FakePost>,
     /// Monotonic sequence handed to the next seeded post.
     next_seq: u64,
 }
@@ -455,9 +459,7 @@ pub struct FakeReadModels {
 impl FakeReadModels {
     /// A new, empty fake.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
+    pub fn new() -> Self { Self::default() }
 
     /// Seed a registered user. Chainable.
     #[must_use]
@@ -539,14 +541,14 @@ impl FakeReadModels {
             .map(|u| (u.handle.clone(), u.display_name.clone()))
             .unwrap_or_default();
         PostView {
-            id: p.id,
-            author_id: p.author,
-            author_handle: handle,
+            id:             p.id,
+            author_id:      p.author,
+            author_handle:  handle,
             author_display: display,
-            body: p.body.clone(),
-            likes: p.likes.len() as u64,
-            liked_by_me: viewer.is_some_and(|v| p.likes.contains(&v)),
-            created_seq: p.seq,
+            body:           p.body.clone(),
+            likes:          p.likes.len() as u64,
+            liked_by_me:    viewer.is_some_and(|v| p.likes.contains(&v)),
+            created_seq:    p.seq,
         }
     }
 

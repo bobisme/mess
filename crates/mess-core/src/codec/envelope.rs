@@ -20,15 +20,15 @@ use super::msgpack::{CODEC_ID_MSGPACK_NAMED, decode_payload, encode_payload};
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct StoredEvent {
     /// The event's registered name (e.g. `"trip.completed"`).
-    pub event_name: String,
+    pub event_name:     String,
     /// Schema version of the payload at write time. Paired with
     /// `event_name` this is the upcaster dispatch key.
     pub schema_version: u16,
     /// Which codec `payload` is encoded under. `0` = bootstrap (frozen,
     /// not handled by this layer); `1` = msgpack-named.
-    pub codec_id: u16,
+    pub codec_id:       u16,
     /// The still-encoded event payload.
-    pub payload: Vec<u8>,
+    pub payload:        Vec<u8>,
 }
 
 impl StoredEvent {
@@ -70,7 +70,7 @@ mod tests {
 
     #[derive(Serialize, Deserialize, PartialEq, Debug)]
     struct Sample {
-        id: u32,
+        id:   u32,
         name: String,
     }
 
@@ -88,10 +88,10 @@ mod tests {
     #[test]
     fn decode_reports_unknown_codec_id() {
         let ev = StoredEvent {
-            event_name: "sample".into(),
+            event_name:     "sample".into(),
             schema_version: 1,
-            codec_id: 200,
-            payload: vec![],
+            codec_id:       200,
+            payload:        vec![],
         };
         let err = ev.decode::<Sample>().unwrap_err();
         assert!(matches!(err, CodecError::UnknownCodecId { codec_id: 200 }));
@@ -100,10 +100,10 @@ mod tests {
     #[test]
     fn decode_reports_bootstrap_codec_as_unsupported_here() {
         let ev = StoredEvent {
-            event_name: "sample".into(),
+            event_name:     "sample".into(),
             schema_version: 1,
-            codec_id: CODEC_ID_BOOTSTRAP,
-            payload: vec![],
+            codec_id:       CODEC_ID_BOOTSTRAP,
+            payload:        vec![],
         };
         let err = ev.decode::<Sample>().unwrap_err();
         assert!(matches!(err, CodecError::BootstrapCodecUnsupported));

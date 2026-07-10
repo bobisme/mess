@@ -28,11 +28,9 @@ pub fn friendly(err: &WriteError) -> String {
     match err {
         WriteError::User(u) => friendly_user(u),
         WriteError::Post(p) => friendly_post(p),
-        WriteError::Conflict { .. } => {
-            "That action hit heavy contention and was not applied. \
-             Please try again."
-                .to_string()
-        }
+        WriteError::Conflict { .. } => "That action hit heavy contention and \
+                                        was not applied. Please try again."
+            .to_string(),
         WriteError::Store(_) => {
             "Something went wrong saving that. Please try again.".to_string()
         }
@@ -44,13 +42,10 @@ fn friendly_user(err: &UserError) -> String {
         UserError::AlreadyRegistered => {
             "That handle is already taken — pick another.".to_string()
         }
-        UserError::NotRegistered => {
-            "That user does not exist yet.".to_string()
-        }
-        UserError::InvalidHandle { .. } => {
-            "Handles must be 1-30 characters of lowercase a-z, 0-9, or _."
-                .to_string()
-        }
+        UserError::NotRegistered => "That user does not exist yet.".to_string(),
+        UserError::InvalidHandle { .. } => "Handles must be 1-30 characters \
+                                            of lowercase a-z, 0-9, or _."
+            .to_string(),
         UserError::SelfFollow => "You cannot follow yourself.".to_string(),
         UserError::AlreadyFollowing => {
             "You already follow that user.".to_string()

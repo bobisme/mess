@@ -28,11 +28,11 @@ use social::domain::user::{
 fn register_emits_registered() {
     AggregateTest::<User>::given_no_events()
         .when(RegisterUser {
-            handle: "alice".into(),
+            handle:       "alice".into(),
             display_name: "Alice".into(),
         })
         .then_events([UserEvent::Registered {
-            handle: "alice".into(),
+            handle:       "alice".into(),
             display_name: "Alice".into(),
         }]);
 }
@@ -40,10 +40,13 @@ fn register_emits_registered() {
 #[test]
 fn cannot_register_twice() {
     AggregateTest::<User>::given([UserEvent::Registered {
-        handle: "alice".into(),
+        handle:       "alice".into(),
         display_name: "Alice".into(),
     }])
-    .when(RegisterUser { handle: "alice".into(), display_name: "A".into() })
+    .when(RegisterUser {
+        handle:       "alice".into(),
+        display_name: "A".into(),
+    })
     .then_error(UserError::AlreadyRegistered);
 }
 
@@ -51,7 +54,7 @@ fn cannot_register_twice() {
 fn rejects_handle_with_uppercase() {
     AggregateTest::<User>::given_no_events()
         .when(RegisterUser {
-            handle: "Alice".into(),
+            handle:       "Alice".into(),
             display_name: "Alice".into(),
         })
         .then_error(matching("invalid handle", |e| {
@@ -62,7 +65,10 @@ fn rejects_handle_with_uppercase() {
 #[test]
 fn rejects_empty_handle() {
     AggregateTest::<User>::given_no_events()
-        .when(RegisterUser { handle: String::new(), display_name: "A".into() })
+        .when(RegisterUser {
+            handle:       String::new(),
+            display_name: "A".into(),
+        })
         .then_error(matching("invalid handle", |e| {
             matches!(e, UserError::InvalidHandle { .. })
         }));
@@ -72,7 +78,7 @@ fn rejects_empty_handle() {
 fn rejects_handle_over_30_chars() {
     AggregateTest::<User>::given_no_events()
         .when(RegisterUser {
-            handle: "a".repeat(31),
+            handle:       "a".repeat(31),
             display_name: "A".into(),
         })
         .then_error(matching("invalid handle", |e| {
@@ -85,7 +91,7 @@ fn rejects_handle_with_spaces_or_symbols() {
     for bad in ["ali ce", "ali-ce", "ali.ce", "aliçe", "@alice"] {
         AggregateTest::<User>::given_no_events()
             .when(RegisterUser {
-                handle: bad.into(),
+                handle:       bad.into(),
                 display_name: "A".into(),
             })
             .then_error(matching("invalid handle", |e| {
@@ -98,11 +104,11 @@ fn rejects_handle_with_spaces_or_symbols() {
 fn accepts_handle_with_digits_and_underscore() {
     AggregateTest::<User>::given_no_events()
         .when(RegisterUser {
-            handle: "alice_01".into(),
+            handle:       "alice_01".into(),
             display_name: "Alice".into(),
         })
         .then_events([UserEvent::Registered {
-            handle: "alice_01".into(),
+            handle:       "alice_01".into(),
             display_name: "Alice".into(),
         }]);
 }
@@ -114,7 +120,7 @@ fn accepts_handle_with_digits_and_underscore() {
 #[test]
 fn set_display_name_emits_changed() {
     AggregateTest::<User>::given([UserEvent::Registered {
-        handle: "alice".into(),
+        handle:       "alice".into(),
         display_name: "Alice".into(),
     }])
     .when(SetDisplayName { display_name: "Alice B.".into() })
@@ -139,7 +145,7 @@ fn follow_emits_followed() {
     let alice = Id::new();
     let bob = Id::new();
     AggregateTest::<User>::given([UserEvent::Registered {
-        handle: "alice".into(),
+        handle:       "alice".into(),
         display_name: "Alice".into(),
     }])
     .when(Follow { follower: alice, target: bob })
@@ -159,7 +165,7 @@ fn cannot_follow_when_unregistered() {
 fn cannot_follow_self() {
     let alice = Id::new();
     AggregateTest::<User>::given([UserEvent::Registered {
-        handle: "alice".into(),
+        handle:       "alice".into(),
         display_name: "Alice".into(),
     }])
     .when(Follow { follower: alice, target: alice })
@@ -172,7 +178,7 @@ fn cannot_follow_twice() {
     let bob = Id::new();
     AggregateTest::<User>::given([
         UserEvent::Registered {
-            handle: "alice".into(),
+            handle:       "alice".into(),
             display_name: "Alice".into(),
         },
         UserEvent::Followed { target: bob },
@@ -190,7 +196,7 @@ fn unfollow_emits_unfollowed() {
     let bob = Id::new();
     AggregateTest::<User>::given([
         UserEvent::Registered {
-            handle: "alice".into(),
+            handle:       "alice".into(),
             display_name: "Alice".into(),
         },
         UserEvent::Followed { target: bob },
@@ -210,7 +216,7 @@ fn cannot_unfollow_when_unregistered() {
 fn cannot_unfollow_when_not_following() {
     let bob = Id::new();
     AggregateTest::<User>::given([UserEvent::Registered {
-        handle: "alice".into(),
+        handle:       "alice".into(),
         display_name: "Alice".into(),
     }])
     .when(Unfollow { target: bob })
@@ -418,7 +424,7 @@ fn user_full_fold_matches_expected_state() {
     let mut state = User::default();
     for event in [
         UserEvent::Registered {
-            handle: "alice".into(),
+            handle:       "alice".into(),
             display_name: "Alice".into(),
         },
         UserEvent::DisplayNameChanged { display_name: "Alice B.".into() },

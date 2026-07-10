@@ -14,8 +14,8 @@ pub enum CodecError {
     #[error(
         "unknown codec_id {codec_id}: mess-core's codec layer implements \
          codec_id 1 (msgpack-named); codec_id 0 is the frozen bootstrap \
-         codec, owned by the registry (docs/spec/04-registry.md), not \
-         this layer"
+         codec, owned by the registry (docs/spec/04-registry.md), not this \
+         layer"
     )]
     UnknownCodecId {
         /// The `codec_id` found on the envelope.
@@ -72,7 +72,7 @@ pub enum UpcastError {
         /// The name this decoder dispatches for.
         expected: &'static str,
         /// The name actually found on the envelope.
-        got: String,
+        got:      String,
     },
 
     /// `schema_version` did not match any version this event's
@@ -83,9 +83,9 @@ pub enum UpcastError {
     )]
     UnknownSchemaVersion {
         /// The event name being decoded.
-        event_name: String,
+        event_name:     String,
         /// The unrecognized `schema_version` found on the envelope.
-        version: u16,
+        version:        u16,
         /// Every `schema_version` this decoder was generated to handle,
         /// in ascending declaration order.
         known_versions: &'static [u16],

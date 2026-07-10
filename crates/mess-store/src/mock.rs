@@ -28,9 +28,9 @@ use crate::version::Version;
 #[derive(Default)]
 struct Inner {
     /// Events per stream, in append order (index == stream position).
-    streams: HashMap<String, Vec<StoredRecord>>,
+    streams:   HashMap<String, Vec<StoredRecord>>,
     /// Every event across all streams, in global order.
-    global: Vec<StoredRecord>,
+    global:    Vec<StoredRecord>,
     /// The throwaway snapshot keyspace: at most one snapshot per stream. This
     /// is a plain map keyed by stream name — explicitly *not* part of the
     /// commit authority, wiped whenever this backend is dropped.
@@ -52,7 +52,7 @@ impl Inner {
 /// same underlying state.
 #[derive(Clone)]
 pub struct MockBackend {
-    inner: Arc<Mutex<Inner>>,
+    inner:     Arc<Mutex<Inner>>,
     /// The committed global watermark (the count of committed events), a
     /// `mess-log` durable [`Watermark`] advanced under the same critical
     /// section as each append so a live tail can wake event-bounded rather
@@ -63,7 +63,7 @@ pub struct MockBackend {
 impl Default for MockBackend {
     fn default() -> Self {
         MockBackend {
-            inner: Arc::new(Mutex::new(Inner::default())),
+            inner:     Arc::new(Mutex::new(Inner::default())),
             watermark: Watermark::new(0),
         }
     }
@@ -72,9 +72,7 @@ impl Default for MockBackend {
 impl MockBackend {
     /// A fresh, empty backend.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
+    pub fn new() -> Self { Self::default() }
 
     /// Total number of events stored across all streams (test helper).
     #[must_use]
@@ -162,9 +160,9 @@ impl Backend for MockBackend {
             .iter()
             .enumerate()
             .map(|(i, rec)| StoredRecord {
-                stream_id: stream_id.to_string(),
-                message_type: rec.message_type.clone(),
-                data: rec.data.clone(),
+                stream_id:       stream_id.to_string(),
+                message_type:    rec.message_type.clone(),
+                data:            rec.data.clone(),
                 stream_position: first_stream_pos + i as u64,
                 global_position: first_global + i as u64,
             })

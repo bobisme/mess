@@ -3,19 +3,19 @@ use std::borrow::Cow;
 use ident::Id;
 
 use crate::{
-    error::{Error, Result},
     Message, StreamPos,
+    error::{Error, Result},
 };
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GlobalRecord<'a> {
-    pub(crate) id: Cow<'a, str>,
-    pub(crate) stream_name: Cow<'a, str>,
+    pub(crate) id:              Cow<'a, str>,
+    pub(crate) stream_name:     Cow<'a, str>,
     pub(crate) stream_position: u64,
-    pub(crate) message_type: Cow<'a, str>,
-    pub(crate) data: Cow<'a, [u8]>,
-    pub(crate) metadata: Cow<'a, [u8]>,
-    pub(crate) ord: u64,
+    pub(crate) message_type:    Cow<'a, str>,
+    pub(crate) data:            Cow<'a, [u8]>,
+    pub(crate) metadata:        Cow<'a, [u8]>,
+    pub(crate) ord:             u64,
 }
 
 impl<'a> GlobalRecord<'a> {
@@ -65,11 +65,11 @@ impl<'a> GlobalRecord<'a> {
 #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StreamRecord<'a> {
     pub(crate) global_position: u64,
-    pub(crate) id: Cow<'a, str>,
-    pub(crate) message_type: Cow<'a, str>,
-    pub(crate) data: Cow<'a, [u8]>,
-    pub(crate) metadata: Cow<'a, [u8]>,
-    pub(crate) ord: u64,
+    pub(crate) id:              Cow<'a, str>,
+    pub(crate) message_type:    Cow<'a, str>,
+    pub(crate) data:            Cow<'a, [u8]>,
+    pub(crate) metadata:        Cow<'a, [u8]>,
+    pub(crate) ord:             u64,
 }
 
 impl<'a> StreamRecord<'a> {
@@ -104,10 +104,10 @@ impl<'a> StreamRecord<'a> {
         Message {
             global_position: self.global_position,
             stream_position: position,
-            stream_name: stream,
-            message_type: self.message_type,
-            data: self.data,
-            metadata: if self.metadata.is_empty() {
+            stream_name:     stream,
+            message_type:    self.message_type,
+            data:            self.data,
+            metadata:        if self.metadata.is_empty() {
                 None
             } else {
                 Some(self.metadata)

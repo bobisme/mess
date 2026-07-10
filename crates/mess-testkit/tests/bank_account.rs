@@ -48,7 +48,7 @@ impl Event for AccountEvent {
             let arr: [u8; 8] =
                 bytes.try_into().map_err(|_| CodecError::Decode {
                     event_name: name.to_string(),
-                    source: "expected 8 payload bytes".to_string(),
+                    source:     "expected 8 payload bytes".to_string(),
                 })?;
             Ok(i64::from_le_bytes(arr))
         };
@@ -57,7 +57,7 @@ impl Event for AccountEvent {
                 let owner = String::from_utf8(data.to_vec()).map_err(|e| {
                     CodecError::Decode {
                         event_name: name.to_string(),
-                        source: e.to_string(),
+                        source:     e.to_string(),
                     }
                 })?;
                 Ok(AccountEvent::Opened { owner })
@@ -75,7 +75,7 @@ impl Event for AccountEvent {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct Account {
-    open: bool,
+    open:    bool,
     balance: i64,
 }
 
@@ -112,7 +112,8 @@ impl fmt::Display for AccountError {
             }
             AccountError::InsufficientFunds { balance, requested } => write!(
                 f,
-                "insufficient funds: balance is {balance}, requested {requested}"
+                "insufficient funds: balance is {balance}, requested \
+                 {requested}"
             ),
         }
     }
@@ -169,7 +170,7 @@ impl Decide<Withdraw> for Account {
         }
         if cmd.amount > self.balance {
             return Err(AccountError::InsufficientFunds {
-                balance: self.balance,
+                balance:   self.balance,
                 requested: cmd.amount,
             });
         }
@@ -226,7 +227,7 @@ fn gwt_overdraw_is_rejected() {
     ])
     .when(Withdraw { amount: 100 })
     .then_error(AccountError::InsufficientFunds {
-        balance: 30,
+        balance:   30,
         requested: 100,
     });
 }

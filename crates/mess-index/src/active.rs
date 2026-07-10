@@ -25,8 +25,8 @@
 //!   and clone-on-write) the whole per-stream map on every group — the active
 //!   index grows to ~1M entries per segment, so republishing it per group is
 //!   the write amplification D5 exists to avoid.
-//! - *left-right* pays every write twice and drains an op-log on the read
-//!   side; it shines when reads vastly dominate a *small* structure, not a
+//! - *left-right* pays every write twice and drains an op-log on the read side;
+//!   it shines when reads vastly dominate a *small* structure, not a
 //!   million-entry append-mostly map.
 //! - *sharded `RwLock`* gives the writer an O(1) `Vec::push` under a
 //!   shard-local lock (contended only against readers touching the *same*
@@ -69,7 +69,7 @@ pub struct EventPtr {
     /// The segment the batch lives in (`SegmentHeader.segment_id`).
     pub segment_id: u64,
     /// Byte offset of the batch within that segment.
-    pub offset: u64,
+    pub offset:     u64,
 }
 
 /// One index entry: a whole committed batch of a single stream. A batch is
@@ -79,13 +79,13 @@ pub struct EventPtr {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamEntry {
     /// Stream version of the batch's first event.
-    pub first_version: u64,
+    pub first_version:    u64,
     /// Number of events (subframes) in the batch.
-    pub frame_count: u32,
+    pub frame_count:      u32,
     /// Global position of the batch's first event (A1) — the D7 clamp key.
     pub first_global_pos: u64,
     /// Where the batch lives.
-    pub ptr: EventPtr,
+    pub ptr:              EventPtr,
 }
 
 impl StreamEntry {
@@ -118,11 +118,11 @@ pub struct GlobalEntry {
     /// Global position of the batch's first event (A1).
     pub first_global_pos: u64,
     /// Number of events in the batch.
-    pub frame_count: u32,
+    pub frame_count:      u32,
     /// The batch's stream.
-    pub stream_id: u64,
+    pub stream_id:        u64,
     /// Where the batch lives.
-    pub ptr: EventPtr,
+    pub ptr:              EventPtr,
 }
 
 impl GlobalEntry {
@@ -140,15 +140,15 @@ impl GlobalEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BatchEntry {
     /// Batch-constant stream id (D-FMT-6).
-    pub stream_id: u64,
+    pub stream_id:            u64,
     /// Stream version of the batch's first event.
     pub first_stream_version: u64,
     /// Number of events in the batch.
-    pub frame_count: u32,
+    pub frame_count:          u32,
     /// Global position of the batch's first event (A1).
-    pub first_global_pos: u64,
+    pub first_global_pos:     u64,
     /// Where the batch lives.
-    pub ptr: EventPtr,
+    pub ptr:                  EventPtr,
 }
 
 impl BatchEntry {
@@ -161,10 +161,10 @@ impl BatchEntry {
     #[inline]
     fn to_stream_entry(self) -> StreamEntry {
         StreamEntry {
-            first_version: self.first_stream_version,
-            frame_count: self.frame_count,
+            first_version:    self.first_stream_version,
+            frame_count:      self.frame_count,
             first_global_pos: self.first_global_pos,
-            ptr: self.ptr,
+            ptr:              self.ptr,
         }
     }
 
@@ -172,9 +172,9 @@ impl BatchEntry {
     fn to_global_entry(self) -> GlobalEntry {
         GlobalEntry {
             first_global_pos: self.first_global_pos,
-            frame_count: self.frame_count,
-            stream_id: self.stream_id,
-            ptr: self.ptr,
+            frame_count:      self.frame_count,
+            stream_id:        self.stream_id,
+            ptr:              self.ptr,
         }
     }
 }
@@ -189,9 +189,9 @@ pub struct IndexSnapshot {
     pub applied_end: u64,
     /// Per-stream committed entries, in version order. `BTreeMap` for a
     /// deterministic ordering independent of shard/hash layout.
-    pub streams: BTreeMap<u64, Vec<StreamEntry>>,
+    pub streams:     BTreeMap<u64, Vec<StreamEntry>>,
     /// The committed global-position-ordered prefix.
-    pub global: Vec<GlobalEntry>,
+    pub global:      Vec<GlobalEntry>,
 }
 
 struct Shard {
@@ -200,9 +200,7 @@ struct Shard {
 }
 
 impl Shard {
-    fn new() -> Self {
-        Shard { streams: RwLock::new(HashMap::new()) }
-    }
+    fn new() -> Self { Shard { streams: RwLock::new(HashMap::new()) } }
 }
 
 /// The in-memory active index: per-stream pointer lists plus a
@@ -210,14 +208,15 @@ impl Shard {
 /// at a time.
 ///
 /// Cheap to share (`Arc<ActiveIndex>`): the committer keeps one clone of the
-/// `Arc` and is the sole caller of [`apply_committed`](ActiveIndex::apply_committed);
-/// readers keep clones and call the resolve/scan methods.
+/// `Arc` and is the sole caller of
+/// [`apply_committed`](ActiveIndex::apply_committed); readers keep clones and
+/// call the resolve/scan methods.
 pub struct ActiveIndex {
-    shards: Box<[Shard]>,
-    shard_mask: u64,
+    shards:      Box<[Shard]>,
+    shard_mask:  u64,
     /// The global-position-ordered log. One writer appends in commit order;
     /// readers take a short read lock and clamp to `applied_end`.
-    global: RwLock<Vec<GlobalEntry>>,
+    global:      RwLock<Vec<GlobalEntry>>,
     /// The exclusive durable end applied to the index (D7). Published with
     /// `Release` after inserts; read with `Acquire` and used to clamp every
     /// result. Monotone non-decreasing.
@@ -225,16 +224,12 @@ pub struct ActiveIndex {
 }
 
 impl Default for ActiveIndex {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
 impl ActiveIndex {
     /// Default 64-shard index.
-    pub fn new() -> Self {
-        Self::with_shards(64)
-    }
+    pub fn new() -> Self { Self::with_shards(64) }
 
     /// An index with `shards` rounded **up** to a power of two (so shard
     /// selection is a mask, not a modulo). A minimum of one shard.
@@ -242,9 +237,9 @@ impl ActiveIndex {
         let n = shards.max(1).next_power_of_two();
         let shards: Vec<Shard> = (0..n).map(|_| Shard::new()).collect();
         ActiveIndex {
-            shards: shards.into_boxed_slice(),
-            shard_mask: (n as u64) - 1,
-            global: RwLock::new(Vec::new()),
+            shards:      shards.into_boxed_slice(),
+            shard_mask:  (n as u64) - 1,
+            global:      RwLock::new(Vec::new()),
             applied_end: AtomicU64::new(0),
         }
     }
@@ -361,7 +356,8 @@ impl ActiveIndex {
         }
     }
 
-    /// The committed entries of `stream_id`, in version order (a clamped clone).
+    /// The committed entries of `stream_id`, in version order (a clamped
+    /// clone).
     pub fn stream_entries(&self, stream_id: u64) -> Vec<StreamEntry> {
         let w = self.applied_end.load(Ordering::Acquire);
         let map = self.shard_for(stream_id).streams.read();
@@ -409,7 +405,13 @@ impl ActiveIndex {
 mod tests {
     use super::*;
 
-    fn entry(stream_id: u64, first_version: u64, n: u32, pos: u64, off: u64) -> BatchEntry {
+    fn entry(
+        stream_id: u64,
+        first_version: u64,
+        n: u32,
+        pos: u64,
+        off: u64,
+    ) -> BatchEntry {
         BatchEntry {
             stream_id,
             first_stream_version: first_version,
@@ -448,7 +450,11 @@ mod tests {
     #[test]
     fn global_view_is_dense_and_ordered() {
         let idx = ActiveIndex::new();
-        let batches = [entry(10, 0, 3, 0, 100), entry(20, 0, 2, 3, 200), entry(10, 3, 1, 5, 300)];
+        let batches = [
+            entry(10, 0, 3, 0, 100),
+            entry(20, 0, 2, 3, 200),
+            entry(10, 3, 1, 5, 300),
+        ];
         idx.apply_committed(6, &batches);
         let g = idx.global_committed();
         assert_eq!(g.len(), 3);
@@ -511,7 +517,10 @@ mod tests {
         assert_eq!(a.snapshot(), b.snapshot());
         // Streams collected in a BTreeMap → key order 10,20,30.
         let snap = a.snapshot();
-        assert_eq!(snap.streams.keys().copied().collect::<Vec<_>>(), vec![10, 20, 30]);
+        assert_eq!(
+            snap.streams.keys().copied().collect::<Vec<_>>(),
+            vec![10, 20, 30]
+        );
     }
 
     #[test]

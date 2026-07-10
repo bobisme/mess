@@ -19,8 +19,8 @@
 
 use mess_core::{Aggregate, CodecError, Event};
 use mess_store::{
-    EventStore, Loaded, SnapshotStore, Snapshottable,
-    StateCodecError, StoredSnapshot, Version,
+    EventStore, Loaded, SnapshotStore, Snapshottable, StateCodecError,
+    StoredSnapshot, Version,
 };
 
 mod common;
@@ -64,7 +64,7 @@ impl Event for CounterEvent {
             let bytes: [u8; 8] =
                 data.try_into().map_err(|_| CodecError::Decode {
                     event_name: name.to_string(),
-                    source: format!("expected 8 bytes, got {}", data.len()),
+                    source:     format!("expected 8 bytes, got {}", data.len()),
                 })?;
             Ok(i64::from_le_bytes(bytes))
         };
@@ -237,15 +237,16 @@ async fn snapshot_plus_tail_equals_full_replay() {
     let iterations: usize = match std::env::var("MESS_SNAPSHOT_LAW_ITERS") {
         Ok(val) => val.trim().parse().unwrap_or_else(|_| {
             panic!(
-                "MESS_SNAPSHOT_LAW_ITERS={val:?} is not a valid positive integer \
-                 (unset it to use the default of {DEFAULT_ITERATIONS})"
+                "MESS_SNAPSHOT_LAW_ITERS={val:?} is not a valid positive \
+                 integer (unset it to use the default of {DEFAULT_ITERATIONS})"
             )
         }),
         Err(_) => DEFAULT_ITERATIONS,
     };
     eprintln!(
-        "snapshot_plus_tail_equals_full_replay: running {iterations} iterations \
-         (default {DEFAULT_ITERATIONS}; override with MESS_SNAPSHOT_LAW_ITERS)"
+        "snapshot_plus_tail_equals_full_replay: running {iterations} \
+         iterations (default {DEFAULT_ITERATIONS}; override with \
+         MESS_SNAPSHOT_LAW_ITERS)"
     );
     let seed: u64 = 0x5EED_C0FF_EE01_1CFF;
     let mut rng = Rng::new(seed);
@@ -353,7 +354,7 @@ async fn stale_fold_version_falls_back_to_full_replay() {
     wrong.0.marks = -999_999;
     let mut stale = StoredSnapshot {
         snapshot_ref: store.save_snapshot::<CounterV2>(stream).await.unwrap(),
-        state_blob: wrong.encode_state().unwrap(),
+        state_blob:   wrong.encode_state().unwrap(),
     };
     // Downgrade the stored ref to the old fold version and poison the blob.
     stale.snapshot_ref.fold_version = 1;
@@ -362,7 +363,8 @@ async fn stale_fold_version_falls_back_to_full_replay() {
     // Sanity: a snapshot IS present (so a non-fallback would use it).
     assert!(store.backend().load_snapshot(stream).await.unwrap().is_some());
 
-    // load_cached as v2 must ignore the fold_version-1 snapshot and full-replay.
+    // load_cached as v2 must ignore the fold_version-1 snapshot and
+    // full-replay.
     let loaded = store.load_cached::<CounterV2>(stream).await.unwrap();
     assert_eq!(
         loaded.state, expected_v2,
@@ -372,7 +374,8 @@ async fn stale_fold_version_falls_back_to_full_replay() {
     assert_eq!(
         loaded.events_replayed,
         events.len(),
-        "fallback must replay the whole stream, proving the snapshot was skipped"
+        "fallback must replay the whole stream, proving the snapshot was \
+         skipped"
     );
 }
 

@@ -57,8 +57,8 @@ macro_rules! __mess_core_upcast_impls {
 ///
 /// Given `versions: [1 => V1, 2 => V2, 3 => V3]` and one hand-written
 /// `impl Upcast<Prev> for Next` per hop, generates:
-///  - transitive `UpcastsTo<V3>` impls for `V1` and `V2` (identity for
-///    `V3` itself),
+///  - transitive `UpcastsTo<V3>` impls for `V1` and `V2` (identity for `V3`
+///    itself),
 ///  - `pub fn decode_fn(&StoredEvent) -> Result<V3, UpcastError>` that
 ///    checks `event_name`, decodes the payload as the version named by
 ///    `schema_version`, and upcasts to `V3` — or fails loudly with

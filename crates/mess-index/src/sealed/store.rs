@@ -1,6 +1,7 @@
 //! The sealed-segment store and the **sealed-or-active handoff** (D5): the
-//! discipline that lets the background sealer evict a segment's entries from the
-//! in-memory active index *without ever exposing a gap* to concurrent readers.
+//! discipline that lets the background sealer evict a segment's entries from
+//! the in-memory active index *without ever exposing a gap* to concurrent
+//! readers.
 //!
 //! # The invariant: sealed-or-active at all times
 //!
@@ -50,7 +51,7 @@ struct Inner {
     segments: HashMap<u64, SealedSegmentRef>,
     /// Segments whose active-index entries have been (logically) evicted; a
     /// subset of `segments`' keys (eviction always follows install).
-    evicted: HashSet<u64>,
+    evicted:  HashSet<u64>,
 }
 
 /// A published set of sealed-segment pointer indexes, plus the sealed-or-active
@@ -62,9 +63,7 @@ pub struct SealedStore {
 
 impl SealedStore {
     /// An empty store.
-    pub fn new() -> Self {
-        Self::default()
-    }
+    pub fn new() -> Self { Self::default() }
 
     /// **Install** a sealed segment index, publishing it to readers (step 3 of
     /// the handoff). Idempotent replace by `segment_id`. MUST be called only
@@ -82,7 +81,8 @@ impl SealedStore {
         let mut inner = self.inner.write();
         debug_assert!(
             inner.segments.contains_key(&segment_id),
-            "D5 handoff: evicted segment {segment_id} before installing its sealed index"
+            "D5 handoff: evicted segment {segment_id} before installing its \
+             sealed index"
         );
         inner.evicted.insert(segment_id);
     }
@@ -98,14 +98,10 @@ impl SealedStore {
     }
 
     /// Number of installed sealed segments.
-    pub fn len(&self) -> usize {
-        self.inner.read().segments.len()
-    }
+    pub fn len(&self) -> usize { self.inner.read().segments.len() }
 
     /// Whether no sealed segment is installed.
-    pub fn is_empty(&self) -> bool {
-        self.inner.read().segments.is_empty()
-    }
+    pub fn is_empty(&self) -> bool { self.inner.read().segments.is_empty() }
 
     /// Resolve `(stream, version)` against the **sealed** indexes only. Scans
     /// installed segments (O(installed); production cross-segment routing is
@@ -117,12 +113,20 @@ impl SealedStore {
     /// definitely lacks `stream` is skipped without touching the directory
     /// at all. A missing/corrupt filter (`might_contain_stream` always
     /// `true`) falls back to exactly today's behavior for that segment.
-    pub fn resolve_sealed(&self, stream: u64, version: u64) -> Option<EventPtr> {
+    pub fn resolve_sealed(
+        &self,
+        stream: u64,
+        version: u64,
+    ) -> Option<EventPtr> {
         let inner = self.inner.read();
         Self::resolve_sealed_locked(&inner, stream, version)
     }
 
-    fn resolve_sealed_locked(inner: &Inner, stream: u64, version: u64) -> Option<EventPtr> {
+    fn resolve_sealed_locked(
+        inner: &Inner,
+        stream: u64,
+        version: u64,
+    ) -> Option<EventPtr> {
         for index in inner.segments.values() {
             // bn-1i7: filter says "no" -> definitely absent, skip the
             // directory/pointer-block lookup for this segment entirely.
@@ -151,7 +155,10 @@ impl SealedStore {
         inner
             .segments
             .values()
-            .filter(|index| index.might_contain_stream(stream) && index.stream_head(stream).is_some())
+            .filter(|index| {
+                index.might_contain_stream(stream)
+                    && index.stream_head(stream).is_some()
+            })
             .cloned()
             .collect()
     }
@@ -163,24 +170,30 @@ impl SealedStore {
     /// evicted check from a post-evict snapshot would see neither the sealed
     /// index nor a trusted active pointer — a spurious gap. Reading both from
     /// one snapshot makes the invariant `evicted ⊆ installed` hold *for the
-    /// reader*: if a segment is evicted in this snapshot it is also installed in
-    /// it, so the sealed scan already covered it.
+    /// reader*: if a segment is evicted in this snapshot it is also installed
+    /// in it, so the sealed scan already covered it.
     ///
     /// Sealed indexes are consulted first; on a miss, the active index is
     /// trusted only for segments not evicted in this snapshot. `active`'s own
     /// resolution uses its own locks and may happen at any instant — only the
     /// store snapshot must be consistent.
-    pub fn resolve_with(&self, active: &ActiveIndex, stream: u64, version: u64) -> Option<EventPtr> {
+    pub fn resolve_with(
+        &self,
+        active: &ActiveIndex,
+        stream: u64,
+        version: u64,
+    ) -> Option<EventPtr> {
         let inner = self.inner.read();
-        if let Some(ptr) = Self::resolve_sealed_locked(&inner, stream, version) {
+        if let Some(ptr) = Self::resolve_sealed_locked(&inner, stream, version)
+        {
             return Some(ptr);
         }
         let ptr = active.resolve(stream, version)?;
         if inner.evicted.contains(&ptr.segment_id) {
             // Evicted in this snapshot ⇒ also installed in it ⇒ the sealed scan
             // above already had authority for this key and did not resolve it,
-            // so the key genuinely is not present. The stale active pointer must
-            // not be trusted.
+            // so the key genuinely is not present. The stale active pointer
+            // must not be trusted.
             None
         } else {
             Some(ptr)
@@ -191,18 +204,24 @@ impl SealedStore {
 /// The **combined resolver**: sealed-or-active, gapless across the handoff.
 /// Free-function form of [`SealedStore::resolve_with`] (which see for why the
 /// resolution happens under a single store snapshot).
-pub fn resolve(active: &ActiveIndex, store: &SealedStore, stream: u64, version: u64) -> Option<EventPtr> {
+pub fn resolve(
+    active: &ActiveIndex,
+    store: &SealedStore,
+    stream: u64,
+    version: u64,
+) -> Option<EventPtr> {
     store.resolve_with(active, stream, version)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::active::BatchEntry;
     use crate::sealed::segment::{
         SealBatch, SealInput, SealStream, SealedSegmentIndex, encode_sidecar,
     };
-    use std::sync::Arc;
 
     fn sealed_seg(segment_id: u64, stream: u64, off: u64) -> SealedSegmentRef {
         let input = SealInput {
@@ -210,16 +229,18 @@ mod tests {
             base_pos: 0,
             streams: vec![SealStream {
                 stream_id: stream,
-                batches: vec![SealBatch {
-                    first_version: 0,
-                    frame_count: 3,
+                batches:   vec![SealBatch {
+                    first_version:    0,
+                    frame_count:      3,
                     first_global_pos: 0,
-                    offset: off,
+                    offset:           off,
                 }],
             }],
             payloads: None,
         };
-        Arc::new(SealedSegmentIndex::from_bytes(encode_sidecar(&input)).unwrap())
+        Arc::new(
+            SealedSegmentIndex::from_bytes(encode_sidecar(&input)).unwrap(),
+        )
     }
 
     #[test]
@@ -228,11 +249,14 @@ mod tests {
         active.apply_committed(
             3,
             &[BatchEntry {
-                stream_id: 10,
+                stream_id:            10,
                 first_stream_version: 0,
-                frame_count: 3,
-                first_global_pos: 0,
-                ptr: EventPtr { segment_id: 1, offset: 100 },
+                frame_count:          3,
+                first_global_pos:     0,
+                ptr:                  EventPtr {
+                    segment_id: 1,
+                    offset:     100,
+                },
             }],
         );
         let store = SealedStore::new();
@@ -243,7 +267,11 @@ mod tests {
         // Install the sealed index for seg 1 (different offset to prove which
         // path answered) then mark evicted.
         store.install(sealed_seg(1, 10, 999));
-        assert_eq!(resolve(&active, &store, 10, 1).unwrap().offset, 999, "sealed wins");
+        assert_eq!(
+            resolve(&active, &store, 10, 1).unwrap().offset,
+            999,
+            "sealed wins"
+        );
         store.mark_active_evicted(1);
         assert_eq!(resolve(&active, &store, 10, 1).unwrap().offset, 999);
         // A version not in any sealed or live-active segment: miss.
@@ -285,12 +313,23 @@ mod tests {
             .iter()
             .map(|&id| SealStream {
                 stream_id: id,
-                batches: vec![SealBatch { first_version: 0, frame_count: 1, first_global_pos: id, offset: 1000 + id }],
+                batches:   vec![SealBatch {
+                    first_version:    0,
+                    frame_count:      1,
+                    first_global_pos: id,
+                    offset:           1000 + id,
+                }],
             })
             .collect();
-        let input1 = SealInput { segment_id: 1, base_pos: 0, streams: streams1, payloads: None };
+        let input1 = SealInput {
+            segment_id: 1,
+            base_pos:   0,
+            streams:    streams1,
+            payloads:   None,
+        };
         let filter1 = SegmentFilter::build(1, &ids).unwrap();
-        let mut idx1 = SealedSegmentIndex::from_bytes(encode_sidecar(&input1)).unwrap();
+        let mut idx1 =
+            SealedSegmentIndex::from_bytes(encode_sidecar(&input1)).unwrap();
         idx1.attach_filter(filter1);
 
         // Segment 2: just stream 777 (never present in segment 1's id set).
@@ -314,11 +353,14 @@ mod tests {
         active.apply_committed(
             3,
             &[BatchEntry {
-                stream_id: 10,
+                stream_id:            10,
                 first_stream_version: 0,
-                frame_count: 3,
-                first_global_pos: 0,
-                ptr: EventPtr { segment_id: 1, offset: 100 },
+                frame_count:          3,
+                first_global_pos:     0,
+                ptr:                  EventPtr {
+                    segment_id: 1,
+                    offset:     100,
+                },
             }],
         );
         let store = SealedStore::new();

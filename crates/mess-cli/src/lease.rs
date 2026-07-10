@@ -31,34 +31,33 @@ pub const DEFAULT_TTL_SECS: u64 = 60;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseFile {
     /// Unique id of the backup holding this lease (its lease-file stem).
-    pub backup_id: String,
-    /// The pid of the `mess backup` process (diagnostic; TTL is authoritative).
-    pub pid: u32,
+    pub backup_id:              String,
+    /// The pid of the `mess backup` process (diagnostic; TTL is
+    /// authoritative).
+    pub pid:                    u32,
     /// Wall-clock creation time (unix seconds).
-    pub created_unix: u64,
+    pub created_unix:           u64,
     /// Wall-clock expiry (unix seconds); the lease is inactive once `now >=`
     /// this. Renewed while the backup copies.
-    pub expires_unix: u64,
+    pub expires_unix:           u64,
     /// Lowest segment id the cut protects (inclusive).
     pub protect_min_segment_id: u64,
     /// Highest segment id the cut protects (inclusive).
     pub protect_max_segment_id: u64,
     /// The cut's durable watermark (diagnostic).
-    pub watermark: u64,
+    pub watermark:              u64,
 }
 
 impl LeaseFile {
     /// Whether this lease is still active at `now` (unix seconds).
     #[must_use]
-    pub fn is_active(&self, now: u64) -> bool {
-        now < self.expires_unix
-    }
+    pub fn is_active(&self, now: u64) -> bool { now < self.expires_unix }
 
     /// The pure retention predicate this lease contributes (doc 07 §5.1).
     #[must_use]
     pub fn to_backup_lease(&self) -> BackupLease {
         BackupLease {
-            backup_id: self.backup_id.clone(),
+            backup_id:              self.backup_id.clone(),
             protect_min_segment_id: self.protect_min_segment_id,
             protect_max_segment_id: self.protect_max_segment_id,
         }
@@ -69,14 +68,15 @@ impl LeaseFile {
 /// happens in practice).
 #[must_use]
 pub fn now_unix() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// The `<dir>/leases` directory holding every backup lease.
 #[must_use]
-pub fn leases_dir(dir: &Path) -> PathBuf {
-    dir.join("leases")
-}
+pub fn leases_dir(dir: &Path) -> PathBuf { dir.join("leases") }
 
 fn lease_path(dir: &Path, backup_id: &str) -> PathBuf {
     leases_dir(dir).join(format!("{backup_id}.lease"))
@@ -110,8 +110,8 @@ fn write_lease(dir: &Path, lease: &LeaseFile) -> io::Result<()> {
 /// the pin (doc 07 §5.2).
 #[derive(Debug)]
 pub struct LeaseGuard {
-    dir: PathBuf,
-    lease: LeaseFile,
+    dir:      PathBuf,
+    lease:    LeaseFile,
     ttl_secs: u64,
     released: bool,
 }
@@ -119,9 +119,7 @@ pub struct LeaseGuard {
 impl LeaseGuard {
     /// The backup id of this lease.
     #[must_use]
-    pub fn backup_id(&self) -> &str {
-        &self.lease.backup_id
-    }
+    pub fn backup_id(&self) -> &str { &self.lease.backup_id }
 
     /// Refresh the expiry to `now + ttl` and rewrite the lease file.
     pub fn renew(&mut self) -> io::Result<()> {
@@ -229,8 +227,8 @@ mod tests {
     fn active_lease_pins_then_releases_on_drop() {
         let d = tempfile::tempdir().expect("tempdir");
         {
-            let _guard =
-                acquire(d.path(), "b1", 1, 5, 42, DEFAULT_TTL_SECS).expect("acquire");
+            let _guard = acquire(d.path(), "b1", 1, 5, 42, DEFAULT_TTL_SECS)
+                .expect("acquire");
             let active = active_leases(d.path(), now_unix());
             assert_eq!(active.len(), 1, "lease is active while held");
             assert!(active[0].pins(3));
@@ -239,7 +237,10 @@ mod tests {
             assert!(!active[0].pins(6));
         }
         // Guard dropped -> lease file removed -> no active leases.
-        assert!(active_leases(d.path(), now_unix()).is_empty(), "lease released on drop");
+        assert!(
+            active_leases(d.path(), now_unix()).is_empty(),
+            "lease released on drop"
+        );
     }
 
     #[test]
@@ -248,19 +249,22 @@ mod tests {
         // Write a lease that expired an hour ago (simulating a crashed backup
         // whose TTL lapsed).
         let stale = LeaseFile {
-            backup_id: "dead".into(),
-            pid: 999_999,
-            created_unix: now_unix().saturating_sub(7200),
-            expires_unix: now_unix().saturating_sub(3600),
+            backup_id:              "dead".into(),
+            pid:                    999_999,
+            created_unix:           now_unix().saturating_sub(7200),
+            expires_unix:           now_unix().saturating_sub(3600),
             protect_min_segment_id: 1,
             protect_max_segment_id: 9,
-            watermark: 0,
+            watermark:              0,
         };
         write_lease(d.path(), &stale).expect("write stale lease");
         assert!(!stale.is_active(now_unix()));
         // active_leases filters it out and unlinks it.
         assert!(active_leases(d.path(), now_unix()).is_empty());
-        assert!(read_all(d.path()).is_empty(), "stale lease file was cleaned up");
+        assert!(
+            read_all(d.path()).is_empty(),
+            "stale lease file was cleaned up"
+        );
     }
 
     #[test]

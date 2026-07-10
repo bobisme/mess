@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-
 use mess_cli::backup::{self, BackupOptions};
 use mess_cli::doctor::{self, DoctorOptions};
 use mess_cli::format::{self, Format};
@@ -55,52 +54,54 @@ struct Common {
     format: Option<FormatArg>,
     /// Hidden alias for `--format json` (agents frequently guess this).
     #[arg(long, hide = true, global = true)]
-    json: bool,
+    json:   bool,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Health checks: lock, epoch, footer/trailer, sidecar, fsync, fold-version.
+    /// Health checks: lock, epoch, footer/trailer, sidecar, fsync,
+    /// fold-version.
     Doctor {
         /// The store directory.
-        dir: PathBuf,
+        dir:                 PathBuf,
         /// Expect every live snapshot to carry this fold_version.
         #[arg(long)]
         expect_fold_version: Option<u32>,
         #[command(flatten)]
-        common: Common,
+        common:              Common,
     },
     /// Segment chain, stream heads, and registry overview.
     Inspect {
         /// The store directory.
-        dir: PathBuf,
+        dir:         PathBuf,
         /// Restrict the segment overview to this segment id.
         #[arg(long)]
-        segment: Option<u64>,
+        segment:     Option<u64>,
         /// Restrict the stream-head overview to one stream: its interned
         /// numeric id or its registered name (name lookup needs the
         /// metadata registry to be readable).
         #[arg(long)]
-        stream: Option<String>,
+        stream:      Option<String>,
         /// Show every stream head in `text`/`pretty` output instead of the
         /// default top-N truncation. `--format json` is always complete.
         #[arg(long)]
         all_streams: bool,
         #[command(flatten)]
-        common: Common,
+        common:      Common,
     },
     /// Recovery scanner: detect every corruption class; exit non-zero on any.
     Verify {
         /// The store directory.
-        dir: PathBuf,
+        dir:    PathBuf,
         /// Full byte-integrity pass (payload reassembly) + fold-chain
         /// linkage recompute.
         #[arg(long)]
-        full: bool,
+        full:   bool,
         /// Attempt Reed-Solomon repair of damaged sealed segments from their
         /// `.par` parity sidecars (bn-2za): reconstruct damaged blocks,
-        /// re-verify against batch CRCs + fold chain, keep the damaged original
-        /// as `.damaged-<ts>`, and write the repaired segment atomically.
+        /// re-verify against batch CRCs + fold chain, keep the damaged
+        /// original as `.damaged-<ts>`, and write the repaired segment
+        /// atomically.
         #[arg(long)]
         repair: bool,
         #[command(flatten)]
@@ -109,15 +110,15 @@ enum Command {
     /// Rebuild pointer sidecars (byte-equal) and, with --meta, the meta tables.
     RebuildIndex {
         /// The store directory.
-        dir: PathBuf,
+        dir:     PathBuf,
         /// Preview without writing anything.
         #[arg(long)]
         dry_run: bool,
         /// Also rebuild the derivable metadata tables (stream heads).
         #[arg(long)]
-        meta: bool,
+        meta:    bool,
         #[command(flatten)]
-        common: Common,
+        common:  Common,
     },
     /// Retention verdict + blockers per sealed segment.
     Retention {
@@ -127,24 +128,24 @@ enum Command {
     /// Copy a consistent cut of a live store to a backup destination.
     Backup {
         /// The source store directory.
-        dir: PathBuf,
+        dir:         PathBuf,
         /// The backup destination directory.
         #[arg(long)]
-        to: PathBuf,
+        to:          PathBuf,
         /// Copy only sealed segments/sidecars not already present at the
         /// destination (verified by size + CRC).
         #[arg(long)]
         incremental: bool,
         #[command(flatten)]
-        common: Common,
+        common:      Common,
     },
     /// Restore a store from a backup: copy back, recover, and verify --full.
     Restore {
         /// The backup source directory.
-        src: PathBuf,
+        src:    PathBuf,
         /// The (empty or absent) target store directory.
         #[arg(long)]
-        to: PathBuf,
+        to:     PathBuf,
         #[command(flatten)]
         common: Common,
     },
@@ -155,7 +156,7 @@ enum RetentionCmd {
     /// Explain each sealed segment's retention verdict and blockers.
     Explain {
         /// The store directory.
-        dir: PathBuf,
+        dir:    PathBuf,
         #[command(flatten)]
         common: Common,
     },
@@ -183,7 +184,8 @@ fn require_dir(dir: &std::path::Path) -> Result<(), ExitCode> {
         Ok(())
     } else {
         eprintln!(
-            "Error: store directory not found at {}\n  Pass the path to a mess store directory (the one holding LOCK and seg-*.log).",
+            "Error: store directory not found at {}\n  Pass the path to a \
+             mess store directory (the one holding LOCK and seg-*.log).",
             dir.display()
         );
         Err(ExitCode::from(EXIT_SYSTEM as u8))
@@ -197,14 +199,18 @@ fn main() -> ExitCode {
             if let Err(code) = require_dir(&dir) {
                 return code;
             }
-            let report = doctor::run(&dir, &DoctorOptions { expect_fold_version });
+            let report =
+                doctor::run(&dir, &DoctorOptions { expect_fold_version });
             emit(&report, resolve_format(&common))
         }
         Command::Inspect { dir, segment, stream, all_streams, common } => {
             if let Err(code) = require_dir(&dir) {
                 return code;
             }
-            let report = inspect::run(&dir, &InspectOptions { segment, stream, all_streams });
+            let report = inspect::run(
+                &dir,
+                &InspectOptions { segment, stream, all_streams },
+            );
             emit(&report, resolve_format(&common))
         }
         Command::Verify { dir, full, repair, common } => {

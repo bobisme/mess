@@ -17,13 +17,13 @@ use mess_store::Version;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShadowEvent {
     pub message_type: String,
-    pub data: Vec<u8>,
+    pub data:         Vec<u8>,
 }
 
 /// Where a global position maps in stream space.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GlobalRef {
-    pub stream: String,
+    pub stream:     String,
     pub stream_pos: u64,
 }
 
@@ -31,7 +31,7 @@ pub struct GlobalRef {
 #[derive(Debug, Default)]
 pub struct Shadow {
     /// `stream name → events in stream order` (index == stream position).
-    streams: HashMap<String, Vec<ShadowEvent>>,
+    streams:   HashMap<String, Vec<ShadowEvent>>,
     /// `global position → (stream, stream position)`. A `BTreeMap` so
     /// `max_global` and dense-prefix checks are cheap and ordered.
     by_global: BTreeMap<u64, GlobalRef>,
@@ -39,9 +39,7 @@ pub struct Shadow {
 
 impl Shadow {
     #[must_use]
-    pub fn new() -> Self {
-        Shadow::default()
-    }
+    pub fn new() -> Self { Shadow::default() }
 
     /// Record a committed batch. `first_stream_pos` MUST equal the stream's
     /// current shadow length (exact-version discipline); `first_global` is the
@@ -59,15 +57,22 @@ impl Shadow {
         assert_eq!(
             entry.len() as u64,
             first_stream_pos,
-            "shadow stream-position discontinuity on {stream}: have {}, batch starts at {first_stream_pos}",
+            "shadow stream-position discontinuity on {stream}: have {}, batch \
+             starts at {first_stream_pos}",
             entry.len(),
         );
         for (i, ev) in events.iter().enumerate() {
             let gp = first_global + i as u64;
             let sp = first_stream_pos + i as u64;
             entry.push(ev.clone());
-            let prev = self.by_global.insert(gp, GlobalRef { stream: stream.to_string(), stream_pos: sp });
-            assert!(prev.is_none(), "shadow global-position {gp} written twice");
+            let prev = self.by_global.insert(
+                gp,
+                GlobalRef { stream: stream.to_string(), stream_pos: sp },
+            );
+            assert!(
+                prev.is_none(),
+                "shadow global-position {gp} written twice"
+            );
         }
     }
 
@@ -99,9 +104,7 @@ impl Shadow {
 
     /// Total events recorded (== next global position on a dense store).
     #[must_use]
-    pub fn total(&self) -> u64 {
-        self.by_global.len() as u64
-    }
+    pub fn total(&self) -> u64 { self.by_global.len() as u64 }
 
     /// The highest global position recorded, or `None` if empty.
     #[must_use]
@@ -119,14 +122,17 @@ impl Shadow {
     /// recorded (acked) event. Each driver payload embeds a unique monotonic
     /// `write_nonce`, so the payload bytes are a globally unique fingerprint of
     /// the append that produced them — an engine "extra" whose payload is a key
-    /// here is a byte-exact duplicate of an acked event (a double-replay), not a
-    /// fresh unacked write. A `Vec` value (not a scalar) makes a
+    /// here is a byte-exact duplicate of an acked event (a double-replay), not
+    /// a fresh unacked write. A `Vec` value (not a scalar) makes a
     /// payload-appearing-at-two-positions duplicate detectable directly.
     #[must_use]
     pub fn acked_payload_index(&self) -> HashMap<Vec<u8>, Vec<u64>> {
         let mut idx: HashMap<Vec<u8>, Vec<u64>> = HashMap::new();
         for (&gp, r) in &self.by_global {
-            if let Some(ev) = self.streams.get(&r.stream).and_then(|s| s.get(r.stream_pos as usize))
+            if let Some(ev) = self
+                .streams
+                .get(&r.stream)
+                .and_then(|s| s.get(r.stream_pos as usize))
             {
                 idx.entry(ev.data.clone()).or_default().push(gp);
             }

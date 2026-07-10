@@ -14,7 +14,10 @@ use mess_store::backend::{Backend, RecordToAppend};
 use mess_store::{EngineOptions, LogEngine, Version};
 
 fn rec(message_type: &str, data: &[u8]) -> RecordToAppend {
-    RecordToAppend { message_type: message_type.to_string(), data: data.to_vec() }
+    RecordToAppend {
+        message_type: message_type.to_string(),
+        data:         data.to_vec(),
+    }
 }
 
 /// Options that force rolls quickly: a tiny active segment so a few hundred
@@ -31,7 +34,12 @@ fn payload(s: usize, i: usize) -> Vec<u8> {
 
 /// Append `events_per` single-event batches to `stream`, awaiting each so the
 /// stream's version chain is exact.
-async fn fill_stream(engine: &LogEngine, stream: &str, s: usize, events_per: usize) {
+async fn fill_stream(
+    engine: &LogEngine,
+    stream: &str,
+    s: usize,
+    events_per: usize,
+) {
     let mut expected = Version::NoStream;
     for i in 0..events_per {
         let out = engine
@@ -56,7 +64,8 @@ async fn fill_stream(engine: &LogEngine, stream: &str, s: usize, events_per: usi
 async fn auto_roll_under_concurrent_load_preserves_every_event() {
     let dir = tempfile::tempdir().expect("tempdir");
     let store_path = dir.path().join("store");
-    let engine = LogEngine::open_with(&store_path, rolling_opts()).expect("open");
+    let engine =
+        LogEngine::open_with(&store_path, rolling_opts()).expect("open");
 
     const STREAMS: usize = 24;
     const PER: usize = 25; // 600 tiny batches over a 16 KiB segment ⇒ many rolls
@@ -76,23 +85,42 @@ async fn auto_roll_under_concurrent_load_preserves_every_event() {
     }
 
     let total = STREAMS * PER;
-    assert_eq!(engine.total_events(), total, "every event committed to the book");
+    assert_eq!(
+        engine.total_events(),
+        total,
+        "every event committed to the book"
+    );
 
     // read_global tiles [0, total) densely with unique positions (no dup/gap).
     let g = engine.read_global(None, total * 2).await.unwrap();
     assert_eq!(g.len(), total, "global read returns exactly every event");
     for (i, r) in g.iter().enumerate() {
-        assert_eq!(r.global_position, i as u64, "dense, in-order global positions");
+        assert_eq!(
+            r.global_position, i as u64,
+            "dense, in-order global positions"
+        );
     }
 
     // Per-stream: contiguous versions, byte-exact payloads, correct head.
     for s in 0..STREAMS {
         let name = format!("stream-{s}");
-        let evs = engine.read_stream(&name, Version::NoStream, total).await.unwrap();
-        assert_eq!(evs.len(), PER, "stream {s}: all events readable after rolls");
+        let evs =
+            engine.read_stream(&name, Version::NoStream, total).await.unwrap();
+        assert_eq!(
+            evs.len(),
+            PER,
+            "stream {s}: all events readable after rolls"
+        );
         for (i, e) in evs.iter().enumerate() {
-            assert_eq!(e.stream_position, i as u64, "stream {s}: contiguous versions");
-            assert_eq!(e.data, payload(s, i), "stream {s} event {i}: byte-exact, no reorder");
+            assert_eq!(
+                e.stream_position, i as u64,
+                "stream {s}: contiguous versions"
+            );
+            assert_eq!(
+                e.data,
+                payload(s, i),
+                "stream {s} event {i}: byte-exact, no reorder"
+            );
             assert_eq!(e.stream_id, name);
         }
         assert_eq!(
@@ -105,12 +133,18 @@ async fn auto_roll_under_concurrent_load_preserves_every_event() {
     // Rolls actually happened: after a clean drop (which drains the background
     // sealer) the reopened engine finds durable sealed sidecars.
     drop(engine);
-    let reopened = LogEngine::open_with(&store_path, rolling_opts()).expect("reopen");
+    let reopened =
+        LogEngine::open_with(&store_path, rolling_opts()).expect("reopen");
     assert!(
         reopened.sealed_segment_count() > 0,
-        "the active segment must have rolled and sealed at least once under load"
+        "the active segment must have rolled and sealed at least once under \
+         load"
     );
-    assert_eq!(reopened.total_events(), total, "reopen rehydrates every event across the chain");
+    assert_eq!(
+        reopened.total_events(),
+        total,
+        "reopen rehydrates every event across the chain"
+    );
 }
 
 /// bn-1vu (item 2 + item 3): crash mid-seal leaves a recoverable state. Force
@@ -129,7 +163,8 @@ async fn crash_mid_roll_seal_is_served_from_log_after_reopen() {
     let total = STREAMS * PER;
 
     {
-        let engine = LogEngine::open_with(&store_path, rolling_opts()).expect("open");
+        let engine =
+            LogEngine::open_with(&store_path, rolling_opts()).expect("open");
         for s in 0..STREAMS {
             fill_stream(&engine, &format!("stream-{s}"), s, PER).await;
         }
@@ -148,35 +183,60 @@ async fn crash_mid_roll_seal_is_served_from_log_after_reopen() {
     assert!(removed > 0, "rolls must have produced sealed sidecars to remove");
 
     // Reopen: no cold tier, everything recovered from the log.
-    let engine = LogEngine::open_with(&store_path, rolling_opts()).expect("reopen after crash");
-    assert_eq!(engine.sealed_segment_count(), 0, "no sidecars ⇒ nothing served cold");
-    assert_eq!(engine.total_events(), total, "every event recovered from the durable log");
+    let engine = LogEngine::open_with(&store_path, rolling_opts())
+        .expect("reopen after crash");
+    assert_eq!(
+        engine.sealed_segment_count(),
+        0,
+        "no sidecars ⇒ nothing served cold"
+    );
+    assert_eq!(
+        engine.total_events(),
+        total,
+        "every event recovered from the durable log"
+    );
 
     let g = engine.read_global(None, total * 2).await.unwrap();
     assert_eq!(g.len(), total, "global read complete after crash mid-seal");
     for (i, r) in g.iter().enumerate() {
-        assert_eq!(r.global_position, i as u64, "dense positions after log recovery");
+        assert_eq!(
+            r.global_position, i as u64,
+            "dense positions after log recovery"
+        );
     }
     for s in 0..STREAMS {
         let name = format!("stream-{s}");
-        let evs = engine.read_stream(&name, Version::NoStream, total).await.unwrap();
+        let evs =
+            engine.read_stream(&name, Version::NoStream, total).await.unwrap();
         assert_eq!(evs.len(), PER, "stream {s}: fully served from the log");
         for (i, e) in evs.iter().enumerate() {
-            assert_eq!(e.data, payload(s, i), "stream {s} event {i}: byte-exact from the log");
+            assert_eq!(
+                e.data,
+                payload(s, i),
+                "stream {s} event {i}: byte-exact from the log"
+            );
         }
     }
 
     // And it keeps appending densely on top of the recovered chain.
     let out = engine
-        .append_batch("stream-0", Version::At((PER - 1) as u64), &[rec("ev", b"resumed")])
+        .append_batch(
+            "stream-0",
+            Version::At((PER - 1) as u64),
+            &[rec("ev", b"resumed")],
+        )
         .await
         .expect("append after crash recovery");
-    assert_eq!(out.last_global_position, total as u64, "next append continues the dense order");
+    assert_eq!(
+        out.last_global_position, total as u64,
+        "next append continues the dense order"
+    );
 }
 
 /// bn-1vu (item 3): a clean reopen after rolls rehydrates the whole segment
 /// chain — sealed segments served cold (sidecars reloaded), the live head hot —
-/// and every read path returns the exact pre-restart data, then keeps appending.
+/// and every read path returns the exact pre-restart data, then keeps
+/// appending.
 #[tokio::test]
 async fn clean_reopen_after_rolls_serves_cold_and_hot_tiers() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -187,30 +247,54 @@ async fn clean_reopen_after_rolls_serves_cold_and_hot_tiers() {
     let total = STREAMS * PER;
 
     {
-        let engine = LogEngine::open_with(&store_path, rolling_opts()).expect("open");
+        let engine =
+            LogEngine::open_with(&store_path, rolling_opts()).expect("open");
         for s in 0..STREAMS {
             fill_stream(&engine, &format!("stream-{s}"), s, PER).await;
         }
     }
 
-    let engine = LogEngine::open_with(&store_path, rolling_opts()).expect("reopen");
-    assert!(engine.sealed_segment_count() > 0, "rolled segments reload into the cold tier");
-    assert_eq!(engine.total_events(), total, "book dense across the whole reopened chain");
+    let engine =
+        LogEngine::open_with(&store_path, rolling_opts()).expect("reopen");
+    assert!(
+        engine.sealed_segment_count() > 0,
+        "rolled segments reload into the cold tier"
+    );
+    assert_eq!(
+        engine.total_events(),
+        total,
+        "book dense across the whole reopened chain"
+    );
 
     let g = engine.read_global(None, total * 2).await.unwrap();
     assert_eq!(g.len(), total);
     for (i, r) in g.iter().enumerate() {
-        assert_eq!(r.global_position, i as u64, "dense global order across cold+hot tiers");
+        assert_eq!(
+            r.global_position, i as u64,
+            "dense global order across cold+hot tiers"
+        );
     }
     for s in 0..STREAMS {
         let name = format!("stream-{s}");
-        let evs = engine.read_stream(&name, Version::NoStream, total).await.unwrap();
-        assert_eq!(evs.len(), PER, "stream {s}: all events across cold/hot after reopen");
+        let evs =
+            engine.read_stream(&name, Version::NoStream, total).await.unwrap();
+        assert_eq!(
+            evs.len(),
+            PER,
+            "stream {s}: all events across cold/hot after reopen"
+        );
         for (i, e) in evs.iter().enumerate() {
             assert_eq!(e.stream_position, i as u64);
-            assert_eq!(e.data, payload(s, i), "stream {s} event {i}: byte-exact after reopen");
+            assert_eq!(
+                e.data,
+                payload(s, i),
+                "stream {s} event {i}: byte-exact after reopen"
+            );
         }
-        assert_eq!(engine.head(&name).await.unwrap(), Version::At((PER - 1) as u64));
+        assert_eq!(
+            engine.head(&name).await.unwrap(),
+            Version::At((PER - 1) as u64)
+        );
     }
 
     // Keep appending on the reopened, rolled store — positions stay dense and a
@@ -218,12 +302,22 @@ async fn clean_reopen_after_rolls_serves_cold_and_hot_tiers() {
     let conflict = engine
         .append_batch("stream-0", Version::At(0), &[rec("ev", b"stale")])
         .await;
-    assert!(conflict.is_err(), "exact-version gate still enforced after reopen");
+    assert!(
+        conflict.is_err(),
+        "exact-version gate still enforced after reopen"
+    );
     let out = engine
-        .append_batch("stream-0", Version::At((PER - 1) as u64), &[rec("ev", b"more")])
+        .append_batch(
+            "stream-0",
+            Version::At((PER - 1) as u64),
+            &[rec("ev", b"more")],
+        )
         .await
         .expect("append after reopen");
-    assert_eq!(out.last_global_position, total as u64, "dense append continues after reopen");
+    assert_eq!(
+        out.last_global_position, total as u64,
+        "dense append continues after reopen"
+    );
 }
 
 /// bn-u6o item 2: a batch bigger than a whole EMPTY segment can never fit no
@@ -248,7 +342,9 @@ async fn oversized_batch_fails_fast_without_wasting_a_roll() {
         std::fs::read_dir(&store_path)
             .expect("read store dir")
             .flatten()
-            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("log"))
+            .filter(|e| {
+                e.path().extension().and_then(|x| x.to_str()) == Some("log")
+            })
             .count()
     };
     assert_eq!(segment_count(), 1, "one active segment at open");
@@ -266,14 +362,25 @@ async fn oversized_batch_fails_fast_without_wasting_a_roll() {
         "must surface the typed SegmentFull error, got: {msg}"
     );
 
-    assert_eq!(segment_count(), 1, "no wasted roll: segment count must be unchanged");
-    assert_eq!(engine.total_events(), 0, "the failed oversized append committed nothing");
+    assert_eq!(
+        segment_count(),
+        1,
+        "no wasted roll: segment count must be unchanged"
+    );
+    assert_eq!(
+        engine.total_events(),
+        0,
+        "the failed oversized append committed nothing"
+    );
 
     // The store must still be usable afterwards — the failed pre-check must
     // not have poisoned or otherwise wedged the committer.
     let out = engine
         .append_batch("stream-ok", Version::NoStream, &[rec("ev", b"small")])
         .await
-        .expect("a normal-sized append after the rejected oversized one must still work");
+        .expect(
+            "a normal-sized append after the rejected oversized one must \
+             still work",
+        );
     assert_eq!(out.last_global_position, 0);
 }

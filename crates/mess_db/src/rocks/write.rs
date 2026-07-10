@@ -1,4 +1,6 @@
-use std::sync::{atomic::Ordering, Arc};
+use std::sync::{Arc, atomic::Ordering};
+
+use rocksdb::{IteratorMode, ReadOptions};
 
 use super::{
     db::DB,
@@ -6,11 +8,10 @@ use super::{
     record::{GlobalRecord, StreamRecord},
 };
 use crate::{
+    ExpectedVersion, Position, StreamPos,
     error::{Error, Result},
     write::{WriteMessage, WriteMessages},
-    ExpectedVersion, Position, StreamPos,
 };
-use rocksdb::{IteratorMode, ReadOptions};
 
 pub fn get_last_global_position(db: &DB) -> Result<GlobalKey> {
     let cached = db.cached_global.load(Ordering::Acquire);
@@ -60,13 +61,8 @@ pub fn get_last_stream_position<'a>(
     let Some((key, _)) = last else {
         return Ok(None);
     };
-    StreamKey::from_bytes(&key).map(|x| {
-        if x.stream == stream {
-            Some(x)
-        } else {
-            None
-        }
-    })
+    StreamKey::from_bytes(&key)
+        .map(|x| if x.stream == stream { Some(x) } else { None })
 }
 
 /// Resolve the FIRST stream position an append should write at, enforcing the
@@ -76,8 +72,8 @@ pub fn get_last_stream_position<'a>(
 ///   position 0. Reads the disk head to validate.
 /// - [`ExpectedVersion::Exact`]: the disk head must equal the expected
 ///   position; first write is at `head + 1`. Reads the disk head to validate.
-/// - [`ExpectedVersion::Any`]: no precondition and NO disk head read — the
-///   next position comes from the authoritative in-memory cache
+/// - [`ExpectedVersion::Any`]: no precondition and NO disk head read — the next
+///   position comes from the authoritative in-memory cache
 ///   ([`DB::cached_stream_head`]), or 0 if the stream is unknown to this
 ///   process.
 fn resolve_first_stream_pos(
@@ -93,9 +89,9 @@ fn resolve_first_stream_pos(
             match get_last_stream_position(db, stream_name)? {
                 None => Ok(StreamPos::new(0)),
                 Some(key) => Err(Error::WrongStreamPosition {
-                    stream: stream_name.to_string(),
+                    stream:   stream_name.to_string(),
                     expected: None,
-                    got: Some(key.position.position()),
+                    got:      Some(key.position.position()),
                 }),
             }
         }
@@ -103,9 +99,9 @@ fn resolve_first_stream_pos(
             match get_last_stream_position(db, stream_name)? {
                 Some(key) if key.position == v => Ok(key.position.next()),
                 other => Err(Error::WrongStreamPosition {
-                    stream: stream_name.to_string(),
+                    stream:   stream_name.to_string(),
                     expected: Some(v.position()),
-                    got: other.map(|k| k.position.position()),
+                    got:      other.map(|k| k.position.position()),
                 }),
             }
         }
@@ -148,9 +144,7 @@ impl<const S: usize> WriteSerializer<S> {
                     let grown = buf.len().max(64).saturating_mul(2);
                     buf.resize(grown, 0);
                 }
-                Err(e) => {
-                    return Err(Error::SerError(format!("{what}: {e}")))
-                }
+                Err(e) => return Err(Error::SerError(format!("{what}: {e}"))),
             }
         };
         Ok(&buf[..len])
@@ -158,9 +152,7 @@ impl<const S: usize> WriteSerializer<S> {
 }
 
 impl<const S: usize> Default for WriteSerializer<S> {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
 /// Write a whole batch of events as ONE atomic `rocksdb::WriteBatch`.
@@ -240,8 +232,11 @@ pub fn write_messages(
     batch: WriteMessages,
     ser: &mut WriteSerializer,
 ) -> Result<Position> {
-    let first_stream_pos =
-        resolve_first_stream_pos(db, batch.expected_version, &batch.stream_name)?;
+    let first_stream_pos = resolve_first_stream_pos(
+        db,
+        batch.expected_version,
+        &batch.stream_name,
+    )?;
     let base_global = get_last_global_position(db)?.0;
     write_batch_records(
         db,
@@ -304,8 +299,9 @@ pub async fn write_mess_async<'a>(
 
 #[cfg(test)]
 mod test_global_key {
-    use super::*;
     use assert2::assert;
+
+    use super::*;
 
     #[test]
     fn test_from_bytes() {
@@ -329,9 +325,10 @@ mod test_global_key {
 
 #[cfg(test)]
 mod test_get_last_stream_position {
+    use assert2::assert;
+
     use super::*;
     use crate::rocks::db::test::SelfDestructingDB;
-    use assert2::assert;
 
     #[test]
     fn it_works() {
@@ -381,16 +378,14 @@ mod test_write_mess {
     use super::*;
     use crate::write::WriteEvent;
 
-    const fn ser() -> WriteSerializer {
-        WriteSerializer::new()
-    }
+    const fn ser() -> WriteSerializer { WriteSerializer::new() }
 
     fn event(payload: &[u8]) -> WriteEvent<'static> {
         WriteEvent {
-            id: Id::new(),
+            id:           Id::new(),
             message_type: "T".into(),
-            data: payload.to_vec().into(),
-            metadata: Cow::Borrowed(b""),
+            data:         payload.to_vec().into(),
+            metadata:     Cow::Borrowed(b""),
         }
     }
 
@@ -399,38 +394,38 @@ mod test_write_mess {
         let mut ser = ser();
 
         let msg = WriteMessage {
-            id: Id::new(),
-            stream_name: "stream1".into(),
-            message_type: "someMsgType".into(),
-            data: Cow::Borrowed(b"{\"a\": 1})"),
-            metadata: Cow::Borrowed(b"{\"b\": 2}"),
+            id:               Id::new(),
+            stream_name:      "stream1".into(),
+            message_type:     "someMsgType".into(),
+            data:             Cow::Borrowed(b"{\"a\": 1})"),
+            metadata:         Cow::Borrowed(b"{\"b\": 2}"),
             expected_version: ExpectedVersion::NoStream,
         };
         write_mess(&db, msg, &mut ser).unwrap();
         let msg = WriteMessage {
-            id: Id::new(),
-            stream_name: "stream2".into(),
-            message_type: "someMsgType".into(),
-            data: Cow::Borrowed(b"{\"a\": 1})"),
-            metadata: Cow::Borrowed(b"{\"b\": 2}"),
+            id:               Id::new(),
+            stream_name:      "stream2".into(),
+            message_type:     "someMsgType".into(),
+            data:             Cow::Borrowed(b"{\"a\": 1})"),
+            metadata:         Cow::Borrowed(b"{\"b\": 2}"),
             expected_version: ExpectedVersion::NoStream,
         };
         write_mess(&db, msg, &mut ser).unwrap();
         let msg = WriteMessage {
-            id: Id::new(),
-            stream_name: "stream1".into(),
-            message_type: "someMsgType".into(),
-            data: Cow::Borrowed(b"{\"a\": 1})"),
-            metadata: Cow::Borrowed(b"{\"b\": 2}"),
+            id:               Id::new(),
+            stream_name:      "stream1".into(),
+            message_type:     "someMsgType".into(),
+            data:             Cow::Borrowed(b"{\"a\": 1})"),
+            metadata:         Cow::Borrowed(b"{\"b\": 2}"),
             expected_version: ExpectedVersion::Exact(StreamPos::new(0)),
         };
         write_mess(&db, msg, &mut ser).unwrap();
         let msg = WriteMessage {
-            id: Id::new(),
-            stream_name: "stream2".into(),
-            message_type: "someMsgType".into(),
-            data: Cow::Borrowed(b"{\"a\": 1})"),
-            metadata: Cow::Borrowed(b"{\"b\": 2}"),
+            id:               Id::new(),
+            stream_name:      "stream2".into(),
+            message_type:     "someMsgType".into(),
+            data:             Cow::Borrowed(b"{\"a\": 1})"),
+            metadata:         Cow::Borrowed(b"{\"b\": 2}"),
             expected_version: ExpectedVersion::Exact(StreamPos::new(0)),
         };
         write_mess(&db, msg, &mut ser).unwrap();
@@ -443,7 +438,8 @@ mod test_write_mess {
         let bytes =
             db.get_cf(db.global(), u64::to_be_bytes(1)).unwrap().unwrap();
 
-        // let x = rkyv::check_archived_root::<GlobalRecord>(&bytes[..]).unwrap();
+        // let x = rkyv::check_archived_root::<GlobalRecord>(&bytes[..]).
+        // unwrap();
         let x = GlobalRecord::from_bytes(&bytes).unwrap();
 
         assert!(x.stream_name == "stream1");
@@ -457,13 +453,13 @@ mod test_write_mess {
         let bytes = db
             .get_cf(
                 db.stream(),
-                StreamKey::new("stream1".into(), StreamPos::new(0))
-                    .as_bytes(),
+                StreamKey::new("stream1".into(), StreamPos::new(0)).as_bytes(),
             )
             .unwrap()
             .unwrap();
 
-        // let x = rkyv::check_archived_root::<StreamRecord>(&bytes[..]).unwrap();
+        // let x = rkyv::check_archived_root::<StreamRecord>(&bytes[..]).
+        // unwrap();
         let x = StreamRecord::from_bytes(&bytes).unwrap();
 
         assert!(x.message_type == "someMsgType");
@@ -476,11 +472,11 @@ mod test_write_mess {
         let mut ser = ser();
         let data = vec![7u8; 64 * 1024];
         let msg = WriteMessage {
-            id: Id::new(),
-            stream_name: "big".into(),
-            message_type: "BigType".into(),
-            data: data.clone().into(),
-            metadata: Cow::Borrowed(b"{}"),
+            id:               Id::new(),
+            stream_name:      "big".into(),
+            message_type:     "BigType".into(),
+            data:             data.clone().into(),
+            metadata:         Cow::Borrowed(b"{}"),
             expected_version: ExpectedVersion::NoStream,
         };
         write_mess(&db, msg, &mut ser).unwrap();
@@ -499,11 +495,11 @@ mod test_write_mess {
         let db1 = setup();
         let db2 = SelfDestructingDB::new_tmp();
         let msg = WriteMessage {
-            id: Id::new(),
-            stream_name: "stream1".into(),
-            message_type: "someMsgType".into(),
-            data: Cow::Borrowed(b"{\"a\": 1}"),
-            metadata: Cow::Borrowed(b"{\"b\": 2}"),
+            id:               Id::new(),
+            stream_name:      "stream1".into(),
+            message_type:     "someMsgType".into(),
+            data:             Cow::Borrowed(b"{\"a\": 1}"),
+            metadata:         Cow::Borrowed(b"{\"b\": 2}"),
             expected_version: ExpectedVersion::NoStream,
         };
         let mut ser = ser();
@@ -516,11 +512,11 @@ mod test_write_mess {
     fn writing_stream_pos_out_of_order_fails() {
         let db = SelfDestructingDB::new_tmp();
         let msg1 = WriteMessage {
-            id: Id::new(),
-            stream_name: "stream1".into(),
-            message_type: "someMsgType".into(),
-            data: Cow::Borrowed(b"{\"a\": 1})"),
-            metadata: Cow::Borrowed(b"{\"b\": 2}"),
+            id:               Id::new(),
+            stream_name:      "stream1".into(),
+            message_type:     "someMsgType".into(),
+            data:             Cow::Borrowed(b"{\"a\": 1})"),
+            metadata:         Cow::Borrowed(b"{\"b\": 2}"),
             expected_version: ExpectedVersion::NoStream,
         };
         let mut msg2 = msg1.clone();
@@ -544,9 +540,9 @@ mod test_write_mess {
         let db = SelfDestructingDB::new_tmp();
         let mut ser = ser();
         let batch = WriteMessages {
-            stream_name: "s1".into(),
+            stream_name:      "s1".into(),
             expected_version: ExpectedVersion::NoStream,
-            events: (0..4).map(|i| event(&[i as u8])).collect(),
+            events:           (0..4).map(|i| event(&[i as u8])).collect(),
         };
         let pos = write_messages(&db, batch, &mut ser).unwrap();
         // Position reported is the last event's.
@@ -585,9 +581,9 @@ mod test_write_mess {
         // Prime the stream (warms the head cache). This NoStream append costs
         // exactly one stream-head read (its validation read).
         let prime = WriteMessages {
-            stream_name: "s1".into(),
+            stream_name:      "s1".into(),
             expected_version: ExpectedVersion::NoStream,
-            events: vec![event(b"prime")],
+            events:           vec![event(b"prime")],
         };
         write_messages(&db, prime, &mut ser).unwrap();
         let reads_before = db.stream_head_reads();
@@ -595,9 +591,9 @@ mod test_write_mess {
 
         // Any-mode multi-event append: must not touch the disk head at all.
         let batch = WriteMessages {
-            stream_name: "s1".into(),
+            stream_name:      "s1".into(),
             expected_version: ExpectedVersion::Any,
-            events: (0..3).map(|i| event(&[i as u8])).collect(),
+            events:           (0..3).map(|i| event(&[i as u8])).collect(),
         };
         let pos = write_messages(&db, batch, &mut ser).unwrap();
 
@@ -611,9 +607,9 @@ mod test_write_mess {
         let db = SelfDestructingDB::new_tmp();
         let mut ser = ser();
         let batch = WriteMessages {
-            stream_name: "fresh".into(),
+            stream_name:      "fresh".into(),
             expected_version: ExpectedVersion::Any,
-            events: (0..2).map(|i| event(&[i as u8])).collect(),
+            events:           (0..2).map(|i| event(&[i as u8])).collect(),
         };
         let pos = write_messages(&db, batch, &mut ser).unwrap();
         assert!(db.stream_head_reads() == 0);
@@ -626,9 +622,9 @@ mod test_write_mess {
         let mut ser = ser();
         // Exact(5) on an empty stream can never match -> whole batch rejected.
         let batch = WriteMessages {
-            stream_name: "s1".into(),
+            stream_name:      "s1".into(),
             expected_version: ExpectedVersion::Exact(StreamPos::new(5)),
-            events: (0..3).map(|i| event(&[i as u8])).collect(),
+            events:           (0..3).map(|i| event(&[i as u8])).collect(),
         };
         let err = write_messages(&db, batch, &mut ser).unwrap_err();
         assert!(let Error::WrongStreamPosition { .. } = err);

@@ -23,12 +23,12 @@ pub const DEFAULT_STREAM_HEADS_LIMIT: usize = 20;
 #[derive(Debug, Default, Clone)]
 pub struct InspectOptions {
     /// Restrict the segment overview to this segment id.
-    pub segment: Option<u64>,
+    pub segment:     Option<u64>,
     /// Restrict the stream-head overview to one stream, by its interned
     /// numeric id (e.g. `"7"`) or its registered name (e.g. `"user-42"`).
     /// Name matching requires the metadata registry to be readable (not
     /// blocked by a live writer's lock); see the `registry.available` field.
-    pub stream: Option<String>,
+    pub stream:      Option<String>,
     /// Disable the default `text`/`pretty` truncation of `stream_heads` and
     /// show every entry. No effect on `--format json`, which is always
     /// complete.
@@ -107,7 +107,8 @@ pub fn run(dir: &Path, opts: &InspectOptions) -> Report {
                     // durable age signal available offline (there is no
                     // per-segment start timestamp in the header).
                     if let Some(age) = file_age_secs(&seg.log_path) {
-                        active_age_secs = Some(active_age_secs.map_or(age, |a| a.max(age)));
+                        active_age_secs =
+                            Some(active_age_secs.map_or(age, |a| a.max(age)));
                     }
                 }
                 report.push_row(json!({
@@ -156,11 +157,12 @@ pub fn run(dir: &Path, opts: &InspectOptions) -> Report {
     );
     report.advise(
         "metrics-scope",
-        "runtime metrics (fdatasync p50/p95/p99, degradation flag, block-cache \
-         hit rate, subscription lag) are in-process only, exposed by \
-         LogEngine::metrics() in the writer process; `mess inspect` opens \
-         read-only from a separate process and reports only offline-observable \
-         shape (segment sizes/ages/counts). See docs/spec/03-durability.md §2.6.",
+        "runtime metrics (fdatasync p50/p95/p99, degradation flag, \
+         block-cache hit rate, subscription lag) are in-process only, exposed \
+         by LogEngine::metrics() in the writer process; `mess inspect` opens \
+         read-only from a separate process and reports only \
+         offline-observable shape (segment sizes/ages/counts). See \
+         docs/spec/03-durability.md §2.6.",
     );
 
     // Stream heads and registry — from the durable metadata store when it can
@@ -220,7 +222,8 @@ pub fn run(dir: &Path, opts: &InspectOptions) -> Report {
         // registry.stream_names/type_names/snapshots are just as unbounded at
         // app scale as stream_heads (bn-1yz) — one row per stream/event-type
         // ever seen. Cap all four listings together under one flag.
-        report.limit_display("registry.stream_names", DEFAULT_STREAM_HEADS_LIMIT);
+        report
+            .limit_display("registry.stream_names", DEFAULT_STREAM_HEADS_LIMIT);
         report.limit_display("registry.type_names", DEFAULT_STREAM_HEADS_LIMIT);
         report.limit_display("registry.snapshots", DEFAULT_STREAM_HEADS_LIMIT);
     }
@@ -242,7 +245,9 @@ pub fn run(dir: &Path, opts: &InspectOptions) -> Report {
     // deterministic tiebreak, so a `text`/`pretty` truncation shows the most
     // active streams first — see `DEFAULT_STREAM_HEADS_LIMIT`.
     let mut heads_all: Vec<(u64, u64)> = stream_heads.into_iter().collect();
-    heads_all.sort_by(|(sid_a, v_a), (sid_b, v_b)| v_b.cmp(v_a).then(sid_a.cmp(sid_b)));
+    heads_all.sort_by(|(sid_a, v_a), (sid_b, v_b)| {
+        v_b.cmp(v_a).then(sid_a.cmp(sid_b))
+    });
 
     let heads: Vec<_> = heads_all
         .iter()
@@ -278,6 +283,8 @@ fn lock_json(lock: &LockState) -> serde_json::Value {
     match lock {
         LockState::Free => json!({ "state": "free" }),
         LockState::Held { pid } => json!({ "state": "held", "pid": pid }),
-        LockState::Unknown { reason } => json!({ "state": "unknown", "reason": reason }),
+        LockState::Unknown { reason } => {
+            json!({ "state": "unknown", "reason": reason })
+        }
     }
 }

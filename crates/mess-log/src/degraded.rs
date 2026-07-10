@@ -15,12 +15,11 @@
 //! 1. **Fail-fast writes.** Every subsequent append fails with a typed
 //!    `StorePoisoned` — the committer never writes atop an indeterminate
 //!    durable state.
-//! 2. **Degraded reads.** Reads remain *allowed*, but the durable watermark
-//!    is frozen at the last known-durable position (the committer stops
-//!    advancing it), so a reader can only ever serve the pre-poison committed
-//!    prefix. A reader holding this [`Degraded`] handle can additionally
-//!    *observe* that it is reading a degraded store (`is_poisoned`) rather
-//!    than a live one.
+//! 2. **Degraded reads.** Reads remain *allowed*, but the durable watermark is
+//!    frozen at the last known-durable position (the committer stops advancing
+//!    it), so a reader can only ever serve the pre-poison committed prefix. A
+//!    reader holding this [`Degraded`] handle can additionally *observe* that
+//!    it is reading a degraded store (`is_poisoned`) rather than a live one.
 //! 3. **Sticky for the store's lifetime.** The flag is set once and never
 //!    cleared. There is no reset API. **The only exit is process restart +
 //!    recovery** ([`docs/spec/02-recovery.md`]): a fresh open re-scans the
@@ -119,9 +118,7 @@ pub struct Degraded {
 
 impl Degraded {
     /// A fresh, healthy state.
-    pub fn new() -> Self {
-        Degraded::default()
-    }
+    pub fn new() -> Self { Degraded::default() }
 
     /// Whether a barrier has poisoned this store. Once `true`, always `true`
     /// (sticky for the store's lifetime; the only exit is restart + recovery).
@@ -143,7 +140,12 @@ impl Degraded {
     /// store from healthy to poisoned.
     pub fn poison(&self, cause: PoisonCause) -> bool {
         self.state
-            .compare_exchange(0, cause.code(), Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(
+                0,
+                cause.code(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .is_ok()
     }
 }
@@ -165,7 +167,10 @@ mod tests {
         // An error with no raw os code (e.g. a synthetic `Interrupted`) is
         // still a barrier failure → still poison, classified `Other`.
         assert_eq!(
-            PoisonCause::classify(&io::Error::new(io::ErrorKind::Interrupted, "x")),
+            PoisonCause::classify(&io::Error::new(
+                io::ErrorKind::Interrupted,
+                "x"
+            )),
             PoisonCause::Other
         );
         // An unusual errno that is neither ENOSPC nor EIO also falls to Other.
@@ -185,14 +190,24 @@ mod tests {
     #[test]
     fn poison_is_sticky_and_first_cause_wins() {
         let d = Degraded::new();
-        assert!(d.poison(PoisonCause::Eio), "first poison transitions the store");
+        assert!(
+            d.poison(PoisonCause::Eio),
+            "first poison transitions the store"
+        );
         assert!(d.is_poisoned());
         assert_eq!(d.cause(), Some(PoisonCause::Eio));
 
         // A second poison (even a different cause) is a no-op: the store is
         // already poisoned and the original cause is preserved. No reset.
-        assert!(!d.poison(PoisonCause::Enospc), "second poison does not re-transition");
-        assert_eq!(d.cause(), Some(PoisonCause::Eio), "first cause is retained");
+        assert!(
+            !d.poison(PoisonCause::Enospc),
+            "second poison does not re-transition"
+        );
+        assert_eq!(
+            d.cause(),
+            Some(PoisonCause::Eio),
+            "first cause is retained"
+        );
         assert!(d.is_poisoned());
     }
 

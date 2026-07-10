@@ -3,8 +3,8 @@
 //! measures build and query cost, and checks:
 //!
 //! 1. Zero false negatives across every present key.
-//! 2. False-positive rate over a large absent-key sample stays well under
-//!    1% (the round-3 spike measured ~0.002% at this key count).
+//! 2. False-positive rate over a large absent-key sample stays well under 1%
+//!    (the round-3 spike measured ~0.002% at this key count).
 //! 3. Build and query cost are recorded (printed here; copied into
 //!    `sealed::filter`'s module docs).
 //!
@@ -45,7 +45,10 @@ fn filter_build_query_cost_and_fpr_at_scale() {
     // No false negatives.
     let t = Instant::now();
     for &id in &ids {
-        assert!(filter.might_contain(id), "false negative for present key {id}");
+        assert!(
+            filter.might_contain(id),
+            "false negative for present key {id}"
+        );
     }
     let hit_query_time = t.elapsed() / ids.len() as u32;
 
@@ -68,9 +71,18 @@ fn filter_build_query_cost_and_fpr_at_scale() {
 
     eprintln!("--- bn-1i7 filter scale ({N_STREAMS} stream ids) ---");
     eprintln!("build time                 : {build_time:?}");
-    eprintln!("serialized size            : {} bytes ({:.3} B/key)", bytes.len(), bytes.len() as f64 / N_STREAMS as f64);
-    eprintln!("query (present / absent)   : {hit_query_time:?} / {miss_query_time:?}");
-    eprintln!("false positive rate        : {false_positives}/{checked} = {:.5}%", fpr * 100.0);
+    eprintln!(
+        "serialized size            : {} bytes ({:.3} B/key)",
+        bytes.len(),
+        bytes.len() as f64 / N_STREAMS as f64
+    );
+    eprintln!(
+        "query (present / absent)   : {hit_query_time:?} / {miss_query_time:?}"
+    );
+    eprintln!(
+        "false positive rate        : {false_positives}/{checked} = {:.5}%",
+        fpr * 100.0
+    );
 
     assert!(fpr < 0.01, "FPR sanity band exceeded: {fpr}");
 
@@ -79,6 +91,9 @@ fn filter_build_query_cost_and_fpr_at_scale() {
     // form answers identically.
     let reopened = SegmentFilter::from_bytes(&bytes).unwrap();
     for &id in &ids {
-        assert!(reopened.might_contain(id), "false negative after round-trip for {id}");
+        assert!(
+            reopened.might_contain(id),
+            "false negative after round-trip for {id}"
+        );
     }
 }

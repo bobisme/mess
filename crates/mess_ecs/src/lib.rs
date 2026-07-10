@@ -17,11 +17,9 @@
 //! code owned elsewhere). This crate is left in place, deprecated, so the
 //! workspace keeps building; deleting it (and `crates/mess`'s re-export
 //! together) is a small, self-contained follow-up.
-#![deprecated(
-    note = "superseded by mess-core/mess-store/mess-derive (the v1 API); \
-            see the module docs for why this crate was kept rather than \
-            deleted"
-)]
+#![deprecated(note = "superseded by mess-core/mess-store/mess-derive (the v1 \
+                      API); see the module docs for why this crate was kept \
+                      rather than deleted")]
 #![allow(deprecated)]
 #![warn(
     clippy::pedantic,
@@ -34,14 +32,15 @@ pub mod streams;
 
 use std::{borrow::Cow, convert::Into, fmt::Display, ops::Deref, sync::Arc};
 
-use crate::error::Error;
 use ident::Id;
 use mess_db::{
-    svc::ActorHandle, write::WriteMessage, Message, Position, StreamPos,
+    Message, Position, StreamPos, svc::ActorHandle, write::WriteMessage,
 };
 use parking_lot::RwLock;
 use quick_cache::sync::Cache;
 use tracing::debug;
+
+use crate::error::Error;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[repr(transparent)]
@@ -50,22 +49,16 @@ pub struct Entity(Id);
 impl Entity {
     #[must_use]
     #[inline]
-    pub fn new() -> Self {
-        Self(Id::new())
-    }
+    pub fn new() -> Self { Self(Id::new()) }
 
     #[must_use]
     #[inline]
-    pub const fn id(&self) -> Id {
-        self.0
-    }
+    pub const fn id(&self) -> Id { self.0 }
 }
 
 impl Default for Entity {
     #[inline]
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
 impl Display for Entity {
@@ -94,15 +87,13 @@ impl From<Version> for StreamPos {
 
 impl From<StreamPos> for Version {
     #[inline]
-    fn from(value: StreamPos) -> Self {
-        Self::Sequential(value.position())
-    }
+    fn from(value: StreamPos) -> Self { Self::Sequential(value.position()) }
 }
 
 #[derive(Clone, Debug)]
 pub struct Component<Data> {
     entity: Entity,
-    data: Arc<RwLock<Data>>,
+    data:   Arc<RwLock<Data>>,
 }
 
 impl<Data> Component<Data>
@@ -155,6 +146,7 @@ where
     Data: ApplyEvents,
 {
     type Event = <Data as ApplyEvents>::Event;
+
     #[inline]
     fn apply_events(&mut self, events: impl Iterator<Item = Self::Event>) {
         let mut data = self.data.write_arc();
@@ -185,25 +177,19 @@ pub struct ComponentCache<Data> {
 impl<Data> ComponentCache<Data> {
     #[must_use]
     #[inline]
-    pub fn new() -> Self {
-        Self { cache: Cache::new(10_000) }
-    }
+    pub fn new() -> Self { Self { cache: Cache::new(10_000) } }
 }
 
 impl<Data> Default for ComponentCache<Data> {
     #[inline]
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
 impl<Data> Deref for ComponentCache<Data> {
     type Target = Cache<Entity, Arc<RwLock<Data>>>;
 
     #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.cache
-    }
+    fn deref(&self) -> &Self::Target { &self.cache }
 }
 
 pub struct EventDB {
@@ -213,9 +199,7 @@ pub struct EventDB {
 impl EventDB {
     #[must_use]
     #[inline]
-    pub fn new(db_actor: ActorHandle) -> Self {
-        Self { db_actor }
-    }
+    pub fn new(db_actor: ActorHandle) -> Self { Self { db_actor } }
 
     /// Write the given event as a message in the database.
     ///
@@ -253,7 +237,7 @@ impl EventDB {
 
 // pub struct ComponentStore<Data, Conn> {
 pub struct ComponentStore<Data, Db> {
-    cache: ComponentCache<Data>,
+    cache:    ComponentCache<Data>,
     event_db: Db,
 }
 
@@ -264,6 +248,7 @@ impl<Data, Db: AsRef<EventDB>> ComponentStore<Data, Db> {
     pub fn new(event_db: Db) -> Self {
         Self { cache: ComponentCache::new(), event_db }
     }
+
     /// Fetch messages from the event store.
     ///
     /// # Errors

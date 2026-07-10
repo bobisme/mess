@@ -34,9 +34,9 @@ pub enum Error {
         got
     )]
     WrongStreamPosition {
-        stream: String,
+        stream:   String,
         expected: Option<u64>,
-        got: Option<u64>,
+        got:      Option<u64>,
     },
     // #[error("the data for key `{0}` is not available")]
     // Redaction(String),

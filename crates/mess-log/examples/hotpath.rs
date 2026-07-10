@@ -89,6 +89,4 @@ fn time(mut body: impl FnMut()) -> f64 {
     t.elapsed().as_secs_f64()
 }
 
-fn nanos_per(secs: f64) -> f64 {
-    secs / ITERS as f64 * 1e9
-}
+fn nanos_per(secs: f64) -> f64 { secs / ITERS as f64 * 1e9 }

@@ -71,7 +71,10 @@ fn overdraw_is_rejected_with_exact_amounts() {
         AccountEvent::Withdrawn { amount: 20 },
     ])
     .when(Withdraw { amount: 100 })
-    .then_error(AccountError::InsufficientFunds { balance: 30, requested: 100 });
+    .then_error(AccountError::InsufficientFunds {
+        balance:   30,
+        requested: 100,
+    });
 }
 
 /// `then_error` also accepts a labeled predicate via `matching`, for

@@ -39,7 +39,8 @@ async fn happy_path_roundtrip() -> Result<(), WriteError> {
     assert_eq!(alice_state.handle, "alice");
     assert!(alice_state.following.contains(&bob));
 
-    let post_state = store.load::<Post>(&post_stream(post)).await.unwrap().state;
+    let post_state =
+        store.load::<Post>(&post_stream(post)).await.unwrap().state;
     assert!(post_state.created);
     assert!(post_state.deleted);
     assert_eq!(post_state.author, Some(bob));

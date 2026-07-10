@@ -10,13 +10,9 @@ use ident::Id;
 struct StrPos(AtomicU16);
 
 impl StrPos {
-    pub const fn new(val: u16) -> Self {
-        Self(AtomicU16::new(val + 1))
-    }
+    pub const fn new(val: u16) -> Self { Self(AtomicU16::new(val + 1)) }
 
-    pub const fn none() -> Self {
-        Self(AtomicU16::new(0))
-    }
+    pub const fn none() -> Self { Self(AtomicU16::new(0)) }
 
     pub fn pos(&self) -> Option<u16> {
         let x = self.0.load(Ordering::Acquire);
@@ -26,16 +22,12 @@ impl StrPos {
         Some(x - 1)
     }
 
-    pub fn set(&self, val: u16) {
-        self.0.store(val + 1, Ordering::SeqCst);
-    }
+    pub fn set(&self, val: u16) { self.0.store(val + 1, Ordering::SeqCst); }
 }
 impl Eq for StrPos {}
 impl std::cmp::Ord for StrPos {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0
-            .load(Ordering::SeqCst)
-            .cmp(&other.0.load(Ordering::SeqCst))
+        self.0.load(Ordering::SeqCst).cmp(&other.0.load(Ordering::SeqCst))
     }
 }
 
@@ -81,7 +73,7 @@ impl PartialEq for StrPos {
 
 #[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StreamName<'a> {
-    source: Cow<'a, str>,
+    source:   Cow<'a, str>,
     id_split: StrPos,
     ex_split: StrPos,
 }
@@ -129,7 +121,7 @@ impl<'a> StreamName<'a> {
         #[allow(clippy::cast_possible_truncation)]
         let id_split = component.len() as u16;
         Self {
-            source: source.into(),
+            source:   source.into(),
             id_split: StrPos::new(id_split),
             ex_split: StrPos::none(),
         }
@@ -161,9 +153,7 @@ impl<'a> StreamName<'a> {
 
     #[inline]
     #[must_use]
-    pub fn source(&self) -> &str {
-        &self.source
-    }
+    pub fn source(&self) -> &str { &self.source }
 
     #[inline]
     #[must_use]
@@ -218,9 +208,10 @@ const _: () = {
 
 #[cfg(test)]
 mod test_streamname {
-    use super::*;
     use assert2::assert;
     use rstest::*;
+
+    use super::*;
 
     #[rstest]
     #[case("stream-1234", "stream")]

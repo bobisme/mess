@@ -64,7 +64,10 @@ pub fn batch_crc(batch: &[u8]) -> u32 {
         "batch shorter than MIN_BATCH_LEN cannot carry both checksum fields",
     );
     // [0, 68) then [72, total_len - 4): split AROUND the two crc fields.
-    crc32c_two(&batch[..HEADER_CRC_OFF], &batch[HEADER_CRC_OFF + 4..total_len - 4])
+    crc32c_two(
+        &batch[..HEADER_CRC_OFF],
+        &batch[HEADER_CRC_OFF + 4..total_len - 4],
+    )
 }
 
 #[cfg(test)]
@@ -78,7 +81,11 @@ mod tests {
     #[test]
     fn castagnoli_check_value() {
         assert_eq!(crc32c::crc32c(b"123456789"), 0xE306_9283);
-        assert_ne!(crc32c::crc32c(b"123456789"), 0xCBF4_3926, "that is CRC-32/ISO, wrong polynomial");
+        assert_ne!(
+            crc32c::crc32c(b"123456789"),
+            0xCBF4_3926,
+            "that is CRC-32/ISO, wrong polynomial"
+        );
     }
 
     /// `crc32c_two` is exactly the CRC of the concatenation.
@@ -100,7 +107,8 @@ mod tests {
         let mut batch = vec![0xABu8; 128];
         // Put non-zero sentinels in the two checksum fields so the difference
         // is real regardless of surrounding bytes.
-        batch[HEADER_CRC_OFF..HEADER_CRC_OFF + 4].copy_from_slice(&[1, 2, 3, 4]);
+        batch[HEADER_CRC_OFF..HEADER_CRC_OFF + 4]
+            .copy_from_slice(&[1, 2, 3, 4]);
         let n = batch.len();
         batch[n - 4..].copy_from_slice(&[5, 6, 7, 8]);
 
@@ -112,6 +120,9 @@ mod tests {
         zeroed[n - 4..].fill(0);
         let copy_and_zero = crc32c::crc32c(&zeroed);
 
-        assert_ne!(split, copy_and_zero, "R4 split must diverge from copy-and-zero");
+        assert_ne!(
+            split, copy_and_zero,
+            "R4 split must diverge from copy-and-zero"
+        );
     }
 }

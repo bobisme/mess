@@ -8,8 +8,9 @@
 use std::collections::HashMap;
 
 use super::{
-    ENC_DELTA, ENC_RAW, FLAG_COLUMNAR, FLAG_PERCOL, K_BOOL, K_INT, K_STR, MAX_BLOCK_EVENTS,
-    COLUMNAR_VERSION, emit_int, emit_str_header, varint_len, write_varint, zz,
+    COLUMNAR_VERSION, ENC_DELTA, ENC_RAW, FLAG_COLUMNAR, FLAG_PERCOL, K_BOOL,
+    K_INT, K_STR, MAX_BLOCK_EVENTS, emit_int, emit_str_header, varint_len,
+    write_varint, zz,
 };
 
 /// Depth limit for nested maps/arrays; deeper input falls back to raw.
@@ -35,7 +36,7 @@ type Shred<T> = Result<T, Unshreddable>;
 #[derive(Clone, Copy, Debug)]
 pub struct EncodeOpts {
     /// zstd level for block/column compression (round-4 default: 9).
-    pub level: i32,
+    pub level:      i32,
     /// Emit the per-column layout (each column its own zstd frame) so single
     /// point reads decompress only the columns they touch. `false` (default)
     /// emits the whole-block layout, which packs tighter.
@@ -43,9 +44,7 @@ pub struct EncodeOpts {
 }
 
 impl Default for EncodeOpts {
-    fn default() -> Self {
-        EncodeOpts { level: 9, per_column: false }
-    }
+    fn default() -> Self { EncodeOpts { level: 9, per_column: false } }
 }
 
 // ---------------------------------------------------------------------------
@@ -55,8 +54,8 @@ impl Default for EncodeOpts {
 #[derive(PartialEq, Eq, Hash)]
 struct PathKey {
     parent: u32,
-    tlen: u8,
-    token: [u8; MAX_TOKEN],
+    tlen:   u8,
+    token:  [u8; MAX_TOKEN],
 }
 
 /// One event's ops, recorded as byte ranges into the event during parse.
@@ -73,8 +72,8 @@ enum ROp {
 
 #[derive(Default)]
 struct ColAcc {
-    kind: u8,
-    ints: Vec<i64>,
+    kind:  u8,
+    ints:  Vec<i64>,
     bytes: Vec<u8>,
 }
 
@@ -82,30 +81,30 @@ struct ColAcc {
 /// between blocks. Block-local: skeletons and columns are interned per block
 /// so every emitted block is self-describing.
 struct Shredder {
-    trie: HashMap<PathKey, u32>,
+    trie:     HashMap<PathKey, u32>,
     node_col: Vec<i32>,
-    cols: Vec<ColAcc>,
-    skels: Vec<Vec<ROp>>,
+    cols:     Vec<ColAcc>,
+    skels:    Vec<Vec<ROp>>,
     skel_lut: HashMap<Vec<u8>, u16>,
     skel_ids: Vec<u16>,
     // scratch reused across events
-    ops: Vec<OpTmp>,
-    sig: Vec<u8>,
-    canon: Vec<u8>,
+    ops:      Vec<OpTmp>,
+    sig:      Vec<u8>,
+    canon:    Vec<u8>,
 }
 
 impl Shredder {
     fn new() -> Self {
         Shredder {
-            trie: HashMap::new(),
+            trie:     HashMap::new(),
             node_col: vec![-1],
-            cols: Vec::new(),
-            skels: Vec::new(),
+            cols:     Vec::new(),
+            skels:    Vec::new(),
             skel_lut: HashMap::new(),
             skel_ids: Vec::new(),
-            ops: Vec::new(),
-            sig: Vec::new(),
-            canon: Vec::new(),
+            ops:      Vec::new(),
+            sig:      Vec::new(),
+            canon:    Vec::new(),
         }
     }
 
@@ -126,7 +125,8 @@ impl Shredder {
         if token.len() > MAX_TOKEN {
             return Err(Unshreddable);
         }
-        let mut key = PathKey { parent, tlen: token.len() as u8, token: [0; MAX_TOKEN] };
+        let mut key =
+            PathKey { parent, tlen: token.len() as u8, token: [0; MAX_TOKEN] };
         key.token[..token.len()].copy_from_slice(token);
         if let Some(&id) = self.trie.get(&key) {
             return Ok(id);
@@ -210,7 +210,9 @@ impl Shredder {
                     let rops: Vec<ROp> = ops
                         .iter()
                         .map(|op| match *op {
-                            OpTmp::Lit(a, b) => ROp::Lit(ev[a..b].to_vec().into_boxed_slice()),
+                            OpTmp::Lit(a, b) => {
+                                ROp::Lit(ev[a..b].to_vec().into_boxed_slice())
+                            }
                             OpTmp::Val(col, kind) => ROp::Val(col, kind),
                         })
                         .collect();
@@ -243,39 +245,39 @@ impl Shredder {
         let m = *ev.get(*p).ok_or(Unshreddable)?;
         match m {
             // ---- maps (keys stay verbatim in the literal run) ----
-            0x80..=0x8f => {
-                let n = (m & 0x0f) as usize;
+            0x80..=0x8F => {
+                let n = (m & 0x0F) as usize;
                 *p += 1;
                 self.parse_map(ev, p, node, depth, lit0, ops, n)
             }
-            0xde => {
+            0xDE => {
                 let n = be16(ev, *p + 1)? as usize;
                 *p += 3;
                 self.parse_map(ev, p, node, depth, lit0, ops, n)
             }
-            0xdf => {
+            0xDF => {
                 let n = be32(ev, *p + 1)? as usize;
                 *p += 5;
                 self.parse_map(ev, p, node, depth, lit0, ops, n)
             }
             // ---- arrays (headers stay verbatim in the literal run) ----
-            0x90..=0x9f => {
-                let n = (m & 0x0f) as usize;
+            0x90..=0x9F => {
+                let n = (m & 0x0F) as usize;
                 *p += 1;
                 self.parse_array(ev, p, node, depth, lit0, ops, n)
             }
-            0xdc => {
+            0xDC => {
                 let n = be16(ev, *p + 1)? as usize;
                 *p += 3;
                 self.parse_array(ev, p, node, depth, lit0, ops, n)
             }
-            0xdd => {
+            0xDD => {
                 let n = be32(ev, *p + 1)? as usize;
                 *p += 5;
                 self.parse_array(ev, p, node, depth, lit0, ops, n)
             }
             // ---- nil: a zero-data constant, kept verbatim in the literal ----
-            0xc0 => {
+            0xC0 => {
                 *p += 1;
                 Ok(())
             }
@@ -303,10 +305,10 @@ impl Shredder {
             // in the literal run verbatim, so we only skip past it here.
             let km = *ev.get(*p).ok_or(Unshreddable)?;
             let (klen, khdr) = match km {
-                0xa0..=0xbf => ((km & 0x1f) as usize, 1usize),
-                0xd9 => (*ev.get(*p + 1).ok_or(Unshreddable)? as usize, 2),
-                0xda => (be16(ev, *p + 1)? as usize, 3),
-                0xdb => (be32(ev, *p + 1)? as usize, 5),
+                0xA0..=0xBF => ((km & 0x1F) as usize, 1usize),
+                0xD9 => (*ev.get(*p + 1).ok_or(Unshreddable)? as usize, 2),
+                0xDA => (be16(ev, *p + 1)? as usize, 3),
+                0xDB => (be32(ev, *p + 1)? as usize, 5),
                 _ => return Err(Unshreddable), // non-string key
             };
             let kstart = *p + khdr;
@@ -334,7 +336,7 @@ impl Shredder {
         }
         for i in 0..n as u32 {
             let mut tok = [0u8; 5];
-            tok[0] = 0xff;
+            tok[0] = 0xFF;
             tok[1..5].copy_from_slice(&i.to_le_bytes());
             let child = self.node(node, &tok)?;
             self.parse_val(ev, p, child, depth + 1, lit0, ops)?;
@@ -358,40 +360,57 @@ impl Shredder {
             B(bool),
         }
         let (sv, end): (Sv, usize) = match m {
-            0x00..=0x7f => (Sv::I(m as i64), v0 + 1),
-            0xe0..=0xff => (Sv::I(m as i8 as i64), v0 + 1),
-            0xcc => (Sv::I(*ev.get(v0 + 1).ok_or(Unshreddable)? as i64), v0 + 2),
-            0xcd => (Sv::I(be16(ev, v0 + 1)? as i64), v0 + 3),
-            0xce => (Sv::I(be32(ev, v0 + 1)? as i64), v0 + 5),
-            0xcf => {
+            0x00..=0x7F => (Sv::I(m as i64), v0 + 1),
+            0xE0..=0xFF => (Sv::I(m as i8 as i64), v0 + 1),
+            0xCC => {
+                (Sv::I(*ev.get(v0 + 1).ok_or(Unshreddable)? as i64), v0 + 2)
+            }
+            0xCD => (Sv::I(be16(ev, v0 + 1)? as i64), v0 + 3),
+            0xCE => (Sv::I(be32(ev, v0 + 1)? as i64), v0 + 5),
+            0xCF => {
                 let u = be64(ev, v0 + 1)?;
                 if u > i64::MAX as u64 {
                     return Err(Unshreddable);
                 }
                 (Sv::I(u as i64), v0 + 9)
             }
-            0xd0 => (Sv::I(*ev.get(v0 + 1).ok_or(Unshreddable)? as i8 as i64), v0 + 2),
-            0xd1 => (Sv::I(be16(ev, v0 + 1)? as i16 as i64), v0 + 3),
-            0xd2 => (Sv::I(be32(ev, v0 + 1)? as i32 as i64), v0 + 5),
-            0xd3 => (Sv::I(be64(ev, v0 + 1)? as i64), v0 + 9),
-            0xa0..=0xbf => {
-                let l = (m & 0x1f) as usize;
-                (Sv::S(ev.get(v0 + 1..v0 + 1 + l).ok_or(Unshreddable)?), v0 + 1 + l)
+            0xD0 => (
+                Sv::I(*ev.get(v0 + 1).ok_or(Unshreddable)? as i8 as i64),
+                v0 + 2,
+            ),
+            0xD1 => (Sv::I(be16(ev, v0 + 1)? as i16 as i64), v0 + 3),
+            0xD2 => (Sv::I(be32(ev, v0 + 1)? as i32 as i64), v0 + 5),
+            0xD3 => (Sv::I(be64(ev, v0 + 1)? as i64), v0 + 9),
+            0xA0..=0xBF => {
+                let l = (m & 0x1F) as usize;
+                (
+                    Sv::S(ev.get(v0 + 1..v0 + 1 + l).ok_or(Unshreddable)?),
+                    v0 + 1 + l,
+                )
             }
-            0xd9 => {
+            0xD9 => {
                 let l = *ev.get(v0 + 1).ok_or(Unshreddable)? as usize;
-                (Sv::S(ev.get(v0 + 2..v0 + 2 + l).ok_or(Unshreddable)?), v0 + 2 + l)
+                (
+                    Sv::S(ev.get(v0 + 2..v0 + 2 + l).ok_or(Unshreddable)?),
+                    v0 + 2 + l,
+                )
             }
-            0xda => {
+            0xDA => {
                 let l = be16(ev, v0 + 1)? as usize;
-                (Sv::S(ev.get(v0 + 3..v0 + 3 + l).ok_or(Unshreddable)?), v0 + 3 + l)
+                (
+                    Sv::S(ev.get(v0 + 3..v0 + 3 + l).ok_or(Unshreddable)?),
+                    v0 + 3 + l,
+                )
             }
-            0xdb => {
+            0xDB => {
                 let l = be32(ev, v0 + 1)? as usize;
-                (Sv::S(ev.get(v0 + 5..v0 + 5 + l).ok_or(Unshreddable)?), v0 + 5 + l)
+                (
+                    Sv::S(ev.get(v0 + 5..v0 + 5 + l).ok_or(Unshreddable)?),
+                    v0 + 5 + l,
+                )
             }
-            0xc2 => (Sv::B(false), v0 + 1),
-            0xc3 => (Sv::B(true), v0 + 1),
+            0xC2 => (Sv::B(false), v0 + 1),
+            0xC3 => (Sv::B(true), v0 + 1),
             // floats (0xca/0xcb), bin (0xc4-c6), ext, timestamp, reserved:
             // not modeled -> raw fallback.
             _ => return Err(Unshreddable),
@@ -448,7 +467,8 @@ impl Shredder {
             .iter()
             .map(|c| match c.kind {
                 K_INT => {
-                    let raw_len: usize = c.ints.iter().map(|&v| varint_len(zz(v))).sum();
+                    let raw_len: usize =
+                        c.ints.iter().map(|&v| varint_len(zz(v))).sum();
                     let mut prev = 0i64;
                     let mut delta_len = 0usize;
                     for &v in &c.ints {
@@ -496,7 +516,11 @@ impl Shredder {
     }
 
     /// Build the uncompressed columnar image (whole-block payload).
-    fn columnar_image(&self, n_events: usize, cols: &[(u8, u8, Vec<u8>)]) -> Vec<u8> {
+    fn columnar_image(
+        &self,
+        n_events: usize,
+        cols: &[(u8, u8, Vec<u8>)],
+    ) -> Vec<u8> {
         let mut img = Vec::new();
         img.extend_from_slice(&(n_events as u16).to_le_bytes());
         img.extend_from_slice(&(self.skels.len() as u16).to_le_bytes());
@@ -539,7 +563,9 @@ impl Shredder {
         }
         let comps: Vec<Vec<u8>> = cols
             .iter()
-            .map(|(_, _, data)| zstd::bulk::compress(data, level).expect("zstd compress"))
+            .map(|(_, _, data)| {
+                zstd::bulk::compress(data, level).expect("zstd compress")
+            })
             .collect();
         for ((kind, enc, data), comp) in cols.iter().zip(&comps) {
             out.push(*kind);
@@ -603,7 +629,7 @@ fn be64(d: &[u8], a: usize) -> Shred<u64> {
 /// A reusable columnar block encoder. Amortizes the shred scratch across many
 /// blocks — the throughput path the sealer (bn-zge) will use.
 pub struct BlockEncoder {
-    sh: Shredder,
+    sh:   Shredder,
     opts: EncodeOpts,
 }
 
@@ -628,9 +654,17 @@ impl BlockEncoder {
         match self.sh.shred_all(events) {
             Ok(()) => {
                 if self.opts.per_column {
-                    self.sh.write_percol(events.len(), self.opts.level, &mut out);
+                    self.sh.write_percol(
+                        events.len(),
+                        self.opts.level,
+                        &mut out,
+                    );
                 } else {
-                    self.sh.write_whole(events.len(), self.opts.level, &mut out);
+                    self.sh.write_whole(
+                        events.len(),
+                        self.opts.level,
+                        &mut out,
+                    );
                 }
             }
             Err(Unshreddable) => write_raw(events, self.opts.level, &mut out),

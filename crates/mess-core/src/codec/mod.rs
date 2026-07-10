@@ -6,15 +6,15 @@
 //! `REPORT.md` for the full bake-off rationale). Ground truth decisions
 //! carried over verbatim:
 //!
-//! - `codec_id 1` = MessagePack, named-field mode
-//!   (`rmp_serde::to_vec_named`) — the only codec in the bake-off that is
-//!   both fast and evolution-safe. `codec_id 0` is the frozen bootstrap
-//!   codec; it is reserved here but owned/implemented by the registry
-//!   (docs/spec/04-registry.md), not this layer.
-//! - Field widths (`schema_version: u16`, `codec_id: u16`) match the
-//!   on-disk `EventSubframe` header (docs/spec/01-log-format.md).
-//! - Unknown `schema_version`/`codec_id` fail loudly with actionable
-//!   errors, never silently — see [`CodecError`] and [`UpcastError`].
+//! - `codec_id 1` = MessagePack, named-field mode (`rmp_serde::to_vec_named`) —
+//!   the only codec in the bake-off that is both fast and evolution-safe.
+//!   `codec_id 0` is the frozen bootstrap codec; it is reserved here but
+//!   owned/implemented by the registry (docs/spec/04-registry.md), not this
+//!   layer.
+//! - Field widths (`schema_version: u16`, `codec_id: u16`) match the on-disk
+//!   `EventSubframe` header (docs/spec/01-log-format.md).
+//! - Unknown `schema_version`/`codec_id` fail loudly with actionable errors,
+//!   never silently — see [`CodecError`] and [`UpcastError`].
 
 mod envelope;
 mod error;

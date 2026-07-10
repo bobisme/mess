@@ -39,9 +39,9 @@
 //!   bug — live and rebuild disagreeing on retroactive follows — cannot arise
 //!   here). The equivalence test covers exactly this case.
 //! - **Deleted posts drop from every feed, but a permalink resolves to a
-//!   tombstone.** [`ReadModels::post`] returns `None` for a deleted post
-//!   (feed semantics: it is gone), matching the trait contract and the fake.
-//!   A direct link, however, should not 404 — so the inherent
+//!   tombstone.** [`ReadModels::post`] returns `None` for a deleted post (feed
+//!   semantics: it is gone), matching the trait contract and the fake. A direct
+//!   link, however, should not 404 — so the inherent
 //!   [`Projections::lookup_post`] returns the post *including* deleted ones
 //!   with a `deleted` flag, letting a permalink handler render "this post was
 //!   deleted" with author attribution intact instead of a dead link.
@@ -81,24 +81,24 @@ const POLL: Duration = Duration::from_millis(1);
 /// One user row, folded from that user's `user-<id>` stream.
 #[derive(Debug, Default, Clone)]
 struct UserRow {
-    handle: String,
+    handle:       String,
     display_name: String,
     /// Ids this user currently follows (the follow set, mirroring the write
     /// aggregate's `following`).
-    following: HashSet<Id>,
+    following:    HashSet<Id>,
 }
 
 /// One post row, folded from that post's `post-<id>` stream.
 #[derive(Debug, Clone)]
 struct PostRow {
     /// The post's id (also its stream id, `post-<id>`, less the prefix).
-    id: Id,
-    author: Id,
-    body: String,
-    likes: HashSet<Id>,
+    id:      Id,
+    author:  Id,
+    body:    String,
+    likes:   HashSet<Id>,
     deleted: bool,
     /// Global position of the `Posted` event — the stable feed sort key.
-    seq: u64,
+    seq:     u64,
 }
 
 /// The whole in-memory read model. All queries read this behind an
@@ -106,14 +106,14 @@ struct PostRow {
 #[derive(Debug, Default)]
 struct State {
     /// user id -> folded user row.
-    users: HashMap<Id, UserRow>,
+    users:     HashMap<Id, UserRow>,
     /// handle -> user id, so handle-keyed queries are O(1).
-    handles: HashMap<String, Id>,
+    handles:   HashMap<String, Id>,
     /// target id -> the set of users following it (reverse of `following`), so
     /// `follower_count` is O(1) rather than a full scan.
     followers: HashMap<Id, HashSet<Id>>,
     /// post id -> folded post row.
-    posts: HashMap<Id, PostRow>,
+    posts:     HashMap<Id, PostRow>,
 }
 
 impl State {
@@ -210,14 +210,14 @@ impl State {
             .map(|u| (u.handle.clone(), u.display_name.clone()))
             .unwrap_or_default();
         PostView {
-            id: p.id,
-            author_id: p.author,
-            author_handle: handle,
+            id:             p.id,
+            author_id:      p.author,
+            author_handle:  handle,
             author_display: display,
-            body: p.body.clone(),
-            likes: p.likes.len() as u64,
-            liked_by_me: viewer.is_some_and(|v| p.likes.contains(&v)),
-            created_seq: p.seq,
+            body:           p.body.clone(),
+            likes:          p.likes.len() as u64,
+            liked_by_me:    viewer.is_some_and(|v| p.likes.contains(&v)),
+            created_seq:    p.seq,
         }
     }
 
@@ -270,7 +270,7 @@ pub struct PostLookup {
     /// The rendered post. For a deleted post the fields are still populated
     /// (author attribution survives); a handler chooses whether to show
     /// `view.body` based on `deleted`.
-    pub view: PostView,
+    pub view:    PostView,
     /// Whether this post has been deleted (a tombstone).
     pub deleted: bool,
 }
@@ -283,22 +283,20 @@ pub struct PostLookup {
 /// Share it behind an `Arc` if several handlers need it.
 #[derive(Debug)]
 pub struct Projections<B: Backend> {
-    state: Arc<RwLock<State>>,
+    state:    Arc<RwLock<State>>,
     /// The read watermark: the number of global events applied, i.e. one past
     /// the highest global position folded in. `wait_for(p)` waits for this to
     /// exceed `p`.
-    applied: Arc<AtomicU64>,
+    applied:  Arc<AtomicU64>,
     /// Pulsed after every batch the pump applies, so `wait_for` waiters wake.
-    notify: Arc<Notify>,
+    notify:   Arc<Notify>,
     /// The live pump; aborted on drop.
-    pump: tokio::task::JoinHandle<()>,
+    pump:     tokio::task::JoinHandle<()>,
     _backend: PhantomData<B>,
 }
 
 impl<B: Backend> Drop for Projections<B> {
-    fn drop(&mut self) {
-        self.pump.abort();
-    }
+    fn drop(&mut self) { self.pump.abort(); }
 }
 
 impl<B: Backend + Clone> Projections<B> {
@@ -369,7 +367,7 @@ impl<B: Backend + Clone> Projections<B> {
     ) -> Option<PostLookup> {
         let st = self.state.read().await;
         st.posts.get(&id).map(|p| PostLookup {
-            view: st.view_of(p, viewer),
+            view:    st.view_of(p, viewer),
             deleted: p.deleted,
         })
     }
@@ -377,9 +375,7 @@ impl<B: Backend + Clone> Projections<B> {
 
 /// The watermark for a "last applied global position" cursor: one past it, or
 /// 0 when nothing has been applied.
-fn watermark_of(after: Option<u64>) -> u64 {
-    after.map_or(0, |p| p + 1)
-}
+fn watermark_of(after: Option<u64>) -> u64 { after.map_or(0, |p| p + 1) }
 
 /// The live pump: page `read_global` from `after`, apply each event, advance
 /// the watermark, and pulse waiters — sleeping briefly whenever the log is
@@ -477,11 +473,9 @@ impl<B: Backend> ReadModels for Projections<B> {
         let st = self.state.read().await;
         let id = *st.handles.get(handle)?;
         let u = st.users.get(&id)?;
-        let post_count = st
-            .posts
-            .values()
-            .filter(|p| !p.deleted && p.author == id)
-            .count() as u64;
+        let post_count =
+            st.posts.values().filter(|p| !p.deleted && p.author == id).count()
+                as u64;
         let follower_count =
             st.followers.get(&id).map_or(0, HashSet::len) as u64;
         let followed_by_me = viewer.is_some_and(|v| {
@@ -499,10 +493,7 @@ impl<B: Backend> ReadModels for Projections<B> {
 
     async fn post(&self, id: Id, viewer: Option<Id>) -> Option<PostView> {
         let st = self.state.read().await;
-        st.posts
-            .get(&id)
-            .filter(|p| !p.deleted)
-            .map(|p| st.view_of(p, viewer))
+        st.posts.get(&id).filter(|p| !p.deleted).map(|p| st.view_of(p, viewer))
     }
 
     async fn resolve(&self, handle: &str) -> Option<Id> {

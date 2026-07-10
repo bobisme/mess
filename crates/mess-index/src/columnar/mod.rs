@@ -159,7 +159,7 @@ pub fn write_varint(out: &mut Vec<u8>, mut v: u64) {
             out.push(v as u8);
             return;
         }
-        out.push((v as u8 & 0x7f) | 0x80);
+        out.push((v as u8 & 0x7F) | 0x80);
         v >>= 7;
     }
 }
@@ -177,7 +177,7 @@ pub fn read_varint(d: &[u8], p: &mut usize) -> Option<u64> {
         if shift >= 64 {
             return None;
         }
-        v |= ((b & 0x7f) as u64) << shift;
+        v |= ((b & 0x7F) as u64) << shift;
         if b & 0x80 == 0 {
             return Some(v);
         }
@@ -188,24 +188,16 @@ pub fn read_varint(d: &[u8], p: &mut usize) -> Option<u64> {
 /// Byte length of `v` as an unsigned varint.
 #[inline]
 pub fn varint_len(v: u64) -> usize {
-    if v == 0 {
-        1
-    } else {
-        (64 - v.leading_zeros() as usize).div_ceil(7)
-    }
+    if v == 0 { 1 } else { (64 - v.leading_zeros() as usize).div_ceil(7) }
 }
 
 /// Zigzag encode `i64 -> u64`.
 #[inline]
-pub fn zz(v: i64) -> u64 {
-    ((v << 1) ^ (v >> 63)) as u64
-}
+pub fn zz(v: i64) -> u64 { ((v << 1) ^ (v >> 63)) as u64 }
 
 /// Zigzag decode `u64 -> i64`.
 #[inline]
-pub fn unzz(u: u64) -> i64 {
-    ((u >> 1) as i64) ^ -((u & 1) as i64)
-}
+pub fn unzz(u: u64) -> i64 { ((u >> 1) as i64) ^ -((u & 1) as i64) }
 
 // ---------------------------------------------------------------------------
 // Minimal MessagePack scalar encoders (mirror rmp's write_uint/write_sint/
@@ -220,31 +212,31 @@ pub fn emit_int(out: &mut Vec<u8>, v: i64) {
         if u < 0x80 {
             out.push(u as u8);
         } else if u < 0x100 {
-            out.push(0xcc);
+            out.push(0xCC);
             out.push(u as u8);
         } else if u < 0x1_0000 {
-            out.push(0xcd);
+            out.push(0xCD);
             out.extend_from_slice(&(u as u16).to_be_bytes());
         } else if u < 0x1_0000_0000 {
-            out.push(0xce);
+            out.push(0xCE);
             out.extend_from_slice(&(u as u32).to_be_bytes());
         } else {
-            out.push(0xcf);
+            out.push(0xCF);
             out.extend_from_slice(&u.to_be_bytes());
         }
     } else if v >= -32 {
         out.push(v as u8);
     } else if v >= -128 {
-        out.push(0xd0);
+        out.push(0xD0);
         out.push(v as u8);
     } else if v >= -32768 {
-        out.push(0xd1);
+        out.push(0xD1);
         out.extend_from_slice(&(v as i16).to_be_bytes());
     } else if v >= -(1i64 << 31) {
-        out.push(0xd2);
+        out.push(0xD2);
         out.extend_from_slice(&(v as i32).to_be_bytes());
     } else {
-        out.push(0xd3);
+        out.push(0xD3);
         out.extend_from_slice(&v.to_be_bytes());
     }
 }
@@ -253,15 +245,15 @@ pub fn emit_int(out: &mut Vec<u8>, v: i64) {
 #[inline]
 pub fn emit_str_header(out: &mut Vec<u8>, len: usize) {
     if len < 32 {
-        out.push(0xa0 | len as u8);
+        out.push(0xA0 | len as u8);
     } else if len < 256 {
-        out.push(0xd9);
+        out.push(0xD9);
         out.push(len as u8);
     } else if len < 0x1_0000 {
-        out.push(0xda);
+        out.push(0xDA);
         out.extend_from_slice(&(len as u16).to_be_bytes());
     } else {
-        out.push(0xdb);
+        out.push(0xDB);
         out.extend_from_slice(&(len as u32).to_be_bytes());
     }
 }

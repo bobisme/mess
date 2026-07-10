@@ -65,12 +65,12 @@ pub struct SkipEntry {
     /// `first_version` of the checkpoint batch — the binary-search key.
     pub first_version: u64,
     /// Absolute byte offset of the checkpoint batch within the segment.
-    pub offset: u64,
+    pub offset:        u64,
     /// Absolute A1 global position of the checkpoint batch's first event.
-    pub global: u64,
+    pub global:        u64,
     /// Byte offset into the pointer block's varint stream at the checkpoint
     /// batch (i.e. where that batch's `first_version` delta begins).
-    pub byte_off: u32,
+    pub byte_off:      u32,
 }
 
 /// On-disk size of a [`SkipEntry`]: `u64 + u64 + u64 + u32`.
@@ -81,13 +81,13 @@ pub const SKIP_ENTRY_LEN: usize = 8 + 8 + 8 + 4;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BatchPtr {
     /// Stream version of the batch's first event.
-    pub first_version: u64,
+    pub first_version:    u64,
     /// Number of events (subframes) in the batch.
-    pub frame_count: u32,
+    pub frame_count:      u32,
     /// Global position (A1) of the batch's first event.
     pub first_global_pos: u64,
     /// Byte offset of the batch within its segment.
-    pub offset: u64,
+    pub offset:           u64,
 }
 
 impl BatchPtr {
@@ -116,7 +116,7 @@ pub fn write_varint(out: &mut Vec<u8>, mut v: u64) {
             out.push(v as u8);
             return;
         }
-        out.push((v as u8 & 0x7f) | 0x80);
+        out.push((v as u8 & 0x7F) | 0x80);
         v >>= 7;
     }
 }
@@ -134,7 +134,7 @@ pub fn read_varint(d: &[u8], p: &mut usize) -> Option<u64> {
         if shift >= 64 {
             return None; // overlong: more than 10 groups.
         }
-        v |= u64::from(b & 0x7f) << shift;
+        v |= u64::from(b & 0x7F) << shift;
         if b & 0x80 == 0 {
             return Some(v);
         }
@@ -149,9 +149,16 @@ pub fn read_varint(d: &[u8], p: &mut usize) -> Option<u64> {
 /// Encode one stream's batches into a packed pointer block, appending its
 /// skip-table checkpoints to `skips`. `batches` MUST be non-empty and ascend
 /// strictly in `first_version`, `offset`, and `first_global_pos` (the active
-/// index maintains exactly this order; debug-asserted). Returns the block bytes.
-pub fn encode_ptr_block(batches: &[BatchPtr], skips: &mut Vec<SkipEntry>) -> Vec<u8> {
-    debug_assert!(!batches.is_empty(), "a stream with no batches has no pointer block");
+/// index maintains exactly this order; debug-asserted). Returns the block
+/// bytes.
+pub fn encode_ptr_block(
+    batches: &[BatchPtr],
+    skips: &mut Vec<SkipEntry>,
+) -> Vec<u8> {
+    debug_assert!(
+        !batches.is_empty(),
+        "a stream with no batches has no pointer block"
+    );
     let mut out = Vec::with_capacity(batches.len() * 4 + 8);
     write_varint(&mut out, batches.len() as u64);
 
@@ -176,9 +183,9 @@ pub fn encode_ptr_block(batches: &[BatchPtr], skips: &mut Vec<SkipEntry>) -> Vec
         if i % SKIP_K == 0 {
             skips.push(SkipEntry {
                 first_version: cur.first_version,
-                offset: cur.offset,
-                global: cur.first_global_pos,
-                byte_off: out.len() as u32,
+                offset:        cur.offset,
+                global:        cur.first_global_pos,
+                byte_off:      out.len() as u32,
             });
         }
         write_varint(&mut out, cur.first_version - prev.first_version);
@@ -228,9 +235,9 @@ fn read_skip_entry(d: &[u8], i: usize) -> Option<SkipEntry> {
     let s = d.get(base..base + SKIP_ENTRY_LEN)?;
     Some(SkipEntry {
         first_version: u64::from_le_bytes(s[0..8].try_into().unwrap()),
-        offset: u64::from_le_bytes(s[8..16].try_into().unwrap()),
-        global: u64::from_le_bytes(s[16..24].try_into().unwrap()),
-        byte_off: u32::from_le_bytes(s[24..28].try_into().unwrap()),
+        offset:        u64::from_le_bytes(s[8..16].try_into().unwrap()),
+        global:        u64::from_le_bytes(s[16..24].try_into().unwrap()),
+        byte_off:      u32::from_le_bytes(s[24..28].try_into().unwrap()),
     })
 }
 
@@ -257,18 +264,30 @@ pub fn decode_ptr_block(block: &[u8]) -> Result<Vec<BatchPtr>, DecodeError> {
         return Err(DecodeError::Malformed);
     }
     let mut out = Vec::with_capacity(n);
-    let first_version = read_varint(block, &mut p).ok_or(DecodeError::Truncated)?;
-    let frame_count = u32::try_from(read_varint(block, &mut p).ok_or(DecodeError::Truncated)?)
-        .map_err(|_| DecodeError::Malformed)?;
-    let mut offset = read_varint(block, &mut p).ok_or(DecodeError::Truncated)?;
-    let mut global = read_varint(block, &mut p).ok_or(DecodeError::Truncated)?;
+    let first_version =
+        read_varint(block, &mut p).ok_or(DecodeError::Truncated)?;
+    let frame_count = u32::try_from(
+        read_varint(block, &mut p).ok_or(DecodeError::Truncated)?,
+    )
+    .map_err(|_| DecodeError::Malformed)?;
+    let mut offset =
+        read_varint(block, &mut p).ok_or(DecodeError::Truncated)?;
+    let mut global =
+        read_varint(block, &mut p).ok_or(DecodeError::Truncated)?;
     let mut version = first_version;
-    out.push(BatchPtr { first_version: version, frame_count, first_global_pos: global, offset });
+    out.push(BatchPtr {
+        first_version: version,
+        frame_count,
+        first_global_pos: global,
+        offset,
+    });
 
     for _ in 1..n {
         version += read_varint(block, &mut p).ok_or(DecodeError::Truncated)?;
-        let fc = u32::try_from(read_varint(block, &mut p).ok_or(DecodeError::Truncated)?)
-            .map_err(|_| DecodeError::Malformed)?;
+        let fc = u32::try_from(
+            read_varint(block, &mut p).ok_or(DecodeError::Truncated)?,
+        )
+        .map_err(|_| DecodeError::Malformed)?;
         offset += read_varint(block, &mut p).ok_or(DecodeError::Truncated)?;
         global += read_varint(block, &mut p).ok_or(DecodeError::Truncated)?;
         out.push(BatchPtr {
@@ -308,7 +327,8 @@ pub fn point_read(
     let mut chosen: Option<SkipEntry> = None;
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        let e = read_skip_entry(skips, mid).ok_or(DecodeError::MalformedSkips)?;
+        let e =
+            read_skip_entry(skips, mid).ok_or(DecodeError::MalformedSkips)?;
         if e.first_version <= version {
             chosen = Some(e);
             lo = mid + 1;
@@ -322,39 +342,55 @@ pub fn point_read(
     // varints so the forward scan reads batch `batch_idx + 1` next.
     let (mut cur, mut p, mut batch_idx) = match chosen {
         Some(e) => {
-            // Checkpoint `chosen_idx` sits at batch index (chosen_idx+1)*SKIP_K.
-            // Its stored fields are the ABSOLUTE first_version/offset/global at
-            // that batch; the varints at `byte_off` are that batch's deltas
+            // Checkpoint `chosen_idx` sits at batch index
+            // (chosen_idx+1)*SKIP_K. Its stored fields are the
+            // ABSOLUTE first_version/offset/global at that batch;
+            // the varints at `byte_off` are that batch's deltas
             // (relative to the previous batch). We take the absolutes from the
             // checkpoint and read only `frame_count` from the stream, consuming
             // the other three deltas to align `p` for the forward scan.
             let chosen_idx = lo - 1;
             let batch_idx = (chosen_idx + 1) * SKIP_K;
             let mut p = e.byte_off as usize;
-            let _fv_delta = read_varint(block, &mut p).ok_or(DecodeError::Truncated)?;
-            let fc = u32::try_from(read_varint(block, &mut p).ok_or(DecodeError::Truncated)?)
-                .map_err(|_| DecodeError::Malformed)?;
-            let _off_delta = read_varint(block, &mut p).ok_or(DecodeError::Truncated)?;
-            let _gl_delta = read_varint(block, &mut p).ok_or(DecodeError::Truncated)?;
+            let _fv_delta =
+                read_varint(block, &mut p).ok_or(DecodeError::Truncated)?;
+            let fc = u32::try_from(
+                read_varint(block, &mut p).ok_or(DecodeError::Truncated)?,
+            )
+            .map_err(|_| DecodeError::Malformed)?;
+            let _off_delta =
+                read_varint(block, &mut p).ok_or(DecodeError::Truncated)?;
+            let _gl_delta =
+                read_varint(block, &mut p).ok_or(DecodeError::Truncated)?;
             let cur = BatchPtr {
-                first_version: e.first_version,
-                frame_count: fc,
+                first_version:    e.first_version,
+                frame_count:      fc,
                 first_global_pos: e.global,
-                offset: e.offset,
+                offset:           e.offset,
             };
             (cur, p, batch_idx)
         }
         None => {
             // Start from the header (batch 0).
             let mut p = 0usize;
-            let _n = read_varint(block, &mut p).ok_or(DecodeError::Truncated)?;
-            let fv = read_varint(block, &mut p).ok_or(DecodeError::Truncated)?;
-            let fc = u32::try_from(read_varint(block, &mut p).ok_or(DecodeError::Truncated)?)
-                .map_err(|_| DecodeError::Malformed)?;
-            let off = read_varint(block, &mut p).ok_or(DecodeError::Truncated)?;
-            let gl = read_varint(block, &mut p).ok_or(DecodeError::Truncated)?;
-            let cur =
-                BatchPtr { first_version: fv, frame_count: fc, first_global_pos: gl, offset: off };
+            let _n =
+                read_varint(block, &mut p).ok_or(DecodeError::Truncated)?;
+            let fv =
+                read_varint(block, &mut p).ok_or(DecodeError::Truncated)?;
+            let fc = u32::try_from(
+                read_varint(block, &mut p).ok_or(DecodeError::Truncated)?,
+            )
+            .map_err(|_| DecodeError::Malformed)?;
+            let off =
+                read_varint(block, &mut p).ok_or(DecodeError::Truncated)?;
+            let gl =
+                read_varint(block, &mut p).ok_or(DecodeError::Truncated)?;
+            let cur = BatchPtr {
+                first_version:    fv,
+                frame_count:      fc,
+                first_global_pos: gl,
+                offset:           off,
+            };
             (cur, p, 0usize)
         }
     };
@@ -373,13 +409,22 @@ pub fn point_read(
         if batch_idx >= n_batches {
             return Ok(None); // past the last batch.
         }
-        let fv = cur.first_version + read_varint(block, &mut p).ok_or(DecodeError::Truncated)?;
-        let fc = u32::try_from(read_varint(block, &mut p).ok_or(DecodeError::Truncated)?)
-            .map_err(|_| DecodeError::Malformed)?;
-        let off = cur.offset + read_varint(block, &mut p).ok_or(DecodeError::Truncated)?;
-        let gl =
-            cur.first_global_pos + read_varint(block, &mut p).ok_or(DecodeError::Truncated)?;
-        cur = BatchPtr { first_version: fv, frame_count: fc, first_global_pos: gl, offset: off };
+        let fv = cur.first_version
+            + read_varint(block, &mut p).ok_or(DecodeError::Truncated)?;
+        let fc = u32::try_from(
+            read_varint(block, &mut p).ok_or(DecodeError::Truncated)?,
+        )
+        .map_err(|_| DecodeError::Malformed)?;
+        let off = cur.offset
+            + read_varint(block, &mut p).ok_or(DecodeError::Truncated)?;
+        let gl = cur.first_global_pos
+            + read_varint(block, &mut p).ok_or(DecodeError::Truncated)?;
+        cur = BatchPtr {
+            first_version:    fv,
+            frame_count:      fc,
+            first_global_pos: gl,
+            offset:           off,
+        };
     }
 }
 
@@ -388,12 +433,23 @@ mod tests {
     use super::*;
 
     fn batch(v: u64, fc: u32, g: u64, off: u64) -> BatchPtr {
-        BatchPtr { first_version: v, frame_count: fc, first_global_pos: g, offset: off }
+        BatchPtr {
+            first_version:    v,
+            frame_count:      fc,
+            first_global_pos: g,
+            offset:           off,
+        }
     }
 
     /// Build a contiguous stream of `n` batches, each `fc` events, starting at
     /// version 0 / global `g0` / offset `off0`, batch stride `stride` bytes.
-    fn contiguous(n: usize, fc: u32, g0: u64, off0: u64, stride: u64) -> Vec<BatchPtr> {
+    fn contiguous(
+        n: usize,
+        fc: u32,
+        g0: u64,
+        off0: u64,
+        stride: u64,
+    ) -> Vec<BatchPtr> {
         let mut out = Vec::with_capacity(n);
         let mut v = 0u64;
         let mut g = g0;
@@ -436,8 +492,13 @@ mod tests {
         assert_eq!(skips.len(), 300 / SKIP_K);
         let decoded = decode_ptr_block(&block).unwrap();
         assert_eq!(decoded, batches);
-        // Contiguous stream: ~ a few bytes/batch, far under a fixed 28-byte rep.
-        assert!(block.len() < batches.len() * 8, "block not compact: {}", block.len());
+        // Contiguous stream: ~ a few bytes/batch, far under a fixed 28-byte
+        // rep.
+        assert!(
+            block.len() < batches.len() * 8,
+            "block not compact: {}",
+            block.len()
+        );
     }
 
     #[test]
@@ -448,12 +509,18 @@ mod tests {
         let skip_bytes = encode_skips(&skips);
         let last_version = batches.last().unwrap().last_version();
         for v in 0..=last_version {
-            let got = point_read(&block, &skip_bytes, batches.len(), v).unwrap();
-            let expect = batches.iter().copied().find(|b| b.contains_version(v));
+            let got =
+                point_read(&block, &skip_bytes, batches.len(), v).unwrap();
+            let expect =
+                batches.iter().copied().find(|b| b.contains_version(v));
             assert_eq!(got, expect, "version {v}");
         }
         // Past the end -> miss.
-        assert_eq!(point_read(&block, &skip_bytes, batches.len(), last_version + 1).unwrap(), None);
+        assert_eq!(
+            point_read(&block, &skip_bytes, batches.len(), last_version + 1)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -463,8 +530,14 @@ mod tests {
         let block = encode_ptr_block(&batches, &mut skips);
         let skip_bytes = encode_skips(&skips);
         assert!(skips.is_empty());
-        assert_eq!(point_read(&block, &skip_bytes, 1, 0).unwrap(), Some(batches[0]));
-        assert_eq!(point_read(&block, &skip_bytes, 1, 2).unwrap(), Some(batches[0]));
+        assert_eq!(
+            point_read(&block, &skip_bytes, 1, 0).unwrap(),
+            Some(batches[0])
+        );
+        assert_eq!(
+            point_read(&block, &skip_bytes, 1, 2).unwrap(),
+            Some(batches[0])
+        );
         assert_eq!(point_read(&block, &skip_bytes, 1, 3).unwrap(), None);
     }
 
@@ -475,9 +548,15 @@ mod tests {
         let mut skips = Vec::new();
         let block = encode_ptr_block(&batches, &mut skips);
         let skip_bytes = encode_skips(&skips);
-        assert_eq!(point_read(&block, &skip_bytes, 2, 2).unwrap(), Some(batches[0]));
+        assert_eq!(
+            point_read(&block, &skip_bytes, 2, 2).unwrap(),
+            Some(batches[0])
+        );
         assert_eq!(point_read(&block, &skip_bytes, 2, 5).unwrap(), None); // in the hole
-        assert_eq!(point_read(&block, &skip_bytes, 2, 11).unwrap(), Some(batches[1]));
+        assert_eq!(
+            point_read(&block, &skip_bytes, 2, 11).unwrap(),
+            Some(batches[1])
+        );
     }
 
     #[test]
@@ -485,7 +564,10 @@ mod tests {
         let batches = contiguous(10, 4, 0, 0, 100);
         let mut skips = Vec::new();
         let block = encode_ptr_block(&batches, &mut skips);
-        assert_eq!(decode_ptr_block(&block[..block.len() - 1]), Err(DecodeError::Truncated));
+        assert_eq!(
+            decode_ptr_block(&block[..block.len() - 1]),
+            Err(DecodeError::Truncated)
+        );
     }
 
     /// bn-fyo: a corrupted/adversarial `n` the buffer can't possibly back
@@ -511,7 +593,8 @@ mod tests {
         assert_eq!(skips.len(), (n - 1) / SKIP_K);
         for v in [0u64, 1, 63, 64, 65, 127, 128, 200, (n - 1) as u64] {
             let got = point_read(&block, &skip_bytes, n, v).unwrap();
-            let expect = batches.iter().copied().find(|b| b.contains_version(v));
+            let expect =
+                batches.iter().copied().find(|b| b.contains_version(v));
             assert_eq!(got, expect, "version {v}");
         }
     }
@@ -536,9 +619,8 @@ mod tests {
     /// `sealed::payload::tests::Rng` and `columnar::tests`'s generator).
     struct Rng(u64);
     impl Rng {
-        fn new(seed: u64) -> Self {
-            Rng(seed ^ 0x9e37_79b9_7f4a_7c15)
-        }
+        fn new(seed: u64) -> Self { Rng(seed ^ 0x9E37_79B9_7F4A_7C15) }
+
         fn next_u64(&mut self) -> u64 {
             let mut x = self.0;
             x ^= x << 13;
@@ -547,9 +629,8 @@ mod tests {
             self.0 = x;
             x
         }
-        fn below(&mut self, n: u64) -> u64 {
-            self.next_u64() % n
-        }
+
+        fn below(&mut self, n: u64) -> u64 { self.next_u64() % n }
     }
 
     /// One-batch pointer block round-trips exactly across the **full**
@@ -562,19 +643,29 @@ mod tests {
         let mut rng = Rng::new(0xC0FF_EE01);
         // Type-level extremes, explicit, before the randomized sweep.
         let extreme_headers: [BatchPtr; 4] = [
-            BatchPtr { first_version: 0, frame_count: 1, first_global_pos: 0, offset: 0 },
-            BatchPtr { first_version: 1, frame_count: 1, first_global_pos: 1, offset: 1 },
             BatchPtr {
-                first_version: u32::MAX as u64,
-                frame_count: u32::MAX,
-                first_global_pos: u32::MAX as u64,
-                offset: u32::MAX as u64,
+                first_version:    0,
+                frame_count:      1,
+                first_global_pos: 0,
+                offset:           0,
             },
             BatchPtr {
-                first_version: u64::MAX,
-                frame_count: u32::MAX,
+                first_version:    1,
+                frame_count:      1,
+                first_global_pos: 1,
+                offset:           1,
+            },
+            BatchPtr {
+                first_version:    u32::MAX as u64,
+                frame_count:      u32::MAX,
+                first_global_pos: u32::MAX as u64,
+                offset:           u32::MAX as u64,
+            },
+            BatchPtr {
+                first_version:    u64::MAX,
+                frame_count:      u32::MAX,
                 first_global_pos: u64::MAX,
-                offset: u64::MAX,
+                offset:           u64::MAX,
             },
         ];
         for b in extreme_headers {
@@ -589,12 +680,20 @@ mod tests {
             let frame_count = 1 + (rng.next_u64() as u32);
             let offset = rng.next_u64();
             let first_global_pos = rng.next_u64();
-            let batches = [BatchPtr { first_version, frame_count, first_global_pos, offset }];
+            let batches = [BatchPtr {
+                first_version,
+                frame_count,
+                first_global_pos,
+                offset,
+            }];
             let mut skips = Vec::new();
             let block = encode_ptr_block(&batches, &mut skips);
             assert!(skips.is_empty());
             let decoded = decode_ptr_block(&block).unwrap();
-            assert_eq!(decoded, batches, "header round trip failed for random step {i}");
+            assert_eq!(
+                decoded, batches,
+                "header round trip failed for random step {i}"
+            );
         }
     }
 
@@ -605,7 +704,8 @@ mod tests {
     /// at `1..=4` and so never encoded a multi-byte varint at all.
     #[test]
     fn property_delta_width_boundaries_round_trip() {
-        let boundaries: [u64; 10] = std::array::from_fn(|i| 1u64 << (7 * i as u32));
+        let boundaries: [u64; 10] =
+            std::array::from_fn(|i| 1u64 << (7 * i as u32));
         let mut rng = Rng::new(0xB0DE_A11E);
         for &boundary in &boundaries {
             for wobble in [-1i64, 0, 1] {
@@ -619,22 +719,25 @@ mod tests {
                 let base_o = rng.below(1000);
                 let base_g = rng.below(1000);
                 let b0 = BatchPtr {
-                    first_version: base_v,
-                    frame_count: 1,
+                    first_version:    base_v,
+                    frame_count:      1,
                     first_global_pos: base_g,
-                    offset: base_o,
+                    offset:           base_o,
                 };
                 let b1 = BatchPtr {
-                    first_version: base_v + delta,
-                    frame_count: 1,
+                    first_version:    base_v + delta,
+                    frame_count:      1,
                     first_global_pos: base_g + delta,
-                    offset: base_o + delta,
+                    offset:           base_o + delta,
                 };
                 let batches = [b0, b1];
                 let mut skips = Vec::new();
                 let block = encode_ptr_block(&batches, &mut skips);
                 let decoded = decode_ptr_block(&block).unwrap();
-                assert_eq!(decoded, batches, "delta {delta} (boundary {boundary}, wobble {wobble})");
+                assert_eq!(
+                    decoded, batches,
+                    "delta {delta} (boundary {boundary}, wobble {wobble})"
+                );
             }
         }
     }
@@ -657,7 +760,12 @@ mod tests {
             let mut g = rng.next_u64() >> 8;
             for _ in 0..n {
                 let fc = 1 + (rng.below(1000) as u32);
-                batches.push(BatchPtr { first_version: v, frame_count: fc, first_global_pos: g, offset: o });
+                batches.push(BatchPtr {
+                    first_version:    v,
+                    frame_count:      fc,
+                    first_global_pos: g,
+                    offset:           o,
+                });
                 // Deltas span every LEB128 width up to ~3 bytes, never 0.
                 v += 1 + rng.below(1 << 20);
                 o += 1 + rng.below(1 << 20);
@@ -777,16 +885,16 @@ mod tests {
 // - [`tests::property_header_round_trips_full_domain`] — one-batch header
 //   fields across the full `u64`/`u32` domain (the "block header decode"
 //   claim), 20k random cases plus the type-level extremes explicitly.
-// - [`tests::property_delta_width_boundaries_round_trip`] — two-batch delta
-//   at every LEB128 width boundary from 1 to 10 bytes (the "varint width
-//   edges" claim) — coverage the old Kani monolith's `1..=4`-capped deltas
-//   never reached at all.
+// - [`tests::property_delta_width_boundaries_round_trip`] — two-batch delta at
+//   every LEB128 width boundary from 1 to 10 bytes (the "varint width edges"
+//   claim) — coverage the old Kani monolith's `1..=4`-capped deltas never
+//   reached at all.
 // - [`tests::property_random_batch_chains_round_trip_and_stay_ascending`] —
 //   2..=8-batch monotone chains, 5000 random cases, checking both exact
 //   round-trip equality and the strict-ascending invariant `point_read`'s
-//   forward scan and `BatchPtr::contains_version` depend on (the
-//   "monotonicity check" claim) — strictly more batches and a far wider
-//   delta range than the old monolith's `MAXB = 3` / `1..=4`.
+//   forward scan and `BatchPtr::contains_version` depend on (the "monotonicity
+//   check" claim) — strictly more batches and a far wider delta range than the
+//   old monolith's `MAXB = 3` / `1..=4`.
 //
 // The skip-table / `point_read` machinery (a checkpoint requires >= SKIP_K
 // == 64 batches) was never Kani-covered even by the original monolith
@@ -818,4 +926,3 @@ mod kani_proofs {
         assert!(p == buf.len());
     }
 }
-

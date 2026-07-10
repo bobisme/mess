@@ -16,35 +16,35 @@
 //!   coherent in-memory backend ([`social::web::MemBackend`]) seeded with a
 //!   tiny hardcoded world — a quick sanity check that needs no setup.
 //! - **`--dir PATH`.** Opens a real [`mess_store::EventStore`] over
-//!   [`mess_store::LogEngine`] at `PATH` (written by `social-seed`, or by
-//!   using the app), and builds a real [`social::Projections`] read model by
-//!   replaying that store's log from position 0 — this is the "the read
-//!   model rebuilds from the log" party trick the README walks through: stop
-//!   this process and start it again, and `Projections::new` redoes exactly
-//!   that replay before serving a single request.
+//!   [`mess_store::LogEngine`] at `PATH` (written by `social-seed`, or by using
+//!   the app), and builds a real [`social::Projections`] read model by
+//!   replaying that store's log from position 0 — this is the "the read model
+//!   rebuilds from the log" party trick the README walks through: stop this
+//!   process and start it again, and `Projections::new` redoes exactly that
+//!   replay before serving a single request.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use ident::Id;
 use mess_store::{EventStore, LogEngine};
-use social::WriteOps;
 use social::Projections;
+use social::WriteOps;
 use social::store_backend::Store;
 use social::web::{AppState, MemBackend, router};
 
 struct Args {
-    dir: Option<PathBuf>,
+    dir:  Option<PathBuf>,
     addr: String,
 }
 
 fn print_usage() {
     eprintln!(
-        "Usage: social-web [--dir PATH] [--addr HOST:PORT]\n\n\
-         Options:\n  \
-         --dir PATH        serve a real on-disk store (written by social-seed).\n  \
-         --addr HOST:PORT  listen address (default: 127.0.0.1:3000)\n\n\
-         With no --dir, serves a tiny hardcoded in-memory demo world instead."
+        "Usage: social-web [--dir PATH] [--addr HOST:PORT]\n\nOptions:\n  \
+         --dir PATH        serve a real on-disk store (written by \
+         social-seed).\n  --addr HOST:PORT  listen address (default: \
+         127.0.0.1:3000)\n\nWith no --dir, serves a tiny hardcoded in-memory \
+         demo world instead."
     );
 }
 
@@ -130,7 +130,8 @@ async fn store_state(
 ) -> AppState<Projections<LogEngine>, Store> {
     if !dir.is_dir() {
         eprintln!(
-            "error: store directory not found at {}\n  Run `cargo run -p social --bin social-seed -- --dir {}` first.",
+            "error: store directory not found at {}\n  Run `cargo run -p \
+             social --bin social-seed -- --dir {}` first.",
             dir.display(),
             dir.display()
         );
