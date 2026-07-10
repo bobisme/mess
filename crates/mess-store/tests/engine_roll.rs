@@ -47,7 +47,12 @@ async fn fill_stream(engine: &LogEngine, stream: &str, s: usize, events_per: usi
 /// live committer. Afterwards every event is readable via all three read paths,
 /// global positions tile `[0, N)` densely (no gaps, no duplicates, no reorder),
 /// and every stream's versions are contiguous with byte-exact payloads.
-#[tokio::test]
+// bn-u6o item 4: multi_thread so the concurrent appenders genuinely run on
+// separate OS threads — a single-threaded flavor cooperatively interleaves
+// tasks at `.await` points only, which cannot exercise the API-side races
+// (distinct tokio worker threads racing the append gate / publish sequencer /
+// committer concurrently) this test's docstring claims to cover.
+#[tokio::test(flavor = "multi_thread")]
 async fn auto_roll_under_concurrent_load_preserves_every_event() {
     let dir = tempfile::tempdir().expect("tempdir");
     let store_path = dir.path().join("store");
@@ -219,4 +224,56 @@ async fn clean_reopen_after_rolls_serves_cold_and_hot_tiers() {
         .await
         .expect("append after reopen");
     assert_eq!(out.last_global_position, total as u64, "dense append continues after reopen");
+}
+
+/// bn-u6o item 2: a batch bigger than a whole EMPTY segment can never fit no
+/// matter how many times the committer rolls. Before this bone, the
+/// committer's `SegmentFull` branch always rolled first and retried, so an
+/// oversized batch wasted a near-empty segment (and a background-sealer
+/// notification for it) before re-failing with the identical typed error —
+/// and a caller that retried the same oversized batch would proliferate one
+/// such wasted segment per attempt. The fix checks the batch against the
+/// capacity of an EMPTY segment before rolling at all: the typed error comes
+/// back immediately, segment count unchanged.
+#[tokio::test]
+async fn oversized_batch_fails_fast_without_wasting_a_roll() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store_path = dir.path().join("store");
+    // A tiny segment: no realistic batch fits, let alone this test's 2000-byte
+    // oversized one.
+    let opts = EngineOptions { segment_size: 512, ..EngineOptions::default() };
+    let engine = LogEngine::open_with(&store_path, opts).expect("open");
+
+    let segment_count = || {
+        std::fs::read_dir(&store_path)
+            .expect("read store dir")
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("log"))
+            .count()
+    };
+    assert_eq!(segment_count(), 1, "one active segment at open");
+
+    // A single event whose payload alone (2000 bytes) is well past the whole
+    // 512-byte segment_size — cannot fit no matter how many times it rolls.
+    let big = rec("Big", &vec![0xABu8; 2000]);
+    let err = engine
+        .append_batch("stream-oversized", Version::NoStream, &[big])
+        .await
+        .expect_err("an oversized batch must fail, not succeed");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("segment full"),
+        "must surface the typed SegmentFull error, got: {msg}"
+    );
+
+    assert_eq!(segment_count(), 1, "no wasted roll: segment count must be unchanged");
+    assert_eq!(engine.total_events(), 0, "the failed oversized append committed nothing");
+
+    // The store must still be usable afterwards — the failed pre-check must
+    // not have poisoned or otherwise wedged the committer.
+    let out = engine
+        .append_batch("stream-ok", Version::NoStream, &[rec("ev", b"small")])
+        .await
+        .expect("a normal-sized append after the rejected oversized one must still work");
+    assert_eq!(out.last_global_position, 0);
 }

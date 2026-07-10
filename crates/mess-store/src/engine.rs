@@ -92,9 +92,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::{Condvar, Mutex};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use mess_index::sealed::{
     BlockCache, ReplaySet, SealBatch, SealDriver, SealInput, SealMetrics, SealStream,
@@ -471,9 +472,20 @@ struct Inner {
     /// segment's age (bn-e2y). Recovery resumes the active segment in place, so
     /// there is no durable per-segment start timestamp to read here; this is the
     /// age of the live head *since this process opened it*.
-    opened_at: std::time::Instant,
+    opened_at: Instant,
     /// The store root (sealed sidecars live under `dir/sealed`).
     dir: PathBuf,
+    /// Shared with the seal thread's [`LogEngine::run_roll_sealer`] loop
+    /// (`bn-u6o`): unset during live operation, so a queued roll's per-segment
+    /// wait uses its normal ~10s bound. [`Inner::drop`] sets this ONCE — to
+    /// `now + shutdown_seal_budget` — before joining the seal thread, so it
+    /// becomes a single deadline shared by every seal still queued at shutdown,
+    /// bounding the TOTAL drain wait instead of ~10s per abandoned roll.
+    shutdown_deadline: Arc<OnceLock<Instant>>,
+    /// The shutdown drain budget `Inner::drop` writes into
+    /// [`shutdown_deadline`](Self::shutdown_deadline) (`bn-u6o`,
+    /// [`EngineOptions::shutdown_seal_budget`]).
+    shutdown_seal_budget: Duration,
 }
 
 impl Drop for Inner {
@@ -485,9 +497,40 @@ impl Drop for Inner {
         // durable) and exits — so a drop-then-reopen sees the finished seals on
         // disk, never a half-written tier.
         drop(self.committer.take());
+        // `bn-u6o`: publish the shared shutdown deadline BEFORE joining, so it
+        // is visible to a wait already in flight and to every seal still
+        // queued behind the now-closed channel. One deadline covers the whole
+        // drain — a drop with several abandoned rolls queued still returns
+        // within `shutdown_seal_budget` total, not that budget times the queue
+        // depth. A skipped seal at shutdown is safe: the segment stays durable
+        // and unsealed, served from the log (and re-sealable) on reopen — see
+        // `run_roll_sealer`'s doc.
+        let _ = self.shutdown_deadline.set(Instant::now() + self.shutdown_seal_budget);
         if let Some(h) = self.seal_thread.take() {
             let _ = h.join();
         }
+    }
+}
+
+/// Poll cadence + per-segment wait bound for [`LogEngine::run_roll_sealer`]'s
+/// bounded wait (`bn-u6o`). Production always uses [`SpinConfig::default`]
+/// (matching bn-1vu's original ~10s/50µs figures exactly); a smaller budget is
+/// how tests force the "spin bound exceeded" skip path deterministically
+/// instead of waiting out the real ~10s.
+#[derive(Debug, Clone, Copy)]
+struct SpinConfig {
+    /// How long the wait loop gives a single queued segment to catch up
+    /// before giving up on it (absent a tighter `shutdown_deadline`).
+    per_seal_budget: Duration,
+    /// Sleep between polls of the hot index/book.
+    poll_interval: Duration,
+}
+
+impl Default for SpinConfig {
+    fn default() -> Self {
+        // 200_000 × 50µs ≈ 10s — the exact bn-1vu figure, just expressed as a
+        // wall-clock budget instead of a spin count.
+        SpinConfig { per_seal_budget: Duration::from_secs(10), poll_interval: Duration::from_micros(50) }
     }
 }
 
@@ -528,6 +571,14 @@ pub struct EngineOptions {
     /// `.par` sidecar next to each sealed segment so `mess verify --repair` can
     /// reconstruct latent-sector / bit-rot damage offline.
     pub parity: mess_index::sealed::parity::ParityConfig,
+    /// The TOTAL bound on how long [`LogEngine`]'s `Drop` will wait for the
+    /// background seal thread to drain queued rolls (`bn-u6o`). Only matters
+    /// when a roll was reported but its publish never caught up (an abandoned
+    /// append future) — the ordinary case drains near-instantly. A skipped seal
+    /// at shutdown is safe (the segment stays durable + unsealed, served from
+    /// the log on reopen), so this bounds worst-case shutdown latency rather
+    /// than protecting correctness. Default 2s.
+    pub shutdown_seal_budget: Duration,
 }
 
 /// Re-export of the committer's runtime metrics snapshot (`bn-e2y`), the
@@ -585,6 +636,14 @@ pub struct EngineMetrics {
     pub seal_duration: LatencySnapshot,
     /// Segments sealed since this process opened.
     pub seals: u64,
+    /// Seals skipped rather than completed (`bn-u6o`): the background
+    /// roll-sealer gave up waiting for the hot index/book to catch up (its
+    /// bounded per-segment spin, live) or a queued seal did not finish inside
+    /// the bounded total shutdown wait (`Inner::drop`). Either way the segment
+    /// stays durable and unsealed — served from the log until it is resealed
+    /// or the store reopens — but an operator MUST be able to see it happened;
+    /// see `mess_index::sealed::SealMetrics::record_seal_skipped`.
+    pub seals_skipped: u64,
 }
 
 impl Default for EngineOptions {
@@ -606,6 +665,11 @@ impl Default for EngineOptions {
             chain: false,
             // bn-2za: parity is opt-in / evidence-gated — off by default.
             parity: mess_index::sealed::parity::ParityConfig::default(),
+            // bn-u6o: bound total shutdown drain latency, not correctness — a
+            // skipped seal at shutdown is safe (served from the log on
+            // reopen). 2s is comfortably above a healthy drain (near-instant)
+            // and comfortably below the old ~10s-per-abandoned-roll worst case.
+            shutdown_seal_budget: Duration::from_secs(2),
         }
     }
 }
@@ -722,6 +786,10 @@ impl LogEngine {
         // Spawn the background auto-roll sealer thread.
         std::fs::create_dir_all(dir.join("sealed"))
             .map_err(|e| EngineError::SealedRead(format!("mkdir sealed: {e}")))?;
+        // `bn-u6o`: unset until `Inner::drop` publishes it once, turning the
+        // sealer's normal ~10s-per-segment wait into a single deadline shared
+        // by every seal still queued at shutdown (see the `Inner` field doc).
+        let shutdown_deadline: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
         let seal_thread = {
             let driver = SealDriver::new(Arc::clone(&sealed), dir.join("sealed"))
                 .with_metrics(Arc::clone(&seal_metrics))
@@ -729,9 +797,22 @@ impl LogEngine {
             let active = Arc::clone(&active);
             let book = Arc::clone(&book);
             let dir = dir.to_path_buf();
+            let seal_metrics_for_thread = Arc::clone(&seal_metrics);
+            let shutdown_deadline = Arc::clone(&shutdown_deadline);
             std::thread::Builder::new()
                 .name("mess-engine-roll-sealer".into())
-                .spawn(move || Self::run_roll_sealer(roll_rx, driver, active, book, dir))
+                .spawn(move || {
+                    Self::run_roll_sealer(
+                        roll_rx,
+                        driver,
+                        active,
+                        book,
+                        dir,
+                        seal_metrics_for_thread,
+                        shutdown_deadline,
+                        SpinConfig::default(),
+                    )
+                })
                 .map_err(|e| EngineError::Open(format!("spawn sealer: {e}")))?
         };
 
@@ -764,8 +845,10 @@ impl LogEngine {
                 book,
                 append_gate: AppendGate::new(),
                 publish_seq: PublishSequencer::new_at(recovered_len),
-                opened_at: std::time::Instant::now(),
+                opened_at: Instant::now(),
                 dir: dir.to_path_buf(),
+                shutdown_deadline,
+                shutdown_seal_budget: opts.shutdown_seal_budget,
             }),
         })
     }
@@ -927,12 +1010,26 @@ impl LogEngine {
     /// and is served from the log (and re-sealable) on reopen, so a failed seal
     /// never loses data. The loop exits when the roll channel closes (the
     /// committer task dropped its [`Roller`]), draining every queued seal first.
+    ///
+    /// `bn-u6o`: `seal_metrics` counts + loudly (rate-limited) logs every
+    /// segment this loop gives up waiting on (see the two `record_seal_skipped`
+    /// call sites below) — before this bone that skip was silent, so an
+    /// operator had no way to learn a segment stayed unsealed until reopen.
+    /// `shutdown_deadline` is unset during live operation (each segment gets
+    /// its own `spin.per_seal_budget`, ~10s by default — the original bn-1vu
+    /// bound); once `Inner::drop` publishes it, it becomes a single deadline
+    /// shared by every segment still queued, bounding the TOTAL shutdown drain
+    /// instead of `per_seal_budget` per abandoned roll.
+    #[allow(clippy::too_many_arguments)] // internal seam; each arg is a distinct shared handle
     fn run_roll_sealer(
         rx: mpsc::Receiver<SegmentSummary>,
         driver: SealDriver,
         active: Arc<ActiveIndex>,
         book: Arc<Mutex<Book>>,
         dir: PathBuf,
+        seal_metrics: Arc<SealMetrics>,
+        shutdown_deadline: Arc<OnceLock<Instant>>,
+        spin: SpinConfig,
     ) {
         for summary in rx {
             let base = summary.base_pos;
@@ -944,25 +1041,43 @@ impl LogEngine {
             // the bounded wait keeps it robust if a future append gate (bn-1s0)
             // relaxes that ordering. A gone writer can never lower the applied
             // end, so this cannot deadlock.
-            let mut spins = 0u32;
+            //
+            // The per-segment deadline (`spin.per_seal_budget` out) is clamped
+            // to `shutdown_deadline` when the latter is set (bn-u6o) — see the
+            // fn doc.
+            let per_seal_deadline = Instant::now() + spin.per_seal_budget;
             loop {
                 let applied = active.snapshot().applied_end;
                 let booked = book.lock().expect("book lock").payloads.len() as u64;
                 if applied >= end && booked >= end {
                     break;
                 }
-                spins += 1;
-                if spins > 200_000 {
-                    // ~10s of 50µs spins: give up on this seal rather than hang.
-                    // The segment stays durable + unsealed (served from the log).
+                let deadline = match shutdown_deadline.get() {
+                    Some(&sd) => sd.min(per_seal_deadline),
+                    None => per_seal_deadline,
+                };
+                if Instant::now() >= deadline {
+                    // Give up on this seal rather than hang. The segment stays
+                    // durable + unsealed (served from the log).
                     break;
                 }
-                std::thread::sleep(std::time::Duration::from_micros(50));
+                std::thread::sleep(spin.poll_interval);
             }
 
             let snapshot = active.snapshot();
             if snapshot.applied_end < end {
-                continue; // incomplete (see the spin cap) — leave it unsealed
+                // bn-u6o: this is the silent-skip site the bone exists to fix —
+                // count it and log loudly (rate-limited) so an operator can see
+                // a segment stayed unsealed rather than discovering it only at
+                // reopen.
+                seal_metrics.record_seal_skipped(&format!(
+                    "segment {} [{base}, {end}) never caught up in the hot index/book \
+                     (applied_end={}, shutdown_deadline={})",
+                    summary.segment_id,
+                    snapshot.applied_end,
+                    shutdown_deadline.get().is_some(),
+                ));
+                continue; // incomplete (see the bounded wait above) — leave it unsealed
             }
             let mut input =
                 seal_input_for_range(&snapshot, summary.segment_id, base, end);
@@ -1089,6 +1204,7 @@ impl LogEngine {
             seal_fsync_degraded_trips: seal.fsync_degraded_trips,
             seal_duration: seal.seal_duration,
             seals: seal.seals,
+            seals_skipped: seal.seals_skipped,
         }
     }
 
@@ -1676,5 +1792,134 @@ impl Backend for LogEngine {
         .map_err(AppendError::Backend)?;
 
         Ok(appended)
+    }
+}
+
+/// White-box unit tests for `bn-u6o` items 1 and 3: [`LogEngine::run_roll_sealer`]'s
+/// bounded per-segment wait, and the bounded TOTAL shutdown wait
+/// [`Inner::drop`] arranges via the shared `shutdown_deadline`. Both drive
+/// `run_roll_sealer` directly with a synthetic [`SegmentSummary`] whose
+/// `end_pos` an intentionally never-advanced [`ActiveIndex`]/[`Book`] can
+/// never reach — the shape of a publish an abandoned append future left
+/// stranded — so the skip path is forced deterministically instead of
+/// waiting out the real ~10s default bound. This needs access to private
+/// items (`run_roll_sealer`, `Book`, `SpinConfig`), so it lives inside this
+/// module rather than as a `tests/` integration test.
+#[cfg(test)]
+mod seal_skip_tests {
+    use super::*;
+    use mess_index::sealed::SealedStore;
+    use mess_log::writer::SegmentSummary;
+
+    fn summary(segment_id: u64, base_pos: u64, end_pos: u64) -> SegmentSummary {
+        SegmentSummary {
+            segment_id,
+            epoch: 1,
+            base_pos,
+            end_pos,
+            batch_count: 1,
+            event_count: end_pos - base_pos,
+            content_len: 100,
+        }
+    }
+
+    /// Item 1: a queued seal whose end the index/book never reaches must,
+    /// once the (test-shrunk) per-segment spin bound elapses, be counted in
+    /// `seals_skipped` and logged loudly — not silently dropped, which was
+    /// the bn-1vu review nit this bone exists to fix.
+    #[test]
+    fn run_roll_sealer_counts_and_logs_a_spin_bound_skip() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (tx, rx) = mpsc::channel();
+        tx.send(summary(1, 0, 10)).expect("send");
+        drop(tx); // close the channel so the loop drains this one item and exits
+
+        let active = Arc::new(ActiveIndex::new()); // never advanced: applied_end stays 0
+        let book = Arc::new(Mutex::new(Book::default())); // never advanced: len stays 0
+        let sealed = Arc::new(SealedStore::new());
+        let driver = SealDriver::new(Arc::clone(&sealed), tmp.path().join("sealed"));
+        let seal_metrics = Arc::new(SealMetrics::new());
+        let shutdown_deadline: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
+        // A tiny bound so the test does not wait out the real ~10s default.
+        let spin = SpinConfig {
+            per_seal_budget: Duration::from_millis(30),
+            poll_interval: Duration::from_millis(1),
+        };
+
+        let start = Instant::now();
+        LogEngine::run_roll_sealer(
+            rx,
+            driver,
+            active,
+            book,
+            tmp.path().to_path_buf(),
+            Arc::clone(&seal_metrics),
+            shutdown_deadline,
+            spin,
+        );
+        let elapsed = start.elapsed();
+
+        assert!(elapsed < Duration::from_secs(1), "must give up promptly, took {elapsed:?}");
+        assert_eq!(
+            seal_metrics.snapshot().seals_skipped,
+            1,
+            "the abandoned seal must be counted as skipped"
+        );
+    }
+
+    /// Item 3: the bounded TOTAL shutdown wait `Inner::drop` arranges. Two
+    /// queued seals that can never complete must both end up skipped (and
+    /// counted) within ONE shared deadline — not `per_seal_budget` each —
+    /// proving the fix bounds the drain's TOTAL wall time rather than only
+    /// each individual seal's wait.
+    #[test]
+    fn shutdown_deadline_bounds_total_wait_across_every_queued_seal() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (tx, rx) = mpsc::channel();
+        tx.send(summary(1, 0, 10)).expect("send");
+        tx.send(summary(2, 10, 20)).expect("send");
+        drop(tx);
+
+        let active = Arc::new(ActiveIndex::new());
+        let book = Arc::new(Mutex::new(Book::default()));
+        let sealed = Arc::new(SealedStore::new());
+        let driver = SealDriver::new(Arc::clone(&sealed), tmp.path().join("sealed"));
+        let seal_metrics = Arc::new(SealMetrics::new());
+        let shutdown_deadline: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
+        // A per-seal budget far bigger than the shared shutdown budget set
+        // below — proving the SHUTDOWN deadline (not the per-seal one) is
+        // what bounds this run, exactly as `Inner::drop` clamps the two.
+        let spin = SpinConfig {
+            per_seal_budget: Duration::from_secs(30),
+            poll_interval: Duration::from_millis(1),
+        };
+        // Mimic `Inner::drop`: publish the shared deadline BEFORE the sealer
+        // loop's wait runs (the real drop sets it, then joins the thread).
+        let budget = Duration::from_millis(150);
+        shutdown_deadline.set(Instant::now() + budget).expect("first set");
+
+        let start = Instant::now();
+        LogEngine::run_roll_sealer(
+            rx,
+            driver,
+            active,
+            book,
+            tmp.path().to_path_buf(),
+            Arc::clone(&seal_metrics),
+            shutdown_deadline,
+            spin,
+        );
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "TOTAL shutdown drain must be bounded near `budget` regardless of queue depth, \
+             took {elapsed:?}"
+        );
+        assert_eq!(
+            seal_metrics.snapshot().seals_skipped,
+            2,
+            "both abandoned seals must be counted as skipped"
+        );
     }
 }

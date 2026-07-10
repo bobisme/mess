@@ -67,6 +67,7 @@ async fn metrics_move_under_durable_workload() {
     assert_eq!(m.seals, 0);
     assert_eq!(m.seal_fsync.count, 0);
     assert!(!m.seal_fsync_degraded);
+    assert_eq!(m.seals_skipped, 0, "bn-u6o: nothing skipped absent a stalled roll");
 }
 
 /// `bn-e2y` (SCOPE 5): with the block cache enabled (the default now) and the
@@ -100,6 +101,8 @@ async fn cache_and_seal_metrics_move_under_workload() {
     assert!(after_seal.seal_duration.count >= 1, "seal duration recorded");
     assert!(after_seal.seal_fsync.count >= 1, "seal-path fsync barriers recorded");
     assert!(!after_seal.seal_fsync_degraded, "healthy seal barriers do not trip the alarm");
+    // bn-u6o: a healthy on-demand seal never hits the bounded-wait skip path.
+    assert_eq!(after_seal.seals_skipped, 0, "a healthy seal is never counted as skipped");
 
     // First sealed read decodes the block → a cache MISS.
     let r1 = engine.read_stream("acct-1", Version::NoStream, 100).await.unwrap();

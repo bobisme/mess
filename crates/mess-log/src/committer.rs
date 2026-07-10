@@ -888,8 +888,17 @@ fn commit_group<R: Runtime, F: Fs>(
         // roll to a fresh segment and retry the SAME batch once. Positions stay
         // dense — the new segment's `base_pos == next_pos`, so the retried batch
         // gets the exact global position it would have had.
+        //
+        // `bn-u6o`: a batch bigger than an EMPTY segment can never fit no
+        // matter how many times we roll — every fresh segment has exactly
+        // `writer.empty_segment_capacity()` bytes of room. Rolling anyway would
+        // waste a near-empty segment before hitting the same typed error, and a
+        // retrying caller would proliferate one such segment per attempt. Check
+        // BEFORE rolling and surface the typed error immediately instead.
         let mut outcome = writer.append(&spec);
-        if let (Err(WriteError::SegmentFull { .. }), Some(roller)) = (&outcome, roller) {
+        if let (Err(WriteError::SegmentFull { needed, .. }), Some(roller)) = (&outcome, roller)
+            && *needed <= writer.empty_segment_capacity()
+        {
             outcome = match roll_segment(writer, roller) {
                 Ok(()) => writer.append(&spec),
                 Err(e) => Err(e),
@@ -1662,6 +1671,60 @@ mod tests {
         assert!(m.fsync_degraded);
         assert!(m.fsync_degraded_trips >= 1);
         assert_eq!(m.fsync_threshold_nanos, 0);
+    }
+
+    // -- bn-u6o item 2: oversized-batch pre-check -------------------------
+
+    /// A batch bigger than a whole EMPTY segment can never fit no matter how
+    /// many times the committer rolls — every fresh segment has exactly the
+    /// same `empty_segment_capacity`. Before this bone, the `SegmentFull`
+    /// branch always rolled first and retried, so this shape wasted a
+    /// near-empty segment (and its `on_rolled` notification) before
+    /// re-failing with the identical typed error. The fix checks
+    /// `needed > writer.empty_segment_capacity()` BEFORE rolling: the typed
+    /// error must come back immediately, with NO roll (nothing sent on the
+    /// roll channel).
+    #[test]
+    fn oversized_batch_skips_the_wasted_roll_and_surfaces_typed_error() {
+        let rt = SimRuntime::new(21);
+        let fs = rt.fs();
+        // 52-byte header + exactly 128 bytes of room — matches
+        // `writer_suite`'s `writer_rolls_on_segment_full` sizing, so one
+        // 128-byte batch fits and a second copy of it does not.
+        let mut params = SegmentParams::new(10, 0, 100, 0);
+        params.segment_size = 180;
+        let writer = SegmentWriter::create(&fs, Path::new("/seg-oversized"), params).unwrap();
+
+        let (roll_tx, roll_rx) = std::sync::mpsc::channel();
+        let roller = Roller::new(|id| PathBuf::from(format!("/seg-oversized-{id}")), roll_tx);
+
+        // A single batch with a 512-byte payload: its encoded length is well
+        // past 128 bytes (the capacity of this writer's segment_size EMPTY),
+        // so it can never fit even a fresh segment.
+        let big = AppendRequest {
+            stream_id: 1,
+            category_id: 0,
+            first_stream_version: 0,
+            events: vec![EventInput::plain(1, 1, 0, vec![0xABu8; 512])],
+        };
+
+        let err = rt.block_on(async {
+            let c = Committer::spawn_with_roll(&rt, writer, Durability::Os, roller);
+            let err = c.append(big).await.unwrap_err();
+            c.shutdown().await;
+            err
+        });
+
+        match err {
+            AppendError::SegmentFull { needed, .. } => {
+                assert!(needed > 128, "the batch must genuinely exceed an empty segment: needed={needed}");
+            }
+            other => panic!("expected a typed SegmentFull, got {other:?}"),
+        }
+        assert!(
+            roll_rx.try_recv().is_err(),
+            "an oversized batch must not roll at all — no SegmentSummary should ever be reported"
+        );
     }
 
     // -- Group mode: concurrent appenders, watermark covers every ack ----

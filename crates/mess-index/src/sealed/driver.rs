@@ -45,6 +45,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -108,6 +109,19 @@ pub struct SealMetrics {
     seal_duration: LatencyHistogram,
     /// Segments sealed.
     seals: Counter,
+    /// Seals skipped rather than completed (`bn-u6o`): the background
+    /// roll-sealer's bounded wait for the hot index/book to publish a rolled
+    /// segment's tail was exceeded, or the bounded total shutdown wait
+    /// (`LogEngine`'s `Inner::drop`) ran out while this seal was still queued.
+    /// The segment stays durable and unsealed either way — served from the log
+    /// until it is resealed or the store reopens, never data loss — but an
+    /// operator MUST be able to see it happened, so it is counted here and
+    /// logged loudly (see [`Self::record_seal_skipped`]).
+    seals_skipped: Counter,
+    /// Rate-limits the loud skip line (see [`Self::record_seal_skipped`]), the
+    /// same `Instant`-gated cadence [`DegradationAlarm`] uses, so a store stuck
+    /// skipping seals does not flood stderr.
+    skip_last_log: Mutex<Option<Instant>>,
 }
 
 impl Default for SealMetrics {
@@ -117,9 +131,15 @@ impl Default for SealMetrics {
             fsync_alarm: DegradationAlarm::new("seal-fsync", DEFAULT_FSYNC_THRESHOLD),
             seal_duration: LatencyHistogram::new(),
             seals: Counter::new(),
+            seals_skipped: Counter::new(),
+            skip_last_log: Mutex::new(None),
         }
     }
 }
+
+/// Minimum wall-clock gap between two loud "seal skipped" log lines —
+/// matches [`DegradationAlarm`]'s rate limit.
+const SKIP_LOG_RATE_LIMIT: Duration = Duration::from_secs(5);
 
 impl std::fmt::Debug for SealMetrics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -159,6 +179,31 @@ impl SealMetrics {
             fsync_threshold_nanos: self.fsync_alarm.threshold_nanos(),
             seal_duration: self.seal_duration.snapshot(),
             seals: self.seals.get(),
+            seals_skipped: self.seals_skipped.get(),
+        }
+    }
+
+    /// Record a seal that was skipped rather than completed (`bn-u6o`): see
+    /// the `seals_skipped` field doc for the two sites that call this (the
+    /// background roll-sealer's bounded per-segment wait, and `Inner::drop`'s
+    /// bounded total shutdown wait). Increments the counter unconditionally
+    /// and, rate-limited like [`DegradationAlarm`], logs loudly to stderr so
+    /// an operator watching the log is never silently left unaware a segment
+    /// stayed unsealed — but a store stuck skipping seals does not flood it.
+    pub fn record_seal_skipped(&self, reason: &str) {
+        self.seals_skipped.incr();
+        let now = Instant::now();
+        let mut last = self.skip_last_log.lock().expect("seal metrics skip-log lock");
+        let due = last.is_none_or(|t| now.duration_since(t) >= SKIP_LOG_RATE_LIMIT);
+        if due {
+            *last = Some(now);
+            drop(last);
+            eprintln!(
+                "!!! mess SEAL SKIPPED: {reason} — segment stays durable and unsealed \
+                 (served from the log) until it is resealed or the store reopens \
+                 ({} skipped so far)",
+                self.seals_skipped.get(),
+            );
         }
     }
 }
@@ -179,6 +224,9 @@ pub struct SealMetricsSnapshot {
     pub seal_duration: LatencySnapshot,
     /// Segments sealed.
     pub seals: u64,
+    /// Seals skipped rather than completed (`bn-u6o`) — see
+    /// [`SealMetrics::record_seal_skipped`].
+    pub seals_skipped: u64,
 }
 
 /// Seal orchestration for one store + sidecar directory. Cheap to clone

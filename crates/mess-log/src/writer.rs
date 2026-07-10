@@ -395,6 +395,18 @@ impl<F: Fs> SegmentWriter<F> {
         self.segment_size.saturating_sub(self.write_off)
     }
 
+    /// The most a batch could ever fit into ONE segment of this writer's
+    /// `segment_size` — i.e. [`remaining`](Self::remaining) of a brand-new,
+    /// empty segment (`segment_size` minus the fixed header). A batch whose
+    /// encoded length exceeds this can never fit no matter how many times the
+    /// committer rolls (`bn-u6o`): every fresh segment has exactly this much
+    /// room, so rolling first would only waste a near-empty segment before the
+    /// same [`WriteError::SegmentFull`] is inevitable. Callers use this to
+    /// short-circuit the roll-and-retry in that case.
+    pub fn empty_segment_capacity(&self) -> u64 {
+        self.segment_size.saturating_sub(SEGMENT_HEADER_LEN as u64)
+    }
+
     /// Whether `spec` would fit in this segment (A8) without rolling. Returns
     /// the encode error for a fundamentally invalid batch (A5/A2/D-FMT-7).
     pub fn would_fit(&self, spec: &BatchSpec) -> Result<bool, EncodeError> {
