@@ -512,3 +512,4 @@
 1783706528886124	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAEx1wQ		item.link	bn-j9u	{"link_type":"blocks","target":"bn-1mw"}	blake3:RWs3fOqH_Gr6iyA3Da439z6De3pi1n5yWheO_mAhbiM
 1783706528927879	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAEx2AQ		item.move	bn-154	{"state":"doing"}	blake3:0905TrOHm93bpwyuASZGbRQz1t7Xn-4U-mu1TNGWy50
 1783706528933547	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAEx2QQ		item.assign	bn-154	{"action":"assign","agent":"mess-dev"}	blake3:8v7hVHgO22rfeRDLYeX0Iy8n0PKp4WOpaohOkn8OwIE
+1783706586696170	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAEx2gQ		item.comment	bn-154	{"body":"wave S1 dispatched: workflow wf_2352c359-659; workspace .maw/workspaces/bn-154"}	blake3:ooiwQ32TKQewIBBpWbxkZCJMfDZtv6CduDToMUlViK4
