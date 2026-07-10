@@ -2244,6 +2244,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // real filesystem + threads
     fn early_close_beats_sync_per_batch_at_4_writers() {
         let p_os = real_tmp("ratio-os");
         let p_grp = real_tmp("ratio-grp");

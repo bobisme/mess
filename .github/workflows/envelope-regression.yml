@@ -2,8 +2,14 @@ name: envelope-regression
 
 # bn-4pk: the envelope regression suite (crates/mess-bench). Nightly full
 # gated run of the reference workload set from docs/perf/envelope.md against
-# the committed crates/mess-bench/floors.json ratchet (default -10%
-# tolerance per metric). See crates/mess-bench/README.md for the mode
+# the committed crates/mess-bench/floors-ci.json ratchet (default -10%
+# tolerance per metric). CI uses the -ci floors file (bn-w32): most floors
+# are machine-independent doc-12 gates, but the CPU-bound BLAKE3 metrics
+# (fold-chain, load_verified) run ~30% slower on the ubuntu-latest runner
+# class than on the reference workstation, so their CI floors are seeded
+# from observed runner numbers. The workstation ratchet (floors.json,
+# reference host Ryzen 9 3900X) is the true envelope and is run locally.
+# See crates/mess-bench/README.md for the mode
 # breakdown; this lane runs `mess-bench run --mode full`, which is a
 # ~1-2 minute composite of several fs-heavy benches (buffered/durable
 # append, sealed reads, engine replay, fold-chain, load_verified,
@@ -50,11 +56,11 @@ jobs:
       - name: build mess-bench (release)
         run: cargo build -p mess-bench --release
 
-      - name: full gated run vs floors.json
+      - name: full gated run vs floors-ci.json
         run: |
           ./target/release/mess-bench run --mode full \
             --out envelope-ledger.json \
-            --floors crates/mess-bench/floors.json
+            --floors crates/mess-bench/floors-ci.json
 
       - name: upload ledger
         if: always()

@@ -70,3 +70,19 @@ positive fraction; `0.10` is the suite default), `source` (where the number
 came from — an `envelope.md` gate row, the bn-4pk bone's own acceptance
 criteria, or a seeded regression baseline for a metric with no named gate
 yet).
+
+## Machine profiles (bn-w32)
+
+Two floors files exist:
+
+- `floors.json` — the true envelope ratchet, seeded from doc-12 gates and the
+  reference workstation (Ryzen 9 3900X). Run locally.
+- `floors-ci.json` — used by `.github/workflows/envelope-regression.yml`.
+  Identical except the CPU-bound BLAKE3 metrics (`phase5.foldchain.*`,
+  `phase5.verify.load_verified.*`), whose floors are seeded from observed
+  GitHub `ubuntu-latest` runner numbers (~30% slower at hashing than the
+  workstation, while I/O metrics run faster there). A regression that clears
+  the CI floor but would trip the workstation floor is caught by the local run.
+
+When re-seeding either file, state the source run/host in each entry's
+`source` field.
