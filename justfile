@@ -56,3 +56,12 @@ alias wt := watch-test
 # Also runs in CI via .github/workflows/loom.yml.
 @loom *args='':
 	env RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 cargo test -p mess-log --release --lib -- --nocapture loom_ "$@"
+
+# bn-1mw: examples/social one-command demo. Seeds a deterministic corpus
+# (~50 users, ~500 posts, Zipf-ish follows/likes — see `social-seed`) into
+# $HOME/.cache/mess-social-demo/store (--force wipes a prior run so this is
+# safe to rerun), then serves it at http://127.0.0.1:3000. See
+# examples/social/README.md for the full tour, including the CLI ops walk.
+@demo:
+	cargo run -p social --bin social-seed -- --force
+	cargo run -p social --bin social-web -- --dir "$HOME/.cache/mess-social-demo/store"

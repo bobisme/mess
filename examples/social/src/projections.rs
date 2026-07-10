@@ -357,6 +357,26 @@ impl<B: Backend + Clone> Projections<B> {
         Self { state, applied, notify, pump, _backend: PhantomData }
     }
 
+    /// Every registered user as `(id, handle)`, for populating a
+    /// [`crate::web::Directory`] at process boot.
+    ///
+    /// **Dogfood finding.** [`ReadModels`] (this type's own trait) answers
+    /// queries *by handle* but exposes no bulk listing — by design, an app
+    /// should not need "give me every user" for request-serving queries. But
+    /// [`web::Directory`](crate::web::Directory) is itself a dogfood finding
+    /// (see its docs): the web layer needs a `handle <-> Id` map the trait
+    /// does not provide, and a store-backed server has no imperative
+    /// registration loop (unlike the in-memory demo seed) to populate one
+    /// incrementally. This inherent method — not part of [`ReadModels`],
+    /// since a production read model would paginate this rather than return
+    /// every user in one `Vec` — is the pragmatic bridge: called once at boot
+    /// after the catch-up replay, it seeds the directory from the same folded
+    /// state every other query reads.
+    pub async fn directory(&self) -> Vec<(Id, String)> {
+        let st = self.state.read().await;
+        st.handles.iter().map(|(handle, id)| (*id, handle.clone())).collect()
+    }
+
     /// Permalink lookup: resolve a post by its stream-id suffix **including
     /// deleted posts**, returning a [`PostLookup`] with the tombstone flag.
     /// `None` only if no post with that id ever existed. See [`PostLookup`].

@@ -42,6 +42,8 @@ use ident::Id;
 pub mod contracts;
 pub mod domain;
 pub mod projections;
+pub mod seed;
+pub mod store_backend;
 pub mod web;
 
 // Re-export the domain surface at the crate root so call sites read

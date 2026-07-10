@@ -33,10 +33,25 @@ axum = { version = "0.8", default-features = false, features = [
 # keeps markup type-checked next to the handler. The `axum` feature makes
 # `Markup` an `IntoResponse`.
 maud = { version = "0.27", default-features = false, features = ["axum"] }
+# --- seed corpus generator (bn-1mw) ---
+# A small, seedable PRNG for the deterministic demo corpus. `std_rng` (the
+# default feature) picks ChaCha12 — good enough determinism-within-a-build for
+# a demo generator; not used for anything security-sensitive. 0.9, not 0.8:
+# 0.9 renamed `Rng::gen`/`gen_range` to `random`/`random_range` specifically
+# because `gen` became a reserved keyword in edition 2024 (this workspace's
+# edition) — 0.8's `Rng::gen` would need `r#gen` escaping everywhere.
+rand = { version = "0.9", default-features = false, features = [
+    "std",
+    "std_rng",
+] }
 
 [[bin]]
 name = "social-web"
 path = "src/bin/social-web.rs"
+
+[[bin]]
+name = "social-seed"
+path = "src/bin/social-seed.rs"
 
 [dev-dependencies]
 mess-testkit = { workspace = true }
