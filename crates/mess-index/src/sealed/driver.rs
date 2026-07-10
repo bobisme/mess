@@ -47,6 +47,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use mess_log::metrics::{
+    Counter, DEFAULT_FSYNC_THRESHOLD, DegradationAlarm, LatencyHistogram, LatencySnapshot,
+};
 
 use crate::sealed::filter::SegmentFilter;
 use crate::sealed::payload::{
@@ -76,18 +81,131 @@ pub enum SealError {
     Payload(#[from] PayloadError),
 }
 
+/// Seal-path runtime metrics (`bn-e2y`).
+///
+/// The seal path issues **real durability barriers off the append hot path**:
+/// the sidecar temp-file `fsync` and the parent-directory `fsync` in
+/// [`write_durable`] (steps 1–2), plus the caller's footer-finalize
+/// `fdatasync` (step 3). A near-full / contended consumer SSD stalls these
+/// ~50× (3.3 ms → 150+ ms) **exactly as it stalls the commit barrier**
+/// (`docs/spec/03-durability.md` §2.6) — a degrading device the store must
+/// surface loudly will stall the sealer identically, so these barriers MUST be
+/// timed and MUST feed a degradation alarm too, not just the committer's group
+/// commit. This also tracks the **seal duration** (`roll → sealed installed`,
+/// the doc-03 metric list) around [`SealDriver::seal`].
+///
+/// Lock-free; share one `Arc<SealMetrics>` across every [`SealDriver`] a store
+/// creates (the background roll-sealer and any on-demand `seal_active`) so the
+/// counts aggregate into a single operational surface.
+pub struct SealMetrics {
+    /// Seal-path durability-barrier (`fsync`) latency distribution.
+    fsync: LatencyHistogram,
+    /// The degradation alarm on seal-path barrier latency (§2.6), latching +
+    /// rate-limited-loud, exactly like the committer's.
+    fsync_alarm: DegradationAlarm,
+    /// Seal wall-clock duration (encode → durable write → finalize → install).
+    seal_duration: LatencyHistogram,
+    /// Segments sealed.
+    seals: Counter,
+}
+
+impl Default for SealMetrics {
+    fn default() -> Self {
+        SealMetrics {
+            fsync: LatencyHistogram::new(),
+            fsync_alarm: DegradationAlarm::new("seal-fsync", DEFAULT_FSYNC_THRESHOLD),
+            seal_duration: LatencyHistogram::new(),
+            seals: Counter::new(),
+        }
+    }
+}
+
+impl std::fmt::Debug for SealMetrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealMetrics").field("snapshot", &self.snapshot()).finish()
+    }
+}
+
+impl SealMetrics {
+    /// A fresh, empty metrics sink.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one seal-path durability-barrier (`fsync`) latency and feed the
+    /// degradation alarm (§2.6) — the same lock-free `fetch_add` + alarm the
+    /// committer runs on its group-commit barrier.
+    #[inline]
+    fn record_fsync(&self, dt: Duration) {
+        self.fsync.record(dt);
+        self.fsync_alarm.observe(dt);
+    }
+
+    /// Reconfigure the seal-fsync degradation threshold at runtime (default
+    /// [`DEFAULT_FSYNC_THRESHOLD`], 50 ms).
+    pub fn set_fsync_alarm_threshold(&self, threshold: Duration) {
+        self.fsync_alarm.set_threshold(threshold);
+    }
+
+    /// A point-in-time snapshot of the seal-path metrics.
+    #[must_use]
+    pub fn snapshot(&self) -> SealMetricsSnapshot {
+        SealMetricsSnapshot {
+            fsync: self.fsync.snapshot(),
+            fsync_degraded: self.fsync_alarm.is_tripped(),
+            fsync_degraded_trips: self.fsync_alarm.trips(),
+            fsync_threshold_nanos: self.fsync_alarm.threshold_nanos(),
+            seal_duration: self.seal_duration.snapshot(),
+            seals: self.seals.get(),
+        }
+    }
+}
+
+/// A point-in-time read of [`SealMetrics`] (`bn-e2y`). Latencies are nanoseconds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SealMetricsSnapshot {
+    /// Seal-path `fsync` barrier latency (p50/p95/p99/max/mean).
+    pub fsync: LatencySnapshot,
+    /// Whether seal-path barrier latency has crossed the degradation threshold
+    /// — the sticky store-status flag (§2.6) for the seal durability site.
+    pub fsync_degraded: bool,
+    /// Seal-path barriers that crossed the threshold.
+    pub fsync_degraded_trips: u64,
+    /// The active seal-fsync degradation threshold, in nanoseconds.
+    pub fsync_threshold_nanos: u64,
+    /// Seal duration (`roll → sealed installed`) distribution.
+    pub seal_duration: LatencySnapshot,
+    /// Segments sealed.
+    pub seals: u64,
+}
+
 /// Seal orchestration for one store + sidecar directory. Cheap to clone
 /// (`Arc` inside); share it with the background thread.
 #[derive(Clone)]
 pub struct SealDriver {
     store: Arc<SealedStore>,
     dir: Arc<PathBuf>,
+    /// Optional shared seal-path metrics sink (`bn-e2y`). `None` keeps a driver
+    /// (and every existing caller/test) allocation- and instrumentation-free;
+    /// the engine attaches a shared sink via [`Self::with_metrics`].
+    metrics: Option<Arc<SealMetrics>>,
 }
 
 impl SealDriver {
     /// A driver writing sidecars into `dir` and publishing into `store`.
     pub fn new(store: Arc<SealedStore>, dir: impl Into<PathBuf>) -> Self {
-        SealDriver { store, dir: Arc::new(dir.into()) }
+        SealDriver { store, dir: Arc::new(dir.into()), metrics: None }
+    }
+
+    /// Attach a shared seal-path metrics sink (`bn-e2y`): this driver then times
+    /// its seal-path durability barriers (feeding the histogram + degradation
+    /// alarm) and its seal durations. Chainable; share one `Arc<SealMetrics>`
+    /// across the store's drivers so the counts aggregate.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<SealMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// The shared sealed store.
@@ -152,7 +270,8 @@ impl SealDriver {
     ) -> Result<SealedPayloadIndex, SealError> {
         let bytes = payload::encode_payload_sidecar(segment_id, events, opts)?;
         let path = self.payload_sidecar_path(segment_id);
-        write_durable(&path, &bytes).map_err(SealError::Write)?;
+        write_durable_metered(&path, &bytes, self.metrics.as_deref())
+            .map_err(SealError::Write)?;
         Ok(SealedPayloadIndex::from_bytes(bytes)?)
     }
 
@@ -168,11 +287,15 @@ impl SealDriver {
         Fin: FnOnce() -> io::Result<()>,
     {
         let segment_id = input.segment_id;
+        // bn-e2y: time the whole seal (encode → durable write → finalize →
+        // install) as the seal duration (`roll → sealed installed`).
+        let t_seal = Instant::now();
 
         // 1 + 2: encode and durably write the sidecar.
         let bytes = encode_sidecar(&input);
         let path = self.sidecar_path(segment_id);
-        write_durable(&path, &bytes).map_err(SealError::Write)?;
+        write_durable_metered(&path, &bytes, self.metrics.as_deref())
+            .map_err(SealError::Write)?;
 
         // bn-1i7: build the seal-time stream-id membership filter and write
         // it durably too. Best-effort by design (I5): a build or write
@@ -184,7 +307,11 @@ impl SealDriver {
         let stream_ids: Vec<u64> = input.streams.iter().map(|s| s.stream_id).collect();
         let filter = SegmentFilter::build(segment_id, &stream_ids);
         if let Some(f) = &filter {
-            let _ = write_durable(&self.filter_path(segment_id), &f.to_bytes());
+            let _ = write_durable_metered(
+                &self.filter_path(segment_id),
+                &f.to_bytes(),
+                self.metrics.as_deref(),
+            );
         }
 
         // bn-zge / D6: if the caller handed us the segment's payloads, emit the
@@ -224,6 +351,12 @@ impl SealDriver {
         // 4: install (publish) THEN evict — the gapless handoff.
         self.store.install(index.clone());
         self.store.mark_active_evicted(segment_id);
+
+        // bn-e2y: the seal is installed — record its duration + count.
+        if let Some(m) = &self.metrics {
+            m.seals.incr();
+            m.seal_duration.record(t_seal.elapsed());
+        }
         Ok(index)
     }
 }
@@ -236,6 +369,22 @@ impl SealDriver {
 /// bn-382) rewrites a segment's `.pcol` under the exact same seal-commit
 /// discipline: a crash mid-reblock leaves the OLD `.pcol` intact and serving.
 pub(crate) fn write_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_durable_metered(path, bytes, None)
+}
+
+/// [`write_durable`], plus optional seal-path barrier instrumentation
+/// (`bn-e2y`). When `metrics` is `Some`, the temp-file `fsync` and the parent
+/// directory `fsync` — the two **real seal-path durability barriers** a
+/// near-full SSD stalls on — are each timed into the histogram and fed to the
+/// degradation alarm, exactly as the committer times its group-commit barrier.
+/// Only successful barriers are recorded (a failed `fsync` is an error, not a
+/// latency sample). `None` is the uninstrumented path the offline archive
+/// re-block (bn-382) and every other caller take.
+pub(crate) fn write_durable_metered(
+    path: &Path,
+    bytes: &[u8],
+    metrics: Option<&SealMetrics>,
+) -> io::Result<()> {
     use std::io::Write;
     // Temp name derived from the real file name (not a fixed `.pidx.tmp`), so
     // the pointer (`.pidx`) and payload (`.pcol`) sidecars never share a temp.
@@ -245,7 +394,11 @@ pub(crate) fn write_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
     {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(bytes)?;
+        let t0 = Instant::now();
         f.sync_all()?;
+        if let Some(m) = metrics {
+            m.record_fsync(t0.elapsed());
+        }
     }
     std::fs::rename(&tmp, path)?;
     if let Some(parent) = path.parent() {
@@ -253,7 +406,11 @@ pub(crate) fn write_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
         // filesystems reject O_RDONLY dir fsync, which is not fatal to the
         // rename's atomicity on mainstream Linux fs.
         if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
+            let t0 = Instant::now();
+            let synced = dir.sync_all();
+            if let (Some(m), Ok(())) = (metrics, &synced) {
+                m.record_fsync(t0.elapsed());
+            }
         }
     }
     Ok(())
@@ -441,6 +598,58 @@ mod tests {
         let reopened8 = SealedSegmentIndex::open(&driver.sidecar_path(8)).unwrap();
         assert!(reopened8.might_contain_stream(10), "corrupt filter degrades to always-maybe");
         assert_eq!(reopened8.resolve(10, 1).unwrap().unwrap().offset, 4096, "resolve still correct");
+    }
+
+    /// bn-e2y: a metered seal records the seal-path durability barriers (the
+    /// sidecar + directory `fsync`s — a real fsync site a near-full SSD stalls
+    /// on identically to the commit barrier), times the seal duration, and —
+    /// with the threshold dropped to zero so every real barrier crosses it —
+    /// latches the mandatory seal-fsync degradation flag. This proves the seal
+    /// durability site is instrumented and alarmed, not just the committer.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn seal_metrics_record_barriers_duration_and_alarm() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SealedStore::new());
+        let metrics = Arc::new(SealMetrics::new());
+        metrics.set_fsync_alarm_threshold(Duration::ZERO);
+        let driver =
+            SealDriver::new(store.clone(), dir.path()).with_metrics(Arc::clone(&metrics));
+
+        // Nothing recorded before the first seal.
+        let s0 = metrics.snapshot();
+        assert_eq!(s0.seals, 0);
+        assert_eq!(s0.fsync.count, 0);
+        assert_eq!(s0.seal_duration.count, 0);
+        assert!(!s0.fsync_degraded);
+
+        driver.seal(input(7), || Ok(())).unwrap();
+
+        let s = metrics.snapshot();
+        assert_eq!(s.seals, 1, "one seal recorded");
+        assert!(s.seal_duration.count >= 1, "seal duration timed (roll → installed)");
+        // The pointer sidecar (and its `.filter` sibling) each issue a
+        // temp-file fsync + a directory fsync — real seal-path barriers, now
+        // observable.
+        assert!(s.fsync.count >= 1, "seal-path fsync barriers recorded");
+        // Threshold 0: every barrier crosses it, so the mandatory §2.6 flag
+        // latches for the seal durability site too.
+        assert!(s.fsync_degraded, "seal-fsync degradation alarm latches past threshold");
+        assert!(s.fsync_degraded_trips >= 1);
+        assert_eq!(s.fsync_threshold_nanos, 0);
+    }
+
+    /// bn-e2y: an unmetered driver (the default) still seals correctly — the
+    /// instrumentation is purely additive and off by default.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn seal_without_metrics_is_unaffected() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SealedStore::new());
+        let driver = SealDriver::new(store.clone(), dir.path());
+        let idx = driver.seal(input(7), || Ok(())).unwrap();
+        assert_eq!(idx.resolve(10, 1).unwrap().unwrap().offset, 4096);
+        assert!(store.get(7).is_some());
     }
 
     #[test]

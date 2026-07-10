@@ -59,7 +59,9 @@ pub mod segment;
 pub mod store;
 
 pub use block_cache::{BlockCache, CachedBlock};
-pub use driver::{BackgroundSealer, FinalizeFn, SealDriver, SealError};
+pub use driver::{
+    BackgroundSealer, FinalizeFn, SealDriver, SealError, SealMetrics, SealMetricsSnapshot,
+};
 pub use filter::{FilterError, SegmentFilter};
 pub use payload::{
     ARCHIVE_BLOCK_EVENTS, ARCHIVE_ZSTD_LEVEL, ArchivePolicy, BlockEntry, BlockKind, DictResolver,

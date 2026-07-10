@@ -54,6 +54,7 @@ Method notes:
 | mess_log.buffered.ev_per_s | 4710027 | Durability::Process (write(2) into page cache, no barrier); 4 writers x 100-event batches; ~250 B payload; ext4; best-of-5; 2M events; 0 fsyncs | 2026-07-09 | `cargo run -p mess-log --release --example durable_bench -- buffered 4 100 5000 5` |
 | mess_log.buffered.gate | 1000000 | acceptance floor (>=1M ev/s) — PASS (4.71x) | 2026-07-09 | as above |
 | mess_log.buffered.b10.ev_per_s | 2038287 | same, 4 writers x **10**-event batches (matches interim-backend batch for the side-by-side below); best-of-5; 1M events | 2026-07-09 | `cargo run -p mess-log --release --example durable_bench -- buffered 4 10 25000 5` |
+| mess_log.buffered.metrics_overhead_pct | ~1 | bn-e2y runtime-metrics counters (3 relaxed atomic fetch_adds per batch): same-machine A/B, best-of-5 with counters 4417725 ev/s vs without 4475227 ev/s (~1.3%, inside the ~4% run-to-run noise band) — trivial, per bone requirement | 2026-07-10 | `cargo run -p mess-log --release --example durable_bench -- buffered 4 100 5000 5` |
 
 ## Interim backend (mess_db-class RocksDB actor) — side-by-side
 

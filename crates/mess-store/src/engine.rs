@@ -97,13 +97,14 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 
 use mess_index::sealed::{
-    BlockCache, ReplaySet, SealBatch, SealDriver, SealInput, SealStream,
+    BlockCache, ReplaySet, SealBatch, SealDriver, SealInput, SealMetrics, SealStream,
     SealedSegmentIndex, SealedStore,
 };
 use mess_index::{ActiveIndex, BatchEntry, EventPtr, IndexSnapshot};
 use mess_index::meta::{CommitGroup, Head, MetaStore, StreamId};
 use mess_log::committer::{
-    AppendOutcome, AppendRequest, Appender, Committer, Durability, EventInput, Roller,
+    AppendOutcome, AppendRequest, Appender, Committer, Durability, EventInput, LatencySnapshot,
+    Roller,
 };
 use mess_log::lock::StoreLock;
 use mess_log::runtime::{RealRuntime, Runtime};
@@ -454,6 +455,10 @@ struct Inner {
     active: Arc<ActiveIndex>,
     sealed: Arc<SealedStore>,
     block_cache: BlockCache,
+    /// Shared seal-path metrics (`bn-e2y`): seal-barrier `fsync` latency +
+    /// degradation alarm and seal durations, aggregated across the background
+    /// roll-sealer and any on-demand [`LogEngine::seal_active`].
+    seal_metrics: Arc<SealMetrics>,
     meta: MetaStore,
     book: Arc<Mutex<Book>>,
     /// Serialises the exact-version critical section, per stream (bn-1s0).
@@ -461,6 +466,11 @@ struct Inner {
     /// Orders the post-ack book/index/meta publish step by global position
     /// across concurrently-committing streams (bn-1s0).
     publish_seq: PublishSequencer,
+    /// When this engine opened — the in-process baseline for the active
+    /// segment's age (bn-e2y). Recovery resumes the active segment in place, so
+    /// there is no durable per-segment start timestamp to read here; this is the
+    /// age of the live head *since this process opened it*.
+    opened_at: std::time::Instant,
     /// The store root (sealed sidecars live under `dir/sealed`).
     dir: PathBuf,
 }
@@ -499,6 +509,69 @@ pub struct EngineOptions {
     pub segment_size: u64,
     /// Dedupe-window capacity for the meta store.
     pub dedupe_capacity: usize,
+    /// Sealed pointer-block cache budget in bytes (`bn-e2y` / bn-1hx). `0`
+    /// disables the cache (every sealed replay decodes fresh); a non-zero
+    /// budget caches decoded blocks so a repeated sealed-stream replay (a
+    /// projection rebuild, a subscription re-read) skips the decode — and makes
+    /// the `cache_hits`/`cache_misses` runtime metrics meaningful under load.
+    pub block_cache_budget_bytes: u64,
+}
+
+/// Re-export of the committer's runtime metrics snapshot (`bn-e2y`), the
+/// barrier-latency + throughput core of [`EngineMetrics`].
+pub use mess_log::committer::CommitterMetrics;
+
+/// An in-process snapshot of a [`LogEngine`]'s runtime health (`bn-e2y`).
+///
+/// The mandatory §2.6 surface is [`commit`](Self::commit)'s barrier-latency
+/// percentiles and [`commit`](Self::commit)`.fsync_degraded`. The rest is the
+/// doc-03 operational list: cache hit rate, append throughput, sealed-tier
+/// size, and the active-segment age. Read via [`LogEngine::metrics`]; every
+/// field is a live-process fact (see that method's note on the process split).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct EngineMetrics {
+    /// Durable committer metrics: `fdatasync` p50/p95/p99, the degradation
+    /// flag (§2.6), and append-throughput counters.
+    pub commit: CommitterMetrics,
+    /// The durable watermark position (highest durable global position + 1).
+    /// A subscription's lag (SUB9, `docs/spec/06-subscriptions.md`) is
+    /// `durable_watermark - subscriber_cursor`, computed per subscription by
+    /// the subscription layer against this value.
+    pub durable_watermark: u64,
+    /// Whether a barrier fault has poisoned the store (D8): writes fail fast,
+    /// reads clamp to the frozen watermark. Distinct from `fsync_degraded`
+    /// (merely slow but still `Ok`, §2.6).
+    pub degraded_poisoned: bool,
+    /// Cumulative sealed block-cache hits.
+    pub cache_hits: u64,
+    /// Cumulative sealed block-cache misses.
+    pub cache_misses: u64,
+    /// Block-cache hit rate over all lookups so far, `[0, 1]`.
+    pub cache_hit_rate: f64,
+    /// Live cached blocks.
+    pub cache_entries: usize,
+    /// Resident cache weight in bytes.
+    pub cache_weight_bytes: u64,
+    /// Sealed segments installed in the cold tier.
+    pub sealed_segment_count: usize,
+    /// Total events committed (record-book length).
+    pub total_events: u64,
+    /// Age of the active segment since this process opened it, in seconds.
+    pub active_segment_age_secs: f64,
+    /// Seal-path durability-barrier (`fsync`) latency (`bn-e2y`): the sidecar +
+    /// directory fsyncs the sealer issues off the append path. A near-full SSD
+    /// stalls these exactly as it stalls the commit barrier, so they are timed
+    /// and alarmed separately from [`commit`](Self::commit)`.fsync`.
+    pub seal_fsync: LatencySnapshot,
+    /// Whether seal-path barrier latency has crossed the degradation threshold
+    /// — the sticky store-status flag (§2.6) for the seal durability site.
+    pub seal_fsync_degraded: bool,
+    /// Seal-path barriers that crossed the threshold.
+    pub seal_fsync_degraded_trips: u64,
+    /// Seal duration (`roll → sealed installed`) latency distribution.
+    pub seal_duration: LatencySnapshot,
+    /// Segments sealed since this process opened.
+    pub seals: u64,
 }
 
 impl Default for EngineOptions {
@@ -510,6 +583,11 @@ impl Default for EngineOptions {
             durability: Durability::Process,
             segment_size: 256 * 1024 * 1024,
             dedupe_capacity: mess_index::meta::DEFAULT_DEDUPE_CAPACITY,
+            // On by default (64 MiB): the sealed block cache is transparent to
+            // results and pays for itself on repeat replay (perf_replay's 48%
+            // hit rate), and a live cache is what makes the hit/miss runtime
+            // metrics operationally meaningful. Set to 0 to disable.
+            block_cache_budget_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -610,11 +688,17 @@ impl LogEngine {
 
         let book = Arc::new(Mutex::new(book));
 
+        // Shared seal-path metrics (bn-e2y): the background roll-sealer and any
+        // on-demand `seal_active` both feed this one sink, so seal-barrier
+        // fsync latency, its degradation alarm, and seal durations aggregate.
+        let seal_metrics = Arc::new(SealMetrics::new());
+
         // Spawn the background auto-roll sealer thread.
         std::fs::create_dir_all(dir.join("sealed"))
             .map_err(|e| EngineError::SealedRead(format!("mkdir sealed: {e}")))?;
         let seal_thread = {
-            let driver = SealDriver::new(Arc::clone(&sealed), dir.join("sealed"));
+            let driver = SealDriver::new(Arc::clone(&sealed), dir.join("sealed"))
+                .with_metrics(Arc::clone(&seal_metrics));
             let active = Arc::clone(&active);
             let book = Arc::clone(&book);
             let dir = dir.to_path_buf();
@@ -640,11 +724,20 @@ impl LogEngine {
                 _lock: lock,
                 active,
                 sealed,
-                block_cache: BlockCache::disabled(),
+                block_cache: if opts.block_cache_budget_bytes == 0 {
+                    BlockCache::disabled()
+                } else {
+                    // `est_blocks` is a rough shard-sizing seed (budget ÷ a
+                    // conservative average block size), not a hard cap.
+                    let est_blocks = (opts.block_cache_budget_bytes / 8192).max(64) as usize;
+                    BlockCache::with_budget_bytes(opts.block_cache_budget_bytes, est_blocks)
+                },
+                seal_metrics,
                 meta,
                 book,
                 append_gate: AppendGate::new(),
                 publish_seq: PublishSequencer::new_at(recovered_len),
+                opened_at: std::time::Instant::now(),
                 dir: dir.to_path_buf(),
             }),
         })
@@ -905,6 +998,45 @@ impl LogEngine {
         self.inner.book.lock().expect("book lock").payloads.len()
     }
 
+    /// An in-process snapshot of the engine's runtime metrics (`bn-e2y`).
+    ///
+    /// This is the **authoritative** metrics surface: `fdatasync` barrier
+    /// latency percentiles and the mandatory degradation flag (§2.6), block
+    /// cache hit/miss, append throughput, sealed-tier size, and the active
+    /// segment's in-process age. These are live-process facts — a separate
+    /// read-only `mess inspect` process cannot observe another process's
+    /// counters, so it surfaces only what is observable offline (segment
+    /// ages/sizes); the in-process surface here is the API operators poll.
+    #[must_use]
+    pub fn metrics(&self) -> EngineMetrics {
+        let commit = self
+            .inner
+            .committer
+            .as_ref()
+            .map(mess_log::committer::Committer::metrics)
+            .unwrap_or_default();
+        let cache = &self.inner.block_cache;
+        let seal = self.inner.seal_metrics.snapshot();
+        EngineMetrics {
+            commit,
+            durable_watermark: self.inner.appender.watermark().get(),
+            degraded_poisoned: self.inner.appender.is_degraded(),
+            cache_hits: cache.hits(),
+            cache_misses: cache.misses(),
+            cache_hit_rate: cache.hit_rate(),
+            cache_entries: cache.len(),
+            cache_weight_bytes: cache.weight_bytes(),
+            sealed_segment_count: self.inner.sealed.len(),
+            total_events: self.inner.book.lock().expect("book lock").payloads.len() as u64,
+            active_segment_age_secs: self.inner.opened_at.elapsed().as_secs_f64(),
+            seal_fsync: seal.fsync,
+            seal_fsync_degraded: seal.fsync_degraded,
+            seal_fsync_degraded_trips: seal.fsync_degraded_trips,
+            seal_duration: seal.seal_duration,
+            seals: seal.seals,
+        }
+    }
+
     /// Test/diagnostic: number of sealed segments currently installed in the
     /// cold tier (populated at open by [`load_sealed`], and by
     /// [`seal_active`](Self::seal_active) at runtime).
@@ -958,7 +1090,8 @@ impl LogEngine {
             }
         };
         let driver =
-            SealDriver::new(Arc::clone(&self.inner.sealed), self.inner.dir.join("sealed"));
+            SealDriver::new(Arc::clone(&self.inner.sealed), self.inner.dir.join("sealed"))
+                .with_metrics(Arc::clone(&self.inner.seal_metrics));
         std::fs::create_dir_all(self.inner.dir.join("sealed"))
             .map_err(|e| EngineError::SealedRead(format!("mkdir sealed: {e}")))?;
         // The finalize step would seal the mess-log segment footer; the engine

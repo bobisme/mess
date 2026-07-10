@@ -43,7 +43,7 @@
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -206,22 +206,77 @@ pub enum AppendError {
 // Fsync metric (§2.6: barrier-latency metric MUST be exposed)
 // ---------------------------------------------------------------------------
 
-/// Barrier (`fdatasync`) instrumentation the store exposes per §2.6 — "a
-/// store that cannot show its own barrier latency cannot be operated."
-/// This is the minimal count + mean; the full p50/p99 histogram is the
-/// doc-09 operational surface a later bone owns.
-#[derive(Debug, Default)]
+pub use crate::metrics::{DEFAULT_FSYNC_THRESHOLD, LatencySnapshot};
+use crate::metrics::{Counter, DegradationAlarm, LatencyHistogram};
+
+/// Barrier (`fdatasync`) instrumentation the store exposes per §2.6 — "a store
+/// that cannot show its own p50/p99 barrier latency cannot be operated." The
+/// full log-scale latency histogram (p50/p95/p99), the mandatory degradation
+/// alarm (§2.6: a near-full device's ~50× `fdatasync` stall MUST be surfaced
+/// loudly), and the append-throughput counters, all lock-free.
 struct Metrics {
-    count: AtomicU64,
-    nanos_total: AtomicU64,
+    /// `fdatasync` barrier latency distribution.
+    fsync: LatencyHistogram,
+    /// The mandatory degradation alarm on barrier latency (§2.6).
+    alarm: DegradationAlarm,
+    /// Commit groups committed (one barrier each in a barriered mode).
+    groups: Counter,
+    /// Batches durably written.
+    batches: Counter,
+    /// Events durably written.
+    events: Counter,
+    /// Payload+framing bytes durably written (the `encoded_len` sum).
+    bytes: Counter,
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Metrics {
+            fsync: LatencyHistogram::new(),
+            alarm: DegradationAlarm::new("fdatasync", DEFAULT_FSYNC_THRESHOLD),
+            groups: Counter::new(),
+            batches: Counter::new(),
+            events: Counter::new(),
+            bytes: Counter::new(),
+        }
+    }
 }
 
 impl Metrics {
-    fn record(&self, dt: Duration) {
-        self.count.fetch_add(1, Ordering::Relaxed);
-        self.nanos_total
-            .fetch_add(u64::try_from(dt.as_nanos()).unwrap_or(u64::MAX), Ordering::Relaxed);
+    /// Record one barrier latency and feed the degradation alarm (§2.6). Both
+    /// are lock-free `fetch_add`s off a timestamp diff the committer already
+    /// holds — the trivial hot-path overhead the bone requires.
+    fn record_fsync(&self, dt: Duration) {
+        self.fsync.record(dt);
+        self.alarm.observe(dt);
     }
+}
+
+/// A point-in-time snapshot of a committer's runtime metrics (`bn-e2y`).
+///
+/// Read via [`Committer::metrics`]. The barrier-latency percentiles and the
+/// degradation flag are the mandatory §2.6 surface; the throughput counters are
+/// the doc-03 operational list (append rate, events-per-fsync denominator).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CommitterMetrics {
+    /// `fdatasync` barrier latency (p50/p95/p99/max/mean, nanoseconds).
+    pub fsync: LatencySnapshot,
+    /// Whether barrier latency has crossed the degradation threshold — the
+    /// sticky store-status flag (§2.6). `true` means the device has shown
+    /// degraded-load `fdatasync` latency at least once.
+    pub fsync_degraded: bool,
+    /// Number of barriers that crossed the threshold.
+    pub fsync_degraded_trips: u64,
+    /// The active degradation threshold, in nanoseconds.
+    pub fsync_threshold_nanos: u64,
+    /// Commit groups committed.
+    pub groups: u64,
+    /// Batches durably written.
+    pub batches: u64,
+    /// Events durably written.
+    pub events: u64,
+    /// Payload+framing bytes durably written.
+    pub bytes: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -772,6 +827,9 @@ fn commit_group<R: Runtime, F: Fs>(
         let res = match outcome {
             Ok(receipt) => {
                 wrote_any = true;
+                metrics.batches.incr();
+                metrics.events.add(u64::from(receipt.frame_count));
+                metrics.bytes.add(req.encoded_len);
                 let first_position = receipt.first_global_pos;
                 let last_position = first_position + u64::from(receipt.frame_count) - 1;
                 Ok(AppendOutcome::Acked { first_position, last_position })
@@ -818,7 +876,10 @@ fn commit_group<R: Runtime, F: Fs>(
     if policy.barrier && wrote_any {
         let t0 = rt.now();
         match writer.sync() {
-            Ok(()) => metrics.record(rt.now().saturating_duration_since(t0)),
+            Ok(()) => {
+                metrics.record_fsync(rt.now().saturating_duration_since(t0));
+                metrics.groups.incr();
+            }
             Err(e) => {
                 barrier_ok = false;
                 degraded.poison(PoisonCause::classify(&e));
@@ -1215,14 +1276,45 @@ impl<R: Runtime> Committer<R> {
     /// Number of `fdatasync` barriers issued so far (§2.6 metric; the
     /// denominator for events-per-fsync).
     pub fn fsync_count(&self) -> u64 {
-        self.metrics.count.load(Ordering::Relaxed)
+        self.metrics.fsync.count()
     }
 
     /// Mean barrier latency in nanoseconds so far, or `0` before any
     /// barrier (§2.6: barrier latency MUST be observable).
     pub fn mean_fsync_nanos(&self) -> u64 {
-        let n = self.metrics.count.load(Ordering::Relaxed);
-        self.metrics.nanos_total.load(Ordering::Relaxed).checked_div(n).unwrap_or(0)
+        self.metrics.fsync.mean_nanos()
+    }
+
+    /// A point-in-time snapshot of this committer's runtime metrics
+    /// (`bn-e2y`): barrier-latency percentiles (p50/p95/p99), the mandatory
+    /// degradation flag (§2.6), and append-throughput counters. Lock-free and
+    /// cheap — safe to poll from any thread while the committer runs.
+    pub fn metrics(&self) -> CommitterMetrics {
+        let m = &*self.metrics;
+        CommitterMetrics {
+            fsync: m.fsync.snapshot(),
+            fsync_degraded: m.alarm.is_tripped(),
+            fsync_degraded_trips: m.alarm.trips(),
+            fsync_threshold_nanos: m.alarm.threshold_nanos(),
+            groups: m.groups.get(),
+            batches: m.batches.get(),
+            events: m.events.get(),
+            bytes: m.bytes.get(),
+        }
+    }
+
+    /// Whether barrier latency has crossed the degradation threshold at least
+    /// once — the sticky store-status flag §2.6 makes mandatory. `true` means
+    /// the device has demonstrably shown degraded-load `fdatasync` latency
+    /// (a near-full/contended consumer SSD's ~50× stall).
+    pub fn is_fsync_degraded(&self) -> bool {
+        self.metrics.alarm.is_tripped()
+    }
+
+    /// Reconfigure the fsync-degradation alarm threshold at runtime
+    /// (default [`DEFAULT_FSYNC_THRESHOLD`], 50 ms).
+    pub fn set_fsync_alarm_threshold(&self, threshold: Duration) {
+        self.metrics.alarm.set_threshold(threshold);
     }
 
     /// Durably append one batch and await its outcome. Validates the batch
@@ -1392,6 +1484,57 @@ mod tests {
             n
         });
         assert_eq!(fsyncs, 0, "Process mode must not issue a barrier before shutdown");
+    }
+
+    // -- Metrics: throughput counters + degradation alarm (bn-e2y) -------
+
+    #[test]
+    fn metrics_count_throughput_and_barriers() {
+        let rt = SimRuntime::new(11);
+        let fs = rt.fs();
+        let writer = seg(&fs, Path::new("/seg-metrics"));
+        let m = rt.block_on(async {
+            let c = Committer::spawn(&rt, writer, Durability::Os);
+            // 3 batches: 3, 5, 2 events = 10 events, 3 batches, 3 barriers (Os).
+            for (v, n) in [(0u64, 3usize), (3, 5), (8, 2)] {
+                c.append(req(1, v, n)).await.unwrap();
+            }
+            let m = c.metrics();
+            c.shutdown().await;
+            m
+        });
+        assert_eq!(m.events, 10, "every durable event is counted");
+        assert_eq!(m.batches, 3);
+        assert_eq!(m.groups, 3, "Os: one barrier per batch");
+        assert_eq!(m.fsync.count, 3, "fsync histogram counts every barrier");
+        assert!(m.bytes > 0, "encoded bytes are counted");
+        // A healthy sim barrier is well under 50 ms: the alarm stays clear.
+        assert!(!m.fsync_degraded, "healthy barriers must not trip the alarm");
+        assert_eq!(m.fsync_degraded_trips, 0);
+    }
+
+    #[test]
+    fn degradation_alarm_fires_on_slow_barrier() {
+        // Inject "slowness" deterministically by dropping the threshold to zero:
+        // every real barrier latency (>= 0) then crosses it, so the mandatory
+        // §2.6 store-status flag latches — the alarm wiring is exercised
+        // end-to-end through the committer without a flaky real-time slow fsync.
+        let rt = SimRuntime::new(5);
+        let fs = rt.fs();
+        let writer = seg(&fs, Path::new("/seg-degraded"));
+        let m = rt.block_on(async {
+            let c = Committer::spawn(&rt, writer, Durability::Os);
+            c.set_fsync_alarm_threshold(Duration::ZERO);
+            assert!(!c.is_fsync_degraded(), "clean before any barrier");
+            c.append(req(1, 0, 2)).await.unwrap();
+            assert!(c.is_fsync_degraded(), "a barrier past threshold must latch the flag");
+            let m = c.metrics();
+            c.shutdown().await;
+            m
+        });
+        assert!(m.fsync_degraded);
+        assert!(m.fsync_degraded_trips >= 1);
+        assert_eq!(m.fsync_threshold_nanos, 0);
     }
 
     // -- Group mode: concurrent appenders, watermark covers every ack ----

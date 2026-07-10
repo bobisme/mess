@@ -32,6 +32,19 @@ pub fn run(dir: &Path, opts: &InspectOptions) -> Report {
     // Segment chain overview.
     let segments = store::discover_segments(dir);
     let mut stream_heads: BTreeMap<u64, u64> = BTreeMap::new();
+    // Offline metrics accumulators (bn-e2y). `mess inspect` opens the store
+    // read-only from a SEPARATE process, so it cannot observe another process's
+    // in-process runtime counters (fsync latency, cache hit rate, subscription
+    // lag) — those live behind `LogEngine::metrics()` in the writer process.
+    // What IS observable offline is the on-disk shape: segment sizes, ages,
+    // seal state, and durable event/batch counts. That is what this section
+    // reports; see the `metrics` advisory below on the split.
+    let mut total_size_bytes: u64 = 0;
+    let mut total_events: u64 = 0;
+    let mut total_batches: u64 = 0;
+    let mut sealed_count: u64 = 0;
+    let mut active_count: u64 = 0;
+    let mut active_age_secs: Option<f64> = None;
     for seg in &segments {
         if let Some(want) = opts.segment
             && seg.segment_id != want
@@ -45,6 +58,20 @@ pub fn run(dir: &Path, opts: &InspectOptions) -> Report {
                         .entry(sid)
                         .and_modify(|cur| *cur = (*cur).max(v))
                         .or_insert(v);
+                }
+                total_size_bytes += scan.file_len;
+                total_events += scan.event_count();
+                total_batches += scan.batch_count() as u64;
+                if scan.is_sealed() {
+                    sealed_count += 1;
+                } else {
+                    active_count += 1;
+                    // The unsealed head's age from its file mtime — the only
+                    // durable age signal available offline (there is no
+                    // per-segment start timestamp in the header).
+                    if let Some(age) = file_age_secs(&seg.log_path) {
+                        active_age_secs = Some(active_age_secs.map_or(age, |a| a.max(age)));
+                    }
                 }
                 report.push_row(json!({
                     "segment_id": seg.segment_id,
@@ -73,6 +100,31 @@ pub fn run(dir: &Path, opts: &InspectOptions) -> Report {
             }
         }
     }
+
+    // Offline metrics section (bn-e2y): the on-disk shape a separate read-only
+    // process CAN observe. Runtime latency/cache/lag metrics are in-process
+    // only — see the advisory below.
+    report.set(
+        "metrics",
+        json!({
+            "scope": "offline",
+            "segment_count": active_count + sealed_count,
+            "active_segment_count": active_count,
+            "sealed_segment_count": sealed_count,
+            "total_size_bytes": total_size_bytes,
+            "durable_event_count": total_events,
+            "durable_batch_count": total_batches,
+            "active_segment_age_secs": active_age_secs,
+        }),
+    );
+    report.advise(
+        "metrics-scope",
+        "runtime metrics (fdatasync p50/p95/p99, degradation flag, block-cache \
+         hit rate, subscription lag) are in-process only, exposed by \
+         LogEngine::metrics() in the writer process; `mess inspect` opens \
+         read-only from a separate process and reports only offline-observable \
+         shape (segment sizes/ages/counts). See docs/spec/03-durability.md §2.6.",
+    );
 
     // Stream heads and registry — from the durable metadata store when it can
     // be opened (a live writer holds fjall's lock, so degrade to the
@@ -125,6 +177,14 @@ pub fn run(dir: &Path, opts: &InspectOptions) -> Report {
     report.set("stream_heads", json!(heads));
 
     report
+}
+
+/// Seconds since a file was last modified, or `None` if the mtime is
+/// unavailable (e.g. a filesystem without mtime, or a clock skew that would
+/// make the age negative).
+fn file_age_secs(path: &Path) -> Option<f64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    modified.elapsed().ok().map(|d| d.as_secs_f64())
 }
 
 fn lock_json(lock: &LockState) -> serde_json::Value {

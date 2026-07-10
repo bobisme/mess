@@ -52,6 +52,7 @@ pub mod footer_ext;
 pub mod format;
 pub mod lock;
 pub mod manifest;
+pub mod metrics;
 pub mod model;
 pub mod reader;
 pub mod recover_all;

@@ -48,7 +48,9 @@ pub use backend::{
     AppendError, Appended, Backend, RecordToAppend, StoredRecord,
 };
 pub use cache::StateCache;
-pub use engine::{EngineError, EngineOptions, LogEngine};
+pub use engine::{
+    CommitterMetrics, EngineError, EngineMetrics, EngineOptions, LogEngine,
+};
 pub use fjall_snapshot::{FjallSnapshotBackend, SnapshotBackendError};
 #[cfg(feature = "mock")]
 pub use mock::MockBackend;
