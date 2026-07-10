@@ -510,3 +510,5 @@
 1783706528845513	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAEx1QQ		item.link	bn-1mw	{"link_type":"blocks","target":"bn-2xl"}	blake3:GTInlsltXzRq18OSRWNH9uZwm4HfTxQtroE7FSA_CtY
 1783706528865981	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAEx1gQ		item.link	bn-1mw	{"link_type":"blocks","target":"bn-13l"}	blake3:VZQXHJ7D3q_R0AtQJfCVV6DhsX5vPTcVe9xyPg1zi1A
 1783706528886124	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAEx1wQ		item.link	bn-j9u	{"link_type":"blocks","target":"bn-1mw"}	blake3:RWs3fOqH_Gr6iyA3Da439z6De3pi1n5yWheO_mAhbiM
+1783706528927879	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAEx2AQ		item.move	bn-154	{"state":"doing"}	blake3:0905TrOHm93bpwyuASZGbRQz1t7Xn-4U-mu1TNGWy50
+1783706528933547	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAEx2QQ		item.assign	bn-154	{"action":"assign","agent":"mess-dev"}	blake3:8v7hVHgO22rfeRDLYeX0Iy8n0PKp4WOpaohOkn8OwIE
