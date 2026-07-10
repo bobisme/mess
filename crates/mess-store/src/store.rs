@@ -6,9 +6,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use mess_core::{Aggregate, CodecError, CommandError, Decide, Event};
 
-use crate::backend::{AppendError, Backend, RecordToAppend};
+use crate::backend::{AppendError, Backend, RecordToAppend, SubscribeBackend};
 use crate::cache::StateCache;
 use crate::retry::RetryPolicy;
+use crate::subscription::Subscription;
 use crate::snapshot::{
     BlobPtr, SnapshotRef, SnapshotStore, Snapshottable, StateCodecError,
     StoredSnapshot, interim_stream_id,
@@ -387,6 +388,65 @@ impl<B: Backend> EventStore<B> {
                 }
             }
         }
+    }
+}
+
+impl<B: SubscribeBackend> EventStore<B> {
+    /// The current committed global watermark: the exclusive end of the
+    /// committed global-position sequence — every global position `< watermark`
+    /// is committed and visible to
+    /// [`backend().read_global`](crate::backend::Backend::read_global), and it
+    /// is the count of committed events. Monotone non-decreasing while the store
+    /// is live.
+    pub async fn watermark(&self) -> Result<u64, StoreError<B::Error>> {
+        self.backend.watermark().await.map_err(StoreError::Backend)
+    }
+
+    /// Await until the committed watermark passes global position `pos` — i.e.
+    /// until `pos` is committed and visible to
+    /// [`backend().read_global`](crate::backend::Backend::read_global).
+    /// Resolves immediately if already past.
+    ///
+    /// This is the **event-bounded** barrier a read model wants after issuing a
+    /// write: pass the write's [`Commit::last_global_position`] and await it to
+    /// know the projection can now observe that write — woken by the commit that
+    /// crosses it, never by polling. Dropping the future is safe and never
+    /// wedges the committer (see [`Subscription`]'s module docs).
+    pub async fn await_past(
+        &self,
+        pos: u64,
+    ) -> Result<(), StoreError<B::Error>> {
+        self.backend
+            .await_watermark_past(pos)
+            .await
+            .map_err(StoreError::Backend)
+    }
+}
+
+impl<B: SubscribeBackend + Clone> EventStore<B> {
+    /// Open a catch-up → live-tail [`Subscription`] over the global event
+    /// stream, starting at global position `from` (`None` starts at 0, the
+    /// whole log).
+    ///
+    /// The returned handle first **replays committed history** from `from` a
+    /// page at a time (page size = this store's
+    /// [`page_size`](Self::with_page_size)), then switches to a **live tail**
+    /// driven by commit notification — the durable watermark, not busy polling.
+    /// Pull records in global order with
+    /// [`Subscription::next_batch`] / [`Subscription::next`]; delivery is
+    /// gap-free and in ascending global position. See [`Subscription`] for the
+    /// full delivery, cancellation, and drop contract.
+    ///
+    /// The subscription holds its own cheap clone of the backend handle, so it
+    /// is independent of this `EventStore` and of every other subscriber: a
+    /// store supports one writer and many concurrent subscriptions.
+    #[must_use]
+    pub fn subscribe(&self, from: Option<u64>) -> Subscription<B> {
+        Subscription::new(
+            self.backend.clone(),
+            from.unwrap_or(0),
+            self.page_size,
+        )
     }
 }
 

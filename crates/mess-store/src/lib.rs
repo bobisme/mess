@@ -42,10 +42,12 @@ pub mod registry;
 pub mod retry;
 pub mod snapshot;
 pub mod store;
+pub mod subscription;
 pub mod version;
 
 pub use backend::{
     AppendError, Appended, Backend, RecordToAppend, StoredRecord,
+    SubscribeBackend,
 };
 pub use cache::StateCache;
 pub use engine::{
@@ -62,6 +64,7 @@ pub use snapshot::{
 pub use store::{
     Commit, DEFAULT_PAGE_SIZE, EventStore, Loaded, SnapshotMetrics, StoreError,
 };
+pub use subscription::Subscription;
 pub use version::Version;
 
 // Re-export the core command error the facade returns so callers need not

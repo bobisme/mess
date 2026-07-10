@@ -111,11 +111,13 @@ use mess_log::fold_chain::ChainHead;
 use mess_log::lock::StoreLock;
 use mess_log::runtime::{RealRuntime, Runtime};
 use mess_log::scanner::{self, AcceptedBatch};
+use mess_log::watermark::Watermark;
 use mess_log::sealer::{TrailerFields, encode_trailer};
 use mess_log::writer::{ResumeParams, SegmentParams, SegmentSummary, SegmentWriter};
 
 use crate::backend::{
     AppendError, Appended, Backend, RecordToAppend, StoredRecord,
+    SubscribeBackend,
 };
 use crate::version::Version;
 
@@ -463,6 +465,18 @@ struct Inner {
     seal_metrics: Arc<SealMetrics>,
     meta: MetaStore,
     book: Arc<Mutex<Book>>,
+    /// The **published** global watermark — the exclusive end of the readable
+    /// global-position sequence (the dense record-book length). Advanced at the
+    /// end of each append's publish step (after the book/index/meta are
+    /// updated, in publish-turn order), so it tracks what
+    /// [`read_global`](Backend::read_global) can serve, NOT merely what the
+    /// durable committer has acked. The app-facing subscription / live-tail API
+    /// ([`SubscribeBackend`](crate::backend::SubscribeBackend)) awaits this
+    /// value; a woken subscriber is therefore guaranteed the position it waited
+    /// for is already materialised in the book. Distinct from the committer's
+    /// own durable watermark ([`Appender::watermark`]), which advances a step
+    /// earlier (at ack, before the in-process publish).
+    read_watermark: Watermark,
     /// Serialises the exact-version critical section, per stream (bn-1s0).
     append_gate: AppendGate,
     /// Orders the post-ack book/index/meta publish step by global position
@@ -843,6 +857,10 @@ impl LogEngine {
                 seal_metrics,
                 meta,
                 book,
+                // Seed the published watermark at the recovered dense book
+                // length: 0 on a fresh store, or the recovered event count on a
+                // reopen — the same baseline the publish sequencer starts from.
+                read_watermark: Watermark::new(recovered_len),
                 append_gate: AppendGate::new(),
                 publish_seq: PublishSequencer::new_at(recovered_len),
                 opened_at: Instant::now(),
@@ -1782,6 +1800,14 @@ impl Backend for LogEngine {
                 .apply_group(&group)
                 .map_err(|e| EngineError::Meta(e.to_string()))?;
 
+            // Publish complete: every position `< watermark` is now resident in
+            // the record book (and index/meta). Advance the published watermark
+            // LAST, still holding this batch's publish turn (`_turn`), so it
+            // moves in strict global-position order and never announces a
+            // position `read_global` cannot yet serve. This is the wake that
+            // drives every live-tail subscriber parked on `await_watermark_past`.
+            inner.read_watermark.advance(watermark);
+
             Ok(Appended {
                 version: Version::At(last_stream_pos),
                 last_global_position: last_global,
@@ -1792,6 +1818,17 @@ impl Backend for LogEngine {
         .map_err(AppendError::Backend)?;
 
         Ok(appended)
+    }
+}
+
+impl SubscribeBackend for LogEngine {
+    async fn watermark(&self) -> Result<u64, Self::Error> {
+        Ok(self.inner.read_watermark.get())
+    }
+
+    async fn await_watermark_past(&self, pos: u64) -> Result<(), Self::Error> {
+        self.inner.read_watermark.await_past(pos).await;
+        Ok(())
     }
 }
 

@@ -143,3 +143,53 @@ pub trait Backend: Send + Sync + 'static {
         records: &[RecordToAppend],
     ) -> impl Future<Output = Result<Appended, AppendError<Self::Error>>> + Send;
 }
+
+/// A [`Backend`] that also exposes the **committed global watermark** and an
+/// event-bounded wait on it — the two primitives the app-facing subscription /
+/// live-tail API ([`EventStore::subscribe`](crate::EventStore::subscribe),
+/// [`EventStore::watermark`](crate::EventStore::watermark),
+/// [`EventStore::await_past`](crate::EventStore::await_past)) is built on.
+///
+/// This is an **additive** capability trait: the base [`Backend`] seam (and its
+/// [`read_global`](Backend::read_global) catch-up path) is untouched, so a
+/// backend that only stores events need not implement it. A backend that *does*
+/// implement it promises a monotone commit-notification hook rather than a
+/// parallel signalling system — internally both shipped backends reuse the
+/// `mess-log` durable watermark (`mess_log::watermark::Watermark`, the same
+/// primitive the log's D11 subscription runtime awaits).
+///
+/// # Watermark meaning
+///
+/// The watermark is the **exclusive end of the committed global-position
+/// sequence**: every global position `< watermark` is committed and visible to
+/// [`read_global`](Backend::read_global), and no position `>= watermark` is yet
+/// readable. Equivalently it is the count of committed events. It is monotone
+/// non-decreasing while the store is live (it can only regress across a crash +
+/// recovery, never in-process).
+///
+/// For the composed [`LogEngine`](crate::LogEngine) the watermark tracks the
+/// **published** end — a position is counted only once its payload is resident
+/// in the read path that [`read_global`](Backend::read_global) serves, which is
+/// strictly after the durable committer acked it. So a waiter woken by
+/// [`await_watermark_past`](SubscribeBackend::await_watermark_past) is
+/// guaranteed the position it waited for is already readable, not merely
+/// durable-but-not-yet-materialised.
+pub trait SubscribeBackend: Backend {
+    /// The current committed global watermark (see the trait docs): the
+    /// exclusive end of the readable global-position sequence.
+    fn watermark(&self) -> impl Future<Output = Result<u64, Self::Error>> + Send;
+
+    /// Resolve once the committed watermark has advanced strictly **past**
+    /// global position `pos` — i.e. once `watermark > pos`, so position `pos`
+    /// is committed and visible to [`read_global`](Backend::read_global).
+    /// Resolves immediately if the watermark is already there.
+    ///
+    /// This is the event-bounded live-tail primitive: it is driven by commit
+    /// notification (the durable watermark's waker list), never by busy
+    /// polling. Dropping the returned future (e.g. a cancelled `next_batch`)
+    /// deregisters the waiter and can never wedge the committer.
+    fn await_watermark_past(
+        &self,
+        pos: u64,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+}

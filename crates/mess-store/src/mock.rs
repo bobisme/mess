@@ -16,8 +16,11 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 
+use mess_log::watermark::Watermark;
+
 use crate::backend::{
     AppendError, Appended, Backend, RecordToAppend, StoredRecord,
+    SubscribeBackend,
 };
 use crate::snapshot::{SnapshotStore, StoredSnapshot};
 use crate::version::Version;
@@ -47,9 +50,23 @@ impl Inner {
 
 /// An in-memory event store backend. Cheap to clone — every clone shares the
 /// same underlying state.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct MockBackend {
     inner: Arc<Mutex<Inner>>,
+    /// The committed global watermark (the count of committed events), a
+    /// `mess-log` durable [`Watermark`] advanced under the same critical
+    /// section as each append so a live tail can wake event-bounded rather
+    /// than by polling. Shared across clones (it is `Arc`-backed internally).
+    watermark: Watermark,
+}
+
+impl Default for MockBackend {
+    fn default() -> Self {
+        MockBackend {
+            inner: Arc::new(Mutex::new(Inner::default())),
+            watermark: Watermark::new(0),
+        }
+    }
 }
 
 impl MockBackend {
@@ -161,8 +178,26 @@ impl Backend for MockBackend {
         let stream = inner.streams.entry(stream_id.to_string()).or_default();
         stream.extend(committed.iter().cloned());
         inner.global.extend(committed);
+        let new_watermark = inner.global.len() as u64;
+        // Advance the watermark AFTER the events are visible in `global` (the
+        // slice `read_global` serves) and with the state lock dropped, so a
+        // woken live-tail subscriber that immediately reads `read_global`
+        // observes exactly the positions the watermark now covers.
+        drop(inner);
+        self.watermark.advance(new_watermark);
 
         Ok(Appended { version, last_global_position: last_global })
+    }
+}
+
+impl SubscribeBackend for MockBackend {
+    async fn watermark(&self) -> Result<u64, Self::Error> {
+        Ok(self.watermark.get())
+    }
+
+    async fn await_watermark_past(&self, pos: u64) -> Result<(), Self::Error> {
+        self.watermark.await_past(pos).await;
+        Ok(())
     }
 }
 
