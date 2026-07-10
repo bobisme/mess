@@ -426,3 +426,11 @@
 1783656911251403	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExgQQ		item.move	bn-4pk	{"state":"done"}	blake3:XRIkQ_EB7gqrwkVuR0QMFTRA1mkwZQpeG7rq5uSbVbg
 1783656911267864	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExggQ		item.move	bn-3nz	{"state":"done"}	blake3:hw9DBamAgsPYx-Gl3eKdZwWVAfR32Hukp20y_GLdcR4
 1783656911285732	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExgwQ		item.move	bn-3h0	{"state":"done"}	blake3:fmMw0T1yEXX-htk695osb8ChlY7QD5g6dSry5nd3zOQ
+1783656945061031	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExhAQ		item.move	bn-e2y	{"state":"doing"}	blake3:KwGnt-b_7FkrujHSrDMBILxySGkQJGey-Bd0_0OA_3Q
+1783656945070758	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExhQQ		item.assign	bn-e2y	{"action":"assign","agent":"mess-dev"}	blake3:davPaWjal7Ixz_Tw9HVMo_7w5AMMxZv9VoJysCt96vM
+1783656945087847	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExhgQ		item.move	bn-1fo	{"state":"doing"}	blake3:BcG2IwDefmuOxqzh1LDzODwBCFpD2EugP2eBauuMfsQ
+1783656945091237	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExhwQ		item.assign	bn-1fo	{"action":"assign","agent":"mess-dev"}	blake3:8Hywn3WXKaeri5DDzwPh9GO8QNXUzkKGucFInEwh6PU
+1783656945107653	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExiAQ		item.move	bn-1hl	{"state":"doing"}	blake3:zOxLcryZO_y-WB9TWMSB8KxZEsVblMyLIYnIn8APUGw
+1783656945111191	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExiQQ		item.assign	bn-1hl	{"action":"assign","agent":"mess-dev"}	blake3:uBR9Ny2VcktmDcDdfpcKakE_FRe6IPkxvJmgBuPrLU8
+1783656945127181	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExigQ		item.move	bn-fyo	{"state":"doing"}	blake3:FcdVvOxyON8MVdiJM2qd31YUpm-cRX-7OBfOQyjt2KE
+1783656945130225	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAExiwQ		item.assign	bn-fyo	{"action":"assign","agent":"mess-dev"}	blake3:ltftrCpyGNJ_zxhOEF0pkkRhZMN6EySVPkFcX_GwKQU
