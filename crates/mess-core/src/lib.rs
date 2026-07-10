@@ -26,7 +26,7 @@ pub mod aggregate;
 pub mod error;
 pub mod event;
 
-pub use aggregate::{Aggregate, Decide};
+pub use aggregate::{Actor, Aggregate, Decide};
 pub use error::{CodecError, CommandError};
 pub use event::Event;
 

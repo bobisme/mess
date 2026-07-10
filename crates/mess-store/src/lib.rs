@@ -56,7 +56,9 @@ pub use engine::{
 pub use fjall_snapshot::{FjallSnapshotBackend, SnapshotBackendError};
 // Re-export the core command error the facade returns so callers need not
 // depend on `mess-core` directly just to match on a command outcome.
-pub use mess_core::CommandError;
+// `Actor` rides along so a caller can implement the authored-command trait
+// ([`EventStore::command_as`]) without a separate `mess-core` import.
+pub use mess_core::{Actor, CommandError};
 #[cfg(feature = "mock")]
 pub use mock::MockBackend;
 pub use retry::{DEFAULT_MAX_ATTEMPTS, RetryPolicy};
@@ -65,7 +67,8 @@ pub use snapshot::{
     StateCodecError, StoredSnapshot, interim_stream_id,
 };
 pub use store::{
-    Commit, DEFAULT_PAGE_SIZE, EventStore, Loaded, SnapshotMetrics, StoreError,
+    AuthoredCommandError, Commit, DEFAULT_PAGE_SIZE, EventStore, Loaded,
+    SnapshotMetrics, StoreError,
 };
 pub use subscription::Subscription;
 pub use version::Version;

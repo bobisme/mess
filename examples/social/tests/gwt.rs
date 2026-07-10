@@ -12,6 +12,7 @@
 //! ```
 
 use ident::Id;
+use mess_core::Actor;
 use mess_testkit::{AggregateTest, matching};
 use social::domain::post::{
     CreatePost, DeletePost, Like, Post, PostError, PostEvent, Unlike,
@@ -170,6 +171,26 @@ fn cannot_follow_self() {
     }])
     .when(Follow { follower: alice, target: alice })
     .then_error(UserError::SelfFollow);
+}
+
+#[test]
+fn follow_declares_its_follower_stream() {
+    // bn-2i3: the echoed `follower` id is now the command's declared *actor
+    // stream*, built from the same `user_stream` helper the writer dispatches
+    // with — so `EventStore::command_as` can assert the two agree instead of
+    // trusting the restated id.
+    let alice = Id::new();
+    let bob = Id::new();
+    assert_eq!(
+        Follow { follower: alice, target: bob }.actor_stream(),
+        social::user_stream(alice),
+    );
+    // A divergent restating (some *other* follower) resolves to a different
+    // stream — precisely the mismatch the authored command path refuses.
+    assert_ne!(
+        Follow { follower: bob, target: alice }.actor_stream(),
+        social::user_stream(alice),
+    );
 }
 
 #[test]

@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use mess_core::{Aggregate, CodecError, CommandError, Decide, Event};
+use mess_core::{Actor, Aggregate, CodecError, CommandError, Decide, Event};
 
 use crate::backend::{AppendError, Backend, RecordToAppend, SubscribeBackend};
 use crate::cache::StateCache;
@@ -43,6 +43,68 @@ pub enum StoreError<E> {
     /// back to full replay.
     #[error("state codec error: {0}")]
     State(#[source] StateCodecError),
+}
+
+/// The outcome of an **authored** command
+/// ([`command_as`](EventStore::command_as) /
+/// [`command_cached_as`](EventStore::command_cached_as)): either the command's
+/// declared [`Actor`] stream diverged from the stream it was dispatched to — a
+/// caller bug caught before the log is touched — or the underlying command
+/// round produced an ordinary [`CommandError`].
+///
+/// It deliberately wraps [`CommandError`] rather than adding a variant to it:
+/// an actor/stream divergence is a *dispatch precondition*, not one of the
+/// three command-round outcomes (`Domain` / `Conflict` / `Store`), and callers
+/// of the plain [`command`](EventStore::command) never have to widen their
+/// match to account for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthoredCommandError<R, S> {
+    /// The command declared actor stream `declared` (via
+    /// [`Actor::actor_stream`]) but was dispatched to `stream`. A
+    /// self-referential invariant's echoed actor id diverged from the stream
+    /// key it implies; the store refuses to write rather than let the two
+    /// disagree. Nothing was appended.
+    ActorMismatch {
+        /// The stream the command declared it is authored against.
+        declared: String,
+        /// The stream it was actually dispatched to.
+        stream:   String,
+    },
+    /// The command round itself failed (a domain rejection, conflict
+    /// exhaustion, or store plumbing) — see [`CommandError`].
+    Command(CommandError<R, S>),
+}
+
+impl<R, S> From<CommandError<R, S>> for AuthoredCommandError<R, S> {
+    fn from(e: CommandError<R, S>) -> Self { AuthoredCommandError::Command(e) }
+}
+
+impl<R: std::fmt::Display, S: std::fmt::Display> std::fmt::Display
+    for AuthoredCommandError<R, S>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthoredCommandError::ActorMismatch { declared, stream } => write!(
+                f,
+                "actor/stream divergence: command is authored against \
+                 {declared:?} but was dispatched to stream {stream:?}"
+            ),
+            AuthoredCommandError::Command(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl<R, S> std::error::Error for AuthoredCommandError<R, S>
+where
+    R: std::error::Error + 'static,
+    S: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            AuthoredCommandError::ActorMismatch { .. } => None,
+            AuthoredCommandError::Command(e) => Some(e),
+        }
+    }
 }
 
 impl<E> From<CodecError> for StoreError<E> {
@@ -380,6 +442,35 @@ impl<B: Backend> EventStore<B> {
                 }
             }
         }
+    }
+
+    /// Like [`command`](Self::command), but for a command that declares its own
+    /// [`Actor`] stream: the store checks the command's declared actor stream
+    /// equals `stream_id` **before** loading or deciding, so a self-referential
+    /// invariant's echoed actor id can never silently diverge from the stream
+    /// it is committed to (see [`Actor`] for the full rationale).
+    ///
+    /// A divergence is a **caller bug**, not a runtime condition: it trips a
+    /// `debug_assert` in debug builds (a loud failure in tests) and, in every
+    /// build, returns [`AuthoredCommandError::ActorMismatch`] *before the log
+    /// is touched* — never a partial write. A command whose declared stream
+    /// matches delegates verbatim to [`command`](Self::command), so the
+    /// optimistic retry, the returned [`Commit`], and the error taxonomy are
+    /// identical; the only addition is the up-front dispatch check.
+    pub async fn command_as<A, C>(
+        &self,
+        stream_id: &str,
+        cmd: C,
+    ) -> Result<
+        Commit,
+        AuthoredCommandError<<A as Decide<C>>::Rejection, StoreError<B::Error>>,
+    >
+    where
+        A: Aggregate + Decide<C>,
+        C: Clone + Actor,
+    {
+        check_actor(&cmd, stream_id)?;
+        Ok(self.command::<A, C>(stream_id, cmd).await?)
     }
 }
 
@@ -811,6 +902,31 @@ impl<B: SnapshotStore> EventStore<B> {
         }
     }
 
+    /// The warm-path twin of [`command_as`](Self::command_as): an authored
+    /// command on the cached [`command_cached`](Self::command_cached) path.
+    ///
+    /// Identical cost model and semantics to
+    /// [`command_cached`](Self::command_cached), with the same up-front
+    /// actor/stream dispatch check as [`command_as`](Self::command_as): a
+    /// divergence trips a `debug_assert` and returns
+    /// [`AuthoredCommandError::ActorMismatch`] before any cache lookup, load,
+    /// or append.
+    pub async fn command_cached_as<A, C>(
+        &self,
+        stream_id: &str,
+        cmd: C,
+    ) -> Result<
+        Commit,
+        AuthoredCommandError<<A as Decide<C>>::Rejection, StoreError<B::Error>>,
+    >
+    where
+        A: Snapshottable + Decide<C> + Clone,
+        C: Clone + Actor,
+    {
+        check_actor(&cmd, stream_id)?;
+        Ok(self.command_cached::<A, C>(stream_id, cmd).await?)
+    }
+
     /// The warm-path read: return the hot aggregate for `stream_id`, folding at
     /// most the delta since the cache last saw it.
     ///
@@ -855,6 +971,35 @@ impl<B: SnapshotStore> EventStore<B> {
         let loaded = self.load_cached::<A>(stream_id).await?;
         self.cache.put::<A>(stream_id, loaded.version, loaded.state.clone());
         Ok(loaded)
+    }
+}
+
+/// Enforce the [`Actor`] dispatch precondition: the stream a command declares
+/// it is authored against must equal the stream it is being dispatched to.
+///
+/// A mismatch is a caller bug, so it trips a `debug_assert` (loud in tests /
+/// debug builds) and, in every build, is returned as
+/// [`AuthoredCommandError::ActorMismatch`] so a release binary refuses the
+/// write instead of committing an event to the wrong stream. Shared by
+/// [`EventStore::command_as`] and [`EventStore::command_cached_as`].
+fn check_actor<C: Actor, R, S>(
+    cmd: &C,
+    stream_id: &str,
+) -> Result<(), AuthoredCommandError<R, S>> {
+    let declared = cmd.actor_stream();
+    debug_assert_eq!(
+        declared.as_str(),
+        stream_id,
+        "actor/stream divergence: command authored against {declared:?} but \
+         dispatched to stream {stream_id:?}"
+    );
+    if declared == stream_id {
+        Ok(())
+    } else {
+        Err(AuthoredCommandError::ActorMismatch {
+            declared,
+            stream: stream_id.to_string(),
+        })
     }
 }
 

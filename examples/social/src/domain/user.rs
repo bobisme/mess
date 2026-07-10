@@ -40,7 +40,7 @@
 use std::collections::HashSet;
 
 use ident::Id;
-use mess_core::Decide;
+use mess_core::{Actor, Decide};
 use mess_derive::{Aggregate, Event};
 
 // ---------------------------------------------------------------------------
@@ -207,15 +207,39 @@ pub struct SetDisplayName {
 /// Follow another user.
 ///
 /// `follower` is the id of the user *this stream belongs to*. It is restated
-/// in the command because `decide` sees only the folded aggregate state, never
-/// the stream id it was loaded from — so the self-follow check has no other
-/// way to learn "who am I?". (Dogfood finding: a self-referential invariant
-/// forces the caller to echo the actor id that the stream key already
-/// implies.)
+/// in the command because [`Decide::decide`] sees only the folded aggregate
+/// state, never the stream id it was loaded from — so the self-follow check has
+/// no other way to learn "who am I?". A self-referential invariant forces the
+/// command to echo the actor id that the stream key `user-<follower>` already
+/// implies.
+///
+/// # The echoed actor id is now *checked*, not merely trusted (bn-2i3)
+///
+/// Echoing the id makes a divergence **representable**: a
+/// `Follow { follower: X }` committed to *Y*'s stream type-checks, and `decide`
+/// — which never learns Y — cannot catch it. The blessed remedy is the
+/// [`Actor`] convention: `Follow` declares, via [`Actor::actor_stream`], the
+/// stream it belongs to (built from `follower` through the one
+/// [`user_stream`](crate::user_stream) helper the writer also dispatches with),
+/// and the store's authored command path
+/// ([`command_as`](mess_store::EventStore::command_as)) asserts the two agree
+/// **before** deciding. The field stays — the self-follow rule still needs it —
+/// but a `follower`/stream divergence is now a fail-fast
+/// [`AuthoredCommandError::ActorMismatch`](mess_store::AuthoredCommandError),
+/// not a silent mis-write.
 #[derive(Debug, Clone, Copy)]
 pub struct Follow {
     pub follower: Id,
     pub target:   Id,
+}
+
+impl Actor for Follow {
+    /// A `Follow` is authored against the *follower's* own stream — the same
+    /// `user-<follower>` key [`WriteOps`](crate::WriteOps) dispatches it to.
+    /// Reusing [`user_stream`](crate::user_stream) keeps the two spellings a
+    /// single source of truth, so the store's dispatch check compares like with
+    /// like.
+    fn actor_stream(&self) -> String { crate::user_stream(self.follower) }
 }
 
 /// Unfollow a user. No `follower` field is needed: you can never be following
