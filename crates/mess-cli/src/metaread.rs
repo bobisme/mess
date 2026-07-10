@@ -5,6 +5,44 @@
 //! Opening the fjall metadata store takes fjall's own directory lock, so under
 //! a live writer this open fails — every caller treats that as best-effort and
 //! degrades to an advisory rather than a hard error.
+//!
+//! # bn-ve0: why there is no read-only fallback
+//!
+//! The obvious fix for the fjall-lock failure mode is "open read-only /
+//! secondary instead of falling over" — investigated for `doctor`'s
+//! fold-version check and rejected for fjall 3.1.6 (the version pinned in
+//! `crates/mess-index/Cargo.toml`), for two independent reasons:
+//!
+//! 1. **No such API exists.** `fjall::Database::open` (via the `Openable`
+//!    trait, `fjall-3.1.6/src/tx/single_writer/mod.rs`) dispatches to either
+//!    `Database::create_new` or `Database::recover` (`fjall-3.1.6/src/db.rs`)
+//!    depending on whether the directory already has a version marker. **Both**
+//!    unconditionally call `LockedFileGuard::create_new`/`try_acquire`
+//!    (`fjall-3.1.6/src/locked_file.rs`), which take an exclusive
+//!    `std::fs::File::try_lock` on the directory's `LOCK` file — there is no
+//!    read-only, shared-lock, or secondary/replica open mode in the public API,
+//!    no builder flag for it, and no `#[doc(hidden)]` escape hatch either
+//!    (checked every `pub`/`pub(crate)` fn in `db.rs`, `builder.rs`,
+//!    `locked_file.rs`). Forking or patching fjall to add one is out of scope
+//!    for a CLI-side bone.
+//!
+//! 2. **Even bypassing the lock would not be safe.** fjall's default durability
+//!    here is journal-buffered (`MetaStore`'s own doc: "writes land in fjall's
+//!    journal buffer and are not fsynced per commit"). A just-written
+//!    `snapshot_heads` row — exactly the data `doctor`'s fold-version check
+//!    wants — can sit in the live writer's in-memory journal for a while before
+//!    it is ever flushed to an SST file on disk. Reading the on-disk
+//!    SST/journal files directly (skipping `Database::open`'s lock, and with it
+//!    fjall's own journal-recovery logic in `recovery.rs`) would silently
+//!    return *stale or incomplete* data rather than failing loudly — worse for
+//!    a health-check tool than today's honest "could not read" degradation,
+//!    because a stale read could report `fold-version-consistent` while a real
+//!    drift sits unflushed in the writer's journal.
+//!
+//! Given both, `doctor` keeps the existing "try exclusive, degrade to an
+//! advisory finding on failure" shape (item 1/2 of bn-ve0: better wording +
+//! docs for the caveat) rather than a forced read-only path. If fjall ever
+//! ships a documented read-only/secondary mode, revisit this.
 
 use mess_index::meta::{MetaStore, StreamId};
 
@@ -44,6 +82,23 @@ fn decode_ref(bytes: &[u8]) -> Option<(u32, bool)> {
     let fold_version = u32::from_le_bytes(bytes[1..5].try_into().ok()?);
     let covers_empty_prefix = bytes[5] != 0;
     Some((fold_version, covers_empty_prefix))
+}
+
+/// True when a [`read`] error reason came from fjall's own exclusive
+/// directory lock being held (`fjall::Error::Locked`, almost always a live
+/// writer) rather than some other failure (fresh/absent store, corruption,
+/// I/O). `read` collapses every error to a display string before returning
+/// it (`mess-cli` has no direct `fjall` dependency to match the typed error
+/// variant against), so this matches fjall's own `Display` text for that
+/// variant — `"FjallError: Locked"`, from `#[error(transparent)]` on
+/// [`mess_index::meta::MetaError::Fjall`] forwarding straight to
+/// `fjall::Error`'s `Display` impl. `fjall::Error::Locked` is a stable
+/// documented unit variant (`fjall-3.1.6/src/error.rs`), so this string is
+/// tied to fjall's public API surface, not an implementation detail that
+/// shifts under us.
+#[must_use]
+pub fn is_locked_error(reason: &str) -> bool {
+    reason.contains("FjallError: Locked")
 }
 
 /// Open the metadata store read-only and pull the facts. Returns an error

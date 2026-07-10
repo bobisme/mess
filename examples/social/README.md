@@ -242,6 +242,30 @@ writer holds exclusively, so that one check degrades from "checked" to
 "could not read" while the app is up. Worth knowing before reaching for
 `doctor` as a live health probe rather than an offline one.
 
+**Resolved (bn-ve0): the degraded finding now says why and what to do,
+instead of surfacing the raw `FjallError`.** Same repro, after the fix:
+
+```
+info  lock-held  lock  store is locked by a live writer (pid 2233883)
+ok  unsealed-head  trailer  segment 1: unsealed active/rolled head (no trailer)
+ok  fsync-ok  fsync  store directory is writable and fdatasync succeeded
+info  meta-store-locked  fold-version  fold-version check skipped: a live writer holds the metadata store's lock (pid 2233883). This is expected while the app is running, not an error. For the full check, stop the writer first, or run doctor against a `mess backup`/`mess restore` copy instead of the live directory.
+```
+
+Still `info` severity, still zero exit code — this was never a failure — but
+the message no longer requires knowing what `FjallError: Locked` means or
+which store it's talking about. `doctor --help` documents the same caveat up
+front. A read-only fallback (open the meta store without the exclusive lock,
+so this check could run against a live writer too) was investigated and
+rejected for the pinned fjall version: fjall 3.1.6's `Database::open` has no
+read-only/secondary open mode at all — every open path takes the same
+exclusive lock — and, separately, fjall's metadata tables are
+journal-buffered (not fsynced per write), so even bypassing the lock to read
+the on-disk files directly could return stale/incomplete data instead of
+failing loudly, which is worse for a health check than today's honest
+degradation. See `crates/mess-cli/src/metaread.rs`'s module doc for the full
+writeup.
+
 ### `mess inspect` — segment chain, stream heads, registry
 
 ```

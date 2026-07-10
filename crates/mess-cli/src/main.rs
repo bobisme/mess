@@ -61,6 +61,15 @@ struct Common {
 enum Command {
     /// Health checks: lock, epoch, footer/trailer, sidecar, fsync,
     /// fold-version.
+    ///
+    /// Every check but one is safe against a live writer. The fold-version
+    /// check is the exception: it needs the metadata store (`meta/`), which
+    /// a live writer holds under its own exclusive lock, so against a
+    /// running app that one check can't run and degrades to an
+    /// info-severity "meta-store-locked" finding instead of failing the
+    /// whole command — expected behavior, not a bug. For the full check,
+    /// stop the writer first, or point `dir` at a `mess backup`/`mess
+    /// restore` copy instead of the live directory.
     Doctor {
         /// The store directory.
         dir:                 PathBuf,
