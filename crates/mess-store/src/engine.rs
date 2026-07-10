@@ -673,10 +673,10 @@ pub struct EngineMetrics {
     pub total_events:              u64,
     /// Age of the active segment since this process opened it, in seconds.
     pub active_segment_age_secs:   f64,
-    /// Seal-path durability-barrier (`fsync`) latency (`bn-e2y`): the sidecar
-    /// + directory fsyncs the sealer issues off the append path. A
-    /// near-full SSD stalls these exactly as it stalls the commit barrier,
-    /// so they are timed and alarmed separately from
+    /// Seal-path durability-barrier (`fsync`) latency (`bn-e2y`): the
+    /// sidecar + directory fsyncs the sealer issues off the append path.
+    /// A near-full SSD stalls these exactly as it stalls the commit
+    /// barrier, so they are timed and alarmed separately from
     /// [`commit`](Self::commit)`.fsync`.
     pub seal_fsync:                LatencySnapshot,
     /// Whether seal-path barrier latency has crossed the degradation threshold
