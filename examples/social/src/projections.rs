@@ -91,8 +91,8 @@ struct UserRow {
 /// One post row, folded from that post's `post-<id>` stream.
 #[derive(Debug, Clone)]
 struct PostRow {
-    /// The post's stream-id suffix (`post-<id>` without the prefix).
-    id: String,
+    /// The post's id (also its stream id, `post-<id>`, less the prefix).
+    id: Id,
     author: Id,
     body: String,
     likes: HashSet<Id>,
@@ -112,8 +112,8 @@ struct State {
     /// target id -> the set of users following it (reverse of `following`), so
     /// `follower_count` is O(1) rather than a full scan.
     followers: HashMap<Id, HashSet<Id>>,
-    /// post suffix -> folded post row.
-    posts: HashMap<String, PostRow>,
+    /// post id -> folded post row.
+    posts: HashMap<Id, PostRow>,
 }
 
 impl State {
@@ -147,16 +147,16 @@ impl State {
         }
     }
 
-    /// Fold one post event into the tables. `suffix` is the `post-<id>` stream
-    /// suffix; `gp` is the event's global position (used only to stamp
-    /// `seq` on creation).
-    fn apply_post(&mut self, suffix: &str, gp: u64, ev: &PostEvent) {
+    /// Fold one post event into the tables. `id` is parsed from the
+    /// `post-<id>` stream suffix; `gp` is the event's global position (used
+    /// only to stamp `seq` on creation).
+    fn apply_post(&mut self, id: Id, gp: u64, ev: &PostEvent) {
         match ev {
             PostEvent::Posted { author, body } => {
                 self.posts.insert(
-                    suffix.to_string(),
+                    id,
                     PostRow {
-                        id: suffix.to_string(),
+                        id,
                         author: *author,
                         body: body.clone(),
                         likes: HashSet::new(),
@@ -166,17 +166,17 @@ impl State {
                 );
             }
             PostEvent::Deleted { .. } => {
-                if let Some(p) = self.posts.get_mut(suffix) {
+                if let Some(p) = self.posts.get_mut(&id) {
                     p.deleted = true;
                 }
             }
             PostEvent::Liked { user } => {
-                if let Some(p) = self.posts.get_mut(suffix) {
+                if let Some(p) = self.posts.get_mut(&id) {
                     p.likes.insert(*user);
                 }
             }
             PostEvent::Unliked { user } => {
-                if let Some(p) = self.posts.get_mut(suffix) {
+                if let Some(p) = self.posts.get_mut(&id) {
                     p.likes.remove(user);
                 }
             }
@@ -194,9 +194,10 @@ impl State {
         {
             self.apply_user(owner, &ev);
         } else if let Some(suffix) = rec.stream_id.strip_prefix("post-")
+            && let Ok(id) = Id::from_str(suffix)
             && let Ok(ev) = PostEvent::decode(&rec.message_type, &rec.data)
         {
-            self.apply_post(suffix, rec.global_position, &ev);
+            self.apply_post(id, rec.global_position, &ev);
         }
     }
 
@@ -209,7 +210,8 @@ impl State {
             .map(|u| (u.handle.clone(), u.display_name.clone()))
             .unwrap_or_default();
         PostView {
-            id: p.id.clone(),
+            id: p.id,
+            author_id: p.author,
             author_handle: handle,
             author_display: display,
             body: p.body.clone(),
@@ -357,36 +359,16 @@ impl<B: Backend + Clone> Projections<B> {
         Self { state, applied, notify, pump, _backend: PhantomData }
     }
 
-    /// Every registered user as `(id, handle)`, for populating a
-    /// [`crate::web::Directory`] at process boot.
-    ///
-    /// **Dogfood finding.** [`ReadModels`] (this type's own trait) answers
-    /// queries *by handle* but exposes no bulk listing — by design, an app
-    /// should not need "give me every user" for request-serving queries. But
-    /// [`web::Directory`](crate::web::Directory) is itself a dogfood finding
-    /// (see its docs): the web layer needs a `handle <-> Id` map the trait
-    /// does not provide, and a store-backed server has no imperative
-    /// registration loop (unlike the in-memory demo seed) to populate one
-    /// incrementally. This inherent method — not part of [`ReadModels`],
-    /// since a production read model would paginate this rather than return
-    /// every user in one `Vec` — is the pragmatic bridge: called once at boot
-    /// after the catch-up replay, it seeds the directory from the same folded
-    /// state every other query reads.
-    pub async fn directory(&self) -> Vec<(Id, String)> {
-        let st = self.state.read().await;
-        st.handles.iter().map(|(handle, id)| (*id, handle.clone())).collect()
-    }
-
-    /// Permalink lookup: resolve a post by its stream-id suffix **including
-    /// deleted posts**, returning a [`PostLookup`] with the tombstone flag.
-    /// `None` only if no post with that id ever existed. See [`PostLookup`].
+    /// Permalink lookup: resolve a post by id **including deleted posts**,
+    /// returning a [`PostLookup`] with the tombstone flag. `None` only if no
+    /// post with that id ever existed. See [`PostLookup`].
     pub async fn lookup_post(
         &self,
-        id: &str,
+        id: Id,
         viewer: Option<Id>,
     ) -> Option<PostLookup> {
         let st = self.state.read().await;
-        st.posts.get(id).map(|p| PostLookup {
+        st.posts.get(&id).map(|p| PostLookup {
             view: st.view_of(p, viewer),
             deleted: p.deleted,
         })
@@ -515,12 +497,17 @@ impl<B: Backend> ReadModels for Projections<B> {
         })
     }
 
-    async fn post(&self, id: &str, viewer: Option<Id>) -> Option<PostView> {
+    async fn post(&self, id: Id, viewer: Option<Id>) -> Option<PostView> {
         let st = self.state.read().await;
         st.posts
-            .get(id)
+            .get(&id)
             .filter(|p| !p.deleted)
             .map(|p| st.view_of(p, viewer))
+    }
+
+    async fn resolve(&self, handle: &str) -> Option<Id> {
+        let st = self.state.read().await;
+        st.handles.get(handle).copied()
     }
 
     async fn wait_for(&self, position: u64) {

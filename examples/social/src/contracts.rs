@@ -17,7 +17,7 @@
 //!    write so a caller can pass it to [`ReadModels::wait_for`] for
 //!    read-your-writes.
 
-use std::collections::BTreeMap;
+use std::future::Future;
 
 use ident::Id;
 use mess_core::CommandError;
@@ -42,8 +42,14 @@ use crate::{post_stream, user_stream};
 /// cursor (see [`TimelinePage`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PostView {
-    /// The post's stream id suffix (`post-<id>` without the prefix).
-    pub id: String,
+    /// The post's id (also its stream id, `post-<id>`, less the prefix).
+    pub id: Id,
+    /// The author's id, joined from their profile. Compare this — not
+    /// [`author_handle`](Self::author_handle) — for author-only UI logic
+    /// (e.g. "show the delete button"): an id compare cannot be fooled by two
+    /// users momentarily sharing a display string, and needs no string
+    /// allocation.
+    pub author_id: Id,
     /// The author's handle, joined from their profile.
     pub author_handle: String,
     /// The author's current display name, joined from their profile.
@@ -92,43 +98,75 @@ pub struct TimelinePage {
 
 /// The frontend's query surface.
 ///
-/// **Why `async`.** Real implementations read from projection stores (a
-/// key-value store, a SQL read replica) — I/O that must not block the async
-/// runtime. The trait is `async` so those impls are natural; the in-memory
-/// [`FakeReadModels`] simply returns already-ready values. Native `async fn`
-/// in traits (Rust 2024) keeps the surface readable; we accept the usual
-/// caveat that these futures are not `Send`-bounded here, which is fine for an
-/// example (a production trait would add `+ Send` bounds or use `trait-variant`).
-#[allow(async_fn_in_trait)]
+/// **Why `-> impl Future<..> + Send` and not bare `async fn`.** Real
+/// implementations read from projection stores (a key-value store, a SQL read
+/// replica) — I/O that must not block the async runtime, hence async. But a
+/// bare `async fn` in a trait carries no `Send` bound on its returned future,
+/// so a caller generic over `R: ReadModels` (an axum handler built once and
+/// reused for any backend) cannot prove the future it `.await`s is `Send` —
+/// and axum's [`Handler`](https://docs.rs/axum/latest/axum/handler/trait.Handler.html)
+/// requires exactly that. Spelling the bound on the trait itself (return
+/// position `impl Trait` in traits, RPITIT) fixes this at the seam instead of
+/// downstream: every implementation below is a plain `async fn` (the desugared
+/// future is checked against the bound at the `impl` site, same as any other
+/// trait method), and a generic caller gets to rely on `Send` without a
+/// hand-rolled `Box::pin` mirror. See `web::AppState`'s docs for the shim this
+/// removed.
 pub trait ReadModels {
     /// Posts from the users `user` follows (and their own), newest first.
-    async fn home_timeline(
+    fn home_timeline(
         &self,
         user: Id,
         cursor: Option<String>,
         limit: usize,
-    ) -> TimelinePage;
+    ) -> impl Future<Output = TimelinePage> + Send;
 
     /// Posts authored by `handle`, newest first.
-    async fn user_posts(
+    fn user_posts(
         &self,
         handle: &str,
         cursor: Option<String>,
         limit: usize,
-    ) -> TimelinePage;
+    ) -> impl Future<Output = TimelinePage> + Send;
 
     /// Every post in the system, newest first — the global firehose.
-    async fn firehose(&self, cursor: Option<String>, limit: usize)
-    -> TimelinePage;
+    fn firehose(
+        &self,
+        cursor: Option<String>,
+        limit: usize,
+    ) -> impl Future<Output = TimelinePage> + Send;
 
     /// The profile for `handle`, viewer-relative to `viewer` (for
     /// `followed_by_me`). `None` if no such user.
-    async fn profile(&self, handle: &str, viewer: Option<Id>)
-    -> Option<ProfileView>;
+    fn profile(
+        &self,
+        handle: &str,
+        viewer: Option<Id>,
+    ) -> impl Future<Output = Option<ProfileView>> + Send;
 
-    /// One post by stream-id suffix, viewer-relative to `viewer` (for
-    /// `liked_by_me`). `None` if no such post (or it was deleted).
-    async fn post(&self, id: &str, viewer: Option<Id>) -> Option<PostView>;
+    /// One post by id, viewer-relative to `viewer` (for `liked_by_me`). `None`
+    /// if no such post (or it was deleted).
+    fn post(
+        &self,
+        id: Id,
+        viewer: Option<Id>,
+    ) -> impl Future<Output = Option<PostView>> + Send;
+
+    /// Resolve a handle to the id of the user currently holding it, or `None`
+    /// if no such user is registered.
+    ///
+    /// This is the trait's answer to the "handle resolution" gap: a frontend
+    /// routes and links by handle (readable URLs, `/u/alice`) but every
+    /// [`WriteOps`] call and every id-comparison in a [`PostView`] needs an
+    /// [`Id`]. Before this method existed the web layer kept its own
+    /// `handle -> Id` side directory, bulk-populated at boot from a
+    /// `Projections::directory` bulk-export method that returned every
+    /// registered user — a second, hand-maintained copy of data the read
+    /// model already has. `resolve` is the one query that closes that gap
+    /// without widening every DTO to carry a redundant id, which is why that
+    /// bulk-export method is gone too; see `web::AppState`'s docs for how the
+    /// acting-user cookie uses `resolve` instead of a directory.
+    fn resolve(&self, handle: &str) -> impl Future<Output = Option<Id>> + Send;
 
     /// **Read-your-writes barrier.** Block until this read model has processed
     /// the event log up to at least global `position`. A caller does
@@ -138,7 +176,7 @@ pub trait ReadModels {
     /// The [`FakeReadModels`] is synchronously consistent (a write mutates it
     /// in place) so this is a no-op there; a real projection-backed impl
     /// awaits its tailer catching up to `position`.
-    async fn wait_for(&self, position: u64);
+    fn wait_for(&self, position: u64) -> impl Future<Output = ()> + Send;
 }
 
 // ===========================================================================
@@ -219,38 +257,61 @@ fn post_err<S: std::fmt::Display>(e: CommandError<PostError, S>) -> WriteError {
 /// one-liner with a monomorphic signature. Every method returns the write's
 /// **global log position**, the token a caller feeds to
 /// [`ReadModels::wait_for`] to read its own write.
-#[allow(async_fn_in_trait)]
+///
+/// Like [`ReadModels`], every method is `-> impl Future<..> + Send` rather
+/// than bare `async fn`, for the same reason: it lets a caller generic over
+/// `W: WriteOps` (an axum handler) satisfy axum's `Send`-future requirement
+/// without a hand-rolled boxed mirror trait.
 pub trait WriteOps {
-    async fn register(
+    fn register(
         &self,
         user: Id,
         handle: String,
         display_name: String,
-    ) -> Result<u64, WriteError>;
+    ) -> impl Future<Output = Result<u64, WriteError>> + Send;
 
-    async fn set_display_name(
+    fn set_display_name(
         &self,
         user: Id,
         display_name: String,
-    ) -> Result<u64, WriteError>;
+    ) -> impl Future<Output = Result<u64, WriteError>> + Send;
 
-    async fn follow(&self, follower: Id, target: Id) -> Result<u64, WriteError>;
+    fn follow(
+        &self,
+        follower: Id,
+        target: Id,
+    ) -> impl Future<Output = Result<u64, WriteError>> + Send;
 
-    async fn unfollow(&self, follower: Id, target: Id)
-    -> Result<u64, WriteError>;
+    fn unfollow(
+        &self,
+        follower: Id,
+        target: Id,
+    ) -> impl Future<Output = Result<u64, WriteError>> + Send;
 
-    async fn create_post(
+    fn create_post(
         &self,
         post: Id,
         author: Id,
         body: String,
-    ) -> Result<u64, WriteError>;
+    ) -> impl Future<Output = Result<u64, WriteError>> + Send;
 
-    async fn delete_post(&self, post: Id, by: Id) -> Result<u64, WriteError>;
+    fn delete_post(
+        &self,
+        post: Id,
+        by: Id,
+    ) -> impl Future<Output = Result<u64, WriteError>> + Send;
 
-    async fn like(&self, post: Id, user: Id) -> Result<u64, WriteError>;
+    fn like(
+        &self,
+        post: Id,
+        user: Id,
+    ) -> impl Future<Output = Result<u64, WriteError>> + Send;
 
-    async fn unlike(&self, post: Id, user: Id) -> Result<u64, WriteError>;
+    fn unlike(
+        &self,
+        post: Id,
+        user: Id,
+    ) -> impl Future<Output = Result<u64, WriteError>> + Send;
 }
 
 impl<B: Backend> WriteOps for EventStore<B>
@@ -367,7 +428,7 @@ struct FakeUser {
 /// global sequence.
 #[derive(Debug, Clone)]
 struct FakePost {
-    id: String,
+    id: Id,
     author: Id,
     body: String,
     likes: Vec<Id>,
@@ -426,13 +487,14 @@ impl FakeReadModels {
         self
     }
 
-    /// Seed a post authored by `author`. The stream-id suffix `id` is what a
-    /// [`PostView`] reports. Assigns the next global sequence. Chainable.
+    /// Seed a post authored by `author`, identified by `id` — the same
+    /// [`Id`] a [`PostView`] reports. Assigns the next global sequence.
+    /// Chainable.
     #[must_use]
-    pub fn with_post(mut self, id: &str, author: Id, body: &str) -> Self {
+    pub fn with_post(mut self, id: Id, author: Id, body: &str) -> Self {
         self.next_seq += 1;
         self.posts.push(FakePost {
-            id: id.to_string(),
+            id,
             author,
             body: body.to_string(),
             likes: Vec::new(),
@@ -444,7 +506,7 @@ impl FakeReadModels {
 
     /// Seed a like by `user` on post `id`. Chainable.
     #[must_use]
-    pub fn with_like(mut self, id: &str, user: Id) -> Self {
+    pub fn with_like(mut self, id: Id, user: Id) -> Self {
         if let Some(p) = self.posts.iter_mut().find(|p| p.id == id)
             && !p.likes.contains(&user)
         {
@@ -455,7 +517,7 @@ impl FakeReadModels {
 
     /// Mark post `id` deleted. Chainable.
     #[must_use]
-    pub fn with_deleted(mut self, id: &str) -> Self {
+    pub fn with_deleted(mut self, id: Id) -> Self {
         if let Some(p) = self.posts.iter_mut().find(|p| p.id == id) {
             p.deleted = true;
         }
@@ -477,7 +539,8 @@ impl FakeReadModels {
             .map(|u| (u.handle.clone(), u.display_name.clone()))
             .unwrap_or_default();
         PostView {
-            id: p.id.clone(),
+            id: p.id,
+            author_id: p.author,
             author_handle: handle,
             author_display: display,
             body: p.body.clone(),
@@ -592,11 +655,15 @@ impl ReadModels for FakeReadModels {
         })
     }
 
-    async fn post(&self, id: &str, viewer: Option<Id>) -> Option<PostView> {
+    async fn post(&self, id: Id, viewer: Option<Id>) -> Option<PostView> {
         self.posts
             .iter()
             .find(|p| p.id == id && !p.deleted)
             .map(|p| self.view_of(p, viewer))
+    }
+
+    async fn resolve(&self, handle: &str) -> Option<Id> {
+        self.user_by_handle(handle).map(|u| u.id)
     }
 
     async fn wait_for(&self, _position: u64) {
@@ -604,8 +671,3 @@ impl ReadModels for FakeReadModels {
         // already visible. A projection-backed impl would await its tailer.
     }
 }
-
-/// A tiny name-indexed directory, handy for tests that need to resolve a
-/// handle to its id without threading a whole [`FakeReadModels`] around.
-/// (Unused by the crate itself; provided for the frontend bone.)
-pub type HandleIndex = BTreeMap<String, Id>;

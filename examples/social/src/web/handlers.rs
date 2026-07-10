@@ -1,9 +1,22 @@
 //! The axum handlers and the router.
 //!
+//! # Generic over the backend
+//!
+//! Every handler is generic over `R: ReadModels + Send + Sync + 'static, W:
+//! WriteOps + Send + Sync + 'static` — the same bounds [`router`] carries —
+//! and reads/writes through `state.read`/`state.write` directly (no trait
+//! object, no boxing; see the module docs in `super`).
+//!
+//! # No side directory: the acting cookie holds a handle
+//!
+//! [`acting`] reads the [`ACTING_COOKIE`] value as a **handle** and resolves
+//! it to an [`Id`] with one [`ReadModels::resolve`] call — see `super`'s
+//! module docs for why this replaced a boot-time `handle <-> Id` directory.
+//!
 //! # Read-your-writes
 //!
-//! Every POST follows the same shape: call one [`DynWrite`] op, take the
-//! returned global log position, `await` [`DynRead::wait_for`] on it, then
+//! Every POST follows the same shape: call one [`WriteOps`] op, take the
+//! returned global log position, `await` [`ReadModels::wait_for`] on it, then
 //! `303`-redirect to a GET that is now guaranteed to reflect the write. On the
 //! `FakeReadModels`/`MemBackend` this barrier is immediate; against real
 //! projections it blocks until the tailer catches up.
@@ -26,25 +39,32 @@ use axum::{
 use ident::Id;
 use serde::Deserialize;
 
+use crate::contracts::{ReadModels, WriteOps};
+
 use super::error::friendly;
 use super::views::{self, Flash};
 use super::{ACTING_COOKIE, AppState, PAGE_SIZE};
 
-/// Build the application router. Non-generic: [`AppState`] holds trait objects,
-/// so the handlers' futures are concretely `Send` and axum accepts them.
-pub fn router(state: AppState) -> Router {
+/// Build the application router. Generic over the backend: [`AppState<R,
+/// W>`](AppState) is monomorphized once per `(R, W)` pair, so every handler's
+/// future is concretely `Send` and axum accepts them — see the module docs.
+pub fn router<R, W>(state: AppState<R, W>) -> Router
+where
+    R: ReadModels + Send + Sync + 'static,
+    W: WriteOps + Send + Sync + 'static,
+{
     Router::new()
-        .route("/", get(home))
-        .route("/firehose", get(firehose))
-        .route("/u/{handle}", get(profile))
-        .route("/p/{id}", get(single_post))
-        .route("/post", post(create_post))
-        .route("/p/{id}/delete", post(delete_post))
-        .route("/p/{id}/like", post(like))
-        .route("/p/{id}/unlike", post(unlike))
-        .route("/u/{handle}/follow", post(follow))
-        .route("/u/{handle}/unfollow", post(unfollow))
-        .route("/whoami", get(whoami).post(whoami_post))
+        .route("/", get(home::<R, W>))
+        .route("/firehose", get(firehose::<R, W>))
+        .route("/u/{handle}", get(profile::<R, W>))
+        .route("/p/{id}", get(single_post::<R, W>))
+        .route("/post", post(create_post::<R, W>))
+        .route("/p/{id}/delete", post(delete_post::<R, W>))
+        .route("/p/{id}/like", post(like::<R, W>))
+        .route("/p/{id}/unlike", post(unlike::<R, W>))
+        .route("/u/{handle}/follow", post(follow::<R, W>))
+        .route("/u/{handle}/unfollow", post(unfollow::<R, W>))
+        .route("/whoami", get(whoami::<R, W>).post(whoami_post::<R, W>))
         .route("/style.css", get(stylesheet))
         .with_state(state)
 }
@@ -86,7 +106,7 @@ struct WhoamiForm {
 // ---------------------------------------------------------------------------
 
 /// Read a cookie value out of the `Cookie` request header (hand-rolled; no
-/// cookie-jar dependency for a demo that stores one plain id).
+/// cookie-jar dependency for a demo that stores one plain value).
 fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     let raw = headers.get(header::COOKIE)?.to_str().ok()?;
     raw.split(';').find_map(|pair| {
@@ -95,15 +115,19 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     })
 }
 
-/// The acting user's id, if the cookie is present and parses.
-fn acting_id(headers: &HeaderMap) -> Option<Id> {
-    cookie_value(headers, ACTING_COOKIE)?.parse().ok()
-}
-
-/// The acting user's `(id, handle)`, if the cookie resolves to a known user.
-fn acting(state: &AppState, headers: &HeaderMap) -> Option<(Id, String)> {
-    let id = acting_id(headers)?;
-    let handle = state.handle_of(id)?;
+/// The acting user's `(id, handle)`, if the [`ACTING_COOKIE`] is present and
+/// still resolves to a registered user. The cookie holds the handle itself
+/// (see the module docs), so resolving it to an id is one
+/// [`ReadModels::resolve`] call — no side directory.
+async fn acting<R, W>(
+    state: &AppState<R, W>,
+    headers: &HeaderMap,
+) -> Option<(Id, String)>
+where
+    R: ReadModels,
+{
+    let handle = cookie_value(headers, ACTING_COOKIE)?;
+    let id = state.read.resolve(&handle).await?;
     Some((id, handle))
 }
 
@@ -155,12 +179,15 @@ fn back(headers: &HeaderMap, fallback: &str) -> String {
 
 /// After a successful write: wait for the read model to catch up to `pos`, then
 /// redirect with an ok flash.
-async fn after_write(
-    state: &AppState,
+async fn after_write<R, W>(
+    state: &AppState<R, W>,
     pos: u64,
     path: &str,
     ok_msg: &str,
-) -> Response {
+) -> Response
+where
+    R: ReadModels,
+{
     state.read.wait_for(pos).await;
     redirect_flash(path, "ok", ok_msg)
 }
@@ -177,12 +204,16 @@ async fn stylesheet() -> Response {
         .into_response()
 }
 
-async fn home(
-    State(state): State<AppState>,
+async fn home<R, W>(
+    State(state): State<AppState<R, W>>,
     headers: HeaderMap,
     Query(q): Query<PageQuery>,
-) -> Response {
-    match acting(&state, &headers) {
+) -> Response
+where
+    R: ReadModels + Send + Sync + 'static,
+    W: WriteOps + Send + Sync + 'static,
+{
+    match acting(&state, &headers).await {
         Some((id, handle)) => {
             let page = state
                 .read
@@ -192,6 +223,7 @@ async fn home(
                 "Home",
                 Some("Posts from you and the people you follow."),
                 &page,
+                Some(id),
                 Some(&handle),
                 "/",
                 true,
@@ -207,6 +239,7 @@ async fn home(
                 Some("Sign in on whoami to get your own home timeline."),
                 &page,
                 None,
+                None,
                 "/",
                 false,
             );
@@ -216,35 +249,46 @@ async fn home(
     }
 }
 
-async fn firehose(
-    State(state): State<AppState>,
+async fn firehose<R, W>(
+    State(state): State<AppState<R, W>>,
     headers: HeaderMap,
     Query(q): Query<PageQuery>,
-) -> Response {
-    let acting = acting(&state, &headers);
-    let handle = acting.as_ref().map(|(_, h)| h.as_str());
+) -> Response
+where
+    R: ReadModels + Send + Sync + 'static,
+    W: WriteOps + Send + Sync + 'static,
+{
+    let acting = acting(&state, &headers).await;
+    let viewer_id = acting.as_ref().map(|(id, _)| *id);
+    let viewer_handle = acting.as_ref().map(|(_, h)| h.as_str());
     let page = state.read.firehose(q.cursor.clone(), PAGE_SIZE).await;
     let body = views::feed(
         "Firehose",
         Some("Every post in the system, newest first."),
         &page,
-        handle,
+        viewer_id,
+        viewer_handle,
         "/firehose",
         false,
     );
-    views::page("Firehose", handle, q.flash().as_ref(), body).into_response()
+    views::page("Firehose", viewer_handle, q.flash().as_ref(), body)
+        .into_response()
 }
 
-async fn profile(
-    State(state): State<AppState>,
+async fn profile<R, W>(
+    State(state): State<AppState<R, W>>,
     headers: HeaderMap,
     Path(handle): Path<String>,
     Query(q): Query<PageQuery>,
-) -> Response {
-    let acting = acting(&state, &headers);
-    let viewer = acting.as_ref().map(|(id, _)| *id);
+) -> Response
+where
+    R: ReadModels + Send + Sync + 'static,
+    W: WriteOps + Send + Sync + 'static,
+{
+    let acting = acting(&state, &headers).await;
+    let viewer_id = acting.as_ref().map(|(id, _)| *id);
     let viewer_handle = acting.as_ref().map(|(_, h)| h.as_str());
-    let Some(prof) = state.read.profile(&handle, viewer).await else {
+    let Some(prof) = state.read.profile(&handle, viewer_id).await else {
         return (
             StatusCode::NOT_FOUND,
             views::page(
@@ -264,23 +308,28 @@ async fn profile(
         acting.is_some(),
         is_self,
         &posts,
+        viewer_id,
         viewer_handle,
     );
     views::page(&prof.handle, viewer_handle, q.flash().as_ref(), body)
         .into_response()
 }
 
-async fn single_post(
-    State(state): State<AppState>,
+async fn single_post<R, W>(
+    State(state): State<AppState<R, W>>,
     headers: HeaderMap,
     Path(id): Path<String>,
     Query(q): Query<PageQuery>,
-) -> Response {
-    let acting = acting(&state, &headers);
-    let viewer = acting.as_ref().map(|(id, _)| *id);
+) -> Response
+where
+    R: ReadModels + Send + Sync + 'static,
+    W: WriteOps + Send + Sync + 'static,
+{
+    let acting = acting(&state, &headers).await;
+    let viewer_id = acting.as_ref().map(|(id, _)| *id);
     let viewer_handle = acting.as_ref().map(|(_, h)| h.as_str());
-    let Some(pv) = state.read.post(&id, viewer).await else {
-        return (
+    let not_found = || {
+        (
             StatusCode::NOT_FOUND,
             views::page(
                 "Not found",
@@ -289,18 +338,28 @@ async fn single_post(
                 views::not_found("That post does not exist or was deleted."),
             ),
         )
-            .into_response();
+            .into_response()
     };
-    let body = views::single_post(&pv, viewer_handle);
+    let Ok(post_id) = id.parse::<Id>() else {
+        return not_found();
+    };
+    let Some(pv) = state.read.post(post_id, viewer_id).await else {
+        return not_found();
+    };
+    let body = views::single_post(&pv, viewer_id, viewer_handle);
     views::page("Post", viewer_handle, q.flash().as_ref(), body).into_response()
 }
 
-async fn whoami(
-    State(state): State<AppState>,
+async fn whoami<R, W>(
+    State(state): State<AppState<R, W>>,
     headers: HeaderMap,
     Query(q): Query<PageQuery>,
-) -> Response {
-    let handle = acting(&state, &headers).map(|(_, h)| h);
+) -> Response
+where
+    R: ReadModels + Send + Sync + 'static,
+    W: WriteOps + Send + Sync + 'static,
+{
+    let handle = acting(&state, &headers).await.map(|(_, h)| h);
     let body = views::whoami(handle.as_deref());
     views::page("Who am I?", handle.as_deref(), q.flash().as_ref(), body)
         .into_response()
@@ -315,12 +374,16 @@ fn require_login() -> Response {
     redirect_flash("/whoami", "err", "Pick a user first — you are not signed in.")
 }
 
-async fn create_post(
-    State(state): State<AppState>,
+async fn create_post<R, W>(
+    State(state): State<AppState<R, W>>,
     headers: HeaderMap,
     Form(form): Form<PostForm>,
-) -> Response {
-    let Some((author, _)) = acting(&state, &headers) else {
+) -> Response
+where
+    R: ReadModels + Send + Sync + 'static,
+    W: WriteOps + Send + Sync + 'static,
+{
+    let Some((author, _)) = acting(&state, &headers).await else {
         return require_login();
     };
     let post_id = Id::new();
@@ -330,12 +393,16 @@ async fn create_post(
     }
 }
 
-async fn delete_post(
-    State(state): State<AppState>,
+async fn delete_post<R, W>(
+    State(state): State<AppState<R, W>>,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Response {
-    let Some((by, _)) = acting(&state, &headers) else {
+) -> Response
+where
+    R: ReadModels + Send + Sync + 'static,
+    W: WriteOps + Send + Sync + 'static,
+{
+    let Some((by, _)) = acting(&state, &headers).await else {
         return require_login();
     };
     let Ok(post_id) = id.parse::<Id>() else {
@@ -347,29 +414,41 @@ async fn delete_post(
     }
 }
 
-async fn like(
-    State(state): State<AppState>,
+async fn like<R, W>(
+    State(state): State<AppState<R, W>>,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Response {
+) -> Response
+where
+    R: ReadModels + Send + Sync + 'static,
+    W: WriteOps + Send + Sync + 'static,
+{
     like_or_unlike(state, headers, id, true).await
 }
 
-async fn unlike(
-    State(state): State<AppState>,
+async fn unlike<R, W>(
+    State(state): State<AppState<R, W>>,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Response {
+) -> Response
+where
+    R: ReadModels + Send + Sync + 'static,
+    W: WriteOps + Send + Sync + 'static,
+{
     like_or_unlike(state, headers, id, false).await
 }
 
-async fn like_or_unlike(
-    state: AppState,
+async fn like_or_unlike<R, W>(
+    state: AppState<R, W>,
     headers: HeaderMap,
     id: String,
     like: bool,
-) -> Response {
-    let Some((user, _)) = acting(&state, &headers) else {
+) -> Response
+where
+    R: ReadModels + Send + Sync + 'static,
+    W: WriteOps + Send + Sync + 'static,
+{
+    let Some((user, _)) = acting(&state, &headers).await else {
         return require_login();
     };
     let Ok(post_id) = id.parse::<Id>() else {
@@ -390,33 +469,45 @@ async fn like_or_unlike(
     }
 }
 
-async fn follow(
-    State(state): State<AppState>,
+async fn follow<R, W>(
+    State(state): State<AppState<R, W>>,
     headers: HeaderMap,
     Path(handle): Path<String>,
-) -> Response {
+) -> Response
+where
+    R: ReadModels + Send + Sync + 'static,
+    W: WriteOps + Send + Sync + 'static,
+{
     follow_or_unfollow(state, headers, handle, true).await
 }
 
-async fn unfollow(
-    State(state): State<AppState>,
+async fn unfollow<R, W>(
+    State(state): State<AppState<R, W>>,
     headers: HeaderMap,
     Path(handle): Path<String>,
-) -> Response {
+) -> Response
+where
+    R: ReadModels + Send + Sync + 'static,
+    W: WriteOps + Send + Sync + 'static,
+{
     follow_or_unfollow(state, headers, handle, false).await
 }
 
-async fn follow_or_unfollow(
-    state: AppState,
+async fn follow_or_unfollow<R, W>(
+    state: AppState<R, W>,
     headers: HeaderMap,
     handle: String,
     follow: bool,
-) -> Response {
-    let Some((follower, _)) = acting(&state, &headers) else {
+) -> Response
+where
+    R: ReadModels + Send + Sync + 'static,
+    W: WriteOps + Send + Sync + 'static,
+{
+    let Some((follower, _)) = acting(&state, &headers).await else {
         return require_login();
     };
     let dest = back(&headers, &format!("/u/{handle}"));
-    let Some(target) = state.id_of(&handle) else {
+    let Some(target) = state.read.resolve(&handle).await else {
         return redirect_flash(&dest, "err", "No user with that handle.");
     };
     let result = if follow {
@@ -437,16 +528,20 @@ async fn follow_or_unfollow(
     }
 }
 
-async fn whoami_post(
-    State(state): State<AppState>,
+async fn whoami_post<R, W>(
+    State(state): State<AppState<R, W>>,
     Form(form): Form<WhoamiForm>,
-) -> Response {
+) -> Response
+where
+    R: ReadModels + Send + Sync + 'static,
+    W: WriteOps + Send + Sync + 'static,
+{
     let handle = form.handle.trim().to_string();
-    // Already known? Just switch the cookie to that id — no write.
-    if let Some(id) = state.id_of(&handle) {
-        return set_acting(id, "/", &format!("You are now @{handle}."));
+    // Already known? Just switch the cookie to that handle — no write.
+    if state.read.resolve(&handle).await.is_some() {
+        return set_acting(&handle, "/", &format!("You are now @{handle}."));
     }
-    // Register-on-first-use: mint an id, register, record in the directory.
+    // Register-on-first-use: mint an id, register, switch the cookie.
     let id = Id::new();
     let display = if form.display_name.trim().is_empty() {
         handle.clone()
@@ -455,18 +550,18 @@ async fn whoami_post(
     };
     match state.write.register(id, handle.clone(), display).await {
         Ok(pos) => {
-            state.dir.write().expect("dir lock").insert(id, &handle);
             state.read.wait_for(pos).await;
-            set_acting(id, "/", &format!("Welcome, @{handle}!"))
+            set_acting(&handle, "/", &format!("Welcome, @{handle}!"))
         }
         Err(e) => redirect_flash("/whoami", "err", &friendly(&e)),
     }
 }
 
-/// Set the acting-user cookie and redirect with an ok flash.
-fn set_acting(id: Id, path: &str, msg: &str) -> Response {
+/// Set the acting-user cookie (to `handle`, see the module docs) and redirect
+/// with an ok flash.
+fn set_acting(handle: &str, path: &str, msg: &str) -> Response {
     let cookie = format!(
-        "{ACTING_COOKIE}={id}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000"
+        "{ACTING_COOKIE}={handle}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000"
     );
     let sep = if path.contains('?') { '&' } else { '?' };
     let location = format!("{path}{sep}flash={}&kind=ok", enc(msg));

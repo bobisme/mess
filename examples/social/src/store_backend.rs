@@ -1,24 +1,31 @@
-//! Wiring the **real**, on-disk store into the web layer's object-safe
-//! [`DynRead`](crate::web::DynRead)/[`DynWrite`](crate::web::DynWrite) seam
-//! (bn-1mw, completing the bn-13l dogfood note that swapping in the real
-//! backend was "the one remaining wiring step").
+//! Type aliases naming the concrete on-disk backend/read-model pair the demo
+//! binaries use.
 //!
 //! `Store` pins the concrete backend the demo binaries use:
 //! [`mess_store::EventStore`] over [`mess_store::LogEngine`], the same
 //! composed on-disk engine [`crate::seed`] writes through and `mess doctor` /
-//! `mess verify` operate on.
+//! `mess verify` operate on. `StoreProjections` is its rebuildable read
+//! model, [`Projections`] over the same engine.
 //!
-//! # Why this lives in its own module, not inline in a bin
+//! # Why this no longer needs a macro-generated shim
 //!
-//! [`impl_dyn_read!`](crate::impl_dyn_read)/[`impl_dyn_write!`](crate::impl_dyn_write)
-//! expand to `impl $crate::web::DynRead for $ty` / `impl ... DynWrite for
-//! $ty`. Rust's orphan rule allows a **local trait** (`DynRead`/`DynWrite`,
-//! defined in this crate) to be implemented for a **foreign type**
-//! (`EventStore`/`LogEngine`, defined in `mess-store`) — but only from
-//! *within the crate that defines the trait*. A binary crate (`social-web`)
-//! cannot write this impl itself: neither the trait nor the type would be
-//! local to it. So the impl has to live here, in the `social` library, even
-//! though only the demo binaries use it.
+//! An earlier version of this module called `impl_dyn_read!`/`impl_dyn_write!`
+//! here to implement the web layer's local, object-safe `DynRead`/`DynWrite`
+//! mirror traits for these two foreign types. Rust's orphan rule allows a
+//! *local* trait to be implemented for a *foreign* type only from within the
+//! crate that defines the trait, so — with `DynRead`/`DynWrite` local to
+//! `social::web` — that impl had to live here even though only the demo
+//! binaries used it.
+//!
+//! Now that [`crate::contracts::ReadModels`]/[`crate::contracts::WriteOps`]
+//! declare their futures `Send` directly (see `web`'s module docs),
+//! [`web::AppState`](crate::web::AppState) is generic over any
+//! `R: ReadModels`/`W: WriteOps` instead of a pair of trait objects. `Store`
+//! and `StoreProjections` already implement those traits via the blanket
+//! `impl<B: Backend> WriteOps for EventStore<B>` in
+//! [`crate::contracts`] and `impl<B: Backend> ReadModels for Projections<B>`
+//! in [`crate::projections`] — there is nothing left to generate for them
+//! here, so this module is down to the two type aliases.
 use crate::projections::Projections;
 
 /// The on-disk backend the demo binaries write through and read from:
@@ -28,6 +35,3 @@ pub type Store = mess_store::EventStore<mess_store::LogEngine>;
 /// The on-disk backend's rebuildable read model: [`Projections`] over the
 /// same [`mess_store::LogEngine`].
 pub type StoreProjections = Projections<mess_store::LogEngine>;
-
-crate::impl_dyn_write!(Store);
-crate::impl_dyn_read!(StoreProjections);

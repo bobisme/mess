@@ -24,14 +24,14 @@
 //!   that replay before serving a single request.
 
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use ident::Id;
 use mess_store::{EventStore, LogEngine};
 use social::WriteOps;
 use social::Projections;
 use social::store_backend::Store;
-use social::web::{AppState, Directory, MemBackend, router};
+use social::web::{AppState, MemBackend, router};
 
 struct Args {
     dir: Option<PathBuf>,
@@ -83,9 +83,8 @@ fn parse_args() -> Args {
 /// The tiny in-memory demo world used when no `--dir` is given: an
 /// interactive sanity check with three hardcoded users, no persistence, no
 /// setup required.
-async fn mem_state() -> AppState {
+async fn mem_state() -> AppState<MemBackend, MemBackend> {
     let backend = Arc::new(MemBackend::new());
-    let mut dir = Directory::new();
 
     let alice = Id::new();
     let bob = Id::new();
@@ -99,7 +98,6 @@ async fn mem_state() -> AppState {
             .register(id, handle.into(), display.into())
             .await
             .expect("seed register");
-        dir.insert(id, handle);
     }
     backend.follow(alice, bob).await.expect("seed follow");
     let p1 = Id::new();
@@ -119,17 +117,17 @@ async fn mem_state() -> AppState {
         .expect("seed post");
     backend.like(p1, alice).await.expect("seed like");
 
-    AppState {
-        read: backend.clone(),
-        write: backend.clone(),
-        dir: Arc::new(RwLock::new(dir)),
-    }
+    AppState::new(backend.clone(), backend)
 }
 
-/// The real, store-backed world: open `dir`, rebuild the read model by
-/// replaying its whole log (see [`Projections::new`]), and populate the
-/// handle directory from that same replay.
-async fn store_state(dir: &std::path::Path) -> AppState {
+/// The real, store-backed world: open `dir` and rebuild the read model by
+/// replaying its whole log (see [`Projections::new`]). No directory to
+/// populate: handle resolution goes through
+/// [`ReadModels::resolve`](social::contracts::ReadModels::resolve) instead —
+/// see `social::web`'s module docs.
+async fn store_state(
+    dir: &std::path::Path,
+) -> AppState<Projections<LogEngine>, Store> {
     if !dir.is_dir() {
         eprintln!(
             "error: store directory not found at {}\n  Run `cargo run -p social --bin social-seed -- --dir {}` first.",
@@ -150,31 +148,36 @@ async fn store_state(dir: &std::path::Path) -> AppState {
     let projections = Arc::new(Projections::new(&store).await);
     println!("done.");
 
-    let users = projections.directory().await;
-    let mut directory = Directory::new();
-    for (id, handle) in &users {
-        directory.insert(*id, handle);
-    }
-    println!("directory: {} users", users.len());
-
-    AppState {
-        read: projections,
-        write: Arc::new(store),
-        dir: Arc::new(RwLock::new(directory)),
-    }
+    AppState::new(projections, Arc::new(store))
 }
 
 #[tokio::main]
 async fn main() {
     let args = parse_args();
-
-    let (state, mode) = match &args.dir {
-        Some(dir) => (store_state(dir).await, format!("store at {}", dir.display())),
-        None => (mem_state().await, "in-memory demo world".to_string()),
-    };
-
     let listener =
         tokio::net::TcpListener::bind(&args.addr).await.expect("bind");
-    println!("social-web listening on http://{} ({mode})", args.addr);
-    axum::serve(listener, router(state)).await.expect("serve");
+
+    // `mem_state`/`store_state` return different `AppState<R, W>`
+    // instantiations, so `router`/`axum::serve` are called once per branch
+    // rather than through one shared variable — see `social::web`'s module
+    // docs on what "generic state, not a trait object" costs here.
+    match &args.dir {
+        Some(dir) => {
+            let state = store_state(dir).await;
+            println!(
+                "social-web listening on http://{} (store at {})",
+                args.addr,
+                dir.display()
+            );
+            axum::serve(listener, router(state)).await.expect("serve");
+        }
+        None => {
+            let state = mem_state().await;
+            println!(
+                "social-web listening on http://{} (in-memory demo world)",
+                args.addr
+            );
+            axum::serve(listener, router(state)).await.expect("serve");
+        }
+    }
 }

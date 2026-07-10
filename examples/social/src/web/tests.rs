@@ -3,7 +3,7 @@
 //! Every route gets a happy path and at least one rejection-rendering check,
 //! plus an HTML smoke test asserting timeline order and post bodies.
 
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use axum::body::Body;
@@ -16,7 +16,7 @@ use crate::contracts::{FakeReadModels, WriteError, WriteOps};
 use crate::domain::post::PostError;
 use crate::domain::user::UserError;
 
-use super::{AppState, Directory, router};
+use super::{AppState, router};
 
 // ---------------------------------------------------------------------------
 // A programmable fake writer: returns a fixed result and records call names.
@@ -84,50 +84,41 @@ impl WriteOps for FakeWriteOps {
     }
 }
 
-crate::impl_dyn_write!(FakeWriteOps);
-
 // ---------------------------------------------------------------------------
 // Fixtures & request helpers
 // ---------------------------------------------------------------------------
 
 /// alice follows bob (not carol); bob has p1,p3; carol has p2; alice liked p1.
-/// Post ids are real `Id` strings (as in production) so the `/p/{id}` routes
-/// that parse the suffix back into an `Id` work. Trailing fields let callers
+/// Post ids are real `Id`s (as in production) so the `/p/{id}` routes that
+/// parse the path param back into an `Id` work. Trailing fields let callers
 /// that only need the ids destructure with `..`.
-type World =
-    (Arc<FakeWriteOps>, Router, Id, Id, Id, String, String, String);
+type World = (Arc<FakeWriteOps>, Router, Id, Id, Id, Id, Id, Id);
 
 fn world(write: FakeWriteOps) -> World {
     let alice = Id::new();
     let bob = Id::new();
     let carol = Id::new();
-    let p1 = Id::new().to_string();
-    let p2 = Id::new().to_string();
-    let p3 = Id::new().to_string();
+    let p1 = Id::new();
+    let p2 = Id::new();
+    let p3 = Id::new();
     let rm = FakeReadModels::new()
         .with_user(alice, "alice", "Alice")
         .with_user(bob, "bob", "Bob")
         .with_user(carol, "carol", "Carol")
         .with_follow(alice, bob)
-        .with_post(&p1, bob, "bob first")
-        .with_post(&p2, carol, "carol first")
-        .with_post(&p3, bob, "bob second")
-        .with_like(&p1, alice);
-    let mut dir = Directory::new();
-    dir.insert(alice, "alice");
-    dir.insert(bob, "bob");
-    dir.insert(carol, "carol");
+        .with_post(p1, bob, "bob first")
+        .with_post(p2, carol, "carol first")
+        .with_post(p3, bob, "bob second")
+        .with_like(p1, alice);
     let write = Arc::new(write);
-    let state = AppState {
-        read: Arc::new(rm),
-        write: write.clone(),
-        dir: Arc::new(RwLock::new(dir)),
-    };
+    let state = AppState { read: Arc::new(rm), write: write.clone() };
     (write, router(state), alice, bob, carol, p1, p2, p3)
 }
 
-fn cookie_for(id: Id) -> String {
-    format!("{}={id}", super::ACTING_COOKIE)
+/// The acting-user cookie holds a **handle**, not an id (see the `web` module
+/// docs), so tests sign in with the fixtures' known handles directly.
+fn cookie_for(handle: &str) -> String {
+    format!("{}={handle}", super::ACTING_COOKIE)
 }
 
 async fn send(app: &Router, req: Request<Body>) -> (StatusCode, String, Option<String>) {
@@ -142,21 +133,21 @@ async fn send(app: &Router, req: Request<Body>) -> (StatusCode, String, Option<S
     (status, String::from_utf8_lossy(&body).to_string(), location)
 }
 
-fn get(uri: &str, cookie: Option<Id>) -> Request<Body> {
+fn get(uri: &str, cookie: Option<&str>) -> Request<Body> {
     let mut b = Request::builder().method("GET").uri(uri);
-    if let Some(id) = cookie {
-        b = b.header(header::COOKIE, cookie_for(id));
+    if let Some(handle) = cookie {
+        b = b.header(header::COOKIE, cookie_for(handle));
     }
     b.body(Body::empty()).unwrap()
 }
 
-fn post_form(uri: &str, form: &str, cookie: Option<Id>) -> Request<Body> {
+fn post_form(uri: &str, form: &str, cookie: Option<&str>) -> Request<Body> {
     let mut b = Request::builder()
         .method("POST")
         .uri(uri)
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
-    if let Some(id) = cookie {
-        b = b.header(header::COOKIE, cookie_for(id));
+    if let Some(handle) = cookie {
+        b = b.header(header::COOKIE, cookie_for(handle));
     }
     b.body(Body::from(form.to_string())).unwrap()
 }
@@ -167,8 +158,8 @@ fn post_form(uri: &str, form: &str, cookie: Option<Id>) -> Request<Body> {
 
 #[tokio::test]
 async fn home_shows_followed_posts_newest_first() {
-    let (_w, app, alice, ..) = world(FakeWriteOps::ok());
-    let (status, body, _) = send(&app, get("/", Some(alice))).await;
+    let (_w, app, _alice, ..) = world(FakeWriteOps::ok());
+    let (status, body, _) = send(&app, get("/", Some("alice"))).await;
     assert_eq!(status, StatusCode::OK);
     // alice sees bob's p1 & p3, not carol's p2. Newest first: "bob second"
     // before "bob first".
@@ -203,23 +194,23 @@ async fn firehose_shows_all_posts() {
 
 #[tokio::test]
 async fn profile_happy_and_not_found() {
-    let (_w, app, alice, ..) = world(FakeWriteOps::ok());
+    let (_w, app, _alice, ..) = world(FakeWriteOps::ok());
     let (status, body, _) =
-        send(&app, get("/u/bob", Some(alice))).await;
+        send(&app, get("/u/bob", Some("alice"))).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("@bob"));
     // alice follows bob → the button reads "Following".
     assert!(body.contains("Following"));
 
-    let (status, _, _) = send(&app, get("/u/nobody", Some(alice))).await;
+    let (status, _, _) = send(&app, get("/u/nobody", Some("alice"))).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
 async fn single_post_happy_and_not_found() {
-    let (_w, app, alice, _b, _c, p1, ..) = world(FakeWriteOps::ok());
+    let (_w, app, _alice, _b, _c, p1, ..) = world(FakeWriteOps::ok());
     let (status, body, _) =
-        send(&app, get(&format!("/p/{p1}"), Some(alice))).await;
+        send(&app, get(&format!("/p/{p1}"), Some("alice"))).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("bob first"));
 
@@ -264,17 +255,17 @@ fn is_err_redirect(status: StatusCode, loc: &Option<String>) -> bool {
 #[tokio::test]
 async fn post_happy_then_rejection() {
     // Happy: writer returns Ok → 303 to / with ok flash, create_post called.
-    let (w, app, alice, ..) = world(FakeWriteOps::ok());
+    let (w, app, _alice, ..) = world(FakeWriteOps::ok());
     let (status, _, loc) =
-        send(&app, post_form("/post", "body=hello+world", Some(alice))).await;
+        send(&app, post_form("/post", "body=hello+world", Some("alice"))).await;
     assert!(is_ok_redirect(status, &loc), "loc={loc:?}");
     assert!(w.called("create_post"));
 
     // Rejection: writer returns EmptyBody → 303 with err flash.
-    let (_w, app, alice, ..) =
+    let (_w, app, _alice, ..) =
         world(FakeWriteOps::err(WriteError::Post(PostError::EmptyBody)));
     let (status, _, loc) =
-        send(&app, post_form("/post", "body=", Some(alice))).await;
+        send(&app, post_form("/post", "body=", Some("alice"))).await;
     assert!(is_err_redirect(status, &loc), "loc={loc:?}");
     assert!(loc.unwrap().to_lowercase().contains("empty"));
 }
@@ -292,24 +283,24 @@ async fn post_requires_login() {
 
 #[tokio::test]
 async fn like_happy_then_already_liked() {
-    let (w, app, alice, _b, _c, _p1, _p2, p3) = world(FakeWriteOps::ok());
+    let (w, app, _alice, _b, _c, _p1, _p2, p3) = world(FakeWriteOps::ok());
     let (status, _, loc) =
-        send(&app, post_form(&format!("/p/{p3}/like"), "", Some(alice))).await;
+        send(&app, post_form(&format!("/p/{p3}/like"), "", Some("alice"))).await;
     assert!(is_ok_redirect(status, &loc));
     assert!(w.called("like"));
 
-    let (_w, app, alice, _b, _c, p1, ..) =
+    let (_w, app, _alice, _b, _c, p1, ..) =
         world(FakeWriteOps::err(WriteError::Post(PostError::AlreadyLiked)));
     let (status, _, loc) =
-        send(&app, post_form(&format!("/p/{p1}/like"), "", Some(alice))).await;
+        send(&app, post_form(&format!("/p/{p1}/like"), "", Some("alice"))).await;
     assert!(is_err_redirect(status, &loc));
 }
 
 #[tokio::test]
 async fn unlike_happy() {
-    let (w, app, alice, _b, _c, p1, ..) = world(FakeWriteOps::ok());
+    let (w, app, _alice, _b, _c, p1, ..) = world(FakeWriteOps::ok());
     let (status, _, loc) =
-        send(&app, post_form(&format!("/p/{p1}/unlike"), "", Some(alice)))
+        send(&app, post_form(&format!("/p/{p1}/unlike"), "", Some("alice")))
             .await;
     assert!(is_ok_redirect(status, &loc));
     assert!(w.called("unlike"));
@@ -317,16 +308,16 @@ async fn unlike_happy() {
 
 #[tokio::test]
 async fn delete_happy_then_not_author() {
-    let (w, app, _alice, bob, _c, p1, ..) = world(FakeWriteOps::ok());
+    let (w, app, _alice, _bob, _c, p1, ..) = world(FakeWriteOps::ok());
     let (status, _, loc) =
-        send(&app, post_form(&format!("/p/{p1}/delete"), "", Some(bob))).await;
+        send(&app, post_form(&format!("/p/{p1}/delete"), "", Some("bob"))).await;
     assert!(is_ok_redirect(status, &loc));
     assert!(w.called("delete_post"));
 
-    let (_w, app, alice, _b, _c, p1, ..) =
+    let (_w, app, _alice, _b, _c, p1, ..) =
         world(FakeWriteOps::err(WriteError::Post(PostError::NotAuthor)));
     let (status, _, loc) =
-        send(&app, post_form(&format!("/p/{p1}/delete"), "", Some(alice)))
+        send(&app, post_form(&format!("/p/{p1}/delete"), "", Some("alice")))
             .await;
     assert!(is_err_redirect(status, &loc));
     assert!(loc.unwrap().to_lowercase().contains("own"));
@@ -335,32 +326,32 @@ async fn delete_happy_then_not_author() {
 #[tokio::test]
 async fn follow_happy_reject_and_unknown_handle() {
     // Happy.
-    let (w, app, alice, ..) = world(FakeWriteOps::ok());
+    let (w, app, _alice, ..) = world(FakeWriteOps::ok());
     let (status, _, loc) =
-        send(&app, post_form("/u/carol/follow", "", Some(alice))).await;
+        send(&app, post_form("/u/carol/follow", "", Some("alice"))).await;
     assert!(is_ok_redirect(status, &loc));
     assert!(w.called("follow"));
 
     // Rejection: self-follow.
-    let (_w, app, alice, ..) =
+    let (_w, app, _alice, ..) =
         world(FakeWriteOps::err(WriteError::User(UserError::SelfFollow)));
     let (status, _, loc) =
-        send(&app, post_form("/u/alice/follow", "", Some(alice))).await;
+        send(&app, post_form("/u/alice/follow", "", Some("alice"))).await;
     assert!(is_err_redirect(status, &loc));
 
     // Unknown handle never reaches the writer.
-    let (w, app, alice, ..) = world(FakeWriteOps::ok());
+    let (w, app, _alice, ..) = world(FakeWriteOps::ok());
     let (status, _, loc) =
-        send(&app, post_form("/u/ghost/follow", "", Some(alice))).await;
+        send(&app, post_form("/u/ghost/follow", "", Some("alice"))).await;
     assert!(is_err_redirect(status, &loc));
     assert!(!w.called("follow"));
 }
 
 #[tokio::test]
 async fn unfollow_happy() {
-    let (w, app, alice, ..) = world(FakeWriteOps::ok());
+    let (w, app, _alice, ..) = world(FakeWriteOps::ok());
     let (status, _, loc) =
-        send(&app, post_form("/u/bob/unfollow", "", Some(alice))).await;
+        send(&app, post_form("/u/bob/unfollow", "", Some("alice"))).await;
     assert!(is_ok_redirect(status, &loc));
     assert!(w.called("unfollow"));
 }
@@ -417,20 +408,18 @@ async fn whoami_register_invalid_handle_renders_error() {
 #[tokio::test]
 async fn html_smoke_timeline_structure_order_and_escaping() {
     let alice = Id::new();
+    let (q1, q2, q3) = (Id::new(), Id::new(), Id::new());
     let rm = FakeReadModels::new()
         .with_user(alice, "alice", "Alice")
-        .with_post("q1", alice, "first <b>escaped</b> body")
-        .with_post("q2", alice, "second body")
-        .with_post("q3", alice, "third body");
-    let mut dir = Directory::new();
-    dir.insert(alice, "alice");
+        .with_post(q1, alice, "first <b>escaped</b> body")
+        .with_post(q2, alice, "second body")
+        .with_post(q3, alice, "third body");
     let state = AppState {
         read: Arc::new(rm),
         write: Arc::new(FakeWriteOps::ok()),
-        dir: Arc::new(RwLock::new(dir)),
     };
     let app = router(state);
-    let (status, body, _) = send(&app, get("/", Some(alice))).await;
+    let (status, body, _) = send(&app, get("/", Some("alice"))).await;
     assert_eq!(status, StatusCode::OK);
 
     // Full document.

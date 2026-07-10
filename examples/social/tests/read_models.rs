@@ -11,77 +11,81 @@ use ident::Id;
 use social::contracts::{FakeReadModels, ReadModels};
 
 /// Build a small world: alice follows bob (not carol); bob and carol each
-/// post; alice likes bob's first post.
-fn world() -> (FakeReadModels, Id, Id, Id) {
+/// post; alice likes bob's first post. Returns the fake plus the three user
+/// ids and the three post ids (seq 1, 2, 3 in that order).
+fn world() -> (FakeReadModels, Id, Id, Id, Id, Id, Id) {
     let alice = Id::new();
     let bob = Id::new();
     let carol = Id::new();
+    let p1 = Id::new();
+    let p2 = Id::new();
+    let p3 = Id::new();
     let rm = FakeReadModels::new()
         .with_user(alice, "alice", "Alice")
         .with_user(bob, "bob", "Bob")
         .with_user(carol, "carol", "Carol")
         .with_follow(alice, bob)
-        .with_post("p1", bob, "bob first") // seq 1
-        .with_post("p2", carol, "carol first") // seq 2
-        .with_post("p3", bob, "bob second") // seq 3
-        .with_like("p1", alice);
-    (rm, alice, bob, carol)
+        .with_post(p1, bob, "bob first") // seq 1
+        .with_post(p2, carol, "carol first") // seq 2
+        .with_post(p3, bob, "bob second") // seq 3
+        .with_like(p1, alice);
+    (rm, alice, bob, carol, p1, p2, p3)
 }
 
 #[tokio::test]
 async fn home_timeline_shows_followed_authors_newest_first() {
-    let (rm, alice, ..) = world();
+    let (rm, alice, _bob, _carol, p1, _p2, p3) = world();
     let page = rm.home_timeline(alice, None, 10).await;
     // alice follows bob (p1, p3) and sees her own posts (none). carol's p2 is
     // excluded. Newest first: p3 then p1.
-    let ids: Vec<&str> = page.entries.iter().map(|e| e.id.as_str()).collect();
-    assert_eq!(ids, ["p3", "p1"]);
+    let ids: Vec<Id> = page.entries.iter().map(|e| e.id).collect();
+    assert_eq!(ids, [p3, p1]);
     assert!(page.next_cursor.is_none());
 }
 
 #[tokio::test]
 async fn home_timeline_marks_liked_by_me() {
-    let (rm, alice, ..) = world();
+    let (rm, alice, _bob, _carol, p1, _p2, p3) = world();
     let page = rm.home_timeline(alice, None, 10).await;
-    let p1 = page.entries.iter().find(|e| e.id == "p1").unwrap();
-    assert!(p1.liked_by_me);
-    assert_eq!(p1.likes, 1);
-    let p3 = page.entries.iter().find(|e| e.id == "p3").unwrap();
-    assert!(!p3.liked_by_me);
+    let p1v = page.entries.iter().find(|e| e.id == p1).unwrap();
+    assert!(p1v.liked_by_me);
+    assert_eq!(p1v.likes, 1);
+    let p3v = page.entries.iter().find(|e| e.id == p3).unwrap();
+    assert!(!p3v.liked_by_me);
 }
 
 #[tokio::test]
 async fn firehose_shows_everything_newest_first() {
-    let (rm, ..) = world();
+    let (rm, _alice, _bob, _carol, p1, p2, p3) = world();
     let page = rm.firehose(None, 10).await;
-    let ids: Vec<&str> = page.entries.iter().map(|e| e.id.as_str()).collect();
-    assert_eq!(ids, ["p3", "p2", "p1"]);
+    let ids: Vec<Id> = page.entries.iter().map(|e| e.id).collect();
+    assert_eq!(ids, [p3, p2, p1]);
 }
 
 #[tokio::test]
 async fn firehose_paginates_by_cursor() {
-    let (rm, ..) = world();
+    let (rm, _alice, _bob, _carol, p1, p2, p3) = world();
     let first = rm.firehose(None, 2).await;
-    let ids: Vec<&str> = first.entries.iter().map(|e| e.id.as_str()).collect();
-    assert_eq!(ids, ["p3", "p2"]);
+    let ids: Vec<Id> = first.entries.iter().map(|e| e.id).collect();
+    assert_eq!(ids, [p3, p2]);
     let cursor = first.next_cursor.expect("more pages");
     let second = rm.firehose(Some(cursor), 2).await;
-    let ids: Vec<&str> = second.entries.iter().map(|e| e.id.as_str()).collect();
-    assert_eq!(ids, ["p1"]);
+    let ids: Vec<Id> = second.entries.iter().map(|e| e.id).collect();
+    assert_eq!(ids, [p1]);
     assert!(second.next_cursor.is_none());
 }
 
 #[tokio::test]
 async fn user_posts_lists_only_that_author() {
-    let (rm, ..) = world();
+    let (rm, _alice, _bob, _carol, p1, _p2, p3) = world();
     let page = rm.user_posts("bob", None, 10).await;
-    let ids: Vec<&str> = page.entries.iter().map(|e| e.id.as_str()).collect();
-    assert_eq!(ids, ["p3", "p1"]);
+    let ids: Vec<Id> = page.entries.iter().map(|e| e.id).collect();
+    assert_eq!(ids, [p3, p1]);
 }
 
 #[tokio::test]
 async fn profile_counts_and_viewer_relation() {
-    let (rm, alice, bob, carol) = world();
+    let (rm, alice, bob, carol, ..) = world();
     // bob viewed by alice: alice follows bob.
     let bob_profile = rm.profile("bob", Some(alice)).await.unwrap();
     assert_eq!(bob_profile.handle, "bob");
@@ -100,20 +104,27 @@ async fn profile_counts_and_viewer_relation() {
 
 #[tokio::test]
 async fn post_query_is_viewer_relative_and_hides_deleted() {
-    let (rm, alice, bob, _carol) = world();
-    let p1 = rm.post("p1", Some(alice)).await.unwrap();
-    assert!(p1.liked_by_me);
-    let p1_anon = rm.post("p1", None).await.unwrap();
+    let (rm, alice, bob, _carol, p1, ..) = world();
+    let p1v = rm.post(p1, Some(alice)).await.unwrap();
+    assert!(p1v.liked_by_me);
+    assert_eq!(p1v.author_id, bob);
+    let p1_anon = rm.post(p1, None).await.unwrap();
     assert!(!p1_anon.liked_by_me);
     // Anonymous view of a post bob authored still shows author fields.
     assert_eq!(p1_anon.author_handle, "bob");
-    let _ = bob;
 
     // A deleted post disappears from single-post and feed queries.
-    let rm2 = rm.with_deleted("p1");
-    assert!(rm2.post("p1", Some(alice)).await.is_none());
+    let rm2 = rm.with_deleted(p1);
+    assert!(rm2.post(p1, Some(alice)).await.is_none());
     let firehose = rm2.firehose(None, 10).await;
-    assert!(firehose.entries.iter().all(|e| e.id != "p1"));
+    assert!(firehose.entries.iter().all(|e| e.id != p1));
+}
+
+#[tokio::test]
+async fn resolve_finds_a_registered_handle_and_none_otherwise() {
+    let (rm, alice, ..) = world();
+    assert_eq!(rm.resolve("alice").await, Some(alice));
+    assert_eq!(rm.resolve("nobody").await, None);
 }
 
 #[tokio::test]

@@ -5,6 +5,7 @@
 //! stylesheet is served separately at `/style.css` (see
 //! [`STYLESHEET`]).
 
+use ident::Id;
 use maud::{DOCTYPE, Markup, html};
 
 use crate::contracts::{PostView, ProfileView, TimelinePage};
@@ -68,15 +69,18 @@ pub fn page(
     }
 }
 
-/// One post card, shared by feeds and the permalink page. `viewer_handle` is
-/// the acting user's handle (for the author-only delete button); `permalink`
-/// controls whether the body links to `/p/:id`.
+/// One post card, shared by feeds and the permalink page. `viewer_id` (the
+/// acting user's id, compared against [`PostView::author_id`] — not the
+/// handle — for the author-only delete button) and `viewer_handle` (for the
+/// author link/compose visibility) both describe the same acting user, if
+/// any. `permalink` controls whether the body links to `/p/:id`.
 fn post_card(
     p: &PostView,
+    viewer_id: Option<Id>,
     viewer_handle: Option<&str>,
     permalink: bool,
 ) -> Markup {
-    let is_author = viewer_handle == Some(p.author_handle.as_str());
+    let is_author = viewer_id == Some(p.author_id);
     let logged_in = viewer_handle.is_some();
     html! {
         article.post {
@@ -127,6 +131,7 @@ pub fn feed(
     heading: &str,
     subtitle: Option<&str>,
     page_data: &TimelinePage,
+    viewer_id: Option<Id>,
     viewer_handle: Option<&str>,
     base_path: &str,
     show_compose: bool,
@@ -149,7 +154,7 @@ pub fn feed(
                 p.empty { "Nothing here yet." }
             }
             @for p in &page_data.entries {
-                (post_card(p, viewer_handle, false))
+                (post_card(p, viewer_id, viewer_handle, false))
             }
             @if let Some(cursor) = &page_data.next_cursor {
                 a.pager href=(format!("{base_path}?cursor={cursor}")) {
@@ -161,11 +166,15 @@ pub fn feed(
 }
 
 /// A single post permalink page.
-pub fn single_post(p: &PostView, viewer_handle: Option<&str>) -> Markup {
+pub fn single_post(
+    p: &PostView,
+    viewer_id: Option<Id>,
+    viewer_handle: Option<&str>,
+) -> Markup {
     html! {
         section.feed {
             h1 { "Post" }
-            (post_card(p, viewer_handle, true))
+            (post_card(p, viewer_id, viewer_handle, true))
             p.back { a href="/" { "← Back home" } }
         }
     }
@@ -177,6 +186,7 @@ pub fn profile(
     logged_in: bool,
     is_self: bool,
     posts: &TimelinePage,
+    viewer_id: Option<Id>,
     viewer_handle: Option<&str>,
 ) -> Markup {
     html! {
@@ -210,6 +220,7 @@ pub fn profile(
             "Posts",
             None,
             posts,
+            viewer_id,
             viewer_handle,
             &format!("/u/{}", prof.handle),
             false,

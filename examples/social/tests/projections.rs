@@ -16,7 +16,7 @@ use ident::Id;
 use mess_store::{EventStore, LogEngine};
 use social::{
     PostLookup, Projections, ProfileView, ReadModels, TimelinePage, WriteError,
-    WriteOps, post_stream,
+    WriteOps,
 };
 
 /// A fresh store in a unique temp dir per test (mirrors `store_roundtrip`).
@@ -27,12 +27,6 @@ fn fresh_store() -> EventStore<LogEngine> {
         Id::new()
     ));
     EventStore::new(LogEngine::open(&dir).expect("open engine"))
-}
-
-/// The stream-suffix a [`PostView`]/`post` query keys on (`post-<id>` without
-/// the prefix).
-fn suffix(id: Id) -> String {
-    post_stream(id).strip_prefix("post-").unwrap().to_string()
 }
 
 // ===========================================================================
@@ -72,18 +66,19 @@ async fn home_timeline_shows_followed_and_own_newest_first() {
     let (_s, proj, [alice, ..], [p1, _p2, p3], _last) = world().await;
     let page = proj.home_timeline(alice, None, 10).await;
     // alice follows bob (p1, p3) + sees her own (none). carol's p2 excluded.
-    let ids: Vec<&str> = page.entries.iter().map(|e| e.id.as_str()).collect();
-    assert_eq!(ids, [suffix(p3), suffix(p1)]);
+    let ids: Vec<Id> = page.entries.iter().map(|e| e.id).collect();
+    assert_eq!(ids, [p3, p1]);
     assert!(page.next_cursor.is_none());
 }
 
 #[tokio::test]
 async fn home_timeline_marks_liked_by_me_and_counts() {
-    let (_s, proj, [alice, ..], [p1, ..], _last) = world().await;
+    let (_s, proj, [alice, bob, _carol], [p1, ..], _last) = world().await;
     let page = proj.home_timeline(alice, None, 10).await;
-    let p1v = page.entries.iter().find(|e| e.id == suffix(p1)).unwrap();
+    let p1v = page.entries.iter().find(|e| e.id == p1).unwrap();
     assert!(p1v.liked_by_me);
     assert_eq!(p1v.likes, 1);
+    assert_eq!(p1v.author_id, bob);
     assert_eq!(p1v.author_handle, "bob");
     assert_eq!(p1v.author_display, "Bob");
 }
@@ -92,16 +87,16 @@ async fn home_timeline_marks_liked_by_me_and_counts() {
 async fn firehose_shows_everything_and_paginates() {
     let (_s, proj, _u, [p1, p2, p3], _last) = world().await;
     let all = proj.firehose(None, 10).await;
-    let ids: Vec<&str> = all.entries.iter().map(|e| e.id.as_str()).collect();
-    assert_eq!(ids, [suffix(p3), suffix(p2), suffix(p1)]);
+    let ids: Vec<Id> = all.entries.iter().map(|e| e.id).collect();
+    assert_eq!(ids, [p3, p2, p1]);
 
     let first = proj.firehose(None, 2).await;
-    let ids: Vec<&str> = first.entries.iter().map(|e| e.id.as_str()).collect();
-    assert_eq!(ids, [suffix(p3), suffix(p2)]);
+    let ids: Vec<Id> = first.entries.iter().map(|e| e.id).collect();
+    assert_eq!(ids, [p3, p2]);
     let cursor = first.next_cursor.expect("more pages");
     let second = proj.firehose(Some(cursor), 2).await;
-    let ids: Vec<&str> = second.entries.iter().map(|e| e.id.as_str()).collect();
-    assert_eq!(ids, [suffix(p1)]);
+    let ids: Vec<Id> = second.entries.iter().map(|e| e.id).collect();
+    assert_eq!(ids, [p1]);
     assert!(second.next_cursor.is_none());
 }
 
@@ -109,8 +104,8 @@ async fn firehose_shows_everything_and_paginates() {
 async fn user_posts_lists_only_that_author() {
     let (_s, proj, _u, [p1, _p2, p3], _last) = world().await;
     let page = proj.user_posts("bob", None, 10).await;
-    let ids: Vec<&str> = page.entries.iter().map(|e| e.id.as_str()).collect();
-    assert_eq!(ids, [suffix(p3), suffix(p1)]);
+    let ids: Vec<Id> = page.entries.iter().map(|e| e.id).collect();
+    assert_eq!(ids, [p3, p1]);
 }
 
 #[tokio::test]
@@ -133,12 +128,20 @@ async fn profile_counts_and_viewer_relation() {
 
 #[tokio::test]
 async fn post_query_is_viewer_relative() {
-    let (_s, proj, [alice, ..], [p1, ..], _last) = world().await;
-    let me = proj.post(&suffix(p1), Some(alice)).await.unwrap();
+    let (_s, proj, [alice, bob, _carol], [p1, ..], _last) = world().await;
+    let me = proj.post(p1, Some(alice)).await.unwrap();
     assert!(me.liked_by_me);
-    let anon = proj.post(&suffix(p1), None).await.unwrap();
+    assert_eq!(me.author_id, bob);
+    let anon = proj.post(p1, None).await.unwrap();
     assert!(!anon.liked_by_me);
     assert_eq!(anon.author_handle, "bob");
+}
+
+#[tokio::test]
+async fn resolve_finds_a_registered_handle_and_none_otherwise() {
+    let (_s, proj, [alice, ..], _p, _last) = world().await;
+    assert_eq!(proj.resolve("alice").await, Some(alice));
+    assert_eq!(proj.resolve("nobody").await, None);
 }
 
 #[tokio::test]
@@ -148,21 +151,21 @@ async fn deleted_post_drops_from_feeds_but_permalink_is_a_tombstone() {
     proj.wait_for(last).await;
 
     // Gone from the single-post feed query and from the firehose.
-    assert!(proj.post(&suffix(p1), None).await.is_none());
+    assert!(proj.post(p1, None).await.is_none());
     let fire = proj.firehose(None, 10).await;
-    assert!(fire.entries.iter().all(|e| e.id != suffix(p1)));
+    assert!(fire.entries.iter().all(|e| e.id != p1));
 
     // Gone from bob's user_posts and his post_count drops.
     let bob_posts = proj.user_posts("bob", None, 10).await;
-    assert!(bob_posts.entries.iter().all(|e| e.id != suffix(p1)));
+    assert!(bob_posts.entries.iter().all(|e| e.id != p1));
     assert_eq!(proj.profile("bob", None).await.unwrap().post_count, 1);
 
     // But a permalink resolves to a tombstone with author attribution intact.
-    let tomb = proj.lookup_post(&suffix(p1), None).await.unwrap();
+    let tomb = proj.lookup_post(p1, None).await.unwrap();
     assert!(tomb.deleted);
     assert_eq!(tomb.view.author_handle, "bob");
     // A never-existing id is None even as a tombstone.
-    assert!(proj.lookup_post(&suffix(Id::new()), None).await.is_none());
+    assert!(proj.lookup_post(Id::new(), None).await.is_none());
 }
 
 // ===========================================================================
@@ -179,7 +182,7 @@ async fn wait_for_is_a_read_your_writes_barrier() {
 
     // After the barrier resolves, the just-written post MUST be visible.
     proj.wait_for(pos).await;
-    let seen = proj.post(&suffix(post), Some(alice)).await;
+    let seen = proj.post(post, Some(alice)).await;
     assert!(seen.is_some(), "post must be visible after wait_for(pos)");
     assert_eq!(seen.unwrap().body, "hello");
 
@@ -210,7 +213,7 @@ async fn wait_for_blocks_until_a_later_write_lands() {
     };
     let (post, pos) = waiter.await;
     proj.wait_for(pos).await;
-    assert!(proj.post(&suffix(post), None).await.is_some());
+    assert!(proj.post(post, None).await.is_some());
 }
 
 // ===========================================================================
@@ -353,8 +356,8 @@ async fn snapshot(
     let mut post_views = Vec::new();
     let mut lookups = Vec::new();
     for p in posts {
-        post_views.push(proj.post(&suffix(*p), None).await);
-        lookups.push(proj.lookup_post(&suffix(*p), None).await);
+        post_views.push(proj.post(*p, None).await);
+        lookups.push(proj.lookup_post(*p, None).await);
     }
     Snap {
         firehose,
@@ -415,5 +418,5 @@ async fn follow_after_post_is_retroactive() {
     // alice's home retroactively contains bob's older post.
     let home = proj.home_timeline(alice, None, 10).await;
     assert_eq!(home.entries.len(), 1);
-    assert_eq!(home.entries[0].id, suffix(post));
+    assert_eq!(home.entries[0].id, post);
 }

@@ -97,13 +97,12 @@ impl Inner {
         posts.sort_by_key(|p| p.created_pos);
         for p in posts {
             let Some(author) = p.agg.author else { continue };
-            let pid = p.id.to_string();
-            rm = rm.with_post(&pid, author, &p.agg.body);
+            rm = rm.with_post(p.id, author, &p.agg.body);
             for liker in &p.agg.likes {
-                rm = rm.with_like(&pid, *liker);
+                rm = rm.with_like(p.id, *liker);
             }
             if p.agg.deleted {
-                rm = rm.with_deleted(&pid);
+                rm = rm.with_deleted(p.id);
             }
         }
         for u in &self.users {
@@ -154,9 +153,13 @@ impl ReadModels for MemBackend {
         let snap = self.inner.lock().unwrap().snapshot();
         snap.profile(handle, viewer).await
     }
-    async fn post(&self, id: &str, viewer: Option<Id>) -> Option<PostView> {
+    async fn post(&self, id: Id, viewer: Option<Id>) -> Option<PostView> {
         let snap = self.inner.lock().unwrap().snapshot();
         snap.post(id, viewer).await
+    }
+    async fn resolve(&self, handle: &str) -> Option<Id> {
+        let g = self.inner.lock().unwrap();
+        g.users.iter().find(|r| r.agg.handle == handle).map(|r| r.id)
     }
     async fn wait_for(&self, _position: u64) {
         // Synchronously consistent: a write mutates state in place.
@@ -322,6 +325,3 @@ impl MemBackend {
         Ok(pos)
     }
 }
-
-crate::impl_dyn_read!(MemBackend);
-crate::impl_dyn_write!(MemBackend);
