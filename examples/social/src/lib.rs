@@ -40,6 +40,7 @@ use ident::Id;
 
 pub mod contracts;
 pub mod domain;
+pub mod projections;
 
 // Re-export the domain surface at the crate root so call sites read
 // `social::RegisterUser` rather than `social::domain::user::RegisterUser`,
@@ -57,6 +58,8 @@ pub use contracts::{
     FakeReadModels, PostView, ProfileView, ReadModels, TimelinePage,
     WriteError, WriteOps,
 };
+
+pub use projections::{PostLookup, Projections};
 
 /// The stream id for a user's aggregate: `user-<id>`.
 ///
