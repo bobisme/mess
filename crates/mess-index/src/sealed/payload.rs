@@ -66,6 +66,7 @@
 //! ```
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use crate::columnar::{self, Block, CodecError, EncodeOpts, FLAG_COLUMNAR};
 
@@ -290,6 +291,215 @@ impl Default for PayloadSealOpts {
             row_dict: None,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Offline archive re-block (bn-382)
+// ---------------------------------------------------------------------------
+//
+// A sealed segment's `.pcol` is written once by the sealer at the round-4 D6
+// default (columnar / 128-event blocks / zstd-9). For an *archive* — a segment
+// past the replay SLA whose bytes/event matters more than its replay CPU —
+// [`archive_reblock`] rewrites that `.pcol` **offline** with larger columnar
+// blocks at a higher zstd level (the round-4 frontier: 2048-event blocks,
+// zstd-19, ~26.5 B/event on the heavy corpus). It is OFF by default and no code
+// path invokes it automatically.
+//
+// The re-block only changes the payload **block geometry** — block size and zstd
+// level are per-block in the `.pcol` format (each [`BlockEntry`] carries its own
+// `n_events`/`byte_len`), so the one read path reassembles a 128-event file and a
+// 2048-event file transparently. The pointer sidecar (`.pidx`) is untouched:
+// logical stored-order positions are unchanged, so every [`EventPtr`] and the
+// pointer sidecar stay valid across the re-block.
+
+/// Recommended archive-tier block size (round-4 D6 frontier): 2048 events.
+pub const ARCHIVE_BLOCK_EVENTS: usize = 2048;
+/// Recommended archive-tier zstd level (round-4 D6 frontier): 19.
+pub const ARCHIVE_ZSTD_LEVEL: i32 = 19;
+
+/// The `.pcol` payload-sidecar path for `segment_id` under `dir`:
+/// `<dir>/seg-<id>.pcol`. The single source of truth for the `.pcol` naming,
+/// shared by [`crate::sealed::driver::SealDriver::payload_sidecar_path`] (write
+/// at seal) and [`archive_reblock`] (rewrite offline) so the two can never drift.
+pub fn pcol_path(dir: &Path, segment_id: u64) -> PathBuf {
+    dir.join(format!("seg-{segment_id:020}.pcol"))
+}
+
+/// Policy for the **offline archive re-block** ([`archive_reblock`]): rewrite an
+/// already-sealed segment's `.pcol` with larger columnar blocks at a higher zstd
+/// level, trading seal/replay CPU for a tighter bytes/event ratio on archives
+/// past the replay SLA.
+///
+/// **OFF by default.** `enabled` is `false` in [`ArchivePolicy::default`], and no
+/// code path invokes the re-block automatically. A caller that wants the archive
+/// tier constructs an enabled policy explicitly (e.g. [`ArchivePolicy::archive`]).
+#[derive(Clone, Copy, Debug)]
+pub struct ArchivePolicy {
+    /// Whether the archive re-block runs at all. `false` ⇒ [`archive_reblock`]
+    /// is a no-op that touches nothing on disk.
+    pub enabled: bool,
+    /// Events per re-blocked columnar block (D6 archive frontier: 2048). The
+    /// codec caps a block at [`crate::columnar::MAX_BLOCK_EVENTS`].
+    pub block_events: usize,
+    /// zstd level for the re-blocked columnar/raw blocks (D6 archive: 19).
+    pub level: i32,
+}
+
+impl Default for ArchivePolicy {
+    /// OFF: `enabled == false`. The archive tier is strictly opt-in.
+    fn default() -> Self {
+        ArchivePolicy {
+            enabled: false,
+            block_events: ARCHIVE_BLOCK_EVENTS,
+            level: ARCHIVE_ZSTD_LEVEL,
+        }
+    }
+}
+
+impl ArchivePolicy {
+    /// An **enabled** archive policy at the round-4 D6 frontier (2048-event
+    /// blocks, zstd-19). [`ArchivePolicy::default`] is OFF; this is the opt-in.
+    pub fn archive() -> Self {
+        ArchivePolicy { enabled: true, ..Default::default() }
+    }
+}
+
+/// The result of an [`archive_reblock`] call.
+#[derive(Debug, Clone, Copy)]
+pub struct ReblockOutcome {
+    /// Whether the `.pcol` was actually rewritten. `false` when the policy was
+    /// disabled — nothing was read or written.
+    pub reblocked: bool,
+    /// Total events in the segment (0 when not reblocked).
+    pub event_count: u64,
+    /// `.pcol` size before the re-block, bytes (0 when not reblocked).
+    pub old_bytes: u64,
+    /// `.pcol` size after the re-block, bytes (0 when not reblocked).
+    pub new_bytes: u64,
+    /// Number of payload blocks before the re-block (0 when not reblocked).
+    pub old_blocks: usize,
+    /// Number of payload blocks after the re-block (0 when not reblocked).
+    pub new_blocks: usize,
+}
+
+/// Errors from an [`archive_reblock`].
+#[derive(Debug, thiserror::Error)]
+pub enum ReblockError {
+    /// Reading the old `.pcol` or writing the new one failed.
+    #[error("archive re-block I/O: {0}")]
+    Io(#[from] std::io::Error),
+    /// Parsing, reassembling, or verifying a payload sidecar failed — including a
+    /// verify-on-reblock byte-exactness mismatch ([`PayloadError::VerifyMismatch`]),
+    /// which aborts the re-block with the OLD `.pcol` left intact.
+    #[error("archive re-block payload: {0}")]
+    Payload(#[from] PayloadError),
+}
+
+/// Re-block the sealed segment `segment_id`'s payload sidecar (`.pcol`) under
+/// `dir` **offline**, into `policy.block_events`-event columnar blocks at
+/// `policy.level` (the archive frontier: 2048 / zstd-19). Returns a
+/// [`ReblockOutcome`] describing the geometry/size change.
+///
+/// - **Off by default.** If `policy.enabled` is `false` this reads and writes
+///   nothing and returns `reblocked == false` — the archive tier is opt-in and
+///   never runs automatically.
+/// - **`.pidx` untouched.** Only the `.pcol` block geometry changes; logical
+///   stored-order positions are unchanged, so the pointer sidecar and every
+///   [`EventPtr`] stay valid. Reads of the re-blocked file go through the exact
+///   same read path (block size is per-block).
+/// - **Verify-on-reblock.** The OLD `.pcol` is fully reassembled (resolving any
+///   row-fallback dictionaries via `resolver`) to recover its exact payloads;
+///   the NEW blocks are then reassembled and byte-compared against those OLD
+///   payloads *before* anything is written. A mismatch aborts with
+///   [`PayloadError::VerifyMismatch`] and leaves the OLD `.pcol` in place.
+/// - **Crash-atomic.** The new image is written temp → fsync → rename → dir
+///   fsync ([`crate::sealed::driver::write_durable`]). A crash before the rename
+///   leaves the OLD `.pcol` intact and serving; the temp husk is never opened by
+///   a reader.
+///
+/// The re-blocked file carries **no dictionary** (`dict_id == 0` on every
+/// block): row fallbacks recompress whole-block at the archive level, so the
+/// archived `.pcol` is fully self-describing and needs no `$registry` dictionary
+/// to read.
+pub fn archive_reblock(
+    dir: &Path,
+    segment_id: u64,
+    policy: &ArchivePolicy,
+    resolver: &impl DictResolver,
+) -> Result<ReblockOutcome, ReblockError> {
+    if !policy.enabled {
+        // Policy off: nothing happens — no read, no write.
+        return Ok(ReblockOutcome {
+            reblocked: false,
+            event_count: 0,
+            old_bytes: 0,
+            new_bytes: 0,
+            old_blocks: 0,
+            new_blocks: 0,
+        });
+    }
+
+    let path = pcol_path(dir, segment_id);
+    let old = SealedPayloadIndex::open(&path)??;
+    let old_bytes = old.bytes.len() as u64;
+    let old_blocks = old.block_count();
+
+    // Reassemble the OLD `.pcol`'s payloads (the re-block's source of truth),
+    // resolving any row-fallback dictionaries the old file referenced.
+    let mut src = Vec::new();
+    let mut src_offs = Vec::new();
+    old.reassemble_all(resolver, &mut src, &mut src_offs)?;
+    let refs: Vec<&[u8]> =
+        src_offs.windows(2).map(|w| &src[w[0] as usize..w[1] as usize]).collect();
+
+    // Re-encode with the archive geometry. encode_payload_sidecar runs the
+    // PERMANENT verify-on-seal: every NEW block is reassembled and byte-compared
+    // against `refs` (the OLD `.pcol`'s exact payloads) before it returns — that
+    // is the verify-on-reblock. No dictionary in the archive tier.
+    let opts = PayloadSealOpts {
+        block_events: policy.block_events,
+        codec: EncodeOpts { level: policy.level, per_column: false },
+        row_dict: None,
+    };
+    let new_image = encode_payload_sidecar(segment_id, &refs, &opts)?;
+
+    // Independent verify-on-reblock against the OLD `.pcol`: reassemble the NEW
+    // image end-to-end and byte-compare the whole payload region + boundaries to
+    // the OLD reassembly. Redundant with encode's internal verify by design —
+    // the re-block never renames a file it has not proven byte-identical to the
+    // one it replaces.
+    let new_idx = SealedPayloadIndex::from_bytes(new_image)?;
+    let mut new_src = Vec::new();
+    let mut new_offs = Vec::new();
+    new_idx.reassemble_all(&NoDicts, &mut new_src, &mut new_offs)?;
+    if new_offs != src_offs || new_src != src {
+        let bad = new_offs
+            .iter()
+            .zip(&src_offs)
+            .position(|(a, b)| a != b)
+            .unwrap_or(0) as u64;
+        return Err(PayloadError::VerifyMismatch(bad).into());
+    }
+
+    let new_blocks = new_idx.block_count();
+    let event_count = new_idx.event_count();
+    let bytes = new_idx.into_bytes();
+    let new_bytes = bytes.len() as u64;
+
+    // Crash-atomic replace, same seal-commit discipline as the sealer: temp →
+    // fsync → rename over the `.pcol` → dir fsync. A crash before the rename
+    // leaves the OLD `.pcol` intact and serving; open() reads exactly `.pcol`,
+    // never the `.tmp` husk.
+    crate::sealed::driver::write_durable(&path, &bytes)?;
+
+    Ok(ReblockOutcome {
+        reblocked: true,
+        event_count,
+        old_bytes,
+        new_bytes,
+        old_blocks,
+        new_blocks,
+    })
 }
 
 /// One block's encoded bytes plus the metadata its index entry needs.
@@ -762,6 +972,53 @@ mod tests {
         evs.iter().map(Vec::as_slice).collect()
     }
 
+    /// A **heavy** shreddable event (~180 B) mirroring the round-4 reference
+    /// corpus shape (`spikes/perf_compress/src/workload.rs`): a 9-field
+    /// rmp-named-style map with low-cardinality enum-ish strings (currency,
+    /// source), a per-event actor word, a monotone timestamp, and a free-text
+    /// `note` drawn from a small fixed vocabulary. The `note`'s cross-event
+    /// vocabulary redundancy is exactly the content a 2048-event zstd-19 window
+    /// exploits better than a 128-event zstd-9 one (REPORT.md H2: +3-8%).
+    fn heavy_event(rng: &mut Rng, seq: u64) -> Vec<u8> {
+        const CURRENCY: [&[u8]; 4] = [b"USD", b"EUR", b"GBP", b"JPY"];
+        const SOURCE: [&[u8]; 4] = [b"web", b"mobile", b"api", b"batch"];
+        const VOCAB: [&[u8]; 16] = [
+            b"payment", b"received", b"from", b"customer", b"for", b"invoice",
+            b"pending", b"review", b"approved", b"by", b"finance", b"team",
+            b"scheduled", b"retry", b"gateway", b"timeout",
+        ];
+        let mut note = Vec::new();
+        let words = 6 + rng.below(6) as usize;
+        for w in 0..words {
+            if w > 0 {
+                note.push(b' ');
+            }
+            note.extend_from_slice(VOCAB[rng.below(VOCAB.len() as u64) as usize]);
+        }
+        let actor: Vec<u8> = (0..8).map(|_| b'a' + (rng.below(26) as u8)).collect();
+
+        let mut v = vec![0x89]; // 9-field map
+        emit_str(&mut v, b"stream");
+        emit_str(&mut v, format!("account-{:07}", rng.below(10_000)).as_bytes());
+        emit_str(&mut v, b"seq");
+        emit_int(&mut v, seq as i64);
+        emit_str(&mut v, b"amount_cents");
+        emit_int(&mut v, rng.below(5_000_000) as i64);
+        emit_str(&mut v, b"currency");
+        emit_str(&mut v, CURRENCY[rng.below(4) as usize]);
+        emit_str(&mut v, b"actor");
+        emit_str(&mut v, &actor);
+        emit_str(&mut v, b"source");
+        emit_str(&mut v, SOURCE[rng.below(4) as usize]);
+        emit_str(&mut v, b"note");
+        emit_str(&mut v, &note);
+        emit_str(&mut v, b"occurred_at_ms");
+        emit_int(&mut v, 1_767_225_600_000_i64 + seq as i64 * 37);
+        emit_str(&mut v, b"schema_v");
+        emit_int(&mut v, 3);
+        v
+    }
+
     /// A mixed corpus: alternating runs of shreddable msgpack and unshreddable
     /// binary, so a small block size yields both columnar and row blocks.
     fn mixed_corpus() -> Vec<Vec<u8>> {
@@ -1069,5 +1326,230 @@ mod tests {
         // Body after the u32 ulen must NOT start with the zstd magic 0x28B52FFD.
         let magic = [0x28u8, 0xB5, 0x2F, 0xFD];
         assert_ne!(&block[4..8], &magic, "frame should be magicless");
+    }
+
+    // -----------------------------------------------------------------------
+    // bn-382: offline archive re-block (2048-event columnar blocks @ zstd-19)
+    // -----------------------------------------------------------------------
+
+    /// Write `bytes` to the segment's `.pcol` path in `dir` (test helper — the
+    /// on-disk starting state a re-block operates on).
+    fn write_pcol(dir: &std::path::Path, seg: u64, bytes: &[u8]) {
+        std::fs::write(pcol_path(dir, seg), bytes).unwrap();
+    }
+
+    /// Re-blocking an already-sealed `.pcol` (128-event / zstd-9) into 2048-event
+    /// zstd-19 blocks keeps every payload byte-exact — point AND range reads —
+    /// while shrinking the block count. The one read path handles both geometries.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn archive_reblock_is_byte_exact_point_and_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg = 42u64;
+
+        // A ~5000-event mixed corpus so the default 128-event geometry produces
+        // many small blocks and the 2048 re-block produces just a few big ones.
+        let mut rng = Rng::new(0xA5C11);
+        let mut evs: Vec<Vec<u8>> = Vec::new();
+        for round in 0..50u64 {
+            for i in 0..90 {
+                evs.push(msgpack_event(&mut rng, round * 90 + i));
+            }
+            for _ in 0..10 {
+                evs.push(binary_event(&mut rng));
+            }
+        }
+
+        // Seal at the round-4 default geometry (128-event blocks, zstd-9) on disk.
+        let sealed = encode_payload_sidecar(seg, &refs(&evs), &PayloadSealOpts::default()).unwrap();
+        write_pcol(dir.path(), seg, &sealed);
+        let old_idx = SealedPayloadIndex::from_bytes(sealed).unwrap();
+        // Sanity: the default geometry blocks are 128 events (except the tail).
+        assert!(old_idx.blocks().iter().rev().skip(1).all(|b| b.n_events == 128));
+
+        // Re-block to the archive frontier.
+        let out =
+            archive_reblock(dir.path(), seg, &ArchivePolicy::archive(), &NoDicts).unwrap();
+        assert!(out.reblocked);
+        assert_eq!(out.event_count as usize, evs.len());
+        assert!(out.new_blocks < out.old_blocks, "re-block coalesces blocks");
+
+        // Re-open the re-blocked file straight from disk: the SAME read path.
+        let new_idx = SealedPayloadIndex::open(&pcol_path(dir.path(), seg)).unwrap().unwrap();
+        assert_eq!(new_idx.segment_id(), seg);
+        assert_eq!(new_idx.event_count() as usize, evs.len());
+        // New geometry: 2048-event blocks (except the tail) — proof the block
+        // size actually changed and is carried per-block in the format.
+        assert!(new_idx.blocks().iter().rev().skip(1).all(|b| b.n_events == 2048));
+        assert_eq!(new_idx.block_count(), out.new_blocks);
+
+        // Full range replay is byte-exact.
+        let mut o = Vec::new();
+        let mut offs = Vec::new();
+        new_idx.reassemble_all(&NoDicts, &mut o, &mut offs).unwrap();
+        assert_eq!(offs.len(), evs.len() + 1);
+        for (i, w) in offs.windows(2).enumerate() {
+            assert_eq!(&o[w[0] as usize..w[1] as usize], evs[i].as_slice(), "range mismatch at {i}");
+        }
+        // Every point read is byte-exact across the whole segment.
+        for (i, ev) in evs.iter().enumerate() {
+            assert_eq!(&new_idx.reassemble_event(i as u64, &NoDicts).unwrap(), ev, "point {i}");
+        }
+        // Out-of-range is still a clean error, not a panic.
+        assert!(matches!(
+            new_idx.reassemble_event(evs.len() as u64, &NoDicts),
+            Err(PayloadError::IndexOutOfRange)
+        ));
+    }
+
+    /// A crash mid-reblock (temp written, rename not yet done) leaves the OLD
+    /// `.pcol` intact and serving; the `.tmp` husk is ignored by the reader.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn archive_reblock_crash_leaves_old_pcol_serving() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg = 7u64;
+        let mut rng = Rng::new(0xC7A5);
+        let evs: Vec<Vec<u8>> = (0..300).map(|i| msgpack_event(&mut rng, i)).collect();
+
+        // The committed, serving `.pcol` at the default geometry.
+        let sealed = encode_payload_sidecar(seg, &refs(&evs), &PayloadSealOpts::default()).unwrap();
+        write_pcol(dir.path(), seg, &sealed);
+        let before = std::fs::read(pcol_path(dir.path(), seg)).unwrap();
+
+        // Simulate a crash mid-reblock: a partial temp husk exists next to the
+        // `.pcol`, but the rename never happened (write_durable's temp is
+        // `<name>.tmp`).
+        let path = pcol_path(dir.path(), seg);
+        let mut husk = path.file_name().unwrap().to_os_string();
+        husk.push(".tmp");
+        let husk = path.with_file_name(husk);
+        std::fs::write(&husk, b"partial garbage, not a valid .pcol").unwrap();
+
+        // The OLD `.pcol` is byte-identical and still serves every payload; the
+        // reader never touches the husk.
+        assert_eq!(std::fs::read(&path).unwrap(), before, "old .pcol untouched by the crash");
+        let idx = SealedPayloadIndex::open(&path).unwrap().unwrap();
+        assert_eq!(idx.event_count() as usize, evs.len());
+        for (i, ev) in evs.iter().enumerate() {
+            assert_eq!(&idx.reassemble_event(i as u64, &NoDicts).unwrap(), ev);
+        }
+
+        // Recovery re-runs the re-block: it completes atomically over the husk
+        // and the new file serves byte-exact.
+        let out = archive_reblock(dir.path(), seg, &ArchivePolicy::archive(), &NoDicts).unwrap();
+        assert!(out.reblocked);
+        let reblocked = SealedPayloadIndex::open(&path).unwrap().unwrap();
+        for (i, ev) in evs.iter().enumerate() {
+            assert_eq!(&reblocked.reassemble_event(i as u64, &NoDicts).unwrap(), ev);
+        }
+    }
+
+    /// Policy OFF (the default) is a strict no-op: the `.pcol` is not read or
+    /// written, its bytes are unchanged, and the outcome reports `reblocked: false`.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn archive_reblock_policy_off_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg = 3u64;
+        let mut rng = Rng::new(0x0FF);
+        let evs: Vec<Vec<u8>> = (0..200).map(|i| msgpack_event(&mut rng, i)).collect();
+        let sealed = encode_payload_sidecar(seg, &refs(&evs), &PayloadSealOpts::default()).unwrap();
+        write_pcol(dir.path(), seg, &sealed);
+        let before = std::fs::read(pcol_path(dir.path(), seg)).unwrap();
+
+        // Default policy is OFF.
+        assert!(!ArchivePolicy::default().enabled);
+        let out = archive_reblock(dir.path(), seg, &ArchivePolicy::default(), &NoDicts).unwrap();
+        assert!(!out.reblocked, "disabled policy does nothing");
+
+        let after = std::fs::read(pcol_path(dir.path(), seg)).unwrap();
+        assert_eq!(before, after, "policy-off left the .pcol byte-identical");
+        // No stray temp husk either.
+        let mut husk = pcol_path(dir.path(), seg).file_name().unwrap().to_os_string();
+        husk.push(".tmp");
+        assert!(!pcol_path(dir.path(), seg).with_file_name(husk).exists());
+    }
+
+    // -----------------------------------------------------------------------
+    // Bench: archive re-block bytes/event improvement on a 1M-event corpus.
+    // Run with:
+    //   TMPDIR=$HOME/.cache/mess-test-tmp cargo test -p mess-index --release \
+    //     sealed::payload::tests::archive_reblock_bench -- --ignored --nocapture
+    // -----------------------------------------------------------------------
+    #[test]
+    #[ignore = "perf bench; run explicitly with --release --ignored --nocapture"]
+    fn archive_reblock_bench() {
+        use std::time::Instant;
+        const TOTAL: usize = 1_000_000;
+        let mut rng = Rng::new(0xA2C41BE);
+        // Heavy reference-shaped corpus (~180 B/event, columnar-shreddable), the
+        // regime the archive tier targets: real cross-event redundancy that a
+        // larger block window + higher zstd level claw back (REPORT.md: 30.8 →
+        // 26.5 B/event at 2048/zstd-19). ~5% incompressible binary blocks stand
+        // in for the row-fallback tail.
+        let mut evs: Vec<Vec<u8>> = Vec::with_capacity(TOTAL);
+        let mut i = 0u64;
+        while evs.len() < TOTAL {
+            let binary_block = rng.below(20) == 0;
+            for _ in 0..DEFAULT_BLOCK_EVENTS {
+                if evs.len() == TOTAL {
+                    break;
+                }
+                evs.push(if binary_block { binary_event(&mut rng) } else { heavy_event(&mut rng, i) });
+                i += 1;
+            }
+        }
+        let raw_bytes: usize = evs.iter().map(Vec::len).sum();
+        let refs = refs(&evs);
+
+        let dir = tempfile::tempdir().unwrap();
+        let seg = 1u64;
+
+        // Baseline seal at the round-4 default (128-event blocks, zstd-9).
+        let sealed = encode_payload_sidecar(seg, &refs, &PayloadSealOpts::default()).unwrap();
+        let base_len = sealed.len();
+        let base_blocks = SealedPayloadIndex::from_bytes(sealed.clone()).unwrap().block_count();
+        write_pcol(dir.path(), seg, &sealed);
+
+        // Offline archive re-block (2048-event blocks, zstd-19).
+        let t = Instant::now();
+        let out = archive_reblock(dir.path(), seg, &ArchivePolicy::archive(), &NoDicts).unwrap();
+        let reblock_dt = t.elapsed();
+
+        // Replay throughput off the re-blocked file.
+        let new_idx = SealedPayloadIndex::open(&pcol_path(dir.path(), seg)).unwrap().unwrap();
+        let t = Instant::now();
+        let mut o = Vec::new();
+        let mut offs = Vec::new();
+        new_idx.reassemble_all(&NoDicts, &mut o, &mut offs).unwrap();
+        let replay_dt = t.elapsed();
+        assert_eq!(offs.len(), evs.len() + 1);
+
+        eprintln!("=== archive re-block bench (1M events, heavy corpus) ===");
+        eprintln!(
+            "  raw payload          {raw_bytes} B ({:.1} B/event)",
+            raw_bytes as f64 / TOTAL as f64
+        );
+        eprintln!(
+            "  baseline 128/zstd-9  {base_len} B ({:.2} B/event, {base_blocks} blocks)",
+            base_len as f64 / TOTAL as f64
+        );
+        eprintln!(
+            "  archive  2048/zstd-19 {} B ({:.2} B/event, {} blocks)",
+            out.new_bytes,
+            out.new_bytes as f64 / TOTAL as f64,
+            out.new_blocks
+        );
+        eprintln!(
+            "  improvement          {:.2} B/event ({:.1}%)",
+            (base_len as f64 - out.new_bytes as f64) / TOTAL as f64,
+            (base_len as f64 - out.new_bytes as f64) / base_len as f64 * 100.0
+        );
+        eprintln!("  re-block wall        {reblock_dt:?}");
+        eprintln!(
+            "  archive replay       {:.2} M ev/s ({replay_dt:?})",
+            TOTAL as f64 / replay_dt.as_secs_f64() / 1e6
+        );
     }
 }

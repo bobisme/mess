@@ -108,9 +108,12 @@ impl SealDriver {
     }
 
     /// The payload-block sidecar path for `segment_id` (bn-zge / D6):
-    /// `<dir>/seg-<id>.pcol`, a sibling of [`Self::sidecar_path`].
+    /// `<dir>/seg-<id>.pcol`, a sibling of [`Self::sidecar_path`]. Delegates to
+    /// [`payload::pcol_path`] — the single source of truth for the `.pcol`
+    /// naming, shared with the offline archive re-block (bn-382) so the two can
+    /// never target different files.
     pub fn payload_sidecar_path(&self, segment_id: u64) -> PathBuf {
-        self.sidecar_path(segment_id).with_extension("pcol")
+        payload::pcol_path(&self.dir, segment_id)
     }
 
     /// Seal a segment's **payloads** into the D6 payload-block sidecar
@@ -228,7 +231,11 @@ impl SealDriver {
 /// Write `bytes` to `path` crash-atomically: temp file → fsync → rename →
 /// fsync the parent directory. A crash leaves either the old/no file or the
 /// complete new one, never a torn sidecar.
-fn write_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
+///
+/// `pub(crate)` so the offline archive re-block ([`payload::archive_reblock`],
+/// bn-382) rewrites a segment's `.pcol` under the exact same seal-commit
+/// discipline: a crash mid-reblock leaves the OLD `.pcol` intact and serving.
+pub(crate) fn write_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
     // Temp name derived from the real file name (not a fixed `.pidx.tmp`), so
     // the pointer (`.pidx`) and payload (`.pcol`) sidecars never share a temp.

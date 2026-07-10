@@ -62,8 +62,9 @@ pub use block_cache::{BlockCache, CachedBlock};
 pub use driver::{BackgroundSealer, FinalizeFn, SealDriver, SealError};
 pub use filter::{FilterError, SegmentFilter};
 pub use payload::{
-    BlockEntry, BlockKind, DictResolver, NoDicts, PayloadError, PayloadSealOpts,
-    SealedPayloadIndex, encode_payload_sidecar, verify_reassembly,
+    ARCHIVE_BLOCK_EVENTS, ARCHIVE_ZSTD_LEVEL, ArchivePolicy, BlockEntry, BlockKind, DictResolver,
+    NoDicts, PayloadError, PayloadSealOpts, ReblockError, ReblockOutcome, SealedPayloadIndex,
+    archive_reblock, encode_payload_sidecar, pcol_path, verify_reassembly,
 };
 pub use ptr_block::{BatchPtr, DecodeError, SKIP_K};
 pub use replay::{ReplaySet, global_checksum, stream_checksum};
