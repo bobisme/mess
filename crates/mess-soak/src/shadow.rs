@@ -115,6 +115,25 @@ impl Shadow {
         self.streams.keys().cloned().collect()
     }
 
+    /// Build a `payload bytes → acked global positions` index over every
+    /// recorded (acked) event. Each driver payload embeds a unique monotonic
+    /// `write_nonce`, so the payload bytes are a globally unique fingerprint of
+    /// the append that produced them — an engine "extra" whose payload is a key
+    /// here is a byte-exact duplicate of an acked event (a double-replay), not a
+    /// fresh unacked write. A `Vec` value (not a scalar) makes a
+    /// payload-appearing-at-two-positions duplicate detectable directly.
+    #[must_use]
+    pub fn acked_payload_index(&self) -> HashMap<Vec<u8>, Vec<u64>> {
+        let mut idx: HashMap<Vec<u8>, Vec<u64>> = HashMap::new();
+        for (&gp, r) in &self.by_global {
+            if let Some(ev) = self.streams.get(&r.stream).and_then(|s| s.get(r.stream_pos as usize))
+            {
+                idx.entry(ev.data.clone()).or_default().push(gp);
+            }
+        }
+        idx
+    }
+
     /// Is the shadow's global space a dense `0..total` prefix? (It always
     /// should be — the driver only records engine-assigned dense positions —
     /// but the reconciliation step asserts it to catch a driver-side bug before

@@ -40,8 +40,10 @@ async fn soak_smoke_survives_crashes_with_all_probes_on() {
         streams: 32,
         writers: 4,
         subscribers: 3,
-        // ~3 crash cycles inside 20s → comfortably >= the required 2.
-        crash_every: Duration::from_secs(6),
+        // Deterministic crash trigger: every 4000 actions (~6s at the dev
+        // box's action rate) → ~3 crash cycles inside 20s, >= the required 2 —
+        // and the same store state at each crash point on any machine.
+        crash_every_actions: 4000,
         crash_mode: CrashMode::DropReopen,
         seed: 0xC0FFEE,
         dir: dir.clone(),
@@ -95,7 +97,7 @@ async fn soak_smoke_crashless_clean_pass() {
         streams: 16,
         writers: 3,
         subscribers: 2,
-        crash_every: Duration::ZERO, // no crashes
+        crash_every_actions: 0, // no crashes
         crash_mode: CrashMode::DropReopen,
         seed: 0x1234_5678,
         dir: dir.clone(),

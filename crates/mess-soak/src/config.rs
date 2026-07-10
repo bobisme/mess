@@ -32,9 +32,21 @@ pub struct Config {
     pub duration: Duration,
     /// Number of distinct streams the Zipf sampler ranges over.
     pub streams: usize,
-    /// Number of logical writer cursors (hot-stream multiplicity).
+    /// Concurrent writer tasks in the SIGKILL child (`--crash-mode sigkill`)
+    /// ONLY. The in-process drop-reopen driver is strictly sequential — every
+    /// append is awaited to a definite result before the next action — so this
+    /// knob does not apply to it (an in-process concurrent-writer mode is
+    /// future work).
     pub writers: usize,
-    /// Wall interval between crash cycles. `ZERO` disables crashes.
+    /// Drop-reopen mode: number of actions between crash cycles; `0` disables
+    /// crashes. Pinned to the deterministic action count — never wall-clock —
+    /// so the store state at every crash point reproduces exactly across
+    /// machines and CPU load (the action stream is a pure function of
+    /// `(seed, config)`).
+    pub crash_every_actions: u64,
+    /// Sigkill mode ONLY: wall-clock delay before the child is `SIGKILL`ed.
+    /// Wall-clock is inherent there (the kill races a live child process), so
+    /// that mode is not action-deterministic. `ZERO` falls back to 5s.
     pub crash_every: Duration,
     /// Master seed — deterministic per seed for a crash-free run.
     pub seed: u64,
@@ -64,6 +76,11 @@ pub struct Config {
     pub metrics_every: Duration,
     /// Print per-action chatter.
     pub verbose: bool,
+    /// If set, when the post-reopen reconcile finds ILLEGAL extras
+    /// (duplicate-of-acked or fabricated) the driver writes the full
+    /// classification breakdown to this JSON path before aborting (bn-3dr
+    /// diagnostics).
+    pub dump_extras: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -72,6 +89,10 @@ impl Default for Config {
             duration: Duration::from_secs(120),
             streams: 256,
             writers: 8,
+            // ~30s of actions at the observed ~650 actions/s on the dev box —
+            // but deterministic: exactly this many actions between crashes on
+            // ANY machine, however fast or loaded.
+            crash_every_actions: 20_000,
             crash_every: Duration::from_secs(30),
             seed: 0x50AC_5EED,
             dir: default_dir(),
@@ -94,6 +115,7 @@ impl Default for Config {
             crash_mode: CrashMode::DropReopen,
             metrics_every: Duration::from_secs(10),
             verbose: false,
+            dump_extras: None,
         }
     }
 }
@@ -112,15 +134,22 @@ impl Config {
     /// Multi-line human summary (header of every run and every abort dump).
     #[must_use]
     pub fn summary(&self) -> String {
+        let crash = match self.crash_mode {
+            CrashMode::DropReopen => format!(
+                "crash_every_actions={} (sequential driver, no writer concurrency)",
+                self.crash_every_actions
+            ),
+            CrashMode::Sigkill => {
+                format!("kill_delay={:?} writers={}", self.crash_every, self.writers)
+            }
+        };
         format!(
-            "duration={:?} streams={} writers={} subscribers={} crash_every={:?} \
-             crash_mode={:?}\n  seed={:#x} zipf_skew={} max_batch={} durability={:?} \
+            "duration={:?} streams={} subscribers={} {crash} crash_mode={:?}\n  \
+             seed={:#x} zipf_skew={} max_batch={} durability={:?} \
              segment_size={}B\n  dir={}\n  ceilings: rss={}B fd={} fsync_p99={:?}",
             self.duration,
             self.streams,
-            self.writers,
             self.subscribers,
-            self.crash_every,
             self.crash_mode,
             self.seed,
             self.zipf_skew,

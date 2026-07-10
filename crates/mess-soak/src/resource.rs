@@ -1,4 +1,5 @@
-//! Process resource probes: RSS, open-fd count, and the tmpfs guard.
+//! Process resource probes: RSS, open-fd count, the tmpfs guard, and the
+//! fresh-`--dir` guard.
 //!
 //! Linux-only (the engine already targets Unix; the soak's whole point is a
 //! real device). On a non-Linux host the RSS/fd readers return `None` and the
@@ -88,6 +89,55 @@ pub fn is_tmpfs(dir: &Path) -> io::Result<bool> {
     }
 }
 
+/// The fresh-`--dir` guard (bn-3dr root cause). The soak's shadow model starts
+/// empty, so the store MUST too: opening a `--dir` that already holds a store
+/// makes every pre-existing event an "extra" the shadow never acked and every
+/// pre-existing stream head a permanent version-conflict source. Exactly this
+/// produced the original bn-3dr finding — a killed first soak attempt left ~9s
+/// of store in the dir, and the next run opened it: `engine_total −
+/// shadow_total = 2727` leftovers (classifying as *fabricated* under the
+/// reconcile probe, since the second run never submitted them) and 277k
+/// conflicts (its writers racing the leftover stream heads).
+///
+/// Returns `Err(message)` naming the leftover artifacts when `dir` exists and
+/// is non-empty; `Ok(())` for a missing or empty dir. There is deliberately no
+/// resume/adopt mode: refusal is the whole contract.
+pub fn guard_fresh_dir(dir: &Path) -> Result<(), String> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        // Missing dir (or any unreadable state that create_dir_all will surface
+        // properly a moment later): nothing to adopt, nothing to refuse.
+        Err(_) => return Ok(()),
+    };
+    let mut segments = 0usize;
+    let mut markers: Vec<String> = Vec::new();
+    let mut others = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("seg-") && name.ends_with(".log") {
+            segments += 1;
+        } else if name == "LOCK" || name == "meta" || name == "sealed" {
+            markers.push(name);
+        } else {
+            others += 1;
+        }
+    }
+    if segments == 0 && markers.is_empty() && others == 0 {
+        return Ok(());
+    }
+    markers.sort();
+    Err(format!(
+        "refusing to soak on non-empty --dir {}: found a leftover store \
+         ({segments} seg-*.log segment file(s), markers: [{}]{}) — the shadow model \
+         starts empty, so pre-existing events would read as fabricated extras and \
+         pre-existing stream heads as version conflicts (the bn-3dr false alarm). \
+         Use a fresh directory per run; there is no resume mode.",
+        dir.display(),
+        markers.join(", "),
+        if others > 0 { format!(", plus {others} other entr(ies)") } else { String::new() },
+    ))
+}
+
 /// `/proc/mounts` octal-escapes spaces (`\040`) and a few other chars in the
 /// mount-point field. Decode the escapes we care about so `starts_with` matches
 /// paths with spaces.
@@ -155,6 +205,39 @@ mod tests {
                 assert!(!on_tmpfs, "HOME unexpectedly detected as tmpfs");
             }
         }
+    }
+
+    // ---- fresh-dir guard (bn-3dr) ----
+
+    #[test]
+    fn fresh_dir_guard_accepts_missing_and_empty() {
+        let t = tempfile::tempdir().unwrap();
+        assert!(guard_fresh_dir(&t.path().join("does-not-exist")).is_ok());
+        assert!(guard_fresh_dir(t.path()).is_ok());
+    }
+
+    #[test]
+    fn fresh_dir_guard_refuses_leftover_store() {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::write(t.path().join("seg-00000001.log"), b"x").unwrap();
+        std::fs::write(t.path().join("LOCK"), b"").unwrap();
+        std::fs::create_dir(t.path().join("meta")).unwrap();
+        let err = guard_fresh_dir(t.path()).unwrap_err();
+        assert!(err.contains("refusing"), "{err}");
+        assert!(err.contains("1 seg-*.log"), "{err}");
+        assert!(err.contains("LOCK") && err.contains("meta"), "{err}");
+        assert!(err.contains("fresh directory"), "{err}");
+    }
+
+    #[test]
+    fn fresh_dir_guard_refuses_any_nonempty_dir() {
+        // Even a dir holding only unrelated files is refused: the run must own
+        // its directory outright (an abort leaves it behind for post-mortem).
+        let t = tempfile::tempdir().unwrap();
+        std::fs::write(t.path().join("unrelated.txt"), b"x").unwrap();
+        let err = guard_fresh_dir(t.path()).unwrap_err();
+        assert!(err.contains("non-empty"), "{err}");
+        assert!(err.contains("1 other entr"), "{err}");
     }
 
     #[test]

@@ -8,6 +8,7 @@
 //! thing that supplies *real* engine reads; the decision logic lives here and
 //! is tested in isolation.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use mess_store::Version;
@@ -190,6 +191,69 @@ impl SubCursor {
     }
 }
 
+/// How recovery surfaced an event that is NOT at a shadow-acked position — the
+/// spec-02 A6 classification of a post-reopen "extra".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtraKind {
+    /// Byte-matches a distinct submitted-but-unacked append (an [`crate`]-level
+    /// A6 candidate), consumed here. **Legal** (spec 02 §6): recovery MAY
+    /// surface a complete, unacknowledged batch.
+    SubmittedUnacked,
+    /// Byte-matches an event that is ALSO present at its own acked position: the
+    /// same acked event surfaced a second time — a recovery **double-replay**
+    /// bug (Z1-family), never legal.
+    DuplicateOfAcked,
+    /// Byte-matches no submitted append at all — a **fabricated** event recovery
+    /// invented from nowhere (or resurfaced a conflicted, never-durable write).
+    Fabricated,
+}
+
+/// Running tally of the [`ExtraKind`]s over all extras after a reopen.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExtraCounts {
+    pub submitted_unacked: u64,
+    pub duplicate_of_acked: u64,
+    pub fabricated: u64,
+}
+
+impl ExtraCounts {
+    /// The count that makes recovery **wrong**: duplicates + fabrications. Zero
+    /// iff every extra was a legal A6 candidate.
+    #[must_use]
+    pub fn illegal(&self) -> u64 {
+        self.duplicate_of_acked + self.fabricated
+    }
+    pub(crate) fn record(&mut self, kind: ExtraKind) {
+        match kind {
+            ExtraKind::SubmittedUnacked => self.submitted_unacked += 1,
+            ExtraKind::DuplicateOfAcked => self.duplicate_of_acked += 1,
+            ExtraKind::Fabricated => self.fabricated += 1,
+        }
+    }
+}
+
+/// Classify one post-reopen extra (an engine event at a position the shadow
+/// never acked) against the acked-payload index and the submitted-but-unacked
+/// candidate multiset. Consumes one candidate on a [`SubmittedUnacked`](ExtraKind::SubmittedUnacked)
+/// match so no candidate excuses two extras. Because every driver payload embeds
+/// a unique write nonce, a payload that appears in `acked` is necessarily a
+/// duplicate of that acked event (spec-02 A6 forbids duplicating an *acked*
+/// batch), and a payload in neither set was never submitted at all.
+pub fn classify_extra(
+    payload: &[u8],
+    acked: &HashMap<Vec<u8>, Vec<u64>>,
+    candidates: &mut HashMap<Vec<u8>, u32>,
+) -> ExtraKind {
+    if acked.contains_key(payload) {
+        ExtraKind::DuplicateOfAcked
+    } else if let Some(n) = candidates.get_mut(payload).filter(|n| **n > 0) {
+        *n -= 1;
+        ExtraKind::SubmittedUnacked
+    } else {
+        ExtraKind::Fabricated
+    }
+}
+
 /// RSS ceiling. `ceiling == 0` disables the check.
 pub fn check_rss(rss_bytes: u64, ceiling_bytes: u64) -> Result<(), Violation> {
     if ceiling_bytes != 0 && rss_bytes > ceiling_bytes {
@@ -319,6 +383,69 @@ mod tests {
         c.observe(1).unwrap();
         let v = c.observe(1).unwrap_err();
         assert!(matches!(v, Violation::SubscriptionGap { expected: 2, got: 1, .. }), "{v}");
+    }
+
+    // ---- A6 extra classification ----
+    fn acked_of(pairs: &[(&[u8], u64)]) -> HashMap<Vec<u8>, Vec<u64>> {
+        let mut m: HashMap<Vec<u8>, Vec<u64>> = HashMap::new();
+        for (p, gp) in pairs {
+            m.entry(p.to_vec()).or_default().push(*gp);
+        }
+        m
+    }
+    fn cands(pairs: &[(&[u8], u32)]) -> HashMap<Vec<u8>, u32> {
+        pairs.iter().map(|(p, n)| (p.to_vec(), *n)).collect()
+    }
+
+    #[test]
+    fn extra_submitted_unacked_is_legal_and_consumes_one_candidate() {
+        let acked = acked_of(&[(b"acked", 0)]);
+        let mut c = cands(&[(b"inflight", 1)]);
+        assert_eq!(
+            classify_extra(b"inflight", &acked, &mut c),
+            ExtraKind::SubmittedUnacked
+        );
+        // The candidate is now spent: a *second* extra with the same payload is
+        // no longer excused (a candidate can back at most one surfaced event).
+        assert_eq!(
+            classify_extra(b"inflight", &acked, &mut c),
+            ExtraKind::Fabricated
+        );
+    }
+
+    #[test]
+    fn extra_duplicate_of_acked_is_a_double_replay_bug() {
+        let acked = acked_of(&[(b"acked", 3)]);
+        let mut c = cands(&[]);
+        assert_eq!(
+            classify_extra(b"acked", &acked, &mut c),
+            ExtraKind::DuplicateOfAcked,
+            "a payload already present at its acked position surfacing again is a duplicate"
+        );
+    }
+
+    #[test]
+    fn extra_matching_nothing_is_fabricated() {
+        let acked = acked_of(&[(b"acked", 0)]);
+        let mut c = cands(&[(b"inflight", 1)]);
+        assert_eq!(
+            classify_extra(b"ghost", &acked, &mut c),
+            ExtraKind::Fabricated
+        );
+    }
+
+    #[test]
+    fn extra_counts_illegal_is_dupes_plus_fabricated_only() {
+        let mut e = ExtraCounts::default();
+        e.record(ExtraKind::SubmittedUnacked);
+        e.record(ExtraKind::SubmittedUnacked);
+        assert_eq!(e.illegal(), 0, "legal A6 candidates never count as illegal");
+        e.record(ExtraKind::DuplicateOfAcked);
+        e.record(ExtraKind::Fabricated);
+        assert_eq!(e.illegal(), 2);
+        assert_eq!(e.submitted_unacked, 2);
+        assert_eq!(e.duplicate_of_acked, 1);
+        assert_eq!(e.fabricated, 1);
     }
 
     // ---- ceilings ----

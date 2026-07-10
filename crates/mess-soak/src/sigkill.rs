@@ -105,6 +105,11 @@ pub fn run(cfg: Config) {
 }
 
 fn guard_dir(cfg: &Config) -> Result<(), String> {
+    // Fresh at STARTUP (bn-3dr): a leftover store from a prior invocation
+    // would corrupt every round's reconcile. Rounds *within* this invocation
+    // then intentionally reuse the dir — each round's ledger is checked
+    // against the accumulated store.
+    resource::guard_fresh_dir(&cfg.dir)?;
     if resource::is_tmpfs(&cfg.dir).map_err(|e| format!("tmpfs check: {e}"))? {
         return Err(format!(
             "refusing to soak on tmpfs dir {} — fdatasync is a no-op there (--dir must be a real device)",

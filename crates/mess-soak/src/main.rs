@@ -28,6 +28,15 @@ fn main() {
         }
     };
 
+    // Fresh-`--dir` guard (bn-3dr root cause): a leftover store from a prior
+    // (possibly killed) run would read as thousands of fabricated "extras" and
+    // permanent version conflicts against the empty shadow. Refuse up front
+    // with the usage exit code; there is no resume mode.
+    if let Err(e) = mess_soak::resource::guard_fresh_dir(&cfg.dir) {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    }
+
     match cfg.crash_mode {
         CrashMode::DropReopen => run_in_process(cfg),
         CrashMode::Sigkill => sigkill::run(cfg),
@@ -66,6 +75,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
             "--duration" => cfg.duration = parse_secs(value()?)?,
             "--streams" => cfg.streams = parse_usize(value()?, "streams")?.max(1),
             "--writers" => cfg.writers = parse_usize(value()?, "writers")?.max(1),
+            "--crash-every-actions" => cfg.crash_every_actions = parse_u64(value()?)?,
             "--crash-every" => cfg.crash_every = parse_secs(value()?)?,
             "--seed" => cfg.seed = parse_u64(value()?)?,
             "--dir" => cfg.dir = PathBuf::from(value()?),
@@ -81,6 +91,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
             "--fsync-p99-ceiling" => cfg.fsync_p99_ceiling = parse_millis(value()?)?,
             "--crash-mode" => cfg.crash_mode = parse_crash_mode(value()?)?,
             "--metrics-every" => cfg.metrics_every = parse_secs(value()?)?,
+            "--dump-extras" => cfg.dump_extras = Some(PathBuf::from(value()?)),
             "--verbose" => cfg.verbose = true,
             other => return Err(format!("unknown flag {other}")),
         }
@@ -133,12 +144,18 @@ USAGE: mess-soak [FLAGS]\n\
 FLAGS (defaults in brackets):\n\
   --duration <secs>          total run length [{dur}]\n\
   --streams <n>              distinct streams the Zipf sampler ranges over [{streams}]\n\
-  --writers <n>              logical writer cursors [{writers}]\n\
+  --writers <n>              sigkill-mode child writer tasks ONLY; the in-process\n\
+                             drop-reopen driver is strictly sequential [{writers}]\n\
   --subscribers <n>          target concurrent subscribers [{subs}]\n\
-  --crash-every <secs>       wall interval between crash cycles; 0 = never [{crash}]\n\
+  --crash-every-actions <n>  drop mode: actions between crash cycles (deterministic,\n\
+                             never wall-clock); 0 = never [{cea}]\n\
+  --crash-every <secs>       sigkill mode ONLY: wall delay before the child is killed [{crash}]\n\
   --crash-mode <drop|sigkill>  drop-and-reopen (in-proc) or fork+SIGKILL child [drop]\n\
   --seed <u64|0xHEX>         master seed; deterministic per seed [{seed:#x}]\n\
-  --dir <path>               store dir; MUST NOT be tmpfs (refused) [$HOME/.cache/mess-soak]\n\
+  --dir <path>               store dir; MUST be EMPTY/fresh and MUST NOT be tmpfs\n\
+                             (both refused) [$HOME/.cache/mess-soak]\n\
+  --dump-extras <path>       write the extra-event classification JSON there if the\n\
+                             post-reopen reconcile finds illegal extras\n\
   --zipf-skew <f>            0=uniform, higher=hotter head [{skew}]\n\
   --max-batch <n>            max events per append [{mb}]\n\
   --segment-size <bytes>     active segment size; small => frequent rolls/seals [{seg}]\n\
@@ -155,6 +172,7 @@ See crates/mess-soak/README.md for the 2h nightly profile and how to read an abo
         streams = d.streams,
         writers = d.writers,
         subs = d.subscribers,
+        cea = d.crash_every_actions,
         crash = d.crash_every.as_secs(),
         seed = d.seed,
         skew = d.zipf_skew,
