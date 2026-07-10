@@ -85,7 +85,8 @@ enum Command {
     Verify {
         /// The store directory.
         dir: PathBuf,
-        /// Full byte-integrity pass (payload reassembly).
+        /// Full byte-integrity pass (payload reassembly) + fold-chain
+        /// linkage recompute.
         #[arg(long)]
         full: bool,
         #[command(flatten)]
