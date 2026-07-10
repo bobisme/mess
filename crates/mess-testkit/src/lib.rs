@@ -22,9 +22,18 @@
 //! [`WhenOutcome::then_error`] takes a matcher (see [`matching`]) rather
 //! than requiring a fully-reconstructed error value.
 //!
+//! # Self-sweeping real-fs temp dirs
+//!
+//! [`sweeping_temp_dir`] (module [`tempdir`]) is the shared, leak-resistant
+//! replacement for hand-rolled `tempfile::tempdir()`/`$HOME/.cache/...`
+//! scratch-dir helpers in real-fs suites (crash/SIGKILL harnesses, engine
+//! reopen tests, …): one namespace, auto-swept of stale dead-process
+//! leftovers on first use per process (bn-cxr).
+//!
 //! # Scope
 //!
 //! - the Given-When-Then kit above (bn-2cn)
+//! - the self-sweeping temp-dir helper above (bn-cxr)
 //! - verification support for commit authority and recovery (D1) and batch
 //!   framing (D2) invariants, shared across crates' test suites (lands
 //!   separately as Phase 1 work continues)
@@ -34,10 +43,15 @@ use std::fmt::Debug;
 use mess_core::{Aggregate, Decide};
 
 pub mod fixture;
+pub mod tempdir;
 
 pub use fixture::{
     FixtureError, UPDATE_ENV, assert_fixture_compat, assert_fold_drift,
     check_fixture_compat, check_fold_drift, fold,
+};
+pub use tempdir::{
+    AUTO_SWEEP_MAX_AGE, SweepingTempDir, namespace_root, sweep_stale,
+    sweeping_temp_dir, temp_dir_in,
 };
 
 /// Arrange: prior events for the aggregate under test.

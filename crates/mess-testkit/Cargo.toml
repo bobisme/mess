@@ -6,6 +6,11 @@ description = "mess v1: test harness and deterministic-simulation-testing (DST) 
 
 [dependencies]
 mess-core = { workspace = true }
+# bn-cxr: `tempdir::pid_is_alive` probes a pid's liveness via `kill(pid, 0)`
+# for the self-sweeping temp-dir helper's safety check (never delete a live
+# concurrent run's dir). Same crate/version already used directly by
+# mess-log and mess-soak.
+libc = "0.2"
 
 [dev-dependencies]
 # The golden-fixture acceptance tests define aggregates/events with the real
@@ -14,6 +19,9 @@ mess-core = { workspace = true }
 # dev-dependency cycle.
 mess-derive = { workspace = true }
 serde = { version = "1", features = ["derive"] }
+# bn-cxr: the `tempdir` acceptance tests build fake namespace roots to sweep
+# in isolation from the real process-wide one.
+tempfile = "3"
 
 [features]
 # Mirrors the `spikes/fold_cert` cfg-flagged drift demo: builds an aggregate

@@ -70,6 +70,36 @@ alias wt := watch-test
 @loom *args='':
 	env RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 cargo test -p mess-log --release --lib -- --nocapture loom_ "$@"
 
+# bn-cxr: force-sweep every dir under the shared real-fs test-temp namespace
+# (`<TMPDIR, or $HOME/.cache/mess-test-tmp>/mess-tests/`), regardless of age —
+# for humans reclaiming disk immediately rather than waiting on the 24h
+# auto-sweep every `mess_testkit::sweeping_temp_dir` call performs. Mirrors
+# that helper's pid-liveness check (never removes a dir whose encoded pid is
+# still alive), so it's safe to run alongside another suite mid-run
+# elsewhere; unlike the auto-sweep it does NOT require the dir to be old.
+# See docs/testing.md.
+@clean-test-tmp:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	base="${TMPDIR:-$HOME/.cache/mess-test-tmp}"
+	root="$base/mess-tests"
+	if [ ! -d "$root" ]; then
+		echo "no $root — nothing to sweep"
+		exit 0
+	fi
+	echo "sweeping $root"
+	shopt -s nullglob
+	for d in "$root"/*/; do
+		name="$(basename "$d")"
+		pid="$(echo "$name" | rev | cut -d- -f2 | rev)"
+		if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+			echo "  skip (pid $pid alive): $name"
+			continue
+		fi
+		echo "  removing: $name"
+		rm -rf -- "$d"
+	done
+
 # bn-1mw: examples/social one-command demo. Seeds a deterministic corpus
 # (~50 users, ~500 posts, Zipf-ish follows/likes — see `social-seed`) into
 # $HOME/.cache/mess-social-demo/store (--force wipes a prior run so this is

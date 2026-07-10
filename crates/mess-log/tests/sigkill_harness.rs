@@ -60,28 +60,15 @@
 //! `SIGKILL`, which is the "child never got going" case worth catching.
 //! See [`ChildDeath`].
 
-use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::os::unix::process::ExitStatusExt;
-use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use mess_log::runtime::{RealRuntime, Runtime};
 use mess_log::scanner::recover_segment;
-
-/// Removes the round's segment file on drop, including on panic (the
-/// prior explicit `fs::remove_file` at the end of [`run_round`] was only
-/// reached on the non-panicking path, so a failed/flaky round would leak
-/// its scratch file under `$HOME/.cache/mess-sigkill-scratch` forever).
-struct CleanupGuard<'a>(&'a Path);
-
-impl Drop for CleanupGuard<'_> {
-    fn drop(&mut self) { let _ = fs::remove_file(self.0); }
-}
 
 /// How the child process ended, established from its
 /// [`std::process::ExitStatus`].
@@ -94,24 +81,6 @@ enum ChildDeath {
     /// died on its own, that's a real bug and must not be waved through as
     /// "vacuously reconciling".
     DiedOnItsOwn { status: std::process::ExitStatus, stderr: String },
-}
-
-/// A scratch dir on a real, persistent device OUTSIDE the repo —
-/// `$HOME/.cache`, not `std::env::temp_dir()` (commonly `tmpfs`, where
-/// `fdatasync` is a no-op and `Os`/`Group`'s barrier contract would be
-/// untestable). Mirrors `committer.rs`'s `real_tmp` helper.
-fn real_tmp_dir(name: &str) -> PathBuf {
-    static N: AtomicU64 = AtomicU64::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    let base = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    let mut dir = base;
-    dir.push(".cache");
-    dir.push("mess-sigkill-scratch");
-    fs::create_dir_all(&dir).unwrap();
-    dir.push(format!("{}-{}-{}", std::process::id(), n, name));
-    dir
 }
 
 /// splitmix64 — a tiny, dependency-free PRNG. Only used to jitter each
@@ -152,10 +121,16 @@ fn run_round(
     min_kill_ms: u64,
     max_kill_ms: u64,
 ) -> RoundResult {
-    let seg_path = real_tmp_dir(&format!("seg-{mode}-{seed:016x}.log"));
-    fs::create_dir_all(seg_path.parent().unwrap()).unwrap();
-    let _ = fs::remove_file(&seg_path);
-    let _cleanup = CleanupGuard(&seg_path);
+    // A fresh, uniquely-named directory on a real, persistent device
+    // OUTSIDE the repo (never `tmpfs`, where `fdatasync` is a no-op and
+    // `Os`/`Group`'s barrier contract would be untestable) — see
+    // `mess_testkit::tempdir`'s module docs. Held for the round's duration
+    // and removed on drop (the common, non-killed path); a round that DOES
+    // get its process killed leaks the dir exactly as before, but the next
+    // process to call `sweeping_temp_dir` anywhere sweeps it once it's both
+    // old enough and its pid is dead — this bone's whole point.
+    let round_dir = mess_testkit::sweeping_temp_dir(&format!("sigkill-{mode}"));
+    let seg_path = round_dir.path().join(format!("seg-{seed:016x}.log"));
 
     let exe = env!("CARGO_BIN_EXE_sigkill_child");
     let mut child = Command::new(exe)

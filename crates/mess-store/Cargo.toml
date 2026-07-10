@@ -34,6 +34,11 @@ tokio = { workspace = true }
 # bn-fdv / bn-20b: real-fs scratch dirs for the fjall-backed snapshot reopen
 # tests and the composed-engine suites/benches.
 tempfile = "3"
+# bn-cxr: the shared self-sweeping temp-dir helper, adopted at the
+# hand-rolled `$HOME/.cache/mess-test-tmp` scratch dir in
+# `engine_append_gate.rs` (the one suite here that bypasses plain
+# `tempfile::tempdir()` for real-fs reasons).
+mess-testkit = { workspace = true }
 
 [[bench]]
 name = "engine_envelope"

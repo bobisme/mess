@@ -18,6 +18,10 @@ libc = "0.2"
 stateright = "0.31"
 # bn-36y: the ENOSPC injection tests assert on `libc::ENOSPC`.
 libc = "0.2"
+# bn-cxr: the SIGKILL harness's real-fs scratch dirs go through the shared
+# self-sweeping temp-dir helper instead of a hand-rolled, never-swept
+# `$HOME/.cache/mess-sigkill-scratch`.
+mess-testkit = { workspace = true }
 # bn-1gx: loom drives the memory-ordering interleaving models in
 # `src/loom_tests.rs`. Only used when built with `--cfg loom` (`just loom`);
 # the module is `#[cfg(all(loom, test))]`, so a normal `cargo test` never

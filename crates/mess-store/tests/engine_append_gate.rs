@@ -14,8 +14,6 @@
 //!    made impossible.
 #![cfg(not(miri))]
 
-use std::path::PathBuf;
-
 use mess_log::committer::Durability;
 use mess_store::backend::{Backend, RecordToAppend};
 use mess_store::engine::EngineOptions;
@@ -23,25 +21,6 @@ use mess_store::{AppendError, LogEngine, Version};
 
 fn rec(t: &str, d: &[u8]) -> RecordToAppend {
     RecordToAppend { message_type: t.to_string(), data: d.to_vec() }
-}
-
-/// A tempdir rooted under `$HOME/.cache/mess-test-tmp`, never `/tmp` —
-/// required for the durability test below: `fdatasync` is a no-op on tmpfs
-/// and would make the "slow commit path" this test relies on dishonestly
-/// fast (or make the earlier open() itself fail with EDQUOT/os 122 on some
-/// tmpfs configs). Built explicitly rather than relying on `$TMPDIR` being
-/// set by the caller, so this test is correct regardless of how it's
-/// invoked.
-fn durable_scratch_dir(prefix: &str) -> tempfile::TempDir {
-    let base: PathBuf = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .expect("HOME must be set")
-        .join(".cache/mess-test-tmp");
-    std::fs::create_dir_all(&base).expect("create scratch base dir");
-    tempfile::Builder::new()
-        .prefix(prefix)
-        .tempdir_in(&base)
-        .expect("tempdir_in scratch base")
 }
 
 /// Requirement 2: N tasks race `Exact(v)` appends to the SAME stream.
@@ -142,7 +121,14 @@ async fn same_stream_exact_version_race_has_exactly_one_winner() {
 /// not roughly equal to it.
 #[tokio::test]
 async fn distinct_streams_overlap_under_durable_commit_path() {
-    let dir = durable_scratch_dir("mess-append-gate-overlap-");
+    // A real (non-`tmpfs`) scratch dir: `fdatasync` is a no-op on `tmpfs`
+    // and would make the "slow commit path" this test relies on dishonestly
+    // fast (or make `open_with` itself fail with EDQUOT/os 122 on some
+    // `tmpfs` configs). `sweeping_temp_dir` resolves `TMPDIR` (falling back
+    // to `$HOME/.cache/mess-test-tmp`, the same real device this test used
+    // to hardcode directly) and — bn-cxr — sweeps stale sibling dirs so
+    // this real-fs suite stops accumulating leaked segment dirs there.
+    let dir = mess_testkit::sweeping_temp_dir("engine-append-gate-overlap");
     let engine = LogEngine::open_with(
         dir.path(),
         EngineOptions {
