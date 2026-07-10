@@ -12,7 +12,12 @@ false comfort about the input space they didn't happen to sample. It is the
 wrong tool for anything with I/O, async, real time, or (as discovered below)
 hardware-intrinsic-dispatching dependencies.
 
-Current coverage is `crates/mess-log` only (bn-y0b, Phase 3).
+Current coverage is `crates/mess-log` (bn-y0b, Phase 3) and
+`crates/mess-index`'s `sealed::ptr_block` (bn-20e's packed pointer block
+encode/decode, restructured by bn-fyo after the original monolithic harness
+blew up cbmc's SAT solver — see that module's `kani_proofs` doc comment for
+the harness-by-harness coverage story and `docs/verification.md`'s "Running
+the proofs" section below for the per-crate invocation).
 
 ## bn-y0b acceptance-criteria status (do not close as fully done)
 
@@ -59,6 +64,12 @@ cargo kani --package mess-log
 # One harness at a time (useful while iterating — each is independently fast):
 cargo kani --package mess-log --harness step_accept_implies_contiguous_and_nonempty
 cargo kani --package mess-log --harness advance_never_decreases_value
+
+# mess-index — one harness (varint_round_trips, ~2s). See
+# sealed::ptr_block::kani_proofs's module doc for why the round-trip
+# proofs a naive reading of bn-y0b's criteria might expect are covered by
+# randomized tests in that module's `mod tests` instead, not by Kani.
+cargo kani --package mess-index
 ```
 
 `cargo kani` requires `cargo-kani` on `PATH` (installed via `cargo install

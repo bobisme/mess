@@ -37,9 +37,13 @@ zstd = { version = "0.13", features = ["experimental"] }
 
 # bn-20e: `#[cfg(kani)]` ptr-block round-trip proofs are compiled only by
 # `cargo kani`; teach the normal `cargo` build the cfg so it is not flagged
-# (`unexpected_cfgs`), mirroring mess-log.
+# (`unexpected_cfgs`), mirroring mess-log. `kani_slow` (bn-fyo) is the
+# escape hatch documented in `sealed::ptr_block::kani_proofs`'s module doc
+# for a future harness that genuinely cannot be bounded into a few minutes
+# — registered here even though nothing uses it today so the convention is
+# ready without another Cargo.toml edit.
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)", "cfg(kani_slow)"] }
 
 [dev-dependencies]
 mess-log = { workspace = true }
