@@ -1,0 +1,37 @@
+[package]
+name = "mess-soak"
+version = "0.0.0"
+edition = "2024"
+description = "mess v1: multi-hour mixed-workload soak driver with continuous invariant probes (bn-1fo)"
+
+[lib]
+name = "mess_soak"
+path = "src/lib.rs"
+
+# The operator-facing soak driver (default + `--crash-mode sigkill`).
+[[bin]]
+name = "mess-soak"
+path = "src/main.rs"
+
+# The forked worker the SIGKILL crash mode spawns and kills. Never invoked
+# directly — the parent (driver, `--crash-mode sigkill`) spawns it, reads its
+# ack ledger off stdout, kills it, reopens the engine, and reconciles. Mirrors
+# `mess-log`'s proven `sigkill_child` harness, one tier up (a real `LogEngine`
+# rather than a bare segment writer).
+[[bin]]
+name = "soak-child"
+path = "src/bin/soak_child.rs"
+
+[dependencies]
+# The real composed production engine under test (log + index + facade).
+mess-store = { workspace = true }
+# `Durability` lives here (`mess_log::committer::Durability`); the soak defaults
+# to `Os` so every append is its own `fdatasync` and the fsync-p99 probe is
+# measuring a real barrier rather than a page-cache write.
+mess-log = { workspace = true }
+tokio = { workspace = true }
+# `libc::SIGKILL` for the crash-cause assertion on the reaped child.
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
