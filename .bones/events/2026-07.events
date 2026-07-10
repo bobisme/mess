@@ -520,3 +520,5 @@
 1783707542886769	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAEx3wQ		item.assign	bn-2xl	{"action":"assign","agent":"mess-dev"}	blake3:uflKAAdaauKUvoio2VhsKW-Xg9CditE6b3gdoPEDM5E
 1783707542922592	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAEx4AQ		item.move	bn-13l	{"state":"doing"}	blake3:xzViGmTWOLS30W7lNrED0EABO6hpMPSqRccTv-0rQMg
 1783707542937631	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAEx4QQ		item.assign	bn-13l	{"action":"assign","agent":"mess-dev"}	blake3:fuRKoIpuaKi5jAmVmeiJwLdvEgSBWHWnVnMp0EimAlE
+1783707604475675	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAEx4gQ		item.comment	bn-2xl	{"body":"wave S2 dispatched: workflow wf_b4b2e4d9-42d; workspace .maw/workspaces/bn-2xl"}	blake3:PL5n1emtlGifyNjociO8G5u0T09Swmi8fIJJzPtZmmg
+1783707604505101	mess-dev	itc:v3:AWKTOcmSTM5M8lAAAAAAQa3darbreoAAAAEx4wQ		item.comment	bn-13l	{"body":"wave S2 dispatched: workflow wf_b4b2e4d9-42d; workspace .maw/workspaces/bn-13l"}	blake3:sp0qk2_ACA0NhHL6NmwCUsU9Vh992Ag_sPbcuVws36E
