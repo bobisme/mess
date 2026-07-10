@@ -1,0 +1,13 @@
+[package]
+name = "odsync_probe"
+version = "0.1.0"
+edition = "2024"
+
+# Standalone spike: opt out of the repo's root workspace.
+[workspace]
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+lto = "thin"

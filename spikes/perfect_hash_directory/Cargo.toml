@@ -1,0 +1,13 @@
+[package]
+name = "perfect_hash_directory"
+version = "0.1.0"
+edition = "2024"
+
+# Standalone spike: opt out of the repo's root workspace.
+[workspace]
+
+[dependencies]
+fjall = "3.1.6"
+
+[profile.release]
+lto = "thin"
