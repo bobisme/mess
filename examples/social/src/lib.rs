@@ -1,3 +1,4 @@
+
 //! Social-feed domain: users, posts, a follow graph, and likes — the mess v1
 //! API's second showcase example after `examples/bank`.
 //!
@@ -41,6 +42,7 @@ use ident::Id;
 pub mod contracts;
 pub mod domain;
 pub mod projections;
+pub mod web;
 
 // Re-export the domain surface at the crate root so call sites read
 // `social::RegisterUser` rather than `social::domain::user::RegisterUser`,

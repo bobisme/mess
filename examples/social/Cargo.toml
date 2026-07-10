@@ -18,6 +18,29 @@ ident = { workspace = true, features = ["serde"] }
 # using the derive needs `serde` as a direct dependency.
 serde = { version = "1.0.188", features = ["derive"] }
 tokio = { workspace = true }
+# --- web layer (bn-13l) ---
+# axum: the HTTP router/extractor layer. `default-features` kept (macros, form,
+# tokio, http1) — no tls/multipart/ws needed. Small, hyper-based, no framework.
+axum = { version = "0.8", default-features = false, features = [
+    "http1",
+    "tokio",
+    "form",
+    "query",
+] }
+# maud: compile-time HTML templating. Chosen over askama (needs a build step +
+# separate template files) and hand-rolled `format!` (no escaping, no
+# structure): maud is a single proc-macro dependency, escapes by default, and
+# keeps markup type-checked next to the handler. The `axum` feature makes
+# `Markup` an `IntoResponse`.
+maud = { version = "0.27", default-features = false, features = ["axum"] }
+
+[[bin]]
+name = "social-web"
+path = "src/bin/social-web.rs"
 
 [dev-dependencies]
 mess-testkit = { workspace = true }
+# tower's `ServiceExt::oneshot` drives the router in handler tests without a
+# live socket; http-body-util collects response bodies to assert on HTML.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
