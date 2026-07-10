@@ -1,4 +1,8 @@
-//! The social-feed domain, run end-to-end through the mess v1 API.
+//! The social-feed domain, run end-to-end through the mess v1 API:
+//! register two users, wire a follow, post, like, and delete — every write
+//! going through the [`WriteOps`] wrapper onto a real
+//! [`EventStore`](mess_store::EventStore), then read the folded aggregates
+//! back with [`load`](mess_store::EventStore::load).
 //!
 //! Run with:
 //!
@@ -6,90 +10,84 @@
 //! cargo run --example social
 //! ```
 //!
-//! See `src/lib.rs` for the domain (events, aggregate, commands) and
-//! `tests/gwt.rs` for the same domain exercised store-free through
-//! `mess-testkit`.
+//! See `src/lib.rs` for the domain and `tests/gwt.rs` for the same rules
+//! exercised store-free through `mess-testkit`.
 
 use ident::Id;
-use mess_core::CommandError;
 use mess_store::{EventStore, LogEngine};
-use social::{HideByModerator, HideByPoster, Post, PostError, Publish};
+use social::domain::post::Post;
+use social::domain::user::User;
+use social::{WriteError, WriteOps, post_stream, user_stream};
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), WriteError> {
     // `EventStore` over the composed production engine (`LogEngine`:
-    // `mess-log` + `mess-index`), the default backend — see `examples/bank`'s
-    // `examples/bank.rs` for the full explanation. The interim in-memory
-    // backend is behind mess-store's `mock` feature; nothing below changes.
-    let dir = std::env::temp_dir().join(format!("mess-social-{}", std::process::id()));
+    // `mess-log` + `mess-index`). Nothing below this line names the backend —
+    // that is the API-first payoff. See `examples/bank/examples/bank.rs`.
+    let dir =
+        std::env::temp_dir().join(format!("mess-social-{}", std::process::id()));
     let store = EventStore::new(LogEngine::open(&dir).expect("open engine"));
 
     let alice = Id::new();
+    let bob = Id::new();
+    let post = Id::new();
 
-    // A stream id is just the string key a caller chooses to identify one
-    // post's history — there is no separate identity type standing between
-    // a caller and that key.
-    let post_stream = format!("post-{}", Id::new());
+    // Every write is one `WriteOps` call — the thin wrapper that maps an HTTP
+    // action to one `store.command` on the right stream and hands back the
+    // global log position of the write (the read-your-writes token).
+    store.register(alice, "alice".into(), "Alice".into()).await?;
+    store.register(bob, "bob".into(), "Bob".into()).await?;
+    println!("registered alice ({alice}) and bob ({bob})");
 
-    store
-        .command::<Post, _>(
-            &post_stream,
-            Publish {
-                poster_id: alice,
-                body: "here is some stupid post".into(),
-            },
-        )
-        .await
-        .expect("publish post");
-    println!("alice published a post on stream {post_stream:?}");
+    // The follow edge is recorded on ALICE's stream (the follower's own
+    // aggregate) — see `domain::user` for why.
+    store.follow(alice, bob).await?;
+    println!("alice now follows bob");
 
-    let loaded = store.load::<Post>(&post_stream).await.expect("load post");
-    println!(
-        "post state: poster={:?} body={:?} status={:?}",
-        loaded.state.poster_id, loaded.state.body, loaded.state.status
-    );
+    store.create_post(post, bob, "hello, mess!".into()).await?;
+    println!("bob posted {}", post_stream(post));
 
-    // Authorization is a business rule the aggregate itself enforces: a
-    // stranger cannot hide alice's post. `CommandError::Domain` carries
-    // `Post`'s own `PostError`, not a generic string.
-    let stranger = Id::new();
-    match store
-        .command::<Post, _>(&post_stream, HideByPoster { requester: stranger })
-        .await
-    {
-        Err(CommandError::Domain(PostError::NotYourPost)) => {
-            println!("a stranger cannot hide alice's post (as expected)");
+    let seq = store.like(post, alice).await?;
+    println!("alice liked bob's post (log position {seq})");
+
+    // A business rule surfaces as a typed `WriteError`: a stranger cannot
+    // delete bob's post.
+    match store.delete_post(post, alice).await {
+        Err(WriteError::Post(social::PostError::NotAuthor)) => {
+            println!("alice cannot delete bob's post (as expected)");
         }
-        other => panic!("expected NotYourPost, got {other:?}"),
+        other => panic!("expected NotAuthor, got {other:?}"),
     }
 
-    // The original poster can hide their own post.
-    store
-        .command::<Post, _>(&post_stream, HideByPoster { requester: alice })
-        .await
-        .expect("poster hides their own post");
-    let loaded = store.load::<Post>(&post_stream).await.expect("load post");
-    println!("after self-hide: status={:?}", loaded.state.status);
+    // The author can.
+    store.delete_post(post, bob).await?;
+    println!("bob deleted his own post");
 
-    // A second post, this time moderated away regardless of author.
-    let second_stream = format!("post-{}", Id::new());
-    store
-        .command::<Post, _>(
-            &second_stream,
-            Publish { poster_id: alice, body: "a spammy post".into() },
-        )
+    // Read the folded aggregates straight back — the same replay `command`
+    // does internally before it decides.
+    let loaded_alice = store
+        .load::<User>(&user_stream(alice))
         .await
-        .expect("publish second post");
-    store
-        .command::<Post, _>(&second_stream, HideByModerator)
-        .await
-        .expect("moderator hides the post");
-    let loaded = store.load::<Post>(&second_stream).await.expect("load post");
+        .expect("load alice");
+    assert!(loaded_alice.state.following.contains(&bob));
     println!(
-        "moderated post: status={:?} (replayed {} events)",
-        loaded.state.status, loaded.events_replayed
+        "alice's aggregate: handle={:?} following {} user(s)",
+        loaded_alice.state.handle,
+        loaded_alice.state.following.len()
     );
-    assert_eq!(loaded.state.status, social::PostStatus::HiddenByModerator);
+
+    let loaded_post =
+        store.load::<Post>(&post_stream(post)).await.expect("load post");
+    assert!(loaded_post.state.deleted);
+    assert!(loaded_post.state.likes.contains(&alice));
+    println!(
+        "post aggregate: author={:?} deleted={} likes={} (replayed {} events)",
+        loaded_post.state.author,
+        loaded_post.state.deleted,
+        loaded_post.state.likes.len(),
+        loaded_post.events_replayed,
+    );
 
     println!("social example OK");
+    Ok(())
 }

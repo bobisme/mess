@@ -1,188 +1,74 @@
-//! Social-feed domain: posts and moderation, on the mess v1 API.
+//! Social-feed domain: users, posts, a follow graph, and likes — the mess v1
+//! API's second showcase example after `examples/bank`.
 //!
-//! `examples/social` (this crate) is the second showcase example after
-//! `examples/bank`: see that crate's `src/lib.rs` for a first walkthrough
-//! of `#[derive(Event)]` / `#[derive(Aggregate)]` / `Decide`; this one adds
-//! authorization logic (only the original poster may hide their own post)
-//! to show a typed rejection carrying more than one business rule.
+//! Where `examples/bank` teaches the vocabulary on one aggregate, this crate
+//! is the *shape of a real application*: two aggregates that reference each
+//! other by id without sharing a stream, plus a [`contracts`] seam that lets
+//! the read-model and HTTP bones build against a stable interface instead of
+//! against each other. Read `examples/bank/src/lib.rs` first for the
+//! walkthrough of `#[derive(Event)]` / `#[derive(Aggregate)]` / `Decide`.
 //!
-//! `examples/social.rs` runs the domain end-to-end against a
-//! [`mess_store::EventStore`]; `tests/gwt.rs` exercises it store-free
-//! through `mess-testkit`.
+//! # The tour, in the order a newcomer meets it
 //!
-//! This crate previously ran on an earlier, now-retired prototype's
-//! game-engine-flavored storage vocabulary. It is ported here onto
-//! `mess-core`'s event-sourcing vocabulary per
-//! `notes/mess-research/09_implementation_plan.md` Phase 0: what that
-//! prototype called an object's identity is just the stream id below, its
-//! per-object record type is the `Aggregate` (`Post`), and its storage
-//! facade is the `EventStore`.
+//! 1. [`domain::user`] — the [`User`](domain::user::User) aggregate: register,
+//!    rename, and a **follow set** that lives on the *follower's own stream*.
+//!    That module's docs explain why the edge set lives there and why
+//!    `decide` deliberately *cannot* check that a follow target exists.
+//! 2. [`domain::post`] — the [`Post`](domain::post::Post) aggregate: create,
+//!    delete (author-only), like, unlike. Its docs record two decisions:
+//!    moderation events were absorbed into `Deleted { by }`, and **self-like
+//!    is allowed** (unlike self-follow).
+//! 3. [`contracts`] — the DTOs ([`PostView`](contracts::PostView),
+//!    [`ProfileView`](contracts::ProfileView),
+//!    [`TimelinePage`](contracts::TimelinePage)), the [`ReadModels`] query
+//!    trait with its [`wait_for`](contracts::ReadModels::wait_for)
+//!    read-your-writes barrier, the [`WriteOps`] wrapper over
+//!    [`EventStore`](mess_store::EventStore), and a deterministic
+//!    [`FakeReadModels`] for frontend tests.
+//!
+//! # Streams
+//!
+//! Each aggregate is one stream *family*. A user lives at `user-<id>`, a post
+//! at `post-<id>`; [`user_stream`] and [`post_stream`] are the single source
+//! of that convention, used by both [`WriteOps`] and the examples.
+//!
+//! `examples/social.rs` runs the whole thing end-to-end against a real
+//! [`EventStore`](mess_store::EventStore); `tests/gwt.rs` exercises every
+//! accept and every rejection store-free through `mess-testkit`.
 
 use ident::Id;
-use mess_core::Decide;
-use mess_derive::{Aggregate, Event};
 
-// ---------------------------------------------------------------------------
-// Events: the wire vocabulary for one post's stream.
-// ---------------------------------------------------------------------------
+pub mod contracts;
+pub mod domain;
 
-/// Every fact that can happen to a post.
+// Re-export the domain surface at the crate root so call sites read
+// `social::RegisterUser` rather than `social::domain::user::RegisterUser`,
+// matching `examples/bank`'s flat surface.
+pub use domain::post::{
+    BODY_MAX_LEN, CreatePost, DeletePost, Like, Post, PostError, PostEvent,
+    Unlike,
+};
+pub use domain::user::{
+    Follow, HANDLE_MAX_LEN, RegisterUser, SetDisplayName, Unfollow, User,
+    UserError, UserEvent, handle_is_valid,
+};
+
+pub use contracts::{
+    FakeReadModels, PostView, ProfileView, ReadModels, TimelinePage,
+    WriteError, WriteOps,
+};
+
+/// The stream id for a user's aggregate: `user-<id>`.
 ///
-/// `#[event(name = "post", version = 1)]` gives `Posted` the wire name
-/// `"post.posted"`, and so on — see `examples/bank`'s `AccountEvent` for
-/// the full explanation of what `#[derive(Event)]` generates.
-#[derive(Debug, Clone, PartialEq, Eq, Event)]
-#[event(name = "post", version = 1)]
-pub enum PostEvent {
-    Posted { poster_id: Id, body: String },
-    HiddenByPoster,
-    HiddenByModerator,
+/// The one place this convention is written down; [`WriteOps`] and the
+/// examples both call it so a rename is a single edit.
+#[must_use]
+pub fn user_stream(id: Id) -> String {
+    format!("user-{id}")
 }
 
-// ---------------------------------------------------------------------------
-// The aggregate: one post's folded state.
-// ---------------------------------------------------------------------------
-
-/// Whether (and why) a post is currently visible.
-///
-/// `#[default]` marks the state a post starts in before any event has been
-/// applied — required because `Post` below derives `Default`, and every
-/// field of a `#[derive(Default)]` struct must itself implement `Default`.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum PostStatus {
-    #[default]
-    Unpublished,
-    Visible,
-    HiddenByPoster,
-    HiddenByModerator,
-}
-
-/// The read-model folded from one post's event stream.
-///
-/// In the v1 API a "stream id" is just the string key passed to
-/// `EventStore::load` / `command` / `append` — there is no separate
-/// identity type standing between a caller and that key; it is simply
-/// the stream id a caller chooses (see `examples/social.rs`).
-#[derive(Debug, Default, Clone, PartialEq, Eq, Aggregate)]
-#[aggregate(event = PostEvent)]
-pub struct Post {
-    pub poster_id: Option<Id>,
-    pub body: String,
-    pub status: PostStatus,
-}
-
-impl Post {
-    /// Fold one event into state. Infallible by construction — see
-    /// `examples/bank`'s `Account::apply` for why `apply` never rejects.
-    pub fn apply(&mut self, event: &PostEvent) {
-        match event {
-            PostEvent::Posted { poster_id, body } => {
-                self.poster_id = Some(*poster_id);
-                body.clone_into(&mut self.body);
-                self.status = PostStatus::Visible;
-            }
-            PostEvent::HiddenByPoster => {
-                self.status = PostStatus::HiddenByPoster;
-            }
-            PostEvent::HiddenByModerator => {
-                self.status = PostStatus::HiddenByModerator;
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Commands, the typed rejection, and one `Decide` impl per command.
-// ---------------------------------------------------------------------------
-
-/// Every way a command against [`Post`] can be refused — see
-/// `examples/bank`'s `AccountError` for what this typed `Decide::Rejection`
-/// buys callers over a stringly error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PostError {
-    AlreadyPosted,
-    NotPosted,
-    AlreadyHidden,
-    /// Authorization failure: only the original poster may hide their own
-    /// post via [`HideByPoster`] — anyone else must go through
-    /// [`HideByModerator`].
-    NotYourPost,
-}
-
-impl std::fmt::Display for PostError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PostError::AlreadyPosted => write!(f, "post already exists"),
-            PostError::NotPosted => write!(f, "post does not exist yet"),
-            PostError::AlreadyHidden => write!(f, "post is already hidden"),
-            PostError::NotYourPost => {
-                write!(f, "only the original poster may hide their own post")
-            }
-        }
-    }
-}
-
-impl std::error::Error for PostError {}
-
-/// Publish a new post. Commands are plain structs — see `examples/bank`.
-#[derive(Debug, Clone)]
-pub struct Publish {
-    pub poster_id: Id,
-    pub body: String,
-}
-
-/// The poster hides their own post.
-#[derive(Debug, Clone, Copy)]
-pub struct HideByPoster {
-    pub requester: Id,
-}
-
-/// A moderator hides someone else's post; no ownership check.
-#[derive(Debug, Clone, Copy)]
-pub struct HideByModerator;
-
-impl Decide<Publish> for Post {
-    type Rejection = PostError;
-
-    fn decide(&self, cmd: Publish) -> Result<Vec<PostEvent>, PostError> {
-        if self.poster_id.is_some() {
-            return Err(PostError::AlreadyPosted);
-        }
-        Ok(vec![PostEvent::Posted {
-            poster_id: cmd.poster_id,
-            body: cmd.body,
-        }])
-    }
-}
-
-impl Decide<HideByPoster> for Post {
-    type Rejection = PostError;
-
-    fn decide(&self, cmd: HideByPoster) -> Result<Vec<PostEvent>, PostError> {
-        match self.poster_id {
-            None => return Err(PostError::NotPosted),
-            Some(poster_id) if poster_id != cmd.requester => {
-                return Err(PostError::NotYourPost);
-            }
-            Some(_) => {}
-        }
-        if self.status != PostStatus::Visible {
-            return Err(PostError::AlreadyHidden);
-        }
-        Ok(vec![PostEvent::HiddenByPoster])
-    }
-}
-
-impl Decide<HideByModerator> for Post {
-    type Rejection = PostError;
-
-    fn decide(&self, _cmd: HideByModerator) -> Result<Vec<PostEvent>, PostError> {
-        if self.poster_id.is_none() {
-            return Err(PostError::NotPosted);
-        }
-        if self.status != PostStatus::Visible {
-            return Err(PostError::AlreadyHidden);
-        }
-        Ok(vec![PostEvent::HiddenByModerator])
-    }
+/// The stream id for a post's aggregate: `post-<id>`.
+#[must_use]
+pub fn post_stream(id: Id) -> String {
+    format!("post-{id}")
 }
