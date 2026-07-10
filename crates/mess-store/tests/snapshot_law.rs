@@ -222,14 +222,35 @@ fn tail_expected_version(p: usize) -> Version {
 
 /// `fold(s0, all) == fold(snapshot.state, tail)` across thousands of random
 /// event sequences with the snapshot taken at a random prefix point.
+///
+/// The iteration count defaults to 3000 real fjall+`LogEngine` fsync-bound
+/// iterations, which is ~62 minutes in `--release` on the reference host —
+/// well past most tool/CI timeouts. Override it for quick local runs or CI
+/// smoke passes with the `MESS_SNAPSHOT_LAW_ITERS` env var, e.g.
+/// `MESS_SNAPSHOT_LAW_ITERS=25 cargo test -p mess-store --test snapshot_law`.
+/// A garbage value panics with a clear message; the default (3000) is used
+/// when the var is unset. The effective count is always printed to stderr.
 #[tokio::test]
 async fn snapshot_plus_tail_equals_full_replay() {
-    const ITERATIONS: usize = 3_000;
+    const DEFAULT_ITERATIONS: usize = 3_000;
     const MAX_EVENTS: usize = 40;
+    let iterations: usize = match std::env::var("MESS_SNAPSHOT_LAW_ITERS") {
+        Ok(val) => val.trim().parse().unwrap_or_else(|_| {
+            panic!(
+                "MESS_SNAPSHOT_LAW_ITERS={val:?} is not a valid positive integer \
+                 (unset it to use the default of {DEFAULT_ITERATIONS})"
+            )
+        }),
+        Err(_) => DEFAULT_ITERATIONS,
+    };
+    eprintln!(
+        "snapshot_plus_tail_equals_full_replay: running {iterations} iterations \
+         (default {DEFAULT_ITERATIONS}; override with MESS_SNAPSHOT_LAW_ITERS)"
+    );
     let seed: u64 = 0x5EED_C0FF_EE01_1CFF;
     let mut rng = Rng::new(seed);
 
-    for iter in 0..ITERATIONS {
+    for iter in 0..iterations {
         let events = rng.sequence(MAX_EVENTS);
         let n = events.len();
         // Snapshot after the first `p` events (0..=n). p==0 exercises the
@@ -294,7 +315,7 @@ async fn snapshot_plus_tail_equals_full_replay() {
             );
         }
     }
-    println!("snapshot law held for {ITERATIONS} prefixes (seed {seed})");
+    println!("snapshot law held for {iterations} prefixes (seed {seed})");
 }
 
 // ---------------------------------------------------------------------------
