@@ -128,6 +128,127 @@ async fn genuine_reopen_returns_exact_pre_crash_data_then_continues() {
     assert_eq!(s2[1].global_position, 6);
 }
 
+/// bn-1vu — the sealed tier must survive a restart.
+///
+/// A stream sealed into the cold tier before a "crash" (drop the engine,
+/// release the `StoreLock`, reopen the same dir with NO shared `Arc`) must, on
+/// reopen, be served from the reloaded sealed sidecars — not silently fall back
+/// to hot replay because the `SealedStore` started empty. Before bn-1vu, `open`
+/// always started with an empty `SealedStore`, so `sealed_segment_count()` was
+/// 0 after any restart. This pins the reload: the durable `.pidx` (plus its
+/// `.pcol`/`.filter` siblings) is reopened and installed, `read_stream` routes
+/// through the cold tier, and the payloads come back byte-exact.
+#[tokio::test]
+async fn reopen_loads_sealed_sidecars_and_serves_from_sealed_tier() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store_path = dir.path().join("store");
+
+    {
+        let engine = LogEngine::open(&store_path).expect("open fresh");
+        engine
+            .append_batch(
+                "acct-1",
+                Version::NoStream,
+                &[rec("account.opened", b"alice"), rec("account.deposited", &10i64.to_le_bytes())],
+            )
+            .await
+            .expect("append b0");
+        engine
+            .append_batch("acct-1", Version::At(1), &[rec("account.withdrawn", &3i64.to_le_bytes())])
+            .await
+            .expect("append b1");
+        // Seal the active segment into the cold tier, writing durable sidecars.
+        engine.seal_active().expect("seal_active");
+        assert!(engine.sealed_segment_count() > 0, "sealed at runtime");
+        // Drop: release the StoreLock and every in-process handle.
+    }
+
+    // GENUINE fresh reopen: the sealed tier must be repopulated from the
+    // durable `.pidx` on disk, not start empty.
+    let engine = LogEngine::open(&store_path).expect("reopen");
+    assert!(
+        engine.sealed_segment_count() > 0,
+        "sealed tier must be reloaded from durable sidecars on reopen"
+    );
+
+    // Reads route through the sealed tier (its stream is in the sealed store)
+    // and return the exact pre-crash data.
+    let s = engine.read_stream("acct-1", Version::NoStream, 100).await.unwrap();
+    assert_eq!(s.len(), 3, "all sealed events readable after restart");
+    assert_eq!(s[0].message_type, "account.opened");
+    assert_eq!(s[0].data, b"alice");
+    assert_eq!(s[0].stream_id, "acct-1");
+    assert_eq!(s[2].message_type, "account.withdrawn");
+    assert_eq!(s[2].data, 3i64.to_le_bytes());
+    assert_eq!(s[2].global_position, 2);
+    assert_eq!(engine.head("acct-1").await.unwrap(), Version::At(2), "head survives");
+
+    // read_global still returns the whole durable order.
+    let expected: Vec<(&str, &str, Vec<u8>, u64, u64)> = vec![
+        ("acct-1", "account.opened", b"alice".to_vec(), 0, 0),
+        ("acct-1", "account.deposited", 10i64.to_le_bytes().to_vec(), 1, 1),
+        ("acct-1", "account.withdrawn", 3i64.to_le_bytes().to_vec(), 2, 2),
+    ];
+    assert_global(&engine, &expected).await;
+}
+
+/// bn-1vu — a crash mid-seal must leave a recoverable state.
+///
+/// The sidecar writer is crash-atomic (temp file → fsync → rename), so a crash
+/// during a seal leaves either the previous state or a complete `.pidx`, never
+/// a torn one under its real name. This test simulates the two crash shapes the
+/// reopen path must tolerate — a torn `*.pidx.tmp` husk left before the rename,
+/// and a truncated/garbage `.pidx` that fails its CRC — and asserts the engine
+/// still reopens, installs neither, and serves every event from the durable log
+/// (the hot tier), losing nothing.
+#[tokio::test]
+async fn crash_mid_seal_leaves_recoverable_state_served_from_log() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store_path = dir.path().join("store");
+
+    {
+        let engine = LogEngine::open(&store_path).expect("open fresh");
+        engine
+            .append_batch("acct-1", Version::NoStream, &[rec("account.opened", b"alice")])
+            .await
+            .expect("append b0");
+        engine
+            .append_batch("acct-1", Version::At(0), &[rec("account.deposited", &10i64.to_le_bytes())])
+            .await
+            .expect("append b1");
+        // Do NOT complete a seal. Fabricate the two partial-seal crash shapes
+        // the atomic writer can leave behind:
+        let sealed = store_path.join("sealed");
+        std::fs::create_dir_all(&sealed).unwrap();
+        // 1) a torn temp husk written before the atomic rename (no real .pidx).
+        std::fs::write(
+            sealed.join("seg-00000000000000000001.pidx.tmp"),
+            b"torn-partial-sidecar-never-renamed",
+        )
+        .unwrap();
+        // 2) a garbage/truncated .pidx that fails its content CRC.
+        std::fs::write(
+            sealed.join("seg-00000000000000000002.pidx"),
+            b"not a real sidecar - fails magic/CRC",
+        )
+        .unwrap();
+    }
+
+    // Reopen must succeed, install neither partial artifact, and serve reads
+    // from the durable log.
+    let engine = LogEngine::open(&store_path).expect("reopen after crash mid-seal");
+    assert_eq!(
+        engine.sealed_segment_count(),
+        0,
+        "no torn/corrupt sidecar may be installed into the sealed tier"
+    );
+    let s = engine.read_stream("acct-1", Version::NoStream, 100).await.unwrap();
+    assert_eq!(s.len(), 2, "every event still served from the log");
+    assert_eq!(s[0].data, b"alice");
+    assert_eq!(s[1].data, 10i64.to_le_bytes());
+    assert_eq!(engine.head("acct-1").await.unwrap(), Version::At(1));
+}
+
 /// bn-20b measurement: engine open-with-rehydration wall time over a populated
 /// single-segment corpus. Writes a realistic corpus, drops the engine, and
 /// times a fresh `LogEngine::open` (which scans the durable segment, decodes

@@ -491,10 +491,81 @@ impl<F: Fs> SegmentWriter<F> {
         self.epoch
     }
 
+    /// This segment's id (§3.2). The next segment MUST use a strictly larger,
+    /// never-reused id — the committer's live auto-roll (`bn-1vu`) stamps
+    /// `segment_id() + 1`.
+    pub fn segment_id(&self) -> u64 {
+        self.segment_id
+    }
+
+    /// This segment's logical size (§3.1) — preserved across a live roll so a
+    /// small test segment keeps rolling (the default [`roll`] hardwires
+    /// [`SEGMENT_SIZE`]).
+    pub fn segment_size(&self) -> u64 {
+        self.segment_size
+    }
+
     /// The next global position (A1) — the `base_pos` a rolled segment MUST
     /// adopt.
     pub fn next_pos(&self) -> u64 {
         self.next_pos
+    }
+
+    /// `fdatasync` all appended bytes and return the handoff [`SegmentSummary`]
+    /// **without consuming** the writer (the segment stays open and, per the
+    /// module docs, **unsealed** — trailer-less). This is the committer's
+    /// live-auto-roll (`bn-1vu`) counterpart to [`close`](SegmentWriter::close),
+    /// which consumes: the committer makes the just-full segment durable, then
+    /// switches its live writer to the next segment ([`open_next`]) in place.
+    ///
+    /// Leaving the rolled segment unsealed is the crash-safe state: recovery
+    /// fully scans a trailer-less segment (§8.3), so a crash between the roll
+    /// and the background footer-finalize loses nothing — the background sealer
+    /// writes the trailer only after the sidecar is durable.
+    ///
+    /// `bn-36y`: a poisoned writer refuses with [`WriteError::StorePoisoned`].
+    pub fn sync_and_summary(&mut self) -> Result<SegmentSummary, WriteError> {
+        if self.poisoned {
+            return Err(WriteError::StorePoisoned);
+        }
+        self.file.fdatasync()?;
+        Ok(self.summary())
+    }
+
+    /// Create the **next** segment continuing this one's A1 chain
+    /// (`base_pos = self.next_pos`), A9 chain (`prev_segment_epoch = self.epoch`,
+    /// `next_epoch` strictly larger), and logical `segment_size` — **without
+    /// consuming or closing** this writer. The caller MUST first make this
+    /// segment durable ([`sync_and_summary`](SegmentWriter::sync_and_summary))
+    /// and then replace its live writer with the returned one. Unlike
+    /// [`roll`](SegmentWriter::roll)/[`roll_sealed`](SegmentWriter::roll_sealed)
+    /// (which consume `self` and hardwire [`SEGMENT_SIZE`]), this preserves
+    /// `self.segment_size` and leaves `self` intact so a failed preallocation
+    /// (`bn-36y` `StoreFull`) leaves the live writer usable — nothing is lost.
+    ///
+    /// # Panics (debug)
+    ///
+    /// Debug-asserts `next_epoch > self.epoch`.
+    pub fn open_next(
+        &self,
+        next_path: &Path,
+        next_segment_id: u64,
+        next_epoch: u64,
+        created_unix_nanos: u64,
+    ) -> Result<SegmentWriter<F>, WriteError> {
+        debug_assert!(
+            next_epoch > self.epoch,
+            "A9: a rolled segment needs a strictly larger epoch"
+        );
+        let params = SegmentParams {
+            segment_id: next_segment_id,
+            base_pos: self.next_pos,
+            epoch: next_epoch,
+            prev_segment_epoch: self.epoch,
+            created_unix_nanos,
+            segment_size: self.segment_size,
+        };
+        SegmentWriter::create(&self.fs, next_path, params)
     }
 
     /// Sync and close, leaving the segment **unsealed** (trailer-less, see the

@@ -41,6 +41,7 @@
 //! cost; see the crate's open items.
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -50,7 +51,7 @@ use crate::degraded::{Degraded, PoisonCause};
 use crate::encode::{BatchEncoder, BatchInput, EncodeError, Subframe};
 use crate::runtime::{Fs, Runtime};
 use crate::watermark::Watermark;
-use crate::writer::{BatchSpec, SegmentWriter, WriteError};
+use crate::writer::{BatchSpec, SegmentSummary, SegmentWriter, WriteError};
 
 pub use crate::degraded::{Degraded as StoreDegraded, PoisonCause as BarrierPoisonCause};
 pub use crate::watermark::Watermark as DurableWatermark;
@@ -668,10 +669,72 @@ async fn gather<R: Runtime>(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Live segment auto-roll (`bn-1vu`)
+// ---------------------------------------------------------------------------
+
+/// Live segment auto-roll wiring for the committer (`bn-1vu`).
+///
+/// When a batch would overflow the active segment (`WriteError::SegmentFull`,
+/// A8) the committer rolls to a fresh segment **in place** — continuing the A1
+/// (`base_pos = next_pos`) and A9 (`epoch + 1`) chains and preserving
+/// `segment_size` — then retries the batch, so no append is lost or reordered
+/// across the boundary (per `docs/spec/02-recovery.md` A7/A8: a rolled segment
+/// gets a NEW id/epoch and its own `base_pos`). The just-full segment is made
+/// durable and left **unsealed** ([`SegmentWriter::sync_and_summary`]); its
+/// [`SegmentSummary`] is reported over `on_rolled` so the owner (the engine)
+/// can build the sealed sidecars and finalize the footer off the append path
+/// (D5). Sending is non-blocking (an unbounded channel); the committer never
+/// waits on the sealer.
+pub struct Roller {
+    /// Produces the on-disk path for a segment id (the store's naming scheme).
+    path_for: Box<dyn Fn(u64) -> PathBuf + Send>,
+    /// Reports each rolled (durable, still-unsealed) segment for background
+    /// sealing. Dropped when the committer task exits, which closes the channel
+    /// and lets the owner's sealer drain queued work and stop.
+    on_rolled: std::sync::mpsc::Sender<SegmentSummary>,
+}
+
+impl Roller {
+    /// Wire auto-roll: `path_for` names segment files, `on_rolled` receives each
+    /// rolled segment's summary for background sealing.
+    pub fn new(
+        path_for: impl Fn(u64) -> PathBuf + Send + 'static,
+        on_rolled: std::sync::mpsc::Sender<SegmentSummary>,
+    ) -> Self {
+        Roller { path_for: Box::new(path_for), on_rolled }
+    }
+}
+
+/// Roll the live `writer` to a fresh segment in place (`bn-1vu`): make the
+/// current (full) segment durable and unsealed, open the next one continuing
+/// the A1/A9/`segment_size` chains, swap it in, and report the rolled segment
+/// for background sealing. On `Err` the swap did not happen and the live writer
+/// is left intact and usable (the current segment stays durable and readable) —
+/// e.g. `bn-36y` `StoreFull` if the next segment could not be preallocated.
+fn roll_segment<F: Fs>(writer: &mut SegmentWriter<F>, roller: &Roller) -> Result<(), WriteError> {
+    let summary = writer.sync_and_summary()?; // old segment durable + unsealed
+    let next_id = writer.segment_id() + 1;
+    let next_epoch = writer.epoch() + 1;
+    let next_path = (roller.path_for)(next_id);
+    let next = writer.open_next(&next_path, next_id, next_epoch, 0)?;
+    *writer = next; // swap in place; the old segment's file handle is dropped
+    // Best-effort: a gone receiver just means no background sealing runs — the
+    // rolled segment is still durable and recovered via a full scan on reopen.
+    let _ = roller.on_rolled.send(summary);
+    Ok(())
+}
+
 /// Write, barrier, advance the watermark, and ack one gathered group
 /// (§2.1 steps 2–6). Pure blocking fs work — no `.await`, so no
 /// appender-facing lock spans the barrier (§2.5). Returns nothing; every
 /// request in `group` is resolved through its ack.
+///
+/// `roller` (`bn-1vu`): when a batch would overflow the active segment (A8),
+/// the committer rolls to a fresh segment and retries the batch once, so a
+/// full segment is transparent to appenders. A batch larger than a whole empty
+/// segment still cannot fit and is surfaced as `SegmentFull` (no infinite roll).
+#[allow(clippy::too_many_arguments)] // internal seam; each arg is a distinct shared handle
 fn commit_group<R: Runtime, F: Fs>(
     rt: &R,
     writer: &mut SegmentWriter<F>,
@@ -680,6 +743,7 @@ fn commit_group<R: Runtime, F: Fs>(
     watermark: &Watermark,
     metrics: &Metrics,
     degraded: &Degraded,
+    roller: Option<&Roller>,
 ) {
     // Steps 2–3: assign positions centrally + write each batch. `next_pos`
     // advances only for successfully written batches.
@@ -694,7 +758,18 @@ fn commit_group<R: Runtime, F: Fs>(
             crypto_chain: None,
             subframes: &subs,
         };
-        let res = match writer.append(&spec) {
+        // `bn-1vu`: try the append; on A8 SegmentFull with auto-roll wired,
+        // roll to a fresh segment and retry the SAME batch once. Positions stay
+        // dense — the new segment's `base_pos == next_pos`, so the retried batch
+        // gets the exact global position it would have had.
+        let mut outcome = writer.append(&spec);
+        if let (Err(WriteError::SegmentFull { .. }), Some(roller)) = (&outcome, roller) {
+            outcome = match roll_segment(writer, roller) {
+                Ok(()) => writer.append(&spec),
+                Err(e) => Err(e),
+            };
+        }
+        let res = match outcome {
             Ok(receipt) => {
                 wrote_any = true;
                 let first_position = receipt.first_global_pos;
@@ -705,8 +780,8 @@ fn commit_group<R: Runtime, F: Fs>(
             Err(WriteError::SegmentFull { needed, remaining }) => {
                 Err(AppendError::SegmentFull { needed, remaining })
             }
-            // bn-36y typed disk-full states. StoreFull only arises from a roll
-            // (the committer does not roll today) but is mapped for exhaustiveness;
+            // bn-36y typed disk-full states. StoreFull surfaces when a live
+            // auto-roll (bn-1vu) could not preallocate the next segment;
             // StorePoisoned fails fast on every append after a barrier ENOSPC.
             Err(WriteError::StoreFull { .. }) => Err(AppendError::StoreFull),
             Err(WriteError::StorePoisoned) => Err(AppendError::StorePoisoned),
@@ -788,6 +863,7 @@ async fn committer_loop<R: Runtime, F: Fs>(
     degraded: Degraded,
     closed: Arc<AtomicBool>,
     done: Done,
+    roller: Option<Roller>,
 ) {
     // The expected convoy width, seeded at 1 (so the first group and the
     // one-writer case both close immediately) and tracking the last group's
@@ -809,7 +885,16 @@ async fn committer_loop<R: Runtime, F: Fs>(
             }
             continue;
         }
-        commit_group(&rt, &mut writer, group, &policy, &watermark, &metrics, &degraded);
+        commit_group(
+            &rt,
+            &mut writer,
+            group,
+            &policy,
+            &watermark,
+            &metrics,
+            &degraded,
+            roller.as_ref(),
+        );
     }
     // Shutdown. On a healthy store, make the handoff durable (a `Process`-mode
     // tail may be unsynced). On a POISONED store, drop the writer WITHOUT a
@@ -1009,6 +1094,36 @@ impl<R: Runtime> Committer<R> {
         F: Fs + Send + 'static,
         F::File: Send,
     {
+        Self::spawn_inner(rt, writer, durability, None)
+    }
+
+    /// Spawn the committer with live segment auto-roll (`bn-1vu`): when a batch
+    /// would overflow the active segment, the committer rolls to a fresh
+    /// segment in place and reports the rolled segment via `roller` for
+    /// background sealing. Otherwise identical to [`spawn`](Committer::spawn).
+    pub fn spawn_with_roll<F>(
+        rt: &R,
+        writer: SegmentWriter<F>,
+        durability: Durability,
+        roller: Roller,
+    ) -> Self
+    where
+        F: Fs + Send + 'static,
+        F::File: Send,
+    {
+        Self::spawn_inner(rt, writer, durability, Some(roller))
+    }
+
+    fn spawn_inner<F>(
+        rt: &R,
+        writer: SegmentWriter<F>,
+        durability: Durability,
+        roller: Option<Roller>,
+    ) -> Self
+    where
+        F: Fs + Send + 'static,
+        F::File: Send,
+    {
         let policy = Policy::from(durability);
         let (tx, rx) = channel::<CommitReq>();
         let gate = Gate::new();
@@ -1033,6 +1148,7 @@ impl<R: Runtime> Committer<R> {
             degraded.clone(),
             closed.clone(),
             done.clone(),
+            roller,
         )));
 
         Committer {

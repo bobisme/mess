@@ -82,23 +82,27 @@
 //! ([`SegmentWriter::resume`]) at the recovered `safe_offset`, so the durable
 //! log continues to grow one contiguous prefix across any number of reopens.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::mpsc;
+use std::thread::JoinHandle;
 
 use mess_index::sealed::{
-    BlockCache, ReplaySet, SealDriver, SealInput, SealedStore,
+    BlockCache, ReplaySet, SealBatch, SealDriver, SealInput, SealStream,
+    SealedSegmentIndex, SealedStore,
 };
-use mess_index::{ActiveIndex, BatchEntry, EventPtr};
+use mess_index::{ActiveIndex, BatchEntry, EventPtr, IndexSnapshot};
 use mess_index::meta::{CommitGroup, Head, MetaStore, StreamId};
 use mess_log::committer::{
-    AppendOutcome, AppendRequest, Appender, Committer, Durability, EventInput,
+    AppendOutcome, AppendRequest, Appender, Committer, Durability, EventInput, Roller,
 };
 use mess_log::lock::StoreLock;
 use mess_log::runtime::{RealRuntime, Runtime};
 use mess_log::scanner::{self, AcceptedBatch};
-use mess_log::writer::{ResumeParams, SegmentParams, SegmentWriter};
+use mess_log::sealer::{TrailerFields, encode_trailer};
+use mess_log::writer::{ResumeParams, SegmentParams, SegmentSummary, SegmentWriter};
 
 use crate::backend::{
     AppendError, Appended, Backend, RecordToAppend, StoredRecord,
@@ -384,15 +388,24 @@ struct Inner {
     rt: RealRuntime,
     appender: Appender,
     /// Kept alive so the commit thread lives as long as the engine; also the
-    /// owner we would `shutdown` on a clean close.
-    _committer: Committer<RealRuntime>,
+    /// owner we `shutdown` on a clean close. `Option` so [`Inner::drop`] can
+    /// drop it *first* — joining the committer task, which drops its
+    /// [`Roller`] and so closes the roll channel — before joining the seal
+    /// thread (`bn-1vu`).
+    committer: Option<Committer<RealRuntime>>,
+    /// The background auto-roll sealer thread (`bn-1vu`): receives each rolled
+    /// segment's [`SegmentSummary`] over the committer's roll channel and builds
+    /// its sidecars + finalizes its footer off the append path. `Option` so
+    /// [`Inner::drop`] can join it after the roll channel closes, draining every
+    /// queued seal so it is durable before the engine handle goes away.
+    seal_thread: Option<JoinHandle<()>>,
     /// Held for the engine's lifetime: D9 single-writer-process enforcement.
     _lock: StoreLock,
     active: Arc<ActiveIndex>,
     sealed: Arc<SealedStore>,
     block_cache: BlockCache,
     meta: MetaStore,
-    book: Mutex<Book>,
+    book: Arc<Mutex<Book>>,
     /// Serialises the exact-version critical section, per stream (bn-1s0).
     append_gate: AppendGate,
     /// Orders the post-ack book/index/meta publish step by global position
@@ -400,6 +413,21 @@ struct Inner {
     publish_seq: PublishSequencer,
     /// The store root (sealed sidecars live under `dir/sealed`).
     dir: PathBuf,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // Order is load-bearing (`bn-1vu`). 1) Drop the committer: its `Drop`
+        // shuts down and joins the commit task, which drops the `Roller` and so
+        // closes the roll channel. 2) Join the seal thread: with the channel
+        // closed it drains every queued roll seal (making each sidecar + footer
+        // durable) and exits — so a drop-then-reopen sees the finished seals on
+        // disk, never a half-written tier.
+        drop(self.committer.take());
+        if let Some(h) = self.seal_thread.take() {
+            let _ = h.join();
+        }
+    }
 }
 
 /// The composed `mess-log` + `mess-index` production backend.
@@ -464,13 +492,29 @@ impl LogEngine {
         )
         .map_err(|e| EngineError::Meta(e.to_string()))?;
 
-        // Recovery on open (F6 + bn-20b): rebuild the active index AND rehydrate
-        // the record book from the durable log, and learn how to resume the
-        // active segment.
-        let active = Arc::new(ActiveIndex::new());
-        let (book, plan) = Self::recover(&rt, dir, &active, &meta)?;
+        // Reload the sealed tier from the durable sidecars written by prior
+        // seals (see `load_sealed`). Without this the `SealedStore` starts
+        // empty on every reopen, so a stream that was sealed before a restart
+        // would silently fall back to hot replay instead of the sealed tier.
+        // The returned `sealed_ids` are the segments already served cold, so
+        // recovery does not re-seed the hot index with their batches (bn-1vu).
+        let (sealed, sealed_ids) = Self::load_sealed(dir);
+        let sealed = Arc::new(sealed);
 
-        let seg_path = active_segment_path(dir);
+        // Recovery on open (F6 + bn-20b + bn-1vu): rehydrate the record book
+        // from EVERY durable segment (dense across rolls), re-seed the hot index
+        // from the segments not already served cold, and learn how to resume the
+        // last (active) segment.
+        let active = Arc::new(ActiveIndex::new());
+        let (book, plan) = Self::recover(&rt, dir, &active, &meta, &sealed_ids)?;
+
+        // The active segment is the highest-id `seg-*.log`; on a fresh store it
+        // is `ACTIVE_SEGMENT_ID`. A roll numbers the next one `+1` from here.
+        let active_seg_id = match &plan {
+            ResumePlan::Fresh => ACTIVE_SEGMENT_ID,
+            ResumePlan::Resume(info) => info.segment_id,
+        };
+        let seg_path = segment_path(dir, active_seg_id);
         let writer = match plan {
             ResumePlan::Fresh => {
                 let params = SegmentParams {
@@ -503,27 +547,52 @@ impl LogEngine {
                     .map_err(|e| EngineError::Open(format!("segment resume: {e}")))?
             }
         };
-        let committer = Committer::spawn(&rt, writer, opts.durability);
+
+        // Wire live auto-roll (bn-1vu): the committer rolls to a fresh segment
+        // when the active one fills and reports each rolled segment over this
+        // channel; the seal thread turns it into durable sidecars + a footer
+        // off the append path.
+        let (roll_tx, roll_rx) = mpsc::channel::<SegmentSummary>();
+        let dir_for_paths = dir.to_path_buf();
+        let roller = Roller::new(move |id| segment_path(&dir_for_paths, id), roll_tx);
+        let committer = Committer::spawn_with_roll(&rt, writer, opts.durability, roller);
         let appender = committer.appender();
+
+        let book = Arc::new(Mutex::new(book));
+
+        // Spawn the background auto-roll sealer thread.
+        std::fs::create_dir_all(dir.join("sealed"))
+            .map_err(|e| EngineError::SealedRead(format!("mkdir sealed: {e}")))?;
+        let seal_thread = {
+            let driver = SealDriver::new(Arc::clone(&sealed), dir.join("sealed"));
+            let active = Arc::clone(&active);
+            let book = Arc::clone(&book);
+            let dir = dir.to_path_buf();
+            std::thread::Builder::new()
+                .name("mess-engine-roll-sealer".into())
+                .spawn(move || Self::run_roll_sealer(roll_rx, driver, active, book, dir))
+                .map_err(|e| EngineError::Open(format!("spawn sealer: {e}")))?
+        };
 
         // The publish sequencer's turn-order starts wherever recovery left
         // the book's dense prefix — 0 on a fresh store, or the recovered
         // event count on a reopen — never a hardcoded 0, or the first
         // post-reopen publish would wait forever for a position that was
         // already durably assigned in a previous process lifetime.
-        let recovered_len = book.payloads.len() as u64;
+        let recovered_len = book.lock().expect("book poisoned").payloads.len() as u64;
 
         Ok(LogEngine {
             inner: Arc::new(Inner {
                 rt,
                 appender,
-                _committer: committer,
+                committer: Some(committer),
+                seal_thread: Some(seal_thread),
                 _lock: lock,
                 active,
-                sealed: Arc::new(SealedStore::new()),
+                sealed,
                 block_cache: BlockCache::disabled(),
                 meta,
-                book: Mutex::new(book),
+                book,
                 append_gate: AppendGate::new(),
                 publish_seq: PublishSequencer::new_at(recovered_len),
                 dir: dir.to_path_buf(),
@@ -531,23 +600,31 @@ impl LogEngine {
         })
     }
 
-    /// Rehydrate the record book and rebuild the active index from the durable
-    /// log (bn-20b), and decide how to resume the active segment.
+    /// Rehydrate the record book and rebuild the hot index from the durable
+    /// log (bn-20b + bn-1vu), and decide how to resume the active segment.
     ///
-    /// One scan of the single active segment (the engine does not roll — see
-    /// [`seal_active`]) does everything: `mess-log`'s
-    /// [`recover_segment_with_image`](scanner::recover_segment_with_image)
-    /// gives the accepted committed prefix plus the durable image, then
-    /// [`AcceptedBatch::frames`] materialises each event's `(event_type_id,
-    /// payload)` — resolved to names through the interner reloaded from the
-    /// durable `stream_names`/`type_names` meta tables. The same accepted
-    /// batches seed the active index (the F6 rebuild), so a fresh open over a
-    /// populated dir returns the exact pre-crash data, not silent-empty.
+    /// With live auto-roll the store holds a chain of segments `seg-*.log`
+    /// (`seg-1` … `seg-N`, `N` the live head). Recovery scans them in ascending
+    /// id order: `mess-log`'s
+    /// [`recover_segment_with_image`](scanner::recover_segment_with_image) gives
+    /// each segment's accepted committed prefix + durable image, then
+    /// [`AcceptedBatch::frames`] materialises every event's `(event_type_id,
+    /// payload)` into the book **densely across the whole chain** — resolved to
+    /// names through the interner reloaded from the durable
+    /// `stream_names`/`type_names` meta tables. A segment already served from the
+    /// cold tier (its id in `sealed_ids`, reloaded from its `.pidx`) is **not**
+    /// re-seeded into the hot index — the book still gets its payloads, but the
+    /// sealed sidecar owns its position enumeration. A rolled-but-not-yet-sealed
+    /// segment (crash mid-seal: unsealed `.log`, no `.pidx`) is not in
+    /// `sealed_ids`, so its batches DO seed the hot index and it is served from
+    /// the log — losing nothing. The last (highest-id) segment is the resumable
+    /// live head.
     fn recover(
         rt: &RealRuntime,
         dir: &Path,
         active: &ActiveIndex,
         meta: &MetaStore,
+        sealed_ids: &HashSet<u64>,
     ) -> Result<(Book, ResumePlan), EngineError> {
         // Reconstruct the interner (both directions) from the durable id→name
         // tables first, so materialised payloads can resolve their names.
@@ -559,79 +636,217 @@ impl LogEngine {
             meta.type_names().map_err(|e| EngineError::Meta(e.to_string()))?,
         );
 
-        let seg_path = active_segment_path(dir);
-        if !seg_path.exists() {
+        // Enumerate the segment chain in ascending id order.
+        let segment_ids = enumerate_segment_ids(dir);
+        if segment_ids.is_empty() {
             return Ok((book, ResumePlan::Fresh));
         }
 
-        let (rec, image) = scanner::recover_segment_with_image(&rt.fs(), &seg_path)
-            .map_err(|e| EngineError::Open(format!("recover: {e}")))?;
-        let Some(header) = rec.header else {
-            // Existing file with no valid header: no committed batches of this
-            // generation. Create a fresh segment over it.
-            return Ok((book, ResumePlan::Fresh));
-        };
+        let mut hot_entries: Vec<BatchEntry> = Vec::new();
+        let mut last_headed: Option<ResumeInfo> = None;
+        let mut watermark = 0u64;
 
-        // Materialise the committed prefix into the book in ascending global
-        // position (== on-disk commit order for the single active segment) and
-        // rebuild the active index from the same accepted batches.
-        let mut order: Vec<&AcceptedBatch> = rec.accepted.iter().collect();
-        order.sort_by_key(|b| b.first_global_pos);
-        let mut entries: Vec<BatchEntry> = Vec::with_capacity(order.len());
-        for b in &order {
-            let sid = b.stream_id;
-            let stream_name = book.stream_name_opt(sid).ok_or_else(|| {
-                EngineError::Meta(format!("recover: no interned name for stream_id {sid}"))
-            })?;
-            // bn-221: `frames` is fallible (misuse-resistant against a wrong
-            // image) but this caller always passes the exact image `b` was
-            // recovered from, so the error path is unreachable in practice —
-            // still propagated rather than unwrapped so a future refactor
-            // that breaks that invariant fails loudly instead of panicking.
-            let frames = b
-                .frames(&image)
-                .map_err(|e| EngineError::Open(format!("recover: {e}")))?;
-            for (k, frame) in frames.enumerate() {
-                let gp = b.first_global_pos + k as u64;
-                debug_assert_eq!(book.payloads.len() as u64, gp, "dense rehydration");
-                let message_type =
-                    book.type_name_opt(frame.event_type_id).ok_or_else(|| {
-                        EngineError::Meta(format!(
-                            "recover: no interned name for event_type_id {}",
-                            frame.event_type_id
-                        ))
-                    })?;
-                let stream_position = b.first_stream_version + k as u64;
-                book.payloads.push(Payload {
-                    stream_name: stream_name.clone(),
-                    message_type,
-                    data: Arc::from(frame.payload),
-                    stream_position,
-                });
-                book.stream_events.entry(sid).or_default().push(gp);
-                book.heads.insert(sid, stream_position);
+        for seg_id in segment_ids {
+            let seg_path = segment_path(dir, seg_id);
+            let (rec, image) = scanner::recover_segment_with_image(&rt.fs(), &seg_path)
+                .map_err(|e| EngineError::Open(format!("recover seg {seg_id}: {e}")))?;
+            let Some(header) = rec.header else {
+                // A file with no valid header carries no committed batches of
+                // this generation — skip it (never resumed, never seeds).
+                continue;
+            };
+            let is_cold = sealed_ids.contains(&header.segment_id);
+
+            // Materialise every committed event into the book, dense across the
+            // whole chain (on-disk commit order == ascending global position).
+            let mut order: Vec<&AcceptedBatch> = rec.accepted.iter().collect();
+            order.sort_by_key(|b| b.first_global_pos);
+            for b in &order {
+                let sid = b.stream_id;
+                let stream_name = book.stream_name_opt(sid).ok_or_else(|| {
+                    EngineError::Meta(format!("recover: no interned name for stream_id {sid}"))
+                })?;
+                // bn-221: `frames` is fallible (misuse-resistant against a wrong
+                // image) but this caller always passes the exact image `b` was
+                // recovered from, so the error path is unreachable in practice —
+                // still propagated rather than unwrapped so a future refactor
+                // that breaks that invariant fails loudly instead of panicking.
+                let frames = b
+                    .frames(&image)
+                    .map_err(|e| EngineError::Open(format!("recover: {e}")))?;
+                for (k, frame) in frames.enumerate() {
+                    let gp = b.first_global_pos + k as u64;
+                    debug_assert_eq!(book.payloads.len() as u64, gp, "dense rehydration");
+                    let message_type =
+                        book.type_name_opt(frame.event_type_id).ok_or_else(|| {
+                            EngineError::Meta(format!(
+                                "recover: no interned name for event_type_id {}",
+                                frame.event_type_id
+                            ))
+                        })?;
+                    let stream_position = b.first_stream_version + k as u64;
+                    book.payloads.push(Payload {
+                        stream_name: stream_name.clone(),
+                        message_type,
+                        data: Arc::from(frame.payload),
+                        stream_position,
+                    });
+                    book.stream_events.entry(sid).or_default().push(gp);
+                    book.heads.insert(sid, stream_position);
+                }
+                // Seed the hot index only for segments not already served cold.
+                if !is_cold {
+                    hot_entries.push(BatchEntry {
+                        stream_id: sid,
+                        first_stream_version: b.first_stream_version,
+                        frame_count: b.frame_count,
+                        first_global_pos: b.first_global_pos,
+                        ptr: EventPtr { segment_id: header.segment_id, offset: b.offset },
+                    });
+                }
             }
-            entries.push(BatchEntry {
-                stream_id: sid,
-                first_stream_version: b.first_stream_version,
-                frame_count: b.frame_count,
-                first_global_pos: b.first_global_pos,
-                ptr: EventPtr { segment_id: header.segment_id, offset: b.offset },
+            watermark = watermark.max(rec.next_pos);
+
+            // The highest-id headed segment is the resumable live head.
+            last_headed = Some(ResumeInfo {
+                segment_id: header.segment_id,
+                base_pos: header.base_pos,
+                epoch: header.epoch,
+                write_off: rec.safe_offset,
+                next_batch_id: rec.next_batch_id,
+                next_pos: rec.next_pos,
+                batch_count: rec.accepted.len() as u64,
+                event_count: rec.next_pos - header.base_pos,
             });
         }
-        active.apply_committed(rec.next_pos, &entries);
 
-        let info = ResumeInfo {
-            segment_id: header.segment_id,
-            base_pos: header.base_pos,
-            epoch: header.epoch,
-            write_off: rec.safe_offset,
-            next_batch_id: rec.next_batch_id,
-            next_pos: rec.next_pos,
-            batch_count: rec.accepted.len() as u64,
-            event_count: rec.next_pos - header.base_pos,
+        active.apply_committed(watermark, &hot_entries);
+
+        match last_headed {
+            Some(info) => Ok((book, ResumePlan::Resume(info))),
+            None => Ok((book, ResumePlan::Fresh)),
+        }
+    }
+
+    /// The background auto-roll sealer loop (`bn-1vu`), run on its own thread.
+    /// For each rolled (durable, unsealed) segment reported over `rx`, it builds
+    /// the pointer + payload sidecars from the hot index snapshot and the book,
+    /// finalizes the segment footer (writes + fsyncs the trailer), and installs
+    /// the segment into the cold [`SealedStore`] — all off the append path (D5).
+    /// A seal failure is best-effort: the rolled segment stays durable + unsealed
+    /// and is served from the log (and re-sealable) on reopen, so a failed seal
+    /// never loses data. The loop exits when the roll channel closes (the
+    /// committer task dropped its [`Roller`]), draining every queued seal first.
+    fn run_roll_sealer(
+        rx: mpsc::Receiver<SegmentSummary>,
+        driver: SealDriver,
+        active: Arc<ActiveIndex>,
+        book: Arc<Mutex<Book>>,
+        dir: PathBuf,
+    ) {
+        for summary in rx {
+            let base = summary.base_pos;
+            let end = summary.end_pos;
+
+            // Wait until the hot index + book have published every event of this
+            // segment (post-ack discipline). Under the current serialised append
+            // gate this already holds by the time the roll notification lands;
+            // the bounded wait keeps it robust if a future append gate (bn-1s0)
+            // relaxes that ordering. A gone writer can never lower the applied
+            // end, so this cannot deadlock.
+            let mut spins = 0u32;
+            loop {
+                let applied = active.snapshot().applied_end;
+                let booked = book.lock().expect("book lock").payloads.len() as u64;
+                if applied >= end && booked >= end {
+                    break;
+                }
+                spins += 1;
+                if spins > 200_000 {
+                    // ~10s of 50µs spins: give up on this seal rather than hang.
+                    // The segment stays durable + unsealed (served from the log).
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_micros(50));
+            }
+
+            let snapshot = active.snapshot();
+            if snapshot.applied_end < end {
+                continue; // incomplete (see the spin cap) — leave it unsealed
+            }
+            let mut input =
+                seal_input_for_range(&snapshot, summary.segment_id, base, end);
+            if input.streams.is_empty() {
+                continue;
+            }
+            // Attach the segment's payloads in stored (global-position) order so
+            // the seal emits the columnar `.pcol` sidecar too (bn-zge / D6).
+            {
+                let book = book.lock().expect("book lock");
+                if book.payloads.len() as u64 >= end {
+                    let payloads: Vec<Vec<u8>> = book.payloads
+                        [base as usize..end as usize]
+                        .iter()
+                        .map(|p| p.data.to_vec())
+                        .collect();
+                    input = input.with_payloads(payloads);
+                }
+            }
+
+            // Finalize: write + fsync the fixed footer trailer (§3.3.1), making
+            // the segment R2-trusted, only after the sidecars are durable.
+            let seg_path = segment_path(&dir, summary.segment_id);
+            let sum = summary;
+            let finalize = move || finalize_footer(&seg_path, &sum);
+            // Best-effort: on failure the segment stays unsealed + recoverable.
+            let _ = driver.seal(input, finalize);
+        }
+    }
+
+    /// Rebuild a [`SealedStore`] from the sealed sidecars already durable under
+    /// `dir/sealed` — the reopen counterpart to [`seal_active`]/the background
+    /// sealer. Each complete `.pidx` (with its opportunistic sibling `.filter`
+    /// and `.pcol`, re-attached by [`SealedSegmentIndex::open`]) is installed so
+    /// a stream sealed before a restart is served from the cold tier again
+    /// rather than silently falling back to hot replay.
+    ///
+    /// **Crash-mid-seal safety.** The sidecar writer is crash-atomic
+    /// (temp-file → fsync → rename, see `SealDriver`'s `write_durable`): a crash
+    /// during a seal leaves either the previous state or a complete `.pidx`,
+    /// never a torn one under its real name. A partial `*.pidx.tmp` husk (a seal
+    /// interrupted before its rename) is ignored here — it does not match the
+    /// `.pidx` extension — and a `.pidx` that fails to parse (CRC / truncation)
+    /// is skipped, not fatal: the durable log remains the authority, so that
+    /// stream is served from the hot tier until it is re-sealed. Either way the
+    /// engine reopens into a readable, recoverable state.
+    ///
+    /// Returns the installed segment ids too, so recovery knows which segments
+    /// are already served cold and must NOT be re-seeded into the hot index
+    /// (bn-1vu).
+    fn load_sealed(dir: &Path) -> (SealedStore, HashSet<u64>) {
+        let store = SealedStore::new();
+        let mut ids = HashSet::new();
+        let sealed_dir = dir.join("sealed");
+        let Ok(entries) = std::fs::read_dir(&sealed_dir) else {
+            // No sealed directory yet: nothing has been sealed.
+            return (store, ids);
         };
-        Ok((book, ResumePlan::Resume(info)))
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("pidx") {
+                // Skip `.pidx.tmp` husks, `.pcol`/`.filter` siblings (re-attached
+                // by `open`), and anything else.
+                continue;
+            }
+            // A complete, CRC-valid sidecar installs; a torn/corrupt one is
+            // skipped (the log stays the truth) so a mid-seal crash never
+            // prevents reopen.
+            if let Ok(index) = SealedSegmentIndex::open(&path) {
+                ids.insert(index.segment_id());
+                store.install(Arc::new(index));
+            }
+        }
+        (store, ids)
     }
 
     /// Test/diagnostic: total events committed to the record book.
@@ -640,16 +855,24 @@ impl LogEngine {
         self.inner.book.lock().expect("book lock").payloads.len()
     }
 
+    /// Test/diagnostic: number of sealed segments currently installed in the
+    /// cold tier (populated at open by [`load_sealed`], and by
+    /// [`seal_active`](Self::seal_active) at runtime).
+    #[must_use]
+    pub fn sealed_segment_count(&self) -> usize {
+        self.inner.sealed.len()
+    }
+
     /// Seal the current active segment into the cold [`SealedStore`], driving
     /// the real `mess-index` [`SealDriver`] (sidecar encode → durable write →
     /// install → evict-from-active). After this, `read_stream` for the sealed
     /// streams routes through the [`ReplaySet`] cold path.
     ///
-    /// The interim `mess-log` committer owns a single segment and does not roll
-    /// (segment roll under a live committer is unimplemented — see the bn-20b
-    /// openQuestions), so this is exposed as an explicit trigger rather than
-    /// fired automatically on roll. It is what the sealed-replay bench and the
-    /// sealed read path exercise.
+    /// This seals the CURRENT (live head) active segment on demand, distinct
+    /// from the automatic seal a live roll triggers (bn-1vu: when the head fills
+    /// the committer rolls and the background sealer seals the rolled segment
+    /// off the append path). It is what the sealed-replay bench and the sealed
+    /// read path exercise directly.
     pub fn seal_active(&self) -> Result<(), EngineError> {
         let snapshot = self.inner.active.snapshot();
         let input = SealInput::from_snapshot(&snapshot, ACTIVE_SEGMENT_ID, 0);
@@ -746,9 +969,90 @@ impl LogEngine {
     }
 }
 
-/// The active segment's on-disk path.
-fn active_segment_path(dir: &Path) -> PathBuf {
-    dir.join(format!("seg-{ACTIVE_SEGMENT_ID:08}.log"))
+/// A segment's on-disk path for a given id — the store's naming scheme, shared
+/// by open/recovery and the committer's [`Roller`] (bn-1vu) so the two never
+/// disagree.
+fn segment_path(dir: &Path, segment_id: u64) -> PathBuf {
+    dir.join(format!("seg-{segment_id:08}.log"))
+}
+
+/// Every existing `seg-<id>.log` id under `dir`, ascending — the segment chain
+/// recovery walks (bn-1vu). Files that do not match the naming scheme are
+/// ignored.
+fn enumerate_segment_ids(dir: &Path) -> Vec<u64> {
+    let mut ids = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return ids;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if let Some(rest) = name.strip_prefix("seg-")
+            && let Some(num) = rest.strip_suffix(".log")
+            && let Ok(id) = num.parse::<u64>()
+        {
+            ids.push(id);
+        }
+    }
+    ids.sort_unstable();
+    ids
+}
+
+/// Build a [`SealInput`] for the segment spanning global positions
+/// `[base_pos, end_pos)` from a hot-index `snapshot` (bn-1vu). Unlike
+/// [`SealInput::from_snapshot`] (which filters by `EventPtr.segment_id`), this
+/// filters by global-position range: the engine serves payloads from the record
+/// book, so its `EventPtr` fields are pseudo (the pointer offset is set to the
+/// global position, never dereferenced), and the batch → segment mapping is by
+/// the durable, correct global position instead. A batch never spans segments
+/// (A8), so `first_global_pos ∈ [base, end)` selects exactly this segment's
+/// batches.
+fn seal_input_for_range(
+    snapshot: &IndexSnapshot,
+    segment_id: u64,
+    base_pos: u64,
+    end_pos: u64,
+) -> SealInput {
+    let mut streams = Vec::new();
+    for (&stream_id, entries) in &snapshot.streams {
+        let batches: Vec<SealBatch> = entries
+            .iter()
+            .filter(|e| e.first_global_pos >= base_pos && e.first_global_pos < end_pos)
+            .map(|e| SealBatch {
+                first_version: e.first_version,
+                frame_count: e.frame_count,
+                first_global_pos: e.first_global_pos,
+                offset: e.first_global_pos, // pseudo: reads come from the book
+            })
+            .collect();
+        if !batches.is_empty() {
+            streams.push(SealStream { stream_id, batches });
+        }
+    }
+    SealInput { segment_id, base_pos, streams, payloads: None }
+}
+
+/// Finalize a rolled segment's footer (bn-1vu): write the fixed 100-byte trailer
+/// (§3.3.1) at `content_len` and `fsync`, so recovery's R2 fast path can trust
+/// the segment. Called from the background sealer's finalize step, only after
+/// the sidecars are durable — a crash before this leaves the segment unsealed
+/// (fully scanned by recovery), losing nothing.
+fn finalize_footer(seg_path: &Path, summary: &SegmentSummary) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let fields = TrailerFields::phase3(
+        summary.segment_id,
+        summary.epoch,
+        summary.base_pos,
+        summary.batch_count,
+        summary.event_count,
+        summary.content_len,
+    );
+    let trailer = encode_trailer(&fields);
+    let mut f = std::fs::OpenOptions::new().write(true).open(seg_path)?;
+    f.seek(SeekFrom::Start(summary.content_len))?;
+    f.write_all(&trailer)?;
+    f.sync_all()?;
+    Ok(())
 }
 
 impl Backend for LogEngine {
