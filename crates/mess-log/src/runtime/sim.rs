@@ -98,6 +98,49 @@ struct SimCore {
 }
 
 impl SimCore {
+    /// Tear the executor down: drop every parked task future and pending
+    /// timer, and clear the ready/woken bookkeeping.
+    ///
+    /// # Why this exists — breaking the executor↔task reference cycle
+    ///
+    /// A spawned task's future lives in `Exec.tasks`, reachable from the
+    /// shared `Arc<SimCore>`. That future routinely captures a
+    /// [`SimRuntime`] handle (the group-commit timer at
+    /// `committer.rs` does `rt.spawn(async move { rt_sleep.sleep_until(..).await })`),
+    /// and a `SimRuntime` handle owns a **strong** `Arc<SimCore>`. So the
+    /// graph contains a cycle: `Arc<SimCore>` → `Exec.tasks` → future →
+    /// captured `SimRuntime` → `Arc<SimCore>`.
+    ///
+    /// A fire-and-forget task that never completes (the group-commit timer
+    /// when its convoy closes early: its [`SimJoin`] handle is dropped but
+    /// the task stays parked in `tasks`/`timers` forever) keeps that cycle
+    /// alive. `SimCore`'s strong count therefore never reaches zero even
+    /// once every external handle is gone, so the whole executor — task
+    /// futures, their captured buffers, and timer wakers — leaks at process
+    /// exit. A `Drop` on `SimCore` can never fire (it is the thing kept
+    /// alive by the cycle), so teardown must be driven from the one handle
+    /// that is *not* captured by any task: the runtime **owner** (see
+    /// [`SimRuntime`]'s `owner` field and its `Drop`).
+    ///
+    /// Clearing `tasks`/`timers` drops those futures, releasing their
+    /// captured `SimRuntime` clones (and the `Arc<SimCore>` inside each),
+    /// which breaks the cycle so the core frees normally.
+    fn drain(&self) {
+        // Move the futures/timers out from under the lock, then drop them
+        // *after* releasing it: a task future's destructor is arbitrary
+        // user code and could re-enter the executor (e.g. drop a nested
+        // handle), so dropping while holding `exec` risks a re-entrant
+        // deadlock.
+        let (tasks, timers) = {
+            let mut ex = self.exec.lock().unwrap();
+            ex.ready.clear();
+            (std::mem::take(&mut ex.tasks), std::mem::take(&mut ex.timers))
+        };
+        self.woken.lock().unwrap().clear();
+        drop(tasks);
+        drop(timers);
+    }
+
     /// Register a task future, mark it runnable, return its id.
     fn push_task(
         &self,
@@ -259,10 +302,29 @@ impl<T> Future for SimJoin<T> {
 
 /// A deterministic simulation runtime: virtual clock, seeded executor, and
 /// an in-memory fault filesystem. Cheap to clone (shared core + fs).
-#[derive(Clone)]
+///
+/// # Owner vs. handle (why this is not `#[derive(Clone)]`)
+///
+/// Modeled on tokio's `Runtime` (an owner that tears the executor down when
+/// dropped) versus its `Handle` (freely cloned, captured into tasks). The
+/// handle returned by [`new`](SimRuntime::new)/[`with_fault`](SimRuntime::with_fault)
+/// is the **owner** (`owner == true`); [`Clone`] always yields a non-owning
+/// handle (`owner == false`). Spawned task futures only ever capture
+/// non-owning clones (`rt.clone()`), so no task can keep the executor alive.
+/// When the owner drops, its [`Drop`] calls [`SimCore::drain`] to release
+/// every parked task and timer — the only place the executor↔task reference
+/// cycle documented on [`SimCore::drain`] can be broken. The owner must
+/// therefore outlive every handle it hands out (the natural RAII shape:
+/// `let rt = SimRuntime::new(..)` at the top of a test, clones handed to
+/// committers/tasks below it).
 pub struct SimRuntime {
     core: Arc<SimCore>,
     fs: SimFs,
+    /// `true` only for the handle from `new`/`with_fault`; `Clone` sets it
+    /// `false`. Exactly one owner exists per executor, and it is never
+    /// captured into a spawned task, so its `Drop` is a reliable teardown
+    /// signal that firing on a task-held clone could never be.
+    owner: bool,
 }
 
 impl SimRuntime {
@@ -286,6 +348,7 @@ impl SimRuntime {
                 woken: Arc::new(Mutex::new(Vec::new())),
             }),
             fs: SimFs::new(fault),
+            owner: true,
         }
     }
 
@@ -293,6 +356,30 @@ impl SimRuntime {
     /// fault plan that is part of the same deterministic stream).
     pub fn with_rng<R>(&self, f: impl FnOnce(&mut Rng) -> R) -> R {
         f(&mut self.core.exec.lock().unwrap().rng)
+    }
+}
+
+impl Clone for SimRuntime {
+    /// Clones share the executor and fs but are **never** owners: a cloned
+    /// handle (including every one captured into a spawned task) must not be
+    /// able to tear the executor down. See the type-level docs.
+    fn clone(&self) -> Self {
+        SimRuntime { core: self.core.clone(), fs: self.fs.clone(), owner: false }
+    }
+}
+
+impl Drop for SimRuntime {
+    /// Tear the executor down when the sole **owner** handle drops. Handles
+    /// created by [`Clone`] are non-owning and drop silently; only the owner
+    /// from `new`/`with_fault` drains the executor, releasing every parked
+    /// task and timer. This is the one teardown point that can break the
+    /// executor↔task reference cycle documented on [`SimCore::drain`] — a
+    /// `Drop` on `SimCore` itself could never run, since the cycle keeps its
+    /// strong count above zero.
+    fn drop(&mut self) {
+        if self.owner {
+            self.core.drain();
+        }
     }
 }
 
