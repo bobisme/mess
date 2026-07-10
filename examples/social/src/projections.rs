@@ -57,8 +57,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use ident::Id;
-use mess_core::Event;
-use mess_store::{Backend, EventStore, StoredRecord};
+use mess_core::{CodecError, Event};
+use mess_store::{
+    AnomalyKind, Backend, EventStore, ProjectionAnomalies,
+    ProjectionAnomaliesSnapshot, StoredRecord,
+};
 use tokio::sync::{Notify, RwLock};
 
 use crate::contracts::{PostView, ProfileView, ReadModels, TimelinePage};
@@ -114,6 +117,31 @@ struct State {
     followers: HashMap<Id, HashSet<Id>>,
     /// post id -> folded post row.
     posts:     HashMap<Id, PostRow>,
+}
+
+/// Record one anomaly hit at `rec`'s position, and — only on that counter's
+/// **first-ever** occurrence — log a one-time warning naming the stream,
+/// message type, and position (`bn-3uu`).
+///
+/// This is the adoption site the [`mess_store::ProjectionAnomalies`] module
+/// docs describe: the counter type itself has no logging dependency, so
+/// *this* crate decides what a warning line looks like. Logging only on the
+/// `0 -> 1` transition keeps a projection stuck skipping the same bad stream
+/// forever from flooding stderr, while still guaranteeing the very first
+/// occurrence of each kind is loud. The liveness policy is unchanged: the
+/// caller still skips the record either way.
+fn record_anomaly(
+    anomalies: &ProjectionAnomalies,
+    kind: AnomalyKind,
+    rec: &StoredRecord,
+) {
+    if anomalies.record(kind, rec.global_position) {
+        eprintln!(
+            "social projections: WARNING first {kind}: stream={:?} \
+             message_type={:?} global_position={}",
+            rec.stream_id, rec.message_type, rec.global_position
+        );
+    }
 }
 
 impl State {
@@ -189,26 +217,66 @@ impl State {
     /// projection does not understand (an unknown category, or a suffix/
     /// payload that fails to decode) are skipped — a projection must
     /// tolerate a log wider than the slice of it that it models.
-    fn apply_record(&mut self, rec: &StoredRecord) {
+    ///
+    /// **Silent-skip is still the liveness policy** — that does not change
+    /// here. What changes (dogfood finding, `bn-3uu`) is that every skip site
+    /// now increments the matching [`mess_store::ProjectionAnomalies`]
+    /// counter via [`record_anomaly`], so schema drift or a routing bug shows
+    /// up in [`Projections::anomalies`] instead of vanishing silently. Each
+    /// counter also logs one warning line the first time it goes nonzero (see
+    /// `record_anomaly`), without spamming on every subsequent occurrence.
+    fn apply_record(
+        &mut self,
+        rec: &StoredRecord,
+        anomalies: &ProjectionAnomalies,
+    ) {
         let (category, suffix) = rec.category_and_suffix();
         match category {
-            "user" => {
-                if let Ok(owner) = Id::from_str(suffix)
-                    && let Ok(ev) =
-                        UserEvent::decode(&rec.message_type, &rec.data)
-                {
-                    self.apply_user(owner, &ev);
+            "user" => match Id::from_str(suffix) {
+                Ok(owner) => {
+                    match UserEvent::decode(&rec.message_type, &rec.data) {
+                        Ok(ev) => self.apply_user(owner, &ev),
+                        Err(CodecError::UnknownEventName(_)) => record_anomaly(
+                            anomalies,
+                            AnomalyKind::UnknownEventKind,
+                            rec,
+                        ),
+                        Err(_) => record_anomaly(
+                            anomalies,
+                            AnomalyKind::UndecodablePayload,
+                            rec,
+                        ),
+                    }
                 }
-            }
-            "post" => {
-                if let Ok(id) = Id::from_str(suffix)
-                    && let Ok(ev) =
-                        PostEvent::decode(&rec.message_type, &rec.data)
-                {
-                    self.apply_post(id, rec.global_position, &ev);
+                Err(_) => record_anomaly(
+                    anomalies,
+                    AnomalyKind::UnroutableStream,
+                    rec,
+                ),
+            },
+            "post" => match Id::from_str(suffix) {
+                Ok(id) => {
+                    match PostEvent::decode(&rec.message_type, &rec.data) {
+                        Ok(ev) => self.apply_post(id, rec.global_position, &ev),
+                        Err(CodecError::UnknownEventName(_)) => record_anomaly(
+                            anomalies,
+                            AnomalyKind::UnknownEventKind,
+                            rec,
+                        ),
+                        Err(_) => record_anomaly(
+                            anomalies,
+                            AnomalyKind::UndecodablePayload,
+                            rec,
+                        ),
+                    }
                 }
-            }
-            _ => {}
+                Err(_) => record_anomaly(
+                    anomalies,
+                    AnomalyKind::UnroutableStream,
+                    rec,
+                ),
+            },
+            _ => record_anomaly(anomalies, AnomalyKind::UnroutableStream, rec),
         }
     }
 
@@ -294,16 +362,21 @@ pub struct PostLookup {
 /// Share it behind an `Arc` if several handlers need it.
 #[derive(Debug)]
 pub struct Projections<B: Backend> {
-    state:    Arc<RwLock<State>>,
+    state:     Arc<RwLock<State>>,
     /// The read watermark: the number of global events applied, i.e. one past
     /// the highest global position folded in. `wait_for(p)` waits for this to
     /// exceed `p`.
-    applied:  Arc<AtomicU64>,
+    applied:   Arc<AtomicU64>,
     /// Pulsed after every batch the pump applies, so `wait_for` waiters wake.
-    notify:   Arc<Notify>,
+    notify:    Arc<Notify>,
+    /// Counts of records this projection could not decode or route, across
+    /// both the catch-up replay and the live pump (`bn-3uu`). Held behind an
+    /// `Arc` (not the `state` lock) so [`Projections::anomalies`] reads it
+    /// without contending with the fold.
+    anomalies: Arc<ProjectionAnomalies>,
     /// The live pump; aborted on drop.
-    pump:     tokio::task::JoinHandle<()>,
-    _backend: PhantomData<B>,
+    pump:      tokio::task::JoinHandle<()>,
+    _backend:  PhantomData<B>,
 }
 
 impl<B: Backend> Drop for Projections<B> {
@@ -329,6 +402,7 @@ impl<B: Backend + Clone> Projections<B> {
         let state = Arc::new(RwLock::new(State::default()));
         let applied = Arc::new(AtomicU64::new(0));
         let notify = Arc::new(Notify::new());
+        let anomalies = Arc::new(ProjectionAnomalies::new());
 
         // Phase 1: synchronous catch-up from position 0 to the current head.
         let mut after: Option<u64> = None;
@@ -346,7 +420,7 @@ impl<B: Backend + Clone> Projections<B> {
                 }
                 let short = page.len() < BATCH;
                 for rec in &page {
-                    st.apply_record(rec);
+                    st.apply_record(rec, &anomalies);
                     after = Some(rec.global_position);
                 }
                 if short {
@@ -362,10 +436,23 @@ impl<B: Backend + Clone> Projections<B> {
             state.clone(),
             applied.clone(),
             notify.clone(),
+            anomalies.clone(),
             after,
         ));
 
-        Self { state, applied, notify, pump, _backend: PhantomData }
+        Self { state, applied, notify, anomalies, pump, _backend: PhantomData }
+    }
+
+    /// The undecodable-payload / unroutable-stream / unknown-event-kind
+    /// counters for records this projection has skipped, across both the
+    /// initial catch-up replay and the live pump (`bn-3uu`). The liveness
+    /// policy is unchanged — a skip is still a skip — but a schema drift or
+    /// routing bug now shows up here (and, on each counter's first hit, as a
+    /// one-time warning line) instead of vanishing silently. See
+    /// [`mess_store::ProjectionAnomalies`].
+    #[must_use]
+    pub fn anomalies(&self) -> ProjectionAnomaliesSnapshot {
+        self.anomalies.snapshot()
     }
 
     /// Permalink lookup: resolve a post by id **including deleted posts**,
@@ -396,6 +483,7 @@ async fn pump_loop<B: Backend>(
     state: Arc<RwLock<State>>,
     applied: Arc<AtomicU64>,
     notify: Arc<Notify>,
+    anomalies: Arc<ProjectionAnomalies>,
     mut after: Option<u64>,
 ) {
     loop {
@@ -415,7 +503,7 @@ async fn pump_loop<B: Backend>(
         {
             let mut st = state.write().await;
             for rec in &page {
-                st.apply_record(rec);
+                st.apply_record(rec, &anomalies);
                 after = Some(rec.global_position);
             }
         }

@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 
 use ident::Id;
-use mess_store::{EventStore, LogEngine};
+use mess_store::{Backend, EventStore, LogEngine, RecordToAppend, Version};
 use social::{
     PostLookup, ProfileView, Projections, ReadModels, TimelinePage, WriteError,
     WriteOps,
@@ -409,4 +409,138 @@ async fn follow_after_post_is_retroactive() {
     let home = proj.home_timeline(alice, None, 10).await;
     assert_eq!(home.entries.len(), 1);
     assert_eq!(home.entries[0].id, post);
+}
+
+// ===========================================================================
+// Anomaly observability (bn-3uu)
+// ===========================================================================
+
+/// Append one raw record straight through [`Backend::append_batch`],
+/// bypassing [`WriteOps`]/`#[derive(Event)]` entirely — this is how the test
+/// gets bytes onto the log that the real domain can never produce, to prove
+/// the projection notices instead of silently vanishing them. Returns the
+/// global position of the appended record.
+async fn append_raw(
+    store: &EventStore<LogEngine>,
+    stream_id: &str,
+    expected: Version,
+    message_type: &str,
+    data: Vec<u8>,
+) -> u64 {
+    store
+        .backend()
+        .append_batch(
+            stream_id,
+            expected,
+            &[RecordToAppend { message_type: message_type.into(), data }],
+        )
+        .await
+        .expect("raw append")
+        .last_global_position
+}
+
+/// Feeds the store a record on a foreign category, a `user-` stream with an
+/// unparseable suffix, a recognized `user-` stream with an unrecognized
+/// message type, and a recognized `user-` stream with a known message type
+/// but garbage payload bytes — one for each [`mess_store::AnomalyKind`] plus
+/// a second unroutable-stream case. Asserts each anomaly counter reflects
+/// exactly what happened, **and** that good records surrounding the garbage
+/// are still folded correctly: the projection stays live, not stuck or
+/// crashed, on a log wider than the slice it models.
+#[tokio::test]
+async fn anomalies_are_counted_while_the_projection_stays_live_and_correct() {
+    let store = fresh_store();
+    let proj = Projections::new(&store).await;
+
+    // A good record BEFORE any garbage: alice registers.
+    let alice = Id::new();
+    store.register(alice, "alice".into(), "Alice".into()).await.unwrap();
+
+    // 1. Unroutable stream: a category this projection does not model at all.
+    let mut last = append_raw(
+        &store,
+        "widget-123",
+        Version::NoStream,
+        "widget.created",
+        b"whatever".to_vec(),
+    )
+    .await;
+
+    // 2. Unroutable stream: a `user-` stream whose suffix is not a valid Id.
+    last = append_raw(
+        &store,
+        "user-not-an-id",
+        Version::NoStream,
+        "user.registered",
+        b"whatever".to_vec(),
+    )
+    .await
+    .max(last);
+
+    // 3. Unknown event kind: a real user stream, an unrecognized message type.
+    let dave = Id::new();
+    last = append_raw(
+        &store,
+        &social::user_stream(dave),
+        Version::NoStream,
+        "user.teleported",
+        b"whatever".to_vec(),
+    )
+    .await
+    .max(last);
+
+    // 4. Undecodable payload: known message type, garbage msgpack bytes.
+    let eve = Id::new();
+    last = append_raw(
+        &store,
+        &social::user_stream(eve),
+        Version::NoStream,
+        "user.registered",
+        vec![0xFF, 0x00, 0x01, 0x02],
+    )
+    .await
+    .max(last);
+
+    // A good record AFTER the garbage: bob registers and posts.
+    let bob = Id::new();
+    store.register(bob, "bob".into(), "Bob".into()).await.unwrap();
+    let post = Id::new();
+    last = store
+        .create_post(post, bob, "still alive".into())
+        .await
+        .unwrap()
+        .max(last);
+
+    proj.wait_for(last).await;
+
+    let snap = proj.anomalies();
+    assert_eq!(
+        snap.unroutable_stream.count, 2,
+        "the foreign category and the bad-suffix user stream are both \
+         unroutable"
+    );
+    assert_eq!(
+        snap.unknown_event_kind.count, 1,
+        "user.teleported is not a UserEvent variant"
+    );
+    assert_eq!(
+        snap.undecodable_payload.count, 1,
+        "the garbage bytes are not valid msgpack for user.registered"
+    );
+    assert_eq!(snap.total(), 4);
+    // The most recent anomaly recorded is the last garbage record appended
+    // (the undecodable payload on eve's stream), not some earlier one.
+    assert!(snap.undecodable_payload.last_position.is_some());
+
+    // The projection is still live and correct on the good records: alice
+    // (registered before the garbage) and bob+his post (registered after)
+    // both resolve normally.
+    assert_eq!(proj.resolve("alice").await, Some(alice));
+    assert_eq!(proj.resolve("bob").await, Some(bob));
+    let bob_posts = proj.user_posts("bob", None, 10).await;
+    assert_eq!(bob_posts.entries.len(), 1);
+    assert_eq!(bob_posts.entries[0].id, post);
+    // dave and eve never registered (their only records were garbage), so
+    // they never got a handle to resolve.
+    assert!(proj.profile("dave", None).await.is_none());
 }

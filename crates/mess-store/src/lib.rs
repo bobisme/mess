@@ -42,6 +42,7 @@
 //! [`Decide`]: mess_core::Decide
 //! [`Decide::Rejection`]: mess_core::Decide::Rejection
 
+pub mod anomalies;
 pub mod backend;
 pub mod cache;
 pub mod engine;
@@ -55,6 +56,10 @@ pub mod store;
 pub mod subscription;
 pub mod version;
 
+pub use anomalies::{
+    AnomalyCounter, AnomalyCounterSnapshot, AnomalyKind, ProjectionAnomalies,
+    ProjectionAnomaliesSnapshot,
+};
 pub use backend::{
     AppendError, Appended, Backend, RecordToAppend, StoredRecord,
     SubscribeBackend,
