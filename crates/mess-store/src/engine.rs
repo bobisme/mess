@@ -103,9 +103,10 @@ use mess_index::sealed::{
 use mess_index::{ActiveIndex, BatchEntry, EventPtr, IndexSnapshot};
 use mess_index::meta::{CommitGroup, Head, MetaStore, StreamId};
 use mess_log::committer::{
-    AppendOutcome, AppendRequest, Appender, Committer, Durability, EventInput, LatencySnapshot,
-    Roller,
+    AppendOutcome, AppendRequest, Appender, ChainInit, Committer, Durability, EventInput,
+    LatencySnapshot, Roller,
 };
+use mess_log::fold_chain::ChainHead;
 use mess_log::lock::StoreLock;
 use mess_log::runtime::{RealRuntime, Runtime};
 use mess_log::scanner::{self, AcceptedBatch};
@@ -515,6 +516,13 @@ pub struct EngineOptions {
     /// projection rebuild, a subscription re-read) skips the decode — and makes
     /// the `cache_hits`/`cache_misses` runtime metrics meaningful under load.
     pub block_cache_budget_bytes: u64,
+    /// Emit the per-batch on-disk fold chain (`crypto_chain`, spec 05 §6,
+    /// `bn-3l0`). **Off by default**: when `false`, segments are byte-identical
+    /// to a store that never knew about the chain. When `true`, every batch the
+    /// committer writes carries its real `crypto_chain` (offset 72, flag bit 0),
+    /// per-stream heads are rehydrated on recovery, and `mess verify --full`
+    /// recomputes the chain to catch a CRC-repaired payload tamper.
+    pub chain: bool,
 }
 
 /// Re-export of the committer's runtime metrics snapshot (`bn-e2y`), the
@@ -588,6 +596,9 @@ impl Default for EngineOptions {
             // hit rate), and a live cache is what makes the hit/miss runtime
             // metrics operationally meaningful. Set to 0 to disable.
             block_cache_budget_bytes: 64 * 1024 * 1024,
+            // Fold chain off by default: opt in per store for tamper-evident
+            // segments (spec 05 §6).
+            chain: false,
         }
     }
 }
@@ -634,7 +645,8 @@ impl LogEngine {
         // from the segments not already served cold, and learn how to resume the
         // last (active) segment.
         let active = Arc::new(ActiveIndex::new());
-        let (book, plan) = Self::recover(&rt, dir, &active, &meta, &sealed_ids)?;
+        let (book, plan, chain_heads) =
+            Self::recover(&rt, dir, &active, &meta, &sealed_ids, opts.chain)?;
 
         // The active segment is the highest-id `seg-*.log`; on a fresh store it
         // is `ACTIVE_SEGMENT_ID`. A roll numbers the next one `+1` from here.
@@ -683,7 +695,14 @@ impl LogEngine {
         let (roll_tx, roll_rx) = mpsc::channel::<SegmentSummary>();
         let dir_for_paths = dir.to_path_buf();
         let roller = Roller::new(move |id| segment_path(&dir_for_paths, id), roll_tx);
-        let committer = Committer::spawn_with_roll(&rt, writer, opts.durability, roller);
+        // Fold chain (`bn-3l0`, spec 05 §6): opt-in. When on, seed the committer
+        // with the per-stream heads rehydrated by recovery so an append after
+        // reopen continues each stream's chain from its durable exit head; when
+        // off, `ChainInit::off()` keeps the on-disk bytes byte-identical.
+        let chain_init =
+            if opts.chain { ChainInit::on(chain_heads) } else { ChainInit::off() };
+        let committer =
+            Committer::spawn_with_roll_chained(&rt, writer, opts.durability, roller, chain_init);
         let appender = committer.appender();
 
         let book = Arc::new(Mutex::new(book));
@@ -768,7 +787,8 @@ impl LogEngine {
         active: &ActiveIndex,
         meta: &MetaStore,
         sealed_ids: &HashSet<u64>,
-    ) -> Result<(Book, ResumePlan), EngineError> {
+        chain: bool,
+    ) -> Result<(Book, ResumePlan, HashMap<u64, ChainHead>), EngineError> {
         // Reconstruct the interner (both directions) from the durable id→name
         // tables first, so materialised payloads can resolve their names.
         let mut book = Book::default();
@@ -779,10 +799,19 @@ impl LogEngine {
             meta.type_names().map_err(|e| EngineError::Meta(e.to_string()))?,
         );
 
+        // Per-stream fold-chain heads rehydrated from the recovered frames
+        // (spec 05 §5/§6, `bn-3l0`): folding every durable event of a stream in
+        // ascending version order leaves each head at the exit value of the
+        // committed prefix, so an append after reopen continues the chain
+        // exactly. Built only when the store opted into the chain; empty
+        // otherwise. Independent of whether a segment is served hot or cold —
+        // the fold walks the durable payloads either way.
+        let mut chain_heads: HashMap<u64, ChainHead> = HashMap::new();
+
         // Enumerate the segment chain in ascending id order.
         let segment_ids = enumerate_segment_ids(dir);
         if segment_ids.is_empty() {
-            return Ok((book, ResumePlan::Fresh));
+            return Ok((book, ResumePlan::Fresh, chain_heads));
         }
 
         let mut hot_entries: Vec<BatchEntry> = Vec::new();
@@ -828,6 +857,16 @@ impl LogEngine {
                             ))
                         })?;
                     let stream_position = b.first_stream_version + k as u64;
+                    if chain {
+                        // Fold the on-disk payload into the stream's head, in
+                        // ascending version order (§6.2). A stream first seen
+                        // here starts at its genesis; `absorb` advances it to
+                        // `h[stream_position]`.
+                        chain_heads
+                            .entry(sid)
+                            .or_insert_with(|| ChainHead::genesis(sid))
+                            .absorb(frame.payload);
+                    }
                     book.payloads.push(Payload {
                         stream_name: stream_name.clone(),
                         message_type,
@@ -866,8 +905,8 @@ impl LogEngine {
         active.apply_committed(watermark, &hot_entries);
 
         match last_headed {
-            Some(info) => Ok((book, ResumePlan::Resume(info))),
-            None => Ok((book, ResumePlan::Fresh)),
+            Some(info) => Ok((book, ResumePlan::Resume(info), chain_heads)),
+            None => Ok((book, ResumePlan::Fresh, chain_heads)),
         }
     }
 

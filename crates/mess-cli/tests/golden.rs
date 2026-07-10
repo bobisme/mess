@@ -50,6 +50,8 @@ use std::process::Command;
 
 use mess_cli::verify::{self, VerifyOptions};
 use mess_log::certificates::{Aggregate, build_cert, load_verified, take_snapshot};
+use mess_log::runtime::real::RealFs;
+use mess_log::scanner::recover_segment_with_image;
 use mess_store::backend::{Backend, RecordToAppend};
 use mess_store::{
     BlobPtr, EngineOptions, FjallSnapshotBackend, LogEngine, SnapshotRef, SnapshotStore,
@@ -61,8 +63,13 @@ use serde_json::{Value, json};
 // Shared, format-frozen constants (generator and check MUST agree).
 // ---------------------------------------------------------------------------
 
-/// Current on-disk format version this golden targets (spec 01 = format v3).
+/// The historical golden: format v3 layout, engine emitting PLAIN frames (no
+/// on-disk `crypto_chain`). Immutable.
 const GOLDEN_VERSION: &str = "v3";
+/// The chained golden (`bn-3l0`): same format v3 layout, but the engine emits
+/// the real per-batch on-disk `crypto_chain` (spec 05 §6), so `mess verify
+/// --full` validates the fold chain against the actual stored bytes.
+const GOLDEN_V4: &str = "v4";
 /// Tiny active segment so a few hundred small batches roll + seal repeatedly.
 const SEGMENT_SIZE: u64 = 16 * 1024;
 /// Named streams `orders-0` .. `orders-{N-1}`.
@@ -83,9 +90,11 @@ const SNAPSHOT_VERSION: u64 = 19;
 /// The stream that must be served entirely from the COLD (sealed) tier.
 const COLD_STREAM: &str = "orders-0";
 
-/// The rolling engine options both phases open the store with.
-fn opts() -> EngineOptions {
-    EngineOptions { segment_size: SEGMENT_SIZE, ..EngineOptions::default() }
+/// The rolling engine options both phases open the store with. `chain` selects
+/// whether the engine emits the real on-disk fold chain (v4+) or plain frames
+/// (v3, the historical layout).
+fn opts(chain: bool) -> EngineOptions {
+    EngineOptions { segment_size: SEGMENT_SIZE, chain, ..EngineOptions::default() }
 }
 
 /// One of a few distinct message types, to exercise the type-name registry.
@@ -188,12 +197,25 @@ fn rec(message_type: &str, data: &[u8]) -> RecordToAppend {
 #[tokio::test]
 #[ignore = "golden generator: run explicitly to (re)create tests/golden/v3; commit its output"]
 async fn generate_golden_v3() {
+    generate(GOLDEN_VERSION, false).await;
+}
+
+#[tokio::test]
+#[ignore = "golden generator: run explicitly to (re)create tests/golden/v4; commit its output"]
+async fn generate_golden_v4() {
+    generate(GOLDEN_V4, true).await;
+}
+
+/// Build a complete golden store `version` with the production engine and pack
+/// it under `tests/golden/<version>/`. `chain` selects whether segments carry
+/// the real on-disk `crypto_chain` (v4) or plain frames (v3).
+async fn generate(version: &str, chain: bool) {
     let work = tempfile::tempdir().expect("tempdir");
     let store = work.path().join("store");
 
     // ---- 1. Build the store with the production engine (rolling segments). ----
     {
-        let engine = LogEngine::open_with(&store, opts()).expect("open fresh");
+        let engine = LogEngine::open_with(&store, opts(chain)).expect("open fresh");
         for s in 0..STREAMS {
             let name = format!("orders-{s}");
             let mut expected = Version::NoStream;
@@ -279,7 +301,8 @@ async fn generate_golden_v3() {
             .collect();
         let manifest = json!({
             "format_version": 3,
-            "golden": GOLDEN_VERSION,
+            "golden": version,
+            "on_disk_chain": chain,
             "generator": "bn-yvi crates/mess-cli/tests/golden.rs",
             "note": "Open + verify only; store bytes are NOT byte-compared (fjall timestamps).",
             "segment_size": SEGMENT_SIZE,
@@ -305,7 +328,7 @@ async fn generate_golden_v3() {
             "events": events,
         });
 
-        let out_dir = golden_dir(GOLDEN_VERSION);
+        let out_dir = golden_dir(version);
         std::fs::create_dir_all(&out_dir).expect("mkdir golden dir");
         let manifest_bytes = serde_json::to_vec_pretty(&manifest).expect("serialize manifest");
         std::fs::write(out_dir.join("expected-events.json"), &manifest_bytes).expect("write manifest");
@@ -327,7 +350,7 @@ async fn generate_golden_v3() {
     assert!(sealed_pidx >= 1, "expected >=1 sealed segment, got {sealed_pidx}");
 
     // ---- 6. Pack the store dir as store.tar.zst (system tar + zstd). ----
-    let out_dir = golden_dir(GOLDEN_VERSION);
+    let out_dir = golden_dir(version);
     let tarball = out_dir.join("store.tar.zst");
     let parent = store.parent().expect("store parent");
     sh(&format!(
@@ -339,7 +362,7 @@ async fn generate_golden_v3() {
     let size = std::fs::metadata(&tarball).expect("tarball stat").len();
     assert!(size < 2 * 1024 * 1024, "golden tarball must stay < 2 MiB, got {size} bytes");
     eprintln!(
-        "golden {GOLDEN_VERSION}: {} events, {sealed_pidx} sealed segment(s), tarball {size} bytes",
+        "golden {version}: {} events, {sealed_pidx} sealed segment(s), tarball {size} bytes",
         STREAMS * EVENTS_PER_STREAM
     );
 }
@@ -350,12 +373,21 @@ async fn generate_golden_v3() {
 
 #[tokio::test]
 async fn golden_v3_opens_and_verifies() {
-    let dir = golden_dir(GOLDEN_VERSION);
+    check(GOLDEN_VERSION, false).await;
+}
+
+#[tokio::test]
+async fn golden_v4_opens_and_verifies() {
+    check(GOLDEN_V4, true).await;
+}
+
+async fn check(version: &str, chain: bool) {
+    let dir = golden_dir(version);
     let tarball = dir.join("store.tar.zst");
     let manifest_path = dir.join("expected-events.json");
     assert!(
         tarball.exists() && manifest_path.exists(),
-        "missing committed golden {GOLDEN_VERSION}; regenerate with `cargo test -p mess-cli --test golden -- --ignored generate_golden_v3`"
+        "missing committed golden {version}; regenerate with `cargo test -p mess-cli --test golden -- --ignored generate_golden_{version}`"
     );
 
     // ---- 1. Unpack the committed golden into a scratch dir. ----
@@ -375,8 +407,13 @@ async fn golden_v3_opens_and_verifies() {
     assert_eq!(events.len(), total);
 
     // ---- 2. Open with CURRENT code: full recovery over the whole chain. ----
-    let engine = LogEngine::open_with(&store, opts()).expect("reopen committed golden");
+    let engine = LogEngine::open_with(&store, opts(chain)).expect("reopen committed golden");
     assert_eq!(engine.total_events(), total, "recovery rehydrated every event");
+    assert_eq!(
+        manifest["on_disk_chain"].as_bool().unwrap_or(false),
+        chain,
+        "golden {version} manifest disagrees on the on-disk-chain flag"
+    );
 
     // ---- 3. Registry + names hydrated; sealed tier reloaded. ----
     assert!(
@@ -485,4 +522,27 @@ async fn golden_v3_opens_and_verifies() {
     // ---- 8. `mess verify --full` exits 0 on the committed golden. ----
     let report = verify::run(&store, &VerifyOptions { full: true });
     assert_eq!(report.exit_code(), 0, "mess verify --full must pass:\n{}", report.to_pretty());
+
+    // ---- 9. (chained goldens only) the segments really carry the on-disk
+    //         fold chain, so §8's `verify --full` validated real stored bytes —
+    //         not a silently-skipped empty chain. Every `.log` segment must
+    //         carry `crypto_chain` on every batch.
+    if chain {
+        let segments = mess_cli::store::discover_segments(&store);
+        assert!(!segments.is_empty(), "chained golden must have segments");
+        let mut chained_batches = 0u64;
+        for seg in &segments {
+            let (rec, _img) =
+                recover_segment_with_image(&RealFs, &seg.log_path).expect("recover golden segment");
+            for b in &rec.accepted {
+                assert!(
+                    b.has_crypto_chain,
+                    "golden {version} segment {} batch at {} is missing its on-disk crypto_chain",
+                    seg.segment_id, b.offset
+                );
+                chained_batches += 1;
+            }
+        }
+        assert!(chained_batches >= 1, "chained golden must carry >=1 on-disk chained batch");
+    }
 }

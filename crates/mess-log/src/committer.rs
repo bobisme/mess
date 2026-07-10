@@ -40,6 +40,7 @@
 //! this match the letter of step 3 and shave the residual per-`pwrite`
 //! cost; see the crate's open items.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -49,6 +50,7 @@ use std::time::Duration;
 
 use crate::degraded::{Degraded, PoisonCause};
 use crate::encode::{BatchEncoder, BatchInput, EncodeError, Subframe};
+use crate::fold_chain::ChainHead;
 use crate::runtime::{Fs, Runtime};
 use crate::watermark::Watermark;
 use crate::writer::{BatchSpec, SegmentSummary, SegmentWriter, WriteError};
@@ -90,6 +92,49 @@ impl Durability {
     /// `max_bytes = 8 MiB` (≈5× the measured knee).
     pub fn group_default() -> Self {
         Durability::Group { max_delay: Duration::from_millis(1), max_bytes: 8 * 1024 * 1024 }
+    }
+}
+
+/// Append-side fold-chain configuration for a committer (`bn-3l0`, spec 05 §6).
+///
+/// Opt-in and **off by default**: a committer built with [`ChainInit::off`]
+/// never sets `flags.CRYPTO_CHAIN` and writes byte-for-byte the same bytes it
+/// did before this feature existed. When [`enabled`](Self::enabled) is set, the
+/// committer maintains one running [`ChainHead`] per stream (G10 per-batch
+/// chain): before each batch it stamps the head's current value (`h[base-1]`)
+/// into the batch's `crypto_chain` slot (offset [`HEADER_LEN`](crate::format::HEADER_LEN),
+/// §4.4), then folds the batch's on-disk payloads into the head so the next
+/// batch of that stream continues the chain.
+///
+/// `heads` seeds the per-stream state on open: fresh stores pass an empty map
+/// (every stream starts at [`ChainHead::genesis`] on first sight); recovery
+/// rehydrates it by folding the recovered frames (spec 05 §5), so an append
+/// after crash-reopen continues each stream's chain exactly where the durable
+/// prefix left off.
+#[derive(Debug, Clone, Default)]
+pub struct ChainInit {
+    /// Whether to materialize `crypto_chain` into each batch. `false` keeps the
+    /// on-disk bytes byte-identical to a non-chained store.
+    pub enabled: bool,
+    /// Per-stream resumed heads (`stream_id → head`), from recovery. A stream
+    /// absent here starts at its [`ChainHead::genesis`] the first time it is
+    /// appended.
+    pub heads: HashMap<u64, ChainHead>,
+}
+
+impl ChainInit {
+    /// Chain disabled — the default. On-disk bytes stay identical to a store
+    /// that never knew about the fold chain.
+    #[must_use]
+    pub fn off() -> Self {
+        ChainInit { enabled: false, heads: HashMap::new() }
+    }
+
+    /// Chain enabled, seeded with `heads` (empty for a fresh store, or the
+    /// per-stream heads rehydrated by recovery).
+    #[must_use]
+    pub fn on(heads: HashMap<u64, ChainHead>) -> Self {
+        ChainInit { enabled: true, heads }
     }
 }
 
@@ -799,6 +844,8 @@ fn commit_group<R: Runtime, F: Fs>(
     metrics: &Metrics,
     degraded: &Degraded,
     roller: Option<&Roller>,
+    chain_enabled: bool,
+    heads: &mut HashMap<u64, ChainHead>,
 ) {
     // Steps 2–3: assign positions centrally + write each batch. `next_pos`
     // advances only for successfully written batches.
@@ -806,11 +853,35 @@ fn commit_group<R: Runtime, F: Fs>(
     let mut wrote_any = false;
     for req in &group {
         let subs = subframes_of(&req.events);
+        // Fold-chain (spec 05 §6, G10): when enabled, stamp this batch's
+        // `crypto_chain = h[base-1]` — the current head of this stream, which
+        // starts at `genesis(stream_id)` the first time the stream is seen. The
+        // head is only *advanced* after a successful write (below), so a
+        // rejected/retried batch never desyncs the chain. `entry` is a Copy
+        // `[u8; 32]`, so the borrow it hands to `spec` ends before the append
+        // returns and cannot conflict with the later `absorb`.
+        let entry: Option<ChainHead> = if chain_enabled {
+            let head = *heads
+                .entry(req.stream_id)
+                .or_insert_with(|| ChainHead::genesis(req.stream_id));
+            debug_assert_eq!(
+                head.next_version(),
+                req.first_stream_version,
+                "chain head for stream {} at v{} but batch starts at v{}",
+                req.stream_id,
+                head.next_version(),
+                req.first_stream_version,
+            );
+            Some(head)
+        } else {
+            None
+        };
+        let entry_bytes = entry.map(|h| h.entry());
         let spec = BatchSpec {
             stream_id: req.stream_id,
             category_id: req.category_id,
             first_stream_version: req.first_stream_version,
-            crypto_chain: None,
+            crypto_chain: entry_bytes.as_ref(),
             subframes: &subs,
         };
         // `bn-1vu`: try the append; on A8 SegmentFull with auto-roll wired,
@@ -829,7 +900,21 @@ fn commit_group<R: Runtime, F: Fs>(
                 wrote_any = true;
                 metrics.batches.incr();
                 metrics.events.add(u64::from(receipt.frame_count));
-                metrics.bytes.add(req.encoded_len);
+                // Exact on-disk bytes written (includes the 32-byte chain slot
+                // when enabled), taken from the receipt rather than the
+                // chain-unaware `encoded_len` preflight estimate.
+                metrics.bytes.add(receipt.total_len);
+                // The batch is durably placed: fold its on-disk payloads into
+                // the stream's head so the NEXT batch continues the chain
+                // (§6.2 exit head). Uncompressed frames (`Subframe::plain`)
+                // store the payload verbatim, so the bytes folded here are the
+                // exact bytes a reader re-hashes.
+                if chain_enabled {
+                    let head = heads
+                        .get_mut(&req.stream_id)
+                        .expect("chain head inserted above");
+                    head.absorb_batch(req.events.iter().map(|e| e.payload.as_slice()));
+                }
                 let first_position = receipt.first_global_pos;
                 let last_position = first_position + u64::from(receipt.frame_count) - 1;
                 Ok(AppendOutcome::Acked { first_position, last_position })
@@ -925,6 +1010,8 @@ async fn committer_loop<R: Runtime, F: Fs>(
     closed: Arc<AtomicBool>,
     done: Done,
     roller: Option<Roller>,
+    chain_enabled: bool,
+    mut heads: HashMap<u64, ChainHead>,
 ) {
     // The expected convoy width, seeded at 1 (so the first group and the
     // one-writer case both close immediately) and tracking the last group's
@@ -955,6 +1042,8 @@ async fn committer_loop<R: Runtime, F: Fs>(
             &metrics,
             &degraded,
             roller.as_ref(),
+            chain_enabled,
+            &mut heads,
         );
     }
     // Shutdown. On a healthy store, make the handoff durable (a `Process`-mode
@@ -1155,7 +1244,23 @@ impl<R: Runtime> Committer<R> {
         F: Fs + Send + 'static,
         F::File: Send,
     {
-        Self::spawn_inner(rt, writer, durability, None)
+        Self::spawn_inner(rt, writer, durability, None, ChainInit::off())
+    }
+
+    /// Spawn the committer with the fold chain enabled (`bn-3l0`, spec 05 §6):
+    /// every batch carries its real on-disk `crypto_chain`, per-stream heads
+    /// seeded from `chain.heads`. Otherwise identical to [`spawn`](Committer::spawn).
+    pub fn spawn_chained<F>(
+        rt: &R,
+        writer: SegmentWriter<F>,
+        durability: Durability,
+        chain: ChainInit,
+    ) -> Self
+    where
+        F: Fs + Send + 'static,
+        F::File: Send,
+    {
+        Self::spawn_inner(rt, writer, durability, None, chain)
     }
 
     /// Spawn the committer with live segment auto-roll (`bn-1vu`): when a batch
@@ -1172,7 +1277,25 @@ impl<R: Runtime> Committer<R> {
         F: Fs + Send + 'static,
         F::File: Send,
     {
-        Self::spawn_inner(rt, writer, durability, Some(roller))
+        Self::spawn_inner(rt, writer, durability, Some(roller), ChainInit::off())
+    }
+
+    /// Spawn with both live segment auto-roll (`bn-1vu`) and the fold chain
+    /// (`bn-3l0`, spec 05 §6): the production engine path. Per-stream heads are
+    /// seeded from `chain.heads` (rehydrated by recovery); each batch carries
+    /// its real on-disk `crypto_chain` when `chain.enabled`.
+    pub fn spawn_with_roll_chained<F>(
+        rt: &R,
+        writer: SegmentWriter<F>,
+        durability: Durability,
+        roller: Roller,
+        chain: ChainInit,
+    ) -> Self
+    where
+        F: Fs + Send + 'static,
+        F::File: Send,
+    {
+        Self::spawn_inner(rt, writer, durability, Some(roller), chain)
     }
 
     fn spawn_inner<F>(
@@ -1180,6 +1303,7 @@ impl<R: Runtime> Committer<R> {
         writer: SegmentWriter<F>,
         durability: Durability,
         roller: Option<Roller>,
+        chain: ChainInit,
     ) -> Self
     where
         F: Fs + Send + 'static,
@@ -1198,6 +1322,7 @@ impl<R: Runtime> Committer<R> {
         // its join handle (which `Runtime::spawn` returns as a non-`'static`
         // RPITIT we cannot store). `Drop`/`shutdown` await `done` instead
         // (`bn-3da`).
+        let ChainInit { enabled: chain_enabled, heads } = chain;
         drop(rt.spawn(committer_loop(
             rt.clone(),
             writer,
@@ -1210,6 +1335,8 @@ impl<R: Runtime> Committer<R> {
             closed.clone(),
             done.clone(),
             roller,
+            chain_enabled,
+            heads,
         )));
 
         Committer {

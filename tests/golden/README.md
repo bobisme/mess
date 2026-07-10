@@ -30,6 +30,13 @@ format v3). The generator and check live in
   format-stability);
 - runs `mess verify --full` and requires exit 0.
 
+The check is parameterized over `(version, chain)`; `golden_v3_opens_and_verifies`
+and `golden_v4_opens_and_verifies` are thin wrappers. `v4` (`bn-3l0`) opens the
+engine with `chain: true`, so its segments carry the **real on-disk**
+`crypto_chain` — `mess verify --full` recomputes the fold chain against the
+actual stored bytes, and the check additionally asserts every batch on disk
+carries the chain (flag bit 0). `v3` stays plain-frame (chain off) and immutable.
+
 ## The rule: OLD GOLDENS ARE IMMUTABLE
 
 A committed `vN/` is **frozen**. Never regenerate, re-pack, or edit an existing
@@ -53,12 +60,15 @@ Add a new golden (bump `N`) on **any format-affecting change**, e.g.:
 If a format change ships without either a new `vN` **or** a migration that keeps
 old goldens opening, the check fails by construction — that is the point.
 
-> Scope note: the composed `LogEngine` backend does not yet emit the optional
-> per-batch `crypto_chain` bytes into its segments, so the fold-certificate
-> contract is pinned against the chained stream's committed payloads via
-> `mess-log`'s spec-conformant `build_cert` construction (hashes frozen in the
-> manifest), not against on-disk chain bytes. When the engine grows a real
-> on-disk chain, add a new `vN` whose segments carry it.
+> Scope note: `v3`'s composed `LogEngine` backend emitted PLAIN frames (no
+> per-batch `crypto_chain`), so its fold-certificate contract is pinned against
+> the chained stream's committed payloads via `mess-log`'s spec-conformant
+> `build_cert` construction (hashes frozen in the manifest), not against on-disk
+> chain bytes. As of `bn-3l0` the engine emits a real on-disk chain when opened
+> with `EngineOptions { chain: true }`; **`v4`** is the golden whose segments
+> carry it, so there `mess verify --full` validates the actual stored
+> `crypto_chain`. Both goldens keep the `build_cert` payload-derived hashes in
+> their manifests for hash-derivation stability.
 
 ## Regenerating (only when creating a NEW `vN`)
 
