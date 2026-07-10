@@ -48,6 +48,132 @@ pub struct StoredRecord {
     pub global_position: u64,
 }
 
+impl StoredRecord {
+    /// Split [`stream_id`](Self::stream_id) into its category and suffix at
+    /// the **first** `-` — the one blessed way to route a
+    /// [`read_global`](crate::Backend::read_global)/subscribe record by
+    /// category without ad-hoc prefix surgery at every call site.
+    ///
+    /// This mirrors the app-level convention every stream id is built from
+    /// (e.g. `examples/social`'s `user_stream`/`post_stream`:
+    /// `format!("{category}-{id}")`): a category tag, a `-`, then an entity
+    /// id. The engine does not (yet) intern a per-stream category — the real
+    /// [`LogEngine`](crate::LogEngine) currently registers every stream
+    /// under the reserved system category — so this is well-defined string
+    /// splitting over the convention, not a lookup into engine state.
+    ///
+    /// # Invariants
+    ///
+    /// - Splits at the **first** `-` only, so a suffix that itself contains `-`
+    ///   (e.g. `post-abc-123`) stays intact: category `"post"`, suffix
+    ///   `"abc-123"`.
+    /// - No `-` anywhere in `stream_id` (e.g. the reserved `"$registry"`
+    ///   stream): the whole string is the category, the suffix is `""`.
+    /// - A leading `-` (e.g. `"-42"`) yields an empty category `""` and suffix
+    ///   `"42"` — never `None`; category/suffix are always defined, just
+    ///   possibly empty.
+    /// - The split is on the ASCII byte `-`, which is always a full UTF-8
+    ///   character on its own, so this never mis-splits inside a multi-byte
+    ///   unicode codepoint on either side.
+    ///
+    /// Returns `(category, suffix)`; [`category`](Self::category) and
+    /// [`stream_suffix`](Self::stream_suffix) are convenience accessors for
+    /// just one half.
+    #[must_use]
+    pub fn category_and_suffix(&self) -> (&str, &str) {
+        self.stream_id.split_once('-').unwrap_or((&self.stream_id, ""))
+    }
+
+    /// The category tag of [`stream_id`](Self::stream_id) — everything
+    /// before the first `-`, or the whole id if there is no `-`. See
+    /// [`category_and_suffix`](Self::category_and_suffix) for the full
+    /// invariants.
+    #[must_use]
+    pub fn category(&self) -> &str { self.category_and_suffix().0 }
+
+    /// The entity-id suffix of [`stream_id`](Self::stream_id) — everything
+    /// after the first `-`, or `""` if there is no `-`. See
+    /// [`category_and_suffix`](Self::category_and_suffix) for the full
+    /// invariants.
+    #[must_use]
+    pub fn stream_suffix(&self) -> &str { self.category_and_suffix().1 }
+}
+
+#[cfg(test)]
+mod stored_record_tests {
+    use super::StoredRecord;
+
+    fn rec(stream_id: &str) -> StoredRecord {
+        StoredRecord {
+            stream_id:       stream_id.to_string(),
+            message_type:    "Test".to_string(),
+            data:            Vec::new(),
+            stream_position: 0,
+            global_position: 0,
+        }
+    }
+
+    #[test]
+    fn splits_category_and_suffix_at_first_dash() {
+        let r = rec("user-42");
+        assert_eq!(r.category(), "user");
+        assert_eq!(r.stream_suffix(), "42");
+        assert_eq!(r.category_and_suffix(), ("user", "42"));
+    }
+
+    #[test]
+    fn separator_in_suffix_stays_in_suffix() {
+        // Only the FIRST `-` is the category/suffix boundary.
+        let r = rec("post-abc-123");
+        assert_eq!(r.category(), "post");
+        assert_eq!(r.stream_suffix(), "abc-123");
+    }
+
+    #[test]
+    fn no_separator_is_all_category() {
+        let r = rec("$registry");
+        assert_eq!(r.category(), "$registry");
+        assert_eq!(r.stream_suffix(), "");
+    }
+
+    #[test]
+    fn empty_stream_id_is_all_category() {
+        let r = rec("");
+        assert_eq!(r.category(), "");
+        assert_eq!(r.stream_suffix(), "");
+    }
+
+    #[test]
+    fn leading_separator_is_empty_category() {
+        let r = rec("-42");
+        assert_eq!(r.category(), "");
+        assert_eq!(r.stream_suffix(), "42");
+    }
+
+    #[test]
+    fn trailing_separator_is_empty_suffix() {
+        let r = rec("user-");
+        assert_eq!(r.category(), "user");
+        assert_eq!(r.stream_suffix(), "");
+    }
+
+    #[test]
+    fn unicode_category_and_suffix() {
+        // The separator `-` is a single-byte ASCII char, so splitting on it
+        // never lands inside a multi-byte codepoint on either side.
+        let r = rec("café-☕42");
+        assert_eq!(r.category(), "café");
+        assert_eq!(r.stream_suffix(), "☕42");
+    }
+
+    #[test]
+    fn only_separator() {
+        let r = rec("-");
+        assert_eq!(r.category(), "");
+        assert_eq!(r.stream_suffix(), "");
+    }
+}
+
 /// A successful append.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Appended {

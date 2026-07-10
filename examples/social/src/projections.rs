@@ -183,21 +183,32 @@ impl State {
         }
     }
 
-    /// Route one stored record to the right fold by stream prefix. Records on
-    /// streams this projection does not understand (or that fail to decode)
-    /// are skipped — a projection must tolerate a log wider than the slice of
-    /// it that it models.
+    /// Route one stored record to the right fold by
+    /// [`StoredRecord::category`] — the blessed, typed replacement for
+    /// hand-rolled stream-prefix string surgery. Records on streams this
+    /// projection does not understand (an unknown category, or a suffix/
+    /// payload that fails to decode) are skipped — a projection must
+    /// tolerate a log wider than the slice of it that it models.
     fn apply_record(&mut self, rec: &StoredRecord) {
-        if let Some(suffix) = rec.stream_id.strip_prefix("user-")
-            && let Ok(owner) = Id::from_str(suffix)
-            && let Ok(ev) = UserEvent::decode(&rec.message_type, &rec.data)
-        {
-            self.apply_user(owner, &ev);
-        } else if let Some(suffix) = rec.stream_id.strip_prefix("post-")
-            && let Ok(id) = Id::from_str(suffix)
-            && let Ok(ev) = PostEvent::decode(&rec.message_type, &rec.data)
-        {
-            self.apply_post(id, rec.global_position, &ev);
+        let (category, suffix) = rec.category_and_suffix();
+        match category {
+            "user" => {
+                if let Ok(owner) = Id::from_str(suffix)
+                    && let Ok(ev) =
+                        UserEvent::decode(&rec.message_type, &rec.data)
+                {
+                    self.apply_user(owner, &ev);
+                }
+            }
+            "post" => {
+                if let Ok(id) = Id::from_str(suffix)
+                    && let Ok(ev) =
+                        PostEvent::decode(&rec.message_type, &rec.data)
+                {
+                    self.apply_post(id, rec.global_position, &ev);
+                }
+            }
+            _ => {}
         }
     }
 
