@@ -1,0 +1,25 @@
+[package]
+name = "flat_combined_append"
+version = "0.1.0"
+edition = "2024"
+
+# Standalone spike: opt out of the repo's root workspace.
+[workspace]
+
+[dependencies]
+# The REAL committer/writer/scanner — v3 on-disk bytes, untouched.
+mess-log = { path = "../../crates/mess-log" }
+# The current composed engine (baseline + differential oracle).
+mess-store = { path = "../../crates/mess-store" }
+# Self-sweeping ext4 scratch dirs (same namespace every repo bench uses).
+mess-testkit = { path = "../../crates/mess-testkit" }
+tokio = { version = "1.52", features = ["full"] }
+futures = "0.3"
+thiserror = "2"
+
+[dev-dependencies]
+rand = "0.8"
+
+[profile.release]
+lto = "thin"
+debug = true # symbols for perf record/report

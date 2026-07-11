@@ -1,0 +1,200 @@
+== cell proc-p24-b10: payload=24 batch=10 writers=4 bpw=12500 shape=perwriter mode=process total_events=500000
+  bare rep0:      2932533 ev/s  wall 0.171s  p50 11.2us  p99 24.1us  fsyncs 0  mean_fsync 0.0us
+  log  rep0:       520056 ev/s  wall 0.961s  p50 67.5us  p99 190.7us  fsyncs 0  mean_fsync 0.0us
+  b0   rep0:       764478 ev/s  wall 0.654s  p50 46.9us  p99 79.5us  fsyncs 0  mean_fsync 0.0us
+  b1   rep0:       919170 ev/s  wall 0.544s  p50 39.0us  p99 70.9us  fsyncs 0  mean_fsync 0.0us
+  b0d  rep0:      1168925 ev/s  wall 0.428s  p50 26.4us  p99 101.5us  fsyncs 0  mean_fsync 0.0us
+  b0dth rep0:      1812800 ev/s  wall 0.276s  p50 19.1us  p99 32.8us  fsyncs 0  mean_fsync 0.0us
+  b0dth rep1:      1752629 ev/s  wall 0.285s  p50 19.6us  p99 34.7us  fsyncs 0  mean_fsync 0.0us
+  b0d  rep1:      1237663 ev/s  wall 0.404s  p50 25.8us  p99 60.9us  fsyncs 0  mean_fsync 0.0us
+  b1   rep1:       770888 ev/s  wall 0.649s  p50 42.2us  p99 132.6us  fsyncs 0  mean_fsync 0.0us
+  b0   rep1:       744206 ev/s  wall 0.672s  p50 45.3us  p99 107.2us  fsyncs 0  mean_fsync 0.0us
+  log  rep1:       508348 ev/s  wall 0.984s  p50 67.9us  p99 252.0us  fsyncs 0  mean_fsync 0.0us
+  bare rep1:      2959586 ev/s  wall 0.169s  p50 11.2us  p99 22.8us  fsyncs 0  mean_fsync 0.0us
+  bare rep2:      3167268 ev/s  wall 0.158s  p50 10.8us  p99 21.5us  fsyncs 0  mean_fsync 0.0us
+  log  rep2:       557360 ev/s  wall 0.897s  p50 62.0us  p99 194.9us  fsyncs 0  mean_fsync 0.0us
+  b0   rep2:       713335 ev/s  wall 0.701s  p50 48.3us  p99 115.3us  fsyncs 0  mean_fsync 0.0us
+  b1   rep2:       830410 ev/s  wall 0.602s  p50 39.8us  p99 105.7us  fsyncs 0  mean_fsync 0.0us
+  b0d  rep2:      1314926 ev/s  wall 0.380s  p50 26.0us  p99 55.5us  fsyncs 0  mean_fsync 0.0us
+  b0dth rep2:      1852386 ev/s  wall 0.270s  p50 18.8us  p99 31.7us  fsyncs 0  mean_fsync 0.0us
+  bare SUMMARY best      3167268 ev/s  median      2959586 ev/s
+  log  SUMMARY best       557360 ev/s  median       520056 ev/s
+  b0   SUMMARY best       764478 ev/s  median       744206 ev/s
+  b1   SUMMARY best       919170 ev/s  median       830410 ev/s
+  b0d  SUMMARY best      1314926 ev/s  median      1237663 ev/s
+  b0dth SUMMARY best      1852386 ev/s  median      1812800 ev/s
+== cell group-p24-b10: payload=24 batch=10 writers=4 bpw=500 shape=perwriter mode=group total_events=20000
+  bare rep0:        14520 ev/s  wall 1.377s  p50 2509.6us  p99 5617.4us  fsyncs 502  mean_fsync 2692.1us
+  log  rep0:        14295 ev/s  wall 1.399s  p50 2597.7us  p99 5838.5us  fsyncs 503  mean_fsync 2662.8us
+  b0   rep0:        13570 ev/s  wall 1.474s  p50 2706.5us  p99 5908.1us  fsyncs 501  mean_fsync 2682.1us
+  b1   rep0:        13787 ev/s  wall 1.451s  p50 2716.1us  p99 4840.9us  fsyncs 500  mean_fsync 2645.8us
+  b0d  rep0:        13887 ev/s  wall 1.440s  p50 2704.2us  p99 5831.8us  fsyncs 500  mean_fsync 2643.2us
+  b0dth rep0:        13890 ev/s  wall 1.440s  p50 2696.5us  p99 5842.4us  fsyncs 501  mean_fsync 2637.1us
+  b0dth rep1:        14491 ev/s  wall 1.380s  p50 2692.0us  p99 5019.1us  fsyncs 502  mean_fsync 2493.8us
+  b0d  rep1:        14580 ev/s  wall 1.372s  p50 2693.4us  p99 5844.9us  fsyncs 500  mean_fsync 2505.2us
+  b1   rep1:        14717 ev/s  wall 1.359s  p50 2696.7us  p99 3605.7us  fsyncs 500  mean_fsync 2468.3us
+  b0   rep1:        11226 ev/s  wall 1.782s  p50 2970.9us  p99 11176.9us  fsyncs 518  mean_fsync 2853.3us
+  log  rep1:        13843 ev/s  wall 1.445s  p50 2615.8us  p99 4863.5us  fsyncs 504  mean_fsync 2733.7us
+  bare rep1:        14155 ev/s  wall 1.413s  p50 2549.5us  p99 4848.3us  fsyncs 501  mean_fsync 2774.3us
+  bare rep2:        14032 ev/s  wall 1.425s  p50 2540.8us  p99 5702.2us  fsyncs 501  mean_fsync 2793.7us
+  log  rep2:         8789 ev/s  wall 2.275s  p50 4976.1us  p99 12950.3us  fsyncs 805  mean_fsync 2779.6us
+  b0   rep2:        13640 ev/s  wall 1.466s  p50 2710.8us  p99 4910.4us  fsyncs 500  mean_fsync 2679.6us
+  b1   rep2:        14696 ev/s  wall 1.361s  p50 2698.9us  p99 2997.1us  fsyncs 500  mean_fsync 2469.4us
+  b0d  rep2:        14230 ev/s  wall 1.405s  p50 2698.8us  p99 5890.6us  fsyncs 500  mean_fsync 2571.0us
+  b0dth rep2:        14793 ev/s  wall 1.352s  p50 2687.6us  p99 3500.1us  fsyncs 501  mean_fsync 2461.7us
+  bare SUMMARY best        14520 ev/s  median        14155 ev/s
+  log  SUMMARY best        14295 ev/s  median        13843 ev/s
+  b0   SUMMARY best        13640 ev/s  median        13570 ev/s
+  b1   SUMMARY best        14717 ev/s  median        14696 ev/s
+  b0d  SUMMARY best        14580 ev/s  median        14230 ev/s
+  b0dth SUMMARY best        14793 ev/s  median        14491 ev/s
+== cell proc-p24-b100: payload=24 batch=100 writers=4 bpw=2500 shape=perwriter mode=process total_events=1000000
+  bare rep0:     10107083 ev/s  wall 0.099s  p50 27.6us  p99 51.5us  fsyncs 0  mean_fsync 0.0us
+  log  rep0:      1969082 ev/s  wall 0.508s  p50 148.6us  p99 326.1us  fsyncs 0  mean_fsync 0.0us
+  b0   rep0:      2038233 ev/s  wall 0.491s  p50 126.9us  p99 489.8us  fsyncs 0  mean_fsync 0.0us
+  b1   rep0:      2447884 ev/s  wall 0.409s  p50 102.7us  p99 334.5us  fsyncs 0  mean_fsync 0.0us
+  b0d  rep0:      2880879 ev/s  wall 0.347s  p50 90.5us  p99 215.0us  fsyncs 0  mean_fsync 0.0us
+  b0dth rep0:      6931808 ev/s  wall 0.144s  p50 41.6us  p99 65.1us  fsyncs 0  mean_fsync 0.0us
+  b0dth rep1:      6830068 ev/s  wall 0.146s  p50 41.2us  p99 75.3us  fsyncs 0  mean_fsync 0.0us
+  b0d  rep1:      2905057 ev/s  wall 0.344s  p50 89.8us  p99 203.7us  fsyncs 0  mean_fsync 0.0us
+  b1   rep1:      2236099 ev/s  wall 0.447s  p50 113.4us  p99 262.7us  fsyncs 0  mean_fsync 0.0us
+  b0   rep1:      1883500 ev/s  wall 0.531s  p50 145.5us  p99 336.8us  fsyncs 0  mean_fsync 0.0us
+  log  rep1:      1956646 ev/s  wall 0.511s  p50 151.5us  p99 348.8us  fsyncs 0  mean_fsync 0.0us
+  bare rep1:      9521221 ev/s  wall 0.105s  p50 31.1us  p99 59.8us  fsyncs 0  mean_fsync 0.0us
+  bare rep2:      9330797 ev/s  wall 0.107s  p50 31.6us  p99 65.2us  fsyncs 0  mean_fsync 0.0us
+  log  rep2:      1910541 ev/s  wall 0.523s  p50 151.8us  p99 308.8us  fsyncs 0  mean_fsync 0.0us
+  b0   rep2:      2353694 ev/s  wall 0.425s  p50 117.1us  p99 402.5us  fsyncs 0  mean_fsync 0.0us
+  b1   rep2:      2393333 ev/s  wall 0.418s  p50 104.5us  p99 270.4us  fsyncs 0  mean_fsync 0.0us
+  b0d  rep2:      3020955 ev/s  wall 0.331s  p50 86.5us  p99 204.4us  fsyncs 0  mean_fsync 0.0us
+  b0dth rep2:      6846221 ev/s  wall 0.146s  p50 44.0us  p99 71.9us  fsyncs 0  mean_fsync 0.0us
+  bare SUMMARY best     10107083 ev/s  median      9521221 ev/s
+  log  SUMMARY best      1969082 ev/s  median      1956646 ev/s
+  b0   SUMMARY best      2353694 ev/s  median      2038233 ev/s
+  b1   SUMMARY best      2447884 ev/s  median      2393333 ev/s
+  b0d  SUMMARY best      3020955 ev/s  median      2905057 ev/s
+  b0dth SUMMARY best      6931808 ev/s  median      6846221 ev/s
+== cell group-p24-b100: payload=24 batch=100 writers=4 bpw=500 shape=perwriter mode=group total_events=200000
+  bare rep0:       143794 ev/s  wall 1.391s  p50 2570.1us  p99 5666.8us  fsyncs 506  mean_fsync 2665.2us
+  log  rep0:       106526 ev/s  wall 1.877s  p50 2916.2us  p99 6868.7us  fsyncs 638  mean_fsync 2773.9us
+  b0   rep0:       129776 ev/s  wall 1.541s  p50 2785.2us  p99 5516.2us  fsyncs 500  mean_fsync 2767.7us
+  b1   rep0:       127488 ev/s  wall 1.569s  p50 2779.2us  p99 8987.7us  fsyncs 501  mean_fsync 2793.0us
+  b0d  rep0:       137766 ev/s  wall 1.452s  p50 2752.5us  p99 6002.3us  fsyncs 500  mean_fsync 2604.5us
+  b0dth rep0:       140185 ev/s  wall 1.427s  p50 2774.1us  p99 5801.6us  fsyncs 502  mean_fsync 2556.8us
+  b0dth rep1:       141593 ev/s  wall 1.413s  p50 2715.3us  p99 3933.8us  fsyncs 503  mean_fsync 2518.6us
+  b0d  rep1:       138386 ev/s  wall 1.445s  p50 2755.0us  p99 5962.4us  fsyncs 500  mean_fsync 2587.8us
+  b1   rep1:       133337 ev/s  wall 1.500s  p50 2770.5us  p99 6328.0us  fsyncs 500  mean_fsync 2680.7us
+  b0   rep1:       142705 ev/s  wall 1.401s  p50 2755.1us  p99 3185.3us  fsyncs 500  mean_fsync 2488.5us
+  log  rep1:       142494 ev/s  wall 1.404s  p50 2696.3us  p99 3035.1us  fsyncs 511  mean_fsync 2493.0us
+  bare rep1:       144785 ev/s  wall 1.381s  p50 2549.1us  p99 5707.3us  fsyncs 502  mean_fsync 2660.2us
+  bare rep2:       142094 ev/s  wall 1.408s  p50 2566.6us  p99 4366.5us  fsyncs 502  mean_fsync 2725.5us
+  log  rep2:       134234 ev/s  wall 1.490s  p50 2744.5us  p99 4650.7us  fsyncs 512  mean_fsync 2652.5us
+  b0   rep2:       125141 ev/s  wall 1.598s  p50 2779.3us  p99 10653.5us  fsyncs 500  mean_fsync 2887.5us
+  b1   rep2:       126733 ev/s  wall 1.578s  p50 2798.2us  p99 6483.7us  fsyncs 502  mean_fsync 2816.5us
+  b0d  rep2:       134569 ev/s  wall 1.486s  p50 2772.2us  p99 4590.5us  fsyncs 501  mean_fsync 2662.5us
+  b0dth rep2:       137388 ev/s  wall 1.456s  p50 2732.6us  p99 4701.1us  fsyncs 500  mean_fsync 2644.8us
+  bare SUMMARY best       144785 ev/s  median       143794 ev/s
+  log  SUMMARY best       142494 ev/s  median       134234 ev/s
+  b0   SUMMARY best       142705 ev/s  median       129776 ev/s
+  b1   SUMMARY best       133337 ev/s  median       127488 ev/s
+  b0d  SUMMARY best       138386 ev/s  median       137766 ev/s
+  b0dth SUMMARY best       141593 ev/s  median       140185 ev/s
+== cell proc-p250-b10: payload=250 batch=10 writers=4 bpw=12500 shape=perwriter mode=process total_events=500000
+  bare rep0:      1900289 ev/s  wall 0.263s  p50 18.6us  p99 32.6us  fsyncs 0  mean_fsync 0.0us
+  log  rep0:       519492 ev/s  wall 0.962s  p50 68.1us  p99 156.9us  fsyncs 0  mean_fsync 0.0us
+  b0   rep0:       697077 ev/s  wall 0.717s  p50 50.3us  p99 106.6us  fsyncs 0  mean_fsync 0.0us
+  b1   rep0:       794895 ev/s  wall 0.629s  p50 45.7us  p99 84.4us  fsyncs 0  mean_fsync 0.0us
+  b0d  rep0:      1162362 ev/s  wall 0.430s  p50 31.3us  p99 61.6us  fsyncs 0  mean_fsync 0.0us
+  b0dth rep0:      1358747 ev/s  wall 0.368s  p50 26.4us  p99 48.7us  fsyncs 0  mean_fsync 0.0us
+  b0dth rep1:      1351352 ev/s  wall 0.370s  p50 26.4us  p99 46.4us  fsyncs 0  mean_fsync 0.0us
+  b0d  rep1:      1140424 ev/s  wall 0.438s  p50 30.3us  p99 63.6us  fsyncs 0  mean_fsync 0.0us
+  b1   rep1:       776785 ev/s  wall 0.644s  p50 46.9us  p99 86.0us  fsyncs 0  mean_fsync 0.0us
+  b0   rep1:       709047 ev/s  wall 0.705s  p50 49.0us  p99 95.5us  fsyncs 0  mean_fsync 0.0us
+  log  rep1:       554454 ev/s  wall 0.902s  p50 65.5us  p99 123.0us  fsyncs 0  mean_fsync 0.0us
+  bare rep1:      1921743 ev/s  wall 0.260s  p50 18.6us  p99 35.2us  fsyncs 0  mean_fsync 0.0us
+  bare rep2:      1932522 ev/s  wall 0.259s  p50 18.5us  p99 32.0us  fsyncs 0  mean_fsync 0.0us
+  log  rep2:       570127 ev/s  wall 0.877s  p50 61.9us  p99 142.0us  fsyncs 0  mean_fsync 0.0us
+  b0   rep2:       725138 ev/s  wall 0.690s  p50 49.9us  p99 86.7us  fsyncs 0  mean_fsync 0.0us
+  b1   rep2:       820205 ev/s  wall 0.610s  p50 44.9us  p99 75.5us  fsyncs 0  mean_fsync 0.0us
+  b0d  rep2:      1193095 ev/s  wall 0.419s  p50 29.4us  p99 62.8us  fsyncs 0  mean_fsync 0.0us
+  b0dth rep2:      1374939 ev/s  wall 0.364s  p50 26.0us  p99 45.2us  fsyncs 0  mean_fsync 0.0us
+  bare SUMMARY best      1932522 ev/s  median      1921743 ev/s
+  log  SUMMARY best       570127 ev/s  median       554454 ev/s
+  b0   SUMMARY best       725138 ev/s  median       709047 ev/s
+  b1   SUMMARY best       820205 ev/s  median       794895 ev/s
+  b0d  SUMMARY best      1193095 ev/s  median      1162362 ev/s
+  b0dth SUMMARY best      1374939 ev/s  median      1358747 ev/s
+== cell group-p250-b10: payload=250 batch=10 writers=4 bpw=500 shape=perwriter mode=group total_events=20000
+  bare rep0:        12444 ev/s  wall 1.607s  p50 2552.3us  p99 5827.2us  fsyncs 609  mean_fsync 2592.4us
+  log  rep0:        14135 ev/s  wall 1.415s  p50 2604.8us  p99 6188.7us  fsyncs 503  mean_fsync 2677.5us
+  b0   rep0:        14154 ev/s  wall 1.413s  p50 2703.1us  p99 5909.0us  fsyncs 500  mean_fsync 2569.4us
+  b1   rep0:        13643 ev/s  wall 1.466s  p50 2724.7us  p99 5139.3us  fsyncs 500  mean_fsync 2679.4us
+  b0d  rep0:        13623 ev/s  wall 1.468s  p50 2723.2us  p99 4875.1us  fsyncs 500  mean_fsync 2690.2us
+  b0dth rep0:        13380 ev/s  wall 1.495s  p50 2716.5us  p99 5882.7us  fsyncs 501  mean_fsync 2737.5us
+  b0dth rep1:        13224 ev/s  wall 1.512s  p50 2710.9us  p99 6394.5us  fsyncs 500  mean_fsync 2788.3us
+  b0d  rep1:        13773 ev/s  wall 1.452s  p50 2708.3us  p99 6112.1us  fsyncs 500  mean_fsync 2658.8us
+  b1   rep1:        14681 ev/s  wall 1.362s  p50 2704.1us  p99 3020.8us  fsyncs 500  mean_fsync 2461.5us
+  b0   rep1:        14406 ev/s  wall 1.388s  p50 2705.3us  p99 5964.3us  fsyncs 500  mean_fsync 2514.6us
+  log  rep1:        14813 ev/s  wall 1.350s  p50 2599.4us  p99 5830.3us  fsyncs 503  mean_fsync 2542.7us
+  bare rep1:        14582 ev/s  wall 1.372s  p50 2500.6us  p99 5648.2us  fsyncs 523  mean_fsync 2571.7us
+  bare rep2:        13277 ev/s  wall 1.506s  p50 2507.4us  p99 5039.9us  fsyncs 596  mean_fsync 2482.1us
+  log  rep2:         8767 ev/s  wall 2.281s  p50 4990.6us  p99 8319.8us  fsyncs 888  mean_fsync 2525.5us
+  b0   rep2:        14175 ev/s  wall 1.411s  p50 2702.4us  p99 8992.6us  fsyncs 500  mean_fsync 2566.4us
+  b1   rep2:        14265 ev/s  wall 1.402s  p50 2710.5us  p99 6132.7us  fsyncs 500  mean_fsync 2544.2us
+  b0d  rep2:        14689 ev/s  wall 1.362s  p50 2702.0us  p99 2935.2us  fsyncs 500  mean_fsync 2478.7us
+  b0dth rep2:        14360 ev/s  wall 1.393s  p50 2697.7us  p99 5882.0us  fsyncs 500  mean_fsync 2544.5us
+  bare SUMMARY best        14582 ev/s  median        13277 ev/s
+  log  SUMMARY best        14813 ev/s  median        14135 ev/s
+  b0   SUMMARY best        14406 ev/s  median        14175 ev/s
+  b1   SUMMARY best        14681 ev/s  median        14265 ev/s
+  b0d  SUMMARY best        14689 ev/s  median        13773 ev/s
+  b0dth SUMMARY best        14360 ev/s  median        13380 ev/s
+== cell proc-p250-b100: payload=250 batch=100 writers=4 bpw=2500 shape=perwriter mode=process total_events=1000000
+  bare rep0:      4685649 ev/s  wall 0.213s  p50 77.1us  p99 112.3us  fsyncs 0  mean_fsync 0.0us
+  log  rep0:      1480965 ev/s  wall 0.675s  p50 214.0us  p99 442.0us  fsyncs 0  mean_fsync 0.0us
+  b0   rep0:      1569626 ev/s  wall 0.637s  p50 192.7us  p99 359.7us  fsyncs 0  mean_fsync 0.0us
+  b1   rep0:      1790888 ev/s  wall 0.558s  p50 156.9us  p99 327.8us  fsyncs 0  mean_fsync 0.0us
+  b0d  rep0:      2549078 ev/s  wall 0.392s  p50 130.8us  p99 228.8us  fsyncs 0  mean_fsync 0.0us
+  b0dth rep0:      3648203 ev/s  wall 0.274s  p50 94.2us  p99 135.0us  fsyncs 0  mean_fsync 0.0us
+  b0dth rep1:      3608087 ev/s  wall 0.277s  p50 94.5us  p99 126.5us  fsyncs 0  mean_fsync 0.0us
+  b0d  rep1:      2594929 ev/s  wall 0.385s  p50 135.9us  p99 226.9us  fsyncs 0  mean_fsync 0.0us
+  b1   rep1:      1811280 ev/s  wall 0.552s  p50 151.5us  p99 394.3us  fsyncs 0  mean_fsync 0.0us
+  b0   rep1:      1747447 ev/s  wall 0.572s  p50 160.5us  p99 365.0us  fsyncs 0  mean_fsync 0.0us
+  log  rep1:      1396659 ev/s  wall 0.716s  p50 222.7us  p99 524.9us  fsyncs 0  mean_fsync 0.0us
+  bare rep1:      4607228 ev/s  wall 0.217s  p50 77.8us  p99 124.5us  fsyncs 0  mean_fsync 0.0us
+  bare rep2:      4638734 ev/s  wall 0.216s  p50 77.3us  p99 115.7us  fsyncs 0  mean_fsync 0.0us
+  log  rep2:      1480972 ev/s  wall 0.675s  p50 205.0us  p99 496.9us  fsyncs 0  mean_fsync 0.0us
+  b0   rep2:      1560464 ev/s  wall 0.641s  p50 189.7us  p99 449.9us  fsyncs 0  mean_fsync 0.0us
+  b1   rep2:      1870452 ev/s  wall 0.535s  p50 148.0us  p99 440.7us  fsyncs 0  mean_fsync 0.0us
+  b0d  rep2:      2238667 ev/s  wall 0.447s  p50 159.3us  p99 230.1us  fsyncs 0  mean_fsync 0.0us
+  b0dth rep2:      3600988 ev/s  wall 0.278s  p50 94.7us  p99 131.9us  fsyncs 0  mean_fsync 0.0us
+  bare SUMMARY best      4685649 ev/s  median      4638734 ev/s
+  log  SUMMARY best      1480972 ev/s  median      1480965 ev/s
+  b0   SUMMARY best      1747447 ev/s  median      1569626 ev/s
+  b1   SUMMARY best      1870452 ev/s  median      1811280 ev/s
+  b0d  SUMMARY best      2594929 ev/s  median      2549078 ev/s
+  b0dth SUMMARY best      3648203 ev/s  median      3608087 ev/s
+== cell group-p250-b100: payload=250 batch=100 writers=4 bpw=500 shape=perwriter mode=group total_events=200000
+  bare rep0:       127894 ev/s  wall 1.564s  p50 2714.7us  p99 7344.2us  fsyncs 501  mean_fsync 2988.3us
+  log  rep0:       114786 ev/s  wall 1.742s  p50 3103.2us  p99 6046.3us  fsyncs 505  mean_fsync 3071.0us
+  b0   rep0:       111515 ev/s  wall 1.793s  p50 3200.2us  p99 6182.7us  fsyncs 500  mean_fsync 3185.5us
+  b1   rep0:       120735 ev/s  wall 1.657s  p50 2942.5us  p99 6126.4us  fsyncs 501  mean_fsync 2896.8us
+  b0d  rep0:       120859 ev/s  wall 1.655s  p50 2972.2us  p99 5257.7us  fsyncs 500  mean_fsync 2957.5us
+  b0dth rep0:       129287 ev/s  wall 1.547s  p50 2882.2us  p99 6009.6us  fsyncs 500  mean_fsync 2765.9us
+  b0dth rep1:       126352 ev/s  wall 1.583s  p50 2939.4us  p99 5118.0us  fsyncs 500  mean_fsync 2817.7us
+  b0d  rep1:       120638 ev/s  wall 1.658s  p50 2985.8us  p99 5951.8us  fsyncs 500  mean_fsync 2944.2us
+  b1   rep1:       116221 ev/s  wall 1.721s  p50 3067.9us  p99 6111.4us  fsyncs 500  mean_fsync 3053.2us
+  b0   rep1:       131054 ev/s  wall 1.526s  p50 2887.3us  p99 6242.5us  fsyncs 503  mean_fsync 2628.7us
+  log  rep1:       128755 ev/s  wall 1.553s  p50 2908.8us  p99 6102.9us  fsyncs 514  mean_fsync 2632.5us
+  bare rep1:       144834 ev/s  wall 1.381s  p50 2684.4us  p99 5786.0us  fsyncs 502  mean_fsync 2604.7us
+  bare rep2:       143055 ev/s  wall 1.398s  p50 2675.7us  p99 5801.4us  fsyncs 503  mean_fsync 2644.2us
+  log  rep2:       121106 ev/s  wall 1.651s  p50 2908.6us  p99 6813.5us  fsyncs 546  mean_fsync 2667.3us
+  b0   rep2:       127225 ev/s  wall 1.572s  p50 2919.0us  p99 6039.0us  fsyncs 501  mean_fsync 2731.4us
+  b1   rep2:       115308 ev/s  wall 1.734s  p50 3022.8us  p99 5939.1us  fsyncs 501  mean_fsync 3071.5us
+  b0d  rep2:       133651 ev/s  wall 1.496s  p50 2871.2us  p99 6088.1us  fsyncs 501  mean_fsync 2619.3us
+  b0dth rep2:       134865 ev/s  wall 1.483s  p50 2882.0us  p99 6007.1us  fsyncs 500  mean_fsync 2626.7us
+  bare SUMMARY best       144834 ev/s  median       143055 ev/s
+  log  SUMMARY best       128755 ev/s  median       121106 ev/s
+  b0   SUMMARY best       131054 ev/s  median       127225 ev/s
+  b1   SUMMARY best       120735 ev/s  median       116221 ev/s
+  b0d  SUMMARY best       133651 ev/s  median       120859 ev/s
+  b0dth SUMMARY best       134865 ev/s  median       129287 ev/s
