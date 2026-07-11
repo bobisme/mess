@@ -74,6 +74,12 @@ pub use fjall_snapshot::{FjallSnapshotBackend, SnapshotBackendError};
 // `mess-core` directly just to match on a command outcome, erase the
 // backend type at an app seam, or implement [`EventStore::command_as`].
 pub use mess_core::{Actor, BoxedStoreError, CommandError};
+/// Re-export of `mess-log`'s fsync-mode enum, so an app can pick
+/// [`EngineOptions::durability`] (e.g. `Durability::group_default()` for
+/// fsync-coalesced group commit, `docs/perf/bulk-writes.md`) through
+/// `mess-store`'s public API alone — no direct `mess-log` dependency
+/// needed.
+pub use mess_log::committer::Durability;
 #[cfg(feature = "mock")]
 pub use mock::MockBackend;
 pub use retry::{DEFAULT_MAX_ATTEMPTS, RetryPolicy};

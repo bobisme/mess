@@ -53,6 +53,12 @@ and the committer's early-close design has a specific, documented property
 > only one writer in flight** — confirmed equal, not merely similar
 > (`perf_group_commit/REPORT.md` §4 H1).
 
+An app selects the durability mode via
+[`EngineOptions::durability`](../../crates/mess-store/src/engine.rs) using
+the `mess_store::Durability` re-export (e.g. `Durability::group_default()`
+for `Group`'s spec-recommended defaults) — no direct `mess-log` dependency
+needed.
+
 A sequential loop of `command` calls is *exactly* that case: each call is the
 *only* request the committer's gather point ever sees, so each one pays a
 full, un-amortized `fdatasync`. `docs/perf/envelope.md` records that barrier
