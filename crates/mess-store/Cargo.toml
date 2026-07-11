@@ -31,13 +31,10 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
-# bn-fdv / bn-20b: real-fs scratch dirs for the fjall-backed snapshot reopen
-# tests and the composed-engine suites/benches.
-tempfile = "3"
-# bn-cxr: the shared self-sweeping temp-dir helper, adopted at the
-# hand-rolled `$HOME/.cache/mess-test-tmp` scratch dir in
-# `engine_append_gate.rs` (the one suite here that bypasses plain
-# `tempfile::tempdir()` for real-fs reasons).
+# bn-cxr/bn-2jr: the shared self-sweeping temp-dir helper — every real-fs
+# scratch dir across this crate's test suites and benches (previously
+# `tempfile::tempdir()`/hand-rolled `$HOME/.cache/mess-test-tmp` joins) now
+# goes through this one namespace so leaked dirs get swept.
 mess-testkit = { workspace = true }
 
 [[bench]]

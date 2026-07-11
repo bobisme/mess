@@ -10,24 +10,31 @@
 //!
 //! This test still touches the real filesystem (the append/durable/engine/
 //! recovery workloads need a segment file), so it uses a real-fs scratch
-//! dir under a fixed, cleaned-up subdirectory — never `std::env::temp_dir()`
-//! (which is `/tmp`, tmpfs on this class of machine, exactly the trap
-//! `assert_real_fs` exists to catch).
+//! dir under [`default_scratch_root`] — never `std::env::temp_dir()` (which
+//! is `/tmp`, tmpfs on this class of machine, exactly the trap
+//! `assert_real_fs` exists to catch) — deliberately the SAME root
+//! `mess-bench run` itself resolves, so this test also exercises that
+//! resolution. The per-run subdirectory is created via `mess_testkit`'s
+//! `temp_dir_in` (bn-2jr, dev-dependency only — `default_scratch_root`
+//! itself in `src/lib.rs` stays free of it: that helper also backs the
+//! shipped `mess-bench` binary's non-dev-dependency runtime path), so a
+//! panic mid-run no longer leaks the scratch dir the way the old
+//! unconditional-on-success `remove_dir_all` did, and concurrent smoke runs
+//! on one host no longer collide on a shared fixed `smoke-test` name.
 
 use mess_bench::{RunSize, assert_real_fs, default_scratch_root, run_all};
 
 #[test]
 fn smoke_harness_runs_every_workload_and_emits_expected_metrics() {
-    let scratch = default_scratch_root().join("smoke-test");
-    std::fs::create_dir_all(&scratch).expect("create smoke scratch dir");
-    assert_real_fs(&scratch).expect(
+    let scratch =
+        mess_testkit::temp_dir_in(&default_scratch_root(), "smoke-test");
+    assert_real_fs(scratch.path()).expect(
         "smoke test scratch dir must be real-fs; set MESS_BENCH_DIR to an \
          ext4/xfs/btrfs path if $HOME/.cache is unexpectedly tmpfs on this \
          host",
     );
 
-    let metrics = run_all(RunSize::Smoke, &scratch, 0);
-    let _ = std::fs::remove_dir_all(&scratch);
+    let metrics = run_all(RunSize::Smoke, scratch.path(), 0);
 
     let expected = [
         "mess_log.buffered.ev_per_s",

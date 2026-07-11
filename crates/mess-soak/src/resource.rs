@@ -224,14 +224,14 @@ mod tests {
 
     #[test]
     fn fresh_dir_guard_accepts_missing_and_empty() {
-        let t = tempfile::tempdir().unwrap();
+        let t = mess_testkit::sweeping_temp_dir("soak-resource-t");
         assert!(guard_fresh_dir(&t.path().join("does-not-exist")).is_ok());
         assert!(guard_fresh_dir(t.path()).is_ok());
     }
 
     #[test]
     fn fresh_dir_guard_refuses_leftover_store() {
-        let t = tempfile::tempdir().unwrap();
+        let t = mess_testkit::sweeping_temp_dir("soak-resource-t-1");
         std::fs::write(t.path().join("seg-00000001.log"), b"x").unwrap();
         std::fs::write(t.path().join("LOCK"), b"").unwrap();
         std::fs::create_dir(t.path().join("meta")).unwrap();
@@ -246,7 +246,7 @@ mod tests {
     fn fresh_dir_guard_refuses_any_nonempty_dir() {
         // Even a dir holding only unrelated files is refused: the run must own
         // its directory outright (an abort leaves it behind for post-mortem).
-        let t = tempfile::tempdir().unwrap();
+        let t = mess_testkit::sweeping_temp_dir("soak-resource-t-2");
         std::fs::write(t.path().join("unrelated.txt"), b"x").unwrap();
         let err = guard_fresh_dir(t.path()).unwrap_err();
         assert!(err.contains("non-empty"), "{err}");

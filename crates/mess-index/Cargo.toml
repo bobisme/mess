@@ -52,8 +52,10 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)", "cfg(kani_slow)"] 
 
 [dev-dependencies]
 mess-log = { workspace = true }
-# bn-1ku: real-fs scratch dirs for the fjall round-trip / crash-lag tests.
-tempfile = "3"
+# bn-cxr/bn-2jr: the shared self-sweeping temp-dir helper for the fjall
+# round-trip / crash-lag / sealed-driver real-fs scratch dirs (replaces
+# hand-rolled `tempfile::tempdir()` call sites).
+mess-testkit = { workspace = true }
 # bn-1bn: the columnar codec's byte-exact corpus mirrors the perf_compress
 # spike's — real rmp-serde named-mode payloads (the actual Phase-1 bytes) and a
 # Zipf stream/field workload — so the reassembly proof runs against the same

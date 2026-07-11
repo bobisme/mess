@@ -21,7 +21,9 @@ fn opts() -> EngineOptions {
 
 #[tokio::test]
 async fn many_reopen_cycles_never_gain_or_duplicate_events() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = mess_testkit::sweeping_temp_dir(
+        "reopen-cycles-many-reopen-cycles-never",
+    );
     let store = dir.path().join("s");
     let streams = 16usize;
     let mut heads = vec![0u64; streams]; // next stream position per stream

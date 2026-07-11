@@ -54,7 +54,9 @@ fn json_of(report: &mess_cli::report::Report) -> Value {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn text_format_renders_extra_sections() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = mess_testkit::sweeping_temp_dir(
+        "cli-inspect-shape-text-format-renders-extra",
+    );
     build_named_corpus(dir.path(), 3).await;
 
     let report = inspect::run(dir.path(), &opts());
@@ -90,7 +92,9 @@ async fn text_format_renders_extra_sections() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn stream_heads_resolve_names_and_truncate_by_default() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = mess_testkit::sweeping_temp_dir(
+        "cli-inspect-shape-stream-heads-resolve-names",
+    );
     let n = inspect::DEFAULT_STREAM_HEADS_LIMIT + 5;
     build_named_corpus(dir.path(), n).await;
 
@@ -144,7 +148,9 @@ async fn stream_heads_resolve_names_and_truncate_by_default() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn stream_filter_accepts_name_or_id() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = mess_testkit::sweeping_temp_dir(
+        "cli-inspect-shape-stream-filter-accepts-name",
+    );
     build_named_corpus(dir.path(), 4).await;
 
     let by_name = InspectOptions {
@@ -188,7 +194,9 @@ async fn stream_filter_accepts_name_or_id() {
 /// it would against a real live-locked store.
 #[tokio::test(flavor = "multi_thread")]
 async fn json_field_names_are_lock_state_independent() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = mess_testkit::sweeping_temp_dir(
+        "cli-inspect-shape-json-field-names-are",
+    );
     build_named_corpus(dir.path(), 3).await;
 
     let free = json_of(&inspect::run(dir.path(), &opts()));

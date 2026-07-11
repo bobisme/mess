@@ -129,7 +129,7 @@ fn open(root: &std::path::Path) -> Store {
     // reopen while the event log is rehydrated by hand (see `rehydrate` below;
     // "the durable log's job, out of this bone's scope"). The production
     // snapshot heads + blobs persist at the fixed `root`.
-    let events = tempfile::tempdir().expect("event dir");
+    let events = mess_testkit::sweeping_temp_dir("fjall-snap-events");
     let engine = LogEngine::open(events.path()).expect("open engine");
     std::mem::forget(events); // keep the fresh event dir for this store's life
     let backend = FjallSnapshotBackend::open(engine, root).expect("open");
@@ -152,7 +152,8 @@ async fn rehydrate(store: &Store, stream: &str, events: &[CounterEvent]) {
 /// now driven through the fjall-heads + blob-dir store rather than the mock.
 #[tokio::test]
 async fn snapshot_plus_tail_equals_full_replay_on_fjall() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir =
+        mess_testkit::sweeping_temp_dir("fjall-snap-snapshot-plus-tail-equals");
     let store = open(dir.path());
 
     // Seeded xorshift, dependency-free (mirrors the snapshot-law test).
@@ -227,7 +228,7 @@ async fn snapshot_plus_tail_equals_full_replay_on_fjall() {
 /// the number of stored snapshots grows (it is a fjall point read, not a scan).
 #[tokio::test]
 async fn load_is_head_plus_blob_plus_tail_no_scan() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = mess_testkit::sweeping_temp_dir("fjall-snap-load-is-head-plus");
     let store = open(dir.path());
 
     // Snapshot many *different* streams so the snapshot-heads table is
@@ -292,7 +293,8 @@ async fn load_is_head_plus_blob_plus_tail_no_scan() {
 /// lost everything on drop; this one does not.
 #[tokio::test]
 async fn snapshots_survive_reopen() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir =
+        mess_testkit::sweeping_temp_dir("fjall-snap-snapshots-survive-reopen");
     let stream = "reopen";
     let events: Vec<CounterEvent> = (0..10)
         .map(|i| {
@@ -340,7 +342,8 @@ async fn snapshots_survive_reopen() {
 /// the *correct* state by full replay. A lost index is never a wrong answer.
 #[tokio::test]
 async fn wiped_meta_dir_falls_back_to_full_replay() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir =
+        mess_testkit::sweeping_temp_dir("fjall-snap-wiped-meta-dir-falls");
     let stream = "wipe-meta";
     let events: Vec<CounterEvent> = (1..=8).map(CounterEvent::Added).collect();
     let expected = fold(&events);
@@ -377,7 +380,8 @@ async fn wiped_meta_dir_falls_back_to_full_replay() {
 /// never trusting the garbled bytes.
 #[tokio::test]
 async fn corrupt_blob_falls_back_to_full_replay() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir =
+        mess_testkit::sweeping_temp_dir("fjall-snap-corrupt-blob-falls-back");
     let stream = "corrupt-blob";
     let events: Vec<CounterEvent> = (1..=6).map(CounterEvent::Scaled).collect();
     let expected = fold(&events);
@@ -406,7 +410,9 @@ async fn corrupt_blob_falls_back_to_full_replay() {
 
 #[tokio::test]
 async fn fold_version_bump_invalidates_and_replaces_persisted_snapshot() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = mess_testkit::sweeping_temp_dir(
+        "fjall-snap-fold-version-bump-invalidates",
+    );
     let store = open(dir.path());
     let stream = "deploy-fjall";
 

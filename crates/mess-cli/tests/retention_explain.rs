@@ -53,7 +53,7 @@ fn stream_id_of(dir: &std::path::Path, name: &str) -> u64 {
 /// equals `decide_segment(idx, &[], &[])`.
 #[test]
 fn deletable_matches_decision_function() {
-    let d = tempfile::tempdir().expect("tempdir");
+    let d = mess_testkit::sweeping_temp_dir("cli-retention-d");
     common::build_corpus(d.path(), 5);
 
     let report = retention::run(d.path());
@@ -76,7 +76,7 @@ fn deletable_matches_decision_function() {
 /// `decide_segment` fed the same live set.
 #[test]
 fn blocked_matches_decision_function() {
-    let d = tempfile::tempdir().expect("tempdir");
+    let d = mess_testkit::sweeping_temp_dir("cli-retention-d-1");
     common::build_corpus(d.path(), 5); // versions 0..=4 in segment 1
 
     let sid = stream_id_of(d.path(), "acct-1");

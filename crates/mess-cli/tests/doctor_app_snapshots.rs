@@ -161,7 +161,7 @@ const EVERY_N: u64 = 3;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn doctor_fold_version_check_fires_on_a_real_app_store() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = mess_testkit::sweeping_temp_dir("cli-doctor-app-snap");
 
     // ---- Phase 1: a running app persists snapshots under the policy. ----
     {
@@ -259,7 +259,7 @@ async fn doctor_fold_version_check_fires_on_a_real_app_store() {
 /// reports `no-snapshots` (genuinely nothing to drift — not a vacuous check).
 #[tokio::test(flavor = "multi_thread")]
 async fn default_policy_persists_nothing_and_check_stays_ok() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = mess_testkit::sweeping_temp_dir("cli-doctor-app-drift");
     {
         let store = open_app_store(dir.path(), SnapshotPolicy::never());
         for s in 0..STREAMS {

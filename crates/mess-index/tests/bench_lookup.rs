@@ -16,7 +16,9 @@ const ITERS: u64 = 200_000;
 #[test]
 #[cfg_attr(miri, ignore)]
 fn bench_head_and_dedupe_lookup() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = mess_testkit::sweeping_temp_dir(
+        "idx-bench-lookup-bench-head-and-dedupe",
+    );
     let store = MetaStore::open(dir.path()).unwrap();
 
     // Populate N heads and N dedupe keys, batched in groups of 256.

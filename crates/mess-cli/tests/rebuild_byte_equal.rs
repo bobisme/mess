@@ -9,7 +9,7 @@ use mess_cli::rebuild::{self, RebuildOptions};
 
 #[test]
 fn rebuild_index_reproduces_pidx_byte_for_byte() {
-    let d = tempfile::tempdir().expect("tempdir");
+    let d = mess_testkit::sweeping_temp_dir("cli-rebuild-byte-d");
     common::build_corpus(d.path(), 6);
 
     let pidx = common::pidx(d.path());
@@ -43,7 +43,7 @@ fn rebuild_index_reproduces_pidx_byte_for_byte() {
 /// the same recovered batches (guards against ordering nondeterminism).
 #[test]
 fn rebuild_is_deterministic() {
-    let d = tempfile::tempdir().expect("tempdir");
+    let d = mess_testkit::sweeping_temp_dir("cli-rebuild-byte-d-1");
     common::build_corpus(d.path(), 4);
 
     let pidx = common::pidx(d.path());

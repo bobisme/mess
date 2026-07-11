@@ -210,43 +210,23 @@ fn read_holder_pid(path: &Path) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
     use super::*;
 
-    /// A directory under the OS temp dir, unique per test, cleaned up
-    /// on drop. No `tempfile` dependency: this crate has none besides
-    /// `thiserror`, and a counter-suffixed `env::temp_dir()` join is
-    /// all a handful of single-threaded-per-dir tests need.
-    struct TestDir(PathBuf);
-
-    impl TestDir {
-        fn new(name: &str) -> Self {
-            static COUNTER: AtomicU64 = AtomicU64::new(0);
-            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let dir = std::env::temp_dir().join(format!(
-                "mess-log-store-lock-test-{}-{name}-{n}",
-                std::process::id()
-            ));
-            std::fs::create_dir_all(&dir).expect("create test dir");
-            TestDir(dir)
-        }
-
-        fn path(&self) -> &Path { &self.0 }
+    /// A self-sweeping real-fs temp dir (bn-2jr), unique per test, tagged by
+    /// call site. Dev-dependency only — this crate's production deps stay
+    /// just `thiserror`.
+    fn test_dir(name: &str) -> mess_testkit::SweepingTempDir {
+        mess_testkit::sweeping_temp_dir(&format!("store-lock-{name}"))
     }
 
-    impl Drop for TestDir {
-        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
-    }
-
-    // bn-25j: touches the real OS filesystem (`TestDir` + `StoreLock`'s
+    // bn-25j: touches the real OS filesystem (`test_dir` + `StoreLock`'s
     // `std::fs::File`/`OpenOptions`); Miri's isolation blocks real `open`
     // (`unsupported operation: \`open\` not available when isolation is
     // enabled`), so this is excluded from the Miri lane.
     #[test]
     #[cfg_attr(miri, ignore)]
     fn first_open_succeeds_and_writes_lock_file() {
-        let dir = TestDir::new("first-open");
+        let dir = test_dir("first-open");
         let lock = StoreLock::acquire(dir.path()).expect("first open");
         assert_eq!(lock.path(), dir.path().join(LOCK_FILE_NAME));
         assert!(lock.path().exists());
@@ -256,7 +236,7 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn second_open_of_same_dir_fails_typed_and_names_dir_and_pid() {
-        let dir = TestDir::new("second-open");
+        let dir = test_dir("second-open");
         let _first = StoreLock::acquire(dir.path()).expect("first open");
 
         let err = StoreLock::acquire(dir.path())
@@ -282,7 +262,7 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn clean_close_releases_the_lock_for_a_new_acquire() {
-        let dir = TestDir::new("clean-close");
+        let dir = test_dir("clean-close");
         let lock = StoreLock::acquire(dir.path()).expect("first open");
         drop(lock);
 
@@ -301,7 +281,7 @@ mod tests {
         // Not just once: acquire/release must be repeatable, since a
         // real store dir is opened and closed many times over its
         // life.
-        let dir = TestDir::new("repeat");
+        let dir = test_dir("repeat");
         for _ in 0..5 {
             let lock = StoreLock::acquire(dir.path()).expect("acquire");
             drop(lock);
@@ -323,7 +303,7 @@ mod tests {
         // fd closed. A genuine cross-process SIGKILL cannot be
         // exercised in this in-process unit test — see the module
         // docs' "What can't be tested in-process" section.
-        let dir = TestDir::new("stale-file");
+        let dir = test_dir("stale-file");
         let lock_path = dir.path().join(LOCK_FILE_NAME);
 
         {
@@ -362,7 +342,7 @@ mod tests {
         // accidentally keying off file *content* or *existence* by
         // pre-seeding a stale-looking pid, then taking a live lock
         // over it, and confirming a second acquire still fails.
-        let dir = TestDir::new("live-over-stale-bytes");
+        let dir = test_dir("live-over-stale-bytes");
         let lock_path = dir.path().join(LOCK_FILE_NAME);
         std::fs::write(&lock_path, "123456\n")
             .expect("seed stale-looking bytes");

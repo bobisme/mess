@@ -259,6 +259,14 @@ pub fn assert_real_fs(path: &Path) -> Result<(), String> {
 /// [`assert_real_fs`] exists to catch; defaulting somewhere real-fs means the
 /// smoke test (which must run under plain `cargo test`, no env setup) does
 /// not trip it by accident.
+///
+/// bn-2jr: deliberately NOT routed through `mess-testkit`'s
+/// `sweeping_temp_dir` — this function backs the shipped `mess-bench`
+/// binary's runtime scratch dir (`main.rs`, not test-only), and
+/// `mess-testkit` must stay a dev-dependency everywhere in this workspace.
+/// `tests/smoke.rs` nests a self-sweeping per-run subdir under this root's
+/// resolved path instead (via `mess_testkit::temp_dir_in`, dev-dependency
+/// only) rather than pulling this production helper into that edge.
 pub fn default_scratch_root() -> PathBuf {
     if let Some(dir) = std::env::var_os("MESS_BENCH_DIR") {
         return PathBuf::from(dir);

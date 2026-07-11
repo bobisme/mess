@@ -2001,7 +2001,7 @@ mod seal_skip_tests {
     /// the bn-1vu review nit this bone exists to fix.
     #[test]
     fn run_roll_sealer_counts_and_logs_a_spin_bound_skip() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = mess_testkit::sweeping_temp_dir("engine-src-tmp");
         let (tx, rx) = mpsc::channel();
         tx.send(summary(1, 0, 10)).expect("send");
         drop(tx); // close the channel so the loop drains this one item and exits
@@ -2051,7 +2051,7 @@ mod seal_skip_tests {
     /// each individual seal's wait.
     #[test]
     fn shutdown_deadline_bounds_total_wait_across_every_queued_seal() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = mess_testkit::sweeping_temp_dir("engine-src-tmp-1");
         let (tx, rx) = mpsc::channel();
         tx.send(summary(1, 0, 10)).expect("send");
         tx.send(summary(2, 10, 20)).expect("send");

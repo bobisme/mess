@@ -21,7 +21,9 @@ fn has_error(report: &Report, kind: &str) -> bool {
     })
 }
 
-fn tmp() -> tempfile::TempDir { tempfile::tempdir().expect("tempdir") }
+fn tmp() -> mess_testkit::SweepingTempDir {
+    mess_testkit::sweeping_temp_dir("cli-corruption-detection")
+}
 
 fn verify_full(dir: &std::path::Path) -> Report {
     verify::run(dir, &VerifyOptions { full: true, repair: false })

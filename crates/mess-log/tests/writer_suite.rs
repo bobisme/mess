@@ -4,7 +4,7 @@
 //! two entry points feed it the real and the simulated runtime). This is the
 //! acceptance requirement "the writer's suite runs against BOTH runtime impls".
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use mess_log::encode::Subframe;
 use mess_log::format::*;
@@ -238,22 +238,9 @@ fn spec<'a, 'p>(subframes: &'a [Subframe<'p>]) -> BatchSpec<'a, 'p> {
 // Real runtime entry points
 // ---------------------------------------------------------------------------
 
-struct Cleanup(Vec<PathBuf>);
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        for p in &self.0 {
-            let _ = std::fs::remove_file(p);
-        }
-    }
-}
-
-fn tmp(name: &str) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static N: AtomicU64 = AtomicU64::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    let mut p = std::env::temp_dir();
-    p.push(format!("mess-log-writer-{}-{}-{}", std::process::id(), n, name));
-    p
+/// A fresh self-sweeping real-fs temp dir (bn-2jr), tagged by call site.
+fn tmp(name: &str) -> mess_testkit::SweepingTempDir {
+    mess_testkit::sweeping_temp_dir(&format!("writer-{name}"))
 }
 
 // bn-25j: real fs (`RealRuntime` over `std::fs`); Miri's isolation blocks
@@ -264,8 +251,8 @@ fn tmp(name: &str) -> PathBuf {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn real_writer_header_and_batch_golden() {
-    let p = tmp("golden");
-    let _c = Cleanup(vec![p.clone()]);
+    let dir = tmp("golden");
+    let p = dir.path().join("golden.seg");
     writer_header_and_batch_golden(&RealRuntime::new(), &p);
 }
 
@@ -273,8 +260,8 @@ fn real_writer_header_and_batch_golden() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn real_writer_rejects_empty_batch() {
-    let p = tmp("empty");
-    let _c = Cleanup(vec![p.clone()]);
+    let dir = tmp("empty");
+    let p = dir.path().join("empty.seg");
     writer_rejects_empty_batch(&RealRuntime::new(), &p);
 }
 
@@ -282,8 +269,8 @@ fn real_writer_rejects_empty_batch() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn real_writer_position_accounting() {
-    let p = tmp("pos");
-    let _c = Cleanup(vec![p.clone()]);
+    let dir = tmp("pos");
+    let p = dir.path().join("pos.seg");
     writer_position_accounting(&RealRuntime::new(), &p);
 }
 
@@ -291,9 +278,9 @@ fn real_writer_position_accounting() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn real_writer_rolls_on_segment_full() {
-    let p0 = tmp("roll-0");
-    let p1 = tmp("roll-1");
-    let _c = Cleanup(vec![p0.clone(), p1.clone()]);
+    let dir = tmp("roll");
+    let p0 = dir.path().join("roll-0.seg");
+    let p1 = dir.path().join("roll-1.seg");
     writer_rolls_on_segment_full(&RealRuntime::new(), &p0, &p1);
 }
 
@@ -301,8 +288,8 @@ fn real_writer_rolls_on_segment_full() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn real_writer_close_leaves_unsealed() {
-    let p = tmp("unsealed");
-    let _c = Cleanup(vec![p.clone()]);
+    let dir = tmp("unsealed");
+    let p = dir.path().join("unsealed.seg");
     writer_close_leaves_unsealed(&RealRuntime::new(), &p);
 }
 

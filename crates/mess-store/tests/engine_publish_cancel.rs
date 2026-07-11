@@ -127,7 +127,9 @@ async fn assert_consistent(engine: &LogEngine, streams: &[String]) {
 /// visible.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dropped_append_future_does_not_gap_the_position_sequence() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = mess_testkit::sweeping_temp_dir(
+        "pub-cancel-dropped-append-future-does",
+    );
     let engine = LogEngine::open(dir.path()).expect("open");
 
     // Prime the streams we will cancel appends on, using the SAME event type
@@ -228,7 +230,8 @@ async fn dropped_append_future_does_not_gap_the_position_sequence() {
 /// (detached) commit+publish, not be released early by the dropped future.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancel_then_same_stream_retry_never_double_writes_version() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir =
+        mess_testkit::sweeping_temp_dir("pub-cancel-cancel-then-same-stream");
     let engine = LogEngine::open(dir.path()).expect("open");
 
     // Prime stream + event type so the cancelled append is pure hot-path.

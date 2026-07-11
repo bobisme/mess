@@ -732,7 +732,6 @@ impl<F: Fs> Subscription<F> {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
     use super::*;
@@ -1377,30 +1376,15 @@ mod tests {
     // Real runtime: end-to-end over real threads + real fs
     // ===================================================================
 
-    fn real_tmp(name: &str) -> std::path::PathBuf {
-        static N: AtomicU64 = AtomicU64::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let base = std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        let mut dir = base;
-        dir.push(".cache");
-        dir.push("mess-subscription-scratch");
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.push(format!("{}-{}-{}", std::process::id(), n, name));
-        dir
-    }
-
-    struct Cleanup(std::path::PathBuf);
-    impl Drop for Cleanup {
-        fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+    fn real_tmp(name: &str) -> mess_testkit::SweepingTempDir {
+        mess_testkit::sweeping_temp_dir(name)
     }
 
     #[test]
     #[cfg_attr(miri, ignore)]
     fn real_end_to_end_catchup_then_live() {
-        let path = real_tmp("e2e");
-        let _c = Cleanup(path.clone());
+        let dir = real_tmp("subscription-e2e");
+        let path = dir.path().join("seg");
         let rt = RealRuntime::new();
         let fs = rt.fs();
         let writer = SegmentWriter::create(

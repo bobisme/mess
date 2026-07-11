@@ -1473,7 +1473,9 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn archive_reblock_is_byte_exact_point_and_range() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = mess_testkit::sweeping_temp_dir(
+            "idx-payload-archive-reblock-is-byte",
+        );
         let seg = 42u64;
 
         // A ~5000-event mixed corpus so the default 128-event geometry produces
@@ -1561,7 +1563,9 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn archive_reblock_crash_leaves_old_pcol_serving() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = mess_testkit::sweeping_temp_dir(
+            "idx-payload-archive-reblock-crash-leaves",
+        );
         let seg = 7u64;
         let mut rng = Rng::new(0xC7A5);
         let evs: Vec<Vec<u8>> =
@@ -1624,7 +1628,9 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn archive_reblock_policy_off_is_noop() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = mess_testkit::sweeping_temp_dir(
+            "idx-payload-archive-reblock-policy-off",
+        );
         let seg = 3u64;
         let mut rng = Rng::new(0x0FF);
         let evs: Vec<Vec<u8>> =
@@ -1696,7 +1702,9 @@ mod tests {
         let raw_bytes: usize = evs.iter().map(Vec::len).sum();
         let refs = refs(&evs);
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = mess_testkit::sweeping_temp_dir(
+            "idx-payload-archive-reblock-bench",
+        );
         let seg = 1u64;
 
         // Baseline seal at the round-4 default (128-event blocks, zstd-9).

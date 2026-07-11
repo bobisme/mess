@@ -12,7 +12,7 @@
 //!
 //! Run: `cargo run -p mess-log --release --example recover_bench`.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
 use mess_log::encode::Subframe;
@@ -91,18 +91,13 @@ fn main() {
     let n_segs = env_u64("MESS_BENCH_SEGS", 8) as usize;
     let seg_bytes = env_u64("MESS_BENCH_SEG_MIB", 64) * 1024 * 1024;
 
-    let dir: PathBuf = {
-        let mut p = std::env::temp_dir();
-        p.push(format!("mess-recover-bench-{}", std::process::id()));
-        std::fs::create_dir_all(&p).unwrap();
-        p
-    };
+    let dir = mess_testkit::sweeping_temp_dir("log-recover-bench");
 
     eprintln!(
         "building corpus: {n_segs} segments × ~{} MiB ...",
         seg_bytes / (1024 * 1024)
     );
-    let (segs, total_content) = build(&dir, n_segs, seg_bytes);
+    let (segs, total_content) = build(dir.path(), n_segs, seg_bytes);
     let gib = total_content as f64 / (1024.0 * 1024.0 * 1024.0);
     eprintln!(
         "corpus: {segs_len} segments, {gib:.3} GiB of content",
@@ -136,6 +131,4 @@ fn main() {
         "speedup: {:.2}×",
         serial.as_secs_f64() / parallel.as_secs_f64().max(1e-9)
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

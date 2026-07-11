@@ -61,7 +61,9 @@ fn rec(message_type: &str, data: &[u8]) -> RecordToAppend {
 /// returns — not zero times, not deferred to some later, unbarriered point.
 #[tokio::test]
 async fn new_stream_name_forces_a_durable_meta_flush() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = mess_testkit::sweeping_temp_dir(
+        "name-durability-new-stream-name-forces",
+    );
     let engine = LogEngine::open(dir.path().join("store")).expect("open");
 
     assert_eq!(engine.meta_persist_call_count(), 0, "nothing flushed yet");
@@ -89,7 +91,8 @@ async fn new_stream_name_forces_a_durable_meta_flush() {
 /// stream-name call site into one flush per append (bn-150).
 #[tokio::test]
 async fn new_type_name_forces_a_durable_meta_flush() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir =
+        mess_testkit::sweeping_temp_dir("name-durability-new-type-name-forces");
     let engine = LogEngine::open(dir.path().join("store")).expect("open");
 
     engine
@@ -121,7 +124,8 @@ async fn new_type_name_forces_a_durable_meta_flush() {
 /// Nth call" regression would also be caught.
 #[tokio::test]
 async fn hot_path_appends_add_zero_meta_flushes() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir =
+        mess_testkit::sweeping_temp_dir("name-durability-hot-path-appends-add");
     let engine = LogEngine::open(dir.path().join("store")).expect("open");
 
     // Prime the interner: one stream, one type. This is the only flush this
@@ -162,7 +166,9 @@ async fn hot_path_appends_add_zero_meta_flushes() {
 #[tokio::test]
 async fn concurrent_new_stream_names_each_flush_exactly_once_and_survive_reopen()
  {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = mess_testkit::sweeping_temp_dir(
+        "name-durability-concurrent-new-stream-names",
+    );
     let store_path = dir.path().join("store");
     let engine = LogEngine::open(&store_path).expect("open");
 
@@ -210,7 +216,9 @@ async fn concurrent_new_stream_names_each_flush_exactly_once_and_survive_reopen(
 /// exist to explain the mechanism of.
 #[tokio::test]
 async fn reopen_after_new_name_append_resolves_correct_name_everywhere() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = mess_testkit::sweeping_temp_dir(
+        "name-durability-reopen-after-new-name",
+    );
     let store_path = dir.path().join("store");
 
     {

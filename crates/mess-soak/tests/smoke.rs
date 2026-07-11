@@ -14,23 +14,24 @@ use std::time::Duration;
 
 use mess_soak::config::{Config, CrashMode};
 
-/// A real-fs scratch dir: never `/tmp` (tmpfs here — the driver would refuse
-/// it). Honors `TMPDIR` when it points at a real device, else `$HOME/.cache`.
+/// A real-fs scratch dir (bn-2jr): the shared self-sweeping `mess-tests`
+/// namespace (`TMPDIR`/`$HOME/.cache/mess-test-tmp`), never `/tmp` (tmpfs
+/// here — the driver would refuse it).
+///
+/// Deliberately does NOT keep the [`mess_testkit::SweepingTempDir`] guard
+/// alive: on an aborted run (see the `Err(aborted)` arms below) this test
+/// intentionally panics BEFORE reaching its own `remove_dir_all` cleanup, so
+/// the dir survives for post-mortem inspection, per the dump contract — the
+/// exact same shape as `mess-log`'s SIGKILL harness leaving a killed child's
+/// dir behind. A guard's `Drop` would run on that panic's unwind and defeat
+/// that; `mem::forget` opts this dir out of RAII cleanup while still gaining
+/// the shared namespace's naming convention and the once-per-process sweep
+/// of anything left behind by a PRIOR aborted run once it's old and dead.
 fn scratch_dir(tag: &str) -> PathBuf {
-    let base = std::env::var("TMPDIR")
-        .ok()
-        .filter(|t| !t.is_empty())
-        .map(PathBuf::from)
-        .filter(|p| !mess_soak::resource::is_tmpfs(p).unwrap_or(true))
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
-                .join(".cache")
-        });
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    base.join("mess-soak-test").join(format!("{tag}-{nonce}"))
+    let dir = mess_testkit::sweeping_temp_dir(&format!("soak-{tag}"));
+    let path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+    path
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

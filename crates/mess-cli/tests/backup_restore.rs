@@ -58,9 +58,10 @@ fn field<'a>(json: &'a Value, key: &str) -> &'a Value { &json[key] }
 /// cleanly beyond it.
 #[test]
 fn backup_during_active_writing_restores_to_the_cut() {
-    let src = tempfile::tempdir().expect("src");
-    let dest = tempfile::tempdir().expect("dest");
-    let restored = tempfile::tempdir().expect("restored");
+    let src = mess_testkit::sweeping_temp_dir("cli-backup-restore-src");
+    let dest = mess_testkit::sweeping_temp_dir("cli-backup-restore-dest");
+    let restored =
+        mess_testkit::sweeping_temp_dir("cli-backup-restore-restored");
 
     let rt = runtime();
     let backup_json = rt.block_on(async {
@@ -143,9 +144,10 @@ fn backup_during_active_writing_restores_to_the_cut() {
 /// and never enters the cut. The restore is clean regardless.
 #[test]
 fn torn_tail_from_a_crashed_writer_is_excluded_from_the_cut() {
-    let src = tempfile::tempdir().expect("src");
-    let dest = tempfile::tempdir().expect("dest");
-    let restored = tempfile::tempdir().expect("restored");
+    let src = mess_testkit::sweeping_temp_dir("cli-backup-restore-src-1");
+    let dest = mess_testkit::sweeping_temp_dir("cli-backup-restore-dest-1");
+    let restored =
+        mess_testkit::sweeping_temp_dir("cli-backup-restore-restored-1");
 
     // Build a clean corpus, then append garbage past the committed prefix to
     // simulate a crash mid-write.
@@ -195,8 +197,8 @@ fn torn_tail_from_a_crashed_writer_is_excluded_from_the_cut() {
 /// destination; segments already present (matching size + CRC) are skipped.
 #[test]
 fn incremental_copies_only_new_segments() {
-    let src = tempfile::tempdir().expect("src");
-    let dest = tempfile::tempdir().expect("dest");
+    let src = mess_testkit::sweeping_temp_dir("cli-backup-restore-src-2");
+    let dest = mess_testkit::sweeping_temp_dir("cli-backup-restore-dest-2");
 
     // A sealed corpus (seg-1 gets a durable trailer so it is a content-stable
     // sealed segment, plus its .pidx/.pcol/.filter sidecars).
@@ -273,9 +275,10 @@ fn incremental_copies_only_new_segments() {
 /// restore refuse, because its absence proves the copy never finished.
 #[test]
 fn missing_manifest_makes_restore_refuse() {
-    let src = tempfile::tempdir().expect("src");
-    let dest = tempfile::tempdir().expect("dest");
-    let restored = tempfile::tempdir().expect("restored");
+    let src = mess_testkit::sweeping_temp_dir("cli-backup-restore-src-3");
+    let dest = mess_testkit::sweeping_temp_dir("cli-backup-restore-dest-3");
+    let restored =
+        mess_testkit::sweeping_temp_dir("cli-backup-restore-restored-2");
 
     common::build_corpus(src.path(), 4);
     let report =
@@ -299,9 +302,9 @@ fn missing_manifest_makes_restore_refuse() {
 /// Restore refuses to overwrite a non-empty target directory.
 #[test]
 fn restore_refuses_non_empty_target() {
-    let src = tempfile::tempdir().expect("src");
-    let dest = tempfile::tempdir().expect("dest");
-    let target = tempfile::tempdir().expect("target");
+    let src = mess_testkit::sweeping_temp_dir("cli-backup-restore-src-4");
+    let dest = mess_testkit::sweeping_temp_dir("cli-backup-restore-dest-4");
+    let target = mess_testkit::sweeping_temp_dir("cli-backup-restore-target");
 
     common::build_corpus(src.path(), 3);
     backup::run(src.path(), dest.path(), &BackupOptions::default());
@@ -318,7 +321,7 @@ fn restore_refuses_non_empty_target() {
 /// backup is running, and releases it when the lease is dropped.
 #[test]
 fn retention_lease_blocks_deletion_during_backup_and_releases_after() {
-    let src = tempfile::tempdir().expect("src");
+    let src = mess_testkit::sweeping_temp_dir("cli-backup-restore-src-5");
     common::build_corpus(src.path(), 5); // seg-1 has sidecars (retention-visible)
 
     // No snapshots, no lease -> seg-1 is deletable.

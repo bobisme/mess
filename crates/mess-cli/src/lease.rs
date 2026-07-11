@@ -225,7 +225,7 @@ mod tests {
 
     #[test]
     fn active_lease_pins_then_releases_on_drop() {
-        let d = tempfile::tempdir().expect("tempdir");
+        let d = mess_testkit::sweeping_temp_dir("cli-lease-src-d");
         {
             let _guard = acquire(d.path(), "b1", 1, 5, 42, DEFAULT_TTL_SECS)
                 .expect("acquire");
@@ -245,7 +245,7 @@ mod tests {
 
     #[test]
     fn expired_lease_is_inactive_and_cleaned_up() {
-        let d = tempfile::tempdir().expect("tempdir");
+        let d = mess_testkit::sweeping_temp_dir("cli-lease-src-d-1");
         // Write a lease that expired an hour ago (simulating a crashed backup
         // whose TTL lapsed).
         let stale = LeaseFile {
@@ -269,7 +269,7 @@ mod tests {
 
     #[test]
     fn renew_extends_expiry() {
-        let d = tempfile::tempdir().expect("tempdir");
+        let d = mess_testkit::sweeping_temp_dir("cli-lease-src-d-2");
         let mut guard = acquire(d.path(), "b1", 1, 1, 0, 1).expect("acquire");
         let before = read_all(d.path())[0].expires_unix;
         // A longer TTL on renew pushes the expiry strictly forward.

@@ -62,7 +62,9 @@ async fn fill_stream(
 // committer concurrently) this test's docstring claims to cover.
 #[tokio::test(flavor = "multi_thread")]
 async fn auto_roll_under_concurrent_load_preserves_every_event() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = mess_testkit::sweeping_temp_dir(
+        "engine-roll-auto-roll-under-concurrent",
+    );
     let store_path = dir.path().join("store");
     let engine =
         LogEngine::open_with(&store_path, rolling_opts()).expect("open");
@@ -155,7 +157,8 @@ async fn auto_roll_under_concurrent_load_preserves_every_event() {
 /// every event comes back byte-exact, none lost.
 #[tokio::test]
 async fn crash_mid_roll_seal_is_served_from_log_after_reopen() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir =
+        mess_testkit::sweeping_temp_dir("engine-roll-crash-mid-roll-seal");
     let store_path = dir.path().join("store");
 
     const STREAMS: usize = 12;
@@ -239,7 +242,8 @@ async fn crash_mid_roll_seal_is_served_from_log_after_reopen() {
 /// appending.
 #[tokio::test]
 async fn clean_reopen_after_rolls_serves_cold_and_hot_tiers() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir =
+        mess_testkit::sweeping_temp_dir("engine-roll-clean-reopen-after-rolls");
     let store_path = dir.path().join("store");
 
     const STREAMS: usize = 16;
@@ -331,7 +335,9 @@ async fn clean_reopen_after_rolls_serves_cold_and_hot_tiers() {
 /// back immediately, segment count unchanged.
 #[tokio::test]
 async fn oversized_batch_fails_fast_without_wasting_a_roll() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = mess_testkit::sweeping_temp_dir(
+        "engine-roll-oversized-batch-fails-fast",
+    );
     let store_path = dir.path().join("store");
     // A tiny segment: no realistic batch fits, let alone this test's 2000-byte
     // oversized one.

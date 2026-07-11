@@ -107,7 +107,9 @@ impl Lcg {
 #[test]
 #[cfg_attr(miri, ignore)] // real filesystem
 fn truncated_sidecar_is_typed_error_and_replay_falls_back_exact() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = mess_testkit::sweeping_temp_dir(
+        "idx-sealed-read-truncated-sidecar-is-typed",
+    );
     let stream_ids: Vec<u64> = (0..8).collect();
 
     // Three good segments + one we will truncate on disk.

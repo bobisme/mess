@@ -54,7 +54,7 @@ fn apply_record(store: &MetaStore, r: &LogRecord) {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn roundtrip_all_tables() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = mess_testkit::sweeping_temp_dir("idx-meta-roundtrip-all-tables");
     let store = MetaStore::open(dir.path()).unwrap();
 
     // stream head
@@ -103,7 +103,7 @@ fn roundtrip_all_tables() {
 fn rebuild_is_byte_equal() {
     let log = synth_log(500, 7);
 
-    let dir_a = tempfile::tempdir().unwrap();
+    let dir_a = mess_testkit::sweeping_temp_dir("idx-meta-dir-a");
     let store_a = MetaStore::open(dir_a.path()).unwrap();
     for r in &log {
         apply_record(&store_a, r);
@@ -115,7 +115,7 @@ fn rebuild_is_byte_equal() {
 
     // Fresh directory (the "rm -rf" — a brand-new dir is the same starting
     // point as a deleted one), rebuilt from the identical log.
-    let dir_b = tempfile::tempdir().unwrap();
+    let dir_b = mess_testkit::sweeping_temp_dir("idx-meta-dir-b");
     let store_b = MetaStore::open(dir_b.path()).unwrap();
     for r in &log {
         apply_record(&store_b, r);
@@ -137,7 +137,8 @@ fn rebuild_is_byte_equal() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn crash_lag_detected_and_replayed() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir =
+        mess_testkit::sweeping_temp_dir("idx-meta-crash-lag-detected-and");
     let log = synth_log(200, 3);
     let log_end = 200u64; // watermark: all 200 positions durable in the log
 
@@ -172,7 +173,7 @@ fn crash_lag_detected_and_replayed() {
     assert_eq!(store.high_water(MetaTable::StreamHeads).unwrap(), 200);
 
     let recovered = store.dump(MetaTable::StreamHeads).unwrap();
-    let fresh_dir = tempfile::tempdir().unwrap();
+    let fresh_dir = mess_testkit::sweeping_temp_dir("idx-meta-fresh-dir");
     let fresh = MetaStore::open(fresh_dir.path()).unwrap();
     for r in &log {
         apply_record(&fresh, r);
@@ -185,7 +186,8 @@ fn crash_lag_detected_and_replayed() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn dedupe_absorb_and_aging() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir =
+        mess_testkit::sweeping_temp_dir("idx-meta-dedupe-absorb-and-aging");
     let store = MetaStore::open_with_capacity(dir.path(), 4).unwrap();
     let s = StreamId(1);
 
@@ -248,7 +250,7 @@ fn dedupe_absorb_and_aging() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn checkpoint_lag() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = mess_testkit::sweeping_temp_dir("idx-meta-checkpoint-lag");
     let store = MetaStore::open(dir.path()).unwrap();
 
     assert_eq!(store.checkpoint_lag("proj", 50).unwrap(), Some((0, 50)));

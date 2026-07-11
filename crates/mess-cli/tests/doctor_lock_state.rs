@@ -65,7 +65,9 @@ fn finding<'a>(v: &'a Value, kind: &str) -> Option<&'a Value> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn fold_version_finding_explains_lock_and_says_what_to_do() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = mess_testkit::sweeping_temp_dir(
+        "cli-doctor-lock-fold-version-finding-explains",
+    );
     build_corpus(dir.path()).await;
 
     // Hold the metadata store's own lock, simulating a live writer.
@@ -112,7 +114,9 @@ async fn old_registry_unavailable_kind_is_reserved_for_non_lock_failures() {
     // engine) is a *different* failure than a live-writer lock: `doctor`
     // must not claim a lock is held when the real reason is "no store here
     // yet".
-    let dir = tempfile::tempdir().unwrap();
+    let dir = mess_testkit::sweeping_temp_dir(
+        "cli-doctor-lock-old-registry-unavailable-kind",
+    );
     std::fs::create_dir_all(dir.path().join("seg")).ok();
     // No engine ever opened this directory, so store::discover_segments
     // finds nothing and metaread::read finds no `meta/` dir either.
@@ -133,7 +137,9 @@ async fn old_registry_unavailable_kind_is_reserved_for_non_lock_failures() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn json_envelope_field_names_are_lock_state_independent() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = mess_testkit::sweeping_temp_dir(
+        "cli-doctor-lock-json-envelope-field-names",
+    );
     build_corpus(dir.path()).await;
 
     let free = json_of(&doctor::run(dir.path(), &opts()));

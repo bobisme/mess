@@ -29,7 +29,9 @@ use mess_log::writer::{BatchSpec, SegmentParams, SegmentWriter};
 const SEG_ID: u64 = 1;
 const STREAM_ID: u64 = 42;
 
-fn tmp() -> tempfile::TempDir { tempfile::tempdir().expect("tempdir") }
+fn tmp() -> mess_testkit::SweepingTempDir {
+    mess_testkit::sweeping_temp_dir("cli-fold-chain-verify")
+}
 
 /// A 32-byte payload: tag byte + u64 amount + filler (mirrors crash_verify.rs).
 fn ev(tag: u8, amount: u64) -> Vec<u8> {

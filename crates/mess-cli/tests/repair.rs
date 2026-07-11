@@ -14,7 +14,9 @@ mod common;
 use mess_cli::report::{Report, Severity};
 use mess_cli::verify::{self, VerifyOptions};
 
-fn tmp() -> tempfile::TempDir { tempfile::tempdir().expect("tempdir") }
+fn tmp() -> mess_testkit::SweepingTempDir {
+    mess_testkit::sweeping_temp_dir("cli-repair")
+}
 
 fn repair_run(dir: &std::path::Path) -> Report {
     verify::run(dir, &VerifyOptions { full: true, repair: true })
@@ -42,7 +44,9 @@ fn shard_off(i: u64) -> u64 { i * 64 }
 
 /// Build a sealed corpus with a parity sidecar; return the temp dir and the
 /// pristine sealed `.log` bytes for byte-exactness assertions.
-fn sealed_corpus_with_parity(n_batches: u64) -> (tempfile::TempDir, Vec<u8>) {
+fn sealed_corpus_with_parity(
+    n_batches: u64,
+) -> (mess_testkit::SweepingTempDir, Vec<u8>) {
     let d = tmp();
     common::build_corpus(d.path(), n_batches);
     common::seal_log_trailer(d.path());

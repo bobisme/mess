@@ -30,11 +30,9 @@ const BATCH: &[u8] = &[0xAB; 256]; // ~250 B, the measured payload size (§2.3)
 const ITERS: usize = 2_000_000;
 
 fn main() {
-    let dir = std::env::temp_dir()
-        .join(format!("mess-hotpath-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let direct_path = dir.join("direct.log");
-    let trait_path = dir.join("trait.log");
+    let dir = mess_testkit::sweeping_temp_dir("log-hotpath");
+    let direct_path = dir.path().join("direct.log");
+    let trait_path = dir.path().join("trait.log");
 
     let rt = RealRuntime::new();
     let fs = rt.fs();
@@ -67,8 +65,6 @@ fn main() {
     println!(
         "  delta            : {delta:+.2}%  (target: within measurement noise)"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Generic over the file handle exactly as the committer is — this is the

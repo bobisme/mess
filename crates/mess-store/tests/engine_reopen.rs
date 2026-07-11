@@ -40,7 +40,9 @@ async fn assert_global(
 
 #[tokio::test]
 async fn genuine_reopen_returns_exact_pre_crash_data_then_continues() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = mess_testkit::sweeping_temp_dir(
+        "engine-reopen-genuine-reopen-returns-exact",
+    );
     let store_path = dir.path().join("store");
 
     // ---- Phase 1: write a few events across two streams, then "crash". ----
@@ -197,7 +199,9 @@ async fn genuine_reopen_returns_exact_pre_crash_data_then_continues() {
 /// through the cold tier, and the payloads come back byte-exact.
 #[tokio::test]
 async fn reopen_loads_sealed_sidecars_and_serves_from_sealed_tier() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = mess_testkit::sweeping_temp_dir(
+        "engine-reopen-reopen-loads-sealed-sidecars",
+    );
     let store_path = dir.path().join("store");
 
     {
@@ -271,7 +275,8 @@ async fn reopen_loads_sealed_sidecars_and_serves_from_sealed_tier() {
 /// (the hot tier), losing nothing.
 #[tokio::test]
 async fn crash_mid_seal_leaves_recoverable_state_served_from_log() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir =
+        mess_testkit::sweeping_temp_dir("engine-reopen-crash-mid-seal-leaves");
     let store_path = dir.path().join("store");
 
     {
@@ -336,7 +341,9 @@ async fn crash_mid_seal_leaves_recoverable_state_served_from_log() {
 #[ignore = "measurement: run with --release --ignored --nocapture to refresh \
             the envelope"]
 async fn measure_open_with_rehydration_wall_time() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = mess_testkit::sweeping_temp_dir(
+        "engine-reopen-measure-open-with-rehydration",
+    );
     let store_path = dir.path().join("store");
 
     const STREAMS: usize = 200;

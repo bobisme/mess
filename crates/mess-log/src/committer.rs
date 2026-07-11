@@ -2356,30 +2356,16 @@ mod tests {
     // into far fewer barriers, so it must complete the same workload with
     // strictly fewer fsyncs and in less wall time.
 
-    /// A scratch path on a real persistent device (ext4 here) OUTSIDE the
-    /// repo — `$HOME/.cache`, not `std::env::temp_dir()`. `/tmp` is commonly
-    /// `tmpfs`, where `fdatasync` is a no-op and any durability measurement
-    /// is a fiction; a path inside the crate would pollute the source tree.
-    /// This keeps the barrier a real device flush so the throughput numbers
-    /// and the sync-per-batch/early-close ratio mean something.
-    fn real_tmp(name: &str) -> std::path::PathBuf {
-        use std::sync::atomic::AtomicU64;
-        static N: AtomicU64 = AtomicU64::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let base = std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        let mut dir = base;
-        dir.push(".cache");
-        dir.push("mess-committer-scratch");
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.push(format!("{}-{}-{}", std::process::id(), n, name));
-        dir
-    }
-
-    struct Cleanup(std::path::PathBuf);
-    impl Drop for Cleanup {
-        fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+    /// A scratch dir on a real persistent device (ext4 here) OUTSIDE the
+    /// repo — `TMPDIR`/`$HOME/.cache/mess-test-tmp` (bn-2jr's shared
+    /// self-sweeping namespace), not `std::env::temp_dir()`. `/tmp` is
+    /// commonly `tmpfs`, where `fdatasync` is a no-op and any durability
+    /// measurement is a fiction; a path inside the crate would pollute the
+    /// source tree. This keeps the barrier a real device flush so the
+    /// throughput numbers and the sync-per-batch/early-close ratio mean
+    /// something.
+    fn real_tmp(name: &str) -> mess_testkit::SweepingTempDir {
+        mess_testkit::sweeping_temp_dir(name)
     }
 
     /// Run `writers × batches` appends of `events_per` events each under
@@ -2442,10 +2428,10 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)] // real filesystem + threads
     fn early_close_beats_sync_per_batch_at_4_writers() {
-        let p_os = real_tmp("ratio-os");
-        let p_grp = real_tmp("ratio-grp");
-        let _c1 = Cleanup(p_os.clone());
-        let _c2 = Cleanup(p_grp.clone());
+        let dir_os = real_tmp("committer-ratio-os");
+        let dir_grp = real_tmp("committer-ratio-grp");
+        let p_os = dir_os.path().join("seg");
+        let p_grp = dir_grp.path().join("seg");
 
         let (os_t, os_fsyncs, _) =
             run_real_workload(&p_os, Durability::Os, 4, 60, 100);
@@ -2485,16 +2471,16 @@ mod tests {
     #[ignore = "perf: run with --release to reproduce >=100k durable ev/s"]
     fn perf_100k_durable_ev_per_s_4x100() {
         // Warm the device/page cache.
-        let wpath = real_tmp("perf-warm");
-        let _cw = Cleanup(wpath.clone());
+        let wdir = real_tmp("committer-perf-warm");
+        let wpath = wdir.path().join("seg");
         let _ =
             run_real_workload(&wpath, Durability::group_default(), 4, 100, 100);
 
         let mut best_ev_per_s = 0.0f64;
         let mut best_per_fsync = 0.0f64;
         for pass in 0..5 {
-            let path = real_tmp("perf-4x100");
-            let _c = Cleanup(path.clone());
+            let dir = real_tmp("committer-perf-4x100");
+            let path = dir.path().join("seg");
             let (elapsed, fsyncs, events) = run_real_workload(
                 &path,
                 Durability::group_default(),
@@ -2550,8 +2536,8 @@ mod tests {
     fn drop_joins_the_real_thread_and_closes_lingering_appenders() {
         let rt = RealRuntime::new();
         let fs = rt.fs();
-        let path = real_tmp("drop-join");
-        let _cleanup = Cleanup(path.clone());
+        let dir = real_tmp("committer-drop-join");
+        let path = dir.path().join("seg");
         let writer =
             SegmentWriter::create(&fs, &path, SegmentParams::new(0, 0, 1, 0))
                 .unwrap();

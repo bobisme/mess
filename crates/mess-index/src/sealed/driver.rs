@@ -642,7 +642,9 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn seal_writes_sidecar_finalizes_and_installs() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = mess_testkit::sweeping_temp_dir(
+            "idx-driver-seal-writes-sidecar-finalizes",
+        );
         let store = Arc::new(SealedStore::new());
         let driver = SealDriver::new(store.clone(), dir.path());
 
@@ -672,7 +674,9 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn seal_builds_and_persists_filter() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = mess_testkit::sweeping_temp_dir(
+            "idx-driver-seal-builds-and-persists",
+        );
         let store = Arc::new(SealedStore::new());
         let driver = SealDriver::new(store.clone(), dir.path());
 
@@ -699,7 +703,9 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn missing_or_corrupt_filter_falls_back_to_unfiltered() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = mess_testkit::sweeping_temp_dir(
+            "idx-driver-missing-or-corrupt-filter",
+        );
         let store = Arc::new(SealedStore::new());
         let driver = SealDriver::new(store.clone(), dir.path());
         driver.seal(input(7), || Ok(())).unwrap();
@@ -751,7 +757,9 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn seal_metrics_record_barriers_duration_and_alarm() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = mess_testkit::sweeping_temp_dir(
+            "idx-driver-seal-metrics-record-barriers",
+        );
         let store = Arc::new(SealedStore::new());
         let metrics = Arc::new(SealMetrics::new());
         metrics.set_fsync_alarm_threshold(Duration::ZERO);
@@ -792,7 +800,9 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn seal_without_metrics_is_unaffected() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = mess_testkit::sweeping_temp_dir(
+            "idx-driver-seal-without-metrics-is",
+        );
         let store = Arc::new(SealedStore::new());
         let driver = SealDriver::new(store.clone(), dir.path());
         let idx = driver.seal(input(7), || Ok(())).unwrap();
@@ -803,7 +813,9 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn finalize_failure_aborts_before_install() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = mess_testkit::sweeping_temp_dir(
+            "idx-driver-finalize-failure-aborts-before",
+        );
         let store = Arc::new(SealedStore::new());
         let driver = SealDriver::new(store.clone(), dir.path());
         let r = driver.seal(input(7), || Err(io::Error::other("boom")));
@@ -821,7 +833,9 @@ mod tests {
         use crate::columnar::{emit_int, emit_str};
         use crate::sealed::payload::{BlockKind, NoDicts, SealedPayloadIndex};
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = mess_testkit::sweeping_temp_dir(
+            "idx-driver-seal-payload-writes-verified",
+        );
         let store = Arc::new(SealedStore::new());
         let driver = SealDriver::new(store.clone(), dir.path());
 
@@ -877,7 +891,9 @@ mod tests {
         use crate::sealed::payload::{BlockKind, NoDicts};
         use crate::sealed::segment::SealStream;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = mess_testkit::sweeping_temp_dir(
+            "idx-driver-seal-emits-and-attaches",
+        );
         let store = Arc::new(SealedStore::new());
         let driver = SealDriver::new(store.clone(), dir.path());
 
@@ -969,7 +985,9 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn seal_without_payloads_emits_no_pcol() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = mess_testkit::sweeping_temp_dir(
+            "idx-driver-seal-without-payloads-emits",
+        );
         let store = Arc::new(SealedStore::new());
         let driver = SealDriver::new(store.clone(), dir.path());
         let idx = driver.seal(input(7), || Ok(())).unwrap();
@@ -988,7 +1006,9 @@ mod tests {
         use crate::sealed::payload::NoDicts;
         use crate::sealed::segment::SealStream;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = mess_testkit::sweeping_temp_dir(
+            "idx-driver-background-sealer-emits-pcol",
+        );
         let store = Arc::new(SealedStore::new());
         let driver = SealDriver::new(store.clone(), dir.path());
         let sealer = BackgroundSealer::spawn(driver.clone());
@@ -1026,7 +1046,9 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn background_sealer_seals_off_thread() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = mess_testkit::sweeping_temp_dir(
+            "idx-driver-background-sealer-seals-off",
+        );
         let store = Arc::new(SealedStore::new());
         let driver = SealDriver::new(store.clone(), dir.path());
         let active = crate::ActiveIndex::new();

@@ -57,7 +57,7 @@ fn count_par(sealed: &Path) -> usize {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn parity_sidecar_written_only_when_enabled() {
     // --- enabled ---
-    let on_dir = tempfile::tempdir().expect("tempdir");
+    let on_dir = mess_testkit::sweeping_temp_dir("parity-seal-on-dir");
     let on_store = on_dir.path().join("store");
     let mut opts = rolling_opts();
     opts.parity = ParityConfig { enabled: true, ..Default::default() };
@@ -105,7 +105,7 @@ async fn parity_sidecar_written_only_when_enabled() {
     drop(engine);
 
     // --- disabled (default) ---
-    let off_dir = tempfile::tempdir().expect("tempdir");
+    let off_dir = mess_testkit::sweeping_temp_dir("parity-seal-off-dir");
     let off_store = off_dir.path().join("store");
     let engine =
         LogEngine::open_with(&off_store, rolling_opts()).expect("open");

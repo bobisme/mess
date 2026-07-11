@@ -197,7 +197,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::Path;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::Ordering;
 
     use super::*;
     use crate::committer::{
@@ -444,31 +444,16 @@ mod tests {
     // advance. Every snapshot must still be exactly the committed prefix.
     // fs-touching + real threads => excluded from the Miri lane.
 
-    fn real_tmp(name: &str) -> PathBuf {
-        static N: AtomicU64 = AtomicU64::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let base = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        let mut dir = base;
-        dir.push(".cache");
-        dir.push("mess-reader-scratch");
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.push(format!("{}-{}-{}", std::process::id(), n, name));
-        dir
-    }
-
-    struct Cleanup(PathBuf);
-    impl Drop for Cleanup {
-        fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+    fn real_tmp(name: &str) -> mess_testkit::SweepingTempDir {
+        mess_testkit::sweeping_temp_dir(name)
     }
 
     #[test]
     #[cfg_attr(miri, ignore)]
     fn real_concurrent_readers_never_see_past_the_watermark() {
         let plan = expected_batches();
-        let path = real_tmp("reader-smoke");
-        let _c = Cleanup(path.clone());
+        let dir = real_tmp("reader-smoke");
+        let path = dir.path().join("seg");
 
         let rt = RealRuntime::new();
         let fs = rt.fs();
@@ -545,8 +530,8 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn await_past_wakes_a_reader_when_its_position_commits() {
-        let path = real_tmp("await-past");
-        let _c = Cleanup(path.clone());
+        let dir = real_tmp("await-past");
+        let path = dir.path().join("seg");
         let rt = RealRuntime::new();
         let fs = rt.fs();
         let writer =

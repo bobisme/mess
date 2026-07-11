@@ -227,7 +227,7 @@ async fn generate_golden_v4() { generate(GOLDEN_V4, true).await; }
 /// it under `tests/golden/<version>/`. `chain` selects whether segments carry
 /// the real on-disk `crypto_chain` (v4) or plain frames (v3).
 async fn generate(version: &str, chain: bool) {
-    let work = tempfile::tempdir().expect("tempdir");
+    let work = mess_testkit::sweeping_temp_dir("cli-golden-work");
     let store = work.path().join("store");
 
     // ---- 1. Build the store with the production engine (rolling segments).
@@ -453,7 +453,7 @@ async fn check(version: &str, chain: bool) {
     );
 
     // ---- 1. Unpack the committed golden into a scratch dir. ----
-    let scratch = tempfile::tempdir().expect("tempdir");
+    let scratch = mess_testkit::sweeping_temp_dir("cli-golden-scratch");
     sh(&format!(
         "zstd -dqc {} | tar -xf - -C {}",
         tarball.display(),

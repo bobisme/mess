@@ -15,7 +15,9 @@ fn rec(t: &str, d: &[u8]) -> RecordToAppend {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn inspect_reports_offline_metrics() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = mess_testkit::sweeping_temp_dir(
+        "cli-inspect-metrics-inspect-reports-offline-metrics",
+    );
     {
         let engine = LogEngine::open(dir.path()).expect("open");
         engine

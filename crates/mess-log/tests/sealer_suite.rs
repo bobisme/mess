@@ -10,7 +10,7 @@
 //! that must plant *stale prior-generation* bytes behind a fresh header use the
 //! sim fault fs directly (its [`SimFs::seed`] is the resurrected-region model).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use mess_log::encode::{BatchEncoder, BatchInput, Subframe};
 use mess_log::format::*;
@@ -420,54 +420,41 @@ fn whole_file_image_trailer_decodes() {
 // Real-runtime entry points (excluded from Miri: real `open` needs the OS)
 // ---------------------------------------------------------------------------
 
-struct Cleanup(Vec<PathBuf>);
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        for p in &self.0 {
-            let _ = std::fs::remove_file(p);
-        }
-    }
-}
-
-fn tmp(name: &str) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static N: AtomicU64 = AtomicU64::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    let mut p = std::env::temp_dir();
-    p.push(format!("mess-log-sealer-{}-{}-{}", std::process::id(), n, name));
-    p
+/// A fresh self-sweeping real-fs temp dir (bn-2jr), tagged by call site.
+fn tmp(name: &str) -> mess_testkit::SweepingTempDir {
+    mess_testkit::sweeping_temp_dir(&format!("sealer-{name}"))
 }
 
 #[test]
 #[cfg_attr(miri, ignore)]
 fn real_seal_roundtrips() {
-    let p = tmp("seal");
-    let _c = Cleanup(vec![p.clone()]);
+    let dir = tmp("seal");
+    let p = dir.path().join("seal.seg");
     seal_roundtrips(&RealRuntime::new(), &p);
 }
 
 #[test]
 #[cfg_attr(miri, ignore)]
 fn real_fast_path_matches_full_scan() {
-    let p = tmp("fast");
-    let _c = Cleanup(vec![p.clone()]);
+    let dir = tmp("fast");
+    let p = dir.path().join("fast.seg");
     fast_path_matches_full_scan(&RealRuntime::new(), &p);
 }
 
 #[test]
 #[cfg_attr(miri, ignore)]
 fn real_corrupt_footer_falls_back_to_scan() {
-    let p = tmp("corrupt");
-    let _c = Cleanup(vec![p.clone()]);
+    let dir = tmp("corrupt");
+    let p = dir.path().join("corrupt.seg");
     corrupt_footer_falls_back_to_scan(&RealRuntime::new(), &p);
 }
 
 #[test]
 #[cfg_attr(miri, ignore)]
 fn real_a9_chain_across_sealed_roll() {
-    let p0 = tmp("roll0");
-    let p1 = tmp("roll1");
-    let _c = Cleanup(vec![p0.clone(), p1.clone()]);
+    let dir = tmp("roll");
+    let p0 = dir.path().join("roll0.seg");
+    let p1 = dir.path().join("roll1.seg");
     a9_chain_across_sealed_roll(&RealRuntime::new(), &p0, &p1);
 }
 

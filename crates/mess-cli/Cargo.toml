@@ -23,5 +23,7 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 mess-core = { workspace = true }
-tempfile = "3"
+# bn-cxr/bn-2jr: the shared self-sweeping temp-dir helper (replaces
+# hand-rolled `tempfile::tempdir()` call sites across this crate's tests).
+mess-testkit = { workspace = true }
 tokio = { workspace = true }

@@ -11,7 +11,9 @@ fn rec(t: &str, d: &[u8]) -> RecordToAppend {
 
 #[tokio::test]
 async fn append_read_head_conflict() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = mess_testkit::sweeping_temp_dir(
+        "engine-smoke-append-read-head-conflict",
+    );
     let engine = LogEngine::open(dir.path()).expect("open");
 
     // Empty stream.
@@ -83,7 +85,7 @@ async fn append_read_head_conflict() {
 #[tokio::test]
 async fn drives_the_facade() {
     // The facade's load/append/command over the engine.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = mess_testkit::sweeping_temp_dir("engine-smoke-drives-facade");
     let store = EventStore::new(LogEngine::open(dir.path()).expect("open"));
     let recs = [rec("A", b"1"), rec("B", b"2")];
     // append via the raw backend to prove read-back through the facade's page

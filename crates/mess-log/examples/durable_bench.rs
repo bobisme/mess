@@ -52,10 +52,20 @@ fn main() {
     let est_bytes = total_events.saturating_mul(320).saturating_add(1 << 20);
     let segment_size = est_bytes.max(256 * 1024 * 1024).next_power_of_two();
 
-    let scratch = std::env::var_os("MESS_BENCH_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("mess-bench"));
-    std::fs::create_dir_all(&scratch).expect("create scratch dir");
+    // `MESS_BENCH_DIR`, if set, still wins (a caller pinning a specific ext4
+    // mount for the durable numbers) — routed through `temp_dir_in` so its
+    // one nested run dir is still cleaned up on exit like every other site
+    // (bn-2jr). Unset, this falls back to the same shared self-sweeping
+    // namespace (`TMPDIR`/`$HOME/.cache/mess-test-tmp`) every other real-fs
+    // suite in this repo uses, rather than a bare, never-swept
+    // `std::env::temp_dir()/mess-bench`.
+    let scratch = match std::env::var_os("MESS_BENCH_DIR").map(PathBuf::from) {
+        Some(root) => {
+            std::fs::create_dir_all(&root).expect("create scratch base dir");
+            mess_testkit::temp_dir_in(&root, "durable-bench")
+        }
+        None => mess_testkit::sweeping_temp_dir("durable-bench"),
+    };
 
     // ~250 B payload, the measured production event size.
     let payload: Vec<u8> = (0..250u32).map(|i| (i & 0xFF) as u8).collect();
@@ -65,7 +75,7 @@ fn main() {
          batches/writer={batches_per_writer} reps={reps} \
          total_events={total_events} segment_size={}MiB scratch={}",
         segment_size >> 20,
-        scratch.display()
+        scratch.path().display()
     );
 
     let mut best_ev_s = 0.0f64;
@@ -76,6 +86,7 @@ fn main() {
         let rt = RealRuntime::new();
         let fs = rt.fs();
         let path = scratch
+            .path()
             .join(format!("bench-{mode}-{}-{rep}.seg", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let mut params = SegmentParams::new(1, 0, 1, 0);

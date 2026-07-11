@@ -29,7 +29,6 @@
 
 use std::convert::Infallible;
 use std::future::Future;
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use mess_core::{Aggregate, CodecError, Decide, Event};
@@ -134,22 +133,15 @@ fn stream_name(i: usize) -> String { format!("bulk-item-{i}") }
 // Harness
 // ===========================================================================
 
-/// A tempdir rooted under `$HOME/.cache/mess-test-tmp`, never `/tmp` — `/tmp`
-/// is a quota-limited tmpfs on this host (256MiB `fallocate` fails with os
-/// error 122) and `fdatasync` is a no-op on tmpfs, which would make this
-/// test's whole premise (sequential commands are durability-barrier-bound)
-/// dishonestly fast. Mirrors `engine_append_gate.rs`'s helper of the same
-/// name.
-fn durable_scratch_dir(prefix: &str) -> tempfile::TempDir {
-    let base: PathBuf = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .expect("HOME must be set")
-        .join(".cache/mess-test-tmp");
-    std::fs::create_dir_all(&base).expect("create scratch base dir");
-    tempfile::Builder::new()
-        .prefix(prefix)
-        .tempdir_in(&base)
-        .expect("tempdir_in scratch base")
+/// A self-sweeping tempdir rooted under `TMPDIR`/`$HOME/.cache/mess-test-tmp`
+/// (never `/tmp` — `/tmp` is a quota-limited tmpfs on this host, 256MiB
+/// `fallocate` fails with os error 122, and `fdatasync` is a no-op on tmpfs,
+/// which would make this test's whole premise — sequential commands are
+/// durability-barrier-bound — dishonestly fast). Mirrors
+/// `engine_append_gate.rs`'s helper of the same name; both now delegate to
+/// `mess_testkit::sweeping_temp_dir` (bn-2jr) so leaked dirs get swept.
+fn durable_scratch_dir(name: &str) -> mess_testkit::SweepingTempDir {
+    mess_testkit::sweeping_temp_dir(name)
 }
 
 /// A real durable engine: `Durability::Group` at the spec's recommended
@@ -211,8 +203,8 @@ where
 /// `(sequential_elapsed, pipelined_elapsed)` after asserting the two stores'
 /// contents are identical.
 async fn run_demo(n: usize, k: usize) -> (Duration, Duration) {
-    let seq_dir = durable_scratch_dir("mess-bulk-write-seq-");
-    let pipe_dir = durable_scratch_dir("mess-bulk-write-pipe-");
+    let seq_dir = durable_scratch_dir("bulk-write-seq");
+    let pipe_dir = durable_scratch_dir("bulk-write-pipe");
     let store_seq = EventStore::new(open_durable_engine(seq_dir.path()));
     let store_pipe = EventStore::new(open_durable_engine(pipe_dir.path()));
 

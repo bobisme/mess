@@ -15,7 +15,9 @@ fn rec(t: &str, d: &[u8]) -> RecordToAppend {
 /// the barrier histogram; a fresh store is not degraded.
 #[tokio::test]
 async fn metrics_move_under_durable_workload() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = mess_testkit::sweeping_temp_dir(
+        "engine-metrics-metrics-move-under-durable",
+    );
     let opts = EngineOptions {
         durability: mess_log::committer::Durability::group_default(),
         ..EngineOptions::default()
@@ -94,7 +96,9 @@ async fn metrics_move_under_durable_workload() {
 /// metrics absent).
 #[tokio::test]
 async fn cache_and_seal_metrics_move_under_workload() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = mess_testkit::sweeping_temp_dir(
+        "engine-metrics-cache-and-seal-metrics",
+    );
     let opts = EngineOptions {
         durability: mess_log::committer::Durability::group_default(),
         block_cache_budget_bytes: 4 * 1024 * 1024,

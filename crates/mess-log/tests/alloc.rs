@@ -60,10 +60,10 @@ static GLOBAL: Counting = Counting;
 fn allocs() -> usize { ALLOCS.load(Ordering::Relaxed) }
 
 // bn-25j: the writer half of this test opens a real segment file via
-// `RealRuntime` (`std::env::temp_dir()` + `std::fs`); Miri's isolation
-// blocks real `open`, and a 20_000-iteration hot-path timing test is also
-// far too slow interpreted under Miri regardless. Excluded from the Miri
-// lane.
+// `RealRuntime` (a self-sweeping real-fs temp dir + `std::fs`); Miri's
+// isolation blocks real `open`, and a 20_000-iteration hot-path timing test
+// is also far too slow interpreted under Miri regardless. Excluded from the
+// Miri lane.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn zero_allocs_per_event_on_the_hot_path() {
@@ -104,9 +104,8 @@ fn zero_allocs_per_event_on_the_hot_path() {
     // --- Part 2: encode + append through the writer is zero-alloc ----------
     // RealRuntime's pwrite is write_at(2): no Rust heap allocation.
     let rt = RealRuntime::new();
-    let path = std::env::temp_dir()
-        .join(format!("mess-log-alloc-{}.seg", std::process::id()));
-    let _cleanup = RmOnDrop(path.clone());
+    let dir = mess_testkit::sweeping_temp_dir("alloc-hotpath");
+    let path = dir.path().join("hotpath.seg");
 
     let mut w =
         SegmentWriter::create(&rt.fs(), &path, SegmentParams::new(1, 0, 1, 0))
@@ -132,9 +131,4 @@ fn zero_allocs_per_event_on_the_hot_path() {
         "encode+append allocated {append_allocs} times over {N} batches (want \
          0)"
     );
-}
-
-struct RmOnDrop(std::path::PathBuf);
-impl Drop for RmOnDrop {
-    fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
 }

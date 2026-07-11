@@ -22,4 +22,10 @@ serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
-tempfile = "3"
+# bn-cxr/bn-2jr: the shared self-sweeping temp-dir helper — `tests/smoke.rs`
+# uses `temp_dir_in` to nest a per-run, panic-safe scratch dir under
+# `default_scratch_root()`. Dev-dependency only: `src/lib.rs`'s own
+# `default_scratch_root`/`assert_real_fs` (used by the shipped `mess-bench`
+# binary too) deliberately do NOT depend on this crate — see their doc
+# comments.
+mess-testkit = { workspace = true }

@@ -37,7 +37,9 @@ async fn append_n(engine: &LogEngine, stream: &str, from: u64, n: u64) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn subscribe_from_zero_replays_then_tails_live() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = mess_testkit::sweeping_temp_dir(
+        "subscription-subscribe-from-zero-replays",
+    );
     let engine = LogEngine::open(dir.path()).expect("open");
     let store = EventStore::new(engine.clone());
 
@@ -82,7 +84,8 @@ async fn subscribe_from_zero_replays_then_tails_live() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn await_past_wakes_after_commit_passes_position() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir =
+        mess_testkit::sweeping_temp_dir("subscription-await-past-wakes-after");
     let engine = LogEngine::open(dir.path()).expect("open");
     let store = EventStore::new(engine.clone());
 
@@ -116,7 +119,9 @@ async fn await_past_wakes_after_commit_passes_position() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn subscribe_from_midlog_replays_only_the_suffix() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = mess_testkit::sweeping_temp_dir(
+        "subscription-subscribe-from-midlog-replays",
+    );
     let engine = LogEngine::open(dir.path()).expect("open");
     let store = EventStore::new(engine.clone());
 
@@ -154,7 +159,9 @@ async fn subscribe_from_midlog_replays_only_the_suffix() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dropping_a_subscription_does_not_wedge_the_committer() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = mess_testkit::sweeping_temp_dir(
+        "subscription-dropping-a-subscription-does",
+    );
     let engine = LogEngine::open(dir.path()).expect("open");
     let store = EventStore::new(engine.clone());
 

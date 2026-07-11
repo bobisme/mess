@@ -524,26 +524,10 @@ fn all_sealed_log_has_no_active_segment() {
 // ---------------------------------------------------------------------------
 
 mod real_parallel {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
     use mess_log::runtime::Runtime;
     use mess_log::runtime::real::RealFs;
 
     use super::*;
-
-    fn tmp_dir() -> PathBuf {
-        static N: AtomicU64 = AtomicU64::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let mut p = std::env::temp_dir();
-        p.push(format!("mess-recover-all-{}-{}", std::process::id(), n));
-        std::fs::create_dir_all(&p).unwrap();
-        p
-    }
-
-    struct Cleanup(PathBuf);
-    impl Drop for Cleanup {
-        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
-    }
 
     /// Build a chain of `n_sealed` sealed segments + a clean unsealed tail on
     /// the real fs under `dir`, returning the ordered segment files.
@@ -586,10 +570,9 @@ mod real_parallel {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn parallel_equals_serial_full_and_fast() {
-        let dir = tmp_dir();
-        let _c = Cleanup(dir.clone());
+        let dir = mess_testkit::sweeping_temp_dir("recover-all-parallel");
         let fs = RealFs;
-        let segs = build_real(&dir, 5);
+        let segs = build_real(dir.path(), 5);
 
         for mode in [RecoveryMode::Full, RecoveryMode::Fast] {
             let serial = recover_whole_log(

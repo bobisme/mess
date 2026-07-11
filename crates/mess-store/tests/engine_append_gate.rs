@@ -29,7 +29,7 @@ fn rec(t: &str, d: &[u8]) -> RecordToAppend {
 /// exactly one version past the raced-on version (no lost or double writes).
 #[tokio::test]
 async fn same_stream_exact_version_race_has_exactly_one_winner() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = mess_testkit::sweeping_temp_dir("engine-append-gate-race");
     let engine = LogEngine::open(dir.path()).expect("open");
 
     // Establish the stream at version 0.

@@ -183,7 +183,9 @@ async fn chain_overhead_report() {
     let total = BATCHES * BATCH;
 
     let run = |chain: bool| async move {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = mess_testkit::sweeping_temp_dir(
+            "cli-chain-verify-chain-overhead-report",
+        );
         let engine =
             LogEngine::open_with(dir.path(), opts(chain)).expect("open");
         let sizes = vec![BATCH; BATCHES as usize];
@@ -227,8 +229,8 @@ async fn chain_off_is_byte_identical_and_chain_on_differs() {
     let batch_sizes = [3u64, 1, 2, 4, 1];
 
     // Two independent chain-OFF stores over the identical corpus.
-    let a = tempfile::tempdir().unwrap();
-    let b = tempfile::tempdir().unwrap();
+    let a = mess_testkit::sweeping_temp_dir("cli-chain-verify-a");
+    let b = mess_testkit::sweeping_temp_dir("cli-chain-verify-b");
     for dir in [a.path(), b.path()] {
         let engine = LogEngine::open_with(dir, opts(false)).expect("open");
         append_batches(&engine, "acct", 0, &batch_sizes).await;
@@ -252,7 +254,7 @@ async fn chain_off_is_byte_identical_and_chain_on_differs() {
 
     // The same corpus with chain ON: bytes differ, every batch carries the
     // chain, and verify --full is green over the real on-disk chain.
-    let c = tempfile::tempdir().unwrap();
+    let c = mess_testkit::sweeping_temp_dir("cli-chain-verify-c");
     let engine =
         LogEngine::open_with(c.path(), opts(true)).expect("open chained");
     append_batches(&engine, "acct", 0, &batch_sizes).await;
@@ -294,7 +296,9 @@ async fn chain_off_is_byte_identical_and_chain_on_differs() {
 
 #[tokio::test]
 async fn reopen_continues_chain_and_verifies_whole_stream() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = mess_testkit::sweeping_temp_dir(
+        "cli-chain-verify-reopen-continues-chain-and",
+    );
 
     // Write chained, then "crash" by dropping the engine.
     {
@@ -343,7 +347,9 @@ async fn reopen_continues_chain_and_verifies_whole_stream() {
 
 #[tokio::test]
 async fn full_verify_catches_crc_repaired_tamper() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = mess_testkit::sweeping_temp_dir(
+        "cli-chain-verify-full-verify-catches-crc",
+    );
     {
         let engine =
             LogEngine::open_with(dir.path(), opts(true)).expect("open");

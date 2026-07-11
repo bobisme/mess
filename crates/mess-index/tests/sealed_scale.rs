@@ -88,7 +88,8 @@ fn percentile(sorted: &[Duration], q: f64) -> Duration {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn full_scale_seal_is_off_path_and_reads_fast() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir =
+        mess_testkit::sweeping_temp_dir("idx-sealed-scale-full-scale-seal-is");
     let store = Arc::new(SealedStore::new());
     let driver = SealDriver::new(store.clone(), dir.path());
 

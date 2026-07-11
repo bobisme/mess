@@ -250,14 +250,12 @@ fn pwrite_enospc_fails_append_no_corruption() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn real_preallocation_keeps_size() {
-    let dir = std::env::temp_dir();
-    let path = dir
-        .join(format!("mess-log-enospc-keepsize-{}.seg", std::process::id()));
-    struct Rm(std::path::PathBuf);
-    impl Drop for Rm {
-        fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
-    }
-    let _rm = Rm(path.clone());
+    // A self-sweeping real-fs temp dir (never `/tmp`/`std::env::temp_dir()`:
+    // this test asserts on `fallocate(FALLOC_FL_KEEP_SIZE)` reservation
+    // behaviour, which a `tmpfs` `/tmp` may not honour the same way as a
+    // real device).
+    let dir = mess_testkit::sweeping_temp_dir("enospc-keepsize");
+    let path = dir.path().join("keepsize.seg");
 
     let rt = RealRuntime::new();
     let mut p = SegmentParams::new(1, 0, 1, 0);

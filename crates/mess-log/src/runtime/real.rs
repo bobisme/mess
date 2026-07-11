@@ -202,34 +202,12 @@ impl Runtime for RealRuntime {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
     use super::*;
     use crate::runtime::testsuite;
 
-    // A unique temp path per test invocation so parallel test threads and
-    // repeated runs never collide.
-    fn tmp(name: &str) -> PathBuf {
-        static N: AtomicU64 = AtomicU64::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "mess-log-runtime-{}-{}-{}",
-            std::process::id(),
-            n,
-            name
-        ));
-        p
-    }
-
-    struct Cleanup(Vec<PathBuf>);
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            for p in &self.0 {
-                let _ = std::fs::remove_file(p);
-            }
-        }
+    /// A fresh self-sweeping real-fs temp dir (bn-2jr), tagged by call site.
+    fn tmp(name: &str) -> mess_testkit::SweepingTempDir {
+        mess_testkit::sweeping_temp_dir(&format!("runtime-{name}"))
     }
 
     // bn-25j: real fs (`std::fs::File::open`/`create`); Miri's isolation
@@ -238,8 +216,8 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn real_fs_roundtrip() {
-        let p = tmp("roundtrip");
-        let _c = Cleanup(vec![p.clone()]);
+        let dir = tmp("roundtrip");
+        let p = dir.path().join("roundtrip.seg");
         testsuite::fs_roundtrip(&RealRuntime::new(), &p);
     }
 
@@ -247,9 +225,9 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn real_fs_rename() {
-        let from = tmp("rename-from");
-        let to = tmp("rename-to");
-        let _c = Cleanup(vec![from.clone(), to.clone()]);
+        let dir = tmp("rename");
+        let from = dir.path().join("rename-from.seg");
+        let to = dir.path().join("rename-to.seg");
         testsuite::fs_rename(&RealRuntime::new(), &from, &to);
     }
 
@@ -260,8 +238,8 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn real_three_actors_share_a_segment() {
-        let p = tmp("three-actors");
-        let _c = Cleanup(vec![p.clone()]);
+        let dir = tmp("three-actors");
+        let p = dir.path().join("three-actors.seg");
         testsuite::three_actors_share_a_segment(&RealRuntime::new(), &p);
     }
 

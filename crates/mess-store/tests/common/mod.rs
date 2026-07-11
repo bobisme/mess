@@ -17,7 +17,7 @@ use mess_store::backend::{
 };
 use mess_store::snapshot::{SnapshotStore, StoredSnapshot};
 use mess_store::{FjallSnapshotBackend, LogEngine, MockBackend, Version};
-use tempfile::TempDir;
+use mess_testkit::{SweepingTempDir, sweeping_temp_dir};
 
 /// Simulate a full process restart over a backend's own durable directory
 /// (bn-20b). `self` is consumed — every in-process handle, OS lock, and cache
@@ -44,7 +44,7 @@ impl Reopen for MockBackend {
 /// A backend `B` paired with the temp dir it is rooted in.
 pub struct Tmp<B> {
     backend: B,
-    _dir:    Arc<TempDir>,
+    _dir:    Arc<SweepingTempDir>,
 }
 
 impl<B: Clone> Clone for Tmp<B> {
@@ -64,7 +64,7 @@ impl TestBackend {
     /// A fresh composed engine on its own temp dir.
     #[must_use]
     pub fn new() -> Self {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = sweeping_temp_dir("mess-store-common-backend");
         let engine =
             LogEngine::open(dir.path().join("store")).expect("open engine");
         Tmp { backend: engine, _dir: Arc::new(dir) }
@@ -79,11 +79,11 @@ impl TestSnapshotBackend {
     /// A fresh snapshot-capable composed engine on its own temp dir.
     #[must_use]
     pub fn new() -> Self {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = sweeping_temp_dir("mess-store-common-snapshot-backend");
         Self::open_at(dir)
     }
 
-    fn open_at(dir: TempDir) -> Self {
+    fn open_at(dir: SweepingTempDir) -> Self {
         let engine =
             LogEngine::open(dir.path().join("store")).expect("open engine");
         let backend =
@@ -103,7 +103,7 @@ impl Reopen for TestSnapshotBackend {
     /// `LogEngine::open` / `FjallSnapshotBackend::open` the SAME directories
     /// fresh — so recovery rehydrates the record book from the durable log with
     /// no shared in-process state carried over. The temp dir (the durable
-    /// bytes) survives via the retained `Arc<TempDir>`.
+    /// bytes) survives via the retained `Arc<SweepingTempDir>`.
     fn reopen(self) -> Self {
         let Tmp { backend, _dir } = self;
         // Release every handle to the old engine before re-acquiring its lock.
