@@ -1,0 +1,31 @@
+[package]
+name = "epoch_dedupe"
+version = "0.1.0"
+edition = "2024"
+
+# Standalone spike: opt out of the repo's root workspace.
+[workspace]
+
+[dependencies]
+# Match the repo pin (crates/mess-index/Cargo.toml) for the G0 synthetic
+# baseline. Journal-buffered (PersistMode::Buffer default), no per-commit
+# fsync — the I5 contract, same as MetaStore.
+fjall = "3.1.6"
+# G1/G2 active table. 0.15 = same major the repo benches elsewhere use.
+hashbrown = "0.15"
+# Same crate/filter the repo's sealed segment filters use (bn-1i7):
+# BinaryFuse16 — zero false negatives, ~2 B/key + slack.
+xorf = "0.12"
+# Keyed 128-bit fingerprints (xxh3_128 with seed). The production design
+# calls for a per-store keyed hash (design.md §13.2); xxh3-128 keyed stands
+# in for BLAKE3/AES-derived here — the spike injects its own width-masked
+# wrapper for forced-collision tests anyway.
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+# Active-table per-fingerprint candidate lists (inline-1 common case).
+smallvec = "1"
+# Thread pinning + /proc for the bench driver.
+libc = "0.2"
+
+[profile.release]
+lto = "thin"
+debug = true

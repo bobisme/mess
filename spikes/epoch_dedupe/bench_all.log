@@ -1,0 +1,209 @@
+INFO cpu="AMD Ryzen 9 3900X 12-Core Processor" governor=performance ns_per_tick=0.2500 tsc_overhead_ticks=80 pid=449660
+RESULT cand=g1 keylen=16 fill=25 scenario=insert ns_per_op=233 ops_per_s=4284401 wall_s=0.06
+RESULT cand=g1 keylen=16 fill=25 scenario=freeze count=1 mean_ms=11.04 max_ms=11.04 ns_per_key=88.3
+RESULT cand=g1 keylen=16 fill=25 scenario=active_miss p50=20 p90=30 p99=120 p999=340 max=7310 mean=28.7
+RESULT cand=g1 keylen=16 fill=25 scenario=window_miss p50=130 p90=170 p99=250 p999=450 max=15070 mean=137.7
+RESULT cand=g1 keylen=16 fill=25 scenario=hit_active_uniform p50=120 p90=200 p99=430 p999=580 max=10080 mean=122.3
+RESULT cand=g1 keylen=16 fill=25 scenario=hit_oldest_uniform p50=310 p90=390 p99=570 p999=770 max=21110 mean=323.7
+RESULT cand=g1 keylen=16 fill=25 scenario=hit_zipf p50=50 p90=150 p99=510 p999=740 max=10660 mean=77.6
+RESULT cand=g1 keylen=16 fill=25 scenario=deletes per_key_deletes=0 (structural: epoch candidates expose no per-key remove)
+MEM cand=g1 keylen=16 fill=25 n=250000 rss_delta=16744448 resident_est=15239456 serialized=8000032 arena_bytes=9250000
+RESULT cand=g2 keylen=16 fill=25 scenario=insert ns_per_op=219 ops_per_s=4560874 wall_s=0.05
+RESULT cand=g2 keylen=16 fill=25 scenario=freeze count=1 mean_ms=17.91 max_ms=17.91 ns_per_key=143.3
+RESULT cand=g2 keylen=16 fill=25 scenario=active_miss p50=20 p90=30 p99=120 p999=350 max=9460 mean=28.6
+RESULT cand=g2 keylen=16 fill=25 scenario=window_miss p50=40 p90=50 p99=150 p999=340 max=31650 mean=42.8
+RESULT cand=g2 keylen=16 fill=25 scenario=hit_active_uniform p50=80 p90=200 p99=400 p999=550 max=9680 mean=111.1
+RESULT cand=g2 keylen=16 fill=25 scenario=hit_oldest_uniform p50=310 p90=390 p99=520 p999=760 max=20960 mean=320.4
+RESULT cand=g2 keylen=16 fill=25 scenario=hit_zipf p50=50 p90=150 p99=500 p999=730 max=9210 mean=77.9
+RESULT cand=g2 keylen=16 fill=25 scenario=deletes per_key_deletes=0 (structural: epoch candidates expose no per-key remove)
+MEM cand=g2 keylen=16 fill=25 n=250000 rss_delta=20762624 resident_est=15534388 serialized=8294964 arena_bytes=9250000
+RESULT cand=g3 keylen=16 fill=25 scenario=insert ns_per_op=168 ops_per_s=5951289 wall_s=0.04
+RESULT cand=g3 keylen=16 fill=25 scenario=freeze count=1 mean_ms=16.43 max_ms=16.43 ns_per_key=131.4
+RESULT cand=g3 keylen=16 fill=25 scenario=active_miss p50=30 p90=40 p99=110 p999=310 max=9930 mean=38.1
+RESULT cand=g3 keylen=16 fill=25 scenario=window_miss p50=50 p90=70 p99=100 p999=140 max=7700 mean=56.3
+RESULT cand=g3 keylen=16 fill=25 scenario=hit_active_uniform p50=80 p90=150 p99=340 p999=530 max=8510 mean=100.8
+RESULT cand=g3 keylen=16 fill=25 scenario=hit_oldest_uniform p50=350 p90=440 p99=650 p999=830 max=9690 mean=366.0
+RESULT cand=g3 keylen=16 fill=25 scenario=hit_zipf p50=50 p90=150 p99=560 p999=840 max=9420 mean=84.0
+RESULT cand=g3 keylen=16 fill=25 scenario=deletes per_key_deletes=0 (structural: epoch candidates expose no per-key remove)
+MEM cand=g3 keylen=16 fill=25 n=250000 rss_delta=16633856 resident_est=12760244 serialized=8294964 arena_bytes=9250000
+RESULT cand=g0 keylen=16 fill=25 scenario=insert ns_per_op=2618 ops_per_s=381969 wall_s=0.65
+RESULT cand=g0 keylen=16 fill=25 scenario=window_miss p50=1090 p90=1440 p99=1830 p999=7610 max=29070 mean=1121.4
+RESULT cand=g0 keylen=16 fill=25 scenario=hit_active_uniform p50=1860 p90=2650 p99=3560 p999=9370 max=21490 mean=1929.7
+RESULT cand=g0 keylen=16 fill=25 scenario=hit_oldest_uniform p50=1890 p90=2730 p99=3770 p999=9730 max=244130 mean=1971.8
+RESULT cand=g0 keylen=16 fill=25 scenario=hit_zipf p50=920 p90=1870 p99=3030 p999=7170 max=23740 mean=1070.6
+RESULT cand=g0 keylen=16 fill=25 scenario=deletes per_key_deletes=0 (structural: epoch candidates expose no per-key remove)
+MEM cand=g0 keylen=16 fill=25 n=250000 rss_delta=78999552 resident_est=0 serialized=67115327 arena_bytes=9250000
+RESULT cand=g1 keylen=16 fill=75 scenario=insert ns_per_op=196 ops_per_s=5099612 wall_s=0.15
+RESULT cand=g1 keylen=16 fill=75 scenario=freeze count=5 mean_ms=9.26 max_ms=10.42 ns_per_key=74.1
+RESULT cand=g1 keylen=16 fill=75 scenario=active_miss p50=20 p90=30 p99=120 p999=340 max=9780 mean=29.2
+RESULT cand=g1 keylen=16 fill=75 scenario=window_miss p50=700 p90=890 p99=1130 p999=1620 max=26960 mean=720.0
+RESULT cand=g1 keylen=16 fill=75 scenario=hit_active_uniform p50=80 p90=200 p99=400 p999=550 max=9650 mean=112.2
+RESULT cand=g1 keylen=16 fill=75 scenario=hit_oldest_uniform p50=1000 p90=1230 p99=1530 p999=6930 max=12220 mean=1020.5
+RESULT cand=g1 keylen=16 fill=75 scenario=hit_zipf p50=60 p90=220 p99=1240 p999=2000 max=9470 mean=124.6
+RESULT cand=g1 keylen=16 fill=75 scenario=deletes per_key_deletes=0 (structural: epoch candidates expose no per-key remove)
+MEM cand=g1 keylen=16 fill=75 n=750000 rss_delta=36777984 resident_est=31239584 serialized=24000160 arena_bytes=27750000
+RESULT cand=g2 keylen=16 fill=75 scenario=insert ns_per_op=238 ops_per_s=4201460 wall_s=0.18
+RESULT cand=g2 keylen=16 fill=75 scenario=freeze count=5 mean_ms=14.99 max_ms=17.53 ns_per_key=119.9
+RESULT cand=g2 keylen=16 fill=75 scenario=active_miss p50=30 p90=40 p99=130 p999=330 max=10370 mean=31.6
+RESULT cand=g2 keylen=16 fill=75 scenario=window_miss p50=80 p90=100 p99=180 p999=340 max=9180 mean=84.3
+RESULT cand=g2 keylen=16 fill=75 scenario=hit_active_uniform p50=90 p90=200 p99=410 p999=560 max=8950 mean=116.5
+RESULT cand=g2 keylen=16 fill=75 scenario=hit_oldest_uniform p50=390 p90=490 p99=720 p999=910 max=11680 mean=403.8
+RESULT cand=g2 keylen=16 fill=75 scenario=hit_zipf p50=60 p90=220 p99=1180 p999=1710 max=11050 mean=126.8
+RESULT cand=g2 keylen=16 fill=75 scenario=deletes per_key_deletes=0 (structural: epoch candidates expose no per-key remove)
+MEM cand=g2 keylen=16 fill=75 n=750000 rss_delta=39538688 resident_est=32714244 serialized=25474820 arena_bytes=27750000
+RESULT cand=g3 keylen=16 fill=75 scenario=insert ns_per_op=193 ops_per_s=5194488 wall_s=0.14
+RESULT cand=g3 keylen=16 fill=75 scenario=freeze count=5 mean_ms=14.03 max_ms=16.43 ns_per_key=112.3
+RESULT cand=g3 keylen=16 fill=75 scenario=active_miss p50=30 p90=40 p99=110 p999=250 max=8210 mean=37.5
+RESULT cand=g3 keylen=16 fill=75 scenario=window_miss p50=90 p90=110 p99=150 p999=250 max=8200 mean=94.9
+RESULT cand=g3 keylen=16 fill=75 scenario=hit_active_uniform p50=80 p90=150 p99=340 p999=540 max=10190 mean=100.9
+RESULT cand=g3 keylen=16 fill=75 scenario=hit_oldest_uniform p50=420 p90=520 p99=750 p999=920 max=10250 mean=431.9
+RESULT cand=g3 keylen=16 fill=75 scenario=hit_zipf p50=60 p90=230 p99=1230 p999=1720 max=9550 mean=132.7
+RESULT cand=g3 keylen=16 fill=75 scenario=deletes per_key_deletes=0 (structural: epoch candidates expose no per-key remove)
+MEM cand=g3 keylen=16 fill=75 n=750000 rss_delta=35164160 resident_est=29940100 serialized=25474820 arena_bytes=27750000
+RESULT cand=g0 keylen=16 fill=75 scenario=insert ns_per_op=4226 ops_per_s=236610 wall_s=3.17
+RESULT cand=g0 keylen=16 fill=75 scenario=window_miss p50=940 p90=1240 p99=1610 p999=7020 max=28430 mean=977.9
+RESULT cand=g0 keylen=16 fill=75 scenario=hit_active_uniform p50=1510 p90=2810 p99=4310 p999=9700 max=26470 mean=1724.2
+RESULT cand=g0 keylen=16 fill=75 scenario=hit_oldest_uniform p50=3270 p90=4160 p99=5650 p999=11600 max=27890 mean=3357.3
+RESULT cand=g0 keylen=16 fill=75 scenario=hit_zipf p50=800 p90=1950 p99=4260 p999=6960 max=13850 mean=1084.7
+RESULT cand=g0 keylen=16 fill=75 scenario=deletes per_key_deletes=0 (structural: epoch candidates expose no per-key remove)
+MEM cand=g0 keylen=16 fill=75 n=750000 rss_delta=239738880 resident_est=0 serialized=126231460 arena_bytes=27750000
+RESULT cand=g1 keylen=16 fill=100 scenario=insert ns_per_op=202 ops_per_s=4943414 wall_s=0.20
+RESULT cand=g1 keylen=16 fill=100 scenario=freeze count=7 mean_ms=9.16 max_ms=11.24 ns_per_key=73.3
+RESULT cand=g1 keylen=16 fill=100 scenario=active_miss p50=20 p90=30 p99=120 p999=360 max=9430 mean=28.7
+RESULT cand=g1 keylen=16 fill=100 scenario=window_miss p50=980 p90=1280 p99=1800 p999=7200 max=99600 mean=1027.7
+RESULT cand=g1 keylen=16 fill=100 scenario=hit_active_uniform p50=80 p90=200 p99=410 p999=560 max=8600 mean=113.6
+RESULT cand=g1 keylen=16 fill=100 scenario=hit_oldest_uniform p50=1350 p90=1680 p99=2060 p999=7980 max=29250 mean=1380.2
+RESULT cand=g1 keylen=16 fill=100 scenario=hit_zipf p50=60 p90=230 p99=1640 p999=2640 max=9510 mean=145.4
+RESULT cand=g1 keylen=16 fill=100 scenario=deletes per_key_deletes=0 (structural: epoch candidates expose no per-key remove)
+MEM cand=g1 keylen=16 fill=100 n=1000000 rss_delta=45785088 resident_est=39239648 serialized=32000224 arena_bytes=37000000
+RESULT cand=g2 keylen=16 fill=100 scenario=insert ns_per_op=247 ops_per_s=4053499 wall_s=0.25
+RESULT cand=g2 keylen=16 fill=100 scenario=freeze count=7 mean_ms=14.99 max_ms=17.85 ns_per_key=119.9
+RESULT cand=g2 keylen=16 fill=100 scenario=active_miss p50=20 p90=30 p99=120 p999=330 max=7310 mean=28.7
+RESULT cand=g2 keylen=16 fill=100 scenario=window_miss p50=100 p90=130 p99=230 p999=480 max=12270 mean=106.4
+RESULT cand=g2 keylen=16 fill=100 scenario=hit_active_uniform p50=90 p90=200 p99=420 p999=560 max=11740 mean=116.8
+RESULT cand=g2 keylen=16 fill=100 scenario=hit_oldest_uniform p50=410 p90=500 p99=700 p999=900 max=19280 mean=421.1
+RESULT cand=g2 keylen=16 fill=100 scenario=hit_zipf p50=60 p90=230 p99=1430 p999=1950 max=11240 mean=143.3
+RESULT cand=g2 keylen=16 fill=100 scenario=deletes per_key_deletes=0 (structural: epoch candidates expose no per-key remove)
+MEM cand=g2 keylen=16 fill=100 n=1000000 rss_delta=47542272 resident_est=41304172 serialized=34064748 arena_bytes=37000000
+RESULT cand=g3 keylen=16 fill=100 scenario=insert ns_per_op=210 ops_per_s=4757232 wall_s=0.21
+RESULT cand=g3 keylen=16 fill=100 scenario=freeze count=7 mean_ms=14.07 max_ms=16.58 ns_per_key=112.5
+RESULT cand=g3 keylen=16 fill=100 scenario=active_miss p50=30 p90=40 p99=110 p999=260 max=7790 mean=37.8
+RESULT cand=g3 keylen=16 fill=100 scenario=window_miss p50=110 p90=120 p99=170 p999=270 max=8040 mean=113.6
+RESULT cand=g3 keylen=16 fill=100 scenario=hit_active_uniform p50=70 p90=150 p99=300 p999=530 max=9800 mean=96.2
+RESULT cand=g3 keylen=16 fill=100 scenario=hit_oldest_uniform p50=440 p90=530 p99=760 p999=940 max=21870 mean=449.3
+RESULT cand=g3 keylen=16 fill=100 scenario=hit_zipf p50=60 p90=280 p99=1450 p999=1990 max=9700 mean=150.8
+RESULT cand=g3 keylen=16 fill=100 scenario=deletes per_key_deletes=0 (structural: epoch candidates expose no per-key remove)
+MEM cand=g3 keylen=16 fill=100 n=1000000 rss_delta=44105728 resident_est=38573932 serialized=34064748 arena_bytes=37000000
+RESULT cand=g0 keylen=16 fill=100 scenario=insert ns_per_op=4294 ops_per_s=232865 wall_s=4.29
+RESULT cand=g0 keylen=16 fill=100 scenario=window_miss p50=1560 p90=2030 p99=2480 p999=8460 max=29350 mean=1596.2
+RESULT cand=g0 keylen=16 fill=100 scenario=hit_active_uniform p50=2200 p90=3140 p99=4230 p999=10050 max=82460 mean=2288.2
+RESULT cand=g0 keylen=16 fill=100 scenario=hit_oldest_uniform p50=4090 p90=5240 p99=7240 p999=12990 max=41580 mean=4200.8
+RESULT cand=g0 keylen=16 fill=100 scenario=hit_zipf p50=1170 p90=2600 p99=5080 p999=8370 max=26130 mean=1461.7
+RESULT cand=g0 keylen=16 fill=100 scenario=deletes per_key_deletes=0 (structural: epoch candidates expose no per-key remove)
+MEM cand=g0 keylen=16 fill=100 n=1000000 rss_delta=326242304 resident_est=0 serialized=124403261 arena_bytes=37000000
+RESULT cand=g1 keylen=256 fill=25 scenario=insert ns_per_op=436 ops_per_s=2293786 wall_s=0.11
+RESULT cand=g1 keylen=256 fill=25 scenario=freeze count=1 mean_ms=10.76 max_ms=10.76 ns_per_key=86.1
+RESULT cand=g1 keylen=256 fill=25 scenario=active_miss p50=60 p90=80 p99=190 p999=440 max=9080 mean=66.1
+RESULT cand=g1 keylen=256 fill=25 scenario=window_miss p50=170 p90=220 p99=300 p999=560 max=8610 mean=178.5
+RESULT cand=g1 keylen=256 fill=25 scenario=hit_active_uniform p50=260 p90=350 p99=640 p999=830 max=11920 mean=259.8
+RESULT cand=g1 keylen=256 fill=25 scenario=hit_oldest_uniform p50=430 p90=550 p99=810 p999=980 max=13120 mean=451.0
+RESULT cand=g1 keylen=256 fill=25 scenario=hit_zipf p50=90 p90=270 p99=780 p999=1150 max=9540 mean=138.7
+RESULT cand=g1 keylen=256 fill=25 scenario=deletes per_key_deletes=0 (structural: epoch candidates expose no per-key remove)
+MEM cand=g1 keylen=256 fill=25 n=250000 rss_delta=16777216 resident_est=15239456 serialized=8000032 arena_bytes=69250000
+RESULT cand=g2 keylen=256 fill=25 scenario=insert ns_per_op=471 ops_per_s=2121486 wall_s=0.12
+RESULT cand=g2 keylen=256 fill=25 scenario=freeze count=1 mean_ms=18.02 max_ms=18.02 ns_per_key=144.1
+RESULT cand=g2 keylen=256 fill=25 scenario=active_miss p50=60 p90=70 p99=190 p999=440 max=8800 mean=64.0
+RESULT cand=g2 keylen=256 fill=25 scenario=window_miss p50=70 p90=90 p99=180 p999=440 max=8690 mean=81.3
+RESULT cand=g2 keylen=256 fill=25 scenario=hit_active_uniform p50=250 p90=360 p99=650 p999=870 max=14410 mean=260.1
+RESULT cand=g2 keylen=256 fill=25 scenario=hit_oldest_uniform p50=440 p90=560 p99=820 p999=1000 max=11260 mean=459.3
+RESULT cand=g2 keylen=256 fill=25 scenario=hit_zipf p50=90 p90=270 p99=810 p999=1180 max=10660 mean=140.2
+RESULT cand=g2 keylen=256 fill=25 scenario=deletes per_key_deletes=0 (structural: epoch candidates expose no per-key remove)
+MEM cand=g2 keylen=256 fill=25 n=250000 rss_delta=20856832 resident_est=15534388 serialized=8294964 arena_bytes=69250000
+RESULT cand=g3 keylen=256 fill=25 scenario=insert ns_per_op=414 ops_per_s=2416144 wall_s=0.10
+RESULT cand=g3 keylen=256 fill=25 scenario=freeze count=1 mean_ms=16.48 max_ms=16.48 ns_per_key=131.9
+RESULT cand=g3 keylen=256 fill=25 scenario=active_miss p50=60 p90=130 p99=240 p999=480 max=9280 mean=77.8
+RESULT cand=g3 keylen=256 fill=25 scenario=window_miss p50=90 p90=140 p99=210 p999=450 max=10900 mean=102.0
+RESULT cand=g3 keylen=256 fill=25 scenario=hit_active_uniform p50=240 p90=360 p99=640 p999=870 max=13050 mean=253.9
+RESULT cand=g3 keylen=256 fill=25 scenario=hit_oldest_uniform p50=500 p90=650 p99=910 p999=1100 max=14390 mean=526.4
+RESULT cand=g3 keylen=256 fill=25 scenario=hit_zipf p50=100 p90=270 p99=890 p999=1300 max=9780 mean=149.9
+RESULT cand=g3 keylen=256 fill=25 scenario=deletes per_key_deletes=0 (structural: epoch candidates expose no per-key remove)
+MEM cand=g3 keylen=256 fill=25 n=250000 rss_delta=16695296 resident_est=12760244 serialized=8294964 arena_bytes=69250000
+RESULT cand=g0 keylen=256 fill=25 scenario=insert ns_per_op=5013 ops_per_s=199469 wall_s=1.25
+RESULT cand=g0 keylen=256 fill=25 scenario=window_miss p50=790 p90=1000 p99=1280 p999=1760 max=32200 mean=812.5
+RESULT cand=g0 keylen=256 fill=25 scenario=hit_active_uniform p50=2930 p90=4990 p99=6870 p999=12690 max=115760 mean=3218.7
+RESULT cand=g0 keylen=256 fill=25 scenario=hit_oldest_uniform p50=3540 p90=5100 p99=6800 p999=12770 max=25280 mean=3689.6
+RESULT cand=g0 keylen=256 fill=25 scenario=hit_zipf p50=760 p90=2190 p99=5650 p999=8710 max=20850 mean=1107.6
+RESULT cand=g0 keylen=256 fill=25 scenario=deletes per_key_deletes=0 (structural: epoch candidates expose no per-key remove)
+MEM cand=g0 keylen=256 fill=25 n=250000 rss_delta=201519104 resident_est=0 serialized=198958405 arena_bytes=69250000
+RESULT cand=g1 keylen=256 fill=75 scenario=insert ns_per_op=451 ops_per_s=2215522 wall_s=0.34
+RESULT cand=g1 keylen=256 fill=75 scenario=freeze count=5 mean_ms=9.52 max_ms=10.84 ns_per_key=76.2
+RESULT cand=g1 keylen=256 fill=75 scenario=active_miss p50=60 p90=70 p99=170 p999=440 max=9250 mean=64.6
+RESULT cand=g1 keylen=256 fill=75 scenario=window_miss p50=730 p90=910 p99=1140 p999=1480 max=14320 mean=749.6
+RESULT cand=g1 keylen=256 fill=75 scenario=hit_active_uniform p50=250 p90=290 p99=590 p999=770 max=13290 mean=245.3
+RESULT cand=g1 keylen=256 fill=75 scenario=hit_oldest_uniform p50=1080 p90=1330 p99=1630 p999=7230 max=23400 mean=1106.6
+RESULT cand=g1 keylen=256 fill=75 scenario=hit_zipf p50=100 p90=300 p99=1800 p999=2710 max=12900 mean=197.0
+RESULT cand=g1 keylen=256 fill=75 scenario=deletes per_key_deletes=0 (structural: epoch candidates expose no per-key remove)
+MEM cand=g1 keylen=256 fill=75 n=750000 rss_delta=36777984 resident_est=31239584 serialized=24000160 arena_bytes=207750000
+RESULT cand=g2 keylen=256 fill=75 scenario=insert ns_per_op=482 ops_per_s=2076462 wall_s=0.36
+RESULT cand=g2 keylen=256 fill=75 scenario=freeze count=5 mean_ms=15.19 max_ms=17.74 ns_per_key=121.5
+RESULT cand=g2 keylen=256 fill=75 scenario=active_miss p50=60 p90=70 p99=180 p999=440 max=8350 mean=63.4
+RESULT cand=g2 keylen=256 fill=75 scenario=window_miss p50=110 p90=230 p99=400 p999=670 max=25250 mean=142.0
+RESULT cand=g2 keylen=256 fill=75 scenario=hit_active_uniform p50=250 p90=300 p99=600 p999=770 max=11030 mean=245.4
+RESULT cand=g2 keylen=256 fill=75 scenario=hit_oldest_uniform p50=490 p90=640 p99=900 p999=1150 max=19160 mean=517.6
+RESULT cand=g2 keylen=256 fill=75 scenario=hit_zipf p50=100 p90=310 p99=1660 p999=2220 max=11310 mean=200.3
+RESULT cand=g2 keylen=256 fill=75 scenario=deletes per_key_deletes=0 (structural: epoch candidates expose no per-key remove)
+MEM cand=g2 keylen=256 fill=75 n=750000 rss_delta=39546880 resident_est=32714244 serialized=25474820 arena_bytes=207750000
+RESULT cand=g3 keylen=256 fill=75 scenario=insert ns_per_op=431 ops_per_s=2317726 wall_s=0.32
+RESULT cand=g3 keylen=256 fill=75 scenario=freeze count=5 mean_ms=13.93 max_ms=16.42 ns_per_key=111.4
+RESULT cand=g3 keylen=256 fill=75 scenario=active_miss p50=60 p90=80 p99=150 p999=390 max=8360 mean=69.6
+RESULT cand=g3 keylen=256 fill=75 scenario=window_miss p50=130 p90=180 p99=240 p999=510 max=8970 mean=135.8
+RESULT cand=g3 keylen=256 fill=75 scenario=hit_active_uniform p50=240 p90=330 p99=600 p999=780 max=11110 mean=242.8
+RESULT cand=g3 keylen=256 fill=75 scenario=hit_oldest_uniform p50=560 p90=710 p99=960 p999=1190 max=11960 mean=577.7
+RESULT cand=g3 keylen=256 fill=75 scenario=hit_zipf p50=100 p90=350 p99=1670 p999=2160 max=10200 mean=212.3
+RESULT cand=g3 keylen=256 fill=75 scenario=deletes per_key_deletes=0 (structural: epoch candidates expose no per-key remove)
+MEM cand=g3 keylen=256 fill=75 n=750000 rss_delta=35106816 resident_est=29940100 serialized=25474820 arena_bytes=207750000
+RESULT cand=g0 keylen=256 fill=75 scenario=insert ns_per_op=7751 ops_per_s=129018 wall_s=5.81
+RESULT cand=g0 keylen=256 fill=75 scenario=window_miss p50=1600 p90=2110 p99=2870 p999=9480 max=42600 mean=1668.3
+RESULT cand=g0 keylen=256 fill=75 scenario=hit_active_uniform p50=2030 p90=2900 p99=3890 p999=9840 max=23180 mean=2112.7
+RESULT cand=g0 keylen=256 fill=75 scenario=hit_oldest_uniform p50=5010 p90=7050 p99=9600 p999=15430 max=140560 mean=5235.1
+RESULT cand=g0 keylen=256 fill=75 scenario=hit_zipf p50=1170 p90=2670 p99=8020 p999=10720 max=119820 mean=1599.3
+RESULT cand=g0 keylen=256 fill=75 scenario=deletes per_key_deletes=0 (structural: epoch candidates expose no per-key remove)
+MEM cand=g0 keylen=256 fill=75 n=750000 rss_delta=266305536 resident_est=0 serialized=588107481 arena_bytes=207750000
+RESULT cand=g1 keylen=256 fill=100 scenario=insert ns_per_op=451 ops_per_s=2218052 wall_s=0.45
+RESULT cand=g1 keylen=256 fill=100 scenario=freeze count=7 mean_ms=9.35 max_ms=10.69 ns_per_key=74.8
+RESULT cand=g1 keylen=256 fill=100 scenario=active_miss p50=60 p90=70 p99=200 p999=450 max=9440 mean=65.0
+RESULT cand=g1 keylen=256 fill=100 scenario=window_miss p50=1110 p90=1400 p99=1750 p999=7740 max=14200 mean=1139.6
+RESULT cand=g1 keylen=256 fill=100 scenario=hit_active_uniform p50=250 p90=340 p99=630 p999=810 max=11860 mean=255.2
+RESULT cand=g1 keylen=256 fill=100 scenario=hit_oldest_uniform p50=1570 p90=1970 p99=2420 p999=9100 max=23380 mean=1612.7
+RESULT cand=g1 keylen=256 fill=100 scenario=hit_zipf p50=100 p90=330 p99=2250 p999=3320 max=10170 mean=224.4
+RESULT cand=g1 keylen=256 fill=100 scenario=deletes per_key_deletes=0 (structural: epoch candidates expose no per-key remove)
+MEM cand=g1 keylen=256 fill=100 n=1000000 rss_delta=45780992 resident_est=39239648 serialized=32000224 arena_bytes=277000000
+RESULT cand=g2 keylen=256 fill=100 scenario=insert ns_per_op=485 ops_per_s=2059989 wall_s=0.49
+RESULT cand=g2 keylen=256 fill=100 scenario=freeze count=7 mean_ms=15.01 max_ms=17.91 ns_per_key=120.1
+RESULT cand=g2 keylen=256 fill=100 scenario=active_miss p50=60 p90=70 p99=190 p999=450 max=9730 mean=64.5
+RESULT cand=g2 keylen=256 fill=100 scenario=window_miss p50=130 p90=160 p99=280 p999=550 max=11500 mean=139.8
+RESULT cand=g2 keylen=256 fill=100 scenario=hit_active_uniform p50=250 p90=300 p99=600 p999=780 max=29280 mean=246.5
+RESULT cand=g2 keylen=256 fill=100 scenario=hit_oldest_uniform p50=510 p90=650 p99=910 p999=1140 max=10970 mean=536.7
+RESULT cand=g2 keylen=256 fill=100 scenario=hit_zipf p50=100 p90=340 p99=1940 p999=2510 max=11580 mean=230.7
+RESULT cand=g2 keylen=256 fill=100 scenario=deletes per_key_deletes=0 (structural: epoch candidates expose no per-key remove)
+MEM cand=g2 keylen=256 fill=100 n=1000000 rss_delta=47546368 resident_est=41304172 serialized=34064748 arena_bytes=277000000
+RESULT cand=g3 keylen=256 fill=100 scenario=insert ns_per_op=442 ops_per_s=2262468 wall_s=0.44
+RESULT cand=g3 keylen=256 fill=100 scenario=freeze count=7 mean_ms=13.85 max_ms=16.93 ns_per_key=110.8
+RESULT cand=g3 keylen=256 fill=100 scenario=active_miss p50=60 p90=90 p99=170 p999=430 max=8500 mean=72.6
+RESULT cand=g3 keylen=256 fill=100 scenario=window_miss p50=150 p90=200 p99=320 p999=560 max=9710 mean=161.1
+RESULT cand=g3 keylen=256 fill=100 scenario=hit_active_uniform p50=240 p90=330 p99=610 p999=790 max=10060 mean=244.9
+RESULT cand=g3 keylen=256 fill=100 scenario=hit_oldest_uniform p50=600 p90=770 p99=1020 p999=1250 max=16330 mean=619.6
+RESULT cand=g3 keylen=256 fill=100 scenario=hit_zipf p50=110 p90=390 p99=1940 p999=2600 max=11580 mean=236.7
+RESULT cand=g3 keylen=256 fill=100 scenario=deletes per_key_deletes=0 (structural: epoch candidates expose no per-key remove)
+MEM cand=g3 keylen=256 fill=100 n=1000000 rss_delta=44154880 resident_est=38530028 serialized=34064748 arena_bytes=277000000
+RESULT cand=g0 keylen=256 fill=100 scenario=insert ns_per_op=8312 ops_per_s=120308 wall_s=8.31
+RESULT cand=g0 keylen=256 fill=100 scenario=window_miss p50=1640 p90=2050 p99=2480 p999=9260 max=161370 mean=1714.1
+RESULT cand=g0 keylen=256 fill=100 scenario=hit_active_uniform p50=1960 p90=2790 p99=3700 p999=9010 max=28410 mean=2036.1
+RESULT cand=g0 keylen=256 fill=100 scenario=hit_oldest_uniform p50=5710 p90=7640 p99=11950 p999=111340 max=3070123 mean=6190.3
+RESULT cand=g0 keylen=256 fill=100 scenario=hit_zipf p50=1220 p90=3020 p99=104970 p999=153170 max=28271031 mean=5515.5
+RESULT cand=g0 keylen=256 fill=100 scenario=deletes per_key_deletes=0 (structural: epoch candidates expose no per-key remove)
+MEM cand=g0 keylen=256 fill=100 n=1000000 rss_delta=350228480 resident_est=0 serialized=1023688123 arena_bytes=277000000
+STEADY cand=g1 keylen=16 n=2000000 ops_per_s=5111871 ns_per_op=196 per_key_deletes=0 freezes=15 freeze_ns_per_key=67.1 epochs_dropped=7
+STEADY cand=g2 keylen=16 n=2000000 ops_per_s=4106216 ns_per_op=244 per_key_deletes=0 freezes=15 freeze_ns_per_key=113.6 epochs_dropped=7
+STEADY cand=g3 keylen=16 n=2000000 ops_per_s=5150120 ns_per_op=194 per_key_deletes=0 freezes=15 freeze_ns_per_key=102.1 epochs_dropped=7
+STEADY cand=g0 keylen=16 n=2000000 ops_per_s=116736 ns_per_op=8566 per_key_deletes=1999998 bytes_written=196999967 disk_bytes=317844834
