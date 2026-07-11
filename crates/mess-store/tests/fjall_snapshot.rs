@@ -490,7 +490,7 @@ async fn fold_version_bump_invalidates_and_replaces_persisted_snapshot() {
 /// wrapped `LogEngine` unchanged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn subscribe_over_fjall_snapshot_backend_sees_live_commits() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = mess_testkit::sweeping_temp_dir("store-fjall-subscribe");
     let store = open(dir.path());
 
     const PRE: u64 = 5;

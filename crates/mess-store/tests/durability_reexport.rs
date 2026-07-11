@@ -23,7 +23,7 @@ fn rec(t: &str, d: &[u8]) -> RecordToAppend {
 
 #[tokio::test]
 async fn group_durability_selected_via_reexport_commits_events() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = mess_testkit::sweeping_temp_dir("store-durability-reexport");
     let opts = EngineOptions {
         durability: Durability::Group {
             max_delay: Duration::from_millis(1),
@@ -61,7 +61,7 @@ async fn group_durability_selected_via_reexport_commits_events() {
 /// defaults) is also reachable through the re-export.
 #[tokio::test]
 async fn group_default_via_reexport_opens_and_commits() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = mess_testkit::sweeping_temp_dir("store-durability-reexport");
     let opts = EngineOptions {
         durability: Durability::group_default(),
         ..EngineOptions::default()
