@@ -525,3 +525,9 @@ fresh-dir guard, and that every generated handle and post body satisfies the
 domain's own validation. `src/rebuild.rs`'s test is the in-process
 checkpoint-correctness proof. Large-tier operations are `#[ignore]`d and run on
 demand.
+
+Every real-fs test/example store dir comes from `mess_testkit::sweeping_temp_dir`
+(never a hand-rolled `TempDir`/`temp_dir()`), namespaced under
+`<TMPDIR or $HOME/.cache/mess-test-tmp>/mess-tests/` and self-swept of
+dead-process leftovers older than 24h on first use per process — the guard
+against the on-disk store leaks that once filled the machine's disk.

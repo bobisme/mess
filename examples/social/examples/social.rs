@@ -30,9 +30,13 @@ async fn main() -> Result<(), WriteError> {
     // `FjallSnapshotBackend` so writes take the `command_cached` warm path.
     // Nothing below this line names the backend — that is the API-first payoff.
     // See `examples/bank/examples/bank.rs`.
-    let dir = std::env::temp_dir()
-        .join(format!("mess-social-{}", std::process::id()));
-    let store = open_store(&dir).expect("open store");
+    //
+    // A self-sweeping temp dir (the real-fs TMPDIR rule, bn-cxr/bn-imm):
+    // removed on a clean exit, and bounded by the sweep even if this process
+    // is killed mid-run instead of leaking a 256MiB-preallocated store
+    // forever under `TMPDIR`.
+    let dir = mess_testkit::sweeping_temp_dir("social-example");
+    let store = open_store(dir.path()).expect("open store");
 
     let alice = Id::new();
     let bob = Id::new();

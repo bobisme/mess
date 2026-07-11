@@ -11,44 +11,41 @@
 //! [`ReadModels`]: social::contracts::ReadModels
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use ident::Id;
 use mess_store::{Backend, EventStore, LogEngine, RecordToAppend, Version};
+use mess_testkit::{SweepingTempDir, sweeping_temp_dir};
 use social::store_backend::{Store, open_store, read_handle};
 use social::{
     PROJECTION_VERSION, PostLookup, ProfileView, Projections, ReadModels,
     TimelinePage, WriteError, WriteOps,
 };
 
-/// A fresh store dir, unique per test.
-fn fresh_dir() -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "mess-social-proj-{}-{}",
-        std::process::id(),
-        Id::new()
-    ))
-}
-
 /// A fresh warm-write store (`writer`) plus a subscribe-capable read handle
-/// (`reader`) over the **same** on-disk log, unique per test. Post-`bn-o9z` the
-/// two capabilities live on different backend types — the writer is a
-/// `SnapshotStore` (warm `command_cached`), the reader a `SubscribeBackend` the
-/// `Projections` pump tails — so a test that both writes and reads needs both
-/// handles. They share one `Arc`-backed `LogEngine`, so writes through `writer`
-/// are visible to `reader`'s subscription. See `social::store_backend`.
-fn fresh_store() -> (Store, EventStore<LogEngine>) {
-    let writer = open_store(&fresh_dir()).expect("open store");
+/// (`reader`) over the **same** on-disk log, on a self-sweeping temp dir per
+/// test (the real-fs TMPDIR rule). Post-`bn-o9z` the two capabilities live on
+/// different backend types — the writer is a `SnapshotStore` (warm
+/// `command_cached`), the reader a `SubscribeBackend` the `Projections` pump
+/// tails — so a test that both writes and reads needs both handles. They
+/// share one `Arc`-backed `LogEngine`, so writes through `writer` are visible
+/// to `reader`'s subscription. See `social::store_backend`. The
+/// [`SweepingTempDir`] guard is returned so the caller keeps it alive for the
+/// duration of the test.
+fn fresh_store() -> (Store, EventStore<LogEngine>, SweepingTempDir) {
+    let dir = sweeping_temp_dir("social-projections");
+    let writer = open_store(dir.path()).expect("open store");
     let reader = read_handle(&writer);
-    (writer, reader)
+    (writer, reader, dir)
 }
 
-/// [`fresh_store`] plus the store dir — the checkpoint sidecar tests need the
-/// dir to place `<dir>/.social-projections.ckpt` next to the store.
-fn fresh_store_with_dir() -> (Store, EventStore<LogEngine>, PathBuf) {
-    let dir = fresh_dir();
-    let writer = open_store(&dir).expect("open store");
+/// [`fresh_store`] but returning the [`SweepingTempDir`] guard itself instead
+/// of consuming it — the checkpoint sidecar tests need `dir.path()` to place
+/// `<dir>/.social-projections.ckpt` next to the store, and still need the
+/// guard held for the duration of the test.
+fn fresh_store_with_dir() -> (Store, EventStore<LogEngine>, SweepingTempDir) {
+    let dir = sweeping_temp_dir("social-projections");
+    let writer = open_store(dir.path()).expect("open store");
     let reader = read_handle(&writer);
     (writer, reader, dir)
 }
@@ -59,9 +56,12 @@ fn fresh_store_with_dir() -> (Store, EventStore<LogEngine>, PathBuf) {
 
 /// alice follows bob (not carol); bob posts p1 & p3, carol posts p2; alice
 /// likes p1. Returns the store, a live projection caught up to `last`, the
-/// three user ids, the three post ids, and `last` (the final global position).
-async fn world() -> (Store, Projections<LogEngine>, [Id; 3], [Id; 3], u64) {
-    let (store, reader) = fresh_store();
+/// three user ids, the three post ids, `last` (the final global position),
+/// and the store dir's [`SweepingTempDir`] guard (must be held for the
+/// duration of the test).
+async fn world()
+-> (Store, Projections<LogEngine>, [Id; 3], [Id; 3], u64, SweepingTempDir) {
+    let (store, reader, dir) = fresh_store();
     let proj = Projections::new(&reader).await;
     let (alice, bob, carol) = (Id::new(), Id::new(), Id::new());
     let (p1, p2, p3) = (Id::new(), Id::new(), Id::new());
@@ -76,12 +76,12 @@ async fn world() -> (Store, Projections<LogEngine>, [Id; 3], [Id; 3], u64) {
     let last = store.like(p1, alice).await.unwrap();
 
     proj.wait_for(last).await;
-    (store, proj, [alice, bob, carol], [p1, p2, p3], last)
+    (store, proj, [alice, bob, carol], [p1, p2, p3], last, dir)
 }
 
 #[tokio::test]
 async fn home_timeline_shows_followed_and_own_newest_first() {
-    let (_s, proj, [alice, ..], [p1, _p2, p3], _last) = world().await;
+    let (_s, proj, [alice, ..], [p1, _p2, p3], _last, _dir) = world().await;
     let page = proj.home_timeline(alice, None, 10).await;
     // alice follows bob (p1, p3) + sees her own (none). carol's p2 excluded.
     let ids: Vec<Id> = page.entries.iter().map(|e| e.id).collect();
@@ -91,7 +91,7 @@ async fn home_timeline_shows_followed_and_own_newest_first() {
 
 #[tokio::test]
 async fn home_timeline_marks_liked_by_me_and_counts() {
-    let (_s, proj, [alice, bob, _carol], [p1, ..], _last) = world().await;
+    let (_s, proj, [alice, bob, _carol], [p1, ..], _last, _dir) = world().await;
     let page = proj.home_timeline(alice, None, 10).await;
     let p1v = page.entries.iter().find(|e| e.id == p1).unwrap();
     assert!(p1v.liked_by_me);
@@ -103,7 +103,7 @@ async fn home_timeline_marks_liked_by_me_and_counts() {
 
 #[tokio::test]
 async fn firehose_shows_everything_and_paginates() {
-    let (_s, proj, _u, [p1, p2, p3], _last) = world().await;
+    let (_s, proj, _u, [p1, p2, p3], _last, _dir) = world().await;
     let all = proj.firehose(None, 10).await;
     let ids: Vec<Id> = all.entries.iter().map(|e| e.id).collect();
     assert_eq!(ids, [p3, p2, p1]);
@@ -120,7 +120,7 @@ async fn firehose_shows_everything_and_paginates() {
 
 #[tokio::test]
 async fn user_posts_lists_only_that_author() {
-    let (_s, proj, _u, [p1, _p2, p3], _last) = world().await;
+    let (_s, proj, _u, [p1, _p2, p3], _last, _dir) = world().await;
     let page = proj.user_posts("bob", None, 10).await;
     let ids: Vec<Id> = page.entries.iter().map(|e| e.id).collect();
     assert_eq!(ids, [p3, p1]);
@@ -128,7 +128,7 @@ async fn user_posts_lists_only_that_author() {
 
 #[tokio::test]
 async fn profile_counts_and_viewer_relation() {
-    let (_s, proj, [alice, ..], _p, _last) = world().await;
+    let (_s, proj, [alice, ..], _p, _last, _dir) = world().await;
     let bob = proj.profile("bob", Some(alice)).await.unwrap();
     assert_eq!(bob.handle, "bob");
     assert_eq!(bob.post_count, 2);
@@ -146,7 +146,7 @@ async fn profile_counts_and_viewer_relation() {
 
 #[tokio::test]
 async fn post_query_is_viewer_relative() {
-    let (_s, proj, [alice, bob, _carol], [p1, ..], _last) = world().await;
+    let (_s, proj, [alice, bob, _carol], [p1, ..], _last, _dir) = world().await;
     let me = proj.post(p1, Some(alice)).await.unwrap();
     assert!(me.liked_by_me);
     assert_eq!(me.author_id, bob);
@@ -157,14 +157,15 @@ async fn post_query_is_viewer_relative() {
 
 #[tokio::test]
 async fn resolve_finds_a_registered_handle_and_none_otherwise() {
-    let (_s, proj, [alice, ..], _p, _last) = world().await;
+    let (_s, proj, [alice, ..], _p, _last, _dir) = world().await;
     assert_eq!(proj.resolve("alice").await, Some(alice));
     assert_eq!(proj.resolve("nobody").await, None);
 }
 
 #[tokio::test]
 async fn deleted_post_drops_from_feeds_but_permalink_is_a_tombstone() {
-    let (store, proj, [_alice, bob, _carol], [p1, ..], _last) = world().await;
+    let (store, proj, [_alice, bob, _carol], [p1, ..], _last, _dir) =
+        world().await;
     let last = store.delete_post(p1, bob).await.unwrap();
     proj.wait_for(last).await;
 
@@ -192,7 +193,7 @@ async fn deleted_post_drops_from_feeds_but_permalink_is_a_tombstone() {
 
 #[tokio::test]
 async fn wait_for_is_a_read_your_writes_barrier() {
-    let (store, reader) = fresh_store();
+    let (store, reader, _dir) = fresh_store();
     let proj = Projections::new(&reader).await;
     let (alice, post) = (Id::new(), Id::new());
     store.register(alice, "alice".into(), "Alice".into()).await.unwrap();
@@ -212,7 +213,7 @@ async fn wait_for_is_a_read_your_writes_barrier() {
 
 #[tokio::test]
 async fn wait_for_blocks_until_a_later_write_lands() {
-    let (store, reader) = fresh_store();
+    let (store, reader, _dir) = fresh_store();
     let proj = Projections::new(&reader).await;
     let alice = Id::new();
     store.register(alice, "alice".into(), "Alice".into()).await.unwrap();
@@ -390,7 +391,7 @@ async fn rebuild_equals_live_over_random_sequences() {
     let posts: Vec<Id> = (0..8).map(|_| Id::new()).collect();
 
     for seed in 1u64..=25 {
-        let (store, reader) = fresh_store();
+        let (store, reader, _dir) = fresh_store();
         // The LIVE projection is built BEFORE any events and follows them
         // incrementally as the pump applies each batch.
         let live = Projections::new(&reader).await;
@@ -416,7 +417,7 @@ async fn rebuild_equals_live_over_random_sequences() {
 
 #[tokio::test]
 async fn follow_after_post_is_retroactive() {
-    let (store, reader) = fresh_store();
+    let (store, reader, _dir) = fresh_store();
     let proj = Projections::new(&reader).await;
     let (alice, bob) = (Id::new(), Id::new());
     let post = Id::new();
@@ -472,7 +473,7 @@ async fn append_raw(
 /// crashed, on a log wider than the slice it models.
 #[tokio::test]
 async fn anomalies_are_counted_while_the_projection_stays_live_and_correct() {
-    let (store, reader) = fresh_store();
+    let (store, reader, _dir) = fresh_store();
     let proj = Projections::new(&reader).await;
 
     // A good record BEFORE any garbage: alice registers.
@@ -601,7 +602,7 @@ fn manual_only_t() -> Duration { Duration::from_secs(3600) }
 async fn checkpoint_kill_restart_matches_from_zero_rebuild() {
     let (users, posts) = cast();
     let (store, reader, dir) = fresh_store_with_dir();
-    let ckpt = dir.join(".social-projections.ckpt");
+    let ckpt = dir.path().join(".social-projections.ckpt");
 
     let last;
     {
@@ -654,7 +655,7 @@ async fn checkpoint_kill_restart_matches_from_zero_rebuild() {
 async fn stale_projection_version_checkpoint_forces_full_rebuild() {
     let (users, posts) = cast();
     let (store, reader, dir) = fresh_store_with_dir();
-    let ckpt = dir.join(".social-projections.ckpt");
+    let ckpt = dir.path().join(".social-projections.ckpt");
 
     let last;
     {
@@ -706,7 +707,7 @@ async fn stale_projection_version_checkpoint_forces_full_rebuild() {
 async fn corrupt_checkpoint_forces_full_rebuild_without_panic() {
     let (users, posts) = cast();
     let (store, reader, dir) = fresh_store_with_dir();
-    let ckpt = dir.join(".social-projections.ckpt");
+    let ckpt = dir.path().join(".social-projections.ckpt");
 
     let last;
     {
@@ -780,7 +781,7 @@ async fn corrupt_checkpoint_forces_full_rebuild_without_panic() {
 async fn checkpoint_during_live_pump_resumes_only_the_suffix() {
     let (users, posts) = cast();
     let (store, reader, dir) = fresh_store_with_dir();
-    let ckpt = dir.join(".social-projections.ckpt");
+    let ckpt = dir.path().join(".social-projections.ckpt");
 
     let ckpt_pos;
     let last;
@@ -860,7 +861,7 @@ async fn wait_for_is_event_bounded_not_poll_bounded() {
     // written position must wake once the write lands, well within a generous
     // bound. The code-level check above is what proves event-boundedness; this
     // proves the barrier is actually wired to wake.
-    let (store, reader) = fresh_store();
+    let (store, reader, _dir) = fresh_store();
     let proj = Projections::new(&reader).await;
     let alice = Id::new();
     store.register(alice, "alice".into(), "Alice".into()).await.unwrap();

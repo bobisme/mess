@@ -22,9 +22,14 @@ async fn main() {
     // `mess-index` (hot/sealed index + fjall meta tables). The interim
     // in-memory backend is behind mess-store's `mock` feature. Nothing below
     // this line changes with the backend — that is the API-first payoff.
-    let dir =
-        std::env::temp_dir().join(format!("mess-bank-{}", std::process::id()));
-    let store = EventStore::new(LogEngine::open(&dir).expect("open engine"));
+    //
+    // A self-sweeping temp dir (the real-fs TMPDIR rule, bn-cxr/bn-imm):
+    // removed on a clean exit, and bounded by the sweep even if this process
+    // is killed mid-run instead of leaking a 256MiB-preallocated store
+    // forever under `TMPDIR`.
+    let dir = mess_testkit::sweeping_temp_dir("bank-example");
+    let store =
+        EventStore::new(LogEngine::open(dir.path()).expect("open engine"));
     let stream = "account-alice";
 
     // `command()` is the north-star call: `load -> decide -> append`, with

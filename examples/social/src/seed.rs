@@ -773,14 +773,6 @@ mod tests {
         (EventStore::new(backend), dir)
     }
 
-    fn temp_dir(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "mess-social-seed-test-{tag}-{}-{}",
-            std::process::id(),
-            Id::new()
-        ))
-    }
-
     fn small_cfg(seed: u64) -> SeedConfig {
         SeedConfig {
             seed,
@@ -993,23 +985,24 @@ mod tests {
 
     #[test]
     fn fresh_dir_guard_accepts_missing_and_empty() {
-        let t = temp_dir("guard-empty");
-        assert!(guard_fresh_dir(&t.join("does-not-exist")).is_ok());
-        std::fs::create_dir_all(&t).unwrap();
-        assert!(guard_fresh_dir(&t).is_ok());
-        std::fs::remove_dir_all(&t).ok();
+        // Self-sweeping temp dir (the real-fs TMPDIR rule): `t.path()` already
+        // exists (empty) for the second assertion; a not-yet-created child of
+        // it covers the "missing" case. The guard cleans up on drop at the end
+        // of this scope (the success path); the sweep is the safety net if a
+        // future panic ever short-circuits that.
+        let t = sweeping_temp_dir("seed-guard-empty");
+        assert!(guard_fresh_dir(&t.path().join("does-not-exist")).is_ok());
+        assert!(guard_fresh_dir(t.path()).is_ok());
     }
 
     #[test]
     fn fresh_dir_guard_refuses_a_leftover_store() {
-        let t = temp_dir("guard-nonempty");
-        std::fs::create_dir_all(&t).unwrap();
-        std::fs::write(t.join("seg-00000001.log"), b"x").unwrap();
-        std::fs::write(t.join("LOCK"), b"x").unwrap();
-        let err = guard_fresh_dir(&t).unwrap_err();
+        let t = sweeping_temp_dir("seed-guard-nonempty");
+        std::fs::write(t.path().join("seg-00000001.log"), b"x").unwrap();
+        std::fs::write(t.path().join("LOCK"), b"x").unwrap();
+        let err = guard_fresh_dir(t.path()).unwrap_err();
         assert!(err.contains("refusing to seed"));
         assert!(err.contains("seg-*.log"));
-        std::fs::remove_dir_all(&t).ok();
     }
 
     #[test]
