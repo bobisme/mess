@@ -204,17 +204,17 @@ struct DedupeBounds {
 /// The metadata store: one fjall [`Database`] holding the four tables, opened
 /// at journal-buffered durability.
 pub struct MetaStore {
-    db:              Database,
-    stream_heads:    Keyspace,
-    snapshot_heads:  Keyspace,
-    checkpoints:     Keyspace,
-    dedupe:          Keyspace,
-    dedupe_order:    Keyspace,
-    hw:              Keyspace,
-    stream_names:    Keyspace,
-    type_names:      Keyspace,
-    dedupe_bounds:   Mutex<DedupeBounds>,
-    dedupe_capacity: usize,
+    db:                     Database,
+    stream_heads:           Keyspace,
+    snapshot_heads:         Keyspace,
+    checkpoints:            Keyspace,
+    dedupe:                 Keyspace,
+    dedupe_order:           Keyspace,
+    hw:                     Keyspace,
+    stream_names:           Keyspace,
+    type_names:             Keyspace,
+    dedupe_bounds:          Mutex<DedupeBounds>,
+    dedupe_capacity:        usize,
     /// Test/diagnostic: counts calls to [`Self::persist`] (bn-150). Lets a
     /// caller (the engine's name-durability regression tests) assert the
     /// hot append path (no newly-interned name) makes zero durable-flush
@@ -223,7 +223,12 @@ pub struct MetaStore {
     /// cannot be simulated portably in-process (an `fsync` survives a mere
     /// process crash/exit; only a real OS crash or power cut loses a
     /// page-cache write that was never `fsync`ed).
-    persist_calls:   std::sync::atomic::AtomicU64,
+    persist_calls:          std::sync::atomic::AtomicU64,
+    /// Test/diagnostic counter for [`Self::persist_buffered`] — the
+    /// barrier-free page-cache flush used under `Durability::Process`
+    /// (bn-2cj). Kept distinct from `persist_calls` so a test can tell a
+    /// real `fsync` barrier apart from a page-cache-only flush.
+    buffered_persist_calls: std::sync::atomic::AtomicU64,
 }
 
 impl MetaStore {
@@ -287,6 +292,7 @@ impl MetaStore {
             dedupe_bounds: Mutex::new(bounds),
             dedupe_capacity,
             persist_calls: std::sync::atomic::AtomicU64::new(0),
+            buffered_persist_calls: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -444,26 +450,82 @@ impl MetaStore {
         Ok(())
     }
 
-    /// Force any buffered writes to disk (fsync). Not needed for correctness
-    /// of the I5 derived-cache tables — a convenience for clean shutdown or
-    /// to bound recovery replay by periodically checkpointing durability —
-    /// but IS required for the `stream_names`/`type_names` interner
-    /// bijection tables, the one durable source of truth this store holds
-    /// (bn-150; see [`MetaStore`]'s and `mess-store`'s `engine.rs`
-    /// `persist_new_names` doc for why).
+    /// Force any buffered writes to disk with a real durability **barrier**
+    /// (`fjall::PersistMode::SyncAll` — an `fsync`). Not needed for
+    /// correctness of the I5 derived-cache tables — a convenience for clean
+    /// shutdown or to bound recovery replay by periodically checkpointing
+    /// durability — but IS the barrier the `stream_names`/`type_names`
+    /// interner bijection tables (the one durable source of truth this store
+    /// holds) ride under a **barriered** engine durability mode
+    /// (`Durability::Os`/`Group`), so a covering log append can only become
+    /// durable once its new name(s) already are (bn-150; see [`MetaStore`]'s
+    /// and `mess-store`'s `engine.rs` `persist_new_names` doc for why). Under
+    /// the barrier-free `Durability::Process` mode the caller uses
+    /// [`persist_buffered`](Self::persist_buffered) instead — see bn-2cj.
     pub fn persist(&self) -> Result<(), MetaError> {
         self.persist_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.db.persist(fjall::PersistMode::SyncAll)?;
         Ok(())
     }
 
-    /// Test/diagnostic: how many times [`Self::persist`] has been called
-    /// (bn-150). Lets a caller assert the hot append path (no newly-interned
-    /// name) makes zero durable-flush calls.
+    /// Flush buffered writes to the OS **page cache** only
+    /// (`fjall::PersistMode::Buffer` — a `write(2)`, never an `fsync`), with
+    /// **no** durability barrier (bn-2cj).
+    ///
+    /// This is the name-persist path chosen when the engine runs
+    /// `Durability::Process`: that mode acks a log append the instant its own
+    /// covering `write(2)` reaches the OS page cache and issues no barrier of
+    /// its own (`docs/spec/03-durability.md` §1.1), so a per-name `SyncAll`
+    /// (a multi-millisecond `fsync`) would be *strictly stronger* than the
+    /// durability the operator asked for — and it is exactly that `fsync`
+    /// that dominated new-stream latency (spike bn-1jg: ~3.4 ms/new stream,
+    /// 98.8% of the cost).
+    ///
+    /// Calling this after a `put_stream_name`/`put_type_name` still matters
+    /// even though fjall's default insert path already flushes each write to
+    /// the page cache (`Keyspace::insert` issues its own
+    /// `PersistMode::Buffer` when `manual_journal_persist` is off, as it is
+    /// here): it makes the "name bytes have reached the kernel" fact an
+    /// explicit, load-bearing ordering point the caller can rely on
+    /// regardless of fjall's insert-time defaults, and gives the tests a
+    /// counter distinct from the `SyncAll` barrier count. It is cheap — a
+    /// `BufWriter::flush` that is a no-op when the insert already flushed —
+    /// so, unlike [`persist`](Self::persist), it does **not** need
+    /// `spawn_blocking`.
+    ///
+    /// # Durability
+    ///
+    /// Survives a **process** crash (a completed `write(2)` outlives process
+    /// death), NOT an OS crash / power loss — identical to what
+    /// `Durability::Process` promises for the event bytes themselves. See the
+    /// `engine.rs` flush-site contract for why "name `write(2)` ordered
+    /// before the covering event `write(2)`" excludes a surviving-event /
+    /// lost-name gap for that crash class.
+    pub fn persist_buffered(&self) -> Result<(), MetaError> {
+        self.buffered_persist_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.db.persist(fjall::PersistMode::Buffer)?;
+        Ok(())
+    }
+
+    /// Test/diagnostic: how many times [`Self::persist`] (the `SyncAll`
+    /// **barrier**) has been called (bn-150). Lets a caller assert the hot
+    /// append path (no newly-interned name) makes zero durable-flush calls,
+    /// and that under a barriered mode a new-name append makes exactly one.
     #[doc(hidden)]
     #[must_use]
     pub fn persist_call_count(&self) -> u64 {
         self.persist_calls.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test/diagnostic: how many times [`Self::persist_buffered`] (the
+    /// barrier-free page-cache flush) has been called (bn-2cj). Lets a caller
+    /// assert that under `Durability::Process` a new-name append pushes the
+    /// name to the page cache without an `fsync` barrier.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn buffered_persist_call_count(&self) -> u64 {
+        self.buffered_persist_calls.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     // ---- reads --------------------------------------------------------

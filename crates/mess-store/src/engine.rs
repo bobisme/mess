@@ -492,6 +492,15 @@ struct Inner {
     /// roll-sealer and any on-demand [`LogEngine::seal_active`].
     seal_metrics:         Arc<SealMetrics>,
     meta:                 MetaStore,
+    /// The engine's durability mode (bn-2cj). Read on the append path to gate
+    /// the new-name persist barrier: `Process` pushes new names to the OS
+    /// page cache without an `fsync` (the log itself issues no barrier under
+    /// `Process`, so a per-name `SyncAll` would be strictly stronger than the
+    /// operator asked for); `Os`/`Group` keep the `SyncAll` barrier so a new
+    /// name is durable no later than the covering append. See the
+    /// [`persist_new_names`](LogEngine::persist_new_names) flush-site
+    /// contract.
+    durability:           Durability,
     book:                 Arc<Mutex<Book>>,
     /// The **published** global watermark — the exclusive end of the readable
     /// global-position sequence (the dense record-book length). Advanced at
@@ -916,6 +925,7 @@ impl LogEngine {
                 },
                 seal_metrics,
                 meta,
+                durability: opts.durability,
                 book,
                 // Seed the published watermark at the recovered dense book
                 // length: 0 on a fresh store, or the recovered event count on a
@@ -1336,6 +1346,19 @@ impl LogEngine {
         self.inner.meta.persist_call_count()
     }
 
+    /// Test/diagnostic: how many times the durable meta store's
+    /// [`MetaStore::persist_buffered`] has been called (bn-2cj) — i.e. how
+    /// many barrier-free page-cache name flushes
+    /// [`persist_new_names`](Self::persist_new_names) has performed under a
+    /// `Durability::Process` engine. Paired with
+    /// [`meta_persist_call_count`](Self::meta_persist_call_count) (the
+    /// `SyncAll` **barrier** count), a test can prove a `Process` new-stream
+    /// append flushed the name to the page cache WITHOUT issuing an `fsync`.
+    #[must_use]
+    pub fn meta_buffered_persist_call_count(&self) -> u64 {
+        self.inner.meta.buffered_persist_call_count()
+    }
+
     /// Seal the current active segment into the cold [`SealedStore`], driving
     /// the real `mess-index` [`SealDriver`] (sidecar encode → durable write →
     /// install → evict-from-active). After this, `read_stream` for the sealed
@@ -1472,17 +1495,34 @@ impl LogEngine {
     /// stream_id" gap and returned `EngineError::Meta` — a store that could
     /// no longer open.
     ///
-    /// The fix: [`append_batch`](LogEngine::append_batch) folds this
-    /// method's two call sites (stream name, then type names) into a single
-    /// `MetaStore::persist` (a real `fsync`) whenever *either* wrote
-    /// something — one flush even when an append introduces both a new
-    /// stream and a new type — performed strictly before the durable
-    /// committer append is submitted. So by construction, a covering append
-    /// can only become durable once its new name(s) already are: the two can
-    /// no longer race. On the hot path — no new stream, no new types, the
-    /// overwhelmingly common case once a store's names have stabilised —
-    /// neither call site writes anything, so the fold adds no flush at all:
-    /// zero fjall calls, zero added latency.
+    /// The fix (bn-150), as gated by bn-2cj:
+    /// [`append_batch`](LogEngine::append_batch) folds this method's two call
+    /// sites (stream name, then type names) into a single meta-store flush
+    /// whenever *either* wrote something — one flush even when an append
+    /// introduces both a new stream and a new type — performed strictly
+    /// before the covering committer append is submitted. So by construction,
+    /// a covering event can only reach the storage layer once its new name(s)
+    /// already have: the two can no longer race in the crash-visible order.
+    ///
+    /// **Which flush** depends on the engine's [`Durability`] mode (bn-2cj),
+    /// and the full rationale lives at that flush site in
+    /// [`append_batch`](LogEngine::append_batch):
+    /// * `Os`/`Group` (the log issues a real `fdatasync` barrier per ack):
+    ///   `MetaStore::persist` — a matching `SyncAll` `fsync` barrier, so the
+    ///   name is on stable storage before the event can be. Unchanged from
+    ///   bn-150; durable modes are not weakened.
+    /// * `Process` (the log issues NO barrier; §1.1 promises process-crash
+    ///   survival only): `MetaStore::persist_buffered` — a
+    ///   `PersistMode::Buffer` page-cache `write(2)`, no `fsync`, matching the
+    ///   operator's chosen durability for the event bytes and ordered strictly
+    ///   before them, so a surviving event can never have a lost name under a
+    ///   process crash. This drops the ~3.4 ms/new-stream `fsync` the spike
+    ///   bn-1jg measured.
+    ///
+    /// On the hot path — no new stream, no new types, the overwhelmingly
+    /// common case once a store's names have stabilised — neither call site
+    /// writes anything, so the fold adds no flush at all in any mode: zero
+    /// fjall calls, zero added latency.
     fn persist_new_names(
         &self,
         stream: Option<(u64, String)>,
@@ -1754,32 +1794,95 @@ impl Backend for LogEngine {
                 AppendError::Backend(EngineError::Meta(e.to_string()))
             })?;
 
-        // Co-durable flush (bn-150): one fsync-backed `MetaStore::persist`
-        // covering BOTH call sites above, strictly before the durable
-        // committer append below is even submitted — so a covering append
-        // can only become durable once its new name(s) already are. Skipped
-        // entirely when neither call site wrote anything (the hot path):
-        // zero fjall calls, zero added latency.
+        // Co-durable name flush, gated on the engine's durability mode
+        // (bn-150 established the barrier; bn-2cj gates it). Covers BOTH
+        // `persist_new_names` call sites above (stream name, then type
+        // names), strictly before the covering committer append below is
+        // submitted. Skipped entirely when neither call site wrote anything
+        // (the hot path, once names have stabilised): zero fjall calls, zero
+        // added latency, in every mode.
         //
-        // Dispatched via `spawn_blocking`, matching the durable committer
-        // append below: `MetaStore::persist` performs a real, synchronous
-        // `fsync`/`fdatasync` that can take milliseconds on a real device,
-        // and running that directly on the async task would block a tokio
-        // executor thread for the duration — starving OTHER concurrent
-        // appends (including ones on the hot, no-new-name path) rather than
-        // just adding latency to this one. `spawn_blocking` lets this
-        // append's flush and every other in-flight append's own work
-        // proceed on separate threads, so a burst of new-name appends
-        // degrades to "N real fsyncs, however long that takes" rather than
-        // serialising the whole engine behind them.
+        // # The contract this gate upholds (bn-2cj)
+        //
+        // `stream_names`/`type_names` are the ONE durable source of truth this
+        // store cannot rebuild from the log: the log frames carry only the
+        // numeric `stream_id`/`event_type_id`, never the name string, so
+        // `recover` resolves each committed event's name PURELY from these
+        // meta tables and hard-fails (`EngineError::Meta`, "no interned name
+        // for stream_id") if a name is missing (see `recover` and
+        // `persist_new_names`' doc). There is no re-derivation path. So the
+        // invariant recovery needs is: **no committed event may out-live its
+        // stream/type name.** How we uphold it depends on what the LOG's own
+        // durability barrier is:
+        //
+        // * `Os`/`Group` — the log append is acked only after its own real
+        //   `fdatasync` barrier (`docs/spec/03-durability.md` §1.2/§1.3). We
+        //   ride a matching `SyncAll` (`fsync`) barrier on the meta store,
+        //   issued STRICTLY BEFORE the covering append is even submitted, so
+        //   the name is on stable storage before the event that references it
+        //   can be. This is the bn-150 guarantee, unchanged — durable modes are
+        //   NOT weakened. Dispatched via `spawn_blocking` because a real
+        //   `fsync` can take milliseconds and would otherwise block a tokio
+        //   executor thread, starving other in-flight appends (including
+        //   hot-path ones) rather than just adding latency to this one.
+        //   (Coalescing these barriers across the group-commit window is the
+        //   separate follow-up bn-34o; not done here.)
+        //
+        // * `Process` — the log append is acked the instant its own covering
+        //   `write(2)` reaches the OS page cache; the mode issues NO barrier
+        //   and its contract (§1.1) is "survives a process crash only; power
+        //   loss has an unbounded, OS-governed loss window." A per-name
+        //   `SyncAll` here would be STRICTLY STRONGER than the operator's
+        //   chosen durability — and it is exactly that `fsync` that cost ~3.4
+        //   ms/new stream (spike bn-1jg, 98.8% of new-stream latency). So we
+        //   drop the barrier and instead push the name to the SAME OS page
+        //   cache the event bytes go to, via `persist_buffered`
+        //   (`PersistMode::Buffer`: a `write(2)`, no `fsync`), which returns
+        //   before this append hands its batch to the committer. Because that
+        //   name `write(2)` completes strictly BEFORE the covering event's own
+        //   `write(2)`, the invariant holds for the crash class `Process`
+        //   actually promises to survive:
+        //     - process crash / panic / `kill -9` — the ONLY class §1.1
+        //       protects. A completed `write(2)` outlives process death, so if
+        //       the event `write(2)` happened, the earlier name `write(2)`
+        //       necessarily did too. A surviving event can NEVER have a lost
+        //       name. Recovery always resolves the name; the store opens.
+        //     - OS crash / power loss — outside `Process`'s promise entirely:
+        //       both name and event live-or-die by the OS page cache, and a
+        //       lost log tail is exactly the "unbounded loss window" the
+        //       operator accepted. A lost name for a lost-tail event is
+        //       consistent (both gone). The only inconsistent outcome — event
+        //       flushed to the device while its earlier-written name was not —
+        //       needs the OS to reorder cross-file writeback against program
+        //       order within the microsecond gap between the two `write(2)`s;
+        //       it is not something `Process` protects against in the first
+        //       place (any operator needing a power-loss guarantee runs
+        //       `Os`/`Group`, which keep the barrier). It is `persist_buffered`
+        //       being a real page-cache `write(2)` ordered before the event —
+        //       NOT a mere in-process buffer — that keeps even this residual
+        //       window as narrow as the log's own, rather than a whole
+        //       writeback interval wide.
+        //   Being barrier-free, the `Process` flush is a cheap `BufWriter`
+        //   flush, so it runs inline (no `spawn_blocking`).
         if wrote_stream || wrote_types {
-            let inner = self.inner.clone();
-            tokio::task::spawn_blocking(move || inner.meta.persist())
-                .await
-                .expect("meta persist task panicked")
-                .map_err(|e| {
-                    AppendError::Backend(EngineError::Meta(e.to_string()))
-                })?;
+            match self.inner.durability {
+                Durability::Process => {
+                    self.inner.meta.persist_buffered().map_err(|e| {
+                        AppendError::Backend(EngineError::Meta(e.to_string()))
+                    })?;
+                }
+                Durability::Os | Durability::Group { .. } => {
+                    let inner = self.inner.clone();
+                    tokio::task::spawn_blocking(move || inner.meta.persist())
+                        .await
+                        .expect("meta persist task panicked")
+                        .map_err(|e| {
+                            AppendError::Backend(EngineError::Meta(
+                                e.to_string(),
+                            ))
+                        })?;
+                }
+            }
         }
 
         let (sid, events, first_stream_pos) = match pre {

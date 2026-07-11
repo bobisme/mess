@@ -259,3 +259,59 @@ fn checkpoint_lag() {
     store.set_checkpoint("proj", 50).unwrap();
     assert_eq!(store.checkpoint_lag("proj", 50).unwrap(), None);
 }
+
+/// bn-2cj: the two name-flush paths are counted independently.
+///
+/// [`MetaStore::persist_buffered`] (`PersistMode::Buffer`, the barrier-free
+/// page-cache flush used under `Durability::Process`) bumps ONLY the buffered
+/// counter; [`MetaStore::persist`] (`SyncAll`, the `fsync` barrier used under
+/// `Os`/`Group`) bumps ONLY the barrier counter. The engine's durability gate
+/// relies on being able to tell the two apart, and after either flush the
+/// interned names reload correctly on reopen.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn buffered_and_barrier_name_flushes_count_independently() {
+    let dir = mess_testkit::sweeping_temp_dir("idx-meta-name-flush-counts");
+    let path = dir.path().join("store");
+    {
+        let store = MetaStore::open(&path).unwrap();
+        assert_eq!(store.persist_call_count(), 0);
+        assert_eq!(store.buffered_persist_call_count(), 0);
+
+        store.put_stream_name(1, "orders-1").unwrap();
+        store.put_type_name(7, "order.placed").unwrap();
+
+        // The Process path: page-cache flush, no fsync barrier.
+        store.persist_buffered().unwrap();
+        assert_eq!(store.buffered_persist_call_count(), 1);
+        assert_eq!(
+            store.persist_call_count(),
+            0,
+            "persist_buffered must NOT be counted as a SyncAll barrier"
+        );
+
+        // The Os/Group path: the fsync barrier, counted separately.
+        store.put_stream_name(2, "orders-2").unwrap();
+        store.persist().unwrap();
+        assert_eq!(store.persist_call_count(), 1);
+        assert_eq!(
+            store.buffered_persist_call_count(),
+            1,
+            "persist (SyncAll) must NOT bump the buffered counter"
+        );
+    }
+
+    // Both names survive a clean reopen (destructors ran; page cache intact) —
+    // the durability class `Process` promises for the buffered write.
+    let store = MetaStore::open(&path).unwrap();
+    let mut names = store.stream_names().unwrap();
+    names.sort_by_key(|(id, _)| *id);
+    assert_eq!(
+        names,
+        vec![(1, "orders-1".to_string()), (2, "orders-2".to_string())]
+    );
+    assert_eq!(
+        store.type_names().unwrap(),
+        vec![(7, "order.placed".to_string())]
+    );
+}
