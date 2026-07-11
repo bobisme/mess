@@ -48,13 +48,13 @@ pub fn rebuild_sidecar_bytes(
             first_version:    b.first_stream_version,
             frame_count:      b.frame_count,
             first_global_pos: b.first_global_pos,
-            // The composed engine is pointer-only: its `EventPtr.offset` is
-            // the batch's global position (a pseudo pointer, never
-            // dereferenced into the `.log` — sealed reads come
-            // from the record book / `.pcol`). The sealer persists
-            // exactly that, so a byte-equal rebuild must reproduce
-            // the global position here, not the raw byte offset.
-            offset:           b.first_global_pos,
+            // bn-2ib: the sealer persists the batch's REAL byte offset (the
+            // block-native read path dereferences sealed `EventPtr`s straight
+            // into the `.log`), so a byte-equal rebuild reproduces exactly
+            // that. (Pre-bn-2ib sidecars carried the global position as a
+            // pseudo offset; the engine's locate-by-scan fallback still
+            // serves those, but a rebuild upgrades them to real pointers.)
+            offset:           b.offset,
         });
     }
     let streams: Vec<SealStream> = by_stream

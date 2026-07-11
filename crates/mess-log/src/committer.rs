@@ -219,6 +219,15 @@ pub enum AppendOutcome {
         first_position: u64,
         /// Global position of the batch's last event.
         last_position:  u64,
+        /// The segment the batch was durably written into (bn-2ib). With live
+        /// auto-roll a batch can land in a segment the caller never named, so
+        /// the ack carries the real placement — the caller's index entry
+        /// (`mess-index`'s `EventPtr` shape) can then point at the actual
+        /// bytes instead of a pseudo location.
+        segment_id:     u64,
+        /// Byte offset of the batch within that segment (the writer
+        /// [`Receipt`](crate::writer::Receipt)'s `offset`).
+        offset:         u64,
     },
     /// The barrier that would cover this batch did not complete (an
     /// `fdatasync` fault, or the crash window §6/§7): the batch MAY still
@@ -990,7 +999,14 @@ fn commit_group<R: Runtime, F: Fs>(
                 let first_position = receipt.first_global_pos;
                 let last_position =
                     first_position + u64::from(receipt.frame_count) - 1;
-                Ok(AppendOutcome::Acked { first_position, last_position })
+                Ok(AppendOutcome::Acked {
+                    first_position,
+                    last_position,
+                    // Read AFTER the (possibly rolled) append: the writer that
+                    // accepted the batch is the one whose id names its segment.
+                    segment_id: writer.segment_id(),
+                    offset: receipt.offset,
+                })
             }
             Err(WriteError::Encode(e)) => Err(AppendError::Encode(e)),
             Err(WriteError::SegmentFull { needed, remaining }) => {
@@ -1728,7 +1744,8 @@ mod tests {
         // already covered the batch (ack strictly after barrier + advance).
         let mut expect_first = 0u64;
         for (out, wm_now) in &outcomes {
-            let AppendOutcome::Acked { first_position, last_position } = *out
+            let AppendOutcome::Acked { first_position, last_position, .. } =
+                *out
             else {
                 panic!("Os must ack every batch");
             };
@@ -2114,7 +2131,11 @@ mod tests {
         assert!(
             matches!(
                 o1,
-                AppendOutcome::Acked { first_position: 0, last_position: 2 }
+                AppendOutcome::Acked {
+                    first_position: 0,
+                    last_position: 2,
+                    ..
+                }
             ),
             "batch 1 got a real barrier: {o1:?}"
         );
@@ -2347,7 +2368,11 @@ mod tests {
         assert!(
             matches!(
                 o1,
-                AppendOutcome::Acked { first_position: 0, last_position: 2 }
+                AppendOutcome::Acked {
+                    first_position: 0,
+                    last_position: 2,
+                    ..
+                }
             ),
             "batch 1 earned a real barrier: {o1:?}"
         );

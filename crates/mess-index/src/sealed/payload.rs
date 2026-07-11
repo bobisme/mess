@@ -917,6 +917,108 @@ impl SealedPayloadIndex {
         }
     }
 
+    /// The index of the block covering stored-order event `idx`, or `None`
+    /// past the coverage (bn-2ib — lets a caller cache **decoded blocks**
+    /// across reads and slice ranges out of them via
+    /// [`reassemble_block`](Self::reassemble_block), instead of re-decoding a
+    /// block for every overlapping batch).
+    pub fn block_for(&self, idx: u64) -> Option<usize> { self.locate(idx) }
+
+    /// Reassemble **every** event of block `bi` to exact source bytes,
+    /// appending to `out` and `n_events + 1` boundaries to `offs` (bn-2ib).
+    /// Event `blocks()[bi].first_event + i` is
+    /// `out[offs[i] as usize..offs[i + 1] as usize]`. The unit a decoded-block
+    /// cache stores: one decode serves every batch the block covers.
+    pub fn reassemble_block(
+        &self,
+        bi: usize,
+        resolver: &impl DictResolver,
+        out: &mut Vec<u8>,
+        offs: &mut Vec<u32>,
+    ) -> Result<(), PayloadError> {
+        out.clear();
+        offs.clear();
+        let e = self.blocks.get(bi).ok_or(PayloadError::IndexOutOfRange)?;
+        let raw = self.block_bytes(e);
+        if e.dict_id == 0 {
+            let block = Block::decode(raw)?;
+            block.reassemble_all(out, offs)?;
+        } else {
+            let dict = resolver
+                .dict_bytes(e.dict_id)
+                .ok_or(PayloadError::UnregisteredDict(e.dict_id))?;
+            let img = decode_row_dict(raw, dict)?;
+            for i in 0..img.len() {
+                offs.push(out.len() as u32);
+                out.extend_from_slice(img.event(i));
+            }
+            offs.push(out.len() as u32);
+        }
+        Ok(())
+    }
+
+    /// Reassemble the contiguous stored-order event range `[lo, hi)` to exact
+    /// source bytes, decoding **only the blocks that cover the range**
+    /// (bn-2ib — the block-native sealed read's per-batch payload fetch;
+    /// [`reassemble_all`](Self::reassemble_all) would decode the whole
+    /// segment, [`reassemble_event`](Self::reassemble_event) would re-decode
+    /// a block once per event). Appends bytes to `out` and `hi - lo + 1`
+    /// boundaries to `offs`: event `lo + i` is
+    /// `out[offs[i] as usize..offs[i + 1] as usize]`. Byte-exact across mixed
+    /// (columnar + row-fallback) blocks, exactly like the two existing paths.
+    pub fn reassemble_range(
+        &self,
+        lo: u64,
+        hi: u64,
+        resolver: &impl DictResolver,
+        out: &mut Vec<u8>,
+        offs: &mut Vec<u32>,
+    ) -> Result<(), PayloadError> {
+        out.clear();
+        offs.clear();
+        if lo >= hi {
+            offs.push(0);
+            return Ok(());
+        }
+        if hi > self.event_count {
+            return Err(PayloadError::IndexOutOfRange);
+        }
+        let mut bi = self.locate(lo).ok_or(PayloadError::IndexOutOfRange)?;
+        let mut next = lo;
+        while next < hi {
+            let e = &self.blocks[bi];
+            debug_assert!(next >= e.first_event);
+            let raw = self.block_bytes(e);
+            let block_lo = (next - e.first_event) as usize;
+            let block_hi = (hi.min(e.first_event + u64::from(e.n_events))
+                - e.first_event) as usize;
+            if e.dict_id == 0 {
+                // Columnar or codec-raw block: decode once, take the rows.
+                let block = Block::decode(raw)?;
+                for row in block_lo..block_hi {
+                    offs.push(out.len() as u32);
+                    out.extend_from_slice(&block.reassemble_one(row)?);
+                }
+            } else {
+                let dict = resolver
+                    .dict_bytes(e.dict_id)
+                    .ok_or(PayloadError::UnregisteredDict(e.dict_id))?;
+                let img = decode_row_dict(raw, dict)?;
+                if block_hi > img.len() {
+                    return Err(PayloadError::IndexOutOfRange);
+                }
+                for row in block_lo..block_hi {
+                    offs.push(out.len() as u32);
+                    out.extend_from_slice(img.event(row));
+                }
+            }
+            next = e.first_event + u64::from(e.n_events);
+            bi += 1;
+        }
+        offs.push(out.len() as u32);
+        Ok(())
+    }
+
     /// Reassemble every event in stored order, appending bytes to `out` and
     /// `event_count + 1` boundaries to `offs`. Byte-exact across mixed
     /// (columnar + row-fallback) blocks.
@@ -1138,6 +1240,56 @@ mod tests {
         // Out-of-range point read is a clean error, not a panic.
         assert!(matches!(
             idx.reassemble_event(evs.len() as u64, &NoDicts),
+            Err(PayloadError::IndexOutOfRange)
+        ));
+    }
+
+    /// bn-2ib: `reassemble_range` must agree with `reassemble_all`'s slices
+    /// for every range shape — inside one block, straddling block (and
+    /// block-kind) boundaries, whole-segment, and empty — and reject a range
+    /// past the coverage with a typed error, never a panic.
+    #[test]
+    fn reassemble_range_matches_full_reassembly_slices() {
+        let evs = mixed_corpus();
+        let bytes = encode_payload_sidecar(7, &refs(&evs), &opts()).unwrap();
+        let idx = SealedPayloadIndex::from_bytes(bytes).unwrap();
+
+        let n = evs.len() as u64;
+        let ranges = [
+            (0u64, n),  // whole segment
+            (0, 1),     // first event
+            (3, 9),     // inside the first (columnar) block
+            (30, 35),   // straddles the 32-event block boundary
+            (28, 100),  // straddles columnar → row-fallback kinds
+            (n - 5, n), // tail
+            (17, 17),   // empty range
+        ];
+        let mut out = Vec::new();
+        let mut offs = Vec::new();
+        for (lo, hi) in ranges {
+            idx.reassemble_range(lo, hi, &NoDicts, &mut out, &mut offs)
+                .unwrap();
+            assert_eq!(
+                offs.len() as u64,
+                hi - lo + 1,
+                "boundary count for [{lo},{hi})"
+            );
+            for (i, w) in offs.windows(2).enumerate() {
+                assert_eq!(
+                    &out[w[0] as usize..w[1] as usize],
+                    evs[lo as usize + i].as_slice(),
+                    "range [{lo},{hi}) mismatch at local {i}"
+                );
+            }
+        }
+
+        // Past-coverage range: typed error.
+        assert!(matches!(
+            idx.reassemble_range(n - 1, n + 1, &NoDicts, &mut out, &mut offs),
+            Err(PayloadError::IndexOutOfRange)
+        ));
+        assert!(matches!(
+            idx.reassemble_range(n + 3, n + 4, &NoDicts, &mut out, &mut offs),
             Err(PayloadError::IndexOutOfRange)
         ));
     }

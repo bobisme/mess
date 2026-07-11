@@ -393,6 +393,103 @@ fn read_segment_through_fs<F: Fs>(fs: &F, path: &Path) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// The fixed batch-header length (§4.2) — how many bytes a point reader must
+/// `pread` at a batch offset before [`peek_batch_total_len`] can size the full
+/// batch read (bn-2ib block-native reads).
+pub const BATCH_HEADER_LEN: usize = HEADER_LEN;
+
+/// Peek a candidate batch header's `total_len` without validating the batch
+/// body (bn-2ib): checks exactly the prefix of [`decode_batch`]'s byte layer
+/// that a point reader needs to size its second `pread` — magic, format
+/// version, known flags, and the A2 `total_len` cap — and returns the typed
+/// byte fault otherwise. `img` needs only [`BATCH_HEADER_LEN`] bytes at `off`.
+///
+/// This is a *sizing* peek, not an acceptance decision: the caller MUST still
+/// run the full byte layer ([`accepted_batch_at`], which always computes the
+/// A4/A12 CRC) over the complete batch bytes before trusting anything in them.
+pub fn peek_batch_total_len(img: &[u8], off: usize) -> Result<u64, ScanStop> {
+    if img.len().saturating_sub(off) < HEADER_LEN {
+        return Err(ScanStop::TornHeader); // A11
+    }
+    if rd_u32(img, off + BH_MAGIC_OFF) != HEADER_MAGIC {
+        return Err(ScanStop::BadMagic);
+    }
+    if rd_u16(img, off + BH_FORMAT_VERSION_OFF) != FORMAT_VERSION {
+        return Err(ScanStop::BadVersion);
+    }
+    if rd_u16(img, off + BH_FLAGS_OFF) & !FLAGS_KNOWN_MASK != 0 {
+        return Err(ScanStop::UnknownFlags); // §4.2.1
+    }
+    let total_len = rd_u64(img, off + BH_TOTAL_LEN_OFF);
+    if !(MIN_BATCH_LEN..=MAX_BATCH_LEN).contains(&total_len) {
+        return Err(ScanStop::BadLength); // A2
+    }
+    Ok(total_len)
+}
+
+/// Decode + byte-validate the single batch at `off` in `img`, returning it as
+/// an [`AcceptedBatch`] (bn-2ib — the block-native point-read seam).
+///
+/// This runs exactly [`decode_batch`]'s byte layer (§2.1 steps 1–6, including
+/// the **mandatory** A4/A12 full-batch CRC — no path skips it), but *only* the
+/// byte layer: the protocol rules the acceptance kernel owns during a scan
+/// (A1 position contiguity, A9 epoch, A5) are the caller's to enforce, because
+/// a point read starts from an already-committed pointer — the index entry it
+/// resolved was admitted by a scan that ran the kernel — and merely
+/// re-materializes those bytes. Callers MUST cross-check the returned batch's
+/// identity (`stream_id`, `first_global_pos`, `first_stream_version`,
+/// `frame_count`) against the pointer they resolved, so a stale or wrong
+/// offset that happens to land on a byte-valid batch is caught.
+///
+/// `img` may be the whole segment image or any buffer whose byte `off` is the
+/// batch's first byte (e.g. a standalone `pread` of just the batch, with
+/// `off == 0`); the returned batch's `offset` field is `off`, and
+/// [`AcceptedBatch::frames`] must then be handed this same `img`.
+pub fn accepted_batch_at(
+    img: &[u8],
+    off: usize,
+) -> Result<AcceptedBatch, ScanStop> {
+    if off >= img.len() {
+        return Err(ScanStop::TornHeader); // uphold decode_batch's precondition
+    }
+    let d = decode_batch(img, off)?;
+    Ok(AcceptedBatch {
+        offset:               off as u64,
+        total_len:            d.total_len,
+        batch_id:             d.batch_id,
+        first_global_pos:     d.first_global_pos,
+        frame_count:          d.frame_count,
+        segment_epoch:        d.segment_epoch,
+        stream_id:            d.stream_id,
+        category_id:          d.category_id,
+        first_stream_version: d.first_stream_version,
+        has_crypto_chain:     d.has_crypto_chain,
+    })
+}
+
+/// Read + validate just the segment's fixed header (§3.2) through the [`Fs`]
+/// seam — a 52-byte `pread`, not a scan (bn-2ib). `None` when the header is
+/// absent/torn/mis-magicked/CRC-invalid, exactly as the full scan would
+/// classify it ([`ScanStop::BadSegmentHeader`]). Used by open-time recovery to
+/// establish per-segment `base_pos` contiguity for segments it can serve from
+/// their sealed sidecars without scanning their bytes.
+pub fn read_segment_header<F: Fs>(
+    fs: &F,
+    path: &Path,
+) -> io::Result<Option<SegmentHeaderInfo>> {
+    let file = fs.open(path, OpenOpts::read_only())?;
+    let mut buf = [0u8; SEGMENT_HEADER_LEN];
+    let mut filled = 0;
+    while filled < SEGMENT_HEADER_LEN {
+        let n = file.pread(filled as u64, &mut buf[filled..])?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    Ok(decode_segment_header(&buf[..filled]))
+}
+
 /// The pure scan over an in-memory segment image. Separated so it is trivially
 /// deterministic and idempotent (property 4): a pure function of the durable
 /// bytes. All callers reach it only after reading those bytes through the Fs.

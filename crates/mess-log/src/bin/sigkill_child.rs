@@ -118,6 +118,7 @@ fn main() {
                         Ok(AppendOutcome::Acked {
                             first_position,
                             last_position,
+                            ..
                         }) => {
                             // A send error means the reporter thread is
                             // gone (stdout write failed, e.g. parent

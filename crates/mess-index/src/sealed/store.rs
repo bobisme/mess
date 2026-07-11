@@ -49,6 +49,16 @@ use crate::sealed::segment::SealedSegmentRef;
 struct Inner {
     /// Installed sealed indexes, keyed by segment id.
     segments: HashMap<u64, SealedSegmentRef>,
+    /// Per-segment **install generation** (bn-2ib review F1/F6): bumped from
+    /// `next_gen` on every [`SealedStore::install`], including a re-install
+    /// of the same segment id (an on-demand re-seal with grown coverage).
+    /// Callers that cache anything DERIVED from a sealed index (decoded
+    /// `.pcol` blocks, global batch directories) key those caches by
+    /// `(segment_id, generation)` so a re-seal can never serve stale
+    /// derived state.
+    gens:     HashMap<u64, u64>,
+    /// Monotone install counter feeding `gens`.
+    next_gen: u64,
     /// Segments whose active-index entries have been (logically) evicted; a
     /// subset of `segments`' keys (eviction always follows install).
     evicted:  HashSet<u64>,
@@ -70,7 +80,11 @@ impl SealedStore {
     /// after the sidecar and footer are durable.
     pub fn install(&self, index: SealedSegmentRef) {
         let id = index.segment_id();
-        self.inner.write().segments.insert(id, index);
+        let mut inner = self.inner.write();
+        inner.next_gen += 1;
+        let generation = inner.next_gen;
+        inner.gens.insert(id, generation);
+        inner.segments.insert(id, index);
     }
 
     /// Mark segment `S`'s active-index entries as evicted (step 4). MUST be
@@ -92,9 +106,42 @@ impl SealedStore {
         self.inner.read().segments.get(&segment_id).cloned()
     }
 
+    /// The installed sealed index for `segment_id` **with its install
+    /// generation** (bn-2ib review F1/F6) — the pair is read under one lock,
+    /// so a caller keying derived caches by the generation can never pair a
+    /// new index with an old generation or vice versa.
+    pub fn get_with_gen(
+        &self,
+        segment_id: u64,
+    ) -> Option<(SealedSegmentRef, u64)> {
+        let inner = self.inner.read();
+        let seg = inner.segments.get(&segment_id)?.clone();
+        let generation = *inner.gens.get(&segment_id).unwrap_or(&0);
+        Some((seg, generation))
+    }
+
+    /// Every installed sealed segment with its install generation (see
+    /// [`get_with_gen`](Self::get_with_gen)); one consistent snapshot.
+    pub fn segments_with_gens(&self) -> Vec<(SealedSegmentRef, u64)> {
+        let inner = self.inner.read();
+        inner
+            .segments
+            .iter()
+            .map(|(id, seg)| (seg.clone(), *inner.gens.get(id).unwrap_or(&0)))
+            .collect()
+    }
+
     /// Whether `segment_id`'s active entries have been evicted.
     pub fn is_evicted(&self, segment_id: u64) -> bool {
         self.inner.read().evicted.contains(&segment_id)
+    }
+
+    /// Every installed sealed segment (unordered; callers sort — e.g.
+    /// [`ReplaySet::from_segments`](crate::sealed::replay::ReplaySet) puts
+    /// them in global A1 order). A snapshot clone of the `Arc` refs, so the
+    /// caller's view is stable across concurrent installs (bn-2ib).
+    pub fn segments(&self) -> Vec<SealedSegmentRef> {
+        self.inner.read().segments.values().cloned().collect()
     }
 
     /// Number of installed sealed segments.

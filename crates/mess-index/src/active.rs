@@ -370,6 +370,75 @@ impl ActiveIndex {
         }
     }
 
+    /// The committed entries of `stream_id` that hold `from_version` or any
+    /// later version, in version order, cloning only enough batches to cover
+    /// `max_events` events at or past `from_version` (bn-2ib — the paged
+    /// block-native `read_stream` resolve). A paged read of a long stream
+    /// thus costs O(page), not O(stream history): the pre-`from_version`
+    /// prefix is skipped by binary search and the copy stops as soon as the
+    /// page is covered. Clamped to `applied_end` exactly like
+    /// [`stream_entries`](Self::stream_entries).
+    pub fn stream_entries_from(
+        &self,
+        stream_id: u64,
+        from_version: u64,
+        max_events: usize,
+    ) -> Vec<StreamEntry> {
+        let w = self.applied_end.load(Ordering::Acquire);
+        let map = self.shard_for(stream_id).streams.read();
+        let Some(entries) = map.get(&stream_id) else {
+            return Vec::new();
+        };
+        let committed = entries.partition_point(|e| e.end_pos() <= w);
+        let entries = &entries[..committed];
+        // First batch whose last event is at/after `from_version`.
+        let start =
+            entries.partition_point(|e| e.last_version() < from_version);
+        let mut out = Vec::new();
+        let mut covered = 0usize;
+        for e in &entries[start..] {
+            if covered >= max_events {
+                break;
+            }
+            out.push(*e);
+            // Events this batch contributes at or past `from_version`.
+            let lo = from_version.max(e.first_version);
+            covered += (e.last_version() - lo + 1) as usize;
+        }
+        out
+    }
+
+    /// The committed global-position-ordered entries covering `from_pos` and
+    /// later, cloning only enough batches to cover `max_events` events at or
+    /// past `from_pos` (bn-2ib — the paged block-native `read_global`
+    /// resolve). Clamped to `applied_end` like
+    /// [`global_committed`](Self::global_committed); the returned slice
+    /// starts at the batch containing `from_pos` (or the first committed
+    /// batch above it, when `from_pos` predates this index's coverage —
+    /// e.g. positions served from the sealed tier after a reopen).
+    pub fn global_range(
+        &self,
+        from_pos: u64,
+        max_events: usize,
+    ) -> Vec<GlobalEntry> {
+        let w = self.applied_end.load(Ordering::Acquire);
+        let g = self.global.read();
+        let committed = g.partition_point(|e| e.end_pos() <= w);
+        let g = &g[..committed];
+        let start = g.partition_point(|e| e.end_pos() <= from_pos);
+        let mut out = Vec::new();
+        let mut covered = 0usize;
+        for e in &g[start..] {
+            if covered >= max_events {
+                break;
+            }
+            out.push(*e);
+            let lo = from_pos.max(e.first_global_pos);
+            covered += (e.end_pos() - lo) as usize;
+        }
+        out
+    }
+
     /// The committed global-position-ordered prefix (a clamped clone). Dense
     /// and ascending: batch `i+1` begins exactly where batch `i` ends.
     pub fn global_committed(&self) -> Vec<GlobalEntry> {
@@ -521,6 +590,63 @@ mod tests {
             snap.streams.keys().copied().collect::<Vec<_>>(),
             vec![10, 20, 30]
         );
+    }
+
+    /// bn-2ib: the paged resolves must agree with filtering the full clamped
+    /// clones, for every from/limit shape — including a `from` inside a
+    /// batch, past the head, and a limit that lands mid-batch.
+    #[test]
+    fn ranged_reads_match_filtered_full_reads() {
+        let idx = ActiveIndex::new();
+        // stream 10: [0..=2], [3..=4], [5..=8]; stream 20: [0..=1].
+        let batches = [
+            entry(10, 0, 3, 0, 100),
+            entry(20, 0, 2, 3, 200),
+            entry(10, 3, 2, 5, 300),
+            entry(10, 5, 4, 7, 400),
+        ];
+        idx.apply_committed(11, &batches);
+
+        let full = idx.stream_entries(10);
+        for from in 0..=9u64 {
+            for limit in [1usize, 2, 4, 100] {
+                let got = idx.stream_entries_from(10, from, limit);
+                // Expected: batches holding any version >= from, until the
+                // covered count reaches `limit`.
+                let mut want = Vec::new();
+                let mut covered = 0usize;
+                for e in &full {
+                    if e.last_version() < from || covered >= limit {
+                        continue;
+                    }
+                    want.push(*e);
+                    covered += (e.last_version() - from.max(e.first_version)
+                        + 1) as usize;
+                }
+                assert_eq!(got, want, "stream from={from} limit={limit}");
+            }
+        }
+        assert!(idx.stream_entries_from(10, 9, 10).is_empty(), "past head");
+        assert!(idx.stream_entries_from(999, 0, 10).is_empty());
+
+        let g = idx.global_committed();
+        for from in 0..=11u64 {
+            for limit in [1usize, 3, 100] {
+                let got = idx.global_range(from, limit);
+                let mut want = Vec::new();
+                let mut covered = 0usize;
+                for e in &g {
+                    if e.end_pos() <= from || covered >= limit {
+                        continue;
+                    }
+                    want.push(*e);
+                    covered +=
+                        (e.end_pos() - from.max(e.first_global_pos)) as usize;
+                }
+                assert_eq!(got, want, "global from={from} limit={limit}");
+            }
+        }
+        assert!(idx.global_range(11, 10).is_empty(), "past applied end");
     }
 
     #[test]

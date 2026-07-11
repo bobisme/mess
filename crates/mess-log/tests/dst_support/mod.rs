@@ -508,6 +508,7 @@ async fn run_committer_segment(
                     Ok(AppendOutcome::Acked {
                         first_position,
                         last_position,
+                        ..
                     }) => {
                         acked2
                             .lock()

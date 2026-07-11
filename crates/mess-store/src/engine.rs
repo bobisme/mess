@@ -28,69 +28,79 @@
 //!   durable write itself across all streams; the gate's job is only to make
 //!   the version check atomic with the append, per stream.)
 //! - **Hot reads** — committed batches are applied to a `mess-index`
-//!   [`ActiveIndex`] via `apply_committed`, and their payloads are written into
-//!   the record book, **only after the committer acks** the durable append
-//!   (post-ack discipline): the book and index therefore never expose a
-//!   position the durable watermark has not already covered. (The committer's
-//!   own watermark is what gates durability; the engine does not re-derive it —
-//!   it simply publishes to the book strictly after the ack.) `read_stream`
+//!   [`ActiveIndex`] via `apply_committed` — with their **real** `(segment_id,
+//!   offset)` pointer from the committer's ack — **only after the committer
+//!   acks** the durable append (post-ack discipline): the index never exposes a
+//!   position the durable watermark has not already covered. `read_stream`
 //!   enumerates a stream's positions through the active index (unsealed tier)
-//!   unioned with the sealed tier.
+//!   unioned with the sealed tier, and materialises bytes through the bounded
+//!   [`BlockReader`] (see "Block-native reads" below).
 //! - **Cold reads** — sealed segments are served through
 //!   [`ReplaySet`](mess_index::sealed::ReplaySet) over a
 //!   [`SealedStore`](mess_index::sealed::SealedStore), so an
 //!   [`EventStore::load`](crate::EventStore::load) of a sealed corpus runs the
-//!   real sealed-replay path.
+//!   real sealed-replay path, with payload bytes reassembled from the columnar
+//!   `.pcol` sidecar where one exists.
 //! - **Meta** — durable stream heads and the dedupe window live in the
 //!   `mess-index` fjall [`MetaStore`].
 //! - **Recovery** — on open the engine enumerates segment files and runs
 //!   `mess-log` `recover_whole_log` (fast path + advisory manifest) and
 //!   `mess-index` `rebuild` (F6) to rehydrate the active index.
 //!
-//! # Payload materialisation and its durable rehydration (bn-20b)
+//! # Block-native reads: no all-history payload mirror (bn-2ib)
 //!
 //! The [`Backend`] seam must return [`StoredRecord`]s carrying
 //! `message_type: String` and `data: Vec<u8>`, but the index tier is
-//! pointer-only. So the engine keeps an in-process **record book**: the
-//! authoritative `(stream name, message type, payload)` for each committed
-//! global position, plus the `&str → u64` / `String → u32` interners the
-//! numeric log/index tier needs. Reads resolve *positions* through the real
-//! index / sealed tiers and then fetch *bytes* from the book.
+//! pointer-only. Before bn-2ib the engine bridged that gap with an all-history
+//! in-process payload mirror (the "record book": one owned payload per
+//! committed global position, rebuilt by decoding every durable event on every
+//! open — memory and startup proportional to total history). That mirror is
+//! **gone**. Reads now resolve *positions* through the real index / sealed
+//! tiers and fetch *bytes* from the durable blocks themselves:
 //!
-//! The book is `Arc`-shared across [`LogEngine`] clones (matching
-//! [`MockBackend`]'s reuse-the-handle semantics), but a `clone()` is **not** a
-//! crash: the durable authority is the log on disk. On a genuine fresh
-//! [`LogEngine::open`] over a populated directory,
-//! [`recover`](LogEngine::recover) **rehydrates the book from the durable
-//! log**:
-//!
-//! - **Payload bytes** come back through `mess-log`'s read-side materialization
-//!   seam — [`scanner::recover_segment_with_image`] + [`AcceptedBatch::frames`]
-//!   (the additive payload-decode API this bone added to `mess-log`): each
-//!   recovered batch yields its events' `(event_type_id, payload)` straight out
-//!   of the durable segment image.
+//! - **Positions** come from the hot [`ActiveIndex`] (unsealed tier) and the
+//!   sealed [`ReplaySet`] pointer sidecars (cold tier), whose [`EventPtr`]s are
+//!   now the batch's **real** `(segment_id, byte offset)` — the committer
+//!   reports the placement in each [`AppendOutcome::Acked`] and recovery
+//!   re-derives it from the scan.
+//! - **Bytes** come from a bounded, bytes-weighted **decoded-capsule cache**
+//!   ([`BlockReader`]): a miss `pread`s the one batch at its pointer,
+//!   re-validates it through the recovery scanner's byte layer (the mandatory
+//!   A4/A12 CRC — [`scanner::accepted_batch_at`]), decodes its frames once into
+//!   an immutable [`DecodedBatch`] arena, and caches it under `(segment_id,
+//!   offset)`. Eviction can never change results: the miss path is the same
+//!   durable bytes.
+//! - **Sealed payloads** are served from the columnar `.pcol` sidecar (D6) when
+//!   the covering segment carries one: the batch's frame *identities*
+//!   (event-type ids, versions) still come from the raw batch — no sealed
+//!   sidecar stores event-type ids today, see the REPORT — but its payload
+//!   *bytes* are reassembled through [`SealedPayloadIndex::reassemble_range`],
+//!   falling back byte-identically to the raw batch on any `.pcol` decode error
+//!   (verify-on-seal proved the two equal when the sidecar was written; the log
+//!   stays truth).
 //! - **Names** cannot be re-derived from the log — it stores only interned
 //!   numeric ids (`stream_id u64`, `event_type_id u32`), never their strings.
-//!   The interner's `id → name` bijection is therefore persisted durably in the
+//!   The interner's `id → name` bijection is persisted durably in the
 //!   `mess-index` [`MetaStore`]'s `stream_names` / `type_names` tables (written
 //!   the first time a name is interned, in
 //!   [`append_batch`](LogEngine::append_batch), via
-//!   [`persist_new_names`](LogEngine::persist_new_names)) and reloaded here to
-//!   reconstruct the interner before the payloads are materialised. This is the
-//!   smallest durable surface for the engine's lightweight interner — the role
-//!   `$registry` plays in the full design (not implemented here: frames carry
-//!   no name payload to derive it from). A new name is `fsync`ed **before** the
-//!   covering append can become durable (bn-150), so recovery can never observe
-//!   a durable event whose name is missing — see
-//!   [`persist_new_names`](LogEngine::persist_new_names)'s doc for why that
-//!   co-durability barrier is needed even though every other meta table is a
-//!   lag-tolerant derived cache.
+//!   [`persist_new_names`](LogEngine::persist_new_names)) and reloaded on open.
+//!   A new name is `fsync`ed **before** the covering append can become durable
+//!   (bn-150) — see [`persist_new_names`](LogEngine::persist_new_names).
 //!
-//! After rehydration the book is dense from global position 0 again, so
-//! post-reopen appends preserve the dense-position invariant and reads return
-//! the exact pre-crash data. The single active segment is *resumed in place*
+//! What remains of the book is deliberately tiny and history-**independent**
+//! per event: the two name interners plus the per-stream head versions
+//! ([`Book`]). On open, [`recover`](LogEngine::recover) reconstructs exactly
+//! that — interners from the meta tables, heads + hot index from a
+//! header/batch-metadata scan of the **unsealed** segments only (no payload
+//! frame is decoded), and heads/watermark for fully-sealed segments straight
+//! from their durable sidecar directories without reading the segment bytes
+//! at all. The single active segment is *resumed in place*
 //! ([`SegmentWriter::resume`]) at the recovered `safe_offset`, so the durable
 //! log continues to grow one contiguous prefix across any number of reopens.
+//!
+//! [`SealedPayloadIndex::reassemble_range`]: mess_index::sealed::SealedPayloadIndex::reassemble_range
+//! [`AppendOutcome::Acked`]: mess_log::committer::AppendOutcome::Acked
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -103,23 +113,27 @@ use std::time::{Duration, Instant};
 
 use mess_index::meta::{CommitGroup, Head, MetaStore, StreamId};
 use mess_index::sealed::{
-    BlockCache, ReplaySet, SealBatch, SealDriver, SealInput, SealMetrics,
-    SealStream, SealedSegmentIndex, SealedStore,
+    BlockCache, NoDicts, ReplaySet, SealBatch, SealDriver, SealInput,
+    SealMetrics, SealStream, SealedSegmentIndex, SealedSegmentRef, SealedStore,
 };
-use mess_index::{ActiveIndex, BatchEntry, EventPtr, IndexSnapshot};
+use mess_index::{ActiveIndex, BatchEntry, EventPtr, GlobalEntry, StreamEntry};
 use mess_log::committer::{
     AppendOutcome, AppendRequest, Appender, ChainInit, Committer, Durability,
     EventInput, LatencySnapshot, PreBarrier, Roller,
 };
 use mess_log::fold_chain::ChainHead;
 use mess_log::lock::StoreLock;
-use mess_log::runtime::{RealRuntime, Runtime};
+use mess_log::runtime::{
+    FileHandle, Fs as LogFs, OpenOpts, RealRuntime, Runtime,
+};
 use mess_log::scanner::{self, AcceptedBatch};
-use mess_log::sealer::{TrailerFields, encode_trailer};
+use mess_log::sealer::{TrailerFields, encode_trailer, read_trailer};
 use mess_log::watermark::Watermark;
 use mess_log::writer::{
     ResumeParams, SegmentParams, SegmentSummary, SegmentWriter,
 };
+use quick_cache::sync::{Cache, DefaultLifecycle};
+use quick_cache::{DefaultHashBuilder, OptionsBuilder, Weighter};
 
 use crate::backend::{
     AppendError, Appended, Backend, RecordToAppend, StoredRecord,
@@ -153,41 +167,35 @@ pub enum EngineError {
     /// A sealed-corpus read failed to decode.
     #[error("sealed read: {0}")]
     SealedRead(String),
+    /// A block-native read of a committed batch failed (bn-2ib): the pointer
+    /// could not be resolved to a CRC-valid batch of the expected identity,
+    /// even via the locate-by-scan fallback.
+    #[error("read: {0}")]
+    Read(String),
 }
 
-/// One committed event's authoritative payload, keyed by global position in
-/// the [`Book`].
-#[derive(Clone)]
-struct Payload {
-    stream_name:     Arc<str>,
-    message_type:    Arc<str>,
-    data:            Arc<[u8]>,
-    stream_position: u64,
-}
-
-/// The in-process record book + interners (see the module docs). All engine
-/// clones share one `Arc<Mutex<Book>>`.
+/// The in-process name interners + per-stream heads (see the module docs).
+/// All engine clones share one `Arc<Mutex<Book>>`.
+///
+/// Since bn-2ib this holds **no payload bytes and no per-event state**: its
+/// size is O(streams + event types), independent of history length. Payloads
+/// live in the durable blocks and are read through the bounded
+/// [`BlockReader`]; per-stream position enumeration lives in the
+/// [`ActiveIndex`] / sealed sidecars.
 #[derive(Default)]
 struct Book {
     /// `stream name → interned id` (ids start at 1; 0 is unused).
-    stream_ids:    HashMap<String, u64>,
+    stream_ids:   HashMap<String, u64>,
     /// `interned id → stream name`, index `id - 1`.
-    stream_names:  Vec<Arc<str>>,
+    stream_names: Vec<Arc<str>>,
     /// `message type → interned event-type id` (ids start at 1).
-    type_ids:      HashMap<String, u32>,
+    type_ids:     HashMap<String, u32>,
     /// `interned event-type id → message type`, index `id - 1` (the reverse of
     /// `type_ids`, kept in lockstep so recovery can resolve a frame's
     /// `event_type_id` back to its name).
-    type_names:    Vec<Arc<str>>,
-    /// Payloads by dense global position.
-    payloads:      Vec<Payload>,
-    /// `stream id → global positions in stream order` (the hot-tier read
-    /// index, kept in lockstep with `ActiveIndex::apply_committed`; index
-    /// into it is the stream position). Serves O(limit) paged reads for
-    /// unsealed streams.
-    stream_events: HashMap<u64, Vec<u64>>,
+    type_names:   Vec<Arc<str>>,
     /// `stream id → last stream position` (the head).
-    heads:         HashMap<u64, u64>,
+    heads:        HashMap<u64, u64>,
 }
 
 impl Book {
@@ -203,10 +211,6 @@ impl Book {
         self.stream_names.push(arc);
         self.stream_ids.insert(name.to_string(), id);
         (id, true)
-    }
-
-    fn stream_name(&self, id: u64) -> Arc<str> {
-        self.stream_names[(id - 1) as usize].clone()
     }
 
     /// Intern `name`, returning `(id, is_new)` (see [`intern_stream`]).
@@ -269,17 +273,552 @@ impl Book {
     fn type_name_opt(&self, id: u32) -> Option<Arc<str>> {
         self.type_names.get((id - 1) as usize).cloned()
     }
+}
 
-    fn record(&self, global_position: u64) -> StoredRecord {
-        let p = &self.payloads[global_position as usize];
-        StoredRecord {
-            stream_id: p.stream_name.to_string(),
-            message_type: p.message_type.to_string(),
-            data: p.data.to_vec(),
-            stream_position: p.stream_position,
-            global_position,
+// ---------------------------------------------------------------------------
+// Block-native reads (bn-2ib): the decoded-capsule cache + block reader
+// ---------------------------------------------------------------------------
+
+/// The engine's concrete filesystem/file types (the same [`Fs`] seam the
+/// writer and recovery scanner use — see [`mess_log::runtime`]).
+type EngineFs = <RealRuntime as Runtime>::Fs;
+type EngineFile = <EngineFs as LogFs>::File;
+
+/// One decoded, CRC-validated committed batch — the immutable block-backed
+/// record view every read path materialises [`StoredRecord`]s from. Shared as
+/// an `Arc` through the bounded capsule cache, so a page of reads over a hot
+/// batch is an `Arc` bump plus per-record slice copies, never a re-decode.
+///
+/// Frame `k` (0-based within the batch) is the event at stream position
+/// `first_stream_version + k`, global position `first_global_pos + k`, with
+/// event-type id `type_ids[k]` and payload
+/// `data[offs[k] as usize..offs[k + 1] as usize]` (a single arena, not one
+/// allocation per event).
+struct DecodedBatch {
+    stream_id:            u64,
+    first_stream_version: u64,
+    first_global_pos:     u64,
+    frame_count:          u32,
+    /// Per-frame interned event-type id.
+    type_ids:             Vec<u32>,
+    /// Payload arena; see the struct doc for the slicing contract.
+    data:                 Vec<u8>,
+    /// `frame_count + 1` arena boundaries.
+    offs:                 Vec<u32>,
+}
+
+impl DecodedBatch {
+    /// Frame `k`'s payload bytes.
+    #[inline]
+    fn payload(&self, k: usize) -> &[u8] {
+        &self.data[self.offs[k] as usize..self.offs[k + 1] as usize]
+    }
+
+    /// Resident bytes for the cache weighter.
+    fn weight_bytes(&self) -> u64 {
+        (self.data.len()
+            + self.offs.len() * 4
+            + self.type_ids.len() * 4
+            + std::mem::size_of::<DecodedBatch>()) as u64
+    }
+}
+
+/// Cache key: the batch's physical placement `(segment_id, byte offset)`.
+type CapsuleKey = (u64, u64);
+
+/// Weighs a cached capsule by its decoded resident bytes plus a fixed
+/// overhead, so the operator-facing budget tracks real memory (the
+/// [`BlockCache`] pattern; a zero weight would never be evicted).
+#[derive(Clone, Copy, Default)]
+struct CapsuleWeighter;
+
+/// Fixed per-entry overhead (key + `Arc` header + map slot).
+const CAPSULE_OVERHEAD_BYTES: u64 = 64;
+
+impl Weighter<CapsuleKey, Arc<DecodedBatch>> for CapsuleWeighter {
+    #[inline]
+    fn weight(&self, _key: &CapsuleKey, val: &Arc<DecodedBatch>) -> u64 {
+        val.weight_bytes() + CAPSULE_OVERHEAD_BYTES
+    }
+}
+
+/// Weighs a cached sealed-segment global batch directory.
+#[derive(Clone, Copy, Default)]
+struct GlobalDirWeighter;
+
+impl Weighter<(u64, u64), Arc<Vec<GlobalEntry>>> for GlobalDirWeighter {
+    #[inline]
+    fn weight(&self, _key: &(u64, u64), val: &Arc<Vec<GlobalEntry>>) -> u64 {
+        (val.len() * std::mem::size_of::<GlobalEntry>()) as u64
+            + CAPSULE_OVERHEAD_BYTES
+    }
+}
+
+/// One decoded `.pcol` payload block (bn-2ib): the unit the sealed payload
+/// tier is cached at. A 128-event block would otherwise be decoded once per
+/// overlapping batch — a small-batch corpus pays that decode ~(block/batch)×
+/// per replay; caching the decoded block bounds it to ~once.
+struct PcolBlock {
+    /// Stored-order index of the block's first event within its segment.
+    first_event: u64,
+    /// Reassembled payload arena for the whole block.
+    data:        Vec<u8>,
+    /// `n_events + 1` arena boundaries.
+    offs:        Vec<u32>,
+}
+
+/// Weighs a cached decoded `.pcol` block.
+#[derive(Clone, Copy, Default)]
+struct PcolWeighter;
+
+impl Weighter<(u64, u64, u64), Arc<PcolBlock>> for PcolWeighter {
+    #[inline]
+    fn weight(&self, _key: &(u64, u64, u64), val: &Arc<PcolBlock>) -> u64 {
+        (val.data.len() + val.offs.len() * 4) as u64 + CAPSULE_OVERHEAD_BYTES
+    }
+}
+
+/// What a read path *expects* the batch at a pointer to be — cross-checked
+/// against the decoded batch's CRC-covered identity so a stale or wrong
+/// offset that happens to land on byte-valid bytes is caught, never served.
+#[derive(Debug, Clone, Copy)]
+struct BatchExpect {
+    stream_id:        u64,
+    first_global_pos: u64,
+    frame_count:      u32,
+    /// `None` on the global-read path ([`GlobalEntry`] carries no version;
+    /// the CRC-covered header's `first_stream_version` is authoritative).
+    first_version:    Option<u64>,
+}
+
+impl BatchExpect {
+    fn matches(&self, b: &DecodedBatch) -> bool {
+        b.stream_id == self.stream_id
+            && b.first_global_pos == self.first_global_pos
+            && b.frame_count == self.frame_count
+            && self.first_version.is_none_or(|v| b.first_stream_version == v)
+    }
+}
+
+/// The block-native byte fetcher (bn-2ib): resolves a committed
+/// [`EventPtr`] to a CRC-validated [`DecodedBatch`] through a bounded,
+/// bytes-weighted decoded-capsule cache. Misses `pread` exactly one batch
+/// from the segment file; correctness never depends on cache residence
+/// (a disabled cache runs the identical miss path for every read).
+struct BlockReader {
+    fs:          EngineFs,
+    dir:         PathBuf,
+    /// Read-only segment file handles, opened lazily and kept for the
+    /// engine's lifetime (bounded by the number of segments; a handle is a
+    /// cheap `Arc`'d fd).
+    files:       Mutex<HashMap<u64, EngineFile>>,
+    /// The decoded-capsule cache. `None` = disabled (every read decodes
+    /// fresh).
+    capsules:    Option<Cache<CapsuleKey, Arc<DecodedBatch>, CapsuleWeighter>>,
+    /// Decoded per-segment global batch directories for **sealed** segments,
+    /// keyed `(segment_id, install generation)` — a segment can be RE-sealed
+    /// with grown coverage (an on-demand `seal_active`, or a roll-seal after
+    /// one), and derived state cached under the old sidecar must never serve
+    /// the new one (bn-2ib review F1/F6). Stale-generation entries become
+    /// unreachable and age out under the byte budget.
+    global_dirs:
+        Option<Cache<(u64, u64), Arc<Vec<GlobalEntry>>, GlobalDirWeighter>>,
+    /// Decoded `.pcol` payload blocks, keyed
+    /// `(segment_id, install generation, block index)` — see [`PcolBlock`]
+    /// for the block granularity and `global_dirs` for the generation
+    /// component (a re-seal re-blocks the payload sidecar; a stale partial
+    /// tail block under the new index's block map was review finding F1).
+    pcol_blocks: Option<Cache<(u64, u64, u64), Arc<PcolBlock>, PcolWeighter>>,
+}
+
+impl BlockReader {
+    fn new(fs: EngineFs, dir: PathBuf, capsule_budget_bytes: u64) -> Self {
+        // One operator-facing budget, split across the three decoded-object
+        // tiers (design.md §14.5: bounded by bytes, separated by type):
+        // half to record capsules (the unit every read consumes), a quarter
+        // each to decoded `.pcol` payload blocks and sealed global batch
+        // directories.
+        let (capsules, global_dirs, pcol_blocks) = if capsule_budget_bytes == 0
+        {
+            (None, None, None)
+        } else {
+            let cap_budget = (capsule_budget_bytes / 2).max(4096);
+            let quarter = (capsule_budget_bytes / 4).max(4096);
+            (
+                Some(Cache::with_weighter(
+                    (cap_budget / 4096).max(16) as usize,
+                    cap_budget,
+                    CapsuleWeighter,
+                )),
+                // A global directory is one LARGE item per sealed segment
+                // (hundreds of KiB for a fine-batched segment). quick_cache
+                // admits an item only if it fits its SHARD's hot budget, so
+                // this cache runs UNSHARDED — otherwise a directory bigger
+                // than budget/shards would be silently rejected and every
+                // cold global page would re-decode the segment's pointer
+                // blocks.
+                Some(Cache::with_options(
+                    OptionsBuilder::new()
+                        .estimated_items_capacity(64)
+                        .weight_capacity(quarter)
+                        .shards(1)
+                        .build()
+                        .expect("static global-dir cache options"),
+                    GlobalDirWeighter,
+                    DefaultHashBuilder::default(),
+                    DefaultLifecycle::default(),
+                )),
+                Some(Cache::with_weighter(
+                    (quarter / 8192).max(16) as usize,
+                    quarter,
+                    PcolWeighter,
+                )),
+            )
+        };
+        BlockReader {
+            fs,
+            dir,
+            files: Mutex::new(HashMap::new()),
+            capsules,
+            global_dirs,
+            pcol_blocks,
         }
     }
+
+    /// The lazily-opened read-only handle for `segment_id`.
+    fn file(&self, segment_id: u64) -> Result<EngineFile, EngineError> {
+        let mut files = self.files.lock().expect("segment files lock");
+        if let Some(f) = files.get(&segment_id) {
+            return Ok(f.clone());
+        }
+        let path = segment_path(&self.dir, segment_id);
+        let f = self.fs.open(&path, OpenOpts::read_only()).map_err(|e| {
+            EngineError::Read(format!("open seg {segment_id}: {e}"))
+        })?;
+        files.insert(segment_id, f.clone());
+        Ok(f)
+    }
+
+    /// Insert a just-published batch (the append path's write-through warm).
+    fn insert(&self, segment_id: u64, offset: u64, batch: Arc<DecodedBatch>) {
+        if let Some(c) = &self.capsules {
+            c.insert((segment_id, offset), batch);
+        }
+    }
+
+    /// Resolve `ptr` to its decoded batch, expecting `expect`'s CRC-covered
+    /// identity. Cache hit → `Arc` bump; miss → one header `pread` + one
+    /// batch `pread` + scanner byte-layer validation (A4/A12 CRC always).
+    /// A pointer that does not decode to the expected batch (torn file,
+    /// stale offset, or a legacy sidecar whose offsets predate real
+    /// pointers) falls back to locating the batch by its global position
+    /// via a full segment scan — slow, loud in spirit, but never wrong.
+    fn batch(
+        &self,
+        sealed: &SealedStore,
+        ptr: EventPtr,
+        expect: BatchExpect,
+    ) -> Result<Arc<DecodedBatch>, EngineError> {
+        let key = (ptr.segment_id, ptr.offset);
+        if let Some(c) = &self.capsules
+            && let Some(hit) = c.get(&key)
+            && expect.matches(&hit)
+        {
+            return Ok(hit);
+        }
+        let decoded = match self.read_at(ptr, expect, sealed) {
+            Ok(b) => Arc::new(b),
+            // Wrong/undecodable pointer: locate by position instead.
+            Err(_) => self.locate_by_scan(ptr.segment_id, expect, sealed)?,
+        };
+        if let Some(c) = &self.capsules {
+            c.insert(key, decoded.clone());
+        }
+        Ok(decoded)
+    }
+
+    /// The point-read miss path: `pread` + validate + decode one batch.
+    fn read_at(
+        &self,
+        ptr: EventPtr,
+        expect: BatchExpect,
+        sealed: &SealedStore,
+    ) -> Result<DecodedBatch, EngineError> {
+        let file = self.file(ptr.segment_id)?;
+        let mut hdr = [0u8; scanner::BATCH_HEADER_LEN];
+        pread_exact(&file, ptr.offset, &mut hdr).map_err(|e| {
+            EngineError::Read(format!(
+                "seg {} off {}: header pread: {e}",
+                ptr.segment_id, ptr.offset
+            ))
+        })?;
+        let total_len =
+            scanner::peek_batch_total_len(&hdr, 0).map_err(|s| {
+                EngineError::Read(format!(
+                    "seg {} off {}: bad batch header: {s:?}",
+                    ptr.segment_id, ptr.offset
+                ))
+            })?;
+        let mut buf = vec![0u8; total_len as usize];
+        pread_exact(&file, ptr.offset, &mut buf).map_err(|e| {
+            EngineError::Read(format!(
+                "seg {} off {}: batch pread: {e}",
+                ptr.segment_id, ptr.offset
+            ))
+        })?;
+        let accepted = scanner::accepted_batch_at(&buf, 0).map_err(|s| {
+            EngineError::Read(format!(
+                "seg {} off {}: batch decode: {s:?}",
+                ptr.segment_id, ptr.offset
+            ))
+        })?;
+        let decoded =
+            self.decode_capsule(&accepted, &buf, ptr.segment_id, sealed)?;
+        if !expect.matches(&decoded) {
+            return Err(EngineError::Read(format!(
+                "seg {} off {}: batch identity mismatch (expected {expect:?})",
+                ptr.segment_id, ptr.offset
+            )));
+        }
+        Ok(decoded)
+    }
+
+    /// The defensive fallback: scan the whole segment (the recovery scanner —
+    /// full byte-layer + kernel acceptance) and pick the batch whose
+    /// CRC-covered identity matches `expect`. Handles a sidecar whose
+    /// pointer offsets are not real byte offsets (stores sealed before
+    /// bn-2ib used pseudo offsets).
+    ///
+    /// The scan's cost is amortized, not repeated (bn-2ib review F3): every
+    /// accepted batch of the scanned segment is decoded once and bulk-warmed
+    /// into the capsule cache under BOTH its legacy pseudo key
+    /// (`offset == first_global_pos` — the key a legacy sidecar's pointers
+    /// will ask for) and its real byte-offset key, so a sequential legacy
+    /// replay pays ~one scan per cache window instead of one scan per batch.
+    /// With the cache disabled only the matching batch is decoded (nothing
+    /// could retain the warm), which keeps the old worst case as the floor —
+    /// `mess rebuild-index` is the real fix for legacy stores.
+    fn locate_by_scan(
+        &self,
+        segment_id: u64,
+        expect: BatchExpect,
+        sealed: &SealedStore,
+    ) -> Result<Arc<DecodedBatch>, EngineError> {
+        let path = segment_path(&self.dir, segment_id);
+        let (rec, image) = scanner::recover_segment_with_image(&self.fs, &path)
+            .map_err(|e| {
+                EngineError::Read(format!("scan seg {segment_id}: {e}"))
+            })?;
+        let mut found: Option<Arc<DecodedBatch>> = None;
+        for b in &rec.accepted {
+            let is_match = b.first_global_pos == expect.first_global_pos;
+            if self.capsules.is_none() && !is_match {
+                continue; // nothing to warm; decode only the match
+            }
+            let decoded =
+                Arc::new(self.decode_capsule(b, &image, segment_id, sealed)?);
+            if let Some(c) = &self.capsules {
+                c.insert((segment_id, b.first_global_pos), decoded.clone());
+                if b.offset != b.first_global_pos {
+                    c.insert((segment_id, b.offset), decoded.clone());
+                }
+            }
+            if is_match && expect.matches(&decoded) {
+                found = Some(decoded);
+            }
+        }
+        found.ok_or_else(|| {
+            EngineError::Read(format!(
+                "seg {segment_id}: no committed batch matches {expect:?}"
+            ))
+        })
+    }
+
+    /// The decoded global batch directory of a **sealed** segment, cached by
+    /// `(segment_id, install generation)` — see the field doc for why the
+    /// generation is load-bearing across re-seals.
+    fn global_dir(
+        &self,
+        seg: &SealedSegmentIndex,
+        generation: u64,
+    ) -> Result<Arc<Vec<GlobalEntry>>, EngineError> {
+        let key = (seg.segment_id(), generation);
+        if let Some(c) = &self.global_dirs
+            && let Some(hit) = c.get(&key)
+        {
+            return Ok(hit);
+        }
+        let dir = Arc::new(seg.global_entries().map_err(|e| {
+            EngineError::SealedRead(format!("global entries: {e:?}"))
+        })?);
+        if let Some(c) = &self.global_dirs {
+            c.insert(key, dir.clone());
+        }
+        Ok(dir)
+    }
+
+    /// The decoded `.pcol` block `(segment, install generation, block
+    /// index)`, cached — the generation keeps a re-sealed segment's blocks
+    /// from ever being served through the old sidecar's block map (review
+    /// F1).
+    fn pcol_block(
+        &self,
+        segment_id: u64,
+        generation: u64,
+        pidx: &mess_index::sealed::SealedPayloadIndex,
+        bi: usize,
+    ) -> Result<Arc<PcolBlock>, mess_index::sealed::PayloadError> {
+        let key = (segment_id, generation, bi as u64);
+        if let Some(c) = &self.pcol_blocks
+            && let Some(hit) = c.get(&key)
+        {
+            return Ok(hit);
+        }
+        let mut data = Vec::new();
+        let mut offs = Vec::new();
+        pidx.reassemble_block(bi, &NoDicts, &mut data, &mut offs)?;
+        let block = Arc::new(PcolBlock {
+            first_event: pidx.blocks()[bi].first_event,
+            data,
+            offs,
+        });
+        if let Some(c) = &self.pcol_blocks {
+            c.insert(key, block.clone());
+        }
+        Ok(block)
+    }
+
+    /// Assemble the stored-order payload range `[lo, hi)` of a sealed
+    /// segment's `.pcol` from its (cached) decoded blocks. Returns the
+    /// arena + `hi - lo + 1` boundaries, exactly the [`DecodedBatch`] shape.
+    fn pcol_range(
+        &self,
+        segment_id: u64,
+        generation: u64,
+        pidx: &mess_index::sealed::SealedPayloadIndex,
+        lo: u64,
+        hi: u64,
+    ) -> Result<(Vec<u8>, Vec<u32>), mess_index::sealed::PayloadError> {
+        use mess_index::sealed::PayloadError;
+        if hi > pidx.event_count() {
+            return Err(PayloadError::IndexOutOfRange);
+        }
+        let mut data = Vec::new();
+        let mut offs = Vec::with_capacity((hi - lo + 1) as usize);
+        let mut next = lo;
+        let mut bi = pidx.block_for(lo).ok_or(PayloadError::IndexOutOfRange)?;
+        while next < hi {
+            let entry =
+                *pidx.blocks().get(bi).ok_or(PayloadError::IndexOutOfRange)?;
+            let blk = self.pcol_block(segment_id, generation, pidx, bi)?;
+            // A cached block that disagrees with THIS sidecar's block map is
+            // a typed error, never a clamp (review F1): the generation key
+            // makes this unreachable, but a silent short slice here was the
+            // original stale-cache corruption, so it stays guarded. The
+            // caller falls back to the raw frames.
+            let n_events = blk.offs.len() - 1;
+            if blk.first_event != entry.first_event
+                || n_events != entry.n_events as usize
+                || next < blk.first_event
+                || next >= blk.first_event + n_events as u64
+            {
+                return Err(PayloadError::Corrupt(
+                    "cached .pcol block disagrees with the sidecar block map",
+                ));
+            }
+            let b_lo = (next - blk.first_event) as usize;
+            let b_hi = ((hi - blk.first_event) as usize).min(n_events);
+            for r in b_lo..b_hi {
+                offs.push(data.len() as u32);
+                data.extend_from_slice(
+                    &blk.data[blk.offs[r] as usize..blk.offs[r + 1] as usize],
+                );
+            }
+            next = blk.first_event + n_events as u64;
+            bi += 1;
+        }
+        offs.push(data.len() as u32);
+        Ok((data, offs))
+    }
+
+    /// Build the [`DecodedBatch`] for an accepted batch: frame identities
+    /// (event-type ids) from the raw batch bytes, payload bytes from the
+    /// covering sealed segment's `.pcol` sidecar when one is attached (D6 —
+    /// the columnar reassembly is verify-on-seal byte-identical to the raw
+    /// frames), assembled from bounded-cached decoded blocks; falls back to
+    /// the raw frames on any `.pcol` decode error or coverage gap. `image`
+    /// must be the buffer `b` was validated against.
+    fn decode_capsule(
+        &self,
+        b: &AcceptedBatch,
+        image: &[u8],
+        segment_id: u64,
+        sealed: &SealedStore,
+    ) -> Result<DecodedBatch, EngineError> {
+        let frames = b.frames(image).map_err(|e| {
+            EngineError::Read(format!("seg {segment_id}: frames: {e}"))
+        })?;
+        let n = b.frame_count as usize;
+        let mut type_ids = Vec::with_capacity(n);
+        let mut data = Vec::new();
+        let mut offs = Vec::with_capacity(n + 1);
+        for f in frames {
+            type_ids.push(f.event_type_id);
+            offs.push(data.len() as u32);
+            data.extend_from_slice(f.payload);
+        }
+        offs.push(data.len() as u32);
+
+        // D6: prefer the columnar payload sidecar's bytes for a sealed batch.
+        // A `.pcol` decode error (or a range past its coverage — e.g. an
+        // on-demand seal of a still-growing head segment) keeps the raw
+        // frames above: typed at this seam, byte-identical by verify-on-seal
+        // where the sidecar does cover.
+        if let Some((seg, generation)) = sealed.get_with_gen(segment_id)
+            && let Some(pcol) = seg.payload_index()
+            && b.first_global_pos >= seg.base_pos()
+        {
+            let lo = b.first_global_pos - seg.base_pos();
+            let hi = lo + u64::from(b.frame_count);
+            if let Ok((pdata, poffs)) =
+                self.pcol_range(segment_id, generation, pcol, lo, hi)
+            {
+                data = pdata;
+                offs = poffs;
+            }
+        }
+
+        Ok(DecodedBatch {
+            stream_id: b.stream_id,
+            first_stream_version: b.first_stream_version,
+            first_global_pos: b.first_global_pos,
+            frame_count: b.frame_count,
+            type_ids,
+            data,
+            offs,
+        })
+    }
+}
+
+/// Positioned exact read through the [`FileHandle`] seam.
+fn pread_exact(
+    file: &EngineFile,
+    mut off: u64,
+    buf: &mut [u8],
+) -> std::io::Result<()> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = file.pread(off, &mut buf[filled..])?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "short pread",
+            ));
+        }
+        filled += n;
+        off += n as u64;
+    }
+    Ok(())
 }
 
 /// Number of shards in the per-stream append gate (bn-1s0). A fixed-size
@@ -346,7 +885,7 @@ impl AppendGate {
     }
 }
 
-/// Orders the post-ack publish step (record book + active index + meta head)
+/// Orders the post-ack publish step (stream head + active index + meta head)
 /// across concurrently-committing streams (bn-1s0), and — since bn-3nz — is
 /// waited on **from the committer-side blocking task**, not the async
 /// caller's future, so a cancelled append can never strand an assigned
@@ -357,10 +896,10 @@ impl AppendGate {
 /// flight at the same time — the whole point of the per-stream
 /// [`AppendGate`] — their `spawn_blocking` acks can resolve in ANY order,
 /// not necessarily the order the committer assigned positions in.
-/// `Book::payloads` requires strictly increasing-by-position pushes (dense
-/// rehydration), and `ActiveIndex::apply_committed` / `MetaStore::apply_group`
-/// carry their own out-of-order asserts — so every publish must wait its turn
-/// here before touching any of them.
+/// `ActiveIndex::apply_committed` / `MetaStore::apply_group` require
+/// in-position-order application (they carry out-of-order asserts), and the
+/// published read watermark must advance densely — so every publish must
+/// wait its turn here before touching any of them.
 ///
 /// # Why this is a *blocking* primitive (bn-3nz)
 ///
@@ -393,7 +932,7 @@ struct PublishSequencer {
 
 impl PublishSequencer {
     /// `start` is the first position a publish is allowed to claim — the
-    /// book's recovered dense length on open (0 for a fresh store).
+    /// recovered durable event count on open (0 for a fresh store).
     fn new_at(start: u64) -> Self {
         PublishSequencer {
             next:     Mutex::new(start),
@@ -405,7 +944,7 @@ impl PublishSequencer {
     /// returned guard advances the sequence to `watermark` when dropped —
     /// on ANY exit path (success, error, or unwind), since the durable
     /// committer has already permanently assigned this position range
-    /// regardless of whether the local book/index/meta publish fully
+    /// regardless of whether the local head/index/meta publish fully
     /// succeeds. Failing to advance on an error path would deadlock every
     /// higher-positioned publish behind this one forever.
     ///
@@ -451,6 +990,25 @@ enum ResumePlan {
     /// An existing active segment with a committed prefix: resume appending at
     /// its recovered `safe_offset`, continuing the A1/`batch_id` chain.
     Resume(ResumeInfo),
+}
+
+/// Everything [`LogEngine::recover`] hands back to
+/// [`open_with`](LogEngine::open_with) (bn-2ib).
+struct Recovered {
+    /// Interners (reloaded from the meta name tables) + per-stream heads.
+    book:        Book,
+    /// How to resume the live head segment.
+    plan:        ResumePlan,
+    /// Per-stream fold-chain exit heads (chain-on stores only; spec 05 §6).
+    chain_heads: HashMap<u64, ChainHead>,
+    /// The recovered durable/published event count — the exclusive end of
+    /// the readable global-position sequence, seeding both the publish
+    /// sequencer and the published read watermark.
+    watermark:   u64,
+    /// Payload frames materialised during recovery — 0 on every chain-off
+    /// open (the bn-2ib gate observable,
+    /// [`LogEngine::recover_payload_decodes`]).
+    decodes:     u64,
 }
 
 /// The recovered resume state threaded from [`LogEngine::recover`] into
@@ -629,15 +1187,25 @@ struct Inner {
     /// hot path (no new name). See [`NameFlush`].
     name_flush:           Arc<NameFlush>,
     book:                 Arc<Mutex<Book>>,
+    /// Block-native byte fetcher: the bounded decoded-capsule cache over the
+    /// durable segment blocks (bn-2ib). Every read path resolves positions
+    /// through the index tiers and bytes through this.
+    reader:               BlockReader,
+    /// Payload frames decoded during [`recover`](LogEngine::recover) — the
+    /// bn-2ib "zero old payload decodes on open" gate's observable. `0` for
+    /// every chain-off open; chain-on stores still fold every durable
+    /// payload (spec 05 §6 requires it).
+    recover_decodes:      u64,
     /// The **published** global watermark — the exclusive end of the readable
-    /// global-position sequence (the dense record-book length). Advanced at
-    /// the end of each append's publish step (after the book/index/meta
+    /// global-position sequence. Advanced at
+    /// the end of each append's publish step (after the head/index/meta
     /// are updated, in publish-turn order), so it tracks what
     /// [`read_global`](Backend::read_global) can serve, NOT merely what the
     /// durable committer has acked. The app-facing subscription / live-tail
     /// API ([`SubscribeBackend`](crate::backend::SubscribeBackend)) awaits
     /// this value; a woken subscriber is therefore guaranteed the position
-    /// it waited for is already materialised in the book. Distinct from
+    /// it waited for is already servable through the index tiers. Distinct
+    /// from
     /// the committer's own durable watermark ([`Appender::watermark`]),
     /// which advances a step earlier (at ack, before the in-process
     /// publish).
@@ -704,7 +1272,7 @@ struct SpinConfig {
     /// How long the wait loop gives a single queued segment to catch up
     /// before giving up on it (absent a tighter `shutdown_deadline`).
     per_seal_budget: Duration,
-    /// Sleep between polls of the hot index/book.
+    /// Sleep between polls of the hot index / published watermark.
     poll_interval:   Duration,
 }
 
@@ -721,9 +1289,10 @@ impl Default for SpinConfig {
 
 /// The composed `mess-log` + `mess-index` production backend.
 ///
-/// Cheap to clone — every clone shares the same durable committer, index, and
-/// record book (matching [`MockBackend`](crate::mock)'s shared-handle
-/// semantics, so a facade reopen over `engine.clone()` sees the same state).
+/// Cheap to clone — every clone shares the same durable committer, index,
+/// interners, and caches (matching [`MockBackend`](crate::mock)'s
+/// shared-handle semantics, so a facade reopen over `engine.clone()` sees
+/// the same state).
 #[derive(Clone)]
 pub struct LogEngine {
     inner: Arc<Inner>,
@@ -733,18 +1302,25 @@ pub struct LogEngine {
 #[derive(Debug, Clone)]
 pub struct EngineOptions {
     /// Durability mode for the commit thread.
-    pub durability:               Durability,
+    pub durability:                 Durability,
     /// Active-segment size in bytes (preallocated at open).
-    pub segment_size:             u64,
+    pub segment_size:               u64,
     /// Dedupe-window capacity for the meta store.
-    pub dedupe_capacity:          usize,
+    pub dedupe_capacity:            usize,
     /// Sealed pointer-block cache budget in bytes (`bn-e2y` / bn-1hx). `0`
     /// disables the cache (every sealed replay decodes fresh); a non-zero
     /// budget caches decoded blocks so a repeated sealed-stream replay (a
     /// projection rebuild, a subscription re-read) skips the decode — and
     /// makes the `cache_hits`/`cache_misses` runtime metrics meaningful
     /// under load.
-    pub block_cache_budget_bytes: u64,
+    pub block_cache_budget_bytes:   u64,
+    /// Decoded-capsule cache budget in bytes (bn-2ib): the bounded,
+    /// bytes-weighted cache of CRC-validated decoded batches every read path
+    /// fetches record bytes through (plus a small slice of it for sealed
+    /// per-segment global batch directories). `0` disables it — every read
+    /// then decodes fresh from the durable blocks, byte-identically (the
+    /// cache is transparent to results by construction).
+    pub capsule_cache_budget_bytes: u64,
     /// Emit the per-batch on-disk fold chain (`crypto_chain`, spec 05 §6,
     /// `bn-3l0`). **Off by default**: when `false`, segments are
     /// byte-identical to a store that never knew about the chain. When
@@ -752,12 +1328,12 @@ pub struct EngineOptions {
     /// `crypto_chain` (offset 72, flag bit 0), per-stream heads are
     /// rehydrated on recovery, and `mess verify --full` recomputes the
     /// chain to catch a CRC-repaired payload tamper.
-    pub chain:                    bool,
+    pub chain:                      bool,
     /// Seal-time Reed-Solomon parity sidecar policy (bn-2za). **Disabled by
     /// default** (evidence-gated): when enabled, the background sealer writes
     /// a `.par` sidecar next to each sealed segment so `mess verify
     /// --repair` can reconstruct latent-sector / bit-rot damage offline.
-    pub parity:                   mess_index::sealed::parity::ParityConfig,
+    pub parity:                     mess_index::sealed::parity::ParityConfig,
     /// The TOTAL bound on how long [`LogEngine`]'s `Drop` will wait for the
     /// background seal thread to drain queued rolls (`bn-u6o`). Only matters
     /// when a roll was reported but its publish never caught up (an abandoned
@@ -765,7 +1341,7 @@ pub struct EngineOptions {
     /// seal at shutdown is safe (the segment stays durable + unsealed,
     /// served from the log on reopen), so this bounds worst-case shutdown
     /// latency rather than protecting correctness. Default 2s.
-    pub shutdown_seal_budget:     Duration,
+    pub shutdown_seal_budget:       Duration,
 }
 
 /// Re-export of the committer's runtime metrics snapshot (`bn-e2y`), the
@@ -805,7 +1381,7 @@ pub struct EngineMetrics {
     pub cache_weight_bytes:        u64,
     /// Sealed segments installed in the cold tier.
     pub sealed_segment_count:      usize,
-    /// Total events committed (record-book length).
+    /// Total events committed and published (the published read watermark).
     pub total_events:              u64,
     /// Age of the active segment since this process opened it, in seconds.
     pub active_segment_age_secs:   f64,
@@ -825,7 +1401,8 @@ pub struct EngineMetrics {
     /// Segments sealed since this process opened.
     pub seals:                     u64,
     /// Seals skipped rather than completed (`bn-u6o`): the background
-    /// roll-sealer gave up waiting for the hot index/book to catch up (its
+    /// roll-sealer gave up waiting for the hot index/watermark to catch up
+    /// (its
     /// bounded per-segment spin, live) or a queued seal did not finish inside
     /// the bounded total shutdown wait (`Inner::drop`). Either way the segment
     /// stays durable and unsealed — served from the log until it is resealed
@@ -837,20 +1414,25 @@ pub struct EngineMetrics {
 impl Default for EngineOptions {
     fn default() -> Self {
         EngineOptions {
-            // `Process`: ack the moment the covering write returns. The record
-            // book and index are in-process, so per-batch fsync buys nothing
-            // for correctness here; benches override this with `Group`.
-            durability:               Durability::Process,
-            segment_size:             256 * 1024 * 1024,
-            dedupe_capacity:          mess_index::meta::DEFAULT_DEDUPE_CAPACITY,
+            // `Process`: ack the moment the covering write returns. The
+            // index is in-process, so per-batch fsync buys nothing for
+            // correctness here; benches override this with `Group`.
+            durability:                 Durability::Process,
+            segment_size:               256 * 1024 * 1024,
+            dedupe_capacity:
+                mess_index::meta::DEFAULT_DEDUPE_CAPACITY,
             // On by default (64 MiB): the sealed block cache is transparent to
             // results and pays for itself on repeat replay (perf_replay's 48%
             // hit rate), and a live cache is what makes the hit/miss runtime
             // metrics operationally meaningful. Set to 0 to disable.
-            block_cache_budget_bytes: 64 * 1024 * 1024,
+            block_cache_budget_bytes:   64 * 1024 * 1024,
+            // bn-2ib: 64 MiB of decoded hot/cold record capsules. Bounded and
+            // transparent to results; sized so a hot working set (recent
+            // appends + a projection's replay window) stays decoded.
+            capsule_cache_budget_bytes: 64 * 1024 * 1024,
             // Fold chain off by default: opt in per store for tamper-evident
             // segments (spec 05 §6).
-            chain:                    false,
+            chain:                      false,
             // bn-2za: parity is opt-in / evidence-gated — off by default.
             parity:
                 mess_index::sealed::parity::ParityConfig::default(),
@@ -859,7 +1441,7 @@ impl Default for EngineOptions {
             // reopen). 2s is comfortably above a healthy drain (near-instant)
             // and comfortably below the old ~10s-per-abandoned-roll worst
             // case.
-            shutdown_seal_budget:     Duration::from_secs(2),
+            shutdown_seal_budget:       Duration::from_secs(2),
         }
     }
 }
@@ -902,16 +1484,29 @@ impl LogEngine {
         // would silently fall back to hot replay instead of the sealed tier.
         // The returned `sealed_ids` are the segments already served cold, so
         // recovery does not re-seed the hot index with their batches (bn-1vu).
-        let (sealed, sealed_ids) = Self::load_sealed(dir);
+        let (sealed, sealed_ids, pending_sidecars) =
+            Self::load_sealed(dir, &rt.fs());
         let sealed = Arc::new(sealed);
 
-        // Recovery on open (F6 + bn-20b + bn-1vu): rehydrate the record book
-        // from EVERY durable segment (dense across rolls), re-seed the hot
-        // index from the segments not already served cold, and learn
-        // how to resume the last (active) segment.
+        // Recovery on open (F6 + bn-1vu + bn-2ib): reload the interners from
+        // the meta name tables, re-seed the hot index + heads from a
+        // batch-metadata scan of the unsealed segments (no payload frame
+        // decode), take fully-sealed segments' heads/coverage straight from
+        // their durable sidecars (no byte scan at all), and learn how to
+        // resume the last (active) segment.
         let active = Arc::new(ActiveIndex::new());
-        let (book, plan, chain_heads) =
-            Self::recover(&rt, dir, &active, &meta, &sealed_ids, opts.chain)?;
+        let recovered = Self::recover(
+            &rt,
+            dir,
+            &active,
+            &meta,
+            &sealed,
+            &sealed_ids,
+            &pending_sidecars,
+            opts.chain,
+        )?;
+        let Recovered { book, plan, chain_heads, watermark, decodes } =
+            recovered;
 
         // bn-34o: the coalesced co-durable name flush lives in the committer's
         // group barrier. Build the shared ticket high-water and the pre-barrier
@@ -1006,13 +1601,20 @@ impl LogEngine {
         // by every seal still queued at shutdown (see the `Inner` field doc).
         let shutdown_deadline: Arc<OnceLock<Instant>> =
             Arc::new(OnceLock::new());
+        // The published read watermark seeds at the recovered event count —
+        // 0 on a fresh store — the same baseline the publish sequencer
+        // starts from. Created before the seal thread so the sealer can gate
+        // each rolled segment's seal on the canonical published watermark
+        // (bn-2ib; previously it gated on the record book's length).
+        let read_watermark = Watermark::new(watermark);
         let seal_thread = {
             let driver =
                 SealDriver::new(Arc::clone(&sealed), dir.join("sealed"))
                     .with_metrics(Arc::clone(&seal_metrics))
                     .with_parity(opts.parity);
             let active = Arc::clone(&active);
-            let book = Arc::clone(&book);
+            let published = read_watermark.clone();
+            let fs = rt.fs();
             let dir = dir.to_path_buf();
             let seal_metrics_for_thread = Arc::clone(&seal_metrics);
             let shutdown_deadline = Arc::clone(&shutdown_deadline);
@@ -1023,7 +1625,8 @@ impl LogEngine {
                         roll_rx,
                         driver,
                         active,
-                        book,
+                        published,
+                        fs,
                         dir,
                         seal_metrics_for_thread,
                         shutdown_deadline,
@@ -1034,13 +1637,13 @@ impl LogEngine {
         };
 
         // The publish sequencer's turn-order starts wherever recovery left
-        // the book's dense prefix — 0 on a fresh store, or the recovered
-        // event count on a reopen — never a hardcoded 0, or the first
-        // post-reopen publish would wait forever for a position that was
-        // already durably assigned in a previous process lifetime.
-        let recovered_len =
-            book.lock().expect("book poisoned").payloads.len() as u64;
+        // the durable prefix — 0 on a fresh store, or the recovered event
+        // count on a reopen — never a hardcoded 0, or the first post-reopen
+        // publish would wait forever for a position that was already durably
+        // assigned in a previous process lifetime.
+        let recovered_len = watermark;
 
+        let rt_fs = rt.fs();
         Ok(LogEngine {
             inner: Arc::new(Inner {
                 rt,
@@ -1067,10 +1670,13 @@ impl LogEngine {
                 durability: opts.durability,
                 name_flush,
                 book,
-                // Seed the published watermark at the recovered dense book
-                // length: 0 on a fresh store, or the recovered event count on a
-                // reopen — the same baseline the publish sequencer starts from.
-                read_watermark: Watermark::new(recovered_len),
+                reader: BlockReader::new(
+                    rt_fs,
+                    dir.to_path_buf(),
+                    opts.capsule_cache_budget_bytes,
+                ),
+                recover_decodes: decodes,
+                read_watermark,
                 append_gate: AppendGate::new(),
                 publish_seq: PublishSequencer::new_at(recovered_len),
                 opened_at: Instant::now(),
@@ -1085,31 +1691,53 @@ impl LogEngine {
     /// log (bn-20b + bn-1vu), and decide how to resume the active segment.
     ///
     /// With live auto-roll the store holds a chain of segments `seg-*.log`
-    /// (`seg-1` … `seg-N`, `N` the live head). Recovery scans them in ascending
-    /// id order: `mess-log`'s
-    /// [`recover_segment_with_image`](scanner::recover_segment_with_image)
-    /// gives each segment's accepted committed prefix + durable image, then
-    /// [`AcceptedBatch::frames`] materialises every event's `(event_type_id,
-    /// payload)` into the book **densely across the whole chain** — resolved to
-    /// names through the interner reloaded from the durable
-    /// `stream_names`/`type_names` meta tables. A segment already served from
-    /// the cold tier (its id in `sealed_ids`, reloaded from its `.pidx`) is
-    /// **not** re-seeded into the hot index — the book still gets its
-    /// payloads, but the sealed sidecar owns its position enumeration. A
-    /// rolled-but-not-yet-sealed segment (crash mid-seal: unsealed `.log`,
-    /// no `.pidx`) is not in `sealed_ids`, so its batches DO seed the hot
-    /// index and it is served from the log — losing nothing. The last
-    /// (highest-id) segment is the resumable live head.
+    /// (`seg-1` … `seg-N`, `N` the live head). Recovery walks them in
+    /// ascending id order, and — since bn-2ib — reads as little as each
+    /// segment's service tier requires. **No payload frame is ever decoded**
+    /// on a chain-off open; reads materialise bytes lazily from the durable
+    /// blocks instead (see the module docs).
+    ///
+    /// - **Fully-sealed, non-head segments** (id in `sealed_ids` — i.e. the
+    ///   sidecar cross-checked against a valid segment **footer** at load
+    ///   (review F2: the footer fsync is what proves the covered bytes are
+    ///   durable) — with coverage contiguous with the running watermark and the
+    ///   next segment's header `base_pos`) are not read at all beyond their
+    ///   52-byte header + 100-byte trailer: per-stream heads come from the
+    ///   sidecar directory ([`SealedSegmentIndex::stream_head`]) and the
+    ///   watermark advances by the sidecar's `event_count`. This is what makes
+    ///   reopen cost O(unsealed bytes), not O(history).
+    /// - **Everything else** — unsealed segments (including a
+    ///   rolled-but-not-yet-sealed one after a mid-seal crash), a sealed
+    ///   segment whose sidecar coverage does not line up (e.g. an on-demand
+    ///   [`seal_active`](LogEngine::seal_active) of a segment that kept
+    ///   growing), and always the live head — is scanned with
+    ///   [`recover_segment`](scanner::recover_segment): batch **metadata** only
+    ///   (the mandatory byte-layer CRC still runs; no frame decode). Scanned
+    ///   batches seed the hot index with their real `(segment_id, offset)`
+    ///   pointers — except the slice a sealed sidecar already covers, which
+    ///   stays cold-served.
+    /// - The last (highest-id) headed segment is the resumable live head; if
+    ///   the head file carries no valid header, the highest headed scanned or
+    ///   sealed segment is scanned for resume instead (positions must never
+    ///   restart at 0 while durable history exists).
+    ///
+    /// With the fold chain **on** (spec 05 §6) every segment is still fully
+    /// scanned and every payload folded — the chain head is a function of all
+    /// payload bytes; `decodes` reports how many frames that materialised.
+    #[allow(clippy::too_many_lines)] // one linear pass; splitting obscures the watermark threading
+    #[allow(clippy::too_many_arguments)] // one open-time seam; each arg is a distinct recovered surface
     fn recover(
         rt: &RealRuntime,
         dir: &Path,
         active: &ActiveIndex,
         meta: &MetaStore,
+        sealed: &SealedStore,
         sealed_ids: &HashSet<u64>,
+        pending_sidecars: &HashMap<u64, SealedSegmentRef>,
         chain: bool,
-    ) -> Result<(Book, ResumePlan, HashMap<u64, ChainHead>), EngineError> {
+    ) -> Result<Recovered, EngineError> {
         // Reconstruct the interner (both directions) from the durable id→name
-        // tables first, so materialised payloads can resolve their names.
+        // tables first, so reads can resolve names.
         let mut book = Book::default();
         book.load_stream_names(
             meta.stream_names()
@@ -1120,97 +1748,155 @@ impl LogEngine {
         );
 
         // Per-stream fold-chain heads rehydrated from the recovered frames
-        // (spec 05 §5/§6, `bn-3l0`): folding every durable event of a stream in
-        // ascending version order leaves each head at the exit value of the
-        // committed prefix, so an append after reopen continues the chain
-        // exactly. Built only when the store opted into the chain; empty
-        // otherwise. Independent of whether a segment is served hot or cold —
-        // the fold walks the durable payloads either way.
+        // (spec 05 §5/§6, `bn-3l0`); empty (and no frame decoded) otherwise.
         let mut chain_heads: HashMap<u64, ChainHead> = HashMap::new();
+        let mut decodes = 0u64;
 
         // Enumerate the segment chain in ascending id order.
         let segment_ids = enumerate_segment_ids(dir);
         if segment_ids.is_empty() {
-            return Ok((book, ResumePlan::Fresh, chain_heads));
+            return Ok(Recovered {
+                book,
+                plan: ResumePlan::Fresh,
+                chain_heads,
+                watermark: 0,
+                decodes,
+            });
         }
+
+        // Every segment's (cheap, 52-byte) header up front: the sidecar-trust
+        // check needs the NEXT segment's base_pos to prove a sealed sidecar
+        // covers its whole segment.
+        let fs = rt.fs();
+        let headers: Vec<Option<scanner::SegmentHeaderInfo>> = segment_ids
+            .iter()
+            .map(|&id| {
+                scanner::read_segment_header(&fs, &segment_path(dir, id))
+                    .map_err(|e| {
+                        EngineError::Open(format!("header seg {id}: {e}"))
+                    })
+            })
+            .collect::<Result<_, _>>()?;
+        let head_id = *segment_ids.last().expect("non-empty");
 
         let mut hot_entries: Vec<BatchEntry> = Vec::new();
         let mut last_headed: Option<ResumeInfo> = None;
         let mut watermark = 0u64;
 
-        for seg_id in segment_ids {
+        for (i, &seg_id) in segment_ids.iter().enumerate() {
+            let is_head = seg_id == head_id;
+
+            // Sidecar-trusted skip: a fully-sealed, non-head segment whose
+            // sidecar coverage is contiguous on both sides needs no byte
+            // scan at all (chain-on stores scan everything — the fold needs
+            // every payload).
+            if !chain
+                && !is_head
+                && sealed_ids.contains(&seg_id)
+                && let Some(sref) = sealed.get(seg_id)
+                && let Some(hdr) = headers[i]
+                && hdr.segment_id == seg_id
+                && hdr.base_pos == watermark
+                && sref.base_pos() == watermark
+                && headers[i + 1].is_some_and(|h| {
+                    h.base_pos == watermark + sref.event_count()
+                })
+            {
+                for &sid in sref.stream_ids() {
+                    if let Some(v) = sref.stream_head(sid) {
+                        book.heads
+                            .entry(sid)
+                            .and_modify(|h| *h = (*h).max(v))
+                            .or_insert(v);
+                    }
+                }
+                watermark += sref.event_count();
+                continue;
+            }
+
+            // Scan path: batch metadata (+ image only when the chain fold
+            // needs payload bytes).
             let seg_path = segment_path(dir, seg_id);
-            let (rec, image) =
-                scanner::recover_segment_with_image(&rt.fs(), &seg_path)
-                    .map_err(|e| {
+            let (rec, image) = if chain {
+                let (rec, image) =
+                    scanner::recover_segment_with_image(&fs, &seg_path)
+                        .map_err(|e| {
+                            EngineError::Open(format!(
+                                "recover seg {seg_id}: {e}"
+                            ))
+                        })?;
+                (rec, Some(image))
+            } else {
+                let rec =
+                    scanner::recover_segment(&fs, &seg_path).map_err(|e| {
                         EngineError::Open(format!("recover seg {seg_id}: {e}"))
                     })?;
+                (rec, None)
+            };
             let Some(header) = rec.header else {
                 // A file with no valid header carries no committed batches of
                 // this generation — skip it (never resumed, never seeds).
                 continue;
             };
-            let is_cold = sealed_ids.contains(&header.segment_id);
+            // The slice of this segment a sealed sidecar already serves cold
+            // (an on-demand seal of a still-growing segment covers a prefix;
+            // batches past it must stay hot-served).
+            let sealed_end = if sealed_ids.contains(&seg_id) {
+                // Footer-verified at load (F2): already installed.
+                sealed.get(seg_id).map(|s| s.base_pos() + s.event_count())
+            } else if let Some(cand) = pending_sidecars.get(&seg_id) {
+                // A footerless sidecar (an on-demand `seal_active` of the
+                // live head, or a roll-seal whose footer fsync a crash
+                // preceded — review F2): install it only now that THIS scan
+                // has proven the durable committed prefix reaches its
+                // coverage end. A refuted candidate is not installed — the
+                // segment is served from the log, losing nothing.
+                let end = cand.base_pos() + cand.event_count();
+                if header.base_pos == cand.base_pos() && rec.next_pos >= end {
+                    sealed.install(cand.clone());
+                    Some(end)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
-            // Materialise every committed event into the book, dense across the
-            // whole chain (on-disk commit order == ascending global position).
             let mut order: Vec<&AcceptedBatch> = rec.accepted.iter().collect();
             order.sort_by_key(|b| b.first_global_pos);
             for b in &order {
                 let sid = b.stream_id;
-                let stream_name =
-                    book.stream_name_opt(sid).ok_or_else(|| {
-                        EngineError::Meta(format!(
-                            "recover: no interned name for stream_id {sid}"
-                        ))
+                // Fail loudly on a durable-name gap — a committed event whose
+                // stream name is missing is unrecoverable (bn-150).
+                book.stream_name_opt(sid).ok_or_else(|| {
+                    EngineError::Meta(format!(
+                        "recover: no interned name for stream_id {sid}"
+                    ))
+                })?;
+                if chain && let Some(image) = &image {
+                    // Fold the on-disk payloads into the stream's head, in
+                    // ascending version order (§6.2). bn-221: `frames` is
+                    // fallible but this caller always passes the exact image
+                    // `b` was recovered from — still propagated so a future
+                    // refactor fails loudly instead of panicking.
+                    let frames = b.frames(image).map_err(|e| {
+                        EngineError::Open(format!("recover: {e}"))
                     })?;
-                // bn-221: `frames` is fallible (misuse-resistant against a
-                // wrong image) but this caller always passes
-                // the exact image `b` was recovered from, so
-                // the error path is unreachable in practice —
-                // still propagated rather than unwrapped so a future refactor
-                // that breaks that invariant fails loudly instead of panicking.
-                let frames = b
-                    .frames(&image)
-                    .map_err(|e| EngineError::Open(format!("recover: {e}")))?;
-                for (k, frame) in frames.enumerate() {
-                    let gp = b.first_global_pos + k as u64;
-                    debug_assert_eq!(
-                        book.payloads.len() as u64,
-                        gp,
-                        "dense rehydration"
-                    );
-                    let message_type = book
-                        .type_name_opt(frame.event_type_id)
-                        .ok_or_else(|| {
-                            EngineError::Meta(format!(
-                                "recover: no interned name for event_type_id \
-                                 {}",
-                                frame.event_type_id
-                            ))
-                        })?;
-                    let stream_position = b.first_stream_version + k as u64;
-                    if chain {
-                        // Fold the on-disk payload into the stream's head, in
-                        // ascending version order (§6.2). A stream first seen
-                        // here starts at its genesis; `absorb` advances it to
-                        // `h[stream_position]`.
-                        chain_heads
-                            .entry(sid)
-                            .or_insert_with(|| ChainHead::genesis(sid))
-                            .absorb(frame.payload);
+                    let head = chain_heads
+                        .entry(sid)
+                        .or_insert_with(|| ChainHead::genesis(sid));
+                    for frame in frames {
+                        head.absorb(frame.payload);
+                        decodes += 1;
                     }
-                    book.payloads.push(Payload {
-                        stream_name: stream_name.clone(),
-                        message_type,
-                        data: Arc::from(frame.payload),
-                        stream_position,
-                    });
-                    book.stream_events.entry(sid).or_default().push(gp);
-                    book.heads.insert(sid, stream_position);
                 }
-                // Seed the hot index only for segments not already served cold.
-                if !is_cold {
+                book.heads
+                    .entry(sid)
+                    .and_modify(|h| *h = (*h).max(b.last_stream_version()))
+                    .or_insert(b.last_stream_version());
+                // Seed the hot index with every batch a sealed sidecar does
+                // not already cover.
+                if sealed_end.is_none_or(|end| b.first_global_pos >= end) {
                     hot_entries.push(BatchEntry {
                         stream_id:            sid,
                         first_stream_version: b.first_stream_version,
@@ -1238,27 +1924,64 @@ impl LogEngine {
             });
         }
 
+        // The head segment normally produced the resume info above (it is
+        // always scanned). If it could not (no valid header — e.g. a crash
+        // between the roll's file creation and its header write), resume
+        // from the highest segment that DOES head — scanning it now if it
+        // was sidecar-skipped — rather than ever falling back to a fresh
+        // segment at position 0 over live durable history.
+        if last_headed.is_none() && watermark > 0 {
+            for &seg_id in segment_ids.iter().rev() {
+                let rec =
+                    scanner::recover_segment(&fs, &segment_path(dir, seg_id))
+                        .map_err(|e| {
+                        EngineError::Open(format!("recover seg {seg_id}: {e}"))
+                    })?;
+                if let Some(header) = rec.header {
+                    last_headed = Some(ResumeInfo {
+                        segment_id:    header.segment_id,
+                        base_pos:      header.base_pos,
+                        epoch:         header.epoch,
+                        write_off:     rec.safe_offset,
+                        next_batch_id: rec.next_batch_id,
+                        next_pos:      rec.next_pos,
+                        batch_count:   rec.accepted.len() as u64,
+                        event_count:   rec.next_pos - header.base_pos,
+                    });
+                    break;
+                }
+            }
+        }
+
         active.apply_committed(watermark, &hot_entries);
 
-        match last_headed {
-            Some(info) => Ok((book, ResumePlan::Resume(info), chain_heads)),
-            None => Ok((book, ResumePlan::Fresh, chain_heads)),
-        }
+        let plan = match last_headed {
+            Some(info) => ResumePlan::Resume(info),
+            None => ResumePlan::Fresh,
+        };
+        Ok(Recovered { book, plan, chain_heads, watermark, decodes })
     }
 
     /// The background auto-roll sealer loop (`bn-1vu`), run on its own thread.
     /// For each rolled (durable, unsealed) segment reported over `rx`, it
-    /// builds the pointer + payload sidecars from the hot index snapshot
-    /// and the book, finalizes the segment footer (writes + fsyncs the
-    /// trailer), and installs the segment into the cold [`SealedStore`] —
-    /// all off the append path (D5). A seal failure is best-effort: the
-    /// rolled segment stays durable + unsealed and is served from the log
-    /// (and re-sealable) on reopen, so a failed seal never loses data. The
-    /// loop exits when the roll channel closes (the committer task dropped
-    /// its [`Roller`]), draining every queued seal first.
+    /// **reads the rolled segment back** (bn-2ib — the durable bytes are the
+    /// seal's sole source; the deleted record book used to be) to build the
+    /// pointer + payload sidecars, finalizes the segment footer (writes +
+    /// fsyncs the trailer), and installs the segment into the cold
+    /// [`SealedStore`] — all off the append path (D5). A seal failure is
+    /// best-effort: the rolled segment stays durable + unsealed and is served
+    /// from the log (and re-sealable) on reopen, so a failed seal never loses
+    /// data. The loop exits when the roll channel closes (the committer task
+    /// dropped its [`Roller`]), draining every queued seal first.
+    ///
+    /// Readiness gates on the hot index's applied end **and the canonical
+    /// published watermark** (bn-2ib; previously the record book's length):
+    /// sealing only what is published preserves the invariant that the sealed
+    /// tier never serves a position `read_global` cannot — the cold read path
+    /// is not watermark-clamped, so this gate is what keeps it safe.
     ///
     /// `bn-u6o`: `seal_metrics` counts + loudly (rate-limited) logs every
-    /// segment this loop gives up waiting on (see the two `record_seal_skipped`
+    /// segment this loop gives up waiting on (see the `record_seal_skipped`
     /// call sites below) — before this bone that skip was silent, so an
     /// operator had no way to learn a segment stayed unsealed until reopen.
     /// `shutdown_deadline` is unset during live operation (each segment gets
@@ -1271,7 +1994,8 @@ impl LogEngine {
         rx: mpsc::Receiver<SegmentSummary>,
         driver: SealDriver,
         active: Arc<ActiveIndex>,
-        book: Arc<Mutex<Book>>,
+        published: Watermark,
+        fs: EngineFs,
         dir: PathBuf,
         seal_metrics: Arc<SealMetrics>,
         shutdown_deadline: Arc<OnceLock<Instant>>,
@@ -1281,23 +2005,19 @@ impl LogEngine {
             let base = summary.base_pos;
             let end = summary.end_pos;
 
-            // Wait until the hot index + book have published every event of
-            // this segment (post-ack discipline). Under the current
-            // serialised append gate this already holds by the time
-            // the roll notification lands; the bounded wait keeps
-            // it robust if a future append gate (bn-1s0)
-            // relaxes that ordering. A gone writer can never lower the applied
-            // end, so this cannot deadlock.
+            // Wait until the hot index + published watermark cover every
+            // event of this segment (post-ack discipline). Under the current
+            // serialised append gate this already holds by the time the roll
+            // notification lands; the bounded wait keeps it robust if a
+            // future append gate (bn-1s0) relaxes that ordering. A gone
+            // writer can never lower either value, so this cannot deadlock.
             //
             // The per-segment deadline (`spin.per_seal_budget` out) is clamped
             // to `shutdown_deadline` when the latter is set (bn-u6o) — see the
             // fn doc.
             let per_seal_deadline = Instant::now() + spin.per_seal_budget;
             loop {
-                let applied = active.snapshot().applied_end;
-                let booked =
-                    book.lock().expect("book lock").payloads.len() as u64;
-                if applied >= end && booked >= end {
+                if active.applied_end() >= end && published.get() >= end {
                     break;
                 }
                 let deadline = match shutdown_deadline.get() {
@@ -1312,45 +2032,48 @@ impl LogEngine {
                 std::thread::sleep(spin.poll_interval);
             }
 
-            let snapshot = active.snapshot();
-            if snapshot.applied_end < end {
+            if active.applied_end() < end || published.get() < end {
                 // bn-u6o: this is the silent-skip site the bone exists to fix —
                 // count it and log loudly (rate-limited) so an operator can see
                 // a segment stayed unsealed rather than discovering it only at
                 // reopen.
                 seal_metrics.record_seal_skipped(&format!(
-                    "segment {} [{base}, {end}) never caught up in the hot \
-                     index/book (applied_end={}, shutdown_deadline={})",
+                    "segment {} [{base}, {end}) never caught up \
+                     (applied_end={}, published={}, shutdown_deadline={})",
                     summary.segment_id,
-                    snapshot.applied_end,
+                    active.applied_end(),
+                    published.get(),
                     shutdown_deadline.get().is_some(),
                 ));
                 continue; // incomplete (see the bounded wait above) — leave it unsealed
             }
-            let mut input =
-                seal_input_for_range(&snapshot, summary.segment_id, base, end);
+
+            // Re-read the rolled segment: the durable bytes are the seal's
+            // input — both the batch pointers (REAL offsets, so the sealed
+            // sidecar's `EventPtr`s dereference) and the payloads for the
+            // columnar `.pcol` sidecar (bn-zge / D6), in stored
+            // (global-position) order. Verify-on-seal inside the driver
+            // byte-compares the `.pcol` reassembly against these frames
+            // before anything is written.
+            let seg_id = summary.segment_id;
+            let seg_path = segment_path(&dir, seg_id);
+            let input = match seal_input_from_segment(
+                &fs, &seg_path, seg_id, base, end,
+            ) {
+                Ok(input) => input,
+                Err(why) => {
+                    seal_metrics.record_seal_skipped(&format!(
+                        "segment {seg_id} [{base}, {end}): {why}"
+                    ));
+                    continue; // unsealed + recoverable — served from the log
+                }
+            };
             if input.streams.is_empty() {
                 continue;
-            }
-            // Attach the segment's payloads in stored (global-position) order
-            // so the seal emits the columnar `.pcol` sidecar too
-            // (bn-zge / D6).
-            {
-                let book = book.lock().expect("book lock");
-                if book.payloads.len() as u64 >= end {
-                    let payloads: Vec<Vec<u8>> = book.payloads
-                        [base as usize..end as usize]
-                        .iter()
-                        .map(|p| p.data.to_vec())
-                        .collect();
-                    input = input.with_payloads(payloads);
-                }
             }
 
             // Finalize: write + fsync the fixed footer trailer (§3.3.1), making
             // the segment R2-trusted, only after the sidecars are durable.
-            let seg_id = summary.segment_id;
-            let seg_path = segment_path(&dir, seg_id);
             let seg_path_for_parity = seg_path.clone();
             let sum = summary;
             let finalize = move || finalize_footer(&seg_path, &sum);
@@ -1369,7 +2092,7 @@ impl LogEngine {
     /// Rebuild a [`SealedStore`] from the sealed sidecars already durable under
     /// `dir/sealed` — the reopen counterpart to [`seal_active`]/the background
     /// sealer. Each complete `.pidx` (with its opportunistic sibling `.filter`
-    /// and `.pcol`, re-attached by [`SealedSegmentIndex::open`]) is installed
+    /// and `.pcol`, re-attached by [`SealedSegmentIndex::open`]) is admitted
     /// so a stream sealed before a restart is served from the cold tier
     /// again rather than silently falling back to hot replay.
     ///
@@ -1384,16 +2107,36 @@ impl LogEngine {
     /// tier until it is re-sealed. Either way the engine reopens into a
     /// readable, recoverable state.
     ///
-    /// Returns the installed segment ids too, so recovery knows which segments
-    /// are already served cold and must NOT be re-seeded into the hot index
-    /// (bn-1vu).
-    fn load_sealed(dir: &Path) -> (SealedStore, HashSet<u64>) {
+    /// **Sidecar-before-data crash safety (bn-2ib review F2).** The seal
+    /// pipeline makes the sidecar durable strictly BEFORE the segment
+    /// footer's whole-file fsync, so a power loss between the two can leave a
+    /// CRC-valid sidecar whose covered tail bytes never reached the device
+    /// (under `Process` durability nothing else fsynced them). A sidecar is
+    /// therefore installed here only when its segment carries a **valid
+    /// footer trailer** that cross-checks (`segment_id`, `base_pos`, and
+    /// `end_pos == coverage end`) — the footer fsync is what proves the data
+    /// bytes are durable. Anything else (notably an on-demand
+    /// [`seal_active`](LogEngine::seal_active) sidecar over the still-live
+    /// head, which never has a footer) is returned as a **pending candidate**
+    /// instead: [`recover`](LogEngine::recover) scans those segments anyway
+    /// and installs a candidate only after the scan proves the durable
+    /// committed prefix reaches the sidecar's coverage end. A candidate the
+    /// scan refutes is simply not installed — the segment is served from the
+    /// log, losing nothing.
+    ///
+    /// Returns `(store, footer_verified_ids, pending)`: recovery trust-skips
+    /// only the footer-verified ids and scan-verifies the pending ones.
+    fn load_sealed(
+        dir: &Path,
+        fs: &EngineFs,
+    ) -> (SealedStore, HashSet<u64>, HashMap<u64, SealedSegmentRef>) {
         let store = SealedStore::new();
         let mut ids = HashSet::new();
+        let mut pending: HashMap<u64, SealedSegmentRef> = HashMap::new();
         let sealed_dir = dir.join("sealed");
         let Ok(entries) = std::fs::read_dir(&sealed_dir) else {
             // No sealed directory yet: nothing has been sealed.
-            return (store, ids);
+            return (store, ids, pending);
         };
         for entry in entries.flatten() {
             let path = entry.path();
@@ -1402,22 +2145,47 @@ impl LogEngine {
                 // (re-attached by `open`), and anything else.
                 continue;
             }
-            // A complete, CRC-valid sidecar installs; a torn/corrupt one is
-            // skipped (the log stays the truth) so a mid-seal crash never
-            // prevents reopen.
-            if let Ok(index) = SealedSegmentIndex::open(&path) {
-                ids.insert(index.segment_id());
-                store.install(Arc::new(index));
+            let Ok(index) = SealedSegmentIndex::open(&path) else {
+                continue;
+            };
+            let seg_id = index.segment_id();
+            let coverage_end = index.base_pos() + index.event_count();
+            let index: SealedSegmentRef = Arc::new(index);
+            // F2: only a valid, cross-checking footer proves the covered
+            // bytes are durable; everything else must be scan-verified.
+            let footer_ok = read_trailer(fs, &segment_path(dir, seg_id))
+                .ok()
+                .flatten()
+                .is_some_and(|t| {
+                    t.segment_id == seg_id
+                        && t.base_pos == index.base_pos()
+                        && t.end_pos == coverage_end
+                });
+            if footer_ok {
+                ids.insert(seg_id);
+                store.install(index);
+            } else {
+                pending.insert(seg_id, index);
             }
         }
-        (store, ids)
+        (store, ids, pending)
     }
 
-    /// Test/diagnostic: total events committed to the record book.
+    /// Test/diagnostic: total events committed and published — the exclusive
+    /// end of the readable global-position sequence (the published read
+    /// watermark; before bn-2ib this was the record book's dense length,
+    /// which tracked the same value).
     #[must_use]
     pub fn total_events(&self) -> usize {
-        self.inner.book.lock().expect("book lock").payloads.len()
+        self.inner.read_watermark.get() as usize
     }
+
+    /// Test/diagnostic (bn-2ib): payload frames decoded during
+    /// [`recover`](Self::recover) on this open. `0` for every chain-off
+    /// open — the "open performs zero old payload decodes" gate observable.
+    /// Chain-on stores still fold every durable payload (spec 05 §6).
+    #[must_use]
+    pub fn recover_payload_decodes(&self) -> u64 { self.inner.recover_decodes }
 
     /// An in-process snapshot of the engine's runtime metrics (`bn-e2y`).
     ///
@@ -1448,13 +2216,7 @@ impl LogEngine {
             cache_entries: cache.len(),
             cache_weight_bytes: cache.weight_bytes(),
             sealed_segment_count: self.inner.sealed.len(),
-            total_events: self
-                .inner
-                .book
-                .lock()
-                .expect("book lock")
-                .payloads
-                .len() as u64,
+            total_events: self.inner.read_watermark.get(),
             active_segment_age_secs: self
                 .inner
                 .opened_at
@@ -1510,30 +2272,34 @@ impl LogEngine {
     /// segment off the append path). It is what the sealed-replay bench and
     /// the sealed read path exercise directly.
     pub fn seal_active(&self) -> Result<(), EngineError> {
-        let snapshot = self.inner.active.snapshot();
-        let input = SealInput::from_snapshot(&snapshot, ACTIVE_SEGMENT_ID, 0);
+        // The live head is the highest-id segment on disk; its committed
+        // prefix is re-read from the durable bytes and clamped to the
+        // published watermark (bn-2ib — the deleted record book used to be
+        // the payload source, and the segment was assumed to be seg 1 at
+        // base 0, which broke after a live roll).
+        let ids = enumerate_segment_ids(&self.inner.dir);
+        let Some(&head_id) = ids.last() else {
+            return Ok(());
+        };
+        let end = self.inner.read_watermark.get();
+        let seg_path = segment_path(&self.inner.dir, head_id);
+        let header =
+            scanner::read_segment_header(&self.inner.rt.fs(), &seg_path)
+                .map_err(|e| EngineError::SealedRead(format!("header: {e}")))?;
+        let Some(header) = header else {
+            return Ok(()); // an unheadered head holds nothing to seal
+        };
+        let input = seal_input_from_segment(
+            &self.inner.rt.fs(),
+            &seg_path,
+            head_id,
+            header.base_pos,
+            end,
+        )
+        .map_err(EngineError::SealedRead)?;
         if input.streams.is_empty() {
             return Ok(());
         }
-        // bn-zge / D6: hand the sealer the segment's payloads in stored
-        // (global-position) order so the seal emits the columnar `.pcol`
-        // payload sidecar alongside the pointer sidecar and attaches it to the
-        // installed segment (the sealed read path can then reassemble payloads
-        // without touching the raw log). base_pos is 0 for the single interim
-        // active segment, so a global position is exactly the dense book index.
-        let event_count = input.event_count() as usize;
-        let input = {
-            let book = self.inner.book.lock().expect("book lock");
-            if book.payloads.len() >= event_count {
-                let payloads: Vec<Vec<u8>> = book.payloads[..event_count]
-                    .iter()
-                    .map(|p| p.data.to_vec())
-                    .collect();
-                input.with_payloads(payloads)
-            } else {
-                input
-            }
-        };
         let driver = SealDriver::new(
             Arc::clone(&self.inner.sealed),
             self.inner.dir.join("sealed"),
@@ -1551,32 +2317,67 @@ impl LogEngine {
         Ok(())
     }
 
-    /// The sealed-tier read path: enumerate a stream's committed
-    /// `(stream_position, global_position)` pairs from the sealed corpus via
-    /// the real [`ReplaySet`], for streams whose batches have been sealed and
-    /// evicted from the hot [`ActiveIndex`] (the sealed-replay bench). A
-    /// `BTreeMap` keeps them in stream order.
-    fn sealed_stream_positions(
+    /// The sealed-tier position resolve for one stream: its committed batch
+    /// entries across the sealed corpus (via the real [`ReplaySet`], pointer
+    /// blocks decoded through the bounded [`BlockCache`]) **unioned with the
+    /// hot tail** (batches not yet sealed, and — since sealed eviction is
+    /// logical — possibly the same batches again during handoff; the union
+    /// dedupes by `first_version`, and the two tiers' entries for one batch
+    /// carry the same identity). Version-ascending.
+    fn sealed_and_hot_entries(
         &self,
         stream_id: u64,
-    ) -> Result<BTreeMap<u64, u64>, EngineError> {
-        let mut out: BTreeMap<u64, u64> = BTreeMap::new();
+    ) -> Result<Vec<StreamEntry>, EngineError> {
         let sealed_segs = self.inner.sealed.segments_for_stream(stream_id);
         let replay = ReplaySet::from_segments(sealed_segs);
-        let entries = replay
+        let mut by_ver: BTreeMap<u64, StreamEntry> = BTreeMap::new();
+        for e in replay
             .stream_replay(stream_id, &self.inner.block_cache)
-            .map_err(|e| EngineError::SealedRead(format!("{e:?}")))?;
-        for e in entries {
-            for k in 0..u64::from(e.frame_count) {
-                out.insert(e.first_version + k, e.first_global_pos + k);
-            }
+            .map_err(|e| EngineError::SealedRead(format!("{e:?}")))?
+        {
+            by_ver.insert(e.first_version, e);
         }
         // The hot tail (if the stream also has unsealed batches during
-        // handoff).
+        // handoff). Sealed entries win the dedupe (same batch identity;
+        // their pointers are the sidecar's).
         for e in self.inner.active.stream_entries(stream_id) {
-            for k in 0..u64::from(e.frame_count) {
-                out.insert(e.first_version + k, e.first_global_pos + k);
-            }
+            by_ver.entry(e.first_version).or_insert(e);
+        }
+        Ok(by_ver.into_values().collect())
+    }
+
+    /// Materialise owned [`StoredRecord`]s from `(batch, frame)` picks — the
+    /// [`StoredRecord`] compatibility adapter over the block-backed views
+    /// (bn-2ib): one book lock resolves every name, then each record copies
+    /// its payload slice out of the shared batch arena.
+    fn materialize(
+        &self,
+        picks: &[(Arc<DecodedBatch>, usize)],
+    ) -> Result<Vec<StoredRecord>, EngineError> {
+        let book = self.inner.book.lock().expect("book lock");
+        let mut out = Vec::with_capacity(picks.len());
+        for (batch, k) in picks {
+            let stream_name =
+                book.stream_name_opt(batch.stream_id).ok_or_else(|| {
+                    EngineError::Meta(format!(
+                        "read: no interned name for stream_id {}",
+                        batch.stream_id
+                    ))
+                })?;
+            let type_id = batch.type_ids[*k];
+            let message_type =
+                book.type_name_opt(type_id).ok_or_else(|| {
+                    EngineError::Meta(format!(
+                        "read: no interned name for event_type_id {type_id}"
+                    ))
+                })?;
+            out.push(StoredRecord {
+                stream_id:       stream_name.to_string(),
+                message_type:    message_type.to_string(),
+                data:            batch.payload(*k).to_vec(),
+                stream_position: batch.first_stream_version + *k as u64,
+                global_position: batch.first_global_pos + *k as u64,
+            });
         }
         Ok(out)
     }
@@ -1595,6 +2396,10 @@ enum Pre {
         sid:              u64,
         events:           Vec<EventInput>,
         first_stream_pos: u64,
+        /// Per-record interned event-type ids, in record order (bn-2ib: the
+        /// publish step warms the capsule cache with the decoded batch, which
+        /// carries type ids).
+        tids:             Vec<u32>,
     },
 }
 
@@ -1741,41 +2546,70 @@ fn enumerate_segment_ids(dir: &Path) -> Vec<u64> {
     ids
 }
 
-/// Build a [`SealInput`] for the segment spanning global positions
-/// `[base_pos, end_pos)` from a hot-index `snapshot` (bn-1vu). Unlike
-/// [`SealInput::from_snapshot`] (which filters by `EventPtr.segment_id`), this
-/// filters by global-position range: the engine serves payloads from the record
-/// book, so its `EventPtr` fields are pseudo (the pointer offset is set to the
-/// global position, never dereferenced), and the batch → segment mapping is by
-/// the durable, correct global position instead. A batch never spans segments
-/// (A8), so `first_global_pos ∈ [base, end)` selects exactly this segment's
-/// batches.
-fn seal_input_for_range(
-    snapshot: &IndexSnapshot,
+/// Build a [`SealInput`] for the segment at `seg_path` by reading its durable
+/// committed prefix back (bn-2ib — review V2: the seal's sole source is the
+/// rolled raw segment, not the deleted record book). Batches are clamped to
+/// `[base_pos, end_pos)` (for an on-demand seal of a still-growing head
+/// segment, `end_pos` is the published watermark; for a rolled segment it is
+/// the roll summary's `end_pos` and the clamp admits everything). The
+/// returned input carries:
+///
+/// - per-stream [`SealBatch`]es with the batch's **real** byte offset, so the
+///   sealed pointer sidecar's [`EventPtr`]s dereference straight into the raw
+///   segment;
+/// - every clamped payload in stored (global-position) order, so the driver
+///   emits the columnar `.pcol` sidecar (bn-zge / D6) — and its permanent
+///   verify-on-seal byte-compares the reassembly against these exact frames
+///   before anything is written.
+///
+/// `Err(String)` when the scan fails or recovers less than `end_pos` (the
+/// caller leaves the segment unsealed — served from the log, losing nothing).
+fn seal_input_from_segment(
+    fs: &EngineFs,
+    seg_path: &Path,
     segment_id: u64,
     base_pos: u64,
     end_pos: u64,
-) -> SealInput {
-    let mut streams = Vec::new();
-    for (&stream_id, entries) in &snapshot.streams {
-        let batches: Vec<SealBatch> = entries
-            .iter()
-            .filter(|e| {
-                e.first_global_pos >= base_pos && e.first_global_pos < end_pos
-            })
-            .map(|e| SealBatch {
-                first_version:    e.first_version,
-                frame_count:      e.frame_count,
-                first_global_pos: e.first_global_pos,
-                offset:           e.first_global_pos, /* pseudo: reads come
-                                                       * from the book */
-            })
-            .collect();
-        if !batches.is_empty() {
-            streams.push(SealStream { stream_id, batches });
+) -> Result<SealInput, String> {
+    let (rec, image) = scanner::recover_segment_with_image(fs, seg_path)
+        .map_err(|e| format!("re-read for seal: {e}"))?;
+    if rec.header.is_none() {
+        return Err("re-read for seal: no valid segment header".to_string());
+    }
+    if rec.next_pos < end_pos {
+        return Err(format!(
+            "re-read for seal recovered only [{}, {}) of [{base_pos}, \
+             {end_pos})",
+            base_pos, rec.next_pos
+        ));
+    }
+    let mut order: Vec<&AcceptedBatch> = rec.accepted.iter().collect();
+    order.sort_by_key(|b| b.first_global_pos);
+
+    let mut streams: BTreeMap<u64, Vec<SealBatch>> = BTreeMap::new();
+    let mut payloads: Vec<Vec<u8>> = Vec::new();
+    for b in &order {
+        if b.first_global_pos < base_pos || b.first_global_pos >= end_pos {
+            continue;
+        }
+        streams.entry(b.stream_id).or_default().push(SealBatch {
+            first_version:    b.first_stream_version,
+            frame_count:      b.frame_count,
+            first_global_pos: b.first_global_pos,
+            offset:           b.offset,
+        });
+        let frames =
+            b.frames(&image).map_err(|e| format!("seal frames: {e}"))?;
+        for f in frames {
+            payloads.push(f.payload.to_vec());
         }
     }
-    SealInput { segment_id, base_pos, streams, payloads: None }
+    let streams: Vec<SealStream> = streams
+        .into_iter()
+        .map(|(stream_id, batches)| SealStream { stream_id, batches })
+        .collect();
+    Ok(SealInput { segment_id, base_pos, streams, payloads: None }
+        .with_payloads(payloads))
 }
 
 /// Finalize a rolled segment's footer (bn-1vu): write the fixed 100-byte
@@ -1833,35 +2667,49 @@ impl Backend for LogEngine {
         };
         let start = after.next_position();
 
-        // Cold path: a stream whose batches have been sealed + evicted from the
-        // hot index is served through the real sealed-replay path
-        // (`ReplaySet`).
-        if !self.inner.sealed.segments_for_stream(sid).is_empty() {
-            let positions = self.sealed_stream_positions(sid)?;
-            let book = self.inner.book.lock().expect("book lock");
-            return Ok(positions
-                .range(start..)
-                .take(limit)
-                .map(|(_, &gp)| book.record(gp))
-                .collect());
-        }
-
-        // Hot path: O(limit) slice of the per-stream index (kept in lockstep
-        // with `ActiveIndex::apply_committed`).
-        let page: Vec<StoredRecord> = {
-            let book = self.inner.book.lock().expect("book lock");
-            match book.stream_events.get(&sid) {
-                Some(events) => events
-                    .get(start as usize..)
-                    .unwrap_or(&[])
-                    .iter()
-                    .take(limit)
-                    .map(|&gp| book.record(gp))
-                    .collect(),
-                None => Vec::new(),
-            }
+        // Resolve positions (batch entries), then materialise bytes through
+        // the block reader (bn-2ib).
+        //
+        // Cold path: a stream with sealed batches is served through the real
+        // sealed-replay path (`ReplaySet`) unioned with its hot tail.
+        // Hot path: a paged clamped slice of the per-stream `ActiveIndex`.
+        let sealed = !self.inner.sealed.segments_for_stream(sid).is_empty();
+        let entries: Vec<StreamEntry> = if sealed {
+            self.sealed_and_hot_entries(sid)?
+        } else {
+            self.inner.active.stream_entries_from(sid, start, limit)
         };
-        tokio::task::yield_now().await;
+
+        let mut picks: Vec<(Arc<DecodedBatch>, usize)> =
+            Vec::with_capacity(limit.min(entries.len() * 2));
+        'outer: for e in &entries {
+            if e.last_version() < start {
+                continue;
+            }
+            let batch = self.inner.reader.batch(
+                &self.inner.sealed,
+                e.ptr,
+                BatchExpect {
+                    stream_id:        sid,
+                    first_global_pos: e.first_global_pos,
+                    frame_count:      e.frame_count,
+                    first_version:    Some(e.first_version),
+                },
+            )?;
+            let from = start.max(e.first_version);
+            for v in from..=e.last_version() {
+                if picks.len() >= limit {
+                    break 'outer;
+                }
+                picks.push((batch.clone(), (v - e.first_version) as usize));
+            }
+        }
+        let page = self.materialize(&picks)?;
+        if !sealed {
+            // Match MockBackend's contention window on the hot path (the
+            // pre-bn-2ib shape: the sealed path returned without yielding).
+            tokio::task::yield_now().await;
+        }
         Ok(page)
     }
 
@@ -1870,19 +2718,101 @@ impl Backend for LogEngine {
         after: Option<u64>,
         limit: usize,
     ) -> Result<Vec<StoredRecord>, Self::Error> {
-        let book = self.inner.book.lock().expect("book lock");
-        // Global positions are dense from 0, so `after` maps straight to an
-        // index; the record book is the authoritative global order.
-        let start = after.map_or(0, |p| p as usize + 1);
-        Ok(book
-            .payloads
-            .get(start..)
-            .unwrap_or(&[])
-            .iter()
-            .take(limit)
-            .enumerate()
-            .map(|(i, _)| book.record((start + i) as u64))
-            .collect())
+        // Global positions are dense from 0 up to the published watermark —
+        // the same bound the record book's length used to impose.
+        let wm = self.inner.read_watermark.get();
+        let start = after.map_or(0, |p| p + 1);
+        let mut picks: Vec<(Arc<DecodedBatch>, usize)> = Vec::new();
+        let mut pos = start;
+        // Built lazily: only reads that reach positions the hot index no
+        // longer covers (sealed history after a reopen) pay for it. Each
+        // entry carries its install generation (the derived-cache key
+        // component, review F1/F6), sorted into global A1 order.
+        let mut sealed_segs: Option<Vec<(SealedSegmentRef, u64)>> = None;
+
+        while picks.len() < limit && pos < wm {
+            // Prefer the hot index while it covers `pos` (in a live process
+            // it covers everything ever appended; after a reopen its
+            // coverage starts at the first unsealed segment).
+            let entries =
+                self.inner.active.global_range(pos, limit - picks.len());
+            if entries.first().is_some_and(|e| e.first_global_pos <= pos) {
+                for e in &entries {
+                    if picks.len() >= limit || pos >= wm {
+                        break;
+                    }
+                    if e.first_global_pos > pos {
+                        // A coverage hole (a sealed segment between two
+                        // hot-served ones): fall through to the sealed tier.
+                        break;
+                    }
+                    let batch = self.inner.reader.batch(
+                        &self.inner.sealed,
+                        e.ptr,
+                        BatchExpect {
+                            stream_id:        e.stream_id,
+                            first_global_pos: e.first_global_pos,
+                            frame_count:      e.frame_count,
+                            first_version:    None,
+                        },
+                    )?;
+                    while pos < e.end_pos() && picks.len() < limit && pos < wm {
+                        picks.push((
+                            batch.clone(),
+                            (pos - e.first_global_pos) as usize,
+                        ));
+                        pos += 1;
+                    }
+                }
+                continue;
+            }
+
+            // Sealed tier: the segment whose contiguous A1 range covers
+            // `pos`, walked through its (cached) global batch directory.
+            let segs = sealed_segs.get_or_insert_with(|| {
+                let mut v = self.inner.sealed.segments_with_gens();
+                v.sort_by_key(|(s, _)| (s.base_pos(), s.segment_id()));
+                v
+            });
+            let Some((seg, generation)) = segs
+                .iter()
+                .find(|(s, _)| {
+                    pos >= s.base_pos() && pos < s.base_pos() + s.event_count()
+                })
+                .cloned()
+            else {
+                // Below the watermark every position is hot- or cold-served;
+                // a gap here means a raced tier handoff — stop the page
+                // rather than serve out of order.
+                break;
+            };
+            let dir = self.inner.reader.global_dir(&seg, generation)?;
+            let seg_end = seg.base_pos() + seg.event_count();
+            let from = dir.partition_point(|e| e.end_pos() <= pos);
+            for e in &dir[from..] {
+                if picks.len() >= limit || pos >= wm || pos >= seg_end {
+                    break;
+                }
+                let batch = self.inner.reader.batch(
+                    &self.inner.sealed,
+                    e.ptr,
+                    BatchExpect {
+                        stream_id:        e.stream_id,
+                        first_global_pos: e.first_global_pos,
+                        frame_count:      e.frame_count,
+                        first_version:    None,
+                    },
+                )?;
+                while pos < e.end_pos() && picks.len() < limit && pos < wm {
+                    picks.push((
+                        batch.clone(),
+                        (pos - e.first_global_pos) as usize,
+                    ));
+                    pos += 1;
+                }
+            }
+        }
+        self.materialize(&picks)
     }
 
     async fn append_batch(
@@ -1940,6 +2870,7 @@ impl Backend for LogEngine {
                 // Empty batch: a no-op that still validated `expected`.
                 Pre::Empty
             } else {
+                let mut tids: Vec<u32> = Vec::with_capacity(records.len());
                 let events: Vec<EventInput> = records
                     .iter()
                     .map(|r| {
@@ -1947,6 +2878,7 @@ impl Backend for LogEngine {
                         if tid_new {
                             new_types.push((tid, r.message_type.clone()));
                         }
+                        tids.push(tid);
                         EventInput::plain(tid, 0, 0, r.data.clone())
                     })
                     .collect();
@@ -1954,6 +2886,7 @@ impl Backend for LogEngine {
                     sid,
                     events,
                     first_stream_pos: expected.next_position(),
+                    tids,
                 }
             };
             (pre, new_types)
@@ -2071,26 +3004,20 @@ impl Backend for LogEngine {
             }
         }
 
-        let (sid, events, first_stream_pos) = match pre {
+        let (sid, events, first_stream_pos, tids) = match pre {
             Pre::Conflict(actual) => {
                 return Err(AppendError::Conflict { expected, actual });
             }
             Pre::Empty => {
-                let last_global = self
-                    .inner
-                    .book
-                    .lock()
-                    .expect("book lock")
-                    .payloads
-                    .len()
-                    .saturating_sub(1) as u64;
+                let last_global =
+                    self.inner.read_watermark.get().saturating_sub(1);
                 return Ok(Appended {
                     version:              expected,
                     last_global_position: last_global,
                 });
             }
-            Pre::Proceed { sid, events, first_stream_pos } => {
-                (sid, events, first_stream_pos)
+            Pre::Proceed { sid, events, first_stream_pos, tids } => {
+                (sid, events, first_stream_pos, tids)
             }
         };
 
@@ -2122,12 +3049,10 @@ impl Backend for LogEngine {
             first_stream_version: first_stream_pos,
             events,
         };
-        // Owned copy of the records for the publish step, which now runs in a
-        // `'static` blocking closure and so can no longer borrow `records`.
-        // (No extra payload copy versus before: the pre-bn-3nz publish also
-        // cloned each payload into the book — `Arc::from(rec.data)` — while
-        // the durable `events` cloned it for the log; this just moves the
-        // book's copy into the closure instead of taking it from the borrow.)
+        // Owned copy of the records for the publish step, which runs in a
+        // `'static` blocking closure and so cannot borrow `records`. Used
+        // only to warm the capsule cache with the just-published batch (the
+        // book's per-event payload copy is gone, bn-2ib).
         let records_owned: Vec<RecordToAppend> = records.to_vec();
         let inner = self.inner.clone();
         let appended = tokio::task::spawn_blocking(
@@ -2147,10 +3072,14 @@ impl Backend for LogEngine {
                     .rt
                     .block_on(inner.appender.append(req))
                     .map_err(|e| EngineError::Append(e.to_string()))?;
-                let (first_global, last_global) = match outcome {
-                    AppendOutcome::Acked { first_position, last_position } => {
-                        (first_position, last_position)
-                    }
+                let (first_global, last_global, seg_id, seg_off) = match outcome
+                {
+                    AppendOutcome::Acked {
+                        first_position,
+                        last_position,
+                        segment_id,
+                        offset,
+                    } => (first_position, last_position, segment_id, offset),
                     AppendOutcome::Indeterminate => {
                         return Err(EngineError::Append(
                             "indeterminate durability".to_string(),
@@ -2172,27 +3101,48 @@ impl Backend for LogEngine {
                 //    the meta error below.
                 let _turn = inner.publish_seq.turn(first_global, watermark);
 
-                // 3) Publish: record book, active index (watermark-gated), meta
-                //    head. No `.await` and no cancellation point exists past
-                //    the position assignment above, so this always completes.
+                // 3) Publish: capsule-cache warm, active index
+                //    (watermark-gated), stream head, meta head. No `.await` and
+                //    no cancellation point exists past the position assignment
+                //    above, so this always completes. The per-event book pushes
+                //    are gone (bn-2ib): the durable batch itself is the byte
+                //    authority, addressed by its real `(segment_id, offset)`
+                //    pointer from the ack.
+                //
+                //    Order note (review F4): the interner head is updated
+                //    strictly AFTER `apply_committed`, so a concurrent
+                //    `head()` can never name a version the index cannot yet
+                //    serve (`read_stream` resolves through the index now;
+                //    pre-bn-2ib both lived under one book lock).
+
+                // Warm the capsule cache with the batch just published, so an
+                // immediate read-back (the overwhelmingly common hot-stream
+                // shape) is a cache hit instead of a `pread` + decode.
+                // Bounded + transparent: if the cache rejects or evicts it,
+                // the read decodes the same durable bytes.
                 {
-                    let mut book = inner.book.lock().expect("book lock");
-                    let stream_name = book.stream_name(sid);
-                    for (i, rec) in records_owned.iter().enumerate() {
-                        let gp = first_global + i as u64;
-                        let payload = Payload {
-                            stream_name:     stream_name.clone(),
-                            message_type:    Arc::from(
-                                rec.message_type.as_str(),
-                            ),
-                            data:            Arc::from(rec.data.as_slice()),
-                            stream_position: first_stream_pos + i as u64,
-                        };
-                        debug_assert_eq!(book.payloads.len() as u64, gp);
-                        book.payloads.push(payload);
-                        book.stream_events.entry(sid).or_default().push(gp);
+                    let mut data = Vec::with_capacity(
+                        records_owned.iter().map(|r| r.data.len()).sum(),
+                    );
+                    let mut offs = Vec::with_capacity(records_owned.len() + 1);
+                    for rec in &records_owned {
+                        offs.push(data.len() as u32);
+                        data.extend_from_slice(&rec.data);
                     }
-                    book.heads.insert(sid, last_stream_pos);
+                    offs.push(data.len() as u32);
+                    inner.reader.insert(
+                        seg_id,
+                        seg_off,
+                        Arc::new(DecodedBatch {
+                            stream_id: sid,
+                            first_stream_version: first_stream_pos,
+                            first_global_pos: first_global,
+                            frame_count,
+                            type_ids: tids,
+                            data,
+                            offs,
+                        }),
+                    );
                 }
 
                 let batch = BatchEntry {
@@ -2200,12 +3150,18 @@ impl Backend for LogEngine {
                     first_stream_version: first_stream_pos,
                     frame_count,
                     first_global_pos: first_global,
-                    ptr: EventPtr {
-                        segment_id: ACTIVE_SEGMENT_ID,
-                        offset:     first_global,
-                    },
+                    // The REAL durable placement from the ack (bn-2ib) — the
+                    // block-native read paths dereference this pointer.
+                    ptr: EventPtr { segment_id: seg_id, offset: seg_off },
                 };
                 inner.active.apply_committed(watermark, &[batch]);
+
+                // The head becomes visible only once the index can serve
+                // every version up to it (review F4).
+                {
+                    let mut book = inner.book.lock().expect("book lock");
+                    book.heads.insert(sid, last_stream_pos);
+                }
 
                 let mut group = CommitGroup::new(watermark);
                 group.stream_heads.push((
@@ -2221,7 +3177,7 @@ impl Backend for LogEngine {
                     .map_err(|e| EngineError::Meta(e.to_string()))?;
 
                 // Publish complete: every position `< watermark` is now
-                // resident in the record book (and index/meta).
+                // servable through the index tiers.
                 // Advance the published watermark LAST, still
                 // holding this batch's publish turn (`_turn`), so it
                 // moves in strict global-position order and never announces a
@@ -2260,11 +3216,12 @@ impl SubscribeBackend for LogEngine {
 /// TOTAL shutdown wait [`Inner::drop`] arranges via the shared
 /// `shutdown_deadline`. Both drive `run_roll_sealer` directly with a synthetic
 /// [`SegmentSummary`] whose `end_pos` an intentionally never-advanced
-/// [`ActiveIndex`]/[`Book`] can never reach — the shape of a publish an
-/// abandoned append future left stranded — so the skip path is forced
-/// deterministically instead of waiting out the real ~10s default bound. This
-/// needs access to private items (`run_roll_sealer`, `Book`, `SpinConfig`), so
-/// it lives inside this module rather than as a `tests/` integration test.
+/// [`ActiveIndex`]/published watermark can never reach — the shape of a
+/// publish an abandoned append future left stranded — so the skip path is
+/// forced deterministically instead of waiting out the real ~10s default
+/// bound. This needs access to private items (`run_roll_sealer`,
+/// `SpinConfig`), so it lives inside this module rather than as a `tests/`
+/// integration test.
 #[cfg(test)]
 mod seal_skip_tests {
     use mess_index::sealed::SealedStore;
@@ -2296,7 +3253,7 @@ mod seal_skip_tests {
         drop(tx); // close the channel so the loop drains this one item and exits
 
         let active = Arc::new(ActiveIndex::new()); // never advanced: applied_end stays 0
-        let book = Arc::new(Mutex::new(Book::default())); // never advanced: len stays 0
+        let published = Watermark::new(0); // never advanced
         let sealed = Arc::new(SealedStore::new());
         let driver =
             SealDriver::new(Arc::clone(&sealed), tmp.path().join("sealed"));
@@ -2314,7 +3271,8 @@ mod seal_skip_tests {
             rx,
             driver,
             active,
-            book,
+            published,
+            RealRuntime::new().fs(),
             tmp.path().to_path_buf(),
             Arc::clone(&seal_metrics),
             shutdown_deadline,
@@ -2347,7 +3305,7 @@ mod seal_skip_tests {
         drop(tx);
 
         let active = Arc::new(ActiveIndex::new());
-        let book = Arc::new(Mutex::new(Book::default()));
+        let published = Watermark::new(0);
         let sealed = Arc::new(SealedStore::new());
         let driver =
             SealDriver::new(Arc::clone(&sealed), tmp.path().join("sealed"));
@@ -2371,7 +3329,8 @@ mod seal_skip_tests {
             rx,
             driver,
             active,
-            book,
+            published,
+            RealRuntime::new().fs(),
             tmp.path().to_path_buf(),
             Arc::clone(&seal_metrics),
             shutdown_deadline,

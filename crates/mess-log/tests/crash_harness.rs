@@ -395,6 +395,7 @@ fn run_case(seed: u64) -> CaseStats {
                         Ok(AppendOutcome::Acked {
                             first_position,
                             last_position,
+                            ..
                         }) => {
                             acked
                                 .lock()
