@@ -28,9 +28,9 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use ident::Id;
 use mess_core::Decide;
 
+use crate::Id;
 use crate::contracts::{
     FakeReadModels, PostView, ProfileView, ReadModels, TimelinePage,
     WriteError, WriteOps,

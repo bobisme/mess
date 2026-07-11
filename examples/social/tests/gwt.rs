@@ -18,8 +18,8 @@
 //! cargo test -p social
 //! ```
 
-use ident::Id;
 use mess_testkit::{AggregateTest, matching};
+use social::Id;
 use social::domain::follow::{
     Follow, FollowError, FollowEvent, PlaceFollow, RemoveFollow,
 };

@@ -75,7 +75,7 @@ pub const PAGE_SIZE: usize = 20;
 
 /// The name of the cookie holding the acting user's **handle** (the
 /// "act-as-user" demo picker — **not** real auth; see the `/whoami` page).
-/// Stores the handle, not an [`ident::Id`]: see the module docs' "No more
+/// Stores the handle, not an [`Id`](crate::Id): see the module docs' "No more
 /// side directory" section for why.
 pub const ACTING_COOKIE: &str = "acting_user";
 

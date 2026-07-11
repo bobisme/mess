@@ -5,8 +5,8 @@
 //! home of the two seam-level rules `decide` cannot express: self-follow
 //! refusal and self-like allowance.
 
-use ident::Id;
 use mess_testkit::{SweepingTempDir, sweeping_temp_dir};
+use social::Id;
 use social::domain::follow::Follow;
 use social::domain::like::Like;
 use social::domain::post::Post;

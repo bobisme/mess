@@ -46,7 +46,6 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
-use ident::Id;
 use mess_core::Decide;
 use mess_derive::{Aggregate, Event};
 use mess_store::{
@@ -55,6 +54,7 @@ use mess_store::{
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use social::Id;
 
 // ===========================================================================
 // MegaPost — the pre-bn-jes unbounded shape, PRIVATE to this benchmark.

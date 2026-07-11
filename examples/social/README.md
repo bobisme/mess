@@ -118,6 +118,13 @@ crowds from the relationship streams into count/membership indexes, and answers
 cross-aggregate queries (a post's `PostView` joins the author's current
 handle/display name and its live like count) at query time.
 
+**Ids** (bn-gt5) are UUIDv7 (`src/id.rs`'s `Id`, a newtype over `uuid::Uuid`),
+shown everywhere — URLs, logs, stream names — as a fixed 26-character
+lowercase Crockford base32 string with no separators, time-ordered (`Ord`
+agrees with creation order) and safe to compare/sort as plain text. Stored ids
+from older (pre-bn-gt5) seeds are format-incompatible with this encoding;
+reseed a fresh store rather than trying to read an old one.
+
 ### The write and read backends (`src/store_backend.rs`)
 
 The warm write path needs `SnapshotStore` (that is where `command_cached`
@@ -155,10 +162,10 @@ command folds only *that one edge's* stream. Ditto follows. So:
   posts against the viewer's *current* follow set.
 - **Stream naming.** A relationship stream keys on *both* ids:
   `like-<post>_<user>`. The `_` is a sound separator because an `Id` renders
-  only over `[0-9a-z-]` (Crockford base32 plus two internal `-`s) and never
-  contains `_`; `StoredRecord::category()` splits at the first `-`, and the
-  suffix splits once on `_` back into the two ids. See `src/lib.rs`'s
-  `PAIR_SEP` / `parse_pair` for the format invariant.
+  only over `[0-9a-hjkmnp-tv-z]` (lowercase Crockford base32, no separators at
+  all) and contains neither `-` nor `_`; `StoredRecord::category()` splits at
+  the first `-`, and the suffix splits once on `_` back into the two ids. See
+  `src/lib.rs`'s `PAIR_SEP` / `parse_pair` for the format invariant.
 
 The payoff is visible in the stream counts below: the demo tier's 1,488 events
 live on **1,438 distinct streams**, and the large tier's 54,680 events on

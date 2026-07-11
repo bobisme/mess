@@ -111,7 +111,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use ident::Id;
 use mess_core::{CodecError, Event};
 use mess_store::{
     AnomalyKind, Backend, EventStore, ProjectionAnomalies,
@@ -120,6 +119,7 @@ use mess_store::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, RwLock};
 
+use crate::Id;
 use crate::contracts::{PostView, ProfileView, ReadModels, TimelinePage};
 use crate::domain::follow::FollowEvent;
 use crate::domain::like::LikeEvent;
@@ -482,29 +482,32 @@ impl State {
     /// serialize to byte-identical fingerprints regardless of `HashMap`/
     /// `HashSet` iteration order (which is per-instance randomized) — the basis
     /// of the `--rebuild` checkpoint-correctness byte-compare. Sorted by each
-    /// [`Id`]'s `Display` (a fixed 22-char string) because `Id` is not `Ord`.
+    /// [`Id`]'s own `Ord` (bn-gt5: the UUIDv7-backed `Id` derives it) rather
+    /// than by comparing its `Display` string — simpler than the pre-bn-gt5
+    /// version, which had to sort by string because `Id` had no `Ord`. (The
+    /// two orders agree by construction — see `id`'s module docs — so this is
+    /// a pure simplification, not a behavior change.) The map values are
+    /// still carried as `Id::to_string()` in the final tuple purely because
+    /// that is what serializes; only the *sort key* changed.
     fn canonical_bytes(&self) -> Vec<u8> {
         fn sorted_ids(set: &HashSet<Id>) -> Vec<String> {
-            let mut v: Vec<String> =
-                set.iter().map(ToString::to_string).collect();
-            v.sort();
-            v
+            let mut ids: Vec<Id> = set.iter().copied().collect();
+            ids.sort();
+            ids.iter().map(ToString::to_string).collect()
         }
         fn sorted_map<V>(map: &HashMap<Id, V>) -> Vec<(String, &V)> {
-            let mut v: Vec<(String, &V)> =
-                map.iter().map(|(id, val)| (id.to_string(), val)).collect();
-            v.sort_by(|a, b| a.0.cmp(&b.0));
-            v
+            let mut v: Vec<(Id, &V)> =
+                map.iter().map(|(&id, val)| (id, val)).collect();
+            v.sort_by_key(|(id, _)| *id);
+            v.into_iter().map(|(id, val)| (id.to_string(), val)).collect()
         }
         fn sorted_sets(
             map: &HashMap<Id, HashSet<Id>>,
         ) -> Vec<(String, Vec<String>)> {
-            let mut v: Vec<(String, Vec<String>)> = map
-                .iter()
-                .map(|(id, set)| (id.to_string(), sorted_ids(set)))
-                .collect();
-            v.sort_by(|a, b| a.0.cmp(&b.0));
-            v
+            let mut v: Vec<(Id, Vec<String>)> =
+                map.iter().map(|(&id, set)| (id, sorted_ids(set))).collect();
+            v.sort_by_key(|(id, _)| *id);
+            v.into_iter().map(|(id, s)| (id.to_string(), s)).collect()
         }
         let mut handles: Vec<(&String, String)> =
             self.handles.iter().map(|(h, id)| (h, id.to_string())).collect();

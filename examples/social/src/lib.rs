@@ -59,10 +59,9 @@
 //! [`EventStore`](mess_store::EventStore); `tests/gwt.rs` exercises every
 //! accept and every rejection store-free through `mess-testkit`.
 
-use ident::Id;
-
 pub mod contracts;
 pub mod domain;
+pub mod id;
 pub mod projections;
 pub mod rebuild;
 pub mod seed;
@@ -87,6 +86,7 @@ pub use domain::user::{
     HANDLE_MAX_LEN, RegisterUser, SetDisplayName, User, UserError, UserEvent,
     handle_is_valid,
 };
+pub use id::{Id, IdParseError};
 pub use projections::{
     Cardinalities, PROJECTION_VERSION, PostLookup, Projections,
 };
@@ -96,17 +96,21 @@ pub use projections::{
 ///
 /// # Format invariant
 ///
-/// An [`Id`] renders (via its `Display`/`FromStr`) as a fixed 22-character
-/// string over the alphabet `[0-9a-z-]` — Crockford base32 digits plus two
-/// internal `-` group separators (e.g. `000000-0dxbdyxy-zezqnd`). It therefore
-/// **never contains `_`**. That is what makes `_` a sound pair separator:
+/// An [`Id`] renders (via its `Display`/`FromStr`) as a fixed 26-character
+/// string over the alphabet `[0-9a-hjkmnp-tv-z]` — lowercase Crockford
+/// base32 digits, **no separators of any kind** (see [`id`] for the full
+/// codec). It therefore contains **neither `-` nor `_`**, which is what
+/// makes `_` an unambiguous — and simpler than before — pair separator:
 ///
 /// - [`StoredRecord::category`](mess_store::StoredRecord::category) splits the
 ///   stream id at the *first* `-`, yielding category `"like"`/`"follow"` and a
-///   suffix `<id1>_<id2>` whose two ids keep their own internal `-`s intact.
+///   suffix `<id1>_<id2>`. Since neither id can contain `-` at all (not just
+///   "no leading `-`"), that split is trivially safe — there is no internal `-`
+///   an id could contribute to confuse it.
 /// - Splitting that suffix once on `_` recovers exactly the two ids, because
-///   neither id can contain a `_`. A `-` separator would be ambiguous (the ids
-///   are full of them); `_` cannot be.
+///   neither id can contain a `_` either. A `-` separator would still work fine
+///   here too (ids have none), but `_` is kept for continuity with the
+///   pre-bn-gt5 stream names.
 pub const PAIR_SEP: char = '_';
 
 /// The stream id for a user's aggregate: `user-<id>`.

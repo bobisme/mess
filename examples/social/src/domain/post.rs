@@ -38,11 +38,11 @@
 //!   one-line extension (widen the `DeletePost` author check) rather than a new
 //!   event.
 
-use ident::Id;
 use mess_core::Decide;
 use mess_derive::{Aggregate, Event};
 use mess_store::{Snapshottable, StateCodecError};
 
+use crate::Id;
 use crate::domain::snapshot_codec::{Reader, put_bool, put_opt_id, put_str};
 
 // ---------------------------------------------------------------------------

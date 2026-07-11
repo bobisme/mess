@@ -5,9 +5,9 @@
 //! stylesheet is served separately at `/style.css` (see
 //! [`STYLESHEET`]).
 
-use ident::Id;
 use maud::{DOCTYPE, Markup, html};
 
+use crate::Id;
 use crate::contracts::{PostView, ProfileView, TimelinePage};
 
 /// A one-shot notification carried across a redirect via query params.

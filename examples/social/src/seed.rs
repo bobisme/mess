@@ -31,7 +31,10 @@
 //! [`SeedConfig::seed`](SeedConfig::seed) — no wall-clock, no store, no
 //! `await` — with a fixed draw order, so the *corpus* (handles, display names,
 //! bodies, the follow/like graphs, which posts get deleted, and the
-//! [`Id::from_u128`]-drawn ids themselves) is a pure function of `seed`.
+//! [`draw_id`]-drawn ids themselves) is a pure function of `seed`. Ids come
+//! from [`Id::from_parts`] fed a fixed [`SEED_BASE_MS`] timestamp plus 10
+//! bytes pulled straight off the seeded RNG — never [`Id::new`]/wall-clock —
+//! which is what keeps the corpus deterministic (see `draw_id`).
 //! Execution then honors [`SeedConfig::concurrency`]: sequential execution
 //! (demo) reproduces the historical **byte-identical** global log; pipelined
 //! execution (large) commits distinct streams concurrently, so per-stream
@@ -43,13 +46,13 @@ use std::future::Future;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use ident::Id;
 use mess_store::{EventStore, SnapshotStore};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use tokio::task::JoinSet;
 
+use crate::Id;
 use crate::contracts::{WriteError, WriteOps};
 
 // ===========================================================================
@@ -483,6 +486,25 @@ fn gen_body(rng: &mut StdRng) -> String {
 // Planning: the deterministic, store-free corpus draw
 // ===========================================================================
 
+/// A fixed, arbitrary Unix-millisecond timestamp
+/// (2024-01-01T00:00:00Z) every seeded id's embedded UUIDv7 timestamp is
+/// drawn from — see [`draw_id`]. Fixed rather than wall-clock so the corpus
+/// stays a pure function of [`SeedConfig::seed`]; the actual value carries no
+/// meaning beyond "some fixed point", since the corpus's realism never
+/// depends on ids' timestamps looking like "now".
+const SEED_BASE_MS: u64 = 1_704_067_200_000;
+
+/// Draw one deterministic [`Id`] from the seeded RNG: [`SEED_BASE_MS`] plus
+/// 10 bytes pulled off `rng`. This is the seed generator's replacement for
+/// the pre-bn-gt5 `Id::from_u128(rng.random())` draw — same "pure function of
+/// the RNG stream, same draw order every run" contract, going through
+/// [`Id::from_parts`] since the UUIDv7-backed `Id` has no raw-`u128`
+/// constructor (a v7 id is not "any 128 bits", it has a fixed shape — see
+/// `id`'s module docs).
+fn draw_id(rng: &mut StdRng) -> Id {
+    Id::from_parts(SEED_BASE_MS, rng.random())
+}
+
 /// The fully-planned corpus: every command's arguments, drawn from the seeded
 /// [`StdRng`] with a fixed draw order, **before** any store write. Splitting
 /// planning from execution is what lets execution be either sequential
@@ -526,7 +548,7 @@ fn plan_corpus(cfg: &SeedConfig) -> Corpus {
     for _ in 0..cfg.users {
         let handle = gen_handle(&mut rng, &mut used_handles);
         let display = gen_display_name(&mut rng);
-        let id = Id::from_u128(rng.random::<u128>());
+        let id = draw_id(&mut rng);
         user_ids.push(id);
         users.push((id, handle, display));
     }
@@ -572,7 +594,7 @@ fn plan_corpus(cfg: &SeedConfig) -> Corpus {
     for _ in 0..cfg.posts {
         let ai = author_weights.sample(&mut rng);
         let body = gen_body(&mut rng);
-        let id = Id::from_u128(rng.random::<u128>());
+        let id = draw_id(&mut rng);
         post_ids.push(id);
         post_author.push(ai);
         posts.push((id, user_ids[ai], body));

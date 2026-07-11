@@ -12,11 +12,18 @@ path = "src/lib.rs"
 mess-core = { workspace = true }
 mess-derive = { workspace = true }
 mess-store = { workspace = true }
-ident = { workspace = true, features = ["serde"] }
+# bn-gt5: the crate's `Id` newtype wraps `uuid::Uuid` (v7, time-ordered),
+# rendered as 26-char lowercase Crockford base32 — see `src/id.rs`. Replaces
+# the `ident` crate (bn-3c6's `Id: Ord` need is met by `Uuid`'s own `Ord`
+# instead).
+uuid = { workspace = true }
 # The `#[derive(Event)]` expansion emits `#[derive(::serde::Serialize)]` /
 # `Deserialize` wrapper structs for each variant's payload, so any crate
 # using the derive needs `serde` as a direct dependency.
 serde = { version = "1.0.188", features = ["derive"] }
+# `Id`'s parse error (`id.rs`) is a `thiserror::Error` typed rejection,
+# matching the domain error convention the rest of this crate already uses.
+thiserror = { workspace = true }
 # rmp-serde: msgpack codec for the projection checkpoint sidecar. Chosen over
 # adding serde_json/bincode because it is the *same* codec `#[derive(Event)]`
 # already uses for event payloads (mess-core depends on rmp-serde), so the

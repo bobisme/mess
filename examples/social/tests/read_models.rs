@@ -7,7 +7,7 @@
 //! [`FakeReadModels`]: social::contracts::FakeReadModels
 //! [`ReadModels`]: social::contracts::ReadModels
 
-use ident::Id;
+use social::Id;
 use social::contracts::{FakeReadModels, ReadModels};
 
 /// Build a small world: alice follows bob (not carol); bob and carol each

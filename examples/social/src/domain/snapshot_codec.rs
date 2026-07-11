@@ -16,7 +16,7 @@
 //! # Format
 //!
 //! Little-endian throughout. `bool`/`u8` are one byte; a `str` is a `u32`
-//! length prefix followed by its UTF-8 bytes; an [`Id`] is its 22-char
+//! length prefix followed by its UTF-8 bytes; an [`Id`] is its 26-char
 //! `Display` string encoded as a `str` (its `FromStr` round-trips it — the same
 //! contract [`crate::parse_pair`] relies on); an `Option<Id>` is a one-byte tag
 //! (`0` absent, `1` present) then the id when present. Every `decode_*` path is
@@ -24,8 +24,9 @@
 //! blob yields a [`StateCodecError`], never a panic — a corrupt snapshot must
 //! degrade to full replay, not crash the load.
 
-use ident::Id;
 use mess_store::StateCodecError;
+
+use crate::Id;
 
 /// Append a `bool` as one byte.
 pub(crate) fn put_bool(out: &mut Vec<u8>, b: bool) { out.push(u8::from(b)); }

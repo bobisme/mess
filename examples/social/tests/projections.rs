@@ -14,9 +14,9 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use ident::Id;
 use mess_store::{Backend, RecordToAppend, Version};
 use mess_testkit::{SweepingTempDir, sweeping_temp_dir};
+use social::Id;
 use social::store_backend::{Store, StoreProjections, open_store};
 use social::{
     PROJECTION_VERSION, PostLookup, ProfileView, Projections, ReadModels,

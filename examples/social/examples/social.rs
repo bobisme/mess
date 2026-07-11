@@ -13,7 +13,7 @@
 //! See `src/lib.rs` for the domain and `tests/gwt.rs` for the same rules
 //! exercised store-free through `mess-testkit`.
 
-use ident::Id;
+use social::Id;
 use social::domain::follow::Follow;
 use social::domain::like::Like;
 use social::domain::post::Post;

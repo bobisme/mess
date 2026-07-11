@@ -30,7 +30,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ident::Id;
+use social::Id;
 use social::WriteOps;
 use social::rebuild::rebuild_check;
 use social::store_backend::{

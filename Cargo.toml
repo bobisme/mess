@@ -53,6 +53,9 @@ thiserror = "2.0.18"
 tokio = { version = "1.52", features = ["full"] }
 tokio-util = "0.7.18"
 tracing = "0.1.44"
+# bn-gt5: examples/social's Id newtype over Uuid (v7, time-ordered). Only
+# `v7` is enabled here at the workspace level; `std`/`rng` etc. stay default.
+uuid = { version = "1", features = ["v7"] }
 # dev
 assert2 = "0.4.0"
 rstest = "0.26.1"

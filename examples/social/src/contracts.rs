@@ -19,10 +19,10 @@
 
 use std::future::Future;
 
-use ident::Id;
 use mess_core::{CommandError, SharedStoreError};
 use mess_store::{EventStore, SnapshotStore};
 
+use crate::Id;
 use crate::domain::follow::{Follow, FollowError, PlaceFollow, RemoveFollow};
 use crate::domain::like::{Like, LikeError, PlaceLike, RemoveLike};
 use crate::domain::post::{CreatePost, DeletePost, Post, PostError};

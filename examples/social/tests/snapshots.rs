@@ -18,12 +18,12 @@
 //!    `fold_version` does not match the aggregate's is ignored and the state is
 //!    rebuilt by full replay — even when its blob encodes a *different* state.
 
-use ident::Id;
 use mess_store::snapshot::{SnapshotStore, StoredSnapshot};
 use mess_store::{
     BlobPtr, CommandError, EventStore, MockBackend, SnapshotRef, Snapshottable,
     interim_stream_id,
 };
+use social::Id;
 use social::domain::follow::Follow;
 use social::domain::like::Like;
 use social::domain::post::Post;
