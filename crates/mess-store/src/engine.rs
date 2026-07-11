@@ -95,6 +95,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -108,7 +109,7 @@ use mess_index::sealed::{
 use mess_index::{ActiveIndex, BatchEntry, EventPtr, IndexSnapshot};
 use mess_log::committer::{
     AppendOutcome, AppendRequest, Appender, ChainInit, Committer, Durability,
-    EventInput, LatencySnapshot, Roller,
+    EventInput, LatencySnapshot, PreBarrier, Roller,
 };
 use mess_log::fold_chain::ChainHead;
 use mess_log::lock::StoreLock;
@@ -465,6 +466,121 @@ struct ResumeInfo {
     event_count:   u64,
 }
 
+/// Coalesces the durable new-name `SyncAll` into the log committer's
+/// group-commit window under a **barriered** [`Durability`] mode (`Os`/`Group`,
+/// bn-34o).
+///
+/// # The problem this closes
+///
+/// bn-150 made a newly-interned stream/type name durable (`MetaStore::persist`,
+/// a real `SyncAll` `fsync`) strictly before the covering append is submitted,
+/// so recovery can never resolve a committed event whose name was lost (the
+/// store's log frames carry only the numeric `stream_id`/`event_type_id`, never
+/// the string, so a lost name is unrecoverable — see
+/// [`persist_new_names`](LogEngine::persist_new_names)). bn-2cj kept that
+/// barrier only for the durable modes (`Process` uses a barrier-free page-cache
+/// `write(2)` instead). But under `Os`/`Group` **every** new stream paid its
+/// **own** `SyncAll`, upstream of the committer, and `N` new streams serialized
+/// on `N` separate fsyncs through the shared `MetaStore` — the single-writer
+/// serialization point spike bn-1jg measured (a k=32 pipeline of new streams
+/// won only ~1.3× because the name flush could not parallelize; ~3.4 ms/new
+/// stream, 98.8% of the cost). Coalescing it *upstream* (a leader/follower
+/// barrier in `append_batch`) does not help a **committer-bound pipeline**: new
+/// streams reach that upstream stage staggered at the committer's drain rate,
+/// so nothing piles up to share a fsync (measured: ~0.99 barriers/new-name).
+///
+/// # The mechanism: ride the committer's own group barrier, high-watered by ticket
+///
+/// The log committer already coalesces the *event* `fdatasync`s of a commit
+/// window behind one barrier (`mess-log`'s group commit). So instead of a
+/// separate upstream name barrier, the name flush **rides that same window**,
+/// via a [`PreBarrier`](mess_log::committer::PreBarrier) the committer invokes
+/// on the committer thread strictly before the group's log `fdatasync`
+/// ([`LogEngine::name_pre_barrier`]):
+///
+/// * When [`append_batch`](LogEngine::append_batch) interns a new name under
+///   `Os`/`Group`, it writes the name bytes to fjall's page cache
+///   (`persist_new_names` → `put_*_name`, a `write(2)`) and bumps a monotone
+///   [`buffered`](Self::buffered) ticket — then submits the covering event
+///   **with no fsync of its own**. The bump happens before submit, so by the
+///   time this append's batch is gathered into a commit group, `buffered`
+///   already covers its name.
+/// * The committer's pre-barrier hook, once per barriered group, captures
+///   `target = buffered` and — only if `target > durable` — issues ONE
+///   `SyncAll`, then advances `durable = max(durable, target)`. fjall's
+///   `SyncAll` flushes exactly what was buffered when it begins, and every
+///   ticket `<= target` had its `put_*_name` sequenced-before the `buffered`
+///   bump the hook's load observes, so that single fsync makes **all** those
+///   names durable at once — strictly before the group's log `fdatasync`.
+///
+/// This coalesces perfectly with the committer's grouping, and — crucially —
+/// **even under `Os`** (group-of-one): the hook's `durable` high-water advances
+/// past *every* already-submitted name in one fsync, so the serial groups that
+/// follow find `buffered == durable` and skip the fsync entirely. `N` new
+/// streams in flight collapse to a handful of meta `SyncAll`s, not `N`. On the
+/// hot path (no new name) `buffered` never moves, so the hook is a pure atomic
+/// load and issues no fsync in any group.
+///
+/// # The ordering invariant is preserved (bn-150/bn-2cj)
+///
+/// The hook's `SyncAll` runs on the committer thread strictly before that
+/// group's log `fdatasync`, which itself precedes the group's acks. So a name
+/// is on stable storage before any event referencing it is, and **no event ack
+/// — and no durable log barrier covering that event — completes before the
+/// names its events reference are durable.** The guarantee is unchanged from
+/// bn-150; it is merely issued from inside the window rather than ahead of it,
+/// and shared. A hook failure is treated as a barrier failure (Indeterminate +
+/// poison, see [`PreBarrier`](mess_log::committer::PreBarrier)): the group's
+/// events never ack durable while their names failed to flush.
+///
+/// # Crash story (walk both orders)
+///
+/// The window's durable order under `Os`/`Group` is: (1) name bytes → page
+/// cache and event bytes → log page cache (both before the barrier, in either
+/// order — the events' `pwrite`s and the names' `write(2)`s all precede any
+/// fsync); (2) hook `SyncAll` (names on device); (3) log `fdatasync` (events on
+/// device); (4) watermark advance + ack. Step (2) is strictly before (3).
+///
+/// * **Crash between (2) and (3)** — names durable, events not. Recovery trusts
+///   the durable watermark, which has not advanced past this group (it advances
+///   only after the log `fdatasync`), so these events are not part of the
+///   committed prefix; the orphan name rows are a harmless, idempotent superset
+///   (re-writing a name later is a no-op). Consistent: names are *more* durable
+///   than events, which is always allowed.
+/// * **Crash between (3) and (4)** — both durable, ack never returned. Recovery
+///   finds the events and resolves their names; consistent (the appends were
+///   durable even though the callers never learned so — the [`AppendOutcome`]
+///   retry contract covers this).
+/// * **The forbidden order — an event durable, its name lost — cannot arise.**
+///   An event is in the committed prefix only past the durable watermark, which
+///   advances only after the log `fdatasync` (3), which runs only after the
+///   hook `SyncAll` (2) made every name buffered before the group durable.
+///   Names can be more durable than events, never less.
+///
+/// `Process` never uses this path (its names ride the barrier-free buffered
+/// flush inline, bn-2cj; the committer runs no barrier and so never calls the
+/// hook). The hot path (no new name) never bumps `buffered`.
+struct NameFlush {
+    /// Monotone count of new-name tickets handed out. Bumped by
+    /// [`append_batch`](LogEngine::append_batch) (before submit) each time it
+    /// buffers newly-interned name bytes under `Os`/`Group`. A hook `SyncAll`
+    /// that captures `target >= t` is guaranteed to have flushed ticket `t`'s
+    /// bytes (the `put_*_name` write is sequenced-before the bump).
+    buffered: AtomicU64,
+    /// The highest ticket a completed hook `SyncAll` has made durable. Read
+    /// and advanced only by the pre-barrier hook, which runs on the single
+    /// committer thread — so it is never concurrently mutated and advances
+    /// monotonically. A group whose `buffered == durable` skips the fsync
+    /// (nothing new pending).
+    durable:  AtomicU64,
+}
+
+impl NameFlush {
+    fn new() -> Self {
+        NameFlush { buffered: AtomicU64::new(0), durable: AtomicU64::new(0) }
+    }
+}
+
 /// Shared engine state behind one `Arc`.
 struct Inner {
     rt:                   RealRuntime,
@@ -491,16 +607,27 @@ struct Inner {
     /// degradation alarm and seal durations, aggregated across the background
     /// roll-sealer and any on-demand [`LogEngine::seal_active`].
     seal_metrics:         Arc<SealMetrics>,
-    meta:                 MetaStore,
+    /// `Arc` so the committer's bn-34o pre-barrier hook
+    /// ([`LogEngine::name_pre_barrier`]) can share the same meta store this
+    /// engine writes names into and flush it durable inside the group window.
+    meta:                 Arc<MetaStore>,
     /// The engine's durability mode (bn-2cj). Read on the append path to gate
     /// the new-name persist barrier: `Process` pushes new names to the OS
     /// page cache without an `fsync` (the log itself issues no barrier under
     /// `Process`, so a per-name `SyncAll` would be strictly stronger than the
     /// operator asked for); `Os`/`Group` keep the `SyncAll` barrier so a new
-    /// name is durable no later than the covering append. See the
+    /// name is durable no later than the covering append — coalesced across
+    /// the commit window since bn-34o (see [`NameFlush`]). See the
     /// [`persist_new_names`](LogEngine::persist_new_names) flush-site
     /// contract.
     durability:           Durability,
+    /// Coalesces the barriered-mode (`Os`/`Group`) new-name `SyncAll` into the
+    /// committer's group window so `N` concurrent new streams pay ~1 fsync,
+    /// not `N` (bn-34o). `Arc` so the committer's pre-barrier hook shares
+    /// the same ticket high-water this engine bumps. Unused under
+    /// `Process` (barrier-free buffered flush) and never touched on the
+    /// hot path (no new name). See [`NameFlush`].
+    name_flush:           Arc<NameFlush>,
     book:                 Arc<Mutex<Book>>,
     /// The **published** global watermark — the exclusive end of the readable
     /// global-position sequence (the dense record-book length). Advanced at
@@ -759,11 +886,15 @@ impl LogEngine {
 
         // The durable metadata store, opened before recovery so the interner's
         // id→name bijection is available to materialise recovered payloads.
-        let meta = MetaStore::open_with_capacity(
-            dir.join("meta"),
-            opts.dedupe_capacity,
-        )
-        .map_err(|e| EngineError::Meta(e.to_string()))?;
+        // `Arc` so the committer's bn-34o co-durable name pre-barrier hook can
+        // share this exact store and flush it durable inside the group window.
+        let meta = Arc::new(
+            MetaStore::open_with_capacity(
+                dir.join("meta"),
+                opts.dedupe_capacity,
+            )
+            .map_err(|e| EngineError::Meta(e.to_string()))?,
+        );
 
         // Reload the sealed tier from the durable sidecars written by prior
         // seals (see `load_sealed`). Without this the `SealedStore` starts
@@ -781,6 +912,13 @@ impl LogEngine {
         let active = Arc::new(ActiveIndex::new());
         let (book, plan, chain_heads) =
             Self::recover(&rt, dir, &active, &meta, &sealed_ids, opts.chain)?;
+
+        // bn-34o: the coalesced co-durable name flush lives in the committer's
+        // group barrier. Build the shared ticket high-water and the pre-barrier
+        // hook that rides each group's `fdatasync` (see [`NameFlush`]).
+        let name_flush = Arc::new(NameFlush::new());
+        let pre_barrier =
+            Self::name_pre_barrier(meta.clone(), name_flush.clone());
 
         // The active segment is the highest-id `seg-*.log`; on a fresh store it
         // is `ACTIVE_SEGMENT_ID`. A roll numbers the next one `+1` from here.
@@ -842,12 +980,13 @@ impl LogEngine {
         } else {
             ChainInit::off()
         };
-        let committer = Committer::spawn_with_roll_chained(
+        let committer = Committer::spawn_with_roll_chained_hooked(
             &rt,
             writer,
             opts.durability,
             roller,
             chain_init,
+            pre_barrier,
         );
         let appender = committer.appender();
 
@@ -926,6 +1065,7 @@ impl LogEngine {
                 seal_metrics,
                 meta,
                 durability: opts.durability,
+                name_flush,
                 book,
                 // Seed the published watermark at the recovered dense book
                 // length: 0 on a fresh store, or the recovered event count on a
@@ -1459,6 +1599,34 @@ enum Pre {
 }
 
 impl LogEngine {
+    /// Build the bn-34o co-durable name **pre-barrier hook**: the closure the
+    /// committer runs on its own thread inside each barriered commit window,
+    /// strictly before that group's log `fdatasync`. It makes every new name
+    /// buffered so far durable in ONE coalesced `SyncAll`, high-watered by the
+    /// [`NameFlush`] ticket so a group with nothing newly pending
+    /// (`buffered == durable`, incl. the entire hot path) skips the fsync and
+    /// is a pure atomic load. See [`NameFlush`] for the full mechanism,
+    /// ordering invariant, and crash story.
+    fn name_pre_barrier(
+        meta: Arc<MetaStore>,
+        name_flush: Arc<NameFlush>,
+    ) -> PreBarrier {
+        Arc::new(move || {
+            // `buffered` covers every name whose `put_*_name` write is
+            // sequenced-before its bump; this SeqCst load observes all such
+            // bumps, so the `SyncAll` below flushes all their bytes. `durable`
+            // is touched only here (single committer thread), so no CAS loop is
+            // needed — a plain load/`fetch_max` is race-free.
+            let target = name_flush.buffered.load(Ordering::SeqCst);
+            if target > name_flush.durable.load(Ordering::SeqCst) {
+                meta.persist()
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                name_flush.durable.fetch_max(target, Ordering::SeqCst);
+            }
+            Ok(())
+        })
+    }
+
     /// Write newly-interned id→name mappings to the durable meta store so a
     /// reopen can reconstruct the interner (bn-20b). Returns whether it wrote
     /// anything, so the caller can fold that into a single co-durable flush
@@ -1510,7 +1678,10 @@ impl LogEngine {
     /// * `Os`/`Group` (the log issues a real `fdatasync` barrier per ack):
     ///   `MetaStore::persist` — a matching `SyncAll` `fsync` barrier, so the
     ///   name is on stable storage before the event can be. Unchanged from
-    ///   bn-150; durable modes are not weakened.
+    ///   bn-150 in strength; bn-34o coalesces the barrier across the commit
+    ///   window ([`coalesced_name_barrier`](Self::coalesced_name_barrier),
+    ///   [`NameFlush`]) so `N` concurrent new streams share ~1 fsync — durable
+    ///   modes are not weakened, only de-serialized.
     /// * `Process` (the log issues NO barrier; §1.1 promises process-crash
     ///   survival only): `MetaStore::persist_buffered` — a
     ///   `PersistMode::Buffer` page-cache `write(2)`, no `fsync`, matching the
@@ -1795,14 +1966,15 @@ impl Backend for LogEngine {
             })?;
 
         // Co-durable name flush, gated on the engine's durability mode
-        // (bn-150 established the barrier; bn-2cj gates it). Covers BOTH
-        // `persist_new_names` call sites above (stream name, then type
-        // names), strictly before the covering committer append below is
-        // submitted. Skipped entirely when neither call site wrote anything
-        // (the hot path, once names have stabilised): zero fjall calls, zero
-        // added latency, in every mode.
+        // (bn-150 established the barrier; bn-2cj gated it; bn-34o coalesces
+        // the durable-mode barrier into the committer's group window).
+        // Covers BOTH `persist_new_names` call sites above (stream
+        // name, then type names). Skipped entirely when neither call
+        // site wrote anything (the hot path, once names have
+        // stabilised): zero fjall calls, zero added latency, in
+        // every mode.
         //
-        // # The contract this gate upholds (bn-2cj)
+        // # The contract this gate upholds (bn-2cj / bn-34o)
         //
         // `stream_names`/`type_names` are the ONE durable source of truth this
         // store cannot rebuild from the log: the log frames carry only the
@@ -1816,17 +1988,22 @@ impl Backend for LogEngine {
         // durability barrier is:
         //
         // * `Os`/`Group` — the log append is acked only after its own real
-        //   `fdatasync` barrier (`docs/spec/03-durability.md` §1.2/§1.3). We
-        //   ride a matching `SyncAll` (`fsync`) barrier on the meta store,
-        //   issued STRICTLY BEFORE the covering append is even submitted, so
-        //   the name is on stable storage before the event that references it
-        //   can be. This is the bn-150 guarantee, unchanged — durable modes are
-        //   NOT weakened. Dispatched via `spawn_blocking` because a real
-        //   `fsync` can take milliseconds and would otherwise block a tokio
-        //   executor thread, starving other in-flight appends (including
-        //   hot-path ones) rather than just adding latency to this one.
-        //   (Coalescing these barriers across the group-commit window is the
-        //   separate follow-up bn-34o; not done here.)
+        //   `fdatasync` barrier (`docs/spec/03-durability.md` §1.2/§1.3).
+        //   Rather than a separate `SyncAll` upstream of the committer
+        //   (bn-150/bn-2cj, which paid one fsync per new stream and serialized
+        //   `N` of them on the shared meta store — spike bn-1jg), bn-34o rides
+        //   the SAME group barrier: here we only push the name bytes to fjall's
+        //   page cache (`persist_new_names`, done above) and bump the
+        //   `NameFlush` ticket high-water, then submit. The committer's
+        //   pre-barrier hook (`name_pre_barrier`) issues ONE meta `SyncAll` per
+        //   group, strictly before that group's log `fdatasync`, making every
+        //   name buffered so far durable at once — coalescing `N` new streams
+        //   to a handful of fsyncs (even under `Os`, via the hook's high-water;
+        //   see `NameFlush`). The name is still on stable storage before any
+        //   event referencing it, and no event acks durable before its name
+        //   does — the bn-150 guarantee, unchanged, merely issued from inside
+        //   the window and shared. See [`NameFlush`] for the mechanism,
+        //   memory-ordering proof, and crash walk.
         //
         // * `Process` — the log append is acked the instant its own covering
         //   `write(2)` reaches the OS page cache; the mode issues NO barrier
@@ -1872,15 +2049,24 @@ impl Backend for LogEngine {
                     })?;
                 }
                 Durability::Os | Durability::Group { .. } => {
-                    let inner = self.inner.clone();
-                    tokio::task::spawn_blocking(move || inner.meta.persist())
-                        .await
-                        .expect("meta persist task panicked")
-                        .map_err(|e| {
-                            AppendError::Backend(EngineError::Meta(
-                                e.to_string(),
-                            ))
-                        })?;
+                    // bn-34o: DON'T fsync here. The name bytes are already in
+                    // fjall's page cache (`persist_new_names` above). Just bump
+                    // the ticket high-water — before this append submits below
+                    // — and the committer's pre-barrier
+                    // hook
+                    // ([`name_pre_barrier`](Self::name_pre_barrier)) makes
+                    // every name buffered so far durable in
+                    // ONE `SyncAll` inside the
+                    // covering group's window, strictly before that group's log
+                    // `fdatasync`. Because the bump is sequenced-before the
+                    // submit, this append's name is covered by its own group's
+                    // barrier; because the hook high-waters, the many serial
+                    // groups of a burst share a handful of fsyncs, not one
+                    // each.
+                    self.inner
+                        .name_flush
+                        .buffered
+                        .fetch_add(1, Ordering::SeqCst);
                 }
             }
         }

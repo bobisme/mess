@@ -59,6 +59,30 @@ use crate::watermark::Watermark;
 pub use crate::watermark::Watermark as DurableWatermark;
 use crate::writer::{BatchSpec, SegmentSummary, SegmentWriter, WriteError};
 
+/// A **pre-barrier hook**: a callback the committer invokes on the committer
+/// thread inside each barriered commit window, **strictly before** the log
+/// `fdatasync` and only when that window actually wrote (`policy.barrier &&
+/// wrote_any`). It exists so an owner that keeps a *separate* durable structure
+/// which must be made durable **no later than** the log — e.g. `mess-store`'s
+/// stream/type-name interner tables, whose bytes cannot be re-derived from the
+/// log (bn-150/bn-34o) — can fold its own flush into the committer's group
+/// window: one flush per group, riding the same barrier the group's events do,
+/// instead of one per append upstream of the committer.
+///
+/// # Contract
+///
+/// * Runs on the single committer thread, so it is never re-entered
+///   concurrently and may block (it is expected to `fsync`); it is sequenced
+///   *before* the group's `fdatasync`, so anything it makes durable is durable
+///   before any event in the group is.
+/// * Returns `Ok(())` on success (including a cheap no-op when it has nothing
+///   pending — the common case, so a barriered store pays it nothing on the hot
+///   path). An `Err` is treated exactly like a failed log barrier: the group is
+///   downgraded to [`AppendOutcome::Indeterminate`], the watermark does not
+///   advance, and the store is poisoned (D8) — so no event is ever acked
+///   durable while the hook's companion state failed to become durable.
+pub type PreBarrier = Arc<dyn Fn() -> std::io::Result<()> + Send + Sync>;
+
 // ---------------------------------------------------------------------------
 // Public config + request/outcome types
 // ---------------------------------------------------------------------------
@@ -880,6 +904,7 @@ fn commit_group<R: Runtime, F: Fs>(
     roller: Option<&Roller>,
     chain_enabled: bool,
     heads: &mut HashMap<u64, ChainHead>,
+    pre_barrier: Option<&PreBarrier>,
 ) {
     // Steps 2–3: assign positions centrally + write each batch. `next_pos`
     // advances only for successfully written batches.
@@ -1009,15 +1034,32 @@ fn commit_group<R: Runtime, F: Fs>(
     // no later `commit_group` runs and no `close()` re-issues it.
     let mut barrier_ok = true;
     if policy.barrier && wrote_any {
-        let t0 = rt.now();
-        match writer.sync() {
-            Ok(()) => {
-                metrics.record_fsync(rt.now().saturating_duration_since(t0));
-                metrics.groups.incr();
-            }
-            Err(e) => {
-                barrier_ok = false;
-                degraded.poison(PoisonCause::classify(&e));
+        // bn-34o: the owner's co-durable pre-barrier flush rides THIS window,
+        // strictly before the log `fdatasync`, so any separate durable state
+        // the group's events reference (e.g. `mess-store`'s name interner
+        // tables) is on stable storage before the events are — coalesced to one
+        // flush per group instead of one per append. A no-op when the owner has
+        // nothing pending (hot path). A hook failure is a barrier failure: skip
+        // the log sync so the group is downgraded to Indeterminate below (its
+        // events never ack durable while the companion state is not).
+        if let Some(pre) = pre_barrier
+            && let Err(e) = pre()
+        {
+            barrier_ok = false;
+            degraded.poison(PoisonCause::classify(&e));
+        }
+        if barrier_ok {
+            let t0 = rt.now();
+            match writer.sync() {
+                Ok(()) => {
+                    metrics
+                        .record_fsync(rt.now().saturating_duration_since(t0));
+                    metrics.groups.incr();
+                }
+                Err(e) => {
+                    barrier_ok = false;
+                    degraded.poison(PoisonCause::classify(&e));
+                }
             }
         }
     }
@@ -1063,6 +1105,7 @@ async fn committer_loop<R: Runtime, F: Fs>(
     roller: Option<Roller>,
     chain_enabled: bool,
     mut heads: HashMap<u64, ChainHead>,
+    pre_barrier: Option<PreBarrier>,
 ) {
     // The expected convoy width, seeded at 1 (so the first group and the
     // one-writer case both close immediately) and tracking the last group's
@@ -1095,6 +1138,7 @@ async fn committer_loop<R: Runtime, F: Fs>(
             roller.as_ref(),
             chain_enabled,
             &mut heads,
+            pre_barrier.as_ref(),
         );
     }
     // Shutdown. On a healthy store, make the handoff durable (a `Process`-mode
@@ -1304,7 +1348,7 @@ impl<R: Runtime> Committer<R> {
         F: Fs + Send + 'static,
         F::File: Send,
     {
-        Self::spawn_inner(rt, writer, durability, None, ChainInit::off())
+        Self::spawn_inner(rt, writer, durability, None, ChainInit::off(), None)
     }
 
     /// Spawn the committer with the fold chain enabled (`bn-3l0`, spec 05 §6):
@@ -1321,7 +1365,7 @@ impl<R: Runtime> Committer<R> {
         F: Fs + Send + 'static,
         F::File: Send,
     {
-        Self::spawn_inner(rt, writer, durability, None, chain)
+        Self::spawn_inner(rt, writer, durability, None, chain, None)
     }
 
     /// Spawn the committer with live segment auto-roll (`bn-1vu`): when a batch
@@ -1344,6 +1388,7 @@ impl<R: Runtime> Committer<R> {
             durability,
             Some(roller),
             ChainInit::off(),
+            None,
         )
     }
 
@@ -1362,7 +1407,34 @@ impl<R: Runtime> Committer<R> {
         F: Fs + Send + 'static,
         F::File: Send,
     {
-        Self::spawn_inner(rt, writer, durability, Some(roller), chain)
+        Self::spawn_inner(rt, writer, durability, Some(roller), chain, None)
+    }
+
+    /// Like [`spawn_with_roll_chained`](Self::spawn_with_roll_chained), plus a
+    /// [`PreBarrier`] hook the committer runs inside each barriered commit
+    /// window, strictly before the log `fdatasync` (bn-34o). The production
+    /// `mess-store` engine uses it to fold its co-durable stream/type-name
+    /// flush into the group barrier — one flush per group, not one per append.
+    pub fn spawn_with_roll_chained_hooked<F>(
+        rt: &R,
+        writer: SegmentWriter<F>,
+        durability: Durability,
+        roller: Roller,
+        chain: ChainInit,
+        pre_barrier: PreBarrier,
+    ) -> Self
+    where
+        F: Fs + Send + 'static,
+        F::File: Send,
+    {
+        Self::spawn_inner(
+            rt,
+            writer,
+            durability,
+            Some(roller),
+            chain,
+            Some(pre_barrier),
+        )
     }
 
     fn spawn_inner<F>(
@@ -1371,6 +1443,7 @@ impl<R: Runtime> Committer<R> {
         durability: Durability,
         roller: Option<Roller>,
         chain: ChainInit,
+        pre_barrier: Option<PreBarrier>,
     ) -> Self
     where
         F: Fs + Send + 'static,
@@ -1404,6 +1477,7 @@ impl<R: Runtime> Committer<R> {
             roller,
             chain_enabled,
             heads,
+            pre_barrier,
         )));
 
         Committer {
@@ -1690,6 +1764,120 @@ mod tests {
         assert_eq!(
             fsyncs, 0,
             "Process mode must not issue a barrier before shutdown"
+        );
+    }
+
+    // -- Pre-barrier hook (bn-34o) ---------------------------------------
+
+    /// The [`PreBarrier`] hook fires exactly once per barriered group (`Os`:
+    /// per batch), and every batch still acks durable — the committer runs the
+    /// hook inside the window without disturbing the ordinary durable path.
+    #[test]
+    fn pre_barrier_hook_fires_once_per_barriered_group() {
+        let rt = SimRuntime::new(11);
+        let fs = rt.fs();
+        let writer = seg(&fs, Path::new("/seg-hook-os"));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let hook_calls = calls.clone();
+        let pre: PreBarrier = Arc::new(move || {
+            hook_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        let n = rt.block_on(async {
+            let c = Committer::spawn_inner(
+                &rt,
+                writer,
+                Durability::Os,
+                None,
+                ChainInit::off(),
+                Some(pre),
+            );
+            for v in [0u64, 3, 8] {
+                let out = c.append(req(1, v, 3)).await.unwrap();
+                assert!(
+                    matches!(out, AppendOutcome::Acked { .. }),
+                    "hook must not disturb the durable ack"
+                );
+            }
+            let n = calls.load(Ordering::SeqCst);
+            c.shutdown().await;
+            n
+        });
+        // Os is group-of-one: three batches → three barriered groups → three
+        // hook calls, one per group's fdatasync.
+        assert_eq!(n, 3, "hook must run once per barriered group");
+    }
+
+    /// Under `Process` (no barrier) the committer never invokes the hook — the
+    /// hot-path guarantee that a barrier-free store pays nothing for it.
+    #[test]
+    fn pre_barrier_hook_not_called_under_process() {
+        let rt = SimRuntime::new(12);
+        let fs = rt.fs();
+        let writer = seg(&fs, Path::new("/seg-hook-proc"));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let hook_calls = calls.clone();
+        let pre: PreBarrier = Arc::new(move || {
+            hook_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        let n = rt.block_on(async {
+            let c = Committer::spawn_inner(
+                &rt,
+                writer,
+                Durability::Process,
+                None,
+                ChainInit::off(),
+                Some(pre),
+            );
+            for v in 0..4u64 {
+                c.append(req(9, v, 1)).await.unwrap();
+            }
+            let n = calls.load(Ordering::SeqCst);
+            c.shutdown().await;
+            n
+        });
+        assert_eq!(n, 0, "Process issues no barrier, so the hook never runs");
+    }
+
+    /// A hook failure is a barrier failure: the group is downgraded to
+    /// [`AppendOutcome::Indeterminate`], the store is poisoned (D8), and — the
+    /// ordering proof — the log `fdatasync` is NEVER issued (`fsync_count ==
+    /// 0`), so the hook ran strictly before the log barrier and gated it.
+    /// No event can be acked durable while the hook's companion state
+    /// failed to flush.
+    #[test]
+    fn pre_barrier_hook_failure_poisons_and_gates_the_log_barrier() {
+        let rt = SimRuntime::new(13);
+        let fs = rt.fs();
+        let writer = seg(&fs, Path::new("/seg-hook-fail"));
+        let pre: PreBarrier =
+            Arc::new(|| Err(io::Error::other("name flush failed")));
+        let (out, degraded, fsyncs) = rt.block_on(async {
+            let c = Committer::spawn_inner(
+                &rt,
+                writer,
+                Durability::Os,
+                None,
+                ChainInit::off(),
+                Some(pre),
+            );
+            let out = c.append(req(1, 0, 2)).await.unwrap();
+            let degraded = c.is_degraded();
+            let fsyncs = c.fsync_count();
+            c.shutdown().await;
+            (out, degraded, fsyncs)
+        });
+        assert_eq!(
+            out,
+            AppendOutcome::Indeterminate,
+            "a hook failure must downgrade the group to Indeterminate"
+        );
+        assert!(degraded, "a hook failure must poison the store (D8)");
+        assert_eq!(
+            fsyncs, 0,
+            "the log fdatasync must NOT run after a hook failure — proof the \
+             hook is sequenced before (and gates) the log barrier"
         );
     }
 
