@@ -1,0 +1,27 @@
+[package]
+name = "state_kernel_dense_heads"
+version = "0.1.0"
+edition = "2024"
+
+# Standalone spike: opt out of the repo's root workspace.
+[workspace]
+
+[dependencies]
+# Match the repo pin (crates/mess-index/Cargo.toml).
+fjall = "3.1.6"
+hashbrown = "0.15"
+rand = "0.10"
+portable-atomic = { version = "1", features = ["fallback"] }
+libc = "0.2"
+# Loom models the REAL production seqlock functions (src/shim.rs swaps the
+# atomics under `--cfg loom`), so unlike crates/mess-log — which mirrors the
+# protocol in a cfg(all(loom, test)) module — loom must be a full dependency
+# here. Only compiled into the binary when RUSTFLAGS="--cfg loom".
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
+
+[profile.release]
+lto = "thin"
+debug = true
