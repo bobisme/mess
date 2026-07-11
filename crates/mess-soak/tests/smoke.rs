@@ -38,14 +38,45 @@ fn scratch_dir(tag: &str) -> PathBuf {
 async fn soak_smoke_survives_crashes_with_all_probes_on() {
     let dir = scratch_dir("smoke");
     let cfg = Config {
-        duration: Duration::from_secs(20),
+        // bn-1av: `duration` used to be the test's *only* stopping
+        // condition, with `crash_every_actions` picked so that "enough
+        // actions to complete >= 2 crash cycles" was expected to fit inside
+        // it. That coupling made the test's pass/fail depend on this host's
+        // fsync throughput on the day it runs: durability=Os makes every
+        // append a real fdatasync, and at the observed slow-disk p50 of
+        // 4-8ms the sequential driver tops out around ~350 actions/s — only
+        // ~7000 actions fit in 20s, short of the 8000 needed for a 2nd
+        // crash cycle at crash_every_actions=4000, so the test flaked on
+        // slow-disk days though recovery itself was fine.
+        //
+        // Fix: crash cycles are still triggered strictly on the
+        // deterministic ACTION COUNT (never wall-clock) — the store state at
+        // each crash point still reproduces exactly on any machine — but
+        // `min_crash_cycles` now makes the run stop as soon as 2 cycles have
+        // actually landed, instead of requiring them to land inside a fixed
+        // window. `duration` becomes a generous HARD TIMEOUT (not a target
+        // to fill): on a normal-speed host the run finishes in a few
+        // seconds once 2 cycles complete; on a slow-disk day like today's it
+        // just takes longer, up to 80s, while still exercising the same
+        // crash/reopen/reconcile machinery. If crash-recovery itself were
+        // broken (hangs, or cycles never complete), the run still bails out
+        // at the 80s hard timeout with `report.crashes < 2` and the
+        // `report.crashes >= 2` assertion below fails the test — 0 crashes
+        // never silently passes.
+        //
+        // 80s was chosen with margin: verified against BOTH today's ambient
+        // slow-disk conditions (p50 fdatasync 8.19ms, 2 cycles landed at
+        // ~22s) AND a synthetic heavy-parallel-fsync-load run (mean
+        // fdatasync 14-19ms, repeated "DEGRADED" >50ms stalls, 2 cycles
+        // still landed at ~67s, comfortably inside 80s). Combined with the
+        // ~5s crashless test below, total worst-case file runtime stays
+        // under the ~90s bound.
+        duration: Duration::from_secs(80),
         streams: 32,
         writers: 4,
         subscribers: 3,
-        // Deterministic crash trigger: every 4000 actions (~6s at the dev
-        // box's action rate) → ~3 crash cycles inside 20s, >= the required 2 —
-        // and the same store state at each crash point on any machine.
         crash_every_actions: 4000,
+        min_crash_cycles: 2,
         crash_mode: CrashMode::DropReopen,
         seed: 0xC0FFEE,
         dir: dir.clone(),

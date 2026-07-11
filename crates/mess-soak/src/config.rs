@@ -44,6 +44,19 @@ pub struct Config {
     /// machines and CPU load (the action stream is a pure function of
     /// `(seed, config)`).
     pub crash_every_actions: u64,
+    /// Drop-reopen mode: if nonzero, the run stops as soon as this many crash
+    /// cycles have completed, even if `duration` has not yet elapsed. This
+    /// decouples "how many recovery cycles get proven" from wall-clock
+    /// throughput (bn-1av): on a slow-fsync host the driver just keeps going
+    /// — still triggering crashes strictly on the deterministic action count,
+    /// never on a clock — until this many cycles land, rather than requiring
+    /// a fixed action count to fit inside a fixed time window. `duration`
+    /// remains the hard timeout: if crash cycles never reach this many before
+    /// it elapses, the run ends anyway with whatever `report.crashes` it has
+    /// — the caller's own assertion on `report.crashes` is what turns that
+    /// into a failure, not this knob. `0` disables (run the full `duration`
+    /// regardless of crash count — the pre-bn-1av behavior).
+    pub min_crash_cycles:    u64,
     /// Sigkill mode ONLY: wall-clock delay before the child is `SIGKILL`ed.
     /// Wall-clock is inherent there (the kill races a live child process), so
     /// that mode is not action-deterministic. `ZERO` falls back to 5s.
@@ -93,6 +106,7 @@ impl Default for Config {
             // but deterministic: exactly this many actions between crashes on
             // ANY machine, however fast or loaded.
             crash_every_actions: 20_000,
+            min_crash_cycles:    0,
             crash_every:         Duration::from_secs(30),
             seed:                0x50AC_5EED,
             dir:                 default_dir(),
@@ -137,11 +151,20 @@ impl Config {
     #[must_use]
     pub fn summary(&self) -> String {
         let crash = match self.crash_mode {
-            CrashMode::DropReopen => format!(
-                "crash_every_actions={} (sequential driver, no writer \
-                 concurrency)",
-                self.crash_every_actions
-            ),
+            CrashMode::DropReopen => {
+                let mut s = format!(
+                    "crash_every_actions={} (sequential driver, no writer \
+                     concurrency)",
+                    self.crash_every_actions
+                );
+                if self.min_crash_cycles > 0 {
+                    s.push_str(&format!(
+                        ", stop_after={}_cycles",
+                        self.min_crash_cycles
+                    ));
+                }
+                s
+            }
             CrashMode::Sigkill => {
                 format!(
                     "kill_delay={:?} writers={}",

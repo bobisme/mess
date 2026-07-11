@@ -84,6 +84,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
             "--crash-every-actions" => {
                 cfg.crash_every_actions = parse_u64(value()?)?
             }
+            "--min-crash-cycles" => cfg.min_crash_cycles = parse_u64(value()?)?,
             "--crash-every" => cfg.crash_every = parse_secs(value()?)?,
             "--seed" => cfg.seed = parse_u64(value()?)?,
             "--dir" => cfg.dir = PathBuf::from(value()?),
@@ -170,12 +171,15 @@ fn print_help() {
          driver is strictly sequential [{writers}]\n--subscribers <n>          \
          target concurrent subscribers [{subs}]\n--crash-every-actions <n>  \
          drop mode: actions between crash cycles (deterministic,\nnever \
-         wall-clock); 0 = never [{cea}]\n--crash-every <secs>       sigkill \
-         mode ONLY: wall delay before the child is killed \
-         [{crash}]\n--crash-mode <drop|sigkill>  drop-and-reopen (in-proc) or \
-         fork+SIGKILL child [drop]\n--seed <u64|0xHEX>         master seed; \
-         deterministic per seed [{seed:#x}]\n--dir <path>               store \
-         dir; MUST be EMPTY/fresh and MUST NOT be tmpfs\n(both refused) \
+         wall-clock); 0 = never [{cea}]\n--min-crash-cycles <n>     drop \
+         mode: stop as soon as this many crash cycles land, even\nbefore \
+         --duration elapses; --duration stays the hard timeout; 0 = off \
+         [{mcc}]\n--crash-every <secs>       sigkill mode ONLY: wall delay \
+         before the child is killed [{crash}]\n--crash-mode <drop|sigkill>  \
+         drop-and-reopen (in-proc) or fork+SIGKILL child [drop]\n--seed \
+         <u64|0xHEX>         master seed; deterministic per seed \
+         [{seed:#x}]\n--dir <path>               store dir; MUST be \
+         EMPTY/fresh and MUST NOT be tmpfs\n(both refused) \
          [$HOME/.cache/mess-soak]\n--dump-extras <path>       write the \
          extra-event classification JSON there if the\npost-reopen reconcile \
          finds illegal extras\n--zipf-skew <f>            0=uniform, \
@@ -195,6 +199,7 @@ fn print_help() {
         writers = d.writers,
         subs = d.subscribers,
         cea = d.crash_every_actions,
+        mcc = d.min_crash_cycles,
         crash = d.crash_every.as_secs(),
         seed = d.seed,
         skew = d.zipf_skew,

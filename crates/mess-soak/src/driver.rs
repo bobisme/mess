@@ -175,7 +175,21 @@ impl Driver {
     pub async fn run(&mut self) -> Result<SoakReport, Aborted> {
         println!("[soak] starting\n  {}", self.cfg.summary());
         let deadline = self.started + self.cfg.duration;
-        while Instant::now() < deadline {
+        loop {
+            if Instant::now() >= deadline {
+                break;
+            }
+            // bn-1av: once the caller's required crash-cycle count has
+            // landed, stop — `duration` is a hard timeout, not a target to
+            // fill. This makes the *number of proven recovery cycles* the
+            // exit criterion instead of "did enough actions fit in a fixed
+            // window", so the test stays correct however fast or slow
+            // fsync is on this host today.
+            if self.cfg.min_crash_cycles > 0
+                && self.report.crashes >= self.cfg.min_crash_cycles
+            {
+                break;
+            }
             self.step().await?;
 
             // Crash trigger pinned to the ACTION COUNT, not wall-clock: the
