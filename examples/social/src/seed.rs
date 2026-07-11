@@ -1,77 +1,168 @@
-//! The deterministic demo-corpus generator (bn-1mw).
+//! The deterministic corpus generator (bn-1mw; scale tiers + pipelining
+//! bn-o9z).
 //!
-//! [`generate`] drives ~50 users, a Zipf-ish follow graph, ~500 posts with
-//! varied phrase-combinator bodies, Zipf-distributed likes, a handful of
-//! deletes, and a handful of unfollows — **entirely through
-//! [`WriteOps`](crate::contracts::WriteOps)**, i.e. one real
-//! [`EventStore::command`](mess_store::EventStore::command) call per action,
-//! the same call path a real client makes. There is no raw-append shortcut:
-//! every invariant (`handle_is_valid`, no self-follow, no double-like, …) is
-//! enforced by the real `Decide` impls exactly as in production, which is
-//! also why the generator tracks its own shadow state (who follows whom, who
-//! liked what) — not to skip validation, but to avoid *wasting* a command
-//! attempt on a rejection it can see coming for free.
+//! [`generate`] drives users, a Zipf-ish follow graph, posts with varied
+//! phrase-combinator bodies, Zipf-distributed likes, a handful of deletes, and
+//! a handful of unfollows — **entirely through
+//! [`WriteOps`](crate::contracts::WriteOps)**, i.e. one real warm-path
+//! [`EventStore::command_cached`](mess_store::EventStore::command_cached) call
+//! per action, the same call path a real client makes. There is no raw-append
+//! shortcut: every invariant (`handle_is_valid`, no self-follow, no
+//! double-like, …) is enforced by the real `Decide` impls exactly as in
+//! production, which is also why the planner tracks shadow state (who follows
+//! whom, who liked what) — not to skip validation, but to avoid *drawing* a
+//! command it knows would be rejected.
 //!
-//! Generic over `B: Backend` (not pinned to [`crate::store_backend::Store`])
-//! so the same generator seeds a real on-disk [`mess_store::LogEngine`] *and*
-//! an in-memory test store —
-//! [`tests::generate_is_deterministic_for_a_fixed_seed`] below exercises the
+//! Two tiers, selected by [`SeedConfig`]: [`SeedConfig::demo`] is the
+//! historical ~1,488-event world (sequential, byte-identical),
+//! [`SeedConfig::large`] is a ~50k+-event world with realistic skew (celebrity
+//! users, viral posts, a long tail), seeded with bounded-concurrency pipelining
+//! per `docs/perf/bulk-writes.md`.
+//!
+//! Generic over `B: SnapshotStore + Clone` (not pinned to
+//! [`crate::store_backend::Store`]) so the same generator seeds a real on-disk
+//! snapshot store *and* an in-memory test one —
+//! [`tests::demo_seed_is_byte_identical_for_a_fixed_seed`] below exercises the
 //! latter.
 //!
-//! # Determinism
+//! # Determinism (plan / execute split)
 //!
-//! Every draw comes from one [`StdRng`] seeded from
-//! [`SeedConfig::seed`](SeedConfig::seed) — no wall-clock, no thread
-//! scheduling dependence in the *shape* of the corpus (handles, display
-//! names, bodies, the follow/like graphs, which posts get deleted). Two runs
-//! with the same seed produce the same sequence of commands in the same
-//! order. (The event *ids* embed randomness too, via [`Id::from_u128`] fed by
-//! the same RNG, so they are reproducible byte-for-byte as well — the whole
-//! corpus, not just its shape, is a pure function of `seed`.)
+//! [`plan_corpus`] draws the whole corpus from one [`StdRng`] seeded from
+//! [`SeedConfig::seed`](SeedConfig::seed) — no wall-clock, no store, no
+//! `await` — with a fixed draw order, so the *corpus* (handles, display names,
+//! bodies, the follow/like graphs, which posts get deleted, and the
+//! [`Id::from_u128`]-drawn ids themselves) is a pure function of `seed`.
+//! Execution then honors [`SeedConfig::concurrency`]: sequential execution
+//! (demo) reproduces the historical **byte-identical** global log; pipelined
+//! execution (large) commits distinct streams concurrently, so per-stream
+//! heads and total counts stay deterministic while the global interleaving does
+//! not — see [`SeedConfig`]'s docs and the two determinism tests below.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use ident::Id;
-use mess_store::{Backend, EventStore};
+use mess_store::{EventStore, SnapshotStore};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
+use tokio::task::JoinSet;
 
-use crate::contracts::WriteOps;
+use crate::contracts::{WriteError, WriteOps};
 
 // ===========================================================================
 // Config / report
 // ===========================================================================
 
-/// Corpus shape. The `Default` is the bone's target shape (~50 users, ~500
-/// posts, …); override individual fields (e.g. in a fast test) via struct
-/// update syntax: `SeedConfig { users: 8, posts: 20, ..SeedConfig::default()
-/// }`.
+/// Corpus shape. The `Default` is the **demo** tier (~50 users, ~500 posts, the
+/// deterministic 1,488-event world the README tours); override individual
+/// fields (e.g. in a fast test) via struct update syntax:
+/// `SeedConfig { users: 8, posts: 20, ..SeedConfig::default() }`. Use
+/// [`SeedConfig::large`] for the ~50k+-event scale tier.
+///
+/// # Determinism and `concurrency`
+///
+/// The *corpus* — every id, handle, body, and the follow/like graphs — is a
+/// pure function of [`seed`](Self::seed): [`plan_corpus`] draws it from one
+/// seeded [`StdRng`] with a fixed draw order, entirely before any store write.
+/// [`concurrency`](Self::concurrency) then only affects **how** the planned
+/// commands are executed, never *what* they are:
+///
+/// - `concurrency == 1` (demo default) executes every command sequentially in
+///   plan order, so the global log is **byte-identical** run-to-run (the
+///   demo-tier determinism test asserts exactly this).
+/// - `concurrency > 1` (large tier) fans the commands of each phase out over
+///   [`JoinSet`] with a bounded window (the `docs/perf/bulk-writes.md`
+///   pattern), across **distinct** streams only — so per-stream event order is
+///   still deterministic and folded heads/counts are identical run-to-run, but
+///   the *global interleaving* (and thus each event's global position) is not.
+///   The large-tier determinism test asserts equal counts + watermark + equal
+///   spot-checked stream heads accordingly.
 #[derive(Debug, Clone)]
 pub struct SeedConfig {
     /// The PRNG seed. Same seed, same corpus.
-    pub seed:      u64,
+    pub seed:                u64,
     /// How many users to register.
-    pub users:     usize,
+    pub users:               usize,
     /// How many posts to create.
-    pub posts:     usize,
+    pub posts:               usize,
     /// How many posts to delete (author-authorized) after they have
     /// accumulated some likes.
-    pub deletes:   usize,
+    pub deletes:             usize,
     /// How many follow edges to retract after the follow graph is built.
-    pub unfollows: usize,
+    pub unfollows:           usize,
+    /// Average target likes per post, as a multiplier on
+    /// [`posts`](Self::posts) (`target_likes = round(posts *
+    /// like_factor)`). Demo uses `1.6`; the large tier turns this up so a
+    /// handful of Zipf-hot posts collect thousands of likes.
+    pub like_factor:         f64,
+    /// Typical follow out-degree ceiling: each user's out-degree is drawn Zipf
+    /// over `1..=out_degree` (skewed toward the low end), so the mean is well
+    /// below this. Larger values thicken the follow graph, which — with the
+    /// Zipf *popularity* target — is what gives a couple of celebrity users
+    /// thousands of followers at the large tier.
+    pub out_degree:          usize,
+    /// Zipf exponent for *who gets followed* — the follow-target weighting:
+    /// rank `r`'s weight is `1 / (r+1)^exponent`, so a larger exponent
+    /// concentrates followers on the top few users. Demo uses `1.0` (the
+    /// historical value, preserved for byte-identity); the large tier sharpens
+    /// it so the top one or two users become celebrities with thousands of
+    /// followers. (Post *like* popularity is a separate fixed `1.1` — sharp
+    /// enough at any scale that the top posts go viral — so it is not
+    /// parameterized here.)
+    pub popularity_exponent: f64,
+    /// Bounded execution concurrency (see the struct docs). `1` = sequential,
+    /// byte-identical demo tier; `>1` = pipelined large tier.
+    pub concurrency:         usize,
 }
 
 impl Default for SeedConfig {
-    fn default() -> Self {
+    fn default() -> Self { Self::demo() }
+}
+
+impl SeedConfig {
+    /// The **demo** tier: the deterministic ~1,488-event world the README tours
+    /// and every existing test uses. Sequential (byte-identical) by default.
+    #[must_use]
+    pub fn demo() -> Self {
         Self {
-            seed:      1337,
-            users:     50,
-            posts:     500,
-            deletes:   30,
-            unfollows: 20,
+            seed:                1337,
+            users:               50,
+            posts:               500,
+            deletes:             30,
+            unfollows:           20,
+            like_factor:         1.6,
+            out_degree:          12,
+            popularity_exponent: 1.0,
+            concurrency:         1,
+        }
+    }
+
+    /// The **large** tier: a deterministic bigger world with realistic skew —
+    /// ~3.5k users, ~3.5k posts, a sharply-Zipf follow graph whose top one or
+    /// two users are celebrities with thousands of followers, and ~38k likes
+    /// whose top posts go viral with thousands each. Totals ~50k+ events.
+    /// Pipelined (`concurrency = 32`) so it rides the durable committer's
+    /// group-commit window (see `docs/perf/bulk-writes.md`) — under a
+    /// fsync-per-batch durability it seeds in a fraction of the sequential
+    /// wall-clock.
+    #[must_use]
+    pub fn large(seed: u64) -> Self {
+        Self {
+            seed,
+            users: 3_500,
+            posts: 3_500,
+            deletes: 200,
+            unfollows: 200,
+            like_factor: 10.0,
+            out_degree: 20,
+            // Sharper than demo's 1.0 so the top users become genuine
+            // celebrities (thousands of followers) and the top posts genuinely
+            // go viral, rather than a gentle long tail.
+            popularity_exponent: 1.5,
+            concurrency: 32,
         }
     }
 }
@@ -389,43 +480,62 @@ fn gen_body(rng: &mut StdRng) -> String {
 }
 
 // ===========================================================================
-// Generation
+// Planning: the deterministic, store-free corpus draw
 // ===========================================================================
 
-/// Generate the demo corpus into `store`, entirely through
-/// [`WriteOps`](crate::contracts::WriteOps) — see the module docs.
+/// The fully-planned corpus: every command's arguments, drawn from the seeded
+/// [`StdRng`] with a fixed draw order, **before** any store write. Splitting
+/// planning from execution is what lets execution be either sequential
+/// (byte-identical demo tier) or pipelined (large tier) without changing a
+/// single id, body, or edge — see [`SeedConfig`]'s determinism docs.
 ///
-/// Generic over `B: Backend` so callers can point this at a real on-disk
-/// store or a throwaway test one.
-pub async fn generate<B>(store: &EventStore<B>, cfg: &SeedConfig) -> SeedReport
-where
-    B: Backend,
-    B::Error: std::fmt::Display,
-{
-    let start = Instant::now();
+/// Each `Vec` is one execution *phase*, and within a phase every entry targets
+/// a **distinct** stream (users by id, follows/likes by their unique edge,
+/// posts by id), which is exactly what makes the phase safe to fan out
+/// concurrently over distinct streams (`docs/perf/bulk-writes.md` §2). Phases
+/// run in order, so the two streams an id touches across phases (a post's
+/// create then delete, an edge's follow then unfollow) are never concurrent.
+struct Corpus {
+    /// `(user_id, handle, display_name)`.
+    users:     Vec<(Id, String, String)>,
+    /// `(follower_id, target_id)`.
+    follows:   Vec<(Id, Id)>,
+    /// `(post_id, author_id, body)`.
+    posts:     Vec<(Id, Id, String)>,
+    /// `(post_id, user_id)`.
+    likes:     Vec<(Id, Id)>,
+    /// `(post_id, author_id)`.
+    deletes:   Vec<(Id, Id)>,
+    /// `(follower_id, target_id)`.
+    unfollows: Vec<(Id, Id)>,
+}
+
+/// Draw the whole corpus deterministically from `cfg.seed`. Pure: no store, no
+/// clock, no `await`. The RNG draw order is pinned (handles→names→ids for
+/// users; shuffle→degree→targets for follows; author→body→id for posts;
+/// post→user for likes; the two shuffles for deletes/unfollows), so the demo
+/// tier reproduces its historical byte-identical 1,488-event corpus and any
+/// tier is a pure function of the seed.
+fn plan_corpus(cfg: &SeedConfig) -> Corpus {
     let mut rng = StdRng::seed_from_u64(cfg.seed);
-    let mut report = SeedReport::default();
 
     // --- users -------------------------------------------------------------
     let mut used_handles = HashSet::new();
     let mut user_ids: Vec<Id> = Vec::with_capacity(cfg.users);
+    let mut users: Vec<(Id, String, String)> = Vec::with_capacity(cfg.users);
     for _ in 0..cfg.users {
         let handle = gen_handle(&mut rng, &mut used_handles);
         let display = gen_display_name(&mut rng);
         let id = Id::from_u128(rng.random::<u128>());
-        store.register(id, handle, display).await.expect(
-            "seed: register should never be rejected (handles are validated, \
-             ids are fresh)",
-        );
         user_ids.push(id);
-        report.users += 1;
+        users.push((id, handle, display));
     }
 
     // --- follow graph (Zipf-ish: a few hub users end up widely followed) --
-    let popularity = ZipfWeights::new(user_ids.len(), 1.0);
+    let popularity = ZipfWeights::new(user_ids.len(), cfg.popularity_exponent);
     // Out-degree per follower is itself Zipf-skewed toward small numbers
     // (most users follow a few people; a few follow a lot).
-    let out_degree = ZipfWeights::new(12, 1.5);
+    let out_degree = ZipfWeights::new(cfg.out_degree, 1.5);
     let mut following: Vec<HashSet<usize>> =
         vec![HashSet::new(); user_ids.len()];
     // Parallel to `following`, but insertion-ordered: the unfollow phase below
@@ -433,7 +543,8 @@ where
     // per-process (not seeded by `cfg.seed`), so iterating `following` there
     // would silently reintroduce nondeterminism into an otherwise
     // seed-pure generator. Recording edges as we create them sidesteps it.
-    let mut edge_list: Vec<(usize, usize)> = Vec::new();
+    let mut edge_index: Vec<(usize, usize)> = Vec::new();
+    let mut follows: Vec<(Id, Id)> = Vec::new();
     let mut follow_order: Vec<usize> = (0..user_ids.len()).collect();
     follow_order.shuffle(&mut rng);
     for &fi in &follow_order {
@@ -446,20 +557,10 @@ where
             if ti == fi || following[fi].contains(&ti) {
                 continue;
             }
-            match store.follow(user_ids[fi], user_ids[ti]).await {
-                Ok(_) => {
-                    following[fi].insert(ti);
-                    edge_list.push((fi, ti));
-                    report.follows += 1;
-                    added += 1;
-                }
-                Err(e) => {
-                    // Should not happen — `following[fi]` mirrors exactly what
-                    // the aggregate would reject on. Surfaced rather than
-                    // silently swallowed in case it ever does (dogfood signal).
-                    eprintln!("seed: unexpected follow rejection: {e}");
-                }
-            }
+            following[fi].insert(ti);
+            edge_index.push((fi, ti));
+            follows.push((user_ids[fi], user_ids[ti]));
+            added += 1;
         }
     }
 
@@ -467,72 +568,210 @@ where
     let author_weights = ZipfWeights::new(user_ids.len(), 0.8);
     let mut post_ids: Vec<Id> = Vec::with_capacity(cfg.posts);
     let mut post_author: Vec<usize> = Vec::with_capacity(cfg.posts);
+    let mut posts: Vec<(Id, Id, String)> = Vec::with_capacity(cfg.posts);
     for _ in 0..cfg.posts {
         let ai = author_weights.sample(&mut rng);
         let body = gen_body(&mut rng);
         let id = Id::from_u128(rng.random::<u128>());
-        store.create_post(id, user_ids[ai], body).await.expect(
-            "seed: create_post should never be rejected (bodies are 1..=500 \
-             chars)",
-        );
         post_ids.push(id);
         post_author.push(ai);
-        report.posts += 1;
+        posts.push((id, user_ids[ai], body));
     }
 
     // --- likes (Zipf on posts: a handful go semi-viral) --------------------
+    let mut likes: Vec<(Id, Id)> = Vec::new();
     if !post_ids.is_empty() {
         let post_popularity = ZipfWeights::new(post_ids.len(), 1.1);
         let mut liked: Vec<HashSet<usize>> =
             vec![HashSet::new(); post_ids.len()];
-        let target_likes = (cfg.posts as f64 * 1.6).round() as usize;
+        let target_likes =
+            (cfg.posts as f64 * cfg.like_factor).round() as usize;
         let mut attempts = 0usize;
-        while report.likes < target_likes && attempts < target_likes.max(1) * 4
-        {
+        while likes.len() < target_likes && attempts < target_likes.max(1) * 4 {
             attempts += 1;
             let pi = post_popularity.sample(&mut rng);
             let ui = rng.random_range(0..user_ids.len());
             if liked[pi].contains(&ui) {
                 continue;
             }
-            match store.like(post_ids[pi], user_ids[ui]).await {
-                Ok(_) => {
-                    liked[pi].insert(ui);
-                    report.likes += 1;
-                }
-                Err(e) => eprintln!("seed: unexpected like rejection: {e}"),
-            }
+            liked[pi].insert(ui);
+            likes.push((post_ids[pi], user_ids[ui]));
         }
     }
 
     // --- deletes (author-authorized, after posts have accrued likes) -------
     let mut delete_candidates: Vec<usize> = (0..post_ids.len()).collect();
     delete_candidates.shuffle(&mut rng);
-    for &pi in delete_candidates.iter().take(cfg.deletes.min(post_ids.len())) {
-        match store.delete_post(post_ids[pi], user_ids[post_author[pi]]).await {
-            Ok(_) => report.deletes += 1,
-            Err(e) => eprintln!("seed: unexpected delete rejection: {e}"),
-        }
-    }
+    let deletes: Vec<(Id, Id)> = delete_candidates
+        .iter()
+        .take(cfg.deletes.min(post_ids.len()))
+        .map(|&pi| (post_ids[pi], user_ids[post_author[pi]]))
+        .collect();
 
     // --- unfollows (retract a handful of the follow edges just built) ------
-    edge_list.shuffle(&mut rng);
-    for &(fi, ti) in edge_list.iter().take(cfg.unfollows.min(edge_list.len())) {
-        match store.unfollow(user_ids[fi], user_ids[ti]).await {
-            Ok(_) => report.unfollows += 1,
-            Err(e) => eprintln!("seed: unexpected unfollow rejection: {e}"),
+    edge_index.shuffle(&mut rng);
+    let unfollows: Vec<(Id, Id)> = edge_index
+        .iter()
+        .take(cfg.unfollows.min(edge_index.len()))
+        .map(|&(fi, ti)| (user_ids[fi], user_ids[ti]))
+        .collect();
+
+    Corpus { users, follows, posts, likes, deletes, unfollows }
+}
+
+// ===========================================================================
+// Execution: sequential (demo) or bounded-concurrency pipelined (large)
+// ===========================================================================
+
+/// Drive an iterator of single-command futures to completion with bounded
+/// concurrency `k`. `k <= 1` awaits them **in order** (the byte-identical demo
+/// path); `k > 1` runs a bounded [`JoinSet`] window of `k` in flight, refilled
+/// one-for-one as each completes — the `docs/perf/bulk-writes.md` §2.2 pattern.
+///
+/// Every future is one seeded `WriteOps` command. A seeded corpus never
+/// produces a rejection (the plan mirrors every invariant: valid handles,
+/// distinct edges, authorized deletes), so a `WriteError` here is a real bug
+/// and panics loudly rather than being silently swallowed.
+async fn drive<I, Fut>(iter: I, k: usize)
+where
+    I: IntoIterator<Item = Fut>,
+    Fut: Future<Output = Result<u64, WriteError>> + Send + 'static,
+{
+    if k <= 1 {
+        for fut in iter {
+            fut.await.expect("seed: command unexpectedly rejected");
+        }
+        return;
+    }
+    let mut it = iter.into_iter();
+    let mut set: JoinSet<Result<u64, WriteError>> = JoinSet::new();
+    for fut in it.by_ref().take(k) {
+        set.spawn(fut);
+    }
+    while let Some(joined) = set.join_next().await {
+        joined
+            .expect("seed: command task panicked")
+            .expect("seed: command unexpectedly rejected");
+        if let Some(fut) = it.next() {
+            set.spawn(fut);
         }
     }
+}
 
-    report.elapsed = start.elapsed();
-    report
+/// Generate a corpus into `store`, entirely through
+/// [`WriteOps`](crate::contracts::WriteOps) — the same warm-path
+/// [`command_cached`](mess_store::EventStore::command_cached) call a real
+/// client makes, one per action, with every invariant enforced by the real
+/// `Decide` impls (see the module docs).
+///
+/// Planning is deterministic ([`plan_corpus`]); execution honors
+/// [`SeedConfig::concurrency`] — sequential and byte-identical at the demo
+/// tier, bounded-concurrency pipelined over distinct streams at the large tier.
+/// The returned [`SeedReport`] carries the committed counts and the measured
+/// execution wall-clock (planning excluded — it is store-free and negligible).
+///
+/// Generic over `B: SnapshotStore + Clone` (not pinned to
+/// [`crate::store_backend::Store`]) so the same generator seeds a real on-disk
+/// snapshot store *and* an in-memory test one. `Clone` is needed for the
+/// pipelined fan-out: each in-flight task owns a cheap clone of the store
+/// handle (they share one backend + warm cache), per the bulk-writes guide.
+pub async fn generate<B>(store: &EventStore<B>, cfg: &SeedConfig) -> SeedReport
+where
+    B: SnapshotStore + Clone,
+    B::Error: std::fmt::Display,
+{
+    let corpus = plan_corpus(cfg);
+    let report = SeedReport {
+        users:     corpus.users.len(),
+        follows:   corpus.follows.len(),
+        posts:     corpus.posts.len(),
+        likes:     corpus.likes.len(),
+        deletes:   corpus.deletes.len(),
+        unfollows: corpus.unfollows.len(),
+        elapsed:   Duration::default(),
+    };
+    let k = cfg.concurrency;
+    let start = Instant::now();
+
+    // Phase order is the global-log order at the demo tier: users, follows,
+    // posts, likes, deletes, unfollows. Each phase's streams are distinct, and
+    // phases are sequential, so no stream is ever written concurrently with
+    // itself (create-before-delete, follow-before-unfollow both hold).
+    drive(
+        corpus.users.into_iter().map(|(id, handle, display)| {
+            let s = store.clone();
+            async move { s.register(id, handle, display).await }
+        }),
+        k,
+    )
+    .await;
+    drive(
+        corpus.follows.into_iter().map(|(f, t)| {
+            let s = store.clone();
+            async move { s.follow(f, t).await }
+        }),
+        k,
+    )
+    .await;
+    drive(
+        corpus.posts.into_iter().map(|(id, author, body)| {
+            let s = store.clone();
+            async move { s.create_post(id, author, body).await }
+        }),
+        k,
+    )
+    .await;
+    drive(
+        corpus.likes.into_iter().map(|(p, u)| {
+            let s = store.clone();
+            async move { s.like(p, u).await }
+        }),
+        k,
+    )
+    .await;
+    drive(
+        corpus.deletes.into_iter().map(|(p, by)| {
+            let s = store.clone();
+            async move { s.delete_post(p, by).await }
+        }),
+        k,
+    )
+    .await;
+    drive(
+        corpus.unfollows.into_iter().map(|(f, t)| {
+            let s = store.clone();
+            async move { s.unfollow(f, t).await }
+        }),
+        k,
+    )
+    .await;
+
+    SeedReport { elapsed: start.elapsed(), ..report }
 }
 
 #[cfg(test)]
 mod tests {
-    use mess_store::LogEngine;
+    use std::collections::{BTreeMap, HashMap};
+
+    use mess_store::{Backend, FjallSnapshotBackend, LogEngine, StoredRecord};
+    use mess_testkit::{SweepingTempDir, sweeping_temp_dir};
 
     use super::*;
+
+    /// A snapshot-backed store on a self-sweeping temp dir (the real-fs TMPDIR
+    /// rule). The returned [`SweepingTempDir`] guard must be held (and dropped
+    /// last) for the duration of the test.
+    fn snap_store(
+        tag: &str,
+    ) -> (EventStore<FjallSnapshotBackend<LogEngine>>, SweepingTempDir) {
+        let dir = sweeping_temp_dir(tag);
+        let engine =
+            LogEngine::open(dir.path().join("log")).expect("open engine");
+        let backend =
+            FjallSnapshotBackend::open(engine, dir.path().join("snap"))
+                .expect("open snapshot backend");
+        (EventStore::new(backend), dir)
+    }
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -543,14 +782,38 @@ mod tests {
     }
 
     fn small_cfg(seed: u64) -> SeedConfig {
-        SeedConfig { seed, users: 8, posts: 20, deletes: 2, unfollows: 2 }
+        SeedConfig {
+            seed,
+            users: 8,
+            posts: 20,
+            deletes: 2,
+            unfollows: 2,
+            ..SeedConfig::demo()
+        }
+    }
+
+    /// A `stream_id -> Vec<(message_type, data)>` view of a store's whole log:
+    /// the per-stream event sequence, independent of the global interleaving.
+    /// Two stores seeded from the same seed have identical per-stream maps
+    /// regardless of execution concurrency (pipelining reorders *across*
+    /// streams, never *within* one).
+    async fn per_stream_events<B: Backend>(
+        store: &EventStore<B>,
+    ) -> BTreeMap<String, Vec<(String, Vec<u8>)>> {
+        let log: Vec<StoredRecord> =
+            store.backend().read_global(None, 1_000_000).await.unwrap();
+        let mut map: BTreeMap<String, Vec<(String, Vec<u8>)>> = BTreeMap::new();
+        for rec in log {
+            map.entry(rec.stream_id.clone())
+                .or_default()
+                .push((rec.message_type.clone(), rec.data.clone()));
+        }
+        map
     }
 
     #[tokio::test]
     async fn generate_produces_the_requested_shape() {
-        let dir = temp_dir("shape");
-        let store =
-            EventStore::new(LogEngine::open(&dir).expect("open engine"));
+        let (store, _dir) = snap_store("shape");
         let report = generate(&store, &small_cfg(42)).await;
         assert_eq!(report.users, 8);
         assert_eq!(report.posts, 20);
@@ -560,21 +823,20 @@ mod tests {
         assert_eq!(report.unfollows, 2);
     }
 
-    /// The determinism contract the whole bone hinges on: same seed, same
-    /// corpus. Compares the two stores' global logs event-for-event —
-    /// stream id, wire message type, and encoded payload — which is a
-    /// stronger check than comparing folded state (it also pins event
-    /// *order* and the generated [`Id`]s themselves).
+    /// The demo-tier determinism contract the whole bone hinges on: same seed,
+    /// **byte-identical** global log. Compares the two stores' global logs
+    /// event-for-event — stream id, wire message type, and encoded payload —
+    /// which is a stronger check than comparing folded state (it also pins
+    /// event *order* and the generated [`Id`]s themselves). Demo tier is
+    /// sequential (`concurrency == 1`), so the global interleaving is
+    /// deterministic too.
     #[tokio::test]
-    async fn generate_is_deterministic_for_a_fixed_seed() {
-        let dir_a = temp_dir("det-a");
-        let dir_b = temp_dir("det-b");
-        let store_a =
-            EventStore::new(LogEngine::open(&dir_a).expect("open engine"));
-        let store_b =
-            EventStore::new(LogEngine::open(&dir_b).expect("open engine"));
+    async fn demo_seed_is_byte_identical_for_a_fixed_seed() {
+        let (store_a, _da) = snap_store("det-a");
+        let (store_b, _db) = snap_store("det-b");
 
         let cfg = small_cfg(7);
+        assert_eq!(cfg.concurrency, 1, "demo tier is sequential");
         generate(&store_a, &cfg).await;
         generate(&store_b, &cfg).await;
 
@@ -587,6 +849,144 @@ mod tests {
             assert_eq!(a.message_type, b.message_type);
             assert_eq!(a.data, b.data);
         }
+    }
+
+    /// Pipelining preserves the corpus: a demo-shaped seed run **sequentially**
+    /// and **pipelined** (`concurrency > 1`) commits the exact same per-stream
+    /// event sequences and the same total event count — only the global
+    /// interleaving differs. This is the property the large-tier determinism
+    /// rests on, proven cheaply at demo scale in the normal test run.
+    #[tokio::test]
+    async fn pipelined_execution_matches_sequential_per_stream() {
+        let (seq_store, _ds) = snap_store("pipe-seq");
+        let (pipe_store, _dp) = snap_store("pipe-conc");
+
+        let seq_cfg = small_cfg(11);
+        let pipe_cfg = SeedConfig { concurrency: 8, ..seq_cfg.clone() };
+
+        let seq_report = generate(&seq_store, &seq_cfg).await;
+        let pipe_report = generate(&pipe_store, &pipe_cfg).await;
+
+        assert_eq!(seq_report.users, pipe_report.users);
+        assert_eq!(seq_report.follows, pipe_report.follows);
+        assert_eq!(seq_report.posts, pipe_report.posts);
+        assert_eq!(seq_report.likes, pipe_report.likes);
+
+        let seq_map = per_stream_events(&seq_store).await;
+        let pipe_map = per_stream_events(&pipe_store).await;
+        assert_eq!(
+            seq_map, pipe_map,
+            "per-stream event sequences must be identical regardless of \
+             execution concurrency"
+        );
+    }
+
+    /// Max follower count (net of unfollows) and max likes-on-one-post in a
+    /// planned corpus — the realistic-skew evidence.
+    fn skew(corpus: &Corpus) -> (usize, usize) {
+        let mut followers: HashMap<Id, i64> = HashMap::new();
+        for (_f, t) in &corpus.follows {
+            *followers.entry(*t).or_default() += 1;
+        }
+        for (_f, t) in &corpus.unfollows {
+            *followers.entry(*t).or_default() -= 1;
+        }
+        let mut likes: HashMap<Id, usize> = HashMap::new();
+        for (p, _u) in &corpus.likes {
+            *likes.entry(*p).or_default() += 1;
+        }
+        let max_followers =
+            followers.values().copied().max().unwrap_or(0).max(0) as usize;
+        let max_likes = likes.values().copied().max().unwrap_or(0);
+        (max_followers, max_likes)
+    }
+
+    fn corpus_events(c: &Corpus) -> usize {
+        c.users.len()
+            + c.follows.len()
+            + c.posts.len()
+            + c.likes.len()
+            + c.deletes.len()
+            + c.unfollows.len()
+    }
+
+    /// The large tier hits its target scale (>=50k events) and realistic skew
+    /// (a celebrity with thousands of followers, a viral post with thousands of
+    /// likes). Planning-only (no store), so it runs in the normal suite and its
+    /// printed line is the README's skew evidence.
+    #[test]
+    fn large_tier_has_target_scale_and_skew() {
+        let cfg = SeedConfig::large(1337);
+        let corpus = plan_corpus(&cfg);
+        let events = corpus_events(&corpus);
+        let (max_followers, max_likes) = skew(&corpus);
+        println!(
+            "large tier @seed=1337: {events} events ({} users, {} follows, {} \
+             posts, {} likes, {} deletes, {} unfollows); top user {} \
+             followers; hottest post {} likes",
+            corpus.users.len(),
+            corpus.follows.len(),
+            corpus.posts.len(),
+            corpus.likes.len(),
+            corpus.deletes.len(),
+            corpus.unfollows.len(),
+            max_followers,
+            max_likes,
+        );
+        assert!(
+            events >= 50_000,
+            "large tier must be >=50k events, got {events}"
+        );
+        assert!(
+            max_followers >= 2_000,
+            "a celebrity should have thousands of followers, got \
+             {max_followers}"
+        );
+        assert!(
+            max_likes >= 2_000,
+            "a hot post should have thousands of likes, got {max_likes}"
+        );
+    }
+
+    /// Large-scale determinism: two **pipelined** runs of the same seed commit
+    /// the same event count, reach the same final watermark, and produce
+    /// byte-identical per-stream event sequences (pipelining reorders only the
+    /// global interleaving). `#[ignore]`d because it seeds a big corpus twice;
+    /// run on demand with `--ignored`. Uses a mid-size tier so the whole test
+    /// stays within a couple of minutes while still exercising the pipeline at
+    /// tens of thousands of events.
+    #[tokio::test]
+    #[ignore = "seeds a large corpus twice; run on demand"]
+    async fn large_scale_pipelined_determinism() {
+        // ~24k events: big enough to exercise the pipeline hard, small enough
+        // to seed twice within the measured-run budget.
+        let cfg = SeedConfig {
+            users: 1_500,
+            posts: 1_500,
+            like_factor: 12.0,
+            ..SeedConfig::large(1337)
+        };
+        let (store_a, _da) = snap_store("large-det-a");
+        let (store_b, _db) = snap_store("large-det-b");
+        let ra = generate(&store_a, &cfg).await;
+        let rb = generate(&store_b, &cfg).await;
+
+        assert_eq!(ra.users, rb.users);
+        assert_eq!(ra.follows, rb.follows);
+        assert_eq!(ra.posts, rb.posts);
+        assert_eq!(ra.likes, rb.likes);
+
+        let wa = store_a.backend().read_global(None, 1_000_000).await.unwrap();
+        let wb = store_b.backend().read_global(None, 1_000_000).await.unwrap();
+        assert_eq!(wa.len(), wb.len(), "equal event count (final watermark)");
+        assert!(wa.len() > 20_000, "should be a large corpus");
+
+        // Full per-stream byte-compare (cheap enough at this scale).
+        assert_eq!(
+            per_stream_events(&store_a).await,
+            per_stream_events(&store_b).await,
+            "per-stream event sequences identical across pipelined runs"
+        );
     }
 
     // ---- fresh-dir guard ----

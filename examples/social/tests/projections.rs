@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use ident::Id;
 use mess_store::{Backend, EventStore, LogEngine, RecordToAppend, Version};
+use social::store_backend::{Store, open_store, read_handle};
 use social::{
     PROJECTION_VERSION, PostLookup, ProfileView, Projections, ReadModels,
     TimelinePage, WriteError, WriteOps,
@@ -30,17 +31,26 @@ fn fresh_dir() -> PathBuf {
     ))
 }
 
-/// A fresh store in a unique temp dir per test (mirrors `store_roundtrip`).
-fn fresh_store() -> EventStore<LogEngine> {
-    EventStore::new(LogEngine::open(fresh_dir()).expect("open engine"))
+/// A fresh warm-write store (`writer`) plus a subscribe-capable read handle
+/// (`reader`) over the **same** on-disk log, unique per test. Post-`bn-o9z` the
+/// two capabilities live on different backend types — the writer is a
+/// `SnapshotStore` (warm `command_cached`), the reader a `SubscribeBackend` the
+/// `Projections` pump tails — so a test that both writes and reads needs both
+/// handles. They share one `Arc`-backed `LogEngine`, so writes through `writer`
+/// are visible to `reader`'s subscription. See `social::store_backend`.
+fn fresh_store() -> (Store, EventStore<LogEngine>) {
+    let writer = open_store(&fresh_dir()).expect("open store");
+    let reader = read_handle(&writer);
+    (writer, reader)
 }
 
-/// A fresh store plus the dir it lives in — the checkpoint sidecar tests need
-/// the dir to place `<dir>/.social-projections.ckpt` next to the store.
-fn fresh_store_with_dir() -> (EventStore<LogEngine>, PathBuf) {
+/// [`fresh_store`] plus the store dir — the checkpoint sidecar tests need the
+/// dir to place `<dir>/.social-projections.ckpt` next to the store.
+fn fresh_store_with_dir() -> (Store, EventStore<LogEngine>, PathBuf) {
     let dir = fresh_dir();
-    let store = EventStore::new(LogEngine::open(&dir).expect("open engine"));
-    (store, dir)
+    let writer = open_store(&dir).expect("open store");
+    let reader = read_handle(&writer);
+    (writer, reader, dir)
 }
 
 // ===========================================================================
@@ -50,10 +60,9 @@ fn fresh_store_with_dir() -> (EventStore<LogEngine>, PathBuf) {
 /// alice follows bob (not carol); bob posts p1 & p3, carol posts p2; alice
 /// likes p1. Returns the store, a live projection caught up to `last`, the
 /// three user ids, the three post ids, and `last` (the final global position).
-async fn world()
--> (EventStore<LogEngine>, Projections<LogEngine>, [Id; 3], [Id; 3], u64) {
-    let store = fresh_store();
-    let proj = Projections::new(&store).await;
+async fn world() -> (Store, Projections<LogEngine>, [Id; 3], [Id; 3], u64) {
+    let (store, reader) = fresh_store();
+    let proj = Projections::new(&reader).await;
     let (alice, bob, carol) = (Id::new(), Id::new(), Id::new());
     let (p1, p2, p3) = (Id::new(), Id::new(), Id::new());
 
@@ -183,8 +192,8 @@ async fn deleted_post_drops_from_feeds_but_permalink_is_a_tombstone() {
 
 #[tokio::test]
 async fn wait_for_is_a_read_your_writes_barrier() {
-    let store = fresh_store();
-    let proj = Projections::new(&store).await;
+    let (store, reader) = fresh_store();
+    let proj = Projections::new(&reader).await;
     let (alice, post) = (Id::new(), Id::new());
     store.register(alice, "alice".into(), "Alice".into()).await.unwrap();
     let pos = store.create_post(post, alice, "hello".into()).await.unwrap();
@@ -203,8 +212,8 @@ async fn wait_for_is_a_read_your_writes_barrier() {
 
 #[tokio::test]
 async fn wait_for_blocks_until_a_later_write_lands() {
-    let store = fresh_store();
-    let proj = Projections::new(&store).await;
+    let (store, reader) = fresh_store();
+    let proj = Projections::new(&reader).await;
     let alice = Id::new();
     store.register(alice, "alice".into(), "Alice".into()).await.unwrap();
 
@@ -249,7 +258,7 @@ impl Rng {
 /// first, then issues a mix of follows/unfollows/posts/deletes/likes/unlikes;
 /// domain rejections are simply skipped (no event, no position).
 async fn drive(
-    store: &EventStore<LogEngine>,
+    store: &Store,
     seed: u64,
     users: &[(Id, String)],
     posts: &[Id],
@@ -381,10 +390,10 @@ async fn rebuild_equals_live_over_random_sequences() {
     let posts: Vec<Id> = (0..8).map(|_| Id::new()).collect();
 
     for seed in 1u64..=25 {
-        let store = fresh_store();
+        let (store, reader) = fresh_store();
         // The LIVE projection is built BEFORE any events and follows them
         // incrementally as the pump applies each batch.
-        let live = Projections::new(&store).await;
+        let live = Projections::new(&reader).await;
 
         let last = drive(&store, seed, &users, &posts).await;
         let last =
@@ -393,7 +402,7 @@ async fn rebuild_equals_live_over_random_sequences() {
 
         // The REBUILD projection is built AFTER all events: a full replay from
         // position 0, in possibly-larger batches than the live path saw.
-        let rebuilt = Projections::new(&store).await;
+        let rebuilt = Projections::new(&reader).await;
         rebuilt.wait_for(last).await;
 
         let live_snap = snapshot(&live, &users, &posts).await;
@@ -407,8 +416,8 @@ async fn rebuild_equals_live_over_random_sequences() {
 
 #[tokio::test]
 async fn follow_after_post_is_retroactive() {
-    let store = fresh_store();
-    let proj = Projections::new(&store).await;
+    let (store, reader) = fresh_store();
+    let proj = Projections::new(&reader).await;
     let (alice, bob) = (Id::new(), Id::new());
     let post = Id::new();
     store.register(alice, "alice".into(), "Alice".into()).await.unwrap();
@@ -463,8 +472,8 @@ async fn append_raw(
 /// crashed, on a log wider than the slice it models.
 #[tokio::test]
 async fn anomalies_are_counted_while_the_projection_stays_live_and_correct() {
-    let store = fresh_store();
-    let proj = Projections::new(&store).await;
+    let (store, reader) = fresh_store();
+    let proj = Projections::new(&reader).await;
 
     // A good record BEFORE any garbage: alice registers.
     let alice = Id::new();
@@ -472,7 +481,7 @@ async fn anomalies_are_counted_while_the_projection_stays_live_and_correct() {
 
     // 1. Unroutable stream: a category this projection does not model at all.
     let mut last = append_raw(
-        &store,
+        &reader,
         "widget-123",
         Version::NoStream,
         "widget.created",
@@ -482,7 +491,7 @@ async fn anomalies_are_counted_while_the_projection_stays_live_and_correct() {
 
     // 2. Unroutable stream: a `user-` stream whose suffix is not a valid Id.
     last = append_raw(
-        &store,
+        &reader,
         "user-not-an-id",
         Version::NoStream,
         "user.registered",
@@ -494,7 +503,7 @@ async fn anomalies_are_counted_while_the_projection_stays_live_and_correct() {
     // 3. Unknown event kind: a real user stream, an unrecognized message type.
     let dave = Id::new();
     last = append_raw(
-        &store,
+        &reader,
         &social::user_stream(dave),
         Version::NoStream,
         "user.teleported",
@@ -506,7 +515,7 @@ async fn anomalies_are_counted_while_the_projection_stays_live_and_correct() {
     // 4. Undecodable payload: known message type, garbage msgpack bytes.
     let eve = Id::new();
     last = append_raw(
-        &store,
+        &reader,
         &social::user_stream(eve),
         Version::NoStream,
         "user.registered",
@@ -591,13 +600,13 @@ fn manual_only_t() -> Duration { Duration::from_secs(3600) }
 #[tokio::test]
 async fn checkpoint_kill_restart_matches_from_zero_rebuild() {
     let (users, posts) = cast();
-    let (store, dir) = fresh_store_with_dir();
+    let (store, reader, dir) = fresh_store_with_dir();
     let ckpt = dir.join(".social-projections.ckpt");
 
     let last;
     {
         let proj = Projections::with_checkpoint_cadence(
-            &store,
+            &reader,
             ckpt.clone(),
             MANUAL_ONLY_N,
             manual_only_t(),
@@ -614,7 +623,7 @@ async fn checkpoint_kill_restart_matches_from_zero_rebuild() {
 
     // Restart: this MUST resume from the checkpoint, not replay from 0.
     let resumed = Projections::with_checkpoint_cadence(
-        &store,
+        &reader,
         ckpt.clone(),
         MANUAL_ONLY_N,
         manual_only_t(),
@@ -627,7 +636,7 @@ async fn checkpoint_kill_restart_matches_from_zero_rebuild() {
     resumed.wait_for(last).await;
 
     // A plain from-0 rebuild over the same log, for comparison.
-    let rebuilt = Projections::new(&store).await;
+    let rebuilt = Projections::new(&reader).await;
     rebuilt.wait_for(last).await;
 
     let resumed_snap = snapshot(&resumed, &users, &posts).await;
@@ -644,13 +653,13 @@ async fn checkpoint_kill_restart_matches_from_zero_rebuild() {
 #[tokio::test]
 async fn stale_projection_version_checkpoint_forces_full_rebuild() {
     let (users, posts) = cast();
-    let (store, dir) = fresh_store_with_dir();
+    let (store, reader, dir) = fresh_store_with_dir();
     let ckpt = dir.join(".social-projections.ckpt");
 
     let last;
     {
         let proj = Projections::with_checkpoint_cadence(
-            &store,
+            &reader,
             ckpt.clone(),
             MANUAL_ONLY_N,
             manual_only_t(),
@@ -669,7 +678,7 @@ async fn stale_projection_version_checkpoint_forces_full_rebuild() {
 
     // The stale-version checkpoint must be discarded -> full from-0 rebuild.
     let restarted = Projections::with_checkpoint_cadence(
-        &store,
+        &reader,
         ckpt.clone(),
         MANUAL_ONLY_N,
         manual_only_t(),
@@ -682,7 +691,7 @@ async fn stale_projection_version_checkpoint_forces_full_rebuild() {
     );
     restarted.wait_for(last).await;
 
-    let rebuilt = Projections::new(&store).await;
+    let rebuilt = Projections::new(&reader).await;
     rebuilt.wait_for(last).await;
     assert_eq!(
         snapshot(&restarted, &users, &posts).await,
@@ -696,13 +705,13 @@ async fn stale_projection_version_checkpoint_forces_full_rebuild() {
 #[tokio::test]
 async fn corrupt_checkpoint_forces_full_rebuild_without_panic() {
     let (users, posts) = cast();
-    let (store, dir) = fresh_store_with_dir();
+    let (store, reader, dir) = fresh_store_with_dir();
     let ckpt = dir.join(".social-projections.ckpt");
 
     let last;
     {
         let proj = Projections::with_checkpoint_cadence(
-            &store,
+            &reader,
             ckpt.clone(),
             MANUAL_ONLY_N,
             manual_only_t(),
@@ -721,7 +730,7 @@ async fn corrupt_checkpoint_forces_full_rebuild_without_panic() {
     std::fs::write(&ckpt, &bytes[..bytes.len() / 2]).expect("truncate");
 
     let restarted = Projections::with_checkpoint_cadence(
-        &store,
+        &reader,
         ckpt.clone(),
         MANUAL_ONLY_N,
         manual_only_t(),
@@ -733,7 +742,7 @@ async fn corrupt_checkpoint_forces_full_rebuild_without_panic() {
         "a truncated checkpoint must force a from-0 rebuild, not panic"
     );
     restarted.wait_for(last).await;
-    let rebuilt = Projections::new(&store).await;
+    let rebuilt = Projections::new(&reader).await;
     rebuilt.wait_for(last).await;
     assert_eq!(
         snapshot(&restarted, &users, &posts).await,
@@ -743,7 +752,7 @@ async fn corrupt_checkpoint_forces_full_rebuild_without_panic() {
     // Flavour 2: fully-garbage bytes.
     std::fs::write(&ckpt, [0xFFu8; 64]).expect("garbage");
     let restarted2 = Projections::with_checkpoint_cadence(
-        &store,
+        &reader,
         ckpt.clone(),
         MANUAL_ONLY_N,
         manual_only_t(),
@@ -770,14 +779,14 @@ async fn corrupt_checkpoint_forces_full_rebuild_without_panic() {
 #[tokio::test]
 async fn checkpoint_during_live_pump_resumes_only_the_suffix() {
     let (users, posts) = cast();
-    let (store, dir) = fresh_store_with_dir();
+    let (store, reader, dir) = fresh_store_with_dir();
     let ckpt = dir.join(".social-projections.ckpt");
 
     let ckpt_pos;
     let last;
     {
         let proj = Projections::with_checkpoint_cadence(
-            &store,
+            &reader,
             ckpt.clone(),
             MANUAL_ONLY_N,
             manual_only_t(),
@@ -802,7 +811,7 @@ async fn checkpoint_during_live_pump_resumes_only_the_suffix() {
     assert!(last >= ckpt_pos, "the suffix must have added positions");
 
     let resumed = Projections::with_checkpoint_cadence(
-        &store,
+        &reader,
         ckpt.clone(),
         MANUAL_ONLY_N,
         manual_only_t(),
@@ -816,7 +825,7 @@ async fn checkpoint_during_live_pump_resumes_only_the_suffix() {
     );
     resumed.wait_for(last).await;
 
-    let rebuilt = Projections::new(&store).await;
+    let rebuilt = Projections::new(&reader).await;
     rebuilt.wait_for(last).await;
     assert_eq!(
         snapshot(&resumed, &users, &posts).await,
@@ -851,8 +860,8 @@ async fn wait_for_is_event_bounded_not_poll_bounded() {
     // written position must wake once the write lands, well within a generous
     // bound. The code-level check above is what proves event-boundedness; this
     // proves the barrier is actually wired to wake.
-    let store = fresh_store();
-    let proj = Projections::new(&store).await;
+    let (store, reader) = fresh_store();
+    let proj = Projections::new(&reader).await;
     let alice = Id::new();
     store.register(alice, "alice".into(), "Alice".into()).await.unwrap();
     let post = Id::new();

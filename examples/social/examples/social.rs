@@ -14,31 +14,34 @@
 //! exercised store-free through `mess-testkit`.
 
 use ident::Id;
-use mess_store::{EventStore, LogEngine};
 use social::domain::follow::Follow;
 use social::domain::like::Like;
 use social::domain::post::Post;
 use social::domain::user::User;
+use social::store_backend::open_store;
 use social::{
     WriteError, WriteOps, follow_stream, like_stream, post_stream, user_stream,
 };
 
 #[tokio::main]
 async fn main() -> Result<(), WriteError> {
-    // `EventStore` over the composed production engine (`LogEngine`:
-    // `mess-log` + `mess-index`). Nothing below this line names the backend —
-    // that is the API-first payoff. See `examples/bank/examples/bank.rs`.
+    // The warm-write on-disk `Store`: an `EventStore` over the composed
+    // production engine (`LogEngine`: `mess-log` + `mess-index`) wrapped in a
+    // `FjallSnapshotBackend` so writes take the `command_cached` warm path.
+    // Nothing below this line names the backend — that is the API-first payoff.
+    // See `examples/bank/examples/bank.rs`.
     let dir = std::env::temp_dir()
         .join(format!("mess-social-{}", std::process::id()));
-    let store = EventStore::new(LogEngine::open(&dir).expect("open engine"));
+    let store = open_store(&dir).expect("open store");
 
     let alice = Id::new();
     let bob = Id::new();
     let post = Id::new();
 
     // Every write is one `WriteOps` call — the thin wrapper that maps an HTTP
-    // action to one `store.command` on the right stream and hands back the
-    // global log position of the write (the read-your-writes token).
+    // action to one warm-path `store.command_cached` on the right stream and
+    // hands back the global log position of the write (the read-your-writes
+    // token).
     store.register(alice, "alice".into(), "Alice".into()).await?;
     store.register(bob, "bob".into(), "Bob".into()).await?;
     println!("registered alice ({alice}) and bob ({bob})");

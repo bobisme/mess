@@ -6,29 +6,29 @@
 //! refusal and self-like allowance.
 
 use ident::Id;
-use mess_store::{EventStore, LogEngine};
+use mess_testkit::{SweepingTempDir, sweeping_temp_dir};
 use social::domain::follow::Follow;
 use social::domain::like::Like;
 use social::domain::post::Post;
 use social::domain::user::User;
+use social::store_backend::{Store, open_store};
 use social::{
     FollowError, WriteError, WriteOps, follow_stream, like_stream, post_stream,
     user_stream,
 };
 
-/// A fresh store in a unique temp dir per test invocation.
-fn fresh_store() -> EventStore<LogEngine> {
-    let dir = std::env::temp_dir().join(format!(
-        "mess-social-test-{}-{}",
-        std::process::id(),
-        Id::new()
-    ));
-    EventStore::new(LogEngine::open(&dir).expect("open engine"))
+/// A fresh warm-write store on a self-sweeping temp dir per test (the real-fs
+/// TMPDIR rule). The guard is returned so the caller keeps it alive for the
+/// duration of the test (dropped last, after the store closes).
+fn fresh_store() -> (Store, SweepingTempDir) {
+    let dir = sweeping_temp_dir("social-roundtrip");
+    let store = open_store(dir.path()).expect("open store");
+    (store, dir)
 }
 
 #[tokio::test]
 async fn happy_path_roundtrip() -> Result<(), WriteError> {
-    let store = fresh_store();
+    let (store, _dir) = fresh_store();
     let alice = Id::new();
     let bob = Id::new();
     let post = Id::new();
@@ -65,7 +65,7 @@ async fn happy_path_roundtrip() -> Result<(), WriteError> {
 
 #[tokio::test]
 async fn typed_rejections_surface_through_the_store() {
-    let store = fresh_store();
+    let (store, _dir) = fresh_store();
     let alice = Id::new();
     let bob = Id::new();
     let post = Id::new();
@@ -99,7 +99,7 @@ async fn typed_rejections_surface_through_the_store() {
 /// well-formedness check lives here and never creates a `follow-X_X` stream.
 #[tokio::test]
 async fn self_follow_is_refused_at_the_seam() {
-    let store = fresh_store();
+    let (store, _dir) = fresh_store();
     let alice = Id::new();
     store.register(alice, "alice".into(), "Alice".into()).await.unwrap();
 
@@ -118,7 +118,7 @@ async fn self_follow_is_refused_at_the_seam() {
 /// simply succeeds.
 #[tokio::test]
 async fn self_like_is_allowed() {
-    let store = fresh_store();
+    let (store, _dir) = fresh_store();
     let author = Id::new();
     let post = Id::new();
     store.register(author, "author".into(), "Author".into()).await.unwrap();

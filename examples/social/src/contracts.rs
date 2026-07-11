@@ -13,15 +13,15 @@
 //!    from projections built by tailing the event log; the [`FakeReadModels`]
 //!    here is a deterministic in-memory stand-in for frontend tests.
 //! 3. **[`WriteOps`]** — a thin wrapper mapping each HTTP write action to one
-//!    [`EventStore::command`] call, returning the global log position of the
-//!    write so a caller can pass it to [`ReadModels::wait_for`] for
-//!    read-your-writes.
+//!    [`EventStore::command_cached`] (warm-path) call, returning the global log
+//!    position of the write so a caller can pass it to [`ReadModels::wait_for`]
+//!    for read-your-writes.
 
 use std::future::Future;
 
 use ident::Id;
 use mess_core::CommandError;
-use mess_store::{Backend, EventStore};
+use mess_store::{EventStore, SnapshotStore};
 
 use crate::domain::follow::{Follow, FollowError, PlaceFollow, RemoveFollow};
 use crate::domain::like::{Like, LikeError, PlaceLike, RemoveLike};
@@ -294,22 +294,27 @@ fn follow_err<S: std::fmt::Display>(
 }
 
 /// The write surface the HTTP layer targets: one method per user action, each
-/// mapping to exactly one [`EventStore::command`] call on the right stream.
-/// The relationship actions (`follow`/`unfollow`/`like`/`unlike`) now route to
-/// the per-edge relationship streams (`follow-<a>_<b>`, `like-<p>_<u>`) rather
-/// than folding a crowd into the `User`/`Post` streams — the public signatures
-/// are unchanged, only the stream each targets moved.
+/// mapping to exactly one warm-path
+/// [`EventStore::command_cached`] call on the right stream (see the blanket
+/// impl below for why `command_cached`, not `command`). The relationship
+/// actions (`follow`/`unfollow`/`like`/`unlike`) route to the per-edge
+/// relationship streams (`follow-<a>_<b>`, `like-<p>_<u>`) rather than folding
+/// a crowd into the `User`/`Post` streams — the public signatures are
+/// unchanged, only the stream each targets moved.
 ///
-/// **Why plain `command`, never `command_as`.** No method here has an
+/// **Why plain `command_cached`, never `command_cached_as`.** No method here
+/// has an
 /// author-id *restated* alongside a stream key it must match: entity commands
 /// (`register`, `create_post`, …) key on the entity id directly, and the
 /// relationship commands fold their whole identity into the stream key
 /// (`follow-<follower>_<followee>`), leaving nothing for
-/// [`command_as`](EventStore::command_as) to validate. (The pre-refactor
-/// `Follow`-on-the-user-stream was the one genuine `command_as` site; moving
-/// the edge onto its own stream dissolved that need — see `domain::follow`.)
+/// [`command_cached_as`](EventStore::command_cached_as) to validate. (The
+/// pre-refactor `Follow`-on-the-user-stream was the one genuine authored site;
+/// moving the edge onto its own stream dissolved that need — see
+/// `domain::follow`.)
 ///
-/// **Why a wrapper and not "HTTP calls `store.command` directly".** The store
+/// **Why a wrapper and not "HTTP calls `store.command_cached` directly".** The
+/// store
 /// call is generic in three type parameters (aggregate, command, backend) and
 /// returns a `CommandError<R, S>` whose two parameters leak the backend type
 /// into every handler signature. [`WriteOps`] pins the stream-naming
@@ -377,34 +382,33 @@ pub trait WriteOps {
 }
 
 // ---------------------------------------------------------------------------
-// Warm writes: why this blanket impl still calls `command`, not
-// `command_cached`
+// Warm writes: this blanket impl routes every write through `command_cached`
 // ---------------------------------------------------------------------------
 //
-// Post-`bn-jes` every aggregate has *bounded* state and now implements
+// Post-`bn-jes` every aggregate has *bounded* state and implements
 // `Snapshottable` + `Clone` (see `domain::{user,post,like,follow}`), which are
 // exactly the bounds `EventStore::command_cached` (the hot-aggregate
-// write-through cache + snapshot-accelerated cold load) requires. So the warm
-// path is *available* for these aggregates — the `tests/snapshots.rs`
-// differential proves `command_cached` yields byte-identical results to
-// `command` (cache-off == cache-miss), and `tests/hot_post_bench.rs` measures
+// write-through cache + snapshot-accelerated cold load) requires. `bn-o9z`
+// flips the app onto that warm path: this impl is bound at `B: SnapshotStore`
+// (the capability `command_cached` lives behind) and calls `command_cached`
+// rather than `command`.
+//
+// Correctness is unchanged and *proven*: `command_cached` is semantically
+// identical to `command` — same optimistic retry, same `Commit`, same error
+// taxonomy — differing only in cost (a warm hit reads zero events; a conflict
+// re-reads only the delta). `tests/snapshots.rs` is the differential that pins
+// this: it drives the same corpus through `command` and `command_cached` and
+// asserts byte-identical folded state and identical typed results
+// (cache-off == cache-miss == cache-hit). `tests/hot_post_bench.rs` measures
 // the speedup on a deep stream.
 //
-// This blanket impl nonetheless stays on plain `command`, deliberately, because
-// it is generic over `B: Backend`. `command_cached` lives in
-// `impl<B: SnapshotStore> EventStore<B>`, so switching this impl's body to it
-// would force the bound to `B: SnapshotStore` — and that bound is **not free to
-// tighten here**: `seed::generate<B: Backend>` (an out-of-scope file for this
-// bone) calls these `WriteOps` methods for *every* `B: Backend`, and the demo's
-// concrete on-disk `Store = EventStore<LogEngine>` is over `LogEngine`, which
-// is a plain `Backend`, not a `SnapshotStore`. Tightening the bound would break
-// both. Flipping the *app* to warm writes is therefore a construction-site
-// change (wrap the engine in `FjallSnapshotBackend<LogEngine>` and thread the
-// `SnapshotStore` bound through `seed::generate` and the web binary) that spans
-// files this bone must not touch — see the worker's concerns note. The warm
-// path is fully implemented and tested at the store seam; only the demo's
-// backing store is not yet snapshot-capable.
-impl<B: Backend> WriteOps for EventStore<B>
+// Tightening the bound from `B: Backend` to `B: SnapshotStore` is what makes
+// the on-disk `Store = EventStore<FjallSnapshotBackend<LogEngine>>` (a
+// `SnapshotStore`) the warm-write path — see `crate::store_backend`. The demo's
+// former plain `EventStore<LogEngine>` was *not* a `SnapshotStore`, which is
+// why the flip is a construction-site change (wrap the engine in
+// `FjallSnapshotBackend`) threaded through `seed::generate` and the binaries.
+impl<B: SnapshotStore> WriteOps for EventStore<B>
 where
     B::Error: std::fmt::Display,
 {
@@ -415,7 +419,7 @@ where
         display_name: String,
     ) -> Result<u64, WriteError> {
         let commit = self
-            .command::<User, _>(
+            .command_cached::<User, _>(
                 &user_stream(user),
                 RegisterUser { handle, display_name },
             )
@@ -430,7 +434,7 @@ where
         display_name: String,
     ) -> Result<u64, WriteError> {
         let commit = self
-            .command::<User, _>(
+            .command_cached::<User, _>(
                 &user_stream(user),
                 SetDisplayName { display_name },
             )
@@ -452,13 +456,16 @@ where
         if follower == target {
             return Err(WriteError::SelfFollow);
         }
-        // Plain `command`, not `command_as`: the follow edge now lives on its
-        // own `follow-<follower>_<followee>` stream, so the whole actor
-        // identity is in the stream key — there is no separately-restated id
-        // to diverge from it, hence nothing for the authored path to check.
+        // Plain `command_cached`, not `command_cached_as`: the follow edge now
+        // lives on its own `follow-<follower>_<followee>` stream, so the whole
+        // actor identity is in the stream key — there is no separately-restated
+        // id to diverge from it, hence nothing for the authored path to check.
         // See `domain::follow`'s module docs.
         let commit = self
-            .command::<Follow, _>(&follow_stream(follower, target), PlaceFollow)
+            .command_cached::<Follow, _>(
+                &follow_stream(follower, target),
+                PlaceFollow,
+            )
             .await
             .map_err(follow_err)?;
         Ok(commit.last_global_position.unwrap_or(0))
@@ -470,7 +477,7 @@ where
         target: Id,
     ) -> Result<u64, WriteError> {
         let commit = self
-            .command::<Follow, _>(
+            .command_cached::<Follow, _>(
                 &follow_stream(follower, target),
                 RemoveFollow,
             )
@@ -486,7 +493,10 @@ where
         body: String,
     ) -> Result<u64, WriteError> {
         let commit = self
-            .command::<Post, _>(&post_stream(post), CreatePost { author, body })
+            .command_cached::<Post, _>(
+                &post_stream(post),
+                CreatePost { author, body },
+            )
             .await
             .map_err(post_err)?;
         Ok(commit.last_global_position.unwrap_or(0))
@@ -494,18 +504,19 @@ where
 
     async fn delete_post(&self, post: Id, by: Id) -> Result<u64, WriteError> {
         let commit = self
-            .command::<Post, _>(&post_stream(post), DeletePost { by })
+            .command_cached::<Post, _>(&post_stream(post), DeletePost { by })
             .await
             .map_err(post_err)?;
         Ok(commit.last_global_position.unwrap_or(0))
     }
 
     async fn like(&self, post: Id, user: Id) -> Result<u64, WriteError> {
-        // Plain `command`: like edge on its own `like-<post>_<user>` stream —
-        // the key is the full identity, so `command_as` would be a tautology
+        // Plain `command_cached`: like edge on its own `like-<post>_<user>`
+        // stream — the key is the full identity, so an authored variant would
+        // be a tautology
         // (see `domain::like`).
         let commit = self
-            .command::<Like, _>(&like_stream(post, user), PlaceLike)
+            .command_cached::<Like, _>(&like_stream(post, user), PlaceLike)
             .await
             .map_err(like_err)?;
         Ok(commit.last_global_position.unwrap_or(0))
@@ -513,7 +524,7 @@ where
 
     async fn unlike(&self, post: Id, user: Id) -> Result<u64, WriteError> {
         let commit = self
-            .command::<Like, _>(&like_stream(post, user), RemoveLike)
+            .command_cached::<Like, _>(&like_stream(post, user), RemoveLike)
             .await
             .map_err(like_err)?;
         Ok(commit.last_global_position.unwrap_or(0))

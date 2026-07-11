@@ -31,30 +31,37 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use ident::Id;
-use mess_store::{EventStore, LogEngine};
+use mess_store::LogEngine;
 use social::Projections;
 use social::WriteOps;
-use social::store_backend::Store;
+use social::rebuild::rebuild_check;
+use social::store_backend::{Store, checkpoint_path, open_store, read_handle};
 use social::web::{AppState, MemBackend, router};
 
 struct Args {
-    dir:  Option<PathBuf>,
-    addr: String,
+    dir:     Option<PathBuf>,
+    addr:    String,
+    /// `--rebuild`: run the checkpoint-correctness proof against `--dir` and
+    /// exit (nonzero on mismatch) instead of serving. Requires `--dir`.
+    rebuild: bool,
 }
 
 fn print_usage() {
     eprintln!(
-        "Usage: social-web [--dir PATH] [--addr HOST:PORT]\n\nOptions:\n  \
-         --dir PATH        serve a real on-disk store (written by \
+        "Usage: social-web [--dir PATH] [--addr HOST:PORT] [--rebuild]\n\n\
+         Options:\n  --dir PATH        serve a real on-disk store (written by \
          social-seed).\n  --addr HOST:PORT  listen address (default: \
-         127.0.0.1:3000)\n\nWith no --dir, serves a tiny hardcoded in-memory \
-         demo world instead."
+         127.0.0.1:3000)\n  --rebuild         run the checkpoint-correctness \
+         proof against --dir and exit\n                    (nonzero on \
+         mismatch); does not serve. Requires --dir.\n\nWith no --dir, serves a \
+         tiny hardcoded in-memory demo world instead."
     );
 }
 
 fn parse_args() -> Args {
     let mut dir = None;
     let mut addr = "127.0.0.1:3000".to_string();
+    let mut rebuild = false;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -70,6 +77,7 @@ fn parse_args() -> Args {
                     std::process::exit(2);
                 });
             }
+            "--rebuild" => rebuild = true,
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -81,7 +89,7 @@ fn parse_args() -> Args {
             }
         }
     }
-    Args { dir, addr }
+    Args { dir, addr, rebuild }
 }
 
 /// The tiny in-memory demo world used when no `--dir` is given: an
@@ -124,18 +132,13 @@ async fn mem_state() -> AppState<MemBackend, MemBackend> {
     AppState::new(backend.clone(), backend)
 }
 
-/// The sidecar checkpoint file kept next to the store dir — see
-/// [`Projections::with_checkpoint`] for why a sidecar (and not the log itself)
-/// and the atomic write-rename it uses.
-fn checkpoint_path(dir: &std::path::Path) -> PathBuf {
-    dir.join(".social-projections.ckpt")
-}
-
-/// The real, store-backed world: open `dir` and build the read model,
-/// **resuming from the sidecar checkpoint** when present and valid, else a full
-/// replay from position 0 (see [`Projections::with_checkpoint`]). Returns the
-/// [`AppState`] plus the projections handle so the caller can checkpoint on a
-/// clean shutdown. No directory to populate: handle resolution goes through
+/// The real, store-backed world: open `dir` as the warm-write [`Store`]
+/// ([`open_store`]) and build the read model over a subscribe-capable
+/// [`read_handle`] to the same log, **resuming from the sidecar checkpoint**
+/// when present and valid, else a full replay from position 0 (see
+/// [`Projections::with_checkpoint`]). Returns the [`AppState`] plus the
+/// projections handle so the caller can checkpoint on a clean shutdown. No
+/// directory to populate: handle resolution goes through
 /// [`ReadModels::resolve`](social::contracts::ReadModels::resolve) instead —
 /// see `social::web`'s module docs.
 async fn store_state(
@@ -150,17 +153,20 @@ async fn store_state(
         );
         std::process::exit(1);
     }
-    let backend = LogEngine::open(dir).unwrap_or_else(|e| {
+    let store: Store = open_store(dir).unwrap_or_else(|e| {
         eprintln!("error: could not open store at {}: {e}", dir.display());
         std::process::exit(1);
     });
-    let store: Store = EventStore::new(backend);
+    // The read model tails a subscribe-capable handle over the same log the
+    // warm-write store writes to — see `store_backend`'s docs on the
+    // `SubscribeBackend` / `SnapshotStore` split.
+    let read = read_handle(&store);
 
     print!("building read model (resume-or-rebuild) ... ");
     use std::io::Write;
     std::io::stdout().flush().ok();
     let projections = Arc::new(
-        Projections::with_checkpoint(&store, checkpoint_path(dir)).await,
+        Projections::with_checkpoint(&read, checkpoint_path(dir)).await,
     );
     match projections.resumed_from() {
         0 => println!("done (full rebuild from position 0)."),
@@ -171,9 +177,43 @@ async fn store_state(
     (state, projections)
 }
 
+/// Run the `--rebuild` checkpoint-correctness proof against `dir` and exit:
+/// print PASS/FAIL + counts, exit nonzero on mismatch. See
+/// [`social::rebuild`].
+async fn run_rebuild(dir: &std::path::Path) -> ! {
+    if !dir.is_dir() {
+        eprintln!(
+            "error: store directory not found at {}\n  Run `cargo run -p \
+             social --bin social-seed -- --dir {}` first.",
+            dir.display(),
+            dir.display()
+        );
+        std::process::exit(1);
+    }
+    let report = rebuild_check(dir).await.unwrap_or_else(|e| {
+        eprintln!("error: could not open store at {}: {e}", dir.display());
+        std::process::exit(1);
+    });
+    println!("{}", report.render());
+    std::process::exit(i32::from(!report.matched));
+}
+
 #[tokio::main]
 async fn main() {
     let args = parse_args();
+
+    // `--rebuild` is a proof-and-exit mode, not a server: run it first.
+    if args.rebuild {
+        match &args.dir {
+            Some(dir) => run_rebuild(dir).await,
+            None => {
+                eprintln!("--rebuild requires --dir PATH\n");
+                print_usage();
+                std::process::exit(2);
+            }
+        }
+    }
+
     let listener =
         tokio::net::TcpListener::bind(&args.addr).await.expect("bind");
 

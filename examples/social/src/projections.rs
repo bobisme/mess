@@ -476,6 +476,52 @@ impl State {
         }
     }
 
+    /// A canonical, iteration-order-independent byte fingerprint of the folded
+    /// state: msgpack over a **key-sorted** view of every map (and every
+    /// membership set sorted too). Two [`State`]s with identical folded content
+    /// serialize to byte-identical fingerprints regardless of `HashMap`/
+    /// `HashSet` iteration order (which is per-instance randomized) — the basis
+    /// of the `--rebuild` checkpoint-correctness byte-compare. Sorted by each
+    /// [`Id`]'s `Display` (a fixed 22-char string) because `Id` is not `Ord`.
+    fn canonical_bytes(&self) -> Vec<u8> {
+        fn sorted_ids(set: &HashSet<Id>) -> Vec<String> {
+            let mut v: Vec<String> =
+                set.iter().map(ToString::to_string).collect();
+            v.sort();
+            v
+        }
+        fn sorted_map<V>(map: &HashMap<Id, V>) -> Vec<(String, &V)> {
+            let mut v: Vec<(String, &V)> =
+                map.iter().map(|(id, val)| (id.to_string(), val)).collect();
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
+        }
+        fn sorted_sets(
+            map: &HashMap<Id, HashSet<Id>>,
+        ) -> Vec<(String, Vec<String>)> {
+            let mut v: Vec<(String, Vec<String>)> = map
+                .iter()
+                .map(|(id, set)| (id.to_string(), sorted_ids(set)))
+                .collect();
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
+        }
+        let mut handles: Vec<(&String, String)> =
+            self.handles.iter().map(|(h, id)| (h, id.to_string())).collect();
+        handles.sort_by(|a, b| a.0.cmp(b.0));
+
+        // A tuple of sorted views — serialized deterministically by msgpack.
+        let canon = (
+            sorted_map(&self.users),
+            handles,
+            sorted_sets(&self.following),
+            sorted_sets(&self.followers),
+            sorted_map(&self.posts),
+            sorted_sets(&self.likes),
+        );
+        rmp_serde::to_vec(&canon).expect("canonical state serializes")
+    }
+
     /// Build one page from a pre-filtered post set, newest-first, applying the
     /// opaque `cursor`/`limit`. The cursor is the `seq` to page strictly
     /// *before* — identical semantics to [`FakeReadModels`], so a real and a
@@ -614,6 +660,20 @@ struct CheckpointCfg {
 /// tombstone rather than a dead 404 — so this carries the view even for a
 /// deleted post, with `deleted` telling a handler to render "this post was
 /// deleted" instead of the body.
+/// Coarse cardinalities of a folded read model, from
+/// [`Projections::cardinalities`] — the counts the `--rebuild` proof prints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cardinalities {
+    /// Registered users folded.
+    pub users:        usize,
+    /// Posts folded (deleted ones included — the tombstone still folds).
+    pub posts:        usize,
+    /// Active follow edges across all `following` sets.
+    pub follow_edges: usize,
+    /// Active like edges across all `likes` sets.
+    pub like_edges:   usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PostLookup {
     /// The rendered post. For a deleted post the fields are still populated
@@ -842,6 +902,30 @@ impl<B: Backend> Projections<B> {
     #[must_use]
     pub fn applied_position(&self) -> u64 {
         self.applied.load(Ordering::Acquire)
+    }
+
+    /// A deterministic byte fingerprint of the current folded read-model state,
+    /// for the `--rebuild` checkpoint-correctness proof (see
+    /// [`crate::rebuild`]). Two projections that folded the same log — one
+    /// rebuilt from position 0, one resumed from a checkpoint and caught up to
+    /// the same head — produce **byte-identical** fingerprints. Canonicalized
+    /// (keys and membership sets sorted) so the fingerprint depends only on
+    /// folded content, never on `HashMap`/`HashSet` iteration order.
+    pub async fn state_fingerprint(&self) -> Vec<u8> {
+        self.state.read().await.canonical_bytes()
+    }
+
+    /// Coarse cardinalities of the folded read model — the counts the
+    /// `--rebuild` report prints alongside PASS/FAIL. Cheap (map lengths, one
+    /// pass over the crowd sets under a read lock).
+    pub async fn cardinalities(&self) -> Cardinalities {
+        let st = self.state.read().await;
+        Cardinalities {
+            users:        st.users.len(),
+            posts:        st.posts.len(),
+            follow_edges: st.following.values().map(HashSet::len).sum(),
+            like_edges:   st.likes.values().map(HashSet::len).sum(),
+        }
     }
 
     /// Permalink lookup: resolve a post by id **including deleted posts**,

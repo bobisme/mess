@@ -3,12 +3,19 @@
 A small Twitter-clone built on `mess` — the second showcase example after
 `examples/bank`. Where `bank` teaches the vocabulary on one aggregate, this
 crate is the *shape of a real application at scale*: **every aggregate has
-bounded state**, a real rebuildable read model, and a server-rendered HTML
-frontend, all wired to a real on-disk event log.
+bounded state**, warm-path writes, a real rebuildable + checkpointed read
+model, and a server-rendered HTML frontend, all wired to a real on-disk event
+log.
 
-This README is the demo tour: what it shows, how to run it, why the
-"rebuild from the log" trick works, and a walk through the real `mess`
-operational CLI run against the demo's own seeded store.
+This README is the demo tour: what it shows, how to run it at two scales, why
+the "rebuild from the log" trick works and how the `--rebuild` proof pins it,
+the numbers the warm path and the scale tiers actually produce on this box, and
+a walk through the real `mess` operational CLI run against the demo's own
+seeded store.
+
+> **Every number in this README is a real captured output from this machine**
+> (2026-07-10), release build, the engine's default `Durability::Process`.
+> Each is labelled with the tier/params that produced it.
 
 ## What this demonstrates
 
@@ -19,37 +26,40 @@ operational CLI run against the demo's own seeded store.
   tiny alternating two-state machine on its own stream. The crowds (a post's
   likers, a user's followers) are **not** aggregate state anywhere; see
   [Why relationship streams](#why-relationship-streams) below.
-  `src/domain/*.rs` are commented in depth on *why* each invariant is enforced
-  where it is (e.g. why self-like is allowed but self-follow is refused at the
-  write seam).
-- **A real, rebuildable read model.** `src/projections.rs`'s `Projections`
-  type folds the *entire* event log into in-memory tables by replaying
-  `read_global` from position 0, then keeps tailing it live. There is no
-  separate "rebuild" code path — construction *is* the rebuild. That is the
-  event-sourcing showcase this demo exists to make tangible; see
-  [below](#the-rebuild-from-log-party-trick).
-- **A write/read seam** (`src/contracts.rs`) — `WriteOps` (one method per
-  user action, each exactly one `EventStore::command` call) and `ReadModels`
-  (the query surface, with a `wait_for` read-your-writes barrier) — that lets
-  the HTTP layer, the projections, and the seed generator all be built and
-  tested independently against the same interface.
-- **A deterministic demo corpus**, generated entirely through `WriteOps` —
-  never a raw log append — so the same domain rules a real client hits
-  (`handle_is_valid`, no self-follow, no double-like, author-only delete, …)
-  also gate every seeded event. See [Seeding the corpus](#seeding-the-corpus).
-- **The real `mess` operational CLI** run against this app's own seeded
-  store — not a synthetic fixture. See the [ops tour](#ops-tour) below.
+- **Warm-path writes.** Every write goes through
+  `EventStore::command_cached` over a `FjallSnapshotBackend<LogEngine>`
+  (`src/store_backend.rs`): a hot-aggregate write-through cache proves the
+  stream's version by the append itself (zero event reads on a warm hit), with
+  a snapshot-accelerated cold load underneath. `tests/snapshots.rs` proves this
+  is byte-identical to plain `command`; `tests/hot_post_bench.rs` measures the
+  speedup ([below](#hot-aggregate-benchmark)).
+- **A real, rebuildable *and* checkpointed read model.** `src/projections.rs`'s
+  `Projections` folds the entire log into in-memory tables by replaying
+  `read_global` from position 0, then tails it live; it also persists a
+  checkpoint sidecar so a restart *resumes* from where it left off instead of
+  re-replaying. `social-web --rebuild` proves the resumed state is
+  byte-identical to a clean from-0 rebuild ([below](#the-rebuild-proof)).
+- **Two scale tiers.** `--scale demo` is the deterministic 1,488-event world
+  the tour walks; `--scale large` is a ~54.7k-event world with realistic skew
+  (a celebrity user with thousands of followers, viral posts with thousands of
+  likes, a long tail), seeded with bounded-concurrency pipelining over distinct
+  streams. See [Seeding the corpus](#seeding-the-corpus).
+- **The real `mess` operational CLI** run against this app's own seeded store —
+  at both tiers, not a synthetic fixture. See the [ops tour](#ops-tour).
 
 ## Quickstart
 
 ```sh
-# one command: seed + serve
+# one command: seed + serve the demo tier
 just demo
 
 # or step by step:
 cargo run -p social --bin social-seed             # seed ~/.cache/mess-social-demo/store
 cargo run -p social --bin social-web -- --dir ~/.cache/mess-social-demo/store
 # then open http://127.0.0.1:3000
+
+# the large tier (~54.7k events, pipelined):
+cargo run -p social --release --bin social-seed -- --scale large --dir /path/to/large
 ```
 
 `social-seed` refuses to run against a directory that already holds a store
@@ -76,25 +86,25 @@ cargo run -p social --bin social-web   # no --dir: in-memory demo world
                       │      ReadModels          │  │       WriteOps           │
                       │  (contracts.rs trait)     │  │  (contracts.rs trait)     │
                       └────────────┬─────────────┘  └────────────┬──────────────┘
-                                   │ query                        │ EventStore::command
+                                   │ query                        │ command_cached
                                    ▼                              ▼
                       ┌────────────────────────┐  ┌─────────────────────────────┐
                       │      Projections          │  │    mess_store::EventStore    │
-                      │  (projections.rs)          │  │   over mess_store::LogEngine  │
-                      │  in-memory fold, rebuilt   │◀─┤                               │
-                      │  from position 0 at boot,  │  │  entities:                    │
+                      │  (projections.rs)          │  │  over FjallSnapshotBackend    │
+                      │  from-0 rebuild at boot    │◀─┤       <LogEngine>             │
+                      │  (or checkpoint-resume),   │  │  entities:                    │
                       │  then live-tails the log,  │  │    user-<id> / post-<id>      │
                       │  reconstructing the like   │  │  relationships:               │
                       │  & follow crowds from the  │  │    like-<post>_<user>         │
                       │  relationship streams      │  │    follow-<flwr>_<flwee>      │
                       └────────────┬───────────────┘  └────────────┬──────────────────┘
-                                   │ read_global(after, limit)      │ append_batch
-                                   │  routed by StoredRecord         │
-                                   │  ::category() (before 1st '-')  │
-                                   └───────────────┬─────────────────┘
+                    read_global +  │                                │ append_batch (+ warm
+                    subscribe over │                                │ cache / snapshot load)
+                    a LogEngine    │                                │
+                    read handle    └───────────────┬─────────────────┘
                                                     ▼
-                                    durable on-disk log
-                                    ($STORE_DIR/seg-*.log + meta/)
+                                    durable on-disk log + snapshots
+                                    ($STORE/seg-*.log + meta/ + .snapshots/)
 ```
 
 No aggregate reads another's state. A `Follow` edge only *records* that
@@ -107,6 +117,19 @@ the entity streams into user/post tables *and* reconstructs the like/follow
 crowds from the relationship streams into count/membership indexes, and answers
 cross-aggregate queries (a post's `PostView` joins the author's current
 handle/display name and its live like count) at query time.
+
+### The write and read backends (`src/store_backend.rs`)
+
+The warm write path needs `SnapshotStore` (that is where `command_cached`
+lives); the read model's live tail needs `SubscribeBackend`. As of this
+example, **no single backend type has both**: `LogEngine` is a
+`SubscribeBackend` but not a `SnapshotStore`, and `FjallSnapshotBackend<LogEngine>`
+is a `SnapshotStore` but does not forward `SubscribeBackend`. The reconciliation
+(`store_backend::read_handle`) is clean because `LogEngine` is `Arc`-backed: the
+warm-write `Store` writes through the snapshot backend, and the read model tails
+a second `EventStore` over a *clone of the very same engine*, which shares its
+watermark and commit notifications. See that module's docs — and the
+[Concerns](#concerns) at the end — for the dogfood note.
 
 ## Why relationship streams
 
@@ -123,13 +146,13 @@ a like is O(1) no matter how many other people liked the same post, because the
 command folds only *that one edge's* stream. Ditto follows. So:
 
 - **Bounded commands.** Every `decide` folds a handful of fields, never a
-  crowd. Snapshots stay tiny.
+  crowd. Snapshots stay tiny. This is exactly what makes the warm
+  `command_cached` path and the O(1)-per-write story below hold at *any* like
+  count.
 - **Crowds live in the projection.** The read model reconstructs like counts,
   `liked_by_me`, and follower/following sets from the relationship streams at
   query time — exactly where a home timeline was already computed by filtering
-  posts against the viewer's *current* follow set. (The broader scale story —
-  fan-out, sharding — is a later bone; this example just establishes the
-  bounded-state shape.)
+  posts against the viewer's *current* follow set.
 - **Stream naming.** A relationship stream keys on *both* ids:
   `like-<post>_<user>`. The `_` is a sound separator because an `Id` renders
   only over `[0-9a-z-]` (Crockford base32 plus two internal `-`s) and never
@@ -137,298 +160,356 @@ command folds only *that one edge's* stream. Ditto follows. So:
   suffix splits once on `_` back into the two ids. See `src/lib.rs`'s
   `PAIR_SEP` / `parse_pair` for the format invariant.
 
-### Event-vocabulary reset
+The payoff is visible in the stream counts below: the demo tier's 1,488 events
+live on **1,438 distinct streams**, and the large tier's 54,680 events on
+**54,280** — almost every action is its own stream. That is the point: it is
+what makes the writes O(1) and the seeder pipelinable.
 
-This rework changes the **on-disk event vocabulary**: `Post` no longer emits
-`Liked`/`Unliked` and `User` no longer emits `Followed`/`Unfollowed`; those are
-now `Liked`/`Unliked` on `like-*` streams and `Followed`/`Unfollowed` on
-`follow-*` streams. For an example crate that is **fine and needs no
-migration** — there is no persisted corpus to preserve; `social-seed`
-regenerates the whole log from scratch on demand. A production system would
-treat this as a real schema change (a new event version and a migration/replay
-plan); here it is just a reseed.
+## Seeding the corpus
+
+`social-seed` (`src/bin/social-seed.rs`, generator in `src/seed.rs`) draws a
+corpus deterministically, then commits it entirely through warm `WriteOps`
+calls — `store.register(...)`, `store.follow(...)`, `store.create_post(...)`,
+`store.like(...)`, … — each exactly one `EventStore::command_cached` call that
+runs the real `Decide` impl. There is no bulk-append shortcut; the planner
+tracks its own shadow state purely to avoid *drawing* a command it knows the
+domain would reject.
+
+Two tiers, `--scale demo` (default) and `--scale large`:
+
+| tier  | users | follows | posts | likes  | deletes | unfollows | **events** | streams |
+|-------|-------|---------|-------|--------|---------|-----------|-----------|---------|
+| demo  | 50    | 88      | 500   | 800    | 30      | 20        | **1,488** | 1,438   |
+| large | 3,500 | 12,280  | 3,500 | 35,000 | 200     | 200       | **54,680**| 54,280  |
+
+The large tier is deliberately **skewed**, not uniform (real captured output of
+`seed::tests::large_tier_has_target_scale_and_skew`):
+
+```
+large tier @seed=1337: 54680 events (3500 users, 12280 follows, 3500 posts,
+35000 likes, 200 deletes, 200 unfollows); top user 2204 followers; hottest
+post 2983 likes
+```
+
+— a sharper follow-target Zipf (`popularity_exponent = 1.5`) makes the top
+user a **celebrity with 2,204 followers**; the post-like Zipf makes the
+**hottest post go viral with 2,983 likes**, with a long tail behind both.
+
+### Determinism, plan vs execute
+
+`plan_corpus` draws the whole corpus (handles, bodies, the follow/like graphs,
+and the `Id`s themselves) from one seeded `StdRng` with a fixed draw order,
+*before any store write* — so the corpus is a pure function of `--seed`.
+Execution then honours `--concurrency`:
+
+- **Demo is sequential** (`concurrency = 1`): the global log is
+  **byte-identical** run-to-run. Covered by
+  `seed::tests::demo_seed_is_byte_identical_for_a_fixed_seed`, which seeds two
+  stores and diffs their whole logs event-for-event.
+- **Large is pipelined** (`concurrency = 32`): commands of each phase fan out
+  over a bounded `JoinSet` window across **distinct** streams only (the
+  `docs/perf/bulk-writes.md` pattern). Per-stream event order stays
+  deterministic — only the *global interleaving* differs run-to-run — so the
+  same seed yields identical event counts, final watermark, and per-stream
+  heads. Proven cheaply at demo scale by
+  `pipelined_execution_matches_sequential_per_stream` (per-stream sequences are
+  identical sequential vs pipelined) and at scale by the `#[ignore]`d
+  `large_scale_pipelined_determinism`.
+
+### Seed wall-clock (this box, release, `Durability::Process`)
+
+| tier  | sequential | pipelined (K=32) | speedup |
+|-------|-----------:|-----------------:|--------:|
+| demo  |    3.91 s  |          2.99 s  |  1.3×   |
+| large |  221.03 s  |        126.27 s  |  1.75×  |
+
+The pipelining pattern (bounded concurrency over distinct streams) is exactly
+`docs/perf/bulk-writes.md`'s; its headline **7–23× win, however, is measured
+under `Durability::Group`**, where each sequential command pays an
+un-amortized `fdatasync` and pipelining coalesces them into shared group
+commits. The engine's *default* durability is `Process` (buffered, no fsync),
+so there is no barrier to coalesce here — the win above is only the CPU
+parallelism of the per-command work (each cold `command_cached` still does a
+snapshot-store point lookup) spread across cores, hence the more modest 1.3–1.75×.
+The `A/B` is reproducible with `--sequential` and `--concurrency N`:
+
+```sh
+social-seed --scale large --dir DIR_A                 # pipelined (K=32)
+social-seed --scale large --sequential --dir DIR_B    # concurrency=1
+```
+
+### Fresh-dir guard
+
+Seeding into a directory that already holds a store would silently double the
+corpus or mix two seeds, so `social-seed` refuses by default:
+
+```
+refusing to seed on non-empty --dir …/store: found a leftover store
+(1 seg-*.log segment file(s), markers: [LOCK, meta, sealed]) — seeding assumes
+an empty starting log, so pre-existing events would either double the corpus or
+mix two seeds' worth of state, silently breaking the "same seed, same corpus"
+guarantee. Pass --force to wipe the directory first, or point --dir at a fresh
+path.
+```
+
+`--force` wipes `--dir` first (what `just demo` passes, so reseeding is always
+one command).
 
 ## The rebuild-from-log party trick
 
 ```sh
 # with the server running against a seeded store:
-curl -s http://127.0.0.1:3000/ > /tmp/before.html
-
-# stop the server (Ctrl-C), then start it again:
-cargo run -p social --bin social-web -- --dir ~/.cache/mess-social-demo/store
-
-curl -s http://127.0.0.1:3000/ > /tmp/after.html
-diff /tmp/before.html /tmp/after.html   # <- empty diff
+curl -s http://127.0.0.1:3000/ > before.html
+# stop the server (Ctrl-C), then start it again, then:
+curl -s http://127.0.0.1:3000/ > after.html
+diff before.html after.html   # <- empty diff
 ```
 
-This is verified byte-for-byte as part of this bone's own testing (curled
-`/` and `/u/<handle>` before and after a real restart — see the bone's final
-report). It works because **`Projections::new` does not load a snapshot —
-it replays**. On every boot it drains `read_global` from position 0, folding
-every `Registered`/`Followed`/`Posted`/`Liked`/… event into the same
-in-memory tables the *live* tailer would build incrementally. Restarting the
-process does not discard any state, because the process never owned the
-state to begin with — the on-disk log did. The read model is a pure,
-cacheable *function of the log*, so replaying it twice from the same log
-produces the same tables, which render the same HTML (nothing in this
-domain's rendering is wall-clock-dependent — post bodies encode a
-"time of day" *flavor* as text, never an actual timestamp — so there is no
-hidden nondeterminism to break the byte-for-byte claim).
-
-The same property is what makes `mess backup` + `mess restore` trustworthy
-(see the [ops tour](#ops-tour)): a restored store, served by `social-web`,
-renders the identical page too — verified below.
-
-## Seeding the corpus
-
-`social-seed` (`src/bin/social-seed.rs`, generator in `src/seed.rs`) drives:
-
-- **50 users** — handles and display names from a small phrase combinator
-  (`{adjective}_{noun}[digits]` handles, `{First} {Surname}` display names;
-  see `src/seed.rs`'s `ADJ`/`NOUN`/`FIRST`/`SURNAME` word pools), never
-  lorem ipsum.
-- **A Zipf-ish follow graph** — a handful of "hub" users end up widely
-  followed (popularity is weighted `1 / (rank+1)^1.0` over registration
-  order), most users follow just one to three people.
-- **500 posts** with varied, human-plausible bodies from a 20-template phrase
-  combinator crossed with 30 topics and a set of "time of day" flavor
-  prefixes (`"3am and just discovered {topic}..."`,
-  `"monday morning, rabbit-holing on {topic} again."`) — the
-  "timestamps-in-content" texture the domain itself has no `created_at`
-  field to carry.
-- **Zipf-distributed likes** — a handful of posts go semi-viral, most get
-  zero or one like.
-- **30 deletes** (author-authorized, after a post has accrued some likes) and
-  **20 unfollows**.
-
-Every single one of those actions is a real `WriteOps` call —
-`store.register(...)`, `store.follow(...)`, `store.create_post(...)`,
-`store.like(...)`, `store.delete_post(...)`, `store.unfollow(...)` — which is
-to say, a real `EventStore::command` call that runs the real `Decide` impl.
-There is no bulk-append shortcut; the generator tracks its own shadow state
-(who follows whom, who liked what) purely to avoid *wasting* a command
-attempt on a rejection it can see coming for free, not to skip validation.
-
-**Determinism.** Every draw comes from one seeded `StdRng`
-(`--seed`, default `1337`) — same seed, same corpus, byte-for-byte (including
-the generated `Id`s, via `Id::from_u128` fed by the same RNG stream). This is
-covered by a real test
-(`seed::tests::generate_is_deterministic_for_a_fixed_seed`) that seeds two
-independent stores and diffs their entire logs event-for-event.
-
-**Fresh-dir guard.** `guard_fresh_dir` (`src/seed.rs`) mirrors
-`mess_soak::resource::guard_fresh_dir` (bn-3dr): seeding into a directory
-that already holds a store would silently double the corpus or mix two
-seeds' worth of state, so `social-seed` refuses by default:
+Verified byte-for-byte for this bone: `/` + `/firehose` before and after a real
+restart were **byte-identical (19,825 bytes)**, and the second boot printed
 
 ```
-$ cargo run -p social --bin social-seed
-refusing to seed on non-empty --dir /home/bob/.cache/mess-social-demo/store: found
-a leftover store (1 seg-*.log segment file(s), markers: [LOCK, meta, sealed]) —
-seeding assumes an empty starting log, so pre-existing events would either double
-the corpus or mix two seeds' worth of state, silently breaking the "same seed,
-same corpus" guarantee. Pass --force to wipe the directory first, or point --dir
-at a fresh path.
+building read model (resume-or-rebuild) ... done (resumed from checkpoint at position 1488).
 ```
 
-`--force` wipes `--dir` first (what `just demo` passes, so reseeding is
-always one command).
+It works because the read model is a pure *function of the log*. On a cold boot
+`Projections::new` drains `read_global` from position 0, folding every event
+into the same in-memory tables the live tailer would build incrementally; the
+process never owned the state — the on-disk log did. The checkpoint sidecar
+(`<dir>/.social-projections.ckpt`) is a pure optimization on top: it lets a
+restart *resume* from the last folded position and replay only the log suffix,
+instead of re-replaying from 0. Nothing in this domain's rendering is
+wall-clock-dependent (post bodies encode a "time of day" *flavor* as text,
+never a real timestamp), so there is no hidden nondeterminism to break the
+byte-for-byte claim.
 
-**Timing** (measured on this box, real fsync-per-append, no batching):
+### The rebuild proof
+
+Because the checkpoint is an optimization, it needs a correctness proof: a
+resumed read model must equal a clean rebuild. `social-web --rebuild` builds the
+projection **both ways** over the same log — a full replay from 0 and a
+checkpoint resume — and byte-compares their folded state (a canonical,
+iteration-order-independent serialization). Real output against the large store
+(54,680 events, checkpoint present):
 
 ```
-$ cargo run -p social --bin social-seed -- --force
-seeding /home/bob/.cache/mess-social-demo/store (seed=1337) ...
-done in 8.57s: 50 users, 88 follows, 500 posts, 800 likes, 30 deletes, 20 unfollows
-next: cargo run -p social --bin social-web -- --dir /home/bob/.cache/mess-social-demo/store
+$ social-web --rebuild --dir /path/to/large
+rebuild-compare: PASS
+  resumed from checkpoint at position 54680
+  from-0 rebuild folded to position 54680 in 0.025s
+  checkpoint resume folded to position 54680 in 0.007s
+  counts: 3500 users, 3500 posts, 12080 follow edges, 35000 like edges
+  compared 2267602 bytes of canonical state fingerprint
 ```
 
-~1,488 total `EventStore::command` calls in 8.57s — comfortably inside the
-60s budget, with room to spare even on a slower disk.
+It exits non-zero on any mismatch. This is the read-path analogue of
+`tests/snapshots.rs`'s cache-on == cache-off differential;
+`rebuild::tests::rebuild_matches_after_checkpoint` runs the same comparison
+in-process at demo scale in the normal test suite.
+
+**Cold-start vs checkpoint-resume timing** (large tier, 54,680 events): the
+from-0 rebuild folds the whole log in **0.025 s**; the checkpoint resume, which
+replays only the suffix (here nothing new since the checkpoint), takes
+**0.007 s**. Both are sub-100 ms at this depth — the log is only ~6.8 MB — so
+the resume advantage is small in absolute terms *here*; it grows with log depth,
+which is exactly why the checkpoint exists (a many-GB production log would
+replay for seconds-to-minutes cold, and resume in the same few ms).
+
+## Hot-aggregate benchmark
+
+The bounded-state remodel is what makes the *real* `Post` command O(1) at any
+like count. `tests/hot_post_bench.rs` proves the mechanism on a deliberately
+*unbounded* aggregate (a `MegaPost` that keeps a growing liker set) so the cost
+being removed is visible. Real captured output
+(`cargo test --release -p social --test hot_post_bench -- --ignored --nocapture`,
+real fs, `EventStore` over `FjallSnapshotBackend<LogEngine>`):
+
+```
+================ hot-post benchmark ================
+params: events=100000 unlike_frac=0.30 seed=184594917 page_size=1000 (default)
+seeded: depth=100000 events, active likers in fold=40278 ids
+---------------------------------------------------
+(a) plain command per like @depth (full replay each)
+      n=5   min=  32.771 ms median=  34.267 ms mean=  36.057 ms
+(b) command_cached warm steady-state (0 event reads/hit)
+      n=300 min=   0.044 ms median=   0.051 ms mean=   0.059 ms  (depth≈100306)
+      => warm median speedup vs cold command:  670.6x
+(c) cold start @depth=100307
+      full replay  load              32.364 ms
+      snapshot+tail load_cached       5.052 ms  (tail=0 events)
+      first warm-miss command         4.902 ms
+      => snapshot load speedup vs full replay:  6.4x
+(d) churn compaction
+      snapshot blob = 1055192 bytes for 100307 events (10.52 B/event)
+===================================================
+```
+
+Reading it: at depth 100k, a plain `command` pays a full replay of every event
+on the stream, so its latency scales with history — **median 34.3 ms** (a). The
+warm `command_cached` path proves the version by the append itself and folds the
+one event it wrote into the cached state, reading **zero** events — flat
+regardless of depth, **median 0.051 ms, ~671× faster** (b). On a cold process a
+snapshot turns the same load from a 100,307-event replay into one blob decode +
+a 0-event tail, **~6.4× faster** (c). This is precisely the cost the bounded
+`Post` remodel removes from the real aggregate, whose command is O(1) and whose
+snapshot is a handful of bytes at *any* like count — which is why the demo's
+warm path stays fast without any of this churn.
 
 ## Ops tour
 
 Everything below is the **real** `mess` CLI (`crates/mess-cli`), run against
-this demo's own seeded store (`~/.cache/mess-social-demo/store`, 50 users +
-500 posts + likes/deletes/unfollows, 1,488 events), output trimmed for
-length but otherwise unedited.
+this demo's own seeded stores — the **demo** store (1,488 events, 1,438 streams)
+and, where noted, the **large** store (54,680 events, 54,280 streams) — output
+lightly trimmed for length but otherwise unedited.
 
-> **Note — this transcript predates the bounded-state (relationship-stream)
-> rework.** The **event** count is unchanged (each action is still exactly one
-> event: 50 + 88 + 500 + 800 + 30 + 20 = 1,488), so `doctor`, `verify`, and the
-> `backup`/`restore` watermarks below all still read `1,488`. What *did* change
-> is the **stream** count: likes and follows are now their own streams, so the
-> store holds ~1,438 streams (50 `user-` + 500 `post-` + 88 `follow-` + 800
-> `like-`) rather than 550. The `inspect` numbers below (`550 entries`,
-> `stream_id` 1..550) are the pre-rework capture; rerun `mess inspect` after a
-> reseed to see the relationship streams. The dogfood findings the tour makes
-> are unaffected.
+### `mess inspect` — stream heads at scale
+
+Against the **large** store, this exercises `inspect`'s stream-head pagination
+(bn-1yz) at real scale — 54,280 streams:
+
+```
+$ mess inspect /path/to/large
+{"base_pos":0,"batch_count":54680,"epoch":1,"event_count":54680,"has_pcol":false,"has_pidx":false,"next_pos":54680,"safe_offset":6851995,"sealed":false,"segment_id":1,"size_bytes":54680-batch}
+…
+registry:
+  available: true
+  source: meta
+  snapshots: (none)
+  stream_names (54280):
+    stream_id=1  name=user-xb4y6n-eqhavjqt-krkcwh
+    stream_id=2  name=user-m52bsg-cqz41e46-b68gw1
+    …
+    ... and 54260 more (showing 20 of 54280; see --format json or a filter flag for the rest)
+```
+
+Proves: the on-disk segment chain matches the durable event count this app's own
+log claims (54,680, matching `social-seed`'s report), and the registry knows all
+54,280 streams — one per entity and one per relationship edge. The top-N
+truncation (`showing 20 of 54280`) is what keeps the overview readable when
+almost every action is its own stream; `--format json` or a `--stream` filter
+gives the rest.
 
 ### `mess doctor` — is the store healthy?
 
 ```
-$ cargo run -p mess-cli --bin mess -- doctor ~/.cache/mess-social-demo/store --format pretty
-mess doctor
-  dir: "/home/bob/.cache/mess-social-demo/store"
-  epochs_seen: [1]
-  fold_versions: []
-
-[OK] lock-free: store is not locked by a live writer
-[OK] unsealed-head: segment 1: unsealed active/rolled head (no trailer)
-[OK] fsync-ok: store directory is writable and fdatasync succeeded
-[OK] no-snapshots: no live snapshots to check for fold drift
-
-[OK] 4 finding(s); worst = ok
-```
-
-Proves: the lock is free (no crashed process still holding it), the segment
-chain's epoch/trailer state is sane, the store directory can actually durably
-fsync (catches read-only mounts / permission drift before an append would),
-and there is no `fold_version` drift across live snapshots (none exist yet —
-this demo never opts into snapshotting).
-
-**Dogfood: doctor tolerates a live writer, but degrades one check.** Run
-against the *same* store while `social-web --dir ...` is running:
-
-```
-info  lock-held  lock  store is locked by a live writer (pid 2233883)
+$ mess doctor /path/to/large
+ok  lock-free  lock  store is not locked by a live writer
 ok  unsealed-head  trailer  segment 1: unsealed active/rolled head (no trailer)
 ok  fsync-ok  fsync  store directory is writable and fdatasync succeeded
-info  registry-unavailable  fold-version  could not read snapshot metadata for fold-version check: FjallError: Locked
+ok  no-snapshots  fold-version  no live snapshots to check for fold drift
+dir: /path/to/large
+epochs_seen: 1
+fold_versions: (none)
 ```
 
-Good behavior — it reports the lock holder's pid rather than erroring out —
-but the `fold-version` check needs the fjall meta store, which the live
-writer holds exclusively, so that one check degrades from "checked" to
-"could not read" while the app is up. Worth knowing before reaching for
-`doctor` as a live health probe rather than an offline one.
+Proves the lock is free, the segment chain's epoch/trailer state is sane, and
+the store directory can durably `fdatasync`.
 
-**Resolved (bn-ve0): the degraded finding now says why and what to do,
-instead of surfacing the raw `FjallError`.** Same repro, after the fix:
-
-```
-info  lock-held  lock  store is locked by a live writer (pid 2233883)
-ok  unsealed-head  trailer  segment 1: unsealed active/rolled head (no trailer)
-ok  fsync-ok  fsync  store directory is writable and fdatasync succeeded
-info  meta-store-locked  fold-version  fold-version check skipped: a live writer holds the metadata store's lock (pid 2233883). This is expected while the app is running, not an error. For the full check, stop the writer first, or run doctor against a `mess backup`/`mess restore` copy instead of the live directory.
-```
-
-Still `info` severity, still zero exit code — this was never a failure — but
-the message no longer requires knowing what `FjallError: Locked` means or
-which store it's talking about. `doctor --help` documents the same caveat up
-front. A read-only fallback (open the meta store without the exclusive lock,
-so this check could run against a live writer too) was investigated and
-rejected for the pinned fjall version: fjall 3.1.6's `Database::open` has no
-read-only/secondary open mode at all — every open path takes the same
-exclusive lock — and, separately, fjall's metadata tables are
-journal-buffered (not fsynced per write), so even bypassing the lock to read
-the on-disk files directly could return stale/incomplete data instead of
-failing loudly, which is worse for a health check than today's honest
-degradation. See `crates/mess-cli/src/metaread.rs`'s module doc for the full
-writeup.
-
-### `mess inspect` — segment chain, stream heads, registry
-
-```
-$ cargo run -p mess-cli --bin mess -- inspect ~/.cache/mess-social-demo/store --format pretty
-mess inspect
-  dir: "/home/bob/.cache/mess-social-demo/store"
-  lock: {"pid":2233883,"state":"held"}
-  metrics: {"active_segment_count":1,"durable_batch_count":1488,"durable_event_count":1488,"sealed_segment_count":0,"segment_count":1,"total_size_bytes":239587}
-  registry_source: "recovered"
-  stream_heads: [{"head_version":11,"name":null,"stream_id":1},{"head_version":1,"name":null,"stream_id":2}, ... 550 entries total]
-
-  {"base_pos":0,"batch_count":1488,"epoch":1,"event_count":1488,"segment_id":1,"sealed":false,"size_bytes":239587}
-
-[OK] 0 finding(s); worst = ok
-```
-
-Proves: the on-disk segment chain matches the durable event count this app's
-own log claims (1,488 events, matching `social-seed`'s report exactly), and
-every one of the 550 streams (50 `user-<id>` + 500 `post-<id>`) this app ever
-wrote to has a recorded head version.
-
-**Dogfood: `inspect`'s default (agent/pipe) format drops almost everything.**
-`Report::to_text()` — the non-TTY default the CLI-conventions doc calls
-"token-efficient... for agents/pipes" — only renders `findings` and the named
-`collection` (here, the one-row segment scan); it never renders
-`Report::extra`, which is where `dir`, `lock`, `metrics`, `registry_source`,
-and `stream_heads` all live for `inspect`. So plain, piped
-`mess inspect <dir>` (exactly how an agent would invoke it) prints a single
-JSON blob and nothing else — no lock state, no stream count, nothing — while
-`--format pretty`/`--json` show the full picture. This is a real gap found by
-running `inspect` against an app-shaped store rather than a synthetic
-fixture with few streams: `doctor`'s useful content lives in `findings`
-(text-format-visible), but `inspect`'s lives in `extra` (text-format-blind).
-
-**Dogfood: `stream_heads` has no truncation and no human-readable id.** With
-550 streams this array is enormous and every entry is `{"stream_id": <opaque
-interned integer>, "name": null}` — there is no way to go from
-`user-<the Id this app knows>` to its numeric `stream_id` without an
-out-of-band lookup (`--stream <numeric-id>` narrows the *output*, but you
-still have to already know the number). A real app with hundreds of streams
-would want either pagination or a `--stream-prefix user-` filter.
+The `fold-version` drift check, though, reports **`no live snapshots`** — and
+this is worth being precise about, because the warm-write flip does not make it
+non-vacuous. The warm path's fast case is a hot-aggregate *in-memory*
+write-through cache; `command_cached` only *reads* the persistent snapshot store
+(on a cold miss) and never proactively *saves* to it, so a seeded/served social
+store simply has **no persisted snapshots** for `doctor` to check. Two separate
+reasons keep it that way, both outside this example's reach — see
+[Concerns](#concerns). (The snapshot store *is* real and *is* exercised, cold-
+load and all — just not visibly to `doctor`; see the
+[hot-aggregate benchmark](#hot-aggregate-benchmark), which saves and re-loads a
+snapshot to measure the 6.4× cold-load win.)
 
 ### `mess verify --full` — recovery scan + byte integrity
 
 ```
-$ cargo run -p mess-cli --bin mess -- verify ~/.cache/mess-social-demo/store --full --format pretty
-mess verify
-  dir: "/home/bob/.cache/mess-social-demo/store"
-  full: true
-  repair: false
-  verified: true
-
-[OK] unsealed-segment-scanned: segment 1: unsealed, 1488 committed batch(es), tail stop = clean
-
-[OK] 1 finding(s); worst = ok
+$ mess verify /path/to/demo --full
+ok  unsealed-segment-scanned  segment-scan  segment 1: unsealed, 1488 committed batch(es), tail stop = clean
+dir: …/demo
+full: true
+verified: true
 ```
 
 Proves: every one of the 1,488 committed batches passes the acceptance-kernel
-scan (CRCs, structural framing) and the scan reaches a *clean* tail stop
-(no truncated/torn last record) — with `--full`, this also reassembles
-payload blocks and would recompute the fold chain on any chain-enabled
-batch (this demo never opts into `crypto_chain`, so that half is a no-op
-here, correctly reported rather than silently skipped). Ran in ~7ms against
-1,488 events — the recovery scanner is not the bottleneck.
+scan (CRCs, structural framing) and reaches a *clean* tail stop (no truncated
+last record); `--full` also reassembles payload blocks and would recompute the
+fold chain on any chain-enabled batch (this demo never opts into `crypto_chain`,
+so that half is a correctly-reported no-op).
 
 ### `mess backup` + `mess restore` — the durability round trip
 
 ```
-$ cargo run -p mess-cli --bin mess -- backup ~/.cache/mess-social-demo/store \
-    --to ~/.cache/mess-social-demo/backup --format pretty
-mess backup
-  copied_bytes: 581705
-  copied_files: 24
-  dest: "/home/bob/.cache/mess-social-demo/backup"
-  lease_id: "bkp-2239497-1783710951"
-  watermark: 1488
+$ mess backup …/demo --to …/backup
+ok  backup-complete  backup  backup complete: 24 file(s) copied, 0 skipped, watermark 1488
+…
+copied_bytes: 654025
+copied_files: 24
+watermark: 1488
 
-[OK] backup-complete: backup complete: 24 file(s) copied, 0 skipped, watermark 1488
-
-$ cargo run -p mess-cli --bin mess -- restore ~/.cache/mess-social-demo/backup \
-    --to ~/.cache/mess-social-demo/restored --format pretty
-mess restore
-  dir: "/home/bob/.cache/mess-social-demo/restored"
-  manifest_watermark: 1488
-  recovered_watermark: 1488
-  restored_bytes: 581705
-  restored_files: 24
-  verified: true
-
-[OK] restore-complete: restored 24 file(s); verify --full clean; recovered watermark 1488
+$ mess restore …/backup --to …/restored
+ok  restore-complete  restore  restored 24 file(s); verify --full clean; recovered watermark 1488
+…
+manifest_watermark: 1488
+recovered_watermark: 1488
+verified: true
 ```
 
 Proves: `backup` took a consistent cut (a retention lease held for the copy,
-`BACKUP_MANIFEST` written last) of a store with a *live writer attached*
-(this ran while `social-web` was serving requests against the same store);
-`restore` copied it back, re-ran `verify --full`, and its
-`recovered_watermark` matches the manifest's `1488` exactly — no events lost,
-none duplicated. And it is not just a byte-count claim: pointing
-`social-web --dir ~/.cache/mess-social-demo/restored` at the restored copy
-serves **byte-identical HTML** to the original store, verified with `diff`
-during this bone's own testing — the restore round-trips the *application*,
-not just the files.
+manifest written last), and `restore` copied it back, re-ran `verify --full`,
+and its `recovered_watermark` matches the manifest's `1488` exactly — no events
+lost, none duplicated.
+
+## At scale
+
+The through-line of this example, from the bounded aggregates to the pipelined
+seeder:
+
+- **Bounded aggregates → O(1) warm commands.** Because a crowd is never
+  aggregate state, a `Post`/`User`/`Like`/`Follow` command folds a handful of
+  fields no matter how popular the entity is. That is the precondition for the
+  warm `command_cached` path: a bounded aggregate has a tiny cached state and a
+  tiny snapshot, so a warm hit is a version-check-plus-append (zero reads), flat
+  at any like count. The hot-post benchmark is the counterfactual — it lets the
+  state grow unbounded specifically to show the ~671× cost the bounded remodel
+  removes.
+- **Crowds reappear in projections.** Counts, `liked_by_me`, follower sets are
+  reconstructed from the relationship streams at query time. The large tier's
+  celebrity (2,204 followers) and viral post (2,983 likes) are folded into O(1)
+  count/membership maps in the read model, never onto the write path.
+- **Checkpoint resume.** The read model is a function of the log, so it is
+  freely rebuildable; the checkpoint sidecar makes a *restart* pay only the log
+  suffix instead of a full replay, and `--rebuild` proves the two agree
+  byte-for-byte.
+- **What changes at 10×.** The write path does not — it is already O(1) per
+  command and pipelinable per distinct stream. What starts to bite is the
+  *read* side: `Projections` is a single in-memory fold of the whole log, and a
+  from-0 rebuild is linear in log length (0.025 s at 54.7k events here; seconds
+  at millions). The checkpoint bounds *restart* cost; the next steps beyond this
+  example are the ones `docs` already flag as later bones — sharding the
+  projection, materialized per-user inboxes for the highest-fanout timelines,
+  and seeding under `Durability::Group` so the committer's group-commit turns
+  the pipelining pattern's 1.75× here into the 7–23× the bulk-writes guide
+  measures.
+
+## Concerns
+
+Dogfood findings surfaced by building this at scale (reported here, not worked
+around by editing `mess-*`):
+
+- **`FjallSnapshotBackend` does not forward `SubscribeBackend`.** The warm write
+  path needs `SnapshotStore`; the read model's live tail needs
+  `SubscribeBackend`; no one backend type has both, so `store_backend` runs the
+  read model over a second `EventStore` on a clone of the wrapped `LogEngine`.
+  Clean here (the engine is `Arc`-shared), but a forward impl on the wrapper
+  would collapse the two handles into one.
+- **`mess doctor`'s fold-version check can't see this store's snapshots.** Two
+  reasons: (1) the social app never *persists* snapshots — `command_cached`'s
+  fast path is an in-memory write-through cache and only *reads* the snapshot
+  store on a cold miss; and (2) even when snapshots are saved (as the hot-post
+  benchmark does), `FjallSnapshotBackend` writes them to a sidecar meta store
+  (`<dir>/.snapshots/meta`) keyed by *interim* FNV stream ids, whereas
+  `mess-cli`'s `metaread` reads the engine's own `<dir>/meta` and correlates
+  snapshot heads by the *registry* stream ids. The two never line up, so the
+  drift check reads `no live snapshots` regardless. Making it non-vacuous is a
+  `mess-store`/`mess-cli` integration change (share the meta store, or key
+  snapshots by registry id), not an `examples/social` one.
 
 ## Development
 
@@ -438,8 +519,9 @@ cargo clippy -p social --all-targets -- -D warnings
 just demo                                          # seed --force, then serve
 ```
 
-`src/seed.rs`'s tests cover: the requested corpus shape, cross-run
-determinism (two independently-seeded stores' logs diff byte-for-byte), the
-fresh-dir guard's accept/refuse behavior, and that every generated handle
-and post body satisfies the domain's own validation (`handle_is_valid`,
-`BODY_MAX_LEN`).
+`src/seed.rs`'s tests cover the demo-tier byte-identity, the pipelined-vs-
+sequential per-stream equivalence, the large-tier scale + skew targets, the
+fresh-dir guard, and that every generated handle and post body satisfies the
+domain's own validation. `src/rebuild.rs`'s test is the in-process
+checkpoint-correctness proof. Large-tier operations are `#[ignore]`d and run on
+demand.
