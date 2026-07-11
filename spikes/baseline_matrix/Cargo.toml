@@ -1,0 +1,20 @@
+[package]
+name = "baseline_matrix"
+version = "0.1.0"
+edition = "2024"
+
+# Standalone spike: opt out of the repo's root workspace.
+[workspace]
+
+[dependencies]
+# The REAL committer/writer — v3 on-disk bytes, the bare lower bound.
+mess-log = { path = "../../crates/mess-log" }
+# The current composed engine (post bn-34o/bn-2cj/bn-2ib): the measured upper layer.
+mess-store = { path = "../../crates/mess-store" }
+# Self-sweeping ext4 scratch dirs (same namespace every repo bench uses).
+mess-testkit = { path = "../../crates/mess-testkit" }
+tokio = { version = "1.52", features = ["full"] }
+
+[profile.release]
+lto = "thin"
+debug = true # symbols for perf record/report
