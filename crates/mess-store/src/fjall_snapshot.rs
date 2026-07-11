@@ -65,6 +65,7 @@ use mess_index::meta::{
 
 use crate::backend::{
     AppendError, Appended, Backend, RecordToAppend, StoredRecord,
+    SubscribeBackend,
 };
 use crate::snapshot::{
     BlobPtr, SnapshotRef, SnapshotStore, StoredSnapshot, interim_stream_id,
@@ -399,6 +400,25 @@ impl<B: Backend> SnapshotStore for FjallSnapshotBackend<B> {
             snapshot_ptr: BlobPtr(snapshot_ptr),
         };
         Ok(Some(StoredSnapshot { snapshot_ref, state_blob }))
+    }
+}
+
+/// Pure delegation: the snapshot wrapper adds no subscription state of its
+/// own, so a live-tail subscription over `FjallSnapshotBackend<B>` is exactly
+/// a subscription over the wrapped log backend `B` (dogfood bn-o9z — lets
+/// callers use a single `EventStore` for both the warm write path
+/// ([`SnapshotStore`]) and live projections ([`SubscribeBackend`]) instead of
+/// standing up a second store just to subscribe).
+impl<B: SubscribeBackend> SubscribeBackend for FjallSnapshotBackend<B> {
+    async fn watermark(&self) -> Result<u64, Self::Error> {
+        self.inner.watermark().await.map_err(SnapshotBackendError::Inner)
+    }
+
+    async fn await_watermark_past(&self, pos: u64) -> Result<(), Self::Error> {
+        self.inner
+            .await_watermark_past(pos)
+            .await
+            .map_err(SnapshotBackendError::Inner)
     }
 }
 

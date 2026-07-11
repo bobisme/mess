@@ -10,7 +10,7 @@
 
 #![cfg(not(miri))]
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use mess_core::{Aggregate, CodecError, Event};
 use mess_store::{
@@ -468,6 +468,68 @@ async fn fold_version_bump_invalidates_and_replaces_persisted_snapshot() {
         store.snapshot_metrics().invalidated(),
         1,
         "rebuild happened exactly once across the deploy"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// New capability #4 (bn-o9z dogfood): `FjallSnapshotBackend` forwards
+// `SubscribeBackend` by pure delegation, so ONE store serves both the warm
+// write path (SnapshotStore) and live projections (subscribe) — no second
+// EventStore over a cloned log just to subscribe.
+// ---------------------------------------------------------------------------
+
+/// A subscription opened over `EventStore<FjallSnapshotBackend<LogEngine>>`
+/// replays pre-existing history and then tails a concurrent writer's commits
+/// — proving the forwarded `watermark` / `await_watermark_past` reach the
+/// wrapped `LogEngine` unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subscribe_over_fjall_snapshot_backend_sees_live_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+
+    const PRE: u64 = 5;
+    const LIVE: u64 = 5;
+    const TOTAL: usize = (PRE + LIVE) as usize;
+
+    // Pre-populate committed history before anyone subscribes.
+    let pre: Vec<CounterEvent> =
+        (0..PRE).map(|i| CounterEvent::Added(i as i64)).collect();
+    store.append("s", Version::NoStream, &pre).await.unwrap();
+    assert_eq!(store.watermark().await.unwrap(), PRE);
+
+    // Consumer: drain exactly TOTAL positions, blocking only on the
+    // watermark — no polling sleeps.
+    let sub_store = store.clone();
+    let consumer = tokio::spawn(async move {
+        let mut sub = sub_store.subscribe(Some(0));
+        let mut got = Vec::with_capacity(TOTAL);
+        while got.len() < TOTAL {
+            let r = sub.next().await.expect("next");
+            got.push(r.global_position);
+        }
+        got
+    });
+
+    // Concurrent writer: commit LIVE more events while the consumer tails.
+    let live: Vec<CounterEvent> =
+        (0..LIVE).map(|i| CounterEvent::Added(i as i64)).collect();
+    let writer_store = store.clone();
+    let writer = tokio::spawn(async move {
+        writer_store.append("s", Version::At(PRE - 1), &live).await.unwrap();
+    });
+    writer.await.unwrap();
+
+    let got = tokio::time::timeout(Duration::from_secs(10), consumer)
+        .await
+        .expect(
+            "subscription over FjallSnapshotBackend must see live commits, \
+             not just history",
+        )
+        .unwrap();
+    let expected: Vec<u64> = (0..TOTAL as u64).collect();
+    assert_eq!(
+        got, expected,
+        "gap-free, in-order delivery through the forwarding wrapper"
     );
 }
 

@@ -31,11 +31,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use ident::Id;
-use mess_store::LogEngine;
-use social::Projections;
 use social::WriteOps;
 use social::rebuild::rebuild_check;
-use social::store_backend::{Store, checkpoint_path, open_store, read_handle};
+use social::store_backend::{
+    Store, StoreProjections, checkpoint_path, open_store,
+};
 use social::web::{AppState, MemBackend, router};
 
 struct Args {
@@ -133,17 +133,19 @@ async fn mem_state() -> AppState<MemBackend, MemBackend> {
 }
 
 /// The real, store-backed world: open `dir` as the warm-write [`Store`]
-/// ([`open_store`]) and build the read model over a subscribe-capable
-/// [`read_handle`] to the same log, **resuming from the sidecar checkpoint**
-/// when present and valid, else a full replay from position 0 (see
-/// [`Projections::with_checkpoint`]). Returns the [`AppState`] plus the
+/// ([`open_store`]) and build the read model by subscribing directly on that
+/// same store handle — `FjallSnapshotBackend` forwards
+/// [`SubscribeBackend`](mess_store::SubscribeBackend), so no second handle
+/// over a cloned log is needed — **resuming from the sidecar checkpoint** when
+/// present and valid, else a full replay from position 0 (see
+/// [`StoreProjections::with_checkpoint`]). Returns the [`AppState`] plus the
 /// projections handle so the caller can checkpoint on a clean shutdown. No
 /// directory to populate: handle resolution goes through
 /// [`ReadModels::resolve`](social::contracts::ReadModels::resolve) instead —
 /// see `social::web`'s module docs.
 async fn store_state(
     dir: &std::path::Path,
-) -> (AppState<Projections<LogEngine>, Store>, Arc<Projections<LogEngine>>) {
+) -> (AppState<StoreProjections, Store>, Arc<StoreProjections>) {
     if !dir.is_dir() {
         eprintln!(
             "error: store directory not found at {}\n  Run `cargo run -p \
@@ -157,16 +159,12 @@ async fn store_state(
         eprintln!("error: could not open store at {}: {e}", dir.display());
         std::process::exit(1);
     });
-    // The read model tails a subscribe-capable handle over the same log the
-    // warm-write store writes to — see `store_backend`'s docs on the
-    // `SubscribeBackend` / `SnapshotStore` split.
-    let read = read_handle(&store);
 
     print!("building read model (resume-or-rebuild) ... ");
     use std::io::Write;
     std::io::stdout().flush().ok();
     let projections = Arc::new(
-        Projections::with_checkpoint(&read, checkpoint_path(dir)).await,
+        StoreProjections::with_checkpoint(&store, checkpoint_path(dir)).await,
     );
     match projections.resumed_from() {
         0 => println!("done (full rebuild from position 0)."),

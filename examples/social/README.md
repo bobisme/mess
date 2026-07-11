@@ -493,12 +493,6 @@ seeder:
 Dogfood findings surfaced by building this at scale (reported here, not worked
 around by editing `mess-*`):
 
-- **`FjallSnapshotBackend` does not forward `SubscribeBackend`.** The warm write
-  path needs `SnapshotStore`; the read model's live tail needs
-  `SubscribeBackend`; no one backend type has both, so `store_backend` runs the
-  read model over a second `EventStore` on a clone of the wrapped `LogEngine`.
-  Clean here (the engine is `Arc`-shared), but a forward impl on the wrapper
-  would collapse the two handles into one.
 - **`mess doctor`'s fold-version check can't see this store's snapshots.** Two
   reasons: (1) the social app never *persists* snapshots — `command_cached`'s
   fast path is an in-memory write-through cache and only *reads* the snapshot

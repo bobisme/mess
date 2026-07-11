@@ -10,36 +10,11 @@
 //! bound [`EventStore::command_cached`](mess_store::EventStore::command_cached)
 //! (the hot-aggregate write-through cache + snapshot-accelerated cold load)
 //! requires — and [`crate::contracts::WriteOps`] now routes every write through
-//! `command_cached`. `StoreProjections` is the rebuildable read model,
-//! [`Projections`] over the **log** engine.
-//!
-//! # The `SubscribeBackend` vs `SnapshotStore` reconciliation (dogfood gap)
-//!
-//! The read model ([`Projections`]) tails the log via
-//! [`SubscribeBackend`](mess_store::SubscribeBackend); the warm write path
-//! needs [`SnapshotStore`](mess_store::SnapshotStore). Those are two different
-//! capabilities and — as of this bone — **no single backend type has both**:
-//!
-//! - [`LogEngine`](mess_store::LogEngine) is a `SubscribeBackend` but not a
-//!   `SnapshotStore`.
-//! - [`FjallSnapshotBackend<LogEngine>`](mess_store::FjallSnapshotBackend) is a
-//!   `SnapshotStore` but **does not forward `SubscribeBackend`** — it wraps a
-//!   `Backend` and delegates the base log ops (`head`/`read_stream`/
-//!   `read_global`/`append_batch`), but it does not re-expose the wrapped
-//!   engine's `watermark`/`await_watermark_past`. That is a **`mess-store`
-//!   gap**, reported in this crate's concerns as dogfood (we do not edit
-//!   `mess-store` from here).
-//!
-//! The workaround is clean because [`LogEngine`](mess_store::LogEngine) is
-//! `Arc`-backed: a clone shares the same underlying log, watermark, and
-//! commit-notification list. So the warm-write [`Store`] writes through the
-//! snapshot backend, and the read model tails a *second* [`EventStore`] over a
-//! **clone of the very same engine** — [`read_handle`]. Every commit the write
-//! store makes is visible to the read handle's `read_global`/`subscribe` and
-//! wakes its `wait_for` waiters, because both are views of one `Arc<Inner>`.
-//! When `FjallSnapshotBackend` grows a `SubscribeBackend` forward (or the Phase
-//! 4 engine makes snapshots always-on), this second handle collapses back into
-//! one type with no change to callers.
+//! `command_cached`. `FjallSnapshotBackend` also forwards
+//! [`SubscribeBackend`](mess_store::SubscribeBackend) straight to the wrapped
+//! log, so `StoreProjections` is [`Projections`] over the **same** [`Store`]
+//! backend the warm-write path uses — ONE `EventStore` serves both writes and
+//! subscriptions; there is no second handle over a cloned engine.
 
 use std::path::{Path, PathBuf};
 
@@ -51,14 +26,17 @@ use crate::projections::Projections;
 /// [`EventStore`](mess_store::EventStore) over
 /// [`FjallSnapshotBackend<LogEngine>`](mess_store::FjallSnapshotBackend). Being
 /// a [`SnapshotStore`](mess_store::SnapshotStore) is what unlocks the
-/// `command_cached` warm path in [`crate::contracts::WriteOps`].
+/// `command_cached` warm path in [`crate::contracts::WriteOps`]; being a
+/// [`SubscribeBackend`](mess_store::SubscribeBackend) (forwarded straight to
+/// the wrapped [`LogEngine`]) is what lets [`StoreProjections`] tail the very
+/// same handle.
 pub type Store = EventStore<FjallSnapshotBackend<LogEngine>>;
 
 /// The on-disk backend's rebuildable read model: [`Projections`] over the
-/// [`LogEngine`](mess_store::LogEngine) (a
-/// [`SubscribeBackend`](mess_store::SubscribeBackend)), built from a
-/// [`read_handle`] over the same log the [`Store`] writes to.
-pub type StoreProjections = Projections<LogEngine>;
+/// same [`Store`] backend, subscribing directly — no second handle over a
+/// cloned log needed now that [`FjallSnapshotBackend`] forwards
+/// [`SubscribeBackend`](mess_store::SubscribeBackend).
+pub type StoreProjections = Projections<FjallSnapshotBackend<LogEngine>>;
 
 /// Failure opening the on-disk store (either half — the event log or the
 /// snapshot sidecar). Rendered to a `String` at the seam so this crate needs no
@@ -116,17 +94,6 @@ pub fn open_store(dir: &Path) -> Result<Store, OpenError> {
     let backend = FjallSnapshotBackend::open(engine, snapshot_root(dir))
         .map_err(|e| OpenError::Snapshot(e.to_string()))?;
     Ok(EventStore::new(backend).with_cache_capacity(DEFAULT_CACHE_CAPACITY))
-}
-
-/// A subscribe-capable read handle over the same log `store` writes to — the
-/// [`SubscribeBackend`](mess_store::SubscribeBackend) workaround for
-/// `FjallSnapshotBackend` not forwarding it (see the module docs). The returned
-/// [`EventStore`] wraps a **clone of the wrapped [`LogEngine`]**, which shares
-/// the store's `Arc<Inner>` (and thus its watermark + commit notifications), so
-/// a [`Projections`] built over it observes every commit made through `store`.
-#[must_use]
-pub fn read_handle(store: &Store) -> EventStore<LogEngine> {
-    EventStore::new(store.backend().inner().clone())
 }
 
 /// Default hot-aggregate cache capacity for the on-disk warm-write [`Store`].

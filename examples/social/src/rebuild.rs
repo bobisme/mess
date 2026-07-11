@@ -34,9 +34,7 @@ use std::time::{Duration, Instant};
 
 use crate::Projections;
 use crate::projections::Cardinalities;
-use crate::store_backend::{
-    OpenError, Store, checkpoint_path, open_store, read_handle,
-};
+use crate::store_backend::{OpenError, Store, checkpoint_path, open_store};
 
 /// The outcome of a [`rebuild_check`]: whether the two folds matched, plus the
 /// counts and positions worth printing.
@@ -119,19 +117,17 @@ pub async fn rebuild_compare(
     store: &Store,
     checkpoint: &Path,
 ) -> RebuildReport {
-    // Both projections tail the same log through the subscribe-capable read
-    // handle over the wrapped engine (see `store_backend`).
-    let read = read_handle(store);
-
+    // Both projections tail the same store directly — `FjallSnapshotBackend`
+    // forwards `SubscribeBackend`, so no separate read handle is needed.
     // (1) Clean rebuild from position 0 — the cold-start cost.
     let t0 = Instant::now();
-    let from0 = Projections::new(&read).await;
+    let from0 = Projections::new(store).await;
     let from0_build = t0.elapsed();
     // (2) Checkpoint resume — with a cadence so large it never rewrites the
     // sidecar while we inspect it (the proof is read-only).
     let t1 = Instant::now();
     let resumed = Projections::with_checkpoint_cadence(
-        &read,
+        store,
         checkpoint,
         u64::MAX,
         Duration::from_secs(24 * 60 * 60),
@@ -197,10 +193,9 @@ mod tests {
             };
             seed::generate(&store, &cfg).await;
 
-            let read = read_handle(&store);
-            let head = read.watermark().await.unwrap();
+            let head = store.watermark().await.unwrap();
             let proj = Projections::with_checkpoint_cadence(
-                &read,
+                &store,
                 &ckpt,
                 u64::MAX,
                 Duration::from_secs(3600),
