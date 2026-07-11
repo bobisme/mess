@@ -20,7 +20,7 @@
 use std::future::Future;
 
 use ident::Id;
-use mess_core::CommandError;
+use mess_core::{CommandError, SharedStoreError};
 use mess_store::{EventStore, SnapshotStore};
 
 use crate::domain::follow::{Follow, FollowError, PlaceFollow, RemoveFollow};
@@ -190,21 +190,20 @@ pub trait ReadModels {
 /// [`SelfFollow`](WriteError::SelfFollow) check, and the infrastructure
 /// outcomes ([`CommandError::Conflict`]/[`CommandError::Store`]) are unified.
 ///
-/// # Dogfood note: why `Store` is a rendered `String`, not `CommandError::erase_store`
+/// # Dogfood note: `Store` is `CommandError::erase_store_shared`'s output
 ///
-/// `mess_core::CommandError::erase_store` (bn-188) exists precisely to keep a
-/// seam like this one from stringifying the store error — it would let `Store`
-/// hold a `BoxedStoreError` that still round-trips `source()`. We deliberately
-/// **do not** adopt it here: this `WriteError` must stay `Clone + PartialEq +
-/// Eq` because the web layer's test double (`web::tests::FakeWriteOps`) hands
-/// back a *cloned* canned `Result<u64, WriteError>` on every call, and several
-/// handler tests compare `WriteError` values. `BoxedStoreError`
-/// (`Box<dyn Error>`) is none of `Clone`/`PartialEq`/`Eq`, so erasing the
-/// store type would forfeit all three derives and break those test doubles.
-/// Rendering to a `String` keeps the seam backend-agnostic *and* comparable;
-/// the lost `source()` chain is an acceptable trade for an example crate whose
-/// store errors are never programmatically inspected. (Reported as a limitation
-/// of `erase_store` for equality-carrying seams.)
+/// `WriteError` must stay `Clone + PartialEq + Eq`: the web layer's test
+/// double (`web::tests::FakeWriteOps`) hands back a *cloned* canned
+/// `Result<u64, WriteError>` on every call, and several handler tests compare
+/// `WriteError` values. `mess_core::CommandError::erase_store`'s
+/// `BoxedStoreError` (`Box<dyn Error>`) cannot serve that — it is none of
+/// `Clone`/`PartialEq`/`Eq` — so `Store` instead holds
+/// [`mess_core::SharedStoreError`], produced by
+/// [`CommandError::erase_store_shared`]: an `Arc`-backed erasure that *is*
+/// `Clone`, with `PartialEq`/`Eq` by pointer identity (see that type's doc
+/// comment for exactly what that means). `source()` still walks into the
+/// backend's own error chain — nothing is lost to stringification, and the
+/// seam stays backend-agnostic *and* comparable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteError {
     /// A [`User`] business rule refused the command.
@@ -222,8 +221,10 @@ pub enum WriteError {
     SelfFollow,
     /// The optimistic-retry budget was exhausted.
     Conflict { stream: String, attempts: u32 },
-    /// The storage backend failed (rendered).
-    Store(String),
+    /// The storage backend failed, erased but still `Clone`/`PartialEq` (by
+    /// identity — see [`mess_core::SharedStoreError`]) and still chaining
+    /// through `source()`.
+    Store(SharedStoreError),
 }
 
 impl std::fmt::Display for WriteError {
@@ -248,48 +249,58 @@ impl std::fmt::Display for WriteError {
 impl std::error::Error for WriteError {}
 
 /// Map a [`User`] command's [`CommandError`] into a [`WriteError`].
-fn user_err<S: std::fmt::Display>(e: CommandError<UserError, S>) -> WriteError {
-    match e {
+fn user_err<S>(e: CommandError<UserError, S>) -> WriteError
+where
+    S: std::error::Error + Send + Sync + 'static,
+{
+    match e.erase_store_shared() {
         CommandError::Domain(d) => WriteError::User(d),
         CommandError::Conflict { stream, attempts } => {
             WriteError::Conflict { stream, attempts }
         }
-        CommandError::Store(s) => WriteError::Store(s.to_string()),
+        CommandError::Store(s) => WriteError::Store(s),
     }
 }
 
 /// Map a [`Post`] command's [`CommandError`] into a [`WriteError`].
-fn post_err<S: std::fmt::Display>(e: CommandError<PostError, S>) -> WriteError {
-    match e {
+fn post_err<S>(e: CommandError<PostError, S>) -> WriteError
+where
+    S: std::error::Error + Send + Sync + 'static,
+{
+    match e.erase_store_shared() {
         CommandError::Domain(d) => WriteError::Post(d),
         CommandError::Conflict { stream, attempts } => {
             WriteError::Conflict { stream, attempts }
         }
-        CommandError::Store(s) => WriteError::Store(s.to_string()),
+        CommandError::Store(s) => WriteError::Store(s),
     }
 }
 
 /// Map a [`Like`] command's [`CommandError`] into a [`WriteError`].
-fn like_err<S: std::fmt::Display>(e: CommandError<LikeError, S>) -> WriteError {
-    match e {
+fn like_err<S>(e: CommandError<LikeError, S>) -> WriteError
+where
+    S: std::error::Error + Send + Sync + 'static,
+{
+    match e.erase_store_shared() {
         CommandError::Domain(d) => WriteError::Like(d),
         CommandError::Conflict { stream, attempts } => {
             WriteError::Conflict { stream, attempts }
         }
-        CommandError::Store(s) => WriteError::Store(s.to_string()),
+        CommandError::Store(s) => WriteError::Store(s),
     }
 }
 
 /// Map a [`Follow`] command's [`CommandError`] into a [`WriteError`].
-fn follow_err<S: std::fmt::Display>(
-    e: CommandError<FollowError, S>,
-) -> WriteError {
-    match e {
+fn follow_err<S>(e: CommandError<FollowError, S>) -> WriteError
+where
+    S: std::error::Error + Send + Sync + 'static,
+{
+    match e.erase_store_shared() {
         CommandError::Domain(d) => WriteError::Follow(d),
         CommandError::Conflict { stream, attempts } => {
             WriteError::Conflict { stream, attempts }
         }
-        CommandError::Store(s) => WriteError::Store(s.to_string()),
+        CommandError::Store(s) => WriteError::Store(s),
     }
 }
 

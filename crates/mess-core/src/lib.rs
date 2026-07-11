@@ -27,7 +27,7 @@ pub mod error;
 pub mod event;
 
 pub use aggregate::{Actor, Aggregate, Decide};
-pub use error::{BoxedStoreError, CodecError, CommandError};
+pub use error::{BoxedStoreError, CodecError, CommandError, SharedStoreError};
 pub use event::Event;
 
 pub mod codec;
