@@ -71,6 +71,24 @@ pub fn lock_path(dir: &Path) -> PathBuf { dir.join(LOCK_FILE_NAME) }
 #[must_use]
 pub fn meta_dir(dir: &Path) -> PathBuf { dir.join("meta") }
 
+/// The **app snapshot sidecar** metadata directory: `<dir>/.snapshots/meta`.
+///
+/// An app that wraps its [`LogEngine`](mess_store::LogEngine) in a
+/// [`FjallSnapshotBackend`](mess_store::FjallSnapshotBackend) persists its
+/// snapshot heads under a co-located sidecar (the `.snapshots` convention the
+/// `examples/social` store uses, so a single `--dir` names the whole store).
+/// Those heads live in a *separate* fjall meta store from the engine's own
+/// `<dir>/meta`, keyed by the interim FNV `stream_id` and carrying the stream
+/// name as a side map (see `mess_store::fjall_snapshot`'s "Discoverability"
+/// doc). `doctor`'s fold-version check reads this location — not the engine's
+/// `<dir>/meta`, whose `snapshot_heads` table an app never writes — so the
+/// check can actually see app-persisted snapshots. Absent (a store with no
+/// snapshot sidecar) is normal and simply means "no app snapshots here".
+#[must_use]
+pub fn snapshot_meta_dir(dir: &Path) -> PathBuf {
+    dir.join(".snapshots").join("meta")
+}
+
 /// Enumerate every `seg-<id>.log` under `dir`, ascending by id, resolving
 /// each one's sidecar paths and presence. Files that do not match the naming
 /// scheme are ignored (mirrors the engine's `enumerate_segment_ids`).

@@ -6,13 +6,25 @@
 //! the snapshot set. Read-only w.r.t. committed data; reports the lock holder
 //! instead of failing when a live writer holds the store.
 //!
+//! # What the fold-version check sees
+//!
+//! The persisted snapshots this check inspects are the app's, written by a
+//! [`FjallSnapshotBackend`](mess_store::FjallSnapshotBackend) into the snapshot
+//! sidecar (`<dir>/.snapshots/meta`) — NOT the engine's own `<dir>/meta`
+//! `snapshot_heads`, which an app never writes. [`metaread::read`] reads that
+//! sidecar and joins its heads back to stream names, so the check is
+//! non-vacuous on any store that actually persists snapshots (an app opts into
+//! that with `mess_store::SnapshotPolicy`). A store that persists none — e.g.
+//! one whose warm path is a pure in-memory cache — correctly reports the
+//! `no-snapshots` OK finding: there is genuinely nothing to drift.
+//!
 //! # The fold-version check's live-writer caveat
 //!
 //! Every other check here reads directly off the segment files or probes the
 //! D9 store lock — none of that needs exclusive access. The `fold_version`
-//! check is the one exception: it opens the fjall metadata store (`meta/`)
-//! via [`metaread::read`], and fjall's own directory lock is exclusive with
-//! no read-only/secondary mode (see that module's doc for why a read-only
+//! check is the one exception: it opens the fjall metadata store(s) via
+//! [`metaread::read`], and fjall's own directory lock is exclusive with no
+//! read-only/secondary mode (see that module's doc for why a read-only
 //! fallback was investigated and rejected). While a live writer holds the
 //! store, this one check cannot run and degrades to an `info`-severity
 //! `meta-store-locked` finding instead of failing the whole command — see

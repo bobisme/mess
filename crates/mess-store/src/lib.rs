@@ -84,8 +84,8 @@ pub use mess_log::committer::Durability;
 pub use mock::MockBackend;
 pub use retry::{DEFAULT_MAX_ATTEMPTS, RetryPolicy};
 pub use snapshot::{
-    BlobPtr, Hash256, SnapshotRef, SnapshotStore, Snapshottable,
-    StateCodecError, StoredSnapshot, interim_stream_id,
+    BlobPtr, Hash256, SnapshotPolicy, SnapshotRef, SnapshotStore,
+    Snapshottable, StateCodecError, StoredSnapshot, interim_stream_id,
 };
 pub use store::{
     AuthoredCommandError, Commit, DEFAULT_PAGE_SIZE, EventStore, Loaded,

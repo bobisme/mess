@@ -191,6 +191,70 @@ pub trait SnapshotStore: Backend {
     > + Send;
 }
 
+/// An opt-in policy for **proactively persisting** snapshots on the warm write
+/// path ([`EventStore::command_cached`](crate::EventStore::command_cached)).
+///
+/// The warm path is a hot-aggregate *in-memory* write-through cache; on its own
+/// it never writes a durable snapshot ([`command_cached`] only *reads* the
+/// snapshot store, on a cold miss). So a normally-running app persists **no**
+/// snapshots, and `mess doctor`'s fold-version drift check has nothing to
+/// inspect — the check is structurally vacuous against a live app store. This
+/// policy is the opt-in that changes that: an app that sets a non-default
+/// policy asks `command_cached` to persist the folded state it *already holds*
+/// on the success path (no extra replay) once every `every_n_events` events on
+/// a stream.
+///
+/// The default is [`never`](Self::never): nothing is written and behavior is
+/// byte-for-byte what it was before this policy existed, so no existing caller
+/// changes. An app opts in with
+/// [`EventStore::with_snapshot_policy`](crate::EventStore::with_snapshot_policy).
+///
+/// The persisted snapshot is throwaway (spec 05's interim keyspace);
+/// correctness of a later load never rests on it (that is the
+/// snapshot-equivalence law), so a failed write is swallowed and the command
+/// still succeeds.
+///
+/// [`command_cached`]: crate::EventStore::command_cached
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SnapshotPolicy {
+    every_n_events: Option<u64>,
+}
+
+impl SnapshotPolicy {
+    /// Never persist a snapshot from the warm path (the default).
+    #[must_use]
+    pub fn never() -> Self { Self { every_n_events: None } }
+
+    /// Persist a snapshot each time a stream's committed event count crosses a
+    /// multiple of `n` on the warm path. `n == 0` is treated as
+    /// [`never`](Self::never) (a zero interval would divide by zero and means
+    /// "off" anyway).
+    #[must_use]
+    pub fn every_n_events(n: u64) -> Self {
+        Self { every_n_events: (n > 0).then_some(n) }
+    }
+
+    /// The configured interval, or `None` when snapshotting is off.
+    #[must_use]
+    pub fn interval(self) -> Option<u64> { self.every_n_events }
+
+    /// Whether an append that moved a stream from `events_before` total events
+    /// to `events_after` total events should trigger a snapshot: true exactly
+    /// when the count crossed a multiple of the interval (so a single append of
+    /// many events fires at most once, and never fires when off).
+    #[must_use]
+    pub fn should_snapshot(
+        self,
+        events_before: u64,
+        events_after: u64,
+    ) -> bool {
+        match self.every_n_events {
+            Some(n) => events_before / n != events_after / n,
+            None => false,
+        }
+    }
+}
+
 /// Derive a stable interim interned-id stand-in from a stream **name**.
 ///
 /// FNV-1a (64-bit) — deterministic, dependency-free, and good enough for the
@@ -206,4 +270,40 @@ pub fn interim_stream_id(stream_id: &str) -> u64 {
         hash = hash.wrapping_mul(PRIME);
     }
     hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn never_policy_is_the_default_and_never_fires() {
+        assert_eq!(SnapshotPolicy::default(), SnapshotPolicy::never());
+        assert_eq!(SnapshotPolicy::never().interval(), None);
+        // Even a large jump never triggers when off.
+        assert!(!SnapshotPolicy::never().should_snapshot(0, 1_000));
+    }
+
+    #[test]
+    fn zero_interval_is_treated_as_off() {
+        let p = SnapshotPolicy::every_n_events(0);
+        assert_eq!(p, SnapshotPolicy::never());
+        assert!(!p.should_snapshot(0, 100));
+    }
+
+    #[test]
+    fn every_n_fires_once_per_boundary_crossing() {
+        let p = SnapshotPolicy::every_n_events(5);
+        assert_eq!(p.interval(), Some(5));
+        // 0 -> 5 crosses the first multiple.
+        assert!(p.should_snapshot(0, 5));
+        // 5 -> 7 stays within the same bucket.
+        assert!(!p.should_snapshot(5, 7));
+        // 8 -> 12 crosses the 10 boundary (a multi-event append fires once).
+        assert!(p.should_snapshot(8, 12));
+        // 0 -> 3 has not reached the first multiple yet.
+        assert!(!p.should_snapshot(0, 3));
+        // A single append that leaps several buckets still fires (once).
+        assert!(p.should_snapshot(0, 23));
+    }
 }

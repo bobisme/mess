@@ -52,6 +52,35 @@
 //!   file still carries a length + checksum header, so a torn/corrupt file is
 //!   detected and also degrades to full replay rather than a wrong answer.
 //!
+//! # Discoverability: why the head carries a stream-name side map
+//!
+//! Snapshot heads are keyed by [`interim_stream_id`] — an FNV-1a hash of the
+//! stream **name** (spec 05's interim keyspace, standing in for the Phase 4
+//! registry's interned id, which is not minted here). That FNV id is opaque:
+//! it cannot be reversed to a name, and it does **not** coincide with the
+//! engine interner's dense `stream_id` that `mess-cli`'s `metaread` correlates
+//! against when it reads the engine's own `<dir>/meta`. The consequence, until
+//! this bone, was that `mess doctor`'s fold-version drift check could never see
+//! an app-persisted snapshot — the id spaces never intersected, so the check
+//! was structurally vacuous against any real store.
+//!
+//! The least-invasive fix (consistent with keeping the interim FNV keyspace) is
+//! to make each head **self-joinable**: [`save_snapshot`] also writes the
+//! `interim_id -> stream name` pair into this store's own
+//! [`stream_names`](mess_index::meta::MetaStore::put_stream_name) table. A
+//! reader then joins `snapshot_heads` ⋈ `stream_names` by the interim id — the
+//! *same* join `metaread` already performs against the engine meta — and
+//! recovers the name (and, if it wants, the engine's registry id for that name)
+//! for every persisted snapshot. Doctor learns to also read this sidecar meta
+//! store, so its fold-version check finally fires on a real app store.
+//!
+//! This changes **no** on-disk `snapshot_ref` byte layout ([`encode_ref`] /
+//! [`decode_ref`] are untouched), so committed golden fixtures still decode and
+//! [`load_snapshot`] still resolves by name via a point lookup. The added
+//! `stream_names` rows are simply absent in a pre-bone store, which only means
+//! an old store's snapshots are invisible to the *join* (they still load) — a
+//! documented, pre-1.0 forward-only incompatibility, no migration required.
+//!
 //! [`SnapshotHeads`]: mess_index::meta::MetaTable::SnapshotHeads
 //! [`SnapshotHead`]: mess_index::meta::SnapshotHead
 
@@ -345,6 +374,16 @@ impl<B: Backend> SnapshotStore for FjallSnapshotBackend<B> {
         snapshot: StoredSnapshot,
     ) -> Result<(), Self::Error> {
         let id = StreamId(interim_stream_id(stream_id));
+        // Persist the interim-id -> stream-name mapping alongside the head, so
+        // a reader (e.g. `mess doctor`'s fold-version check via `mess-cli`'s
+        // `metaread`) can JOIN this store's `snapshot_heads` back to stream
+        // names and make the drift check non-vacuous — see the module doc's
+        // "Discoverability" section. The FNV `interim_stream_id` keyspace is
+        // unchanged (spec 05's interim story); this is a self-describing side
+        // map, not a key change, so the on-disk `snapshot_ref` format and the
+        // golden fixtures are untouched. Journal-buffered like every other row
+        // here; a lost mapping self-heals (the head still loads by name).
+        self.meta.put_stream_name(id.0, stream_id)?;
         let snap = &snapshot.snapshot_ref;
         // An empty-prefix snapshot covers version 0 by convention; the flag is
         // what disambiguates "folds the empty prefix" from "folds index 0".

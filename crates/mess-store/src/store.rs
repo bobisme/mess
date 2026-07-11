@@ -10,8 +10,8 @@ use crate::backend::{AppendError, Backend, RecordToAppend, SubscribeBackend};
 use crate::cache::StateCache;
 use crate::retry::RetryPolicy;
 use crate::snapshot::{
-    BlobPtr, SnapshotRef, SnapshotStore, Snapshottable, StateCodecError,
-    StoredSnapshot, interim_stream_id,
+    BlobPtr, SnapshotPolicy, SnapshotRef, SnapshotStore, Snapshottable,
+    StateCodecError, StoredSnapshot, interim_stream_id,
 };
 use crate::subscription::Subscription;
 use crate::version::Version;
@@ -208,17 +208,23 @@ enum SnapshotOutcome<A> {
 /// `Arc`), so warm state is shared across clones and across concurrent writers.
 #[derive(Debug, Clone)]
 pub struct EventStore<B> {
-    backend:   B,
-    policy:    RetryPolicy,
-    page_size: usize,
+    backend:     B,
+    policy:      RetryPolicy,
+    page_size:   usize,
     /// Hot-aggregate state cache (doc-02). Disabled by default, so the base
     /// [`load`](Self::load)/[`command`](Self::command) behavior — and every
     /// existing test — is unchanged until a caller opts in with
     /// [`with_cache_capacity`](Self::with_cache_capacity).
-    cache:     StateCache,
+    cache:       StateCache,
     /// Snapshot-path observability (the `fold_version` invalidation counter,
     /// §9). Shared across clones via its internal `Arc`.
-    metrics:   SnapshotMetrics,
+    metrics:     SnapshotMetrics,
+    /// Opt-in policy for proactively persisting snapshots on the warm write
+    /// path ([`command_cached`](Self::command_cached)). Default
+    /// [`SnapshotPolicy::never`], so nothing is written and existing behavior
+    /// is unchanged until a caller opts in via
+    /// [`with_snapshot_policy`](Self::with_snapshot_policy).
+    snap_policy: SnapshotPolicy,
 }
 
 impl<B: Backend> EventStore<B> {
@@ -232,6 +238,7 @@ impl<B: Backend> EventStore<B> {
             page_size: DEFAULT_PAGE_SIZE,
             cache: StateCache::disabled(),
             metrics: SnapshotMetrics::default(),
+            snap_policy: SnapshotPolicy::never(),
         }
     }
 
@@ -258,6 +265,30 @@ impl<B: Backend> EventStore<B> {
         self.cache = cache;
         self
     }
+
+    /// Set the opt-in [`SnapshotPolicy`] for the warm write path
+    /// ([`command_cached`](Self::command_cached)).
+    ///
+    /// The default is [`SnapshotPolicy::never`] — the warm path writes no
+    /// durable snapshots, exactly as before. Opting into a non-default policy
+    /// (e.g. [`SnapshotPolicy::every_n_events`]) makes `command_cached` persist
+    /// the folded state it already holds on the success path once per interval
+    /// crossing, with **no extra replay**. This is what gives a
+    /// normally-running app persisted snapshots for `mess doctor`'s
+    /// fold-version check to see.
+    ///
+    /// Only takes effect when the backend is a
+    /// [`SnapshotStore`](crate::SnapshotStore); it is a no-op otherwise (the
+    /// warm path itself requires `SnapshotStore`).
+    #[must_use]
+    pub fn with_snapshot_policy(mut self, policy: SnapshotPolicy) -> Self {
+        self.snap_policy = policy;
+        self
+    }
+
+    /// The configured warm-path [`SnapshotPolicy`].
+    #[must_use]
+    pub fn snapshot_policy(&self) -> SnapshotPolicy { self.snap_policy }
 
     /// Borrow the hot-aggregate state cache (for inspection / tests).
     #[must_use]
@@ -855,6 +886,26 @@ impl<B: SnapshotStore> EventStore<B> {
                     let mut folded = state;
                     for e in &events {
                         folded.apply(e);
+                    }
+                    // Opt-in proactive snapshot (default off): persist the
+                    // folded state we ALREADY hold — no extra replay — once per
+                    // policy-interval crossing. Best-effort: the snapshot store
+                    // is throwaway (correctness comes from the log), so a
+                    // failed write never fails a committed
+                    // command. This is what gives
+                    // a normally-running app persisted snapshots for the `mess
+                    // doctor` fold-version check to inspect.
+                    let before = version.position().map_or(0, |p| p + 1);
+                    let after =
+                        appended.version.position().map_or(0, |p| p + 1);
+                    if self.snap_policy.should_snapshot(before, after) {
+                        let _ = self
+                            .persist_snapshot::<A>(
+                                stream_id,
+                                &folded,
+                                appended.version,
+                            )
+                            .await;
                     }
                     self.cache.put::<A>(stream_id, appended.version, folded);
                     return Ok(Commit {

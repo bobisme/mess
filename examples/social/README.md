@@ -493,17 +493,25 @@ seeder:
 Dogfood findings surfaced by building this at scale (reported here, not worked
 around by editing `mess-*`):
 
-- **`mess doctor`'s fold-version check can't see this store's snapshots.** Two
-  reasons: (1) the social app never *persists* snapshots — `command_cached`'s
-  fast path is an in-memory write-through cache and only *reads* the snapshot
-  store on a cold miss; and (2) even when snapshots are saved (as the hot-post
-  benchmark does), `FjallSnapshotBackend` writes them to a sidecar meta store
-  (`<dir>/.snapshots/meta`) keyed by *interim* FNV stream ids, whereas
-  `mess-cli`'s `metaread` reads the engine's own `<dir>/meta` and correlates
-  snapshot heads by the *registry* stream ids. The two never line up, so the
-  drift check reads `no live snapshots` regardless. Making it non-vacuous is a
-  `mess-store`/`mess-cli` integration change (share the meta store, or key
-  snapshots by registry id), not an `examples/social` one.
+- **`mess doctor`'s fold-version check now *can* see app snapshots — social
+  just hasn't opted in yet.** This used to be a two-part dead end: (1) the
+  social app never *persists* snapshots (`command_cached`'s fast path is an
+  in-memory write-through cache that only *reads* the snapshot store on a cold
+  miss), and (2) even saved snapshots were written to the sidecar meta store
+  (`<dir>/.snapshots/meta`) keyed by *interim* FNV stream ids, while `mess-cli`'s
+  `metaread` read only the engine's `<dir>/meta` and correlated by the engine's
+  own ids — two id spaces that never intersected, so the check always read `no
+  live snapshots`. The `mess-store`/`mess-cli` half of that is now fixed: a
+  `FjallSnapshotBackend` records each snapshot head's stream *name* alongside
+  its FNV key, `doctor`/`metaread` read the `.snapshots` sidecar and join heads
+  back to names, and `EventStore::with_snapshot_policy(SnapshotPolicy::every_n_events(N))`
+  lets the warm path persist a snapshot every N events straight from the folded
+  state it already holds (default off — nothing changes until you opt in). What
+  remains is purely an `examples/social` adoption choice: `store_backend`'s
+  `open_store` does not yet set a snapshot policy, so a seeded/served store
+  still persists none and `doctor` still (correctly) reports `no-snapshots`.
+  Flip the policy on there and `mess doctor --expect-fold-version` reports a
+  real, non-vacuous fold-version check over this store's persisted snapshots.
 
 ## Development
 
