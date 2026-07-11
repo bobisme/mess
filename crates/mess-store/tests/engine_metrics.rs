@@ -1,5 +1,26 @@
 //! `bn-e2y`: the engine's runtime-metrics surface moves under a real workload,
 //! and the mandatory §2.6 fsync-degradation flag latches.
+//!
+//! `bn-11n`: [`metrics_move_under_durable_workload`] used to also assert the
+//! degradation flag stays *false* after a healthy three-batch workload. That
+//! assertion is a real-wall-clock comparison against the alarm's fixed 50 ms
+//! threshold (`DEFAULT_FSYNC_THRESHOLD`, mess-log/src/metrics.rs) — a
+//! property of the *shared disk*, not of this store's wiring. Recurrence data
+//! (2 incidents, 2026-07-10) showed it tripping for real: once immediately
+//! after the 462s differential suite, once during a 10-crate parallel sweep;
+//! standalone it always passes in ~2s. Reproduced directly in this bone by
+//! running the compiled test binary in a loop while `differential_full_profile`
+//! (`--release`) and a full `cargo test --workspace --release` sweep ran
+//! concurrently: barriers were observed at 102–155 ms, comfortably crossing
+//! the 50 ms threshold on an otherwise-healthy store. The fix splits the
+//! promise in two: this test now asserts the flag stays *internally
+//! consistent* with its own trip counter (a wiring property, independent of
+//! host load) plus the unconditional counter-movement assertions below;
+//! [`metrics_fsync_healthy_on_uncontended_disk`] keeps the strict
+//! never-degraded check, `#[ignore]`d for on-demand/quiet-disk runs. The
+//! alarm's trip-on-genuinely-slow-barrier behavior itself is covered
+//! deterministically (no real disk timing involved) by
+//! `degradation_alarm_fires_on_slow_barrier` in mess-log's committer tests.
 #![cfg(not(miri))]
 
 use std::time::Duration;
@@ -12,7 +33,10 @@ fn rec(t: &str, d: &[u8]) -> RecordToAppend {
 }
 
 /// Under a durable (`Group`) engine, appends move the throughput counters and
-/// the barrier histogram; a fresh store is not degraded.
+/// the barrier histogram; a fresh store is not degraded before any barrier
+/// runs. (The stronger "stays healthy under this workload" claim is a
+/// host-disk-speed property, not a store-wiring one — see the module doc and
+/// [`metrics_fsync_healthy_on_uncontended_disk`].)
 #[tokio::test]
 async fn metrics_move_under_durable_workload() {
     let dir = mess_testkit::sweeping_temp_dir(
@@ -68,10 +92,31 @@ async fn metrics_move_under_durable_workload() {
         m.commit.fsync_threshold_nanos,
         Duration::from_millis(50).as_nanos() as u64
     );
-    assert!(
-        !m.commit.fsync_degraded,
-        "healthy barriers must not trip the alarm"
+    // bn-11n: NOT `assert!(!m.commit.fsync_degraded, ...)` — whether a real
+    // barrier crosses the fixed 50 ms threshold depends on host disk
+    // contention (a concurrent build/test sweep), not on this store's
+    // wiring; see the module doc. What IS a wiring property, independent of
+    // host load, is that the sticky flag and its trip counter always agree —
+    // a dead alarm (e.g. `observe` wired to a no-op) that lets `trips`
+    // advance without ever latching `fsync_degraded`, or latches without
+    // ever counting a trip, would fail this regardless of disk speed.
+    assert_eq!(
+        m.commit.fsync_degraded,
+        m.commit.fsync_degraded_trips > 0,
+        "the degradation flag and its trip counter must agree (flag={}, \
+         trips={})",
+        m.commit.fsync_degraded,
+        m.commit.fsync_degraded_trips,
     );
+    if m.commit.fsync_degraded {
+        eprintln!(
+            "note: fsync alarm tripped during this run (trips={}, p99={} ns) \
+             — expected under host disk contention, not a regression; see \
+             `metrics_fsync_healthy_on_uncontended_disk` (#[ignore]d) for the \
+             strict standalone check",
+            m.commit.fsync_degraded_trips, m.commit.fsync.p99_nanos,
+        );
+    }
 
     // The cache is enabled by default now, but this workload never reads a
     // sealed stream, so no block lookup has happened yet — hit/miss are still
@@ -131,9 +176,18 @@ async fn cache_and_seal_metrics_move_under_workload() {
         after_seal.seal_fsync.count >= 1,
         "seal-path fsync barriers recorded"
     );
-    assert!(
-        !after_seal.seal_fsync_degraded,
-        "healthy seal barriers do not trip the alarm"
+    // bn-11n: same host-disk-contention caveat as the commit-path alarm
+    // above (module doc) — observed live in this bone's own validation run
+    // (a concurrent sibling workspace's `cargo test` tripped this exact
+    // assertion at a 78.8 ms seal-fsync latency). Assert wiring consistency,
+    // not real-wall-clock health.
+    assert_eq!(
+        after_seal.seal_fsync_degraded,
+        after_seal.seal_fsync_degraded_trips > 0,
+        "the seal-fsync degradation flag and its trip counter must agree \
+         (flag={}, trips={})",
+        after_seal.seal_fsync_degraded,
+        after_seal.seal_fsync_degraded_trips,
     );
     // bn-u6o: a healthy on-demand seal never hits the bounded-wait skip path.
     assert_eq!(
@@ -164,4 +218,67 @@ async fn cache_and_seal_metrics_move_under_workload() {
     );
     assert!(after_second.cache_hit_rate > 0.0, "hit rate moved off zero");
     assert!(after_second.cache_entries >= 1, "a block is resident");
+}
+
+/// `bn-11n`: the strict, timing-sensitive half of
+/// [`metrics_move_under_durable_workload`] and
+/// [`cache_and_seal_metrics_move_under_workload`] — that on a healthy,
+/// uncontended disk this tiny workload's real commit AND seal barriers never
+/// cross the §2.6 alarms' 50 ms thresholds. `#[ignore]`d because that claim
+/// only holds when nothing else on the host is contending for the same disk
+/// (see the module doc for the recurrence data and two independent
+/// reproductions — one under a concurrent differential-suite +
+/// workspace-sweep load, one live against a sibling workspace's own `cargo
+/// test`). Run on demand: `cargo test -p mess-store --test engine_metrics --
+/// --ignored metrics_fsync_healthy_on_uncontended_disk`.
+#[tokio::test]
+#[ignore = "timing-sensitive: assumes an uncontended disk; run standalone, not \
+            under parallel host load (bn-11n)"]
+async fn metrics_fsync_healthy_on_uncontended_disk() {
+    let dir = mess_testkit::sweeping_temp_dir(
+        "engine-metrics-fsync-healthy-uncontended",
+    );
+    let opts = EngineOptions {
+        durability: mess_log::committer::Durability::group_default(),
+        block_cache_budget_bytes: 4 * 1024 * 1024,
+        ..EngineOptions::default()
+    };
+    let engine = LogEngine::open_with(dir.path(), opts).expect("open");
+
+    engine
+        .append_batch(
+            "acct-1",
+            Version::NoStream,
+            &[rec("Opened", b"x"), rec("Deposited", b"5")],
+        )
+        .await
+        .unwrap();
+    engine
+        .append_batch("acct-1", Version::At(1), &[rec("Withdrew", b"2")])
+        .await
+        .unwrap();
+    engine
+        .append_batch("acct-2", Version::NoStream, &[rec("Opened", b"y")])
+        .await
+        .unwrap();
+
+    let m = engine.metrics();
+    assert!(
+        !m.commit.fsync_degraded,
+        "healthy barriers on an uncontended disk must not trip the alarm \
+         (p99={} ns, threshold={} ns) — if this trips, either re-run on a \
+         quieter disk or the committer/alarm wiring genuinely regressed",
+        m.commit.fsync.p99_nanos, m.commit.fsync_threshold_nanos,
+    );
+
+    engine.seal_active().expect("seal active segment");
+    let after_seal = engine.metrics();
+    assert!(
+        !after_seal.seal_fsync_degraded,
+        "healthy seal barriers on an uncontended disk must not trip the alarm \
+         (p99={} ns, threshold={} ns default) — if this trips, either re-run \
+         on a quieter disk or the seal-path alarm wiring genuinely regressed",
+        after_seal.seal_fsync.p99_nanos,
+        mess_log::committer::DEFAULT_FSYNC_THRESHOLD.as_nanos(),
+    );
 }
