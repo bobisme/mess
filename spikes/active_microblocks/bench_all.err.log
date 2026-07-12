@@ -1,0 +1,16 @@
+[quiet-guard] contended (load1=12.14 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=11.65 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=11.03 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=10.47 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=9.87 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=9.32 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=8.81 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=8.51 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=8.31 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=7.96 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=7.41 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=7.77 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=7.39 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=7.12 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.79 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.41 procs=[]); sleeping 5s

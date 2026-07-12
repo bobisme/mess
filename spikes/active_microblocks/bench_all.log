@@ -1,0 +1,76 @@
+== info ==
+tsc: 0.2500 ns/tick, empty rdtsc..rdtscp overhead 80 ticks (20.0 ns)
+block: size 568 B, 32 entries -> 17.75 B/batch at full occupancy (analytic)
+incumbent StreamEntry 40 B + GlobalEntry 40 B per batch (pre-container)
+== apply throughput (single writer, pinned core 5; pre-generated schedules) ==
+apply F0-incumbent   ev=1   hot  group=1    11.819 M batches/s  (    11.8 M events/s)
+apply F-arena        ev=1   hot  group=1    43.014 M batches/s  (    43.0 M events/s)  [blocks 62500 escapes 0 (0.000%)]
+apply F0-incumbent   ev=1   hot  group=64   15.447 M batches/s  (    15.4 M events/s)
+apply F-arena        ev=1   hot  group=64   45.351 M batches/s  (    45.4 M events/s)  [blocks 62500 escapes 0 (0.000%)]
+apply F0-incumbent   ev=1   zipf group=1     6.177 M batches/s  (     6.2 M events/s)
+apply F-arena        ev=1   zipf group=1    16.415 M batches/s  (    16.4 M events/s)  [blocks 148018 escapes 0 (0.000%)]
+apply F0-incumbent   ev=1   zipf group=64    7.435 M batches/s  (     7.4 M events/s)
+apply F-arena        ev=1   zipf group=64   19.099 M batches/s  (    19.1 M events/s)  [blocks 148018 escapes 0 (0.000%)]
+apply F0-incumbent   ev=100 hot  group=1    11.579 M batches/s  (  1157.9 M events/s)
+apply F-arena        ev=100 hot  group=1    61.891 M batches/s  (  6189.1 M events/s)  [blocks 62500 escapes 0 (0.000%)]
+apply F0-incumbent   ev=100 hot  group=64   14.740 M batches/s  (  1474.0 M events/s)
+apply F-arena        ev=100 hot  group=64   78.336 M batches/s  (  7833.6 M events/s)  [blocks 62500 escapes 0 (0.000%)]
+apply F0-incumbent   ev=100 zipf group=1     6.702 M batches/s  (   670.2 M events/s)
+apply F-arena        ev=100 zipf group=1    14.976 M batches/s  (  1497.6 M events/s)  [blocks 148018 escapes 354698 (17.735%)]
+apply F0-incumbent   ev=100 zipf group=64    7.189 M batches/s  (   718.9 M events/s)
+apply F-arena        ev=100 zipf group=64   17.332 M batches/s  (  1733.2 M events/s)  [blocks 148018 escapes 354698 (17.735%)]
+== read latency under concurrent writer (ns/op; writer 500000 batches/s in 64-batch groups; fresh index per row) ==
+lat zipf F0-incumbent     r=4  resolve p50     50.0  p90    170.0  p99     380.0  p99.9      670.0  max       107160  mean     78.9
+lat zipf F0-incumbent     r=4  head    p50    130.0  p90    300.0  p99     620.0  p99.9     1090.0  max        64960  mean    157.2
+lat zipf F0-incumbent     r=64 resolve p50    120.0  p90    560.0  p99    1820.0  p99.9   212590.0  max      6513449  mean   1461.5
+lat zipf F0-incumbent     r=64 head    p50    270.0  p90    720.0  p99    6670.0  p99.9  1624859.7  max     13009257  mean   5489.6
+lat zipf F1-micro-linear  r=4  resolve p50     10.0  p90    170.0  p99     350.0  p99.9      590.0  max        12160  mean     45.2
+lat zipf F1-micro-linear  r=4  head    p50     10.0  p90    170.0  p99     340.0  p99.9      590.0  max        13080  mean     44.3
+lat zipf F1-micro-linear  r=64 resolve p50     10.0  p90    120.0  p99     330.0  p99.9      580.0  max     17010957  mean     68.0
+lat zipf F1-micro-linear  r=64 head    p50     10.0  p90    100.0  p99     300.0  p99.9      540.0  max     21014416  mean    124.7
+lat zipf F2-micro-binary  r=4  resolve p50     20.0  p90    190.0  p99     470.0  p99.9      750.0  max        22890  mean     56.9
+lat zipf F2-micro-binary  r=4  head    p50     10.0  p90    120.0  p99     250.0  p99.9      520.0  max        76270  mean     32.4
+lat zipf F2-micro-binary  r=64 resolve p50     20.0  p90    130.0  p99     360.0  p99.9      630.0  max     17019067  mean     91.0
+lat zipf F2-micro-binary  r=64 head    p50     10.0  p90    100.0  p99     290.0  p99.9      540.0  max     11021558  mean     69.7
+lat zipf F3-micro-skip    r=4  resolve p50     10.0  p90    160.0  p99     310.0  p99.9      570.0  max        12790  mean     38.2
+lat zipf F3-micro-skip    r=4  head    p50     10.0  p90    140.0  p99     260.0  p99.9      540.0  max        26520  mean     34.5
+lat zipf F3-micro-skip    r=64 resolve p50     10.0  p90    140.0  p99     340.0  p99.9      589.7  max      8012188  mean     53.2
+lat zipf F3-micro-skip    r=64 head    p50     10.0  p90    100.0  p99     300.0  p99.9      550.0  max     21152666  mean    103.1
+lat hot  F0-incumbent     r=4  resolve p50    250.0  p90    490.0  p99    1500.0  p99.9    13640.0  max       153900  mean    344.5
+lat hot  F0-incumbent     r=64 resolve p50   1030.0  p90   3920.0  p99  282369.9  p99.9  2857459.4  max     11723328  mean  18805.0
+lat hot  F0-incumbent     r=4  head    p50    190.0  p90    420.0  p99    1320.0  p99.9    12810.0  max        95780  mean    308.8
+lat deep F0-incumbent     r=4  resolve p50    300.0  p90    490.0  p99    1010.0  p99.9    13050.0  max       334280  mean    369.1
+lat hot  F1-micro-linear  r=4  resolve p50      0.0  p90     10.0  p99      29.7  p99.9      340.0  max        11350  mean      4.8
+lat hot  F1-micro-linear  r=64 resolve p50      0.0  p90     10.0  p99      90.0  p99.9      650.0  max     13532067  mean     21.7
+lat hot  F1-micro-linear  r=4  head    p50      0.0  p90     10.0  p99     150.0  p99.9      380.0  max        14920  mean      4.0
+lat deep F1-micro-linear  r=4  resolve p50    360.0  p90    390.0  p99     600.0  p99.9      810.0  max       753470  mean    377.2
+lat hot  F2-micro-binary  r=4  resolve p50     10.0  p90     10.0  p99      70.0  p99.9      360.0  max        14160  mean     10.1
+lat hot  F2-micro-binary  r=64 resolve p50     10.0  p90     10.0  p99     220.0  p99.9      720.0  max     13094937  mean     39.3
+lat hot  F2-micro-binary  r=4  head    p50      0.0  p90      0.0  p99     130.0  p99.9      370.0  max        11810  mean      2.6
+lat deep F2-micro-binary  r=4  resolve p50    380.0  p90    420.0  p99     640.0  p99.9      880.0  max        26610  mean    399.1
+lat hot  F3-micro-skip    r=4  resolve p50      0.0  p90     10.0  p99      80.0  p99.9      350.0  max        31490  mean      7.1
+lat hot  F3-micro-skip    r=64 resolve p50      0.0  p90     10.0  p99     200.0  p99.9      690.0  max     20029806  mean     32.5
+lat hot  F3-micro-skip    r=4  head    p50      0.0  p90     10.0  p99     140.0  p99.9      380.0  max        30470  mean      4.2
+lat deep F3-micro-skip    r=4  resolve p50     70.0  p90     80.0  p99     280.0  p99.9      470.0  max       111180  mean     72.9
+== global seek: position -> batch, 4 readers under writer ==
+seek F0-globalvec(range1)   p50   1310.0  p90   1880.0  p99    4330.0  p99.9     9960.0  max      2561951  mean   1422.1
+seek F1-sparse-stride8      p50    120.0  p90    170.0  p99     260.0  p99.9      380.0  max        26510  mean    130.4
+seek F1-sparse-stride1      p50    460.0  p90    850.0  p99    1410.0  p99.9     2250.0  max       131170  mean    517.5
+== memory per committed batch (fresh child per point; RSS delta across apply; 1-event batches) ==
+mem f0        hot  n=1000000   RSS   80.21 B/batch  analytic    n/a    drop     6.23 ms  (apply+drop 0.07s)
+mem f0        zipf n=1000000   RSS  102.07 B/batch  analytic    n/a    drop    18.90 ms  (apply+drop 0.16s)
+mem arena-s8  hot  n=1000000   RSS   20.69 B/batch  analytic   20.46 B/batch  drop     1.85 ms blocks 31250 escapes 0 (0.000%)  (apply+drop 0.02s)
+mem arena-s8  zipf n=1000000   RSS   71.97 B/batch  analytic   72.03 B/batch  drop     6.37 ms blocks 121525 escapes 0 (0.000%)  (apply+drop 0.07s)
+mem arena-s1  hot  n=1000000   RSS   35.22 B/batch  analytic   34.48 B/batch  drop     3.74 ms blocks 31250 escapes 0 (0.000%)  (apply+drop 0.03s)
+mem arena-s1  zipf n=1000000   RSS   86.00 B/batch  analytic   86.06 B/batch  drop     6.98 ms blocks 121525 escapes 0 (0.000%)  (apply+drop 0.09s)
+mem f0        zipf n=4000000   RSS   89.14 B/batch  analytic    n/a    drop    42.71 ms  (apply+drop 0.57s)
+mem arena-s8  zipf n=4000000   RSS   31.15 B/batch  analytic   31.15 B/batch  drop     9.73 ms blocks 203270 escapes 0 (0.000%)  (apply+drop 0.23s)
+== segment-roll reclaim (1M-batch generation retired under 8 readers holding leases) ==
+reclaim F0-incumbent     swap      1350 ns   slab-free      18.92 ms   (readers held leases across both)
+reclaim F0-incumbent       pre    ( 3000057 ops) p50    360.0  p90    620.0  p99    1020.0  p99.9     1450.0  max        17960  mean    398.7
+reclaim F0-incumbent       during ( 2075943 ops) p50    220.0  p90    440.0  p99     750.0  p99.9     1080.0  max        12620  mean    257.0
+reclaim F0-incumbent       post   ( 3000304 ops) p50    210.0  p90    410.0  p99     700.0  p99.9     1000.0  max      1153160  mean    241.1
+reclaim F1-micro         swap      2220 ns   slab-free       0.05 ms   (readers held leases across both)
+reclaim F1-micro           pre    ( 3000080 ops) p50     40.0  p90    250.0  p99     510.0  p99.9      770.0  max        20280  mean     86.6
+reclaim F1-micro           during ( 2000464 ops) p50     50.0  p90    320.0  p99     610.0  p99.9      880.0  max        34390  mean    110.6
+reclaim F1-micro           post   ( 3000240 ops) p50     50.0  p90    290.0  p99     580.0  p99.9      850.0  max        17120  mean    102.7

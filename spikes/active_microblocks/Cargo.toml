@@ -1,0 +1,30 @@
+[package]
+name = "active_microblocks"
+version = "0.1.0"
+edition = "2024"
+
+# Standalone spike: opt out of the repo's root workspace.
+[workspace]
+
+[dependencies]
+# F0 — the incumbent, used as the REAL crate (not a copy): sharded
+# RwLock<HashMap<u64, Vec<StreamEntry>>> + global Vec + applied_end watermark.
+mess-index = { path = "../../crates/mess-index" }
+rand = "0.10"
+libc = "0.2"
+# Generation handles for slab reclamation (design §8.5 "Arc generation
+# handles"): readers load the current generation lock-free; the slab frees
+# when the last lease (Arc) drains. Also used to give F0 the identical roll
+# shape in the reclaim benchmark so the comparison is like-for-like.
+arc-swap = "1"
+# Loom models the REAL publication functions (src/shim.rs swaps the atomics
+# under `--cfg loom`), so loom must be a full dependency here (same shape as
+# spikes/state_kernel_dense_heads). Compiled in only under RUSTFLAGS="--cfg loom".
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
+
+[profile.release]
+lto = "thin"
+debug = true
