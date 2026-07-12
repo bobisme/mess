@@ -213,8 +213,13 @@ mod tests {
                     .collect(),
             })
             .collect();
-        let input =
-            SealInput { segment_id, base_pos: 0, streams, payloads: None };
+        let input = SealInput {
+            segment_id,
+            base_pos: 0,
+            streams,
+            payloads: None,
+            event_type_ids: None,
+        };
         Arc::new(
             SealedSegmentIndex::from_bytes(encode_sidecar(&input)).unwrap(),
         )

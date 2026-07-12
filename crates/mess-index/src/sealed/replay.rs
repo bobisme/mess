@@ -474,8 +474,13 @@ mod tests {
                 SealStream { stream_id: sid, batches }
             })
             .collect();
-        let input =
-            SealInput { segment_id, base_pos: base, streams, payloads: None };
+        let input = SealInput {
+            segment_id,
+            base_pos: base,
+            streams,
+            payloads: None,
+            event_type_ids: None,
+        };
         Arc::new(
             SealedSegmentIndex::from_bytes(encode_sidecar(&input)).unwrap(),
         )
@@ -661,6 +666,7 @@ mod tests {
                 }],
             }],
             payloads: None,
+            event_type_ids: None,
         };
         let mut idx =
             SealedSegmentIndex::from_bytes(encode_sidecar(&input)).unwrap();

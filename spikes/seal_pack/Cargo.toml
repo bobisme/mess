@@ -1,0 +1,24 @@
+[package]
+name = "seal_pack_bench"
+version = "0.1.0"
+edition = "2024"
+
+# Standalone spike: opt out of the repo's root workspace.
+[workspace]
+
+[[bin]]
+name = "seal_pack_bench"
+path = "src/main.rs"
+
+[dependencies]
+# Drive the REAL composed engine both ways (flag off / on) so the numbers are
+# the production seal + reopen paths, not a reimplementation.
+mess-store = { path = "../../crates/mess-store" }
+mess-log = { path = "../../crates/mess-log" }
+mess-testkit = { path = "../../crates/mess-testkit" }
+tokio = { version = "1", features = ["full"] }
+# /proc load + quiet guard.
+libc = "0.2"
+
+[profile.release]
+opt-level = 3

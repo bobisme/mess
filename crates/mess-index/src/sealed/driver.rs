@@ -253,6 +253,13 @@ pub struct SealDriver {
     /// `.par` sidecar is written at seal only when the engine opts in
     /// (evidence-gated).
     parity:  ParityConfig,
+    /// bn-3of (Spike I): emit ONE consolidated SealPack (`.seal`) per segment
+    /// instead of the `.pidx`/`.filter`/`.pcol` sidecar trio. Default `false`
+    /// (the legacy sidecar path). When `true`, [`Self::seal`] takes the
+    /// [`Self::seal_consolidated`] path: build the pack, verify every pointer
+    /// + byte-reassembled payload against the input, then
+    /// temp→fdatasync→rename→ dir-fsync→finalize→install.
+    pack:    bool,
 }
 
 impl SealDriver {
@@ -263,6 +270,7 @@ impl SealDriver {
             dir: Arc::new(dir.into()),
             metrics: None,
             parity: ParityConfig::default(),
+            pack: false,
         }
     }
 
@@ -284,6 +292,22 @@ impl SealDriver {
     pub fn with_parity(mut self, parity: ParityConfig) -> Self {
         self.parity = parity;
         self
+    }
+
+    /// Enable the consolidated SealPack path (bn-3of, Spike I): when `pack` is
+    /// `true`, [`Self::seal`] writes one `.seal` per segment instead of the
+    /// `.pidx`/`.filter`/`.pcol` trio. Default `false`. Chainable.
+    #[must_use]
+    pub fn with_pack(mut self, pack: bool) -> Self {
+        self.pack = pack;
+        self
+    }
+
+    /// The consolidated SealPack (`.seal`) path for `segment_id`
+    /// (`<dir>/seg-<id:020>.seal`), the single source of truth shared with the
+    /// reopen loader (bn-3of).
+    pub fn seal_pack_path(&self, segment_id: u64) -> PathBuf {
+        crate::sealed::pack::seal_pack_path(&self.dir, segment_id)
     }
 
     /// The `.par` parity-sidecar path for `segment_id`
@@ -400,6 +424,9 @@ impl SealDriver {
     where
         Fin: FnOnce() -> io::Result<()>,
     {
+        if self.pack {
+            return self.seal_consolidated(input, finalize);
+        }
         let segment_id = input.segment_id;
         // bn-e2y: time the whole seal (encode → durable write → finalize →
         // install) as the seal duration (`roll → sealed installed`).
@@ -474,6 +501,154 @@ impl SealDriver {
             m.seal_duration.record(t_seal.elapsed());
         }
         Ok(index)
+    }
+
+    /// bn-3of (Spike I): seal one segment into a single consolidated SealPack
+    /// (`.seal`), the design §11.3 install protocol. Reached from
+    /// [`Self::seal`] when the driver has [`Self::with_pack`] enabled.
+    ///
+    /// 1. build the pack from the same [`SealInput`] the sidecar path uses
+    ///    (pointers, membership filter, columnar payload columns) plus the new
+    ///    per-event `event_type_ids`;
+    /// 2. parse it back and **verify** every pointer resolves to its real
+    ///    offset and every payload reassembles byte-identically to the input
+    ///    (the columnar codec's own verify-on-seal already ran inside
+    ///    [`payload::encode_payload_sidecar`]; this additionally proves the
+    ///    pack embedding preserved them);
+    /// 3. durably write it (temp → `fdatasync` → rename → directory `fsync`,
+    ///    via [`write_durable_metered`]);
+    /// 4. finalize the segment footer (caller closure);
+    /// 5. install then evict — the same gapless handoff as the sidecar path.
+    ///
+    /// A verify mismatch aborts before any publish and writes nothing.
+    fn seal_consolidated<Fin>(
+        &self,
+        input: SealInput,
+        finalize: Fin,
+    ) -> Result<SealedSegmentRef, SealError>
+    where
+        Fin: FnOnce() -> io::Result<()>,
+    {
+        use crate::sealed::pack;
+
+        let segment_id = input.segment_id;
+        let t_seal = Instant::now();
+
+        // Membership filter over the segment's distinct stream ids (one key per
+        // `SealStream`). `None` for an empty segment.
+        let stream_ids: Vec<u64> =
+            input.streams.iter().map(|s| s.stream_id).collect();
+        let filter = SegmentFilter::build(segment_id, &stream_ids);
+
+        // Columnar payload bytes — `encode_payload_sidecar` runs the permanent
+        // verify-on-seal internally (byte-compares every reassembled block
+        // against `events` before returning). A mismatch is
+        // `SealError::Payload` and nothing is written.
+        let payload_bytes: Option<Vec<u8>> = match &input.payloads {
+            Some(payloads) => {
+                let refs: Vec<&[u8]> =
+                    payloads.iter().map(Vec::as_slice).collect();
+                Some(payload::encode_payload_sidecar(
+                    segment_id,
+                    &refs,
+                    &PayloadSealOpts::default(),
+                )?)
+            }
+            None => None,
+        };
+
+        let type_ids: &[u32] = input.event_type_ids.as_deref().unwrap_or(&[]);
+
+        let bytes = pack::encode_pack(&pack::PackInput {
+            segment_id,
+            base_pos: input.base_pos,
+            streams: &input.streams,
+            event_type_ids: type_ids,
+            filter: filter.as_ref(),
+            payload_bytes: payload_bytes.as_deref(),
+        });
+
+        // Parse the pack back and VERIFY it against the input before publishing
+        // (design §11.3 step 2). The reader owns these exact bytes afterward
+        // without a re-read.
+        let index = SealedSegmentIndex::from_pack(bytes.clone())?;
+        Self::verify_pack(&index, &input)?;
+
+        // Durable write: temp → fdatasync → rename → directory fsync.
+        let path = self.seal_pack_path(segment_id);
+        write_durable_metered(&path, &bytes, self.metrics.as_deref())
+            .map_err(SealError::Write)?;
+
+        // Finalize the footer (mess-log's single seal fsync).
+        finalize().map_err(SealError::Finalize)?;
+
+        let index: SealedSegmentRef = Arc::new(index);
+        self.store.install(index.clone());
+        self.store.mark_active_evicted(segment_id);
+
+        if let Some(m) = &self.metrics {
+            m.seals.incr();
+            m.seal_duration.record(t_seal.elapsed());
+        }
+        Ok(index)
+    }
+
+    /// Verify a parsed pack answers every input pointer at its real offset,
+    /// and that the `EVENT_TYPE_IDS` section decodes back to exactly the
+    /// gathered per-event vector (a cheap encoder self-check — review F3).
+    /// Returns [`SealError::Sidecar`] on the first mismatch.
+    ///
+    /// The **payload** verification is discharged without re-reassembly:
+    /// [`payload::encode_payload_sidecar`] already ran the permanent
+    /// verify-on-seal (it reassembles every block and byte-compares it to the
+    /// raw `events` before returning the bytes), and
+    /// [`SealedSegmentIndex::from_pack`] then validated those exact bytes via
+    /// the directory-committed section `crc32c` + `content_hash_prefix`
+    /// (which the trailer hash binds transitively) — so the pack's payload
+    /// columns are provably identical to the already-verified `.pcol` image.
+    /// Re-decompressing every block a second time here would ~8× the seal
+    /// (measured) for zero additional coverage.
+    fn verify_pack(
+        index: &SealedSegmentIndex,
+        input: &SealInput,
+    ) -> Result<(), SealError> {
+        for s in &input.streams {
+            for b in &s.batches {
+                let last_v = b.first_version
+                    + u64::from(b.frame_count).saturating_sub(1);
+                for v in [b.first_version, last_v] {
+                    let ok = matches!(
+                        index.resolve(s.stream_id, v),
+                        Ok(Some(ptr)) if ptr.offset == b.offset
+                    );
+                    if !ok {
+                        return Err(SealError::Sidecar(SidecarError::Corrupt(
+                            "pack pointer verify mismatch",
+                        )));
+                    }
+                }
+            }
+        }
+        // Review F3: the type-id column is tiny (1 B/event indices in the
+        // common case), so a full decode-back + compare is essentially free at
+        // seal time and catches an encoder bug before anything is published.
+        if let Some(type_ids) = &input.event_type_ids
+            && !type_ids.is_empty()
+        {
+            if !index.has_event_types() {
+                return Err(SealError::Sidecar(SidecarError::Corrupt(
+                    "pack event-type section missing after encode",
+                )));
+            }
+            for (i, &t) in type_ids.iter().enumerate() {
+                if index.event_type_id(i as u64) != Some(t) {
+                    return Err(SealError::Sidecar(SidecarError::Corrupt(
+                        "pack event-type verify mismatch",
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -636,7 +811,82 @@ mod tests {
                 }],
             }],
             payloads: None,
+            event_type_ids: None,
         }
+    }
+
+    /// bn-3of (Spike I): a pack-mode driver writes ONE `.seal` (no
+    /// `.pidx`/`.filter`/`.pcol`), installs + evicts, resolves pointers,
+    /// reassembles payloads, and serves the new `event_type_id` column — and a
+    /// fresh `open_pack` from disk round-trips all of it.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn seal_consolidated_writes_one_pack_and_round_trips() {
+        use crate::sealed::payload::NoDicts;
+
+        let dir = mess_testkit::sweeping_temp_dir("idx-driver-seal-pack");
+        let store = Arc::new(SealedStore::new());
+        let driver = SealDriver::new(store.clone(), dir.path()).with_pack(true);
+
+        // One stream, 8 events, distinct payloads + type ids.
+        let payloads: Vec<Vec<u8>> =
+            (0..8u8).map(|i| vec![0xAB, i, 0xCD]).collect();
+        let type_ids: Vec<u32> = (0..8u32).map(|i| (i % 2) + 1).collect();
+        let input = SealInput {
+            segment_id:     4,
+            base_pos:       0,
+            streams:        vec![SealStream {
+                stream_id: 10,
+                batches:   vec![SealBatch {
+                    first_version:    0,
+                    frame_count:      8,
+                    first_global_pos: 0,
+                    offset:           4096,
+                }],
+            }],
+            payloads:       Some(payloads.clone()),
+            event_type_ids: Some(type_ids.clone()),
+        };
+
+        let finalized = Arc::new(AtomicUsize::new(0));
+        let f = finalized.clone();
+        let idx = driver
+            .seal(input, move || {
+                f.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(finalized.load(Ordering::SeqCst), 1, "finalize ran once");
+        assert!(driver.seal_pack_path(4).exists(), ".seal written");
+        assert!(!driver.sidecar_path(4).exists(), "no legacy .pidx");
+        assert!(!driver.filter_path(4).exists(), "no legacy .filter");
+        assert!(!driver.payload_sidecar_path(4).exists(), "no legacy .pcol");
+        assert!(store.get(4).is_some(), "installed");
+        assert!(store.is_evicted(4), "evicted after install");
+
+        // Live index: pointers, payloads, type ids.
+        assert_eq!(idx.resolve(10, 3).unwrap().unwrap().offset, 4096);
+        assert!(idx.has_event_types());
+        for (i, &t) in type_ids.iter().enumerate() {
+            assert_eq!(idx.event_type_id(i as u64), Some(t));
+        }
+        for (i, ev) in payloads.iter().enumerate() {
+            assert_eq!(
+                idx.reassemble_payload(i as u64, &NoDicts).unwrap().as_deref(),
+                Some(ev.as_slice())
+            );
+        }
+
+        // Fresh reopen from the single file.
+        let reopened =
+            SealedSegmentIndex::open_pack(&driver.seal_pack_path(4)).unwrap();
+        assert_eq!(reopened.resolve(10, 7).unwrap().unwrap().offset, 4096);
+        assert_eq!(reopened.event_type_id(5), Some(type_ids[5]));
+        assert_eq!(
+            reopened.reassemble_payload(2, &NoDicts).unwrap().as_deref(),
+            Some(payloads[2].as_slice())
+        );
     }
 
     #[test]
@@ -923,9 +1173,9 @@ mod tests {
             ]);
         }
         let input = SealInput {
-            segment_id: 5,
-            base_pos:   0,
-            streams:    vec![SealStream {
+            segment_id:     5,
+            base_pos:       0,
+            streams:        vec![SealStream {
                 stream_id: 1,
                 batches:   vec![SealBatch {
                     first_version:    0,
@@ -934,7 +1184,8 @@ mod tests {
                     offset:           4096,
                 }],
             }],
-            payloads:   Some(payloads.clone()),
+            payloads:       Some(payloads.clone()),
+            event_type_ids: None,
         };
 
         // Seal through the normal live path (`driver.seal`, the same call
@@ -1016,9 +1267,9 @@ mod tests {
         let payloads: Vec<Vec<u8>> =
             (0..8u8).map(|i| vec![0xDE, 0xAD, i]).collect();
         let input = SealInput {
-            segment_id: 4,
-            base_pos:   0,
-            streams:    vec![SealStream {
+            segment_id:     4,
+            base_pos:       0,
+            streams:        vec![SealStream {
                 stream_id: 1,
                 batches:   vec![SealBatch {
                     first_version:    0,
@@ -1027,7 +1278,8 @@ mod tests {
                     offset:           4096,
                 }],
             }],
-            payloads:   Some(payloads.clone()),
+            payloads:       Some(payloads.clone()),
+            event_type_ids: None,
         };
         let rx = sealer.submit(input, || Ok(()));
         let idx = rx.recv().unwrap().unwrap();

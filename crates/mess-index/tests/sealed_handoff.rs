@@ -61,7 +61,16 @@ fn build(
         })
         .collect();
     streams.extend(streams_vec);
-    (active, SealInput { segment_id, base_pos: 0, streams, payloads: None })
+    (
+        active,
+        SealInput {
+            segment_id,
+            base_pos: 0,
+            streams,
+            payloads: None,
+            event_type_ids: None,
+        },
+    )
 }
 
 #[test]

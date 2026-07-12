@@ -284,6 +284,7 @@ mod tests {
                 }],
             }],
             payloads: None,
+            event_type_ids: None,
         };
         Arc::new(
             SealedSegmentIndex::from_bytes(encode_sidecar(&input)).unwrap(),
@@ -369,10 +370,11 @@ mod tests {
             })
             .collect();
         let input1 = SealInput {
-            segment_id: 1,
-            base_pos:   0,
-            streams:    streams1,
-            payloads:   None,
+            segment_id:     1,
+            base_pos:       0,
+            streams:        streams1,
+            payloads:       None,
+            event_type_ids: None,
         };
         let filter1 = SegmentFilter::build(1, &ids).unwrap();
         let mut idx1 =

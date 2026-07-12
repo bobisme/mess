@@ -52,8 +52,13 @@ fn build_segment(
             SealStream { stream_id: sid, batches }
         })
         .collect();
-    let input =
-        SealInput { segment_id, base_pos: base, streams, payloads: None };
+    let input = SealInput {
+        segment_id,
+        base_pos: base,
+        streams,
+        payloads: None,
+        event_type_ids: None,
+    };
     let idx = Arc::new(
         SealedSegmentIndex::from_bytes(encode_sidecar(&input)).unwrap(),
     );
@@ -120,9 +125,9 @@ fn truncated_sidecar_is_typed_error_and_replay_falls_back_exact() {
 
     // Persist the "bad" one, then truncate it mid-body and try to reopen.
     let bad_bytes = encode_sidecar(&SealInput {
-        segment_id: 2,
-        base_pos:   b2,
-        streams:    (0..8)
+        segment_id:     2,
+        base_pos:       b2,
+        streams:        (0..8)
             .map(|sid| SealStream {
                 stream_id: sid,
                 batches:   (0..3)
@@ -135,7 +140,8 @@ fn truncated_sidecar_is_typed_error_and_replay_falls_back_exact() {
                     .collect(),
             })
             .collect(),
-        payloads:   None,
+        payloads:       None,
+        event_type_ids: None,
     });
     let path = dir.path().join("seg-2.pidx");
     std::fs::write(&path, &bad_bytes).unwrap();

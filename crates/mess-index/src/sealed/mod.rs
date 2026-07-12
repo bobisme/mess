@@ -51,6 +51,7 @@
 pub mod block_cache;
 pub mod driver;
 pub mod filter;
+pub mod pack;
 pub mod parity;
 pub mod payload;
 pub mod ptr_block;
@@ -65,6 +66,9 @@ pub use driver::{
     SealMetricsSnapshot,
 };
 pub use filter::{FilterError, SegmentFilter};
+pub use pack::{
+    PackError, PackInput, encode_event_types, encode_pack, seal_pack_path,
+};
 pub use parity::{
     ParityConfig, ParityError, ParitySidecar, RepairPlan,
     generate as generate_parity, par_path,

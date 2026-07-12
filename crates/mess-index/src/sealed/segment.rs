@@ -124,7 +124,7 @@ pub struct SealBatch {
 
 impl SealBatch {
     #[inline]
-    fn as_batch_ptr(&self) -> BatchPtr {
+    pub(crate) fn as_batch_ptr(&self) -> BatchPtr {
         BatchPtr {
             first_version:    self.first_version,
             frame_count:      self.frame_count,
@@ -149,11 +149,11 @@ pub struct SealStream {
 #[derive(Debug, Clone)]
 pub struct SealInput {
     /// The segment being sealed (all pointers resolve into it).
-    pub segment_id: u64,
+    pub segment_id:     u64,
     /// The segment's A1 base position.
-    pub base_pos:   u64,
+    pub base_pos:       u64,
     /// Per-stream batch lists, ascending by `stream_id`.
-    pub streams:    Vec<SealStream>,
+    pub streams:        Vec<SealStream>,
     /// The segment's event **payloads** in stored / global-position order:
     /// index `i` is the payload of the event at global position
     /// `base_pos + i`. When `Some`,
@@ -166,7 +166,15 @@ pub struct SealInput {
     /// payloads without touching the raw log. `None` seals the pointer
     /// sidecar only (the caller has no payload bytes in hand — e.g. a
     /// pointer-only rebuild).
-    pub payloads:   Option<Vec<Vec<u8>>>,
+    pub payloads:       Option<Vec<Vec<u8>>>,
+    /// The segment's per-event `event_type_id` in stored / global-position
+    /// order (bn-3of): index `i` is the type id of the event at global
+    /// position `base_pos + i`. Consumed only by the **consolidated SealPack**
+    /// path ([`crate::sealed::driver::SealDriver::with_pack`]) to build the
+    /// `EVENT_TYPE_IDS` section, so cold `message_type` reads never decode the
+    /// raw batch (bn-3fn carry-forward #1). `None` (the legacy default) omits
+    /// the section; the three-sidecar path ignores this field entirely.
+    pub event_type_ids: Option<Vec<u32>>,
 }
 
 impl SealInput {
@@ -186,6 +194,16 @@ impl SealInput {
     #[must_use]
     pub fn with_payloads(mut self, payloads: Vec<Vec<u8>>) -> Self {
         self.payloads = Some(payloads);
+        self
+    }
+
+    /// Attach the segment's per-event `event_type_id` column in stored /
+    /// global-position order (builder form), so the consolidated SealPack path
+    /// emits the `EVENT_TYPE_IDS` section (bn-3of). See
+    /// [`SealInput::event_type_ids`] for the ordering contract.
+    #[must_use]
+    pub fn with_event_type_ids(mut self, type_ids: Vec<u32>) -> Self {
+        self.event_type_ids = Some(type_ids);
         self
     }
 
@@ -216,7 +234,13 @@ impl SealInput {
                 streams.push(SealStream { stream_id, batches });
             }
         }
-        SealInput { segment_id, base_pos, streams, payloads: None }
+        SealInput {
+            segment_id,
+            base_pos,
+            streams,
+            payloads: None,
+            event_type_ids: None,
+        }
     }
 }
 
@@ -405,6 +429,14 @@ pub struct SealedSegmentIndex {
     /// seal. When present, the sealed read path reassembles payloads from
     /// it ([`Self::reassemble_payload`]) instead of the raw log.
     payload:     Option<SealedPayloadIndex>,
+    /// Per-event `event_type_id` in stored (global-position) order, indexed by
+    /// segment-local position (bn-3of / bn-3fn carry-forward #1). Present only
+    /// when this index was built from a [`SealPack`](crate::sealed::pack) that
+    /// carried an `EVENT_TYPE_IDS` section. When present, the cold read path
+    /// resolves an event's `message_type` **without decoding the raw batch**;
+    /// `None` (legacy sidecars, or a dropped/corrupt section) falls back to
+    /// the raw-batch decode exactly as before.
+    event_types: Option<Vec<u32>>,
 }
 
 impl SealedSegmentIndex {
@@ -507,8 +539,135 @@ impl SealedSegmentIndex {
             stream_ids,
             filter: None,
             payload: None,
+            event_types: None,
         })
     }
+
+    /// Parse a **SealPack** byte image (bn-3of, [`crate::sealed::pack`]) into
+    /// the same read surface a legacy `.pidx`+`.filter`+`.pcol` trio yields.
+    /// Validates the header/directory blake3 hash and every section's
+    /// directory-committed `crc32c` + `content_hash_prefix` (see
+    /// [`crate::sealed::pack::parse_pack`]); a corrupt mandatory section or any
+    /// structural fault returns [`SidecarError::Corrupt`] so the caller
+    /// raw-scans. The optional filter / payload / event-type sections are
+    /// attached only when they verify — a corrupt one is silently dropped and
+    /// that accelerator degrades locally (the pointer resolution stays exact).
+    pub fn from_pack(bytes: Vec<u8>) -> Result<Self, SidecarError> {
+        use crate::sealed::pack;
+        let parsed = pack::parse_pack(&bytes)
+            .map_err(|pack::PackError::Corrupt(m)| SidecarError::Corrupt(m))?;
+        let n_streams = parsed.n_streams as usize;
+
+        // Mandatory sections are guaranteed present + CRC-valid by parse_pack.
+        let dir_sec = parsed
+            .section(pack::KIND_STREAM_DIRECTORY)
+            .ok_or(SidecarError::Corrupt("missing stream directory"))?;
+        let pb = parsed
+            .section(pack::KIND_POINTER_BLOCKS)
+            .ok_or(SidecarError::Corrupt("missing pointer blocks"))?;
+        let ps = parsed
+            .section(pack::KIND_POINTER_SKIPS)
+            .ok_or(SidecarError::Corrupt("missing pointer skips"))?;
+
+        let dir_body = &bytes[dir_sec.offset..dir_sec.offset + dir_sec.length];
+        let raws = pack::decode_stream_directory(
+            dir_sec.codec_id,
+            dir_body,
+            n_streams,
+        )
+        .map_err(|pack::PackError::Corrupt(m)| SidecarError::Corrupt(m))?;
+
+        let mut dir = HashMap::with_capacity(n_streams);
+        let mut stream_ids = Vec::with_capacity(n_streams);
+        for r in raws {
+            // Rebase the section-relative offsets onto absolute pack offsets so
+            // `ptr_slice`/`skip_slice` index straight into `bytes`, and
+            // bounds-check each span inside its section.
+            let ptr_end = (r.ptr_off as usize)
+                .checked_add(r.ptr_len as usize)
+                .ok_or(SidecarError::Corrupt("dir ptr span overflow"))?;
+            let skip_end = (r.skip_off as usize)
+                .checked_add(r.skip_len as usize)
+                .ok_or(SidecarError::Corrupt("dir skip span overflow"))?;
+            if ptr_end > pb.length || skip_end > ps.length {
+                return Err(SidecarError::Corrupt("dir span out of section"));
+            }
+            let entry = DirEntry {
+                first_version: r.first_version,
+                last_version:  r.last_version,
+                ptr_off:       pb.offset as u64 + r.ptr_off,
+                ptr_len:       r.ptr_len,
+                n_batches:     r.n_batches,
+                skip_off:      ps.offset as u64 + r.skip_off,
+                skip_len:      r.skip_len,
+            };
+            dir.insert(r.stream_id, entry);
+            stream_ids.push(r.stream_id);
+        }
+        // Both directory codecs emit ascending stream ids; keep the contract
+        // the sidecar path guarantees for global replay / retention.
+        stream_ids.sort_unstable();
+
+        // Optional accelerators: attach only when they verify + cross-check the
+        // segment id, else drop (local degradation).
+        let filter = parsed.section(pack::KIND_STREAM_FILTER).and_then(|s| {
+            SegmentFilter::from_bytes(&bytes[s.offset..s.offset + s.length])
+                .ok()
+                .filter(|f| f.segment_id() == parsed.segment_id)
+        });
+        let payload =
+            parsed.section(pack::KIND_PAYLOAD_COLUMNS).and_then(|s| {
+                SealedPayloadIndex::from_bytes(
+                    bytes[s.offset..s.offset + s.length].to_vec(),
+                )
+                .ok()
+                .filter(|p| p.segment_id() == parsed.segment_id)
+            });
+        let event_types =
+            parsed.section(pack::KIND_EVENT_TYPE_IDS).and_then(|s| {
+                pack::decode_event_types(&bytes[s.offset..s.offset + s.length])
+                    .ok()
+                    .filter(|v| v.len() as u64 == parsed.event_count)
+            });
+
+        Ok(SealedSegmentIndex {
+            segment_id: parsed.segment_id,
+            base_pos: parsed.base_pos,
+            event_count: parsed.event_count,
+            bytes,
+            dir,
+            stream_ids,
+            filter,
+            payload,
+            event_types,
+        })
+    }
+
+    /// Read and parse a SealPack from `path` (bn-3of). The whole artifact —
+    /// pointers, filter, payload columns, event-type ids — lives in the one
+    /// file, so there are no sibling opens (unlike [`Self::open`]).
+    pub fn open_pack(path: &Path) -> Result<Self, SidecarError> {
+        let bytes = std::fs::read(path)?;
+        Self::from_pack(bytes)
+    }
+
+    /// The `event_type_id` of the event at **segment-local** stored index
+    /// `local_idx` (global position `base_pos + local_idx`), from the pack's
+    /// `EVENT_TYPE_IDS` section — the cold read path's message-type source that
+    /// never touches the raw batch (bn-3of). `None` when no verified event-type
+    /// section is attached (legacy sidecars, or the section was dropped as
+    /// corrupt) or `local_idx` is out of range; the caller then decodes the raw
+    /// batch exactly as before.
+    #[inline]
+    pub fn event_type_id(&self, local_idx: u64) -> Option<u32> {
+        self.event_types
+            .as_ref()
+            .and_then(|v| v.get(local_idx as usize).copied())
+    }
+
+    /// Whether a verified `EVENT_TYPE_IDS` section is attached (bn-3of).
+    #[inline]
+    pub fn has_event_types(&self) -> bool { self.event_types.is_some() }
 
     /// Read and parse a sidecar from `path`, opportunistically attaching the
     /// sibling `.filter` file ([`filter_path_for`]) if one exists, parses,
@@ -723,14 +882,15 @@ mod tests {
 
     fn sample_input() -> SealInput {
         SealInput {
-            segment_id: 7,
-            base_pos:   1000,
-            streams:    vec![
+            segment_id:     7,
+            base_pos:       1000,
+            streams:        vec![
                 seal_stream(10, &[(0, 3, 1000, 4096), (3, 2, 1003, 8192)]),
                 seal_stream(20, &[(0, 1, 1005, 12288)]),
                 seal_stream(30, &[(0, 5, 1006, 16384), (5, 5, 1011, 20480)]),
             ],
-            payloads:   None,
+            payloads:       None,
+            event_type_ids: None,
         }
     }
 
@@ -877,6 +1037,128 @@ mod tests {
         );
     }
 
+    /// bn-3of: a SealPack built from the same seal input answers every
+    /// pointer / head / global-replay query byte-identically to the legacy
+    /// `.pidx` sidecar, and additionally serves the new `event_type_id` column
+    /// and (when present) the attached membership filter — the index-level half
+    /// of the Spike I semantic-equivalence gate.
+    #[test]
+    fn pack_matches_sidecar_pointer_results_and_adds_type_ids() {
+        use crate::sealed::pack::{self, PackInput};
+
+        let input = sample_input(); // segment 7, base 1000, 3 streams
+        // Per-event type ids in stored (global-position) order. event_count=16.
+        let type_ids: Vec<u32> =
+            (0..input.event_count() as u32).map(|i| (i % 3) + 1).collect();
+        let filter = crate::sealed::filter::SegmentFilter::build(
+            input.segment_id,
+            &input.streams.iter().map(|s| s.stream_id).collect::<Vec<_>>(),
+        );
+
+        let sidecar =
+            SealedSegmentIndex::from_bytes(encode_sidecar(&input)).unwrap();
+        let pack_bytes = pack::encode_pack(&PackInput {
+            segment_id:     input.segment_id,
+            base_pos:       input.base_pos,
+            streams:        &input.streams,
+            event_type_ids: &type_ids,
+            filter:         filter.as_ref(),
+            payload_bytes:  None,
+        });
+        let packed = SealedSegmentIndex::from_pack(pack_bytes).unwrap();
+
+        // Identical scalar surface.
+        assert_eq!(packed.segment_id(), sidecar.segment_id());
+        assert_eq!(packed.base_pos(), sidecar.base_pos());
+        assert_eq!(packed.event_count(), sidecar.event_count());
+        assert_eq!(packed.stream_ids(), sidecar.stream_ids());
+
+        // Identical resolve for every (stream, version) including misses.
+        for &sid in sidecar.stream_ids() {
+            for v in 0..12u64 {
+                assert_eq!(
+                    packed.resolve(sid, v).unwrap(),
+                    sidecar.resolve(sid, v).unwrap(),
+                    "resolve mismatch stream {sid} version {v}"
+                );
+            }
+            assert_eq!(packed.stream_head(sid), sidecar.stream_head(sid));
+            assert_eq!(
+                packed.stream_entries(sid).unwrap(),
+                sidecar.stream_entries(sid).unwrap()
+            );
+        }
+        assert_eq!(
+            packed.global_entries().unwrap(),
+            sidecar.global_entries().unwrap()
+        );
+
+        // New: event-type ids come from the pack, matching the input column.
+        assert!(packed.has_event_types());
+        for (i, &t) in type_ids.iter().enumerate() {
+            assert_eq!(packed.event_type_id(i as u64), Some(t));
+        }
+        assert_eq!(packed.event_type_id(type_ids.len() as u64), None);
+
+        // The filter attached through the pack (no false negatives).
+        for &sid in packed.stream_ids() {
+            assert!(packed.might_contain_stream(sid));
+        }
+    }
+
+    /// bn-3of review F1: a REAL single flipped byte inside an OPTIONAL section
+    /// (the filter) — no trailer repair, exactly what bitrot produces — must
+    /// leave the pack openable with only that section dropped: the filter
+    /// degrades to always-"maybe" while pointer resolution stays byte-identical
+    /// to an uncorrupted index. The trailer hash covers header + directory
+    /// only, so it does not (and must not) trip here; the section's own
+    /// directory-committed CRC is what catches the flip.
+    #[test]
+    fn pack_optional_section_corruption_degrades_locally() {
+        use crate::sealed::pack::{self, KIND_STREAM_FILTER, PackInput};
+
+        let input = sample_input();
+        let ids: Vec<u64> = input.streams.iter().map(|s| s.stream_id).collect();
+        let filter =
+            crate::sealed::filter::SegmentFilter::build(input.segment_id, &ids);
+        let mut bytes = pack::encode_pack(&PackInput {
+            segment_id:     input.segment_id,
+            base_pos:       input.base_pos,
+            streams:        &input.streams,
+            event_type_ids: &[],
+            filter:         filter.as_ref(),
+            payload_bytes:  None,
+        });
+
+        // Flip ONE byte in the middle of the filter section body. Nothing
+        // else is touched — a genuine bitrot injection.
+        let parsed = pack::parse_pack(&bytes).unwrap();
+        let fsec = parsed.section(KIND_STREAM_FILTER).unwrap();
+        bytes[fsec.offset + fsec.length / 2] ^= 0xFF;
+
+        // (a) the pack still opens;
+        let packed = SealedSegmentIndex::from_pack(bytes).unwrap();
+        // (b) only the filter was dropped -> always "maybe";
+        assert!(packed.might_contain_stream(999));
+        // (c) reads remain byte-identical to an uncorrupted index.
+        let clean =
+            SealedSegmentIndex::from_bytes(encode_sidecar(&input)).unwrap();
+        for &sid in clean.stream_ids() {
+            for v in 0..12u64 {
+                assert_eq!(
+                    packed.resolve(sid, v).unwrap(),
+                    clean.resolve(sid, v).unwrap(),
+                    "resolve mismatch after filter corruption: {sid}/{v}"
+                );
+            }
+            assert_eq!(packed.stream_head(sid), clean.stream_head(sid));
+        }
+        assert_eq!(
+            packed.global_entries().unwrap(),
+            clean.global_entries().unwrap()
+        );
+    }
+
     /// bn-1i7 acceptance: with a real filter attached, every present stream
     /// answers "maybe" (zero false negatives) and the vast majority of a
     /// large absent-key sample answers "no" — i.e. filtering actually skips
@@ -888,8 +1170,13 @@ mod tests {
         let streams: Vec<SealStream> = (0..n_streams)
             .map(|i| seal_stream(i * 2, &[(0, 3, i, 4096 + i)])) // even ids only
             .collect();
-        let input =
-            SealInput { segment_id: 1, base_pos: 0, streams, payloads: None };
+        let input = SealInput {
+            segment_id: 1,
+            base_pos: 0,
+            streams,
+            payloads: None,
+            event_type_ids: None,
+        };
         let stream_ids: Vec<u64> =
             input.streams.iter().map(|s| s.stream_id).collect();
         let filter =

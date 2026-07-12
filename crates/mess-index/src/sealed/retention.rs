@@ -470,13 +470,14 @@ mod tests {
     #[test]
     fn decide_segment_matches_pure_function_over_real_sidecar() {
         let input = SealInput {
-            segment_id: 7,
-            base_pos:   1000,
-            streams:    vec![
+            segment_id:     7,
+            base_pos:       1000,
+            streams:        vec![
                 seal_stream(10, &[(0, 3, 1000, 4096), (3, 2, 1003, 8192)]), /* versions 0..=4 */
                 seal_stream(20, &[(0, 1, 1005, 12288)]), // version 0..=0
             ],
-            payloads:   None,
+            payloads:       None,
+            event_type_ids: None,
         };
         let bytes = encode_sidecar(&input);
         let seg = SealedSegmentIndex::from_bytes(bytes).unwrap();
@@ -548,10 +549,11 @@ mod tests {
     #[test]
     fn segment_deletable_respects_active_lease() {
         let input = SealInput {
-            segment_id: 5,
-            base_pos:   0,
-            streams:    vec![seal_stream(10, &[(0, 1, 0, 4096)])],
-            payloads:   None,
+            segment_id:     5,
+            base_pos:       0,
+            streams:        vec![seal_stream(10, &[(0, 1, 0, 4096)])],
+            payloads:       None,
+            event_type_ids: None,
         };
         let seg =
             SealedSegmentIndex::from_bytes(encode_sidecar(&input)).unwrap();

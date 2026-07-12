@@ -73,7 +73,13 @@ fn build_big(segment_id: u64) -> (Arc<ActiveIndex>, SealInput) {
         .collect();
     (
         Arc::new(active),
-        SealInput { segment_id, base_pos: 0, streams, payloads: None },
+        SealInput {
+            segment_id,
+            base_pos: 0,
+            streams,
+            payloads: None,
+            event_type_ids: None,
+        },
     )
 }
 

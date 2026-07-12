@@ -755,10 +755,48 @@ impl BlockReader {
         segment_id: u64,
         sealed: &SealedStore,
     ) -> Result<DecodedBatch, EngineError> {
+        let n = b.frame_count as usize;
+
+        // bn-3of: fully-from-pack fast path. When the covering SealPack carries
+        // BOTH the `EVENT_TYPE_IDS` section (per-event `event_type_id`) and the
+        // `.pcol` payload columns for this batch's range, materialize the
+        // capsule straight from the pack — the raw frames are never decoded, so
+        // a cold `message_type`/payload read never parses the raw batch bytes
+        // for type ids (the bn-3fn carry-forward #1 win). The batch was already
+        // CRC-validated (`accepted_batch_at`) by the caller, and the section +
+        // columns are verify-on-seal byte-identical to those frames, so this is
+        // exact. Any coverage gap or decode error falls through to the raw
+        // frame decode below, byte-identically.
+        if let Some((seg, generation)) = sealed.get_with_gen(segment_id)
+            && seg.has_event_types()
+            && let Some(pcol) = seg.payload_index()
+            && b.first_global_pos >= seg.base_pos()
+        {
+            let lo = b.first_global_pos - seg.base_pos();
+            let hi = lo + u64::from(b.frame_count);
+            let type_ids: Option<Vec<u32>> =
+                (lo..hi).map(|i| seg.event_type_id(i)).collect();
+            if let Some(type_ids) = type_ids
+                && let Ok((data, offs)) =
+                    self.pcol_range(segment_id, generation, pcol, lo, hi)
+            {
+                return Ok(DecodedBatch {
+                    stream_id: b.stream_id,
+                    first_stream_version: b.first_stream_version,
+                    first_global_pos: b.first_global_pos,
+                    frame_count: b.frame_count,
+                    type_ids,
+                    data,
+                    offs,
+                });
+            }
+        }
+
+        // Raw-frame path (legacy sidecars, uncovered range, or any decode
+        // error above): type ids + payload from the decoded frames.
         let frames = b.frames(image).map_err(|e| {
             EngineError::Read(format!("seg {segment_id}: frames: {e}"))
         })?;
-        let n = b.frame_count as usize;
         let mut type_ids = Vec::with_capacity(n);
         let mut data = Vec::new();
         let mut offs = Vec::with_capacity(n + 1);
@@ -769,11 +807,10 @@ impl BlockReader {
         }
         offs.push(data.len() as u32);
 
-        // D6: prefer the columnar payload sidecar's bytes for a sealed batch.
-        // A `.pcol` decode error (or a range past its coverage — e.g. an
-        // on-demand seal of a still-growing head segment) keeps the raw
-        // frames above: typed at this seam, byte-identical by verify-on-seal
-        // where the sidecar does cover.
+        // D6: prefer the columnar payload sidecar's bytes for a sealed batch
+        // whose pack lacked the type-id section (e.g. a legacy `.pcol`-only
+        // seal) but still covers the payload. A `.pcol` decode error / coverage
+        // gap keeps the raw frames — byte-identical by verify-on-seal.
         if let Some((seg, generation)) = sealed.get_with_gen(segment_id)
             && let Some(pcol) = seg.payload_index()
             && b.first_global_pos >= seg.base_pos()
@@ -1234,6 +1271,11 @@ struct Inner {
     /// [`shutdown_deadline`](Self::shutdown_deadline) (`bn-u6o`,
     /// [`EngineOptions::shutdown_seal_budget`]).
     shutdown_seal_budget: Duration,
+    /// bn-3of: whether on-demand [`seal_active`](LogEngine::seal_active)
+    /// writes a consolidated SealPack (`.seal`) instead of the sidecar
+    /// trio ([`EngineOptions::seal_pack`]). The background roll-sealer
+    /// captures the same flag directly in its `SealDriver`.
+    seal_pack:            bool,
 }
 
 impl Drop for Inner {
@@ -1334,6 +1376,14 @@ pub struct EngineOptions {
     /// a `.par` sidecar next to each sealed segment so `mess verify
     /// --repair` can reconstruct latent-sector / bit-rot damage offline.
     pub parity:                     mess_index::sealed::parity::ParityConfig,
+    /// bn-3of (Spike I): emit ONE consolidated SealPack (`.seal`) per sealed
+    /// segment instead of the `.pidx`/`.filter`/`.pcol` sidecar trio. **Off by
+    /// default** — the sealer writes the legacy sidecars and reopen dual-reads
+    /// (a `.seal` is preferred when present, else the sidecars). When `true`,
+    /// the background roll-sealer and [`seal_active`](LogEngine::seal_active)
+    /// both write a single `.seal` per segment (install protocol: build →
+    /// verify vs raw → fdatasync → rename → dir fsync → footer → publish).
+    pub seal_pack:                  bool,
     /// The TOTAL bound on how long [`LogEngine`]'s `Drop` will wait for the
     /// background seal thread to drain queued rolls (`bn-u6o`). Only matters
     /// when a roll was reported but its publish never caught up (an abandoned
@@ -1436,6 +1486,8 @@ impl Default for EngineOptions {
             // bn-2za: parity is opt-in / evidence-gated — off by default.
             parity:
                 mess_index::sealed::parity::ParityConfig::default(),
+            // bn-3of: consolidated SealPack off by default (Spike I flag).
+            seal_pack:                  false,
             // bn-u6o: bound total shutdown drain latency, not correctness — a
             // skipped seal at shutdown is safe (served from the log on
             // reopen). 2s is comfortably above a healthy drain (near-instant)
@@ -1611,7 +1663,8 @@ impl LogEngine {
             let driver =
                 SealDriver::new(Arc::clone(&sealed), dir.join("sealed"))
                     .with_metrics(Arc::clone(&seal_metrics))
-                    .with_parity(opts.parity);
+                    .with_parity(opts.parity)
+                    .with_pack(opts.seal_pack);
             let active = Arc::clone(&active);
             let published = read_watermark.clone();
             let fs = rt.fs();
@@ -1681,6 +1734,7 @@ impl LogEngine {
                 publish_seq: PublishSequencer::new_at(recovered_len),
                 opened_at: Instant::now(),
                 dir: dir.to_path_buf(),
+                seal_pack: opts.seal_pack,
                 shutdown_deadline,
                 shutdown_seal_budget: opts.shutdown_seal_budget,
             }),
@@ -2138,21 +2192,55 @@ impl LogEngine {
             // No sealed directory yet: nothing has been sealed.
             return (store, ids, pending);
         };
+
+        // bn-3of DUAL-READ. A segment may have a consolidated `.seal` pack
+        // (new path), a legacy `.pidx`+`.filter`+`.pcol` trio (old path), or —
+        // during a format migration — both. The `.seal` is preferred: parse
+        // every `.seal` first and remember which segment ids it covers, then
+        // fold in `.pidx`es only for segments the pack path did not.
+        let mut opened: HashMap<u64, SealedSegmentRef> = HashMap::new();
+        let mut from_pack: HashSet<u64> = HashSet::new();
+        let mut sidecars: Vec<(u64, std::path::PathBuf)> = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("pidx") {
-                // Skip `.pidx.tmp` husks, `.pcol`/`.filter` siblings
-                // (re-attached by `open`), and anything else.
-                continue;
+            match path.extension().and_then(|e| e.to_str()) {
+                Some("seal") => {
+                    // A complete `.seal` is crash-atomic (temp → fsync →
+                    // rename); a torn `*.seal.tmp` husk is a different
+                    // extension and ignored here. A pack that fails to parse
+                    // (whole-pack hash / mandatory-section CRC) is skipped —
+                    // the log stays authority and the segment is served from
+                    // the log until re-sealed.
+                    if let Ok(index) = SealedSegmentIndex::open_pack(&path) {
+                        let seg_id = index.segment_id();
+                        from_pack.insert(seg_id);
+                        opened.insert(seg_id, Arc::new(index));
+                    }
+                }
+                Some("pidx") => sidecars.push((0, path)),
+                // `.pidx.tmp`/`.seal.tmp` husks, `.pcol`/`.filter` siblings
+                // (re-attached by `open`), `.par`, and anything else.
+                _ => {}
             }
+        }
+        for (_, path) in sidecars {
             let Ok(index) = SealedSegmentIndex::open(&path) else {
                 continue;
             };
             let seg_id = index.segment_id();
+            // A `.seal` for this segment wins over its legacy sidecars.
+            if from_pack.contains(&seg_id) {
+                continue;
+            }
+            opened.insert(seg_id, Arc::new(index));
+        }
+
+        for (seg_id, index) in opened {
             let coverage_end = index.base_pos() + index.event_count();
-            let index: SealedSegmentRef = Arc::new(index);
-            // F2: only a valid, cross-checking footer proves the covered
-            // bytes are durable; everything else must be scan-verified.
+            // F2 (unchanged trust semantics): only a valid, cross-checking
+            // footer proves the covered bytes are durable — install trust-free;
+            // everything else is a pending candidate the recovery scan must
+            // confirm reaches the coverage end before installing.
             let footer_ok = read_trailer(fs, &segment_path(dir, seg_id))
                 .ok()
                 .flatten()
@@ -2304,7 +2392,8 @@ impl LogEngine {
             Arc::clone(&self.inner.sealed),
             self.inner.dir.join("sealed"),
         )
-        .with_metrics(Arc::clone(&self.inner.seal_metrics));
+        .with_metrics(Arc::clone(&self.inner.seal_metrics))
+        .with_pack(self.inner.seal_pack);
         std::fs::create_dir_all(self.inner.dir.join("sealed")).map_err(
             |e| EngineError::SealedRead(format!("mkdir sealed: {e}")),
         )?;
@@ -2588,6 +2677,11 @@ fn seal_input_from_segment(
 
     let mut streams: BTreeMap<u64, Vec<SealBatch>> = BTreeMap::new();
     let mut payloads: Vec<Vec<u8>> = Vec::new();
+    // bn-3of: collect per-event `event_type_id` in stored order so the
+    // consolidated SealPath path can emit the `EVENT_TYPE_IDS` section and cold
+    // `message_type` reads never decode the raw batch. Free to gather here —
+    // the frames are already decoded for the payload columns.
+    let mut event_type_ids: Vec<u32> = Vec::new();
     for b in &order {
         if b.first_global_pos < base_pos || b.first_global_pos >= end_pos {
             continue;
@@ -2602,14 +2696,22 @@ fn seal_input_from_segment(
             b.frames(&image).map_err(|e| format!("seal frames: {e}"))?;
         for f in frames {
             payloads.push(f.payload.to_vec());
+            event_type_ids.push(f.event_type_id);
         }
     }
     let streams: Vec<SealStream> = streams
         .into_iter()
         .map(|(stream_id, batches)| SealStream { stream_id, batches })
         .collect();
-    Ok(SealInput { segment_id, base_pos, streams, payloads: None }
-        .with_payloads(payloads))
+    Ok(SealInput {
+        segment_id,
+        base_pos,
+        streams,
+        payloads: None,
+        event_type_ids: None,
+    }
+    .with_payloads(payloads)
+    .with_event_type_ids(event_type_ids))
 }
 
 /// Finalize a rolled segment's footer (bn-1vu): write the fixed 100-byte

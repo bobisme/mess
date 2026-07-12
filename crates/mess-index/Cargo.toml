@@ -16,6 +16,11 @@ thiserror = { workspace = true }
 # bn-20e: crc32c over the sealed sidecar's content (same crate/algorithm as
 # mess-log's batch/footer CRCs, so the whole store speaks one checksum).
 crc32c = "0.6"
+# bn-3of (Spike I): blake3 whole-pack + per-section content hash for the
+# consolidated SealPack (design §11, research/04 §6.1). Same primitive
+# mess-log's fold chain / content-addressed pages already use, so the store
+# speaks one cryptographic hash.
+blake3 = "1"
 # bn-1hx: bounded-bytes LRU of decoded pointer blocks for sealed stream replay
 # (the sealed read paths' decompressed-block cache). Already a workspace dep;
 # the sealed reader parallelizes with std scoped threads, no rayon. The `stats`
