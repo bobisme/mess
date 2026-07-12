@@ -1,0 +1,12 @@
+CORPUS start histories=100000 threads=12 (distribution: 97% [100,1e3], 2.9% (1e3,1e4], 0.1% (1e4,1e5] capsules)
+  ... 10000/100000
+  ... 20000/100000
+  ... 30000/100000
+  ... 40000/100000
+  ... 50000/100000
+  ... 60000/100000
+  ... 70000/100000
+  ... 80000/100000
+  ... 90000/100000
+  ... 100000/100000
+CORPUS RESULT histories=100000/100000 all-digests-identical capsules=74290628 v6-rescans=100000 v7-effects-fallbacks=68692 wall=89.4s

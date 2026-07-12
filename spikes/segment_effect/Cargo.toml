@@ -1,0 +1,32 @@
+[package]
+name = "segment_effect"
+version = "0.1.0"
+edition = "2024"
+
+# Standalone spike: opt out of the repo's root workspace.
+[workspace]
+
+[dependencies]
+# Content-addressed pages + effect hashes + prefix anchors (design.md §10.2).
+# Same crate/major the production log format uses (crates/mess-log).
+blake3 = "1"
+# Manifest/effect frame CRC — same crate/algorithm as the sealed sidecars.
+crc32c = "0.6"
+# Kernel-side registry/dirty-set maps (the "optimized" side of the
+# differential; the oracle stays on std BTreeMap/VecDeque by design).
+hashbrown = "0.15"
+# /proc + pinning for the bench driver's quiet guard.
+libc = "0.2"
+
+[dev-dependencies]
+# Real-segment integration test only: generate a store with the CURRENT
+# engine, scan with the production scanner, build head-only effects from
+# real AcceptedBatch headers (review/11 C3).
+mess-log = { path = "../../crates/mess-log" }
+mess-store = { path = "../../crates/mess-store" }
+mess-testkit = { path = "../../crates/mess-testkit" }
+tokio = { version = "1.52", features = ["full"] }
+
+[profile.release]
+lto = "thin"
+debug = true # symbols for perf record/report

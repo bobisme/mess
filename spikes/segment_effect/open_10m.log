@@ -1,0 +1,6 @@
+OPEN gen capsules=10000000 pool=1000000
+[quiet-guard] contended (load1=6.22 procs=[]); sleeping 5s
+OPEN full-scan oracle-fold wall=3.802s
+OPEN full-scan kernel-fold wall=1.589s (denominator)
+OPEN install wall=1.565s blobs=494 bytes=28097255 suffix-capsules=99860
+OPEN checkpoint-open+suffix wall=0.078s ratio-vs-kernel=4.90% ratio-vs-oracle=2.05%  [gate <= 10%]
