@@ -1,0 +1,8 @@
+# gxhash (a default ptr_hash dependency) hard-requires AES+SSE2 intrinsics and
+# refuses to compile without them. The whole spike is therefore built with
+# target-cpu=native (Ryzen 3900X: znver2), which also gives every OTHER
+# candidate the same hardware popcount/BMI2 the design docs assume. Noted in
+# REPORT.md: all candidates are compiled with identical flags, so the
+# tournament stays fair.
+[build]
+rustflags = ["-C", "target-cpu=native"]

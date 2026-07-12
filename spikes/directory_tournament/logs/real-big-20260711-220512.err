@@ -1,0 +1,189 @@
+[bench] tsc 0.2500 ns/tick, overhead 80 ticks; quick=false
+[bench] real segments:
+  seg   1  n=7839    min=1        max=7839     U/n=1.00
+  seg   2  n=7947    min=1        max=12369    U/n=1.56
+  seg   3  n=8056    min=1        max=15973    U/n=1.98
+  seg   4  n=7983    min=1        max=18733    U/n=2.35
+  seg   5  n=7877    min=1        max=21010    U/n=2.67
+  seg   6  n=8003    min=1        max=22991    U/n=2.87
+  seg   7  n=7976    min=1        max=24602    U/n=3.08
+  seg   8  n=7963    min=1        max=26019    U/n=3.27
+  seg   9  n=7839    min=1        max=27341    U/n=3.49
+  seg  10  n=6927    min=1        max=28468    U/n=4.11
+  seg  11  n=5281    min=2        max=29349    U/n=5.56
+  seg  12  n=4217    min=2        max=30089    U/n=7.13
+  seg  13  n=1704    min=2        max=30345    U/n=17.81
+
+[bench] dataset real-seg1-n7839 n=7839 U/n=1.00
+  h0_hashmap_sip     build p50     188.4us open p50     283.0us ser     439004B res     996688B batch  18.26ns/op serial  21.69ns/op cold p50   179.8ns
+  h0f_hashmap_fold   build p50     127.1us open p50     216.7us ser     439004B res     996680B batch   5.90ns/op serial  15.27ns/op cold p50   169.8ns
+  h1_sorted          build p50      14.3us open p50      45.4us ser     439004B res     439032B batch  25.42ns/op serial  39.13ns/op cold p50   310.0ns
+  h2_bitrank         build p50      15.4us open p50      34.3us ser     377292B res     377686B batch   4.50ns/op serial   8.77ns/op cold p50    70.0ns
+  h3_pef             build p50      31.5us open p50      34.5us ser     378679B res     379600B batch  65.21ns/op serial  58.55ns/op cold p50   130.0ns
+  h4_ptrhash         build p50     572.6us open p50     667.2us ser     439004B res     446304B batch   7.04ns/op serial  15.13ns/op cold p50   110.0ns
+  h5_kbin            build p50     252.7us open p50     340.7us ser     439004B res     505384B batch  17.62ns/op serial  22.29ns/op cold p50   100.0ns
+[bench] dataset real-seg2-n7947 n=7947 U/n=1.56
+  h0_hashmap_sip     build p50     418.2us open p50     382.8us ser     445052B res     997552B batch  14.65ns/op serial  20.12ns/op cold p50   190.0ns
+  h0f_hashmap_fold   build p50     115.6us open p50     175.3us ser     445052B res     997544B batch   7.93ns/op serial  15.02ns/op cold p50   160.0ns
+  h1_sorted          build p50      14.4us open p50      46.9us ser     445052B res     445080B batch  25.39ns/op serial  40.15ns/op cold p50   340.0ns
+[quiet-guard] contended (load1=7.34 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=7.40 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=7.44 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=7.17 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=7.48 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=7.20 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.86 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.63 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.42 procs=[]); sleeping 5s
+  h2_bitrank         build p50      15.4us open p50      35.1us ser     383044B res     383616B batch   4.37ns/op serial   8.91ns/op cold p50    70.0ns
+  h3_pef             build p50      34.2us open p50      35.6us ser     384380B res     385328B batch  92.53ns/op serial  92.31ns/op cold p50   170.0ns
+  h4_ptrhash         build p50     582.7us open p50     677.8us ser     445052B res     452444B batch   7.44ns/op serial  15.73ns/op cold p50   140.0ns
+  h5_kbin            build p50     257.6us open p50     339.3us ser     445052B res     511976B batch  17.33ns/op serial  22.43ns/op cold p50    90.0ns
+[bench] dataset real-seg3-n8056 n=8056 U/n=1.98
+[quiet-guard] contended (load1=7.27 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.93 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.53 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.17 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.00 procs=[]); sleeping 5s
+  h0_hashmap_sip     build p50     206.3us open p50     289.8us ser     451156B res     998424B batch  15.24ns/op serial  20.55ns/op cold p50   180.0ns
+  h0f_hashmap_fold   build p50     104.8us open p50     165.2us ser     451156B res     998416B batch   8.07ns/op serial  17.31ns/op cold p50   160.0ns
+  h1_sorted          build p50      17.5us open p50      60.9us ser     451156B res     451184B batch  25.68ns/op serial  40.19ns/op cold p50   330.0ns
+[quiet-guard] contended (load1=6.99 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.67 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.29 procs=[]); sleeping 5s
+  h2_bitrank         build p50      17.0us open p50      35.7us ser     388724B res     389436B batch   4.40ns/op serial   9.04ns/op cold p50    70.0ns
+  h3_pef             build p50      33.9us open p50      35.4us ser     389916B res     390864B batch 107.57ns/op serial 103.04ns/op cold p50   190.0ns
+  h4_ptrhash         build p50     584.8us open p50     680.8us ser     451156B res     458641B batch   7.11ns/op serial  15.43ns/op cold p50   140.0ns
+[quiet-guard] contended (load1=6.20 procs=[]); sleeping 5s
+  h5_kbin            build p50     260.7us open p50     348.3us ser     451156B res     518616B batch  17.57ns/op serial  22.57ns/op cold p50    90.0ns
+[bench] dataset real-seg4-n7983 n=7983 U/n=2.35
+  h0_hashmap_sip     build p50     201.2us open p50     302.0us ser     447068B res     997840B batch  14.54ns/op serial  20.54ns/op cold p50   180.0ns
+  h0f_hashmap_fold   build p50     105.5us open p50     171.7us ser     447068B res     997832B batch   6.86ns/op serial  15.25ns/op cold p50   160.0ns
+[quiet-guard] contended (load1=6.11 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.34 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=7.92 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=7.60 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=7.39 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=7.12 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.87 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.56 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.76 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=7.34 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=7.31 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=7.12 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.87 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.64 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.35 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.00 procs=[]); sleeping 5s
+  h1_sorted          build p50      14.5us open p50      46.5us ser     447068B res     447096B batch  26.31ns/op serial  40.34ns/op cold p50   350.0ns
+  h2_bitrank         build p50      15.7us open p50      35.6us ser     385564B res     386382B batch   4.27ns/op serial   8.83ns/op cold p50    70.0ns
+  h3_pef             build p50      34.2us open p50      35.3us ser     386596B res     387544B batch 107.61ns/op serial 106.88ns/op cold p50   190.0ns
+  h4_ptrhash         build p50     593.5us open p50     682.8us ser     447068B res     454472B batch   7.80ns/op serial  15.38ns/op cold p50   130.0ns
+  h5_kbin            build p50     259.1us open p50     345.3us ser     447068B res     514152B batch  20.72ns/op serial  21.74ns/op cold p50   100.0ns
+[bench] dataset real-seg5-n7877 n=7877 U/n=2.67
+  h0_hashmap_sip     build p50     328.4us open p50     379.1us ser     441132B res     996992B batch  15.33ns/op serial  20.16ns/op cold p50   170.0ns
+  h0f_hashmap_fold   build p50      97.4us open p50     177.4us ser     441132B res     996984B batch   6.82ns/op serial  15.18ns/op cold p50   160.0ns
+[quiet-guard] contended (load1=6.60 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.39 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.04 procs=[]); sleeping 5s
+  h1_sorted          build p50      14.4us open p50      46.0us ser     441132B res     441160B batch  25.59ns/op serial  39.77ns/op cold p50   340.0ns
+  h2_bitrank         build p50      15.0us open p50      35.0us ser     380764B res     381674B batch   5.07ns/op serial   9.29ns/op cold p50    70.0ns
+  h3_pef             build p50      34.1us open p50      38.3us ser     381615B res     382536B batch 108.84ns/op serial 109.45ns/op cold p50   200.0ns
+[quiet-guard] contended (load1=6.29 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.10 procs=[]); sleeping 5s
+  h4_ptrhash         build p50     586.1us open p50     659.7us ser     441132B res     448445B batch   7.08ns/op serial  15.34ns/op cold p50   120.0ns
+  h5_kbin            build p50     252.5us open p50     337.9us ser     441132B res     507720B batch  17.21ns/op serial  21.98ns/op cold p50    90.0ns
+[bench] dataset real-seg6-n8003 n=8003 U/n=2.87
+  h0_hashmap_sip     build p50     196.2us open p50     299.1us ser     448188B res     998000B batch  14.84ns/op serial  20.09ns/op cold p50   179.8ns
+[quiet-guard] contended (load1=6.43 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.39 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.04 procs=[]); sleeping 5s
+  h0f_hashmap_fold   build p50     104.2us open p50     174.0us ser     448188B res     997992B batch   5.99ns/op serial  15.77ns/op cold p50   150.0ns
+  h1_sorted          build p50      15.4us open p50      46.6us ser     448188B res     448216B batch  26.02ns/op serial  40.27ns/op cold p50   350.0ns
+  h2_bitrank         build p50      15.4us open p50      36.0us ser     387060B res     388044B batch   4.58ns/op serial   9.96ns/op cold p50    70.0ns
+  h3_pef             build p50      34.4us open p50      35.3us ser     387828B res     388776B batch 113.62ns/op serial 112.46ns/op cold p50   200.0ns
+  h4_ptrhash         build p50     552.0us open p50     639.8us ser     448188B res     455599B batch   7.83ns/op serial  15.44ns/op cold p50   140.0ns
+  h5_kbin            build p50     262.8us open p50     338.9us ser     448188B res     515368B batch  16.88ns/op serial  22.59ns/op cold p50    99.8ns
+[bench] dataset real-seg7-n7976 n=7976 U/n=3.08
+  h0_hashmap_sip     build p50     198.4us open p50     273.2us ser     446676B res     997784B batch  14.98ns/op serial  20.59ns/op cold p50   180.0ns
+  h0f_hashmap_fold   build p50     184.0us open p50     185.6us ser     446676B res     997776B batch   6.50ns/op serial  15.25ns/op cold p50   160.0ns
+  h1_sorted          build p50      14.5us open p50      46.5us ser     446676B res     446704B batch  25.29ns/op serial  40.09ns/op cold p50   350.0ns
+  h2_bitrank         build p50      15.3us open p50      38.7us ser     385964B res     387014B batch   4.26ns/op serial   8.92ns/op cold p50    70.0ns
+[quiet-guard] contended (load1=6.00 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.00 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.16 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=7.19 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.85 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=7.02 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.78 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.56 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.27 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.09 procs=[]); sleeping 5s
+  h3_pef             build p50      47.0us open p50      51.7us ser     386612B res     387560B batch 117.76ns/op serial 118.46ns/op cold p50   210.0ns
+  h4_ptrhash         build p50     600.1us open p50     666.5us ser     446676B res     454078B batch   8.73ns/op serial  15.32ns/op cold p50   130.0ns
+  h5_kbin            build p50     259.2us open p50     349.6us ser     446676B res     513752B batch  18.38ns/op serial  21.93ns/op cold p50   100.0ns
+[bench] dataset real-seg8-n7963 n=7963 U/n=3.27
+  h0_hashmap_sip     build p50     189.1us open p50     275.6us ser     445948B res     997680B batch  15.30ns/op serial  20.39ns/op cold p50   180.0ns
+  h0f_hashmap_fold   build p50      87.9us open p50     169.8us ser     445948B res     997672B batch   6.20ns/op serial  15.54ns/op cold p50   160.0ns
+  h1_sorted          build p50      14.4us open p50      46.4us ser     445948B res     445976B batch  25.03ns/op serial  44.09ns/op cold p50   349.8ns
+  h2_bitrank         build p50      15.1us open p50      36.0us ser     385516B res     386618B batch   4.39ns/op serial   9.10ns/op cold p50    70.0ns
+  h3_pef             build p50      34.5us open p50      35.4us ser     386076B res     387024B batch 116.70ns/op serial 115.91ns/op cold p50   210.0ns
+  h4_ptrhash         build p50     611.7us open p50     654.4us ser     445948B res     453346B batch   8.48ns/op serial  15.55ns/op cold p50   140.0ns
+  h5_kbin            build p50     260.7us open p50     414.6us ser     445948B res     512936B batch  17.44ns/op serial  22.05ns/op cold p50   100.0ns
+[bench] dataset real-seg9-n7839 n=7839 U/n=3.49
+  h0_hashmap_sip     build p50     200.4us open p50     272.5us ser     439004B res     996688B batch  14.18ns/op serial  20.63ns/op cold p50   180.0ns
+  h0f_hashmap_fold   build p50      93.0us open p50     179.5us ser     439004B res     996680B batch   6.52ns/op serial  15.00ns/op cold p50   160.0ns
+  h1_sorted          build p50      14.2us open p50      45.2us ser     439004B res     439032B batch  25.57ns/op serial  41.07ns/op cold p50   370.0ns
+[quiet-guard] contended (load1=6.13 procs=[]); sleeping 5s
+  h2_bitrank         build p50      16.6us open p50      35.4us ser     379732B res     380888B batch   4.45ns/op serial   8.87ns/op cold p50    70.0ns
+  h3_pef             build p50      34.9us open p50      34.7us ser     380135B res     381056B batch 114.87ns/op serial 114.95ns/op cold p50   210.0ns
+  h4_ptrhash         build p50     573.3us open p50     650.5us ser     439004B res     446304B batch   7.38ns/op serial  15.71ns/op cold p50   130.0ns
+  h5_kbin            build p50     246.3us open p50     335.9us ser     439004B res     505384B batch  17.24ns/op serial  21.71ns/op cold p50    90.0ns
+[bench] dataset real-seg10-n6927 n=6927 U/n=4.11
+  h0_hashmap_sip     build p50     167.7us open p50     250.9us ser     387932B res     522448B batch  18.29ns/op serial  22.36ns/op cold p50   150.0ns
+  h0f_hashmap_fold   build p50      81.4us open p50     160.0us ser     387932B res     522440B batch   8.52ns/op serial  15.95ns/op cold p50   120.0ns
+  h1_sorted          build p50      12.8us open p50      43.8us ser     387932B res     387960B batch  26.38ns/op serial  39.84ns/op cold p50   320.0ns
+  h2_bitrank         build p50      13.7us open p50      31.6us ser     336092B res     337290B batch   4.48ns/op serial   8.89ns/op cold p50    70.0ns
+  h3_pef             build p50      32.1us open p50      30.8us ser     336128B res     336968B batch 124.53ns/op serial 126.51ns/op cold p50   220.0ns
+  h4_ptrhash         build p50     494.5us open p50     560.5us ser     387932B res     394368B batch   7.13ns/op serial  15.27ns/op cold p50   100.0ns
+  h5_kbin            build p50     217.1us open p50     294.8us ser     387932B res     449960B batch  17.36ns/op serial  21.48ns/op cold p50    90.0ns
+[bench] dataset real-seg11-n5281 n=5281 U/n=5.56
+  h0_hashmap_sip     build p50     129.4us open p50     205.0us ser     295756B res     509280B batch  13.30ns/op serial  19.17ns/op cold p50   160.0ns
+  h0f_hashmap_fold   build p50      52.8us open p50     105.1us ser     295756B res     509272B batch   6.30ns/op serial  13.40ns/op cold p50   120.0ns
+  h1_sorted          build p50      10.1us open p50      30.5us ser     295756B res     295784B batch  24.32ns/op serial  40.46ns/op cold p50   299.8ns
+  h2_bitrank         build p50      10.2us open p50      26.3us ser     257196B res     258430B batch   4.63ns/op serial  10.99ns/op cold p50    70.0ns
+  h3_pef             build p50      28.0us open p50      39.1us ser     256549B res     257200B batch 119.13ns/op serial 118.75ns/op cold p50   210.0ns
+[quiet-guard] contended (load1=6.32 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.06 procs=[]); sleeping 5s
+  h4_ptrhash         build p50     417.5us open p50     468.1us ser     295756B res     300748B batch   7.49ns/op serial  14.13ns/op cold p50    90.0ns
+  h5_kbin            build p50     170.3us open p50     225.3us ser     295756B res     349896B batch  16.69ns/op serial  21.23ns/op cold p50    90.0ns
+[bench] dataset real-seg12-n4217 n=4217 U/n=7.13
+  h0_hashmap_sip     build p50     119.2us open p50     140.2us ser     236172B res     500768B batch  13.19ns/op serial  18.53ns/op cold p50   160.0ns
+  h0f_hashmap_fold   build p50      42.0us open p50      85.2us ser     236172B res     500760B batch   5.93ns/op serial  13.15ns/op cold p50   120.0ns
+[quiet-guard] contended (load1=6.87 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.64 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.83 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.68 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.79 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.56 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.44 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.32 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.30 procs=[]); sleeping 5s
+  h1_sorted          build p50       6.8us open p50      24.3us ser     236172B res     236200B batch  29.04ns/op serial  41.49ns/op cold p50   250.0ns
+  h2_bitrank         build p50      10.2us open p50      25.8us ser     206220B res     207482B batch   4.22ns/op serial   7.99ns/op cold p50    70.0ns
+  h3_pef             build p50      18.2us open p50      18.5us ser     205025B res     205568B batch 112.96ns/op serial 113.11ns/op cold p50   200.0ns
+[quiet-guard] contended (load1=6.60 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.31 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=6.12 procs=[]); sleeping 5s
+  h4_ptrhash         build p50     313.4us open p50     367.3us ser     236172B res     240193B batch   6.82ns/op serial  13.68ns/op cold p50    90.0ns
+  h5_kbin            build p50     129.8us open p50     193.9us ser     236172B res     270856B batch  16.54ns/op serial  19.58ns/op cold p50    90.0ns
+[bench] dataset real-seg13-n1704 n=1704 U/n=17.81
+  h0_hashmap_sip     build p50      45.9us open p50      55.0us ser      95444B res     130456B batch  15.11ns/op serial  19.84ns/op cold p50    90.0ns
+[quiet-guard] contended (load1=6.14 procs=[]); sleeping 5s
+  h0f_hashmap_fold   build p50      16.1us open p50      32.9us ser      95444B res     130448B batch   7.41ns/op serial  13.41ns/op cold p50    80.0ns
+  h1_sorted          build p50       2.6us open p50      10.1us ser      95444B res      95472B batch  18.67ns/op serial  31.89ns/op cold p50   100.0ns
+  h2_bitrank         build p50       3.7us open p50       8.8us ser      85628B res      86902B batch   4.19ns/op serial   7.56ns/op cold p50    70.0ns
+[quiet-guard] contended (load1=6.30 procs=[]); sleeping 5s
+  h3_pef             build p50       8.0us open p50       8.9us ser      83143B res      83416B batch  96.59ns/op serial  95.68ns/op cold p50   189.8ns
+  h4_ptrhash         build p50     128.2us open p50     144.9us ser      95444B res      97227B batch   6.48ns/op serial  13.03ns/op cold p50    80.0ns
+  h5_kbin            build p50      53.2us open p50      72.5us ser      95444B res     110872B batch  15.39ns/op serial  18.24ns/op cold p50    90.0ns

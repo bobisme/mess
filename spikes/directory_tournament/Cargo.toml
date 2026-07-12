@@ -1,0 +1,41 @@
+[package]
+name = "directory_tournament"
+version = "0.1.0"
+edition = "2024"
+
+# Standalone spike: opt out of the repo's root workspace.
+[workspace]
+
+[dependencies]
+# The incumbent's home: sealed sidecar format + reader (real `.pidx` parsing
+# for the REAL datasets is validated through SealedSegmentIndex::open first).
+mess-index = { path = "../../crates/mess-index" }
+# The current composed engine — generates the REAL store (append across many
+# streams with Zipf popularity, auto-roll segments, background roll-sealer
+# writes real `.pidx` sidecars).
+mess-store = { path = "../../crates/mess-store" }
+# Self-sweeping ext4 scratch dirs (only used by `gen-real --scratch`).
+mess-testkit = { path = "../../crates/mess-testkit" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+# H4: the published PtrHash crate by the paper author (RagnarGrootKoerkamp).
+# Default features (gxhash) require `-C target-cpu=native` — set for the whole
+# spike in .cargo/config.toml and noted in the REPORT.
+ptr_hash = "2.0.1"
+
+# H0f: the cheap-hasher variant of the incumbent HashMap (hashbrown's default
+# hasher; the incumbent std HashMap uses SipHash-1-3).
+foldhash = "0.2"
+
+# Same CRC the sidecar uses; every candidate's serialized image is CRC-framed
+# so the corrupt-bytes tests are meaningful.
+crc32c = "0.6"
+
+rand = "0.10"
+rand_distr = "0.6"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+debug = true # symbols for perf record/report

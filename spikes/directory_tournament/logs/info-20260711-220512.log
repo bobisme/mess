@@ -1,0 +1,3 @@
+tsc: 0.2500 ns/tick, empty rdtsc..rdtscp overhead 80 ticks (~20.0 ns)
+contention: Some("load1=12.68 procs=[]")
+store dir default: /home/bob/.cache/mess-bench-scratch/directory_tournament_store
