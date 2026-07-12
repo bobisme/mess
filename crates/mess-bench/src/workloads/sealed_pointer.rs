@@ -47,8 +47,13 @@ fn build_segment(
             SealStream { stream_id: sid, batches }
         })
         .collect();
-    let input =
-        SealInput { segment_id, base_pos: base, streams, payloads: None };
+    let input = SealInput {
+        segment_id,
+        base_pos: base,
+        streams,
+        payloads: None,
+        event_type_ids: None,
+    };
     let idx = Arc::new(
         SealedSegmentIndex::from_bytes(encode_sidecar(&input)).unwrap(),
     );

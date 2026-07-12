@@ -64,7 +64,13 @@ pub fn rebuild_sidecar_bytes(
             SealStream { stream_id, batches }
         })
         .collect();
-    let input = SealInput { segment_id, base_pos, streams, payloads: None };
+    let input = SealInput {
+        segment_id,
+        base_pos,
+        streams,
+        payloads: None,
+        event_type_ids: None,
+    };
     encode_sidecar(&input)
 }
 
