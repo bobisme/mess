@@ -59,6 +59,10 @@ pub mod runtime;
 pub mod scanner;
 pub mod sealer;
 pub mod subscription;
+// bn-9mw (Spike E): the v4 commit-capsule format — atomic control+event
+// capsules. Non-normative spike code; v4 write is OFF by default (the engine
+// keeps writing v3). See `spikes/capsule_v4_prelude/REPORT.md`.
+pub mod v4;
 pub mod watermark;
 pub mod writer;
 

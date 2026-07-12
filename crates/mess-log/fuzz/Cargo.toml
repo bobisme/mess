@@ -48,3 +48,25 @@ path = "fuzz_targets/gen_corpus.rs"
 test = false
 doc = false
 bench = false
+
+# bn-9mw Spike E: v4 commit-capsule fuzz targets.
+[[bin]]
+name = "fuzz_v4_capsule"
+path = "fuzz_targets/fuzz_v4_capsule.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_v4_control"
+path = "fuzz_targets/fuzz_v4_control.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_v4_scan"
+path = "fuzz_targets/fuzz_v4_scan.rs"
+test = false
+doc = false
+bench = false

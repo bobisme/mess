@@ -156,9 +156,166 @@ fn main() {
     write_seed(&decode_dir, "empty_input", &[]);
     write_seed(&decode_dir, "single_byte", &[0x42]);
 
+    // --- bn-9mw Spike E: v4 commit-capsule seeds -------------------------
+    gen_v4_seeds(&root);
+
     eprintln!(
         "wrote seeds to {} and {}",
         scanner_dir.display(),
         decode_dir.display()
     );
+}
+
+/// Seeds for the three v4 fuzz targets, built from the real v4 encoder /
+/// writer so they match the format byte-for-byte, plus a few hand-corrupted
+/// mutations covering the adversarial classes.
+fn gen_v4_seeds(root: &Path) {
+    use mess_log::v4::capsule::{CapsuleEncoder, CapsuleInput};
+    use mess_log::v4::control::ControlRecord;
+    use mess_log::v4::format::{
+        CAPSULE_HEADER_LEN, DEDUPE_SCOPE_STREAM,
+    };
+    use mess_log::v4::writer::{CapsuleSpec, CapsuleWriter, SegmentParamsV4};
+
+    let capsule_dir = root.join("fuzz_v4_capsule");
+    let control_dir = root.join("fuzz_v4_control");
+    let scan_dir = root.join("fuzz_v4_scan");
+
+    let all_controls = vec![
+        ControlRecord::CategoryRegistered { category_id: 2, name: "orders".into() },
+        ControlRecord::StreamRegistered {
+            stream_id: 9,
+            category_id: 2,
+            name: "s9".into(),
+        },
+        ControlRecord::EventTypeRegistered {
+            event_type_id: 3,
+            codec_id: 1,
+            current_schema_version: 1,
+            schema_fingerprint: [0xAB; 32],
+            name: "T".into(),
+        },
+        ControlRecord::DedupeKey {
+            scope_kind: DEDUPE_SCOPE_STREAM,
+            scope_id: 9,
+            key: b"dedupe".to_vec(),
+        },
+        ControlRecord::ProjectionCheckpoint {
+            projection_id: 1,
+            position: 5,
+            state_ref_kind: 1,
+            state_ref: b"ref".to_vec(),
+        },
+    ];
+
+    // fuzz_v4_control seeds: encoded control regions.
+    for (i, c) in all_controls.iter().enumerate() {
+        let mut buf = Vec::new();
+        c.encode_into(&mut buf);
+        write_seed(&control_dir, &format!("control_{i}"), &buf);
+    }
+    // All controls tiled into one region.
+    let mut all_region = Vec::new();
+    for c in &all_controls {
+        c.encode_into(&mut all_region);
+    }
+    write_seed(&control_dir, "all_controls", &all_region);
+    write_seed(&control_dir, "empty", &[]);
+
+    // fuzz_v4_capsule seeds: encoded capsules of each shape.
+    let mut enc = CapsuleEncoder::new();
+    // control-only.
+    let co = enc
+        .encode(&CapsuleInput {
+            segment_epoch: 1,
+            batch_id: 0,
+            first_global_pos: 0,
+            stream_id: 0,
+            category_id: 0,
+            first_stream_version: 0,
+            crypto_chain: None,
+            controls: &all_controls,
+            subframes: &[],
+        })
+        .unwrap()
+        .to_vec();
+    write_seed(&capsule_dir, "control_only", &co);
+    // mixed (register + use).
+    let sfs = [Subframe::plain(3, 1, 1, b"ev")];
+    let mixed = enc
+        .encode(&CapsuleInput {
+            segment_epoch: 1,
+            batch_id: 0,
+            first_global_pos: 0,
+            stream_id: 9,
+            category_id: 2,
+            first_stream_version: 0,
+            crypto_chain: None,
+            controls: &all_controls[..3],
+            subframes: &sfs,
+        })
+        .unwrap()
+        .to_vec();
+    write_seed(&capsule_dir, "mixed", &mixed);
+    // events-only.
+    let eo = enc
+        .encode(&CapsuleInput {
+            segment_epoch: 1,
+            batch_id: 0,
+            first_global_pos: 0,
+            stream_id: 9,
+            category_id: 0,
+            first_stream_version: 0,
+            crypto_chain: None,
+            controls: &[],
+            subframes: &sfs,
+        })
+        .unwrap()
+        .to_vec();
+    write_seed(&capsule_dir, "events_only", &eo);
+    // torn header + flipped crc mutations.
+    write_seed(&capsule_dir, "torn_header", &co[..CAPSULE_HEADER_LEN - 1]);
+    let mut bad = mixed.clone();
+    let m = bad.len() / 2;
+    bad[m] ^= 0xFF;
+    write_seed(&capsule_dir, "flipped_mid", &bad);
+    write_seed(&capsule_dir, "empty", &[]);
+
+    // fuzz_v4_scan seeds: whole v4 segment images.
+    let fs = SimFs::new(Fault::SECTOR_512);
+    let path = Path::new("v4seed.seg");
+    let mut w =
+        CapsuleWriter::create(&fs, path, SegmentParamsV4::new(1, 0, 5, 0))
+            .unwrap();
+    w.append(&CapsuleSpec {
+        stream_id: 0,
+        category_id: 0,
+        first_stream_version: 0,
+        crypto_chain: None,
+        controls: &all_controls,
+        subframes: &[],
+    })
+    .unwrap();
+    w.append(&CapsuleSpec {
+        stream_id: 9,
+        category_id: 0,
+        first_stream_version: 0,
+        crypto_chain: None,
+        controls: &[],
+        subframes: &sfs,
+    })
+    .unwrap();
+    w.close().unwrap();
+    let f = fs.open(path, OpenOpts::read_only()).unwrap();
+    let len = f.len().unwrap() as usize;
+    let mut img = vec![0u8; len];
+    let n = f.pread(0, &mut img).unwrap();
+    img.truncate(n);
+    write_seed(&scan_dir, "clean_two_capsules", &img);
+    let mut torn = img.clone();
+    torn.truncate(torn.len() - 4);
+    write_seed(&scan_dir, "torn_tail", &torn);
+    write_seed(&scan_dir, "header_only", &img[..52]);
+    write_seed(&scan_dir, "all_zero", &[0u8; 52]);
+    write_seed(&scan_dir, "empty", &[]);
 }

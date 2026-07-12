@@ -156,7 +156,7 @@ pub enum EncodeError {
 }
 
 /// Why a single subframe is not encodable.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum SubframeError {
     /// `payload.len()` (`compressed_len`) exceeds `u32::MAX`.
     #[error("payload of {len} bytes exceeds u32::MAX compressed_len")]
