@@ -344,6 +344,29 @@ pub struct Model {
     /// cache-on configuration; a run with cache off never touches this field,
     /// matching a real disabled `StateCache` (always empty, by construction).
     hot:        HashMap<String, (Version, Account)>,
+    /// `bn-2di`: the `LogEngine`'s `$registry` interner, mirrored — `None`
+    /// when driving the `MockBackend` (which has no registry).
+    ///
+    /// The engine mints a `$registry` record the first time it sees a stream
+    /// name or an event-type name, and those records are ordinary log events
+    /// that **consume global positions** (the accepted cost of landing the
+    /// registry on v3). `last_global_position` is therefore no longer "the
+    /// index of the Nth user event", and an oracle that assumed so would
+    /// diverge on the very first append. It is still perfectly
+    /// *deterministic*, though — a pure function of which names the op
+    /// sequence has already used — so the model just mirrors the interner
+    /// and counts the same positions. Nothing else about the oracle
+    /// changes: versions, state, conflicts, and event counts are all
+    /// untouched by the registry.
+    registry:   Option<RegistryInterner>,
+}
+
+/// The subset of the engine's interner that affects global positions
+/// (`bn-2di`) — see [`Model::registry`].
+#[derive(Debug, Default, Clone)]
+struct RegistryInterner {
+    streams: std::collections::HashSet<String>,
+    types:   std::collections::HashSet<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -387,6 +410,18 @@ impl Model {
         (self.state(stream), self.version(stream))
     }
 
+    /// Model a store whose backend keeps a log-derived `$registry` — i.e. the
+    /// real [`LogEngine`](mess_store::LogEngine), whose registration records
+    /// consume global positions (`bn-2di`). The `MockBackend` has no registry,
+    /// so its model is built with [`Model::default`] and this stays `None`.
+    #[must_use]
+    pub fn with_registry() -> Self {
+        Model {
+            registry: Some(RegistryInterner::default()),
+            ..Model::default()
+        }
+    }
+
     /// The naive fold's append primitive: exact expected-version check, then
     /// commit — the same contract `Backend::append_batch` promises.
     pub fn append(
@@ -395,6 +430,17 @@ impl Model {
         expected: Version,
         events: &[AccountEvent],
     ) -> Result<ModelCommit, ModelConflict> {
+        // `bn-2di`: mirror the engine's registration exactly, because a
+        // `$registry` record is an ordinary log event that consumes a global
+        // position — get this wrong and every subsequent position shifts by
+        // one.
+        //
+        // The engine *stages* the ids an append needs and mints them only on
+        // the path that actually pushes a batch (review F1: nothing may be
+        // minted that the log might not hear about). So an append that
+        // CONFLICTS or is EMPTY registers nothing at all — not even a
+        // brand-new stream name — and a committing one registers its stream
+        // name (if new) and then each new event-type name, in that order.
         let actual = self.version(stream);
         if actual != expected {
             return Err(ModelConflict { expected, actual });
@@ -407,6 +453,20 @@ impl Model {
                 attempts:        1,
             });
         }
+
+        let mut minted = 0u64;
+        if let Some(reg) = &mut self.registry {
+            if reg.streams.insert(stream.to_string()) {
+                minted += 1;
+            }
+            for e in events {
+                if reg.types.insert(e.name()) {
+                    minted += 1;
+                }
+            }
+        }
+        self.global_len += minted;
+
         let entry = self.streams.entry(stream.to_string()).or_default();
         entry.extend(events.iter().cloned());
         self.global_len += events.len() as u64;
@@ -987,8 +1047,27 @@ pub async fn run_sequence(
     n_streams: usize,
 ) -> Result<(), DivergenceReport> {
     // The interim in-memory backend: kept for differential testing (bn-20b).
-    run_sequence_with(MockBackend::new(), seed, cache_on, n_ops, n_streams)
-        .await
+    run_sequence_with(
+        MockBackend::new(),
+        seed,
+        cache_on,
+        n_ops,
+        n_streams,
+        Registry::Absent,
+    )
+    .await
+}
+
+/// Whether the backend under test keeps a log-derived `$registry` whose
+/// records consume global positions (`bn-2di`). The real
+/// [`LogEngine`](mess_store::LogEngine) does; the `MockBackend` does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Registry {
+    /// `MockBackend`: global positions are dense over user events.
+    Absent,
+    /// `LogEngine`: registration records take global positions too, so the
+    /// oracle must mirror the interner to keep `last_global` comparable.
+    Present,
 }
 
 /// The same differential sequence, driven against an arbitrary supplied
@@ -1000,6 +1079,7 @@ pub async fn run_sequence_with<B>(
     cache_on: bool,
     n_ops: usize,
     n_streams: usize,
+    registry: Registry,
 ) -> Result<(), DivergenceReport>
 where
     B: mess_store::snapshot::SnapshotStore + Clone + crate::common::Reopen,
@@ -1008,7 +1088,10 @@ where
     let streams: Vec<String> =
         (0..n_streams).map(|i| format!("acct-{i}")).collect();
 
-    let mut model = Model::default();
+    let mut model = match registry {
+        Registry::Absent => Model::default(),
+        Registry::Present => Model::with_registry(),
+    };
     let mut backend = backend;
     let mut store = build_store(&backend, cache_on);
 

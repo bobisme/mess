@@ -23,9 +23,17 @@ fn ref_v1(fold_version: u32, covers_empty_prefix: bool) -> Vec<u8> {
 
 /// Write a snapshot head for `stream_id` at `version` into the (closed) meta
 /// store, so the store presents a live snapshot for the retention decision.
+///
+/// `bn-2di`: the snapshot-head join is keyed off the snapshot side map
+/// (`snapshot_stream_names`), the way a real `FjallSnapshotBackend` writes it —
+/// it can no longer piggy-back on the engine's name tables, because those are
+/// gone (names live in the log's `$registry` now). So the fixture writes the
+/// side-map row too, exactly as the real snapshot backend does.
 fn inject_snapshot(dir: &std::path::Path, stream_id: u64, version: u64) {
     let meta =
         MetaStore::open(mess_cli::store::meta_dir(dir)).expect("open meta");
+    meta.put_snapshot_stream_name(stream_id, "acct-1")
+        .expect("snapshot side map");
     let mut group = CommitGroup::new(version + 2);
     group.snapshot_heads.push((
         StreamId(stream_id),
@@ -39,10 +47,10 @@ fn inject_snapshot(dir: &std::path::Path, stream_id: u64, version: u64) {
     drop(meta);
 }
 
+/// bn-2di: names come from the log's $registry now, not from fjall.
 fn stream_id_of(dir: &std::path::Path, name: &str) -> u64 {
-    metaread::read(dir)
-        .expect("meta")
-        .stream_names
+    let state = mess_cli::registryfold::fold(dir).expect("fold $registry");
+    mess_cli::registryfold::stream_names(&state)
         .into_iter()
         .find(|(_, n)| n == name)
         .map(|(id, _)| id)

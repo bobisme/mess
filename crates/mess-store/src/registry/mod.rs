@@ -38,6 +38,7 @@
 //! later with no code change.
 
 pub mod codec;
+pub mod log;
 pub mod state;
 
 mod error;
@@ -47,6 +48,11 @@ pub use codec::{
     TARGET_KIND_CATEGORY, TARGET_KIND_EVENT_TYPE, TARGET_KIND_STREAM,
 };
 pub use error::RegistryError;
+pub use log::{
+    DOMAIN_CODEC_ID, ENGINE_CATEGORY_ID, Fold, REGISTRY_CODEC_ID,
+    REGISTRY_EVENT_TYPE_ID, REGISTRY_SCHEMA_VERSION, REGISTRY_STREAM_ID,
+    UNKNOWN_SCHEMA_FINGERPRINT, event_type_registered, stream_registered,
+};
 pub use state::{
     DictMeta, EventTypeMeta, RESERVED_CATEGORY_ID, RESERVED_CATEGORY_NAME,
     RESERVED_DICT_ID, RESERVED_EVENT_TYPE_ID, RESERVED_EVENT_TYPE_NAME,

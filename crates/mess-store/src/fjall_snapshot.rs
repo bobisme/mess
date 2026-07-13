@@ -65,11 +65,14 @@
 //! was structurally vacuous against any real store.
 //!
 //! The least-invasive fix (consistent with keeping the interim FNV keyspace) is
-//! to make each head **self-joinable**: [`save_snapshot`] also writes the
+//! to make each head **self-joinable**: `save_snapshot` also writes the
 //! `interim_id -> stream name` pair into this store's own
-//! [`stream_names`](mess_index::meta::MetaStore::put_stream_name) table. A
-//! reader then joins `snapshot_heads` ⋈ `stream_names` by the interim id — the
-//! *same* join `metaread` already performs against the engine meta — and
+//! [`snapshot_stream_names`](mess_index::meta::MetaStore::put_snapshot_stream_name)
+//! table (a snapshot-sidecar side map — NOT the engine interner, which since
+//! `bn-2di` lives in the log as `$registry` and has no fjall table at all). A
+//! reader then joins `snapshot_heads` ⋈ `snapshot_stream_names` by the interim
+//! id — the *same* join `metaread` already performs against the engine meta —
+//! and
 //! recovers the name (and, if it wants, the engine's registry id for that name)
 //! for every persisted snapshot. Doctor learns to also read this sidecar meta
 //! store, so its fold-version check finally fires on a real app store.
@@ -77,9 +80,10 @@
 //! This changes **no** on-disk `snapshot_ref` byte layout ([`encode_ref`] /
 //! [`decode_ref`] are untouched), so committed golden fixtures still decode and
 //! [`load_snapshot`] still resolves by name via a point lookup. The added
-//! `stream_names` rows are simply absent in a pre-bone store, which only means
-//! an old store's snapshots are invisible to the *join* (they still load) — a
-//! documented, pre-1.0 forward-only incompatibility, no migration required.
+//! `snapshot_stream_names` rows are simply absent in a pre-bone store, which
+//! only means an old store's snapshots are invisible to the *join* (they still
+//! load) — a documented, pre-1.0 forward-only incompatibility, no migration
+//! required.
 //!
 //! [`SnapshotHeads`]: mess_index::meta::MetaTable::SnapshotHeads
 //! [`SnapshotHead`]: mess_index::meta::SnapshotHead
@@ -383,7 +387,7 @@ impl<B: Backend> SnapshotStore for FjallSnapshotBackend<B> {
         // map, not a key change, so the on-disk `snapshot_ref` format and the
         // golden fixtures are untouched. Journal-buffered like every other row
         // here; a lost mapping self-heals (the head still loads by name).
-        self.meta.put_stream_name(id.0, stream_id)?;
+        self.meta.put_snapshot_stream_name(id.0, stream_id)?;
         let snap = &snapshot.snapshot_ref;
         // An empty-prefix snapshot covers version 0 by convention; the flag is
         // what disambiguates "folds the empty prefix" from "folds index 0".

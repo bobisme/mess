@@ -100,7 +100,12 @@ fn backup_during_active_writing_restores_to_the_cut() {
                 .await
                 .expect("append past cut");
         }
-        assert_eq!(engine.total_events(), 15, "source now has 15 events");
+        assert_eq!(
+            engine.total_events(),
+            15 + common::REGISTRY_EVENTS,
+            "source now has 15 user events (plus the $registry records for \
+             its one stream name and one type name)"
+        );
         drop(engine);
         json
     });
@@ -108,8 +113,9 @@ fn backup_during_active_writing_restores_to_the_cut() {
     let watermark =
         field(&backup_json, "watermark").as_u64().expect("watermark");
     assert_eq!(
-        watermark, 10,
-        "cut watermark is the 10 events acked before the cut"
+        watermark,
+        10 + common::REGISTRY_EVENTS as u64,
+        "cut watermark is the 10 events acked before the cut (+ $registry)"
     );
     assert!(dest.path().join(BACKUP_MANIFEST).exists(), "manifest written");
 
@@ -123,7 +129,10 @@ fn backup_during_active_writing_restores_to_the_cut() {
         &Value::Bool(true),
         "verify --full clean"
     );
-    assert_eq!(field(&rj, "recovered_watermark").as_u64(), Some(10));
+    assert_eq!(
+        field(&rj, "recovered_watermark").as_u64(),
+        Some(10 + common::REGISTRY_EVENTS as u64)
+    );
     assert!(has_kind(&rr, "restore-complete"));
 
     // The restored store recovers exactly the 10 pre-cut events; the 5 events
@@ -132,10 +141,13 @@ fn backup_during_active_writing_restores_to_the_cut() {
         let engine = small_engine(restored.path());
         assert_eq!(
             engine.total_events(),
-            10,
+            10 + common::REGISTRY_EVENTS,
             "restored store holds only the pre-cut events"
         );
-        assert_eq!(engine.metrics().durable_watermark, 10);
+        assert_eq!(
+            engine.metrics().durable_watermark,
+            10 + common::REGISTRY_EVENTS as u64
+        );
     });
 }
 
@@ -178,8 +190,9 @@ fn torn_tail_from_a_crashed_writer_is_excluded_from_the_cut() {
     );
     let watermark = report.to_json()["watermark"].as_u64().expect("watermark");
     assert_eq!(
-        watermark, 8,
-        "cut watermark is the 8 committed events, tail excluded"
+        watermark,
+        8 + common::REGISTRY_EVENTS as u64,
+        "cut watermark is the 8 committed events (+ $registry), tail excluded"
     );
 
     let rr =
@@ -190,7 +203,10 @@ fn torn_tail_from_a_crashed_writer_is_excluded_from_the_cut() {
         "restore clean despite the crash artifact: {:?}",
         rr.findings
     );
-    assert_eq!(rr.to_json()["recovered_watermark"].as_u64(), Some(8));
+    assert_eq!(
+        rr.to_json()["recovered_watermark"].as_u64(),
+        Some(8 + common::REGISTRY_EVENTS as u64)
+    );
 }
 
 /// Shape 3: incremental backup copies only the segment that is new at the

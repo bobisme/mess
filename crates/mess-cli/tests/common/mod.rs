@@ -23,6 +23,20 @@ use mess_store::version::Version;
 /// The single interim active segment id the engine seals (`ACTIVE_SEGMENT_ID`).
 pub const SEG_ID: u64 = 1;
 
+/// `bn-2di`: how many global positions the `$registry` consumes in these
+/// fixtures.
+///
+/// The log-derived registry writes a `StreamRegistered` the first time it sees
+/// a stream name and an `EventTypeRegistered` the first time it sees a type
+/// name, as ordinary log events — so they take global positions like anything
+/// else. Every corpus here writes to exactly ONE stream with exactly ONE event
+/// type, so that is exactly two records, both landing ahead of the first user
+/// event. A store's watermark is therefore `user_events + REGISTRY_EVENTS`.
+///
+/// (These records are never *delivered*: `read_global` skips them. They are
+/// visible only in position accounting like this.)
+pub const REGISTRY_EVENTS: usize = 2;
+
 fn rec(message_type: &str, data: &[u8]) -> RecordToAppend {
     RecordToAppend {
         message_type: message_type.into(),

@@ -73,15 +73,35 @@ async fn metrics_move_under_durable_workload() {
         .await
         .unwrap();
 
+    // `bn-2di`: these three appends also minted FIVE names, each of which is a
+    // `$registry` record — a real, committed, durable log event:
+    //   append 1: stream `acct-1` + types `Opened`, `Deposited`  -> 3 records
+    //   append 2: type `Withdrew`                                -> 1 record
+    //   append 3: stream `acct-2` (`Opened` already known)       -> 1 record
+    // Each append's registrations go in ONE batch, pushed ahead of the batch
+    // that uses them. So the committer sees 6 batches and 9 events, of which 4
+    // are the user's. These counters describe the LOG, and the registry is in
+    // the log now — that is the whole point of the bone.
+    const REGISTRY_EVENTS: u64 = 5;
+    const REGISTRY_BATCHES: u64 = 3;
     let m = engine.metrics();
-    assert_eq!(m.total_events, 4, "record book counts every committed event");
-    assert_eq!(m.commit.events, 4, "committer counts every durable event");
-    assert_eq!(m.commit.batches, 3);
+    assert_eq!(
+        m.total_events as u64,
+        4 + REGISTRY_EVENTS,
+        "the log holds every committed event, registrations included"
+    );
+    assert_eq!(
+        m.commit.events,
+        4 + REGISTRY_EVENTS,
+        "committer counts every durable event"
+    );
+    assert_eq!(m.commit.batches, 3 + REGISTRY_BATCHES);
     assert!(m.commit.groups >= 1, "at least one barriered group");
     assert_eq!(m.commit.fsync.count, m.commit.groups, "one barrier per group");
     assert!(m.commit.bytes > 0, "durable bytes counted");
     assert_eq!(
-        m.durable_watermark, 4,
+        m.durable_watermark,
+        4 + REGISTRY_EVENTS,
         "watermark past the last global position"
     );
     // fsync percentiles are populated (>= mean is meaningless on tmpfs, but the

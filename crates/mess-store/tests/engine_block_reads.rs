@@ -95,36 +95,60 @@ async fn seed(
             _ => 0,
         });
     }
-    let mut gp = oracle.len() as u64;
+    // `seq` numbers the USER events (it seeds the payloads and type names, so
+    // it must stay dense and reproducible). The oracle's `global`, by
+    // contrast, is taken from the engine's OWN ack — `bn-2di`: the
+    // log-derived `$registry` consumes a global position per name it
+    // registers, so global positions are no longer "the index of the Nth
+    // user event" and an oracle that assumed so would be asserting a
+    // falsehood. Deriving them from the ack is also simply more faithful:
+    // it tests what the engine actually reports.
+    let mut seq = oracle.len() as u64;
     let batches = total / per_batch;
     for b in 0..batches {
         let s = (b as usize) % streams;
         let name = format!("acct-{s:04}");
         let recs: Vec<RecordToAppend> = (0..per_batch)
             .map(|k| RecordToAppend {
-                message_type: if (gp + k).is_multiple_of(3) {
+                message_type: if (seq + k).is_multiple_of(3) {
                     "acct.opened".to_string()
                 } else {
                     "acct.deposited".to_string()
                 },
-                data:         payload(gp + k),
+                data:         payload(seq + k),
             })
             .collect();
         let out =
             engine.append_batch(&name, heads[s], &recs).await.expect("append");
         heads[s] = out.version;
-        for r in &recs {
+        // The batch's events occupy [last - (n-1) ..= last].
+        let first_global = out.last_global_position + 1 - recs.len() as u64;
+        for (k, r) in recs.iter().enumerate() {
             oracle.push(Shadow {
                 stream:  name.clone(),
                 typ:     r.message_type.clone(),
                 data:    r.data.clone(),
                 version: versions[s],
-                global:  gp,
+                global:  first_global + k as u64,
             });
             versions[s] += 1;
-            gp += 1;
+            seq += 1;
         }
     }
+}
+
+/// The number of LOG events the oracle implies (`bn-2di`).
+///
+/// `LogEngine::total_events()` is the durable watermark — it counts every event
+/// in the log, and that now includes the `$registry` records the engine writes
+/// when it first sees a stream name or an event-type name. The oracle only
+/// records USER events, so the two differ by exactly the number of
+/// registrations. Rather than hard-code that, derive it: the highest global
+/// position the oracle knows, plus one, IS the log's event count (the last
+/// append is always a user event, never a registration — a registration is only
+/// ever written *ahead of* the batch that uses it).
+fn implied_total_events(oracle: &[Shadow]) -> usize {
+    oracle.last().map_or(0, |s| s.global as usize + 1)
 }
 
 /// Every read API vs the oracle: paged `read_global` (several page sizes and
@@ -132,11 +156,22 @@ async fn seed(
 /// limits), and `head`.
 async fn assert_identical(engine: &LogEngine, oracle: &[Shadow], ctx: &str) {
     // read_global, full paging at two page sizes + a mid-log start.
-    for (page, start) in
-        [(97usize, None), (512, None), (64, Some(oracle.len() as u64 / 2))]
+    //
+    // `bn-2di`: the oracle INDEX and the global POSITION are no longer the same
+    // number (the `$registry` records the engine writes consume positions but
+    // are never delivered), so the mid-log start is expressed as an oracle
+    // index and converted to the `after` cursor through the oracle's own
+    // recorded position. Conflating the two would silently mis-align every
+    // assertion past the first registration.
+    for (page, start_idx) in
+        [(97usize, 0usize), (512, 0), (64, oracle.len() / 2)]
     {
-        let mut after = start;
-        let mut idx = after.map_or(0, |p| p as usize + 1);
+        let mut idx = start_idx;
+        let mut after = if start_idx == 0 {
+            None
+        } else {
+            Some(oracle[start_idx].global - 1)
+        };
         loop {
             let got =
                 engine.read_global(after, page).await.expect("read_global");
@@ -255,7 +290,7 @@ fn block_reads_are_byte_identical_live_reopened_and_cache_starved() {
         LogEngine::open_with(&dir, opts(64 * 1024, 64 << 20)).expect("open");
     rt.block_on(seed(&engine, &mut oracle, 16, 4000, 5));
     await_seals(&engine, 3);
-    assert_eq!(engine.total_events(), oracle.len());
+    assert_eq!(engine.total_events(), implied_total_events(&oracle));
     rt.block_on(assert_identical(&engine, &oracle, "live"));
     drop(engine);
 
@@ -268,7 +303,11 @@ fn block_reads_are_byte_identical_live_reopened_and_cache_starved() {
         0,
         "chain-off open must decode zero payload frames"
     );
-    assert_eq!(engine.total_events(), oracle.len(), "reopen watermark");
+    assert_eq!(
+        engine.total_events(),
+        implied_total_events(&oracle),
+        "reopen watermark"
+    );
     rt.block_on(assert_identical(&engine, &oracle, "reopened"));
 
     // Appends after reopen continue the dense positions; reads still match.
@@ -493,7 +532,15 @@ fn sidecar_durable_before_data_is_not_trusted_on_reopen() {
     assert!(!full.is_empty(), "the surviving prefix is served");
     for (i, r) in full.iter().enumerate() {
         oracle[i].assert_eq_record(r, "torn-seal surviving prefix");
-        assert_eq!(r.global_position, i as u64, "dense, no fabrication");
+        // The surviving prefix is a prefix of the ORACLE, in order, with each
+        // record at the exact global position the engine acked it at (bn-2di:
+        // those positions are not `i`, because `$registry` records sit between
+        // them — but they are still exactly what was acked, so nothing was
+        // fabricated or shifted).
+        assert_eq!(
+            r.global_position, oracle[i].global,
+            "no fabrication: each surviving record keeps its acked position"
+        );
     }
 }
 
@@ -529,7 +576,7 @@ fn seal_active_partial_coverage_straddles_byte_identically() {
     assert_eq!(engine.recover_payload_decodes(), 0);
     assert_eq!(
         engine.total_events(),
-        oracle.len(),
+        implied_total_events(&oracle),
         "no tail lost across reopen"
     );
     rt.block_on(assert_identical(&engine, &oracle, "seal_active reopened"));

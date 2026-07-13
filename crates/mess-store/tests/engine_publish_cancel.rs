@@ -62,17 +62,32 @@ fn poll_once_then_drop<F: Future>(fut: F) -> bool {
 /// Spin until `engine.total_events()` reaches `want`, or panic on timeout. Used
 /// to reach quiescence after detached commit tasks: once the book holds every
 /// expected event, no publish is in flight, so subsequent reads are stable.
+/// How many USER events `read_global` currently delivers.
+///
+/// `bn-2di`: `total_events()` counts the LOG, which now includes the
+/// `$registry` records the engine writes when it first sees a stream or type
+/// name. This suite is about publish/cancellation of *user* appends, so it
+/// counts what a user can actually see — a strictly tighter thing to assert,
+/// since a stranded publish would show up here just the same.
+async fn delivered(engine: &LogEngine) -> usize {
+    engine
+        .read_global(None, engine.total_events() + 1000)
+        .await
+        .expect("read_global")
+        .len()
+}
+
 async fn await_total(engine: &LogEngine, want: usize) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        if engine.total_events() >= want {
+        let got = delivered(engine).await;
+        if got >= want {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "store never reached {want} events (got {}) — a stranded/stalled \
-             publish (bn-3nz)",
-            engine.total_events()
+            "store never reached {want} delivered events (got {got}) — a \
+             stranded/stalled publish (bn-3nz)"
         );
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
@@ -85,12 +100,26 @@ async fn assert_consistent(engine: &LogEngine, streams: &[String]) {
     let total = engine.total_events();
     let all =
         engine.read_global(None, total + 1000).await.expect("read_global");
-    assert_eq!(all.len(), total, "read_global must expose every booked event");
-    for (i, r) in all.iter().enumerate() {
-        assert_eq!(
-            r.global_position, i as u64,
-            "global positions must be dense 0..N"
+    // `bn-2di`: the delivered global order is strictly ascending and
+    // duplicate-free, but not dense — `$registry` records consume positions and
+    // are never delivered. A stranded or double publish (the bn-3nz bug this
+    // suite exists for) still shows up as an out-of-order or repeated position.
+    let mut prev: Option<u64> = None;
+    for r in &all {
+        if let Some(p) = prev {
+            assert!(
+                r.global_position > p,
+                "global positions must be strictly ascending and unique: {} \
+                 after {p}",
+                r.global_position
+            );
+        }
+        assert!(
+            (r.global_position as usize) < total,
+            "delivered position {} is past the log's own event count {total}",
+            r.global_position
         );
+        prev = Some(r.global_position);
     }
     for s in streams {
         let head = engine.head(s).await.expect("head");
@@ -201,7 +230,7 @@ async fn dropped_append_future_does_not_gap_the_position_sequence() {
         .expect("barrier append");
     await_total(&engine, expected).await;
     assert_eq!(
-        engine.total_events(),
+        delivered(&engine).await,
         expected,
         "no extra or missing events at quiescence"
     );
@@ -289,9 +318,19 @@ async fn cancel_then_same_stream_retry_never_double_writes_version() {
     );
     assert_eq!(page[0].stream_position, 0);
     assert_eq!(page[1].stream_position, 1);
-    // Global order dense across the whole store.
+    // Global order: strictly ascending, no duplicate (bn-2di — not dense, since
+    // `$registry` records take positions but are never delivered; a double
+    // publish would still repeat a position).
     let all = engine.read_global(None, 100).await.expect("read_global");
-    for (i, r) in all.iter().enumerate() {
-        assert_eq!(r.global_position, i as u64, "dense global order");
+    let mut prev: Option<u64> = None;
+    for r in &all {
+        if let Some(p) = prev {
+            assert!(
+                r.global_position > p,
+                "global order must be strictly ascending: {} after {p}",
+                r.global_position
+            );
+        }
+        prev = Some(r.global_position);
     }
 }

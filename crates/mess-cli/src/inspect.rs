@@ -8,6 +8,7 @@ use serde_json::json;
 
 use crate::lockprobe::{self, LockState};
 use crate::metaread;
+use crate::registryfold;
 use crate::report::{Finding, Report, Severity};
 use crate::scan::scan_segment;
 use crate::store;
@@ -165,63 +166,83 @@ pub fn run(dir: &Path, opts: &InspectOptions) -> Report {
          docs/spec/03-durability.md §2.6.",
     );
 
-    // Stream heads and registry — from the durable metadata store when it can
-    // be opened (a live writer holds fjall's lock, so degrade to the
-    // recovered-from-log heads otherwise).
+    // Stream heads, names, and snapshots.
     //
-    // bn-1yz: the JSON schema here is LOCK-STATE-INDEPENDENT. Earlier this
-    // set a top-level `registry_source` scalar and, only on success, a
-    // sibling `registry` object — so `registry.stream_names` was a real
-    // array when the store was free and simply ABSENT (not even `null`)
-    // when a live writer held the meta lock. A reader had to branch on
-    // whether the key existed at all. Now `registry` is always present with
-    // the same fields; `registry.available` is the one place that state is
-    // signaled, and `stream_names`/`type_names`/`snapshots` are `[]` (not
-    // missing) when degraded.
-    let meta = metaread::read(dir);
+    // `bn-2di`: NAMES NOW COME FROM THE LOG. Fjall has no name keyspace any
+    // more — the `id -> name` bijection is the `$registry` stream (spec
+    // `04-registry.md`), and `registryfold` decodes it straight out of the
+    // segment bytes. That is strictly better than what this used to do: the
+    // fold needs no lock, so a live writer no longer degrades the name report
+    // at all. Only SNAPSHOTS still need fjall (the app snapshot sidecar),
+    // and only that part degrades when a writer holds the lock.
+    //
+    // bn-1yz: the JSON schema here is LOCK-STATE-INDEPENDENT. `registry` is
+    // always present with the same fields; `registry.available` signals whether
+    // the snapshot half could be read, and `snapshots` is `[]` (not missing)
+    // when it could not.
+    let folded = registryfold::fold(dir);
     let mut names: BTreeMap<u64, String> = BTreeMap::new();
-    let registry = match &meta {
-        Ok(facts) => {
-            for (id, name) in &facts.stream_names {
+    // `$registry` (stream 0) is named by SPEC TEXT, not by any record
+    // (REG1/REG2 — the reserved ids are exactly what makes registry
+    // bootstrap non-circular, so there is nothing upstream of them to
+    // record them).
+    names.insert(
+        mess_store::registry::REGISTRY_STREAM_ID,
+        mess_store::registry::RESERVED_STREAM_NAME.to_string(),
+    );
+    let (stream_names, type_names) = match &folded {
+        Ok(state) => {
+            let streams = registryfold::stream_names(state);
+            for (id, name) in &streams {
                 names.insert(*id, name.clone());
             }
-            json!({
-                "available": true,
-                "source": "meta",
-                "reason": null,
-                "stream_names": facts.stream_names.iter()
-                    .map(|(id, n)| json!({ "stream_id": id, "name": n }))
-                    .collect::<Vec<_>>(),
-                "type_names": facts.type_names.iter()
-                    .map(|(id, n)| json!({ "event_type_id": id, "name": n }))
-                    .collect::<Vec<_>>(),
-                "snapshots": facts.snapshots.iter()
-                    .map(|s| json!({
-                        "stream_id": s.stream_id,
-                        "version": s.version,
-                        "fold_version": s.fold_version,
-                        "covers_empty_prefix": s.covers_empty_prefix,
-                    }))
-                    .collect::<Vec<_>>(),
-            })
+            (streams, registryfold::event_type_names(state))
         }
         Err(reason) => {
-            report.advise("registry-unavailable", reason);
-            json!({
-                "available": false,
-                "source": "unavailable",
-                "reason": reason,
-                "stream_names": [],
-                "type_names": [],
-                "snapshots": [],
-            })
+            report.advise("registry-fold-failed", reason);
+            (Vec::new(), Vec::new())
         }
     };
-    report.set("registry", registry);
+
+    let meta = metaread::read(dir);
+    let snapshots = match &meta {
+        Ok(facts) => facts
+            .snapshots
+            .iter()
+            .map(|s| {
+                json!({
+                    "stream_id": s.stream_id,
+                    "version": s.version,
+                    "fold_version": s.fold_version,
+                    "covers_empty_prefix": s.covers_empty_prefix,
+                })
+            })
+            .collect::<Vec<_>>(),
+        Err(reason) => {
+            report.advise("registry-unavailable", reason);
+            Vec::new()
+        }
+    };
+    report.set(
+        "registry",
+        json!({
+            "available": folded.is_ok(),
+            "source": "log",
+            "reason": folded.as_ref().err(),
+            "snapshots_available": meta.is_ok(),
+            "stream_names": stream_names.iter()
+                .map(|(id, n)| json!({ "stream_id": id, "name": n }))
+                .collect::<Vec<_>>(),
+            "type_names": type_names.iter()
+                .map(|(id, n)| json!({ "event_type_id": id, "name": n }))
+                .collect::<Vec<_>>(),
+            "snapshots": snapshots,
+        }),
+    );
     if !opts.all_streams {
         // registry.stream_names/type_names/snapshots are just as unbounded at
         // app scale as stream_heads (bn-1yz) — one row per stream/event-type
-        // ever seen. Cap all four listings together under one flag.
+        // ever seen. Cap all listings together under one flag.
         report
             .limit_display("registry.stream_names", DEFAULT_STREAM_HEADS_LIMIT);
         report.limit_display("registry.type_names", DEFAULT_STREAM_HEADS_LIMIT);

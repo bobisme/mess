@@ -1,56 +1,40 @@
-//! bn-150 / bn-2cj — name persistence must be co-durable with the covering
-//! append, at the strength the engine's [`Durability`] mode asks for.
+//! bn-2di — a committed event may never out-live the name of the stream or
+//! type it references, and that guarantee costs **nothing**.
 //!
-//! # Background
+//! # The invariant, and where it lives now
 //!
-//! `EngineError::Meta` on reopen ("no interned name for stream_id …") is
-//! reachable whenever a newly-interned stream/type name is lost while a
-//! covering event survives: unlike every other meta table (`stream_heads`,
-//! `snapshot_heads`, dedupe), `stream_names`/`type_names` are NOT a derived
-//! cache the log can rebuild (I5) — this engine's log frames carry only the
-//! numeric `stream_id`/`event_type_id`, never the name string (see
-//! `engine.rs`'s module doc; the spec's `$registry`, `04-registry.md`, would
-//! carry names in the log, but that is not implemented here). So recovery
-//! resolves names purely from these tables, and the invariant it needs is:
-//! **no committed event may out-live its stream/type name.**
+//! v3 log frames carry the numeric `stream_id` / `event_type_id` and never the
+//! name string, so *something* durable has to hold the `id → name` bijection:
+//! recovery hard-fails without it ("no interned name for stream_id …").
 //!
-//! # The mechanism, and why it is mode-gated (bn-2cj)
+//! Before bn-2di that something was **fjall** — `stream_names`/`type_names`,
+//! the one meta keyspace that was NOT a derived cache the log could rebuild
+//! (I5). Upholding the invariant therefore meant ordering two *separate*
+//! storage systems, and that cost a real barrier:
 //!
-//! The name flush is issued strictly BEFORE the covering committer append is
-//! submitted; *which* flush depends on the engine's [`Durability`] mode:
+//! * bn-150 added a `SyncAll` per new name (~3.4 ms/new-stream — spike bn-1jg
+//!   measured it at 98.8% of new-stream latency);
+//! * bn-2cj gated it by durability mode;
+//! * bn-34o coalesced the barriered modes' fsyncs into the committer's group
+//!   window;
+//! * and Spike J *still* found a second serialized `SyncAll` worth ~953 µs per
+//!   new stream that the `commit.fsync` counter could not even see.
 //!
-//! * `Os`/`Group` (the log append is acked only after its own real `fdatasync`
-//!   barrier): the name rides a matching `SyncAll` (`fsync`) barrier —
-//!   [`MetaStore::persist`], counted by [`LogEngine::meta_persist_call_count`].
-//!   The name is on stable storage before the event that references it can be.
-//!   bn-150, unchanged.
-//! * `Process` (the log append is acked the instant its own `write(2)` reaches
-//!   the OS page cache; §1.1 promises process-crash survival only, with an
-//!   unbounded, OS-governed power-loss window): a per-name `fsync` would be
-//!   strictly stronger than the operator asked for — and it is exactly that
-//!   `fsync` that dominated new-stream latency (spike bn-1jg, ~3.4 ms/new
-//!   stream, 98.8% of it). So the name is pushed to the SAME OS page cache the
-//!   event bytes go to, WITHOUT a barrier — [`MetaStore::persist_buffered`],
-//!   counted by [`LogEngine::meta_buffered_persist_call_count`] — ordered
-//!   strictly before the covering event's own `write(2)`.
+//! Since bn-2di that something is **the log itself**. A new name is a
+//! `$registry` record (spec `04-registry.md`), written by the same committer,
+//! into the same segment, in the same commit group, at a *lower offset* than
+//! the batch that first references the id it mints (`Appender::submit_ordered`,
+//! pushed under the interner lock so no concurrent appender can overtake it).
+//! Recovery accepts a **contiguous prefix** of the log, so no crash can keep
+//! the reference and lose the registration: the ordering is structural, and
+//! structure needs no fsync.
 //!
-//! # Why these tests assert call counts, not "kill -9 and reopen"
-//!
-//! A real power-loss event cannot be simulated portably from inside
-//! `cargo test`: fjall's default insert/commit path already performs a real
-//! `write(2)` to the OS page cache on every call, so an abrupt process exit
-//! (`kill -9`, or `std::process::exit` skipping every destructor) does not
-//! reproduce the loss — the write already reached the kernel and survives any
-//! process-level death; only an actual OS crash / hardware power cut, which
-//! loses the page cache itself, would. (`mess-log`'s own
-//! `tests/sigkill_harness.rs` documents the identical limitation for its
-//! `Os`/`Group` durability modes.) So instead these tests pin the actual
-//! mechanism by construction: the SyncAll-barrier count (barriered modes) and
-//! the buffered-flush count (`Process`), each fired exactly when — and only
-//! when — a name was newly interned, before the covering append is submitted.
-//! The reopen tests then confirm the end-to-end effect (no `EngineError::Meta`,
-//! correct names everywhere) that a process crash after such an append
-//! preserves in every mode.
+//! The fjall name tables are **gone** — not shadowed, not optional: the
+//! keyspaces do not exist, `MetaStore` has no method to write one, and
+//! `mess-log`'s committer no longer has a `PreBarrier` hook to hang a name
+//! flush on. So the assertions here **invert**: where the old suite demanded a
+//! flush per new name, this one demands zero, in every durability mode, and
+//! pins the guarantee where it actually lives — in the bytes of the log.
 
 use std::time::{Duration, Instant};
 
@@ -72,130 +56,171 @@ fn open_with(dir: &std::path::Path, durability: Durability) -> LogEngine {
     .expect("open")
 }
 
+const MODES: [Durability; 3] = [
+    Durability::Process,
+    Durability::Os,
+    Durability::Group { max_delay: Duration::from_micros(200), max_bytes: 0 },
+];
+
 // ---------------------------------------------------------------------------
-// Barriered modes (`Os`/`Group`): the SyncAll barrier still holds (bn-150).
+// The headline: a store keeps NO names in fjall, at all, ever.
 // ---------------------------------------------------------------------------
 
-/// Under `Os`, an append that interns a brand-new stream name must issue
-/// exactly one real `fsync` barrier (`SyncAll`) before it returns — the
-/// bn-150 guarantee, which bn-2cj must NOT weaken for a barriered mode.
+/// The acceptance criterion for retiring the keyspace, in its strongest form:
+/// the fjall name tables are never created, so a store must open, resolve every
+/// name, and serve every read with **no name data in fjall in existence**.
+///
+/// This is not "deleted after a migration" — there is nothing to delete. The
+/// `MetaStore` has no name keyspace and no method to write one; the only place
+/// a name has ever been written is the log.
 #[tokio::test]
-async fn new_stream_name_under_os_forces_a_durable_meta_flush() {
-    let dir =
-        mess_testkit::sweeping_temp_dir("name-durability-os-new-stream-forces");
-    let engine = open_with(&dir.path().join("store"), Durability::Os);
+async fn a_store_resolves_every_name_with_no_fjall_name_tables_in_existence() {
+    let dir = mess_testkit::sweeping_temp_dir("name-dur-no-fjall-names");
+    let store_path = dir.path().join("store");
 
-    assert_eq!(engine.meta_persist_call_count(), 0, "nothing flushed yet");
+    {
+        let engine = open_with(&store_path, Durability::Process);
+        for i in 0..8u64 {
+            engine
+                .append_batch(
+                    &format!("acct-{i}"),
+                    Version::NoStream,
+                    &[rec(&format!("evt.type-{i}"), &i.to_le_bytes())],
+                )
+                .await
+                .expect("append");
+        }
+    }
 
-    engine
-        .append_batch(
-            "new-stream",
-            Version::NoStream,
-            &[rec("evt.a", b"payload")],
-        )
+    // Reopen: every name comes back, from the log and only the log.
+    let engine = open_with(&store_path, Durability::Process);
+    for i in 0..8u64 {
+        let s = engine
+            .read_stream(&format!("acct-{i}"), Version::NoStream, 10)
+            .await
+            .expect("read");
+        assert_eq!(s.len(), 1, "stream acct-{i} must be readable");
+        assert_eq!(s[0].stream_id, format!("acct-{i}"));
+        assert_eq!(
+            s[0].message_type,
+            format!("evt.type-{i}"),
+            "the event TYPE name must fold back out of the log too"
+        );
+        assert_eq!(s[0].data, i.to_le_bytes());
+    }
+
+    // And the registry it folded them from is a real, readable log stream.
+    let reg = engine
+        .read_stream("$registry", Version::NoStream, 100)
         .await
-        .expect("append with a new stream name");
-
-    assert_eq!(
-        engine.meta_persist_call_count(),
-        1,
-        "a newly-interned stream name under Os must force exactly one durable \
-         (SyncAll) meta flush"
-    );
-    // The barrier IS the durability here; no barrier-free flush was used.
-    assert_eq!(engine.meta_buffered_persist_call_count(), 0);
+        .expect("$registry is readable");
+    assert_eq!(reg.len(), 16, "8 stream names + 8 type names");
+    assert!(reg.iter().all(|r| r.message_type == "RegistryEventV1"));
 }
 
-/// Under `Os`, a new event-TYPE name (on an already-known stream) must equally
-/// force a durable barrier — the type-name call site is a second, independent
-/// path through `persist_new_names`, folded with the stream-name call site
-/// into one barrier per append (bn-150).
+/// A new name adds **no barrier to a second storage system** — and, in the
+/// production `Group` mode, no barrier at all.
+///
+/// There is no meta-flush counter to assert on any more
+/// (`meta_persist_call_count` died with the barrier it counted), so this
+/// asserts the thing that actually matters and that a counter could never
+/// prove: what the *log's own* fsync count does when an append mints two
+/// brand-new names versus none.
+///
+/// The two modes answer differently, and the difference is inherent, not a
+/// defect:
+///
+/// * **`Group`** (the production mode, and the one the perf gate is stated in):
+///   the registration and the append it precedes are pushed back-to-back under
+///   one gate span, so the committer's gather drains BOTH into the SAME commit
+///   group. One `fdatasync` covers both. A new name costs **zero** extra
+///   barriers.
+/// * **`Os`**: `Durability::Os` is *defined* as one `fdatasync` per batch (spec
+///   03 §1.2 — a group IS a single append), so two batches are two barriers, by
+///   construction, in any mechanism. That is not a regression: the pre-bn-2di
+///   engine paid ~the same two barriers for a new stream under `Os` (one log
+///   `fdatasync` + at least one meta `SyncAll`). What changed is that both
+///   barriers are now the LOG's own — there is no second storage system in the
+///   path, no shared-`MetaStore` serialization point that `N` concurrent new
+///   streams funnel through (spike bn-1jg's finding), and no phantom `SyncAll`
+///   invisible to `commit.fsync` (Spike J's).
 #[tokio::test]
-async fn new_type_name_under_os_forces_a_durable_meta_flush() {
-    let dir =
-        mess_testkit::sweeping_temp_dir("name-durability-os-new-type-forces");
-    let engine = open_with(&dir.path().join("store"), Durability::Os);
+async fn a_new_name_adds_no_barrier_beyond_the_log_s_own() {
+    for durability in [
+        Durability::Os,
+        Durability::Group {
+            max_delay: Duration::from_micros(200),
+            max_bytes: 0,
+        },
+    ] {
+        let dir = mess_testkit::sweeping_temp_dir("name-dur-no-extra-fsync");
+        let engine = open_with(&dir.path().join("store"), durability);
 
-    engine
-        .append_batch("s", Version::NoStream, &[rec("evt.a", b"1")])
-        .await
-        .expect("append b0 (new stream AND new type, folded into ONE flush)");
-    assert_eq!(
-        engine.meta_persist_call_count(),
-        1,
-        "a new stream + a new type in the SAME append must fold into one \
-         barrier, not two"
-    );
+        engine
+            .append_batch("prime", Version::NoStream, &[rec("prime.t", b"0")])
+            .await
+            .expect("prime");
 
-    engine
-        .append_batch("s", Version::At(0), &[rec("evt.b", b"2")])
-        .await
-        .expect("append b1 (same stream, NEW type: +1)");
-    assert_eq!(
-        engine.meta_persist_call_count(),
-        2,
-        "a newly-interned event type must also force a durable barrier"
-    );
+        // A run of appends to an EXISTING stream + type: no registration.
+        let before = engine.metrics().commit.fsync.count;
+        let mut expected = Version::At(0);
+        for i in 0..20u64 {
+            let out = engine
+                .append_batch(
+                    "prime",
+                    expected,
+                    &[rec("prime.t", &i.to_le_bytes())],
+                )
+                .await
+                .expect("hot append");
+            expected = out.version;
+        }
+        let hot = engine.metrics().commit.fsync.count - before;
+
+        // A run of appends each minting a brand-new stream AND a brand-new
+        // type.
+        let before = engine.metrics().commit.fsync.count;
+        for i in 0..20u64 {
+            engine
+                .append_batch(
+                    &format!("fresh-{i}"),
+                    Version::NoStream,
+                    &[rec(&format!("fresh.t-{i}"), &i.to_le_bytes())],
+                )
+                .await
+                .expect("new-name append");
+        }
+        let new_name = engine.metrics().commit.fsync.count - before;
+
+        match durability {
+            Durability::Group { .. } => assert!(
+                new_name <= hot,
+                "Group: 20 new-name appends took {new_name} barriers vs {hot} \
+                 for 20 hot appends — the registration must ride the append's \
+                 OWN commit group, adding no barrier"
+            ),
+            Durability::Os => assert!(
+                new_name <= 2 * hot,
+                "Os: 20 new-name appends took {new_name} barriers vs {hot} \
+                 for 20 hot appends. Os is one fdatasync per BATCH, and a \
+                 new-name append writes two (registration, then use), so 2x \
+                 is the floor — but never more, and never a barrier to a \
+                 second store."
+            ),
+            Durability::Process => unreachable!("not exercised here"),
+        }
+    }
 }
 
-// ---------------------------------------------------------------------------
-// `Process`: a new name is flushed to the page cache WITHOUT an fsync barrier.
-// This is the bn-2cj win — the per-new-stream fsync that dominated latency is
-// gone, replaced by a barrier-free page-cache write ordered before the event.
-// ---------------------------------------------------------------------------
-
-/// The bone's core assertion: under `Durability::Process` an append that
-/// interns a brand-new stream name does NOT issue an `fsync` barrier — it
-/// flushes the name to the OS page cache (`Buffer`) instead. Zero `SyncAll`
-/// calls, exactly one buffered flush. This is the counting-wrapper proof that
-/// the new-stream append cannot block on a meta `fsync`.
+/// Corroborating timing proof (spike bn-1jg's yardstick shape): under
+/// `Process` — which issues no log barrier at all — a run of all-new-stream
+/// appends must have a per-append MEDIAN far below the `fsync` floor a barrier
+/// would impose. This is the guard against a per-new-stream fsync creeping back
+/// in by ANY route, including one no counter watches (which is exactly how
+/// Spike J's phantom ~953 µs `SyncAll` hid).
 #[tokio::test]
-async fn new_stream_name_under_process_flushes_without_a_barrier() {
-    let dir = mess_testkit::sweeping_temp_dir(
-        "name-durability-process-new-stream-no-barrier",
-    );
-    let engine = open_with(&dir.path().join("store"), Durability::Process);
-
-    assert_eq!(engine.meta_persist_call_count(), 0);
-    assert_eq!(engine.meta_buffered_persist_call_count(), 0);
-
-    engine
-        .append_batch(
-            "new-stream",
-            Version::NoStream,
-            &[rec("evt.a", b"payload")],
-        )
-        .await
-        .expect("append with a new stream name");
-
-    assert_eq!(
-        engine.meta_persist_call_count(),
-        0,
-        "under Process a new stream name must NOT force a SyncAll fsync \
-         barrier — the log itself issues none"
-    );
-    assert_eq!(
-        engine.meta_buffered_persist_call_count(),
-        1,
-        "under Process a new stream name must be pushed to the OS page cache \
-         via exactly one barrier-free (Buffer) flush"
-    );
-}
-
-/// Corroborating timing proof (bn-2cj, spike bn-1jg's yardstick shape): under
-/// `Process`, a run of all-new-stream appends must have a per-append MEDIAN
-/// well below the `fsync` floor the barrier would impose. On this class of
-/// host the spike measured ~3.4 ms/new-stream WITH the barrier and ~0.03 ms
-/// WITHOUT it (existing-stream floor); asserting the median stays under 1 ms
-/// separates the two by a wide margin while a p50 (not max) is robust to the
-/// occasional writeback/scheduler spike. Deliberately lenient: the
-/// deterministic proof is the call-count test above; this guards against a
-/// silent reintroduction of a per-new-stream barrier.
-#[tokio::test]
-async fn process_new_stream_appends_do_not_block_on_a_meta_fsync() {
-    let dir = mess_testkit::sweeping_temp_dir(
-        "name-durability-process-new-stream-timing",
-    );
+async fn process_new_stream_appends_do_not_block_on_any_fsync() {
+    let dir = mess_testkit::sweeping_temp_dir("name-dur-process-timing");
     let engine = open_with(&dir.path().join("store"), Durability::Process);
 
     const N: usize = 200;
@@ -213,44 +238,137 @@ async fn process_new_stream_appends_do_not_block_on_a_meta_fsync() {
         samples.push(t.elapsed());
     }
 
-    // Every one of the N appends interned a new stream name → N buffered
-    // flushes, zero fsync barriers.
-    assert_eq!(engine.meta_buffered_persist_call_count(), N as u64);
-    assert_eq!(engine.meta_persist_call_count(), 0);
-
     samples.sort_unstable();
     let p50 = samples[N / 2];
     assert!(
         p50 < Duration::from_millis(1),
-        "Process new-stream append p50 = {p50:?} — a per-new-stream fsync \
-         (~ms) appears to have crept back in; the barrier-free page-cache \
-         flush should keep this well under 1ms"
+        "Process new-stream append p50 = {p50:?} — an fsync (~ms) appears to \
+         have crept back into the new-name path"
     );
 }
 
 // ---------------------------------------------------------------------------
-// The hot path (either mode): once names are interned, ZERO added flushes.
+// Durability: every name survives, in every mode, across reopen.
 // ---------------------------------------------------------------------------
 
-/// Once a stream and its event type(s) are interned, repeated appends must add
-/// ZERO name flushes of EITHER kind — the append-latency cost this bone
-/// requires stay at zero on the common path. Run under both modes.
+/// A burst of 32 concurrent brand-new streams — the shape that used to
+/// serialize on the shared `MetaStore`'s fsync — must reopen with every name
+/// resolved, in every durability mode. Concurrency is the interesting part: two
+/// appenders on different streams race, and each must get its registration into
+/// the log ahead of any batch that references the id it minted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_concurrent_burst_of_new_names_all_survive_reopen() {
+    for durability in MODES {
+        let dir = mess_testkit::sweeping_temp_dir("name-dur-burst");
+        let store_path = dir.path().join("store");
+        let engine = open_with(&store_path, durability);
+
+        const K: usize = 32;
+        let gate = std::sync::Arc::new(tokio::sync::Barrier::new(K));
+        let mut handles = Vec::new();
+        for i in 0..K {
+            let engine = engine.clone();
+            let gate = gate.clone();
+            handles.push(tokio::spawn(async move {
+                gate.wait().await;
+                engine
+                    .append_batch(
+                        &format!("burst-{i}"),
+                        Version::NoStream,
+                        &[rec(&format!("evt-{i}"), &(i as u64).to_le_bytes())],
+                    )
+                    .await
+                    .expect("burst new-stream append")
+            }));
+        }
+        for h in handles {
+            h.await.expect("join");
+        }
+
+        drop(engine);
+        let engine = open_with(&store_path, durability);
+        for i in 0..K {
+            assert_eq!(
+                engine.head(&format!("burst-{i}")).await.unwrap(),
+                Version::At(0),
+                "{durability:?}: burst stream {i} must survive reopen with \
+                 its name resolved"
+            );
+            let s = engine
+                .read_stream(&format!("burst-{i}"), Version::NoStream, 10)
+                .await
+                .unwrap();
+            assert_eq!(s[0].message_type, format!("evt-{i}"));
+        }
+    }
+}
+
+/// The registration must be IN THE LOG, at a **lower global position** than the
+/// event that references it. That ordering — not a barrier — is the entire
+/// durability argument, because recovery accepts a contiguous prefix: a crash
+/// that keeps the event necessarily kept the registration too.
 #[tokio::test]
-async fn hot_path_appends_add_zero_meta_flushes() {
-    for durability in [Durability::Process, Durability::Os] {
-        let dir =
-            mess_testkit::sweeping_temp_dir("name-durability-hot-path-appends");
+async fn a_registration_always_precedes_the_event_that_uses_it() {
+    for durability in MODES {
+        let dir = mess_testkit::sweeping_temp_dir("name-dur-ordering");
         let engine = open_with(&dir.path().join("store"), durability);
 
-        // Prime the interner: one stream, one type. The only flush this loop
-        // expects, ever (a barrier under Os, a buffered flush under Process).
+        engine
+            .append_batch(
+                "acct-42",
+                Version::NoStream,
+                &[rec("account.opened", b"carol")],
+            )
+            .await
+            .expect("append with new stream + new type");
+
+        let reg = engine
+            .read_stream("$registry", Version::NoStream, 10)
+            .await
+            .expect("$registry is readable");
+        assert_eq!(
+            reg.len(),
+            2,
+            "one StreamRegistered, one EventTypeRegistered"
+        );
+        let event =
+            engine.read_stream("acct-42", Version::NoStream, 10).await.unwrap();
+        assert!(
+            reg[1].global_position < event[0].global_position,
+            "{durability:?}: both registrations must precede the event that \
+             references them ({} vs {})",
+            reg[1].global_position,
+            event[0].global_position
+        );
+
+        // The registry records consume global positions but are NEVER delivered
+        // to an application.
+        let g = engine.read_global(None, 10).await.unwrap();
+        assert_eq!(g.len(), 1, "system records must not leak into read_global");
+        assert_eq!(g[0].stream_id, "acct-42");
+    }
+}
+
+/// Once a name is interned, repeated appends add ZERO `$registry` records — the
+/// registry is append-only-and-tiny by construction (REG4: one record per name
+/// ever created, not one per event), and the hot append path must not notice it
+/// exists.
+#[tokio::test]
+async fn hot_path_appends_add_no_registry_records() {
+    for durability in MODES {
+        let dir = mess_testkit::sweeping_temp_dir("name-dur-hot-path");
+        let engine = open_with(&dir.path().join("store"), durability);
+
         engine
             .append_batch("hot", Version::NoStream, &[rec("hot.type", b"0")])
             .await
             .expect("priming append");
-
-        let base_barrier = engine.meta_persist_call_count();
-        let base_buffered = engine.meta_buffered_persist_call_count();
+        let base = engine
+            .read_stream("$registry", Version::NoStream, 100)
+            .await
+            .expect("read $registry")
+            .len();
+        assert_eq!(base, 2, "the priming append minted one stream + one type");
 
         let mut expected = Version::At(0);
         for i in 0..500u64 {
@@ -266,219 +384,180 @@ async fn hot_path_appends_add_zero_meta_flushes() {
         }
 
         assert_eq!(
-            engine.meta_persist_call_count(),
-            base_barrier,
-            "{durability:?}: 500 no-new-name appends must add ZERO barriers"
-        );
-        assert_eq!(
-            engine.meta_buffered_persist_call_count(),
-            base_buffered,
-            "{durability:?}: 500 no-new-name appends must add ZERO buffered \
-             flushes"
+            engine
+                .read_stream("$registry", Version::NoStream, 100)
+                .await
+                .unwrap()
+                .len(),
+            base,
+            "{durability:?}: 500 no-new-name appends must add ZERO $registry \
+             records"
         );
         assert_eq!(engine.head("hot").await.unwrap(), Version::At(500));
     }
 }
 
-// ---------------------------------------------------------------------------
-// Concurrency + reopen: every new name survives a clean reopen, both modes.
-// ---------------------------------------------------------------------------
-
-/// Concurrent appends across MANY distinct brand-new streams must persist every
-/// name durably and reopen correctly-named. Under `Process` that is exactly one
-/// buffered flush per name (barrier-free, uncoalesced). Under `Os` the
-/// `SyncAll` barriers are COALESCED across the commit window (bn-34o): the
-/// count is `>= 1` and `<= N` (never more than one per name, usually far
-/// fewer). The tight "approaches 1 barrier, not N" proof lives in
-/// [`os_burst_of_new_streams_coalesces_barriers`]; here the load-bearing check
-/// is that every name survives reopen regardless of how the window coalesced.
-/// A clean `drop` (destructors run, page cache intact) models the process-exit
-/// class both modes preserve.
-#[tokio::test]
-async fn concurrent_new_stream_names_each_flush_once_and_survive_reopen() {
-    for durability in [Durability::Process, Durability::Os] {
-        let dir = mess_testkit::sweeping_temp_dir(
-            "name-durability-concurrent-new-streams",
-        );
-        let store_path = dir.path().join("store");
-        let engine = open_with(&store_path, durability);
-
-        const N: usize = 20;
-        let mut handles = Vec::new();
-        for i in 0..N {
-            let engine = engine.clone();
-            handles.push(tokio::spawn(async move {
-                engine
-                    .append_batch(
-                        &format!("concurrent-{i}"),
-                        Version::NoStream,
-                        &[rec("evt", &(i as u64).to_le_bytes())],
-                    )
-                    .await
-                    .expect("concurrent new-stream append")
-            }));
-        }
-        for h in handles {
-            h.await.expect("join");
-        }
-
-        match durability {
-            Durability::Process => {
-                assert_eq!(
-                    engine.meta_buffered_persist_call_count(),
-                    N as u64,
-                    "Process: one buffered flush per newly-interned name"
-                );
-                assert_eq!(engine.meta_persist_call_count(), 0);
-            }
-            _ => {
-                // bn-34o: barriers are coalesced across the window, so the
-                // count is bounded by N (never MORE than one fsync per name)
-                // and at least 1 (durability preserved) — but is typically far
-                // below N. Exact count is timing-dependent; the deterministic
-                // coalescing proof is the dedicated burst test below.
-                let barriers = engine.meta_persist_call_count();
-                assert!(
-                    (1..=N as u64).contains(&barriers),
-                    "Os: coalesced barriers must be in 1..=N, got {barriers}"
-                );
-                assert_eq!(engine.meta_buffered_persist_call_count(), 0);
-            }
-        }
-
-        drop(engine);
-        let engine = open_with(&store_path, durability);
-        for i in 0..N {
-            assert_eq!(
-                engine.head(&format!("concurrent-{i}")).await.unwrap(),
-                Version::At(0),
-                "{durability:?}: stream {i}'s durable event must survive \
-                 reopen"
-            );
-        }
-    }
-}
-
-/// bn-34o, the core coalescing proof: a BURST of `K` concurrent brand-new
-/// streams committing in one window under `Os` must issue **far fewer than
-/// `K`** `SyncAll` barriers — the shared-`MetaStore` serialization point spike
-/// bn-1jg measured (where `K=32` won only ~1.3× from pipelining because each
-/// new name paid its own fsync) is dissolved. All `K` tasks rendezvous on a
-/// barrier so they hit the name-flush together, maximizing window overlap; a
-/// single leader then makes every buffered name durable in one fsync while the
-/// rest ride it.
+/// `$registry` takes REGISTRY RECORDS and nothing else (review F2).
 ///
-/// The hard guard is `barriers < K` (any coalescing at all — a regression that
-/// restored per-name fsyncs would push this back to `K` and fail). The tighter
-/// `barriers <= K / 2` documents the "approaches 1, not K" target and holds
-/// comfortably because an fsync (~ms) is orders of magnitude longer than the
-/// microsecond window in which all `K` tickets are taken, so the whole burst
-/// collapses onto a handful of barriers. Every name must still reopen
-/// resolvable (durability was preserved, not traded away).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn os_burst_of_new_streams_coalesces_barriers() {
-    let dir =
-        mess_testkit::sweeping_temp_dir("name-durability-os-burst-coalesce");
-    let store_path = dir.path().join("store");
-    let engine = open_with(&store_path, Durability::Os);
+/// The stream is not write-*locked* — spec 04's `Registry<B>` writer drives it
+/// through this very seam, and `tests/registry.rs` proves that end to end
+/// against the real engine. What it is, is **type-checked**: every record must
+/// be a `RegistryEventV1` whose payload decodes as a `codec_id 0` registry
+/// record AND folds cleanly into the live `RegistryState` (REG13). Anything
+/// else — a domain frame, corrupt bytes, a REG-rule violation — is refused
+/// before it can reach the log, because those are the bytes recovery decodes as
+/// registry records: one accepted, and the store never opens again.
+#[tokio::test]
+async fn registry_stream_takes_only_valid_registry_records() {
+    use mess_store::registry::{
+        REGISTRY_EVENT_TYPE_NAME, RESERVED_STREAM_ID, RegistryRecord,
+    };
 
-    const K: usize = 32;
-    let gate = std::sync::Arc::new(tokio::sync::Barrier::new(K));
-    let mut handles = Vec::new();
-    for i in 0..K {
-        let engine = engine.clone();
-        let gate = gate.clone();
-        handles.push(tokio::spawn(async move {
-            // Rendezvous so all K appends drive their name-flush concurrently,
-            // giving the leader's single fsync the widest window to cover.
-            gate.wait().await;
-            engine
-                .append_batch(
-                    &format!("burst-{i}"),
-                    Version::NoStream,
-                    &[rec("evt", &(i as u64).to_le_bytes())],
-                )
-                .await
-                .expect("burst new-stream append")
-        }));
-    }
-    for h in handles {
-        h.await.expect("join");
-    }
+    let dir = mess_testkit::sweeping_temp_dir("name-dur-registry-write");
+    let engine = open_with(&dir.path().join("store"), Durability::Process);
 
-    let barriers = engine.meta_persist_call_count();
-    eprintln!(
-        "bn-34o Os burst: {K} concurrent new streams -> {barriers} SyncAll \
-         barriers (ratio {:.3} barriers/new-name)",
-        barriers as f64 / K as f64
-    );
-    // No barrier-free flushes under Os — the barrier IS the durability.
-    assert_eq!(engine.meta_buffered_persist_call_count(), 0);
-    assert!(barriers >= 1, "durability: at least one fsync must have run");
+    // 1. A domain frame: refused on its message type.
+    let err = engine
+        .append_batch("$registry", Version::NoStream, &[rec("evil", b"x")])
+        .await
+        .expect_err("a domain frame in $registry must be refused");
     assert!(
-        barriers < K as u64,
-        "bn-34o: {K} new streams must coalesce to FEWER than {K} barriers, \
-         got {barriers} — per-new-stream fsync appears to have regressed"
-    );
-    assert!(
-        barriers <= (K / 2) as u64,
-        "bn-34o: coalescing should collapse the burst to well under half the \
-         new-name count; got {barriers} of {K}"
+        format!("{err}").contains("RegistryEventV1"),
+        "expected a record-type refusal, got: {err}"
     );
 
-    // Durability was preserved, not traded for the speedup: every name reopens.
+    // 2. The right message type, garbage bytes: refused at the decode.
+    let err = engine
+        .append_batch(
+            "$registry",
+            Version::NoStream,
+            &[rec(REGISTRY_EVENT_TYPE_NAME, b"\xffnot a registry record")],
+        )
+        .await
+        .expect_err("undecodable registry bytes must be refused");
+    assert!(
+        format!("{err}").contains("$registry"),
+        "expected a decode refusal, got: {err}"
+    );
+
+    // 3. A decodable record that violates a REG-rule (REG2: stream_id 0 is
+    //    reserved and may never be registered): refused at the fold.
+    let reserved = RegistryRecord::StreamRegistered {
+        stream_id:   RESERVED_STREAM_ID,
+        category_id: 0,
+        name:        "nope".to_string(),
+    };
+    let err = engine
+        .append_batch(
+            "$registry",
+            Version::NoStream,
+            &[rec(REGISTRY_EVENT_TYPE_NAME, &reserved.encode())],
+        )
+        .await
+        .expect_err("a REG-rule violation must be refused");
+    assert!(
+        format!("{err}").contains("$registry"),
+        "expected a REG-rule refusal, got: {err}"
+    );
+
+    // REG13: not one of them touched the log.
+    assert_eq!(engine.head("$registry").await.unwrap(), Version::NoStream);
     drop(engine);
-    let engine = open_with(&store_path, Durability::Os);
-    for i in 0..K {
-        assert_eq!(
-            engine.head(&format!("burst-{i}")).await.unwrap(),
-            Version::At(0),
-            "burst stream {i} must survive reopen with its name resolved"
-        );
-    }
+    let engine = open_with(&dir.path().join("store"), Durability::Process);
+    assert_eq!(engine.head("$registry").await.unwrap(), Version::NoStream);
+
+    // ...and a VALID record is accepted through the same seam.
+    let cat = RegistryRecord::CategoryRegistered {
+        category_id: 1,
+        name:        "orders".to_string(),
+    };
+    engine
+        .append_batch(
+            "$registry",
+            Version::NoStream,
+            &[rec(REGISTRY_EVENT_TYPE_NAME, &cat.encode())],
+        )
+        .await
+        .expect("a valid registry record is appendable");
+    assert_eq!(engine.head("$registry").await.unwrap(), Version::At(0));
+
+    drop(engine);
+    let engine = open_with(&dir.path().join("store"), Durability::Process);
+    assert_eq!(engine.head("$registry").await.unwrap(), Version::At(0));
+    assert_eq!(
+        engine.fold_registry().await.unwrap().category_name(1),
+        Some("orders")
+    );
 }
 
-/// A genuine fresh reopen after a new-name append must never surface
-/// `EngineError::Meta` and must resolve the exact correct name through every
-/// read path — the end-to-end effect the call-count tests explain the
-/// mechanism of. Under `Process` this is the crux of the bn-2cj contract: the
-/// buffered name `write(2)` (ordered before the event's own `write(2)`) is
-/// enough for a clean reopen after the process exits, even though no `fsync`
-/// was issued. Run under both modes.
-#[tokio::test]
-async fn reopen_after_new_name_append_resolves_correct_name_everywhere() {
-    for durability in [Durability::Process, Durability::Os] {
-        let dir = mess_testkit::sweeping_temp_dir(
-            "name-durability-reopen-after-new-name",
-        );
-        let store_path = dir.path().join("store");
+// ---------------------------------------------------------------------------
+// How close is fjall to deletable? (the lead's question, answered by test)
+// ---------------------------------------------------------------------------
 
-        {
-            let engine = open_with(&store_path, durability);
+/// **The engine reads NOTHING from fjall on open.**
+///
+/// Delete the entire `meta/` directory — every keyspace, not just the names —
+/// and the store must still open, resolve every name, serve every read, and
+/// keep appending. Because it does, fjall is now a pure write-behind derived
+/// cache for the engine: `stream_heads` is the only thing the append path still
+/// writes there, heads are re-derived from the log scan on every open, and
+/// nothing on the open path consults fjall at all (`recover` does not even take
+/// a `&MetaStore` any more).
+///
+/// This is the test that says how close we are to deleting fjall outright: for
+/// the ENGINE, the answer is "it already is". What still needs it is the
+/// separate, opt-in `FjallSnapshotBackend` (the app's snapshot sidecar, its own
+/// database under `.snapshots/`), which is a different component with a
+/// different lifecycle.
+#[tokio::test]
+async fn the_engine_opens_and_serves_with_the_whole_meta_directory_deleted() {
+    let dir = mess_testkit::sweeping_temp_dir("name-dur-no-meta-dir");
+    let store_path = dir.path().join("store");
+
+    {
+        let engine = open_with(&store_path, Durability::Process);
+        for i in 0..6u64 {
             engine
                 .append_batch(
-                    "acct-42",
+                    &format!("acct-{i}"),
                     Version::NoStream,
-                    &[rec("account.opened", b"carol")],
+                    &[rec(&format!("evt-{i}"), &i.to_le_bytes())],
                 )
                 .await
-                .expect("append with new stream + new type");
+                .expect("append");
         }
-
-        let engine = LogEngine::open_with(
-            &store_path,
-            EngineOptions { durability, ..EngineOptions::default() },
-        )
-        .expect("reopen must not error EngineError::Meta");
-        assert_eq!(engine.head("acct-42").await.unwrap(), Version::At(0));
-        let s =
-            engine.read_stream("acct-42", Version::NoStream, 10).await.unwrap();
-        assert_eq!(s.len(), 1);
-        assert_eq!(s[0].stream_id, "acct-42");
-        assert_eq!(s[0].message_type, "account.opened");
-        assert_eq!(s[0].data, b"carol");
-        let g = engine.read_global(None, 10).await.unwrap();
-        assert_eq!(g.len(), 1);
-        assert_eq!(g[0].stream_id, "acct-42");
+        // A second event on one stream, so heads are non-trivial.
+        engine
+            .append_batch("acct-0", Version::At(0), &[rec("evt-0", b"second")])
+            .await
+            .expect("append");
     }
+
+    // Nuke the ENTIRE fjall metadata store — every keyspace it has.
+    let meta_dir = store_path.join("meta");
+    assert!(meta_dir.exists(), "the fixture must actually have a meta dir");
+    std::fs::remove_dir_all(&meta_dir).expect("delete the meta directory");
+
+    let engine = open_with(&store_path, Durability::Process);
+    for i in 0..6u64 {
+        let s = engine
+            .read_stream(&format!("acct-{i}"), Version::NoStream, 10)
+            .await
+            .expect("read");
+        let want = if i == 0 { 2 } else { 1 };
+        assert_eq!(s.len(), want, "acct-{i} must be fully readable");
+        assert_eq!(s[0].message_type, format!("evt-{i}"));
+    }
+    assert_eq!(
+        engine.head("acct-0").await.unwrap(),
+        Version::At(1),
+        "heads are re-derived from the log, not from fjall"
+    );
+
+    // And it keeps working: a new append (minting a new name) still commits.
+    engine
+        .append_batch("acct-new", Version::NoStream, &[rec("evt.new", b"x")])
+        .await
+        .expect("append after the meta store was deleted");
+    assert_eq!(engine.head("acct-new").await.unwrap(), Version::At(0));
 }

@@ -473,7 +473,17 @@ async fn check(version: &str, chain: bool) {
     // ---- 2. Open with CURRENT code: full recovery over the whole chain. ----
     let engine = LogEngine::open_with(&store, opts(chain))
         .expect("reopen committed golden");
-    assert_eq!(engine.total_events(), total, "recovery rehydrated every event");
+    // `bn-2di`: `total_events()` counts the LOG, which includes the `$registry`
+    // records the engine writes when it first sees a stream or type name. The
+    // manifest counts USER events. So the log holds strictly more — and the
+    // delivered sequence (checked in step 4) is what must match the manifest
+    // exactly.
+    assert!(
+        engine.total_events() >= total,
+        "recovery rehydrated every event: log holds {} but the manifest has \
+         {total} user events",
+        engine.total_events()
+    );
     assert_eq!(
         manifest["on_disk_chain"].as_bool().unwrap_or(false),
         chain,

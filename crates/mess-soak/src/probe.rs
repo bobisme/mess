@@ -183,10 +183,25 @@ pub fn check_head(
     }
 }
 
-/// A subscriber's cursor: it must observe every global position exactly once,
-/// strictly ascending with no gaps — the subscription-delivery contract
-/// (`06`). Construct at the position the subscriber joined *after* (so a fresh
-/// full subscriber starts with `next_expected == 0`).
+/// A subscriber's cursor: it must observe every **user** event exactly once, in
+/// strictly ascending global order — the subscription-delivery contract (`06`).
+/// Construct at the position the subscriber joined *after* (so a fresh full
+/// subscriber starts with `next_expected == 0`).
+///
+/// # Why the delivered sequence has holes (`bn-2di`)
+///
+/// The engine's log-derived `$registry` writes a registration record the first
+/// time it sees a stream name or an event-type name. Those are real log events
+/// — they consume global positions — but they are engine bookkeeping and
+/// `read_global` never delivers them. So the delivered sequence is ascending
+/// and exactly-once, but **not dense**.
+///
+/// A cursor that merely tolerated gaps would be a much weaker check: a
+/// genuinely dropped user event looks exactly like a skipped registry record.
+/// So [`observe`](Self::observe) does not tolerate gaps — it *explains* them:
+/// every skipped position must be one the shadow has no user event at. A
+/// dropped user event still fails, loudly, with the position it went missing
+/// from.
 #[derive(Debug, Clone)]
 pub struct SubCursor {
     pub name:          String,
@@ -199,18 +214,38 @@ impl SubCursor {
         SubCursor { name: name.into(), next_expected: first_global }
     }
 
-    /// Observe the next delivered global position. Must equal `next_expected`;
-    /// a higher value is a dropped event, a lower/equal value is a
-    /// re-delivery — both are gaps in the exactly-once-in-order contract.
-    pub fn observe(&mut self, global_pos: u64) -> Result<(), Violation> {
-        if global_pos != self.next_expected {
+    /// Observe the next delivered global position, given an oracle that says
+    /// whether a position carries a user event.
+    ///
+    /// Ascending is mandatory (a lower/equal value is a re-delivery). A jump
+    /// forward is legal ONLY if every position skipped over is one the shadow
+    /// agrees is not a user event — i.e. a `$registry` record. If any skipped
+    /// position DOES carry a user event, that event was dropped, and this is a
+    /// [`Violation::SubscriptionGap`] naming exactly the position lost.
+    pub fn observe(
+        &mut self,
+        global_pos: u64,
+        is_user_event: impl Fn(u64) -> bool,
+    ) -> Result<(), Violation> {
+        if global_pos < self.next_expected {
+            // A re-delivery: at-most-once is broken.
             return Err(Violation::SubscriptionGap {
                 subscriber: self.name.clone(),
                 expected:   self.next_expected,
                 got:        global_pos,
             });
         }
-        self.next_expected += 1;
+        // Everything skipped over must be a non-user (engine) position.
+        for skipped in self.next_expected..global_pos {
+            if is_user_event(skipped) {
+                return Err(Violation::SubscriptionGap {
+                    subscriber: self.name.clone(),
+                    expected:   skipped,
+                    got:        global_pos,
+                });
+            }
+        }
+        self.next_expected = global_pos + 1;
         Ok(())
     }
 }
@@ -409,31 +444,64 @@ mod tests {
     }
 
     // ---- subscription ----
+    /// Every position is a user event: the classic dense case.
+    fn all_user(_gp: u64) -> bool { true }
+
     #[test]
     fn subscription_accepts_contiguous() {
         let mut c = SubCursor::joining_from("sub", 0);
         for gp in 0..10 {
-            c.observe(gp).unwrap();
+            c.observe(gp, all_user).unwrap();
         }
     }
+
     #[test]
     fn subscription_fires_on_skip() {
         let mut c = SubCursor::joining_from("sub", 0);
-        c.observe(0).unwrap();
-        c.observe(1).unwrap();
-        // Doctored sequence skips global 2.
-        let v = c.observe(3).unwrap_err();
+        c.observe(0, all_user).unwrap();
+        c.observe(1, all_user).unwrap();
+        // Doctored sequence skips global 2, which IS a user event -> dropped.
+        let v = c.observe(3, all_user).unwrap_err();
         assert!(
             matches!(v, Violation::SubscriptionGap { expected: 2, got: 3, .. }),
             "{v}"
         );
     }
+
+    /// `bn-2di`: a gap over positions the engine consumed for `$registry` is
+    /// legal — those are never delivered — as long as no USER event hides in
+    /// it.
+    #[test]
+    fn subscription_accepts_a_gap_over_non_user_positions() {
+        let mut c = SubCursor::joining_from("sub", 0);
+        // Positions 0 and 1 are registry records; 2 and 3 are user events.
+        let is_user = |gp: u64| gp >= 2;
+        c.observe(2, is_user).unwrap();
+        c.observe(3, is_user).unwrap();
+        assert_eq!(c.next_expected, 4);
+    }
+
+    /// ...but a user event hiding inside such a gap is still caught, at the
+    /// exact position it went missing from. This is what keeps the relaxed
+    /// check as strong as the dense one.
+    #[test]
+    fn subscription_still_fires_on_a_user_event_inside_a_gap() {
+        let mut c = SubCursor::joining_from("sub", 0);
+        // 0 = registry, 1 = USER (must be delivered), 2 = registry, 3 = user.
+        let is_user = |gp: u64| gp == 1 || gp == 3;
+        let v = c.observe(3, is_user).unwrap_err();
+        assert!(
+            matches!(v, Violation::SubscriptionGap { expected: 1, got: 3, .. }),
+            "the dropped user event at 1 must be named: {v}"
+        );
+    }
+
     #[test]
     fn subscription_fires_on_redelivery() {
         let mut c = SubCursor::joining_from("sub", 0);
-        c.observe(0).unwrap();
-        c.observe(1).unwrap();
-        let v = c.observe(1).unwrap_err();
+        c.observe(0, all_user).unwrap();
+        c.observe(1, all_user).unwrap();
+        let v = c.observe(1, all_user).unwrap_err();
         assert!(
             matches!(v, Violation::SubscriptionGap { expected: 2, got: 1, .. }),
             "{v}"

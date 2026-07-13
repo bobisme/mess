@@ -17,6 +17,8 @@
 //!   coexistence all reopen into an exact, byte-identical store (the log stays
 //!   truth).
 
+use std::collections::HashSet;
+
 use mess_log::committer::Durability;
 use mess_store::backend::{Backend, RecordToAppend, StoredRecord};
 use mess_store::{EngineOptions, LogEngine, Version};
@@ -111,20 +113,30 @@ async fn seed(
             _ => 0,
         });
     }
-    let mut gp = oracle.len() as u64;
+    // `seq` drives the CONTENT (payload + message type); the global POSITION is
+    // taken from the append's own ack. Since bn-2di they are not the same
+    // number: the first append that uses a new stream name or a new message
+    // type also writes a `$registry` record, which is an ordinary log event and
+    // consumes a global position of its own (never delivered — stream 0 is
+    // filtered out of every user-facing read). So user events are dense in
+    // stream version but NOT in global position, and an oracle that assumed
+    // otherwise would be testing its own arithmetic.
+    let mut seq = oracle.len() as u64;
     let batches = total / per_batch;
     for b in 0..batches {
         let s = (b as usize) % streams;
         let name = format!("acct-{s:04}");
         let recs: Vec<RecordToAppend> = (0..per_batch)
             .map(|k| RecordToAppend {
-                message_type: message_type(gp + k),
-                data:         payload(gp + k),
+                message_type: message_type(seq + k),
+                data:         payload(seq + k),
             })
             .collect();
         let out =
             engine.append_batch(&name, heads[s], &recs).await.expect("append");
         heads[s] = out.version;
+        // The batch's events are the last `recs.len()` positions of the ack.
+        let mut gp = out.last_global_position - (recs.len() as u64 - 1);
         for r in &recs {
             oracle.push(Shadow {
                 stream:  name.clone(),
@@ -135,8 +147,21 @@ async fn seed(
             });
             versions[s] += 1;
             gp += 1;
+            seq += 1;
         }
     }
+}
+
+/// Every global position the store holds for `oracle` — user events PLUS the
+/// `$registry` records the engine wrote to name them (`bn-2di`: one per
+/// distinct stream name and one per distinct message type, ordinary log events
+/// that consume a position each and are never delivered). The read watermark
+/// counts positions, not deliveries, so this is what it must equal.
+fn total_positions(oracle: &[Shadow]) -> usize {
+    let streams: HashSet<&str> =
+        oracle.iter().map(|s| s.stream.as_str()).collect();
+    let types: HashSet<&str> = oracle.iter().map(|s| s.typ.as_str()).collect();
+    oracle.len() + streams.len() + types.len()
 }
 
 /// Every read API vs the oracle: paged `read_global`, paged `read_stream` per
@@ -295,7 +320,11 @@ fn pack_reopen_serves_cold_tier_byte_identical() {
         0,
         "reopen decodes zero payload frames"
     );
-    assert_eq!(engine.total_events(), oracle.len(), "reopen watermark");
+    assert_eq!(
+        engine.total_events(),
+        total_positions(&oracle),
+        "reopen watermark"
+    );
     rt.block_on(assert_identical(&engine, &oracle, "pack-reopened"));
 
     // Continue appending after reopen — positions stay dense, reads still
@@ -348,7 +377,7 @@ fn pack_injection_matrix_reopens_byte_identical() {
     let engine = LogEngine::open_with(&dir, pack_opts(64 * 1024)).unwrap();
     assert_eq!(
         engine.total_events(),
-        oracle.len(),
+        total_positions(&oracle),
         "watermark after injection"
     );
     rt.block_on(assert_identical(&engine, &oracle, "post-injection"));
@@ -390,7 +419,7 @@ fn legacy_sidecars_and_packs_coexist() {
 
     // Final reopen (pack flag) still reads everything byte-identically.
     let engine = LogEngine::open_with(&dir, pack_opts(64 * 1024)).unwrap();
-    assert_eq!(engine.total_events(), oracle.len());
+    assert_eq!(engine.total_events(), total_positions(&oracle));
     rt.block_on(assert_identical(&engine, &oracle, "coexist-final-reopen"));
     drop(engine);
 }

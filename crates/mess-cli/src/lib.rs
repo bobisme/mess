@@ -23,6 +23,7 @@ pub mod lease;
 pub mod lockprobe;
 pub mod metaread;
 pub mod rebuild;
+pub mod registryfold;
 pub mod report;
 pub mod restore;
 pub mod retention;

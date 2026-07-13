@@ -496,12 +496,19 @@ async fn subscribe_over_fjall_snapshot_backend_sees_live_commits() {
     const PRE: u64 = 5;
     const LIVE: u64 = 5;
     const TOTAL: usize = (PRE + LIVE) as usize;
+    /// `bn-2di`: the first append registers two names — the stream `s` and the
+    /// one event type these events carry — as `$registry` records, which are
+    /// ordinary log events and so CONSUME the first two global positions. They
+    /// are never delivered (stream 0 is filtered out of every user-facing
+    /// read), so the subscription's first record is at position `REG`, and
+    /// the watermark counts them. Nothing else registers after that.
+    const REG: u64 = 2;
 
     // Pre-populate committed history before anyone subscribes.
     let pre: Vec<CounterEvent> =
         (0..PRE).map(|i| CounterEvent::Added(i as i64)).collect();
     store.append("s", Version::NoStream, &pre).await.unwrap();
-    assert_eq!(store.watermark().await.unwrap(), PRE);
+    assert_eq!(store.watermark().await.unwrap(), PRE + REG);
 
     // Consumer: drain exactly TOTAL positions, blocking only on the
     // watermark — no polling sleeps.
@@ -532,10 +539,11 @@ async fn subscribe_over_fjall_snapshot_backend_sees_live_commits() {
              not just history",
         )
         .unwrap();
-    let expected: Vec<u64> = (0..TOTAL as u64).collect();
+    let expected: Vec<u64> = (REG..REG + TOTAL as u64).collect();
     assert_eq!(
         got, expected,
-        "gap-free, in-order delivery through the forwarding wrapper"
+        "gap-free, in-order delivery through the forwarding wrapper (past the \
+         two $registry positions the first append consumed)"
     );
 }
 

@@ -60,6 +60,43 @@ async fn fill_stream(
 // tasks at `.await` points only, which cannot exercise the API-side races
 // (distinct tokio worker threads racing the append gate / publish sequencer /
 // committer concurrently) this test's docstring claims to cover.
+/// `bn-2di`: how many events the LOG holds for a corpus of `user_events` user
+/// events across `streams` streams, each using `types_per_stream` event types.
+///
+/// The log-derived `$registry` writes one record the first time it sees a
+/// stream name and one the first time it sees an event-type name. Those are
+/// real, committed log events — they consume global positions like anything
+/// else — so `LogEngine::total_events()` (which counts the LOG) exceeds the
+/// user-event count by exactly the number of names ever registered.
+/// `read_global` never delivers them, so the DELIVERED count is still exactly
+/// the user-event count.
+fn log_events(user_events: usize, registrations: usize) -> usize {
+    user_events + registrations
+}
+
+/// Every `fill_stream` corpus uses ONE event type (`"ev"`) across all its
+/// streams, so it registers `streams + 1` names in total.
+fn registrations(streams: usize) -> usize { streams + 1 }
+
+/// Assert a `read_global` page is the user corpus, in order: strictly
+/// ascending, duplicate-free positions (bn-2di — NOT dense, since `$registry`
+/// records take positions and are never delivered; a gap or a dupe still
+/// fails).
+fn assert_ascending(g: &[mess_store::backend::StoredRecord]) {
+    let mut prev: Option<u64> = None;
+    for r in g {
+        if let Some(p) = prev {
+            assert!(
+                r.global_position > p,
+                "global positions must be strictly ascending and unique: {} \
+                 after {p}",
+                r.global_position
+            );
+        }
+        prev = Some(r.global_position);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn auto_roll_under_concurrent_load_preserves_every_event() {
     let dir = mess_testkit::sweeping_temp_dir(
@@ -89,19 +126,16 @@ async fn auto_roll_under_concurrent_load_preserves_every_event() {
     let total = STREAMS * PER;
     assert_eq!(
         engine.total_events(),
-        total,
-        "every event committed to the book"
+        log_events(total, registrations(STREAMS)),
+        "every event committed to the log (user events + $registry records)"
     );
 
-    // read_global tiles [0, total) densely with unique positions (no dup/gap).
+    // read_global delivers exactly the user corpus, in ascending order with no
+    // duplicate (bn-2di: not dense — `$registry` records take positions between
+    // them and are never delivered).
     let g = engine.read_global(None, total * 2).await.unwrap();
-    assert_eq!(g.len(), total, "global read returns exactly every event");
-    for (i, r) in g.iter().enumerate() {
-        assert_eq!(
-            r.global_position, i as u64,
-            "dense, in-order global positions"
-        );
-    }
+    assert_eq!(g.len(), total, "global read returns exactly every user event");
+    assert_ascending(&g);
 
     // Per-stream: contiguous versions, byte-exact payloads, correct head.
     for s in 0..STREAMS {
@@ -144,7 +178,7 @@ async fn auto_roll_under_concurrent_load_preserves_every_event() {
     );
     assert_eq!(
         reopened.total_events(),
-        total,
+        log_events(total, registrations(STREAMS)),
         "reopen rehydrates every event across the chain"
     );
 }
@@ -195,18 +229,13 @@ async fn crash_mid_roll_seal_is_served_from_log_after_reopen() {
     );
     assert_eq!(
         engine.total_events(),
-        total,
+        log_events(total, registrations(STREAMS)),
         "every event recovered from the durable log"
     );
 
     let g = engine.read_global(None, total * 2).await.unwrap();
     assert_eq!(g.len(), total, "global read complete after crash mid-seal");
-    for (i, r) in g.iter().enumerate() {
-        assert_eq!(
-            r.global_position, i as u64,
-            "dense positions after log recovery"
-        );
-    }
+    assert_ascending(&g);
     for s in 0..STREAMS {
         let name = format!("stream-{s}");
         let evs =
@@ -230,9 +259,14 @@ async fn crash_mid_roll_seal_is_served_from_log_after_reopen() {
         )
         .await
         .expect("append after crash recovery");
+    // The next append continues the global order right where the log ended —
+    // which is past the `$registry` records too (bn-2di), not merely past the
+    // user events. It mints no new name (stream-0 and type `ev` are both
+    // already registered), so it takes exactly one position.
     assert_eq!(
-        out.last_global_position, total as u64,
-        "next append continues the dense order"
+        out.last_global_position,
+        log_events(total, registrations(STREAMS)) as u64,
+        "the next append continues the global order"
     );
 }
 
@@ -266,18 +300,13 @@ async fn clean_reopen_after_rolls_serves_cold_and_hot_tiers() {
     );
     assert_eq!(
         engine.total_events(),
-        total,
-        "book dense across the whole reopened chain"
+        log_events(total, registrations(STREAMS)),
+        "the whole reopened chain is intact (user events + $registry records)"
     );
 
     let g = engine.read_global(None, total * 2).await.unwrap();
-    assert_eq!(g.len(), total);
-    for (i, r) in g.iter().enumerate() {
-        assert_eq!(
-            r.global_position, i as u64,
-            "dense global order across cold+hot tiers"
-        );
-    }
+    assert_eq!(g.len(), total, "every user event is delivered");
+    assert_ascending(&g);
     for s in 0..STREAMS {
         let name = format!("stream-{s}");
         let evs =
@@ -319,8 +348,9 @@ async fn clean_reopen_after_rolls_serves_cold_and_hot_tiers() {
         .await
         .expect("append after reopen");
     assert_eq!(
-        out.last_global_position, total as u64,
-        "dense append continues after reopen"
+        out.last_global_position,
+        log_events(total, registrations(STREAMS)) as u64,
+        "the append continues the global order after reopen"
     );
 }
 
@@ -373,10 +403,32 @@ async fn oversized_batch_fails_fast_without_wasting_a_roll() {
         1,
         "no wasted roll: segment count must be unchanged"
     );
+    // `bn-2di`: the failed append committed no USER event — but its two
+    // `$registry` records (the stream name and the event-type name it minted)
+    // ARE durable, and must be.
+    //
+    // This is not new behaviour, only newly *visible*. The pre-bn-2di engine
+    // did exactly the same thing: it wrote the name to fjall BEFORE
+    // submitting the append, so a failed append left the name persisted
+    // there too — it just did not show up in `total_events()`, because
+    // fjall was not the log. The reason is unchanged and unavoidable:
+    // interning is irreversible (the id was handed out in-process and the
+    // interner never rewinds), so the registration has to be durable on the
+    // path that minted it or a later successful append to the same stream
+    // would reference an id nothing ever registered.
+    //
+    // An orphan registration is harmless: `$registry` is append-only and tiny
+    // by construction (REG4), and a retry with a batch that fits reuses the
+    // same ids and registers nothing new.
+    assert_eq!(
+        engine.read_global(None, 100).await.unwrap().len(),
+        0,
+        "the failed oversized append committed no USER event"
+    );
     assert_eq!(
         engine.total_events(),
-        0,
-        "the failed oversized append committed nothing"
+        2,
+        "...but its stream-name and type-name registrations are durable"
     );
 
     // The store must still be usable afterwards — the failed pre-check must
@@ -388,5 +440,9 @@ async fn oversized_batch_fails_fast_without_wasting_a_roll() {
             "a normal-sized append after the rejected oversized one must \
              still work",
         );
-    assert_eq!(out.last_global_position, 0);
+    // Globals 0-1 are the failed oversized append's registrations (the stream
+    // name `stream-oversized` and the type name `Big`); 2-3 are `stream-ok`'s
+    // own (its stream name and the type name `ev`); and 4 is the event itself —
+    // the first and only USER event in this store.
+    assert_eq!(out.last_global_position, 4);
 }

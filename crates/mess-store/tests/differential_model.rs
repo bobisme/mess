@@ -38,7 +38,7 @@ mod common;
 
 use common::TestSnapshotBackend;
 use differential_support::{
-    Op, first_divergence, plan_ops, run_sequence, run_sequence_with,
+    Op, Registry, first_divergence, plan_ops, run_sequence, run_sequence_with,
 };
 
 const FAST_SEEDS: u64 = 500;
@@ -113,6 +113,7 @@ async fn differential_profile_on_engine() {
                 cache_on,
                 FAST_OPS,
                 N_STREAMS,
+                Registry::Present,
             )
             .await
             {

@@ -78,11 +78,27 @@ async fn genuine_reopen_returns_exact_pre_crash_data_then_continues() {
         // Drop the engine: releases the StoreLock and the in-process book.
     }
 
+    // `bn-2di`: the global positions are NOT 0..3, because each of these
+    // appends also wrote the `$registry` records for the names it minted —
+    // real log events, ordered ahead of the batch that uses them, consuming
+    // positions:
+    //
+    //   pos 0,1,2  StreamRegistered(acct-1),
+    // EventTypeRegistered(account.opened),
+    // EventTypeRegistered(account.deposited)   pos 3,4    the two user
+    // events of append #1   pos 5      StreamRegistered(acct-2)
+    //   pos 6      the user event of append #2
+    //   pos 7      EventTypeRegistered(account.withdrawn)
+    //   pos 8      the user event of append #3
+    //
+    // The registry records are never DELIVERED (`read_global` skips them), so
+    // the user sees exactly these four events, in this order — just at these
+    // positions. Stream positions are untouched.
     let pre_crash: Vec<(&str, &str, Vec<u8>, u64, u64)> = vec![
-        ("acct-1", "account.opened", b"alice".to_vec(), 0, 0),
-        ("acct-1", "account.deposited", 10i64.to_le_bytes().to_vec(), 1, 1),
-        ("acct-2", "account.opened", b"bob".to_vec(), 0, 2),
-        ("acct-1", "account.withdrawn", 3i64.to_le_bytes().to_vec(), 2, 3),
+        ("acct-1", "account.opened", b"alice".to_vec(), 0, 3),
+        ("acct-1", "account.deposited", 10i64.to_le_bytes().to_vec(), 1, 4),
+        ("acct-2", "account.opened", b"bob".to_vec(), 0, 6),
+        ("acct-1", "account.withdrawn", 3i64.to_le_bytes().to_vec(), 2, 8),
     ];
 
     // ---- Phase 2: GENUINE fresh open over the populated dir. ----
@@ -110,7 +126,7 @@ async fn genuine_reopen_returns_exact_pre_crash_data_then_continues() {
     assert_eq!(s1[0].stream_id, "acct-1");
     assert_eq!(s1[2].message_type, "account.withdrawn");
     assert_eq!(s1[2].data, 3i64.to_le_bytes());
-    assert_eq!(s1[2].global_position, 3);
+    assert_eq!(s1[2].global_position, 8, "see the pre_crash table above");
 
     // read_global: the whole durable order, exact.
     assert_global(&engine, &pre_crash).await;
@@ -133,20 +149,24 @@ async fn genuine_reopen_returns_exact_pre_crash_data_then_continues() {
         .await
         .expect("append acct-1 after reopen");
 
+    // Both post-reopen appends reuse names that are ALREADY registered (the
+    // interner was folded back out of `$registry` on open), so they mint no new
+    // records: the user events simply continue at 9 and 10. That the interner
+    // survived the reopen is exactly what this phase proves.
     let mut all = pre_crash.clone();
     all.push((
         "acct-2",
         "account.deposited",
         50i64.to_le_bytes().to_vec(),
         1,
-        4,
+        9,
     ));
     all.push((
         "acct-1",
         "account.deposited",
         7i64.to_le_bytes().to_vec(),
         3,
-        5,
+        10,
     ));
 
     assert_eq!(engine.head("acct-2").await.unwrap(), Version::At(1));
@@ -176,7 +196,7 @@ async fn genuine_reopen_returns_exact_pre_crash_data_then_continues() {
         "account.withdrawn",
         5i64.to_le_bytes().to_vec(),
         2,
-        6,
+        11,
     ));
     assert_global(&engine, &all).await;
     let s2 = engine.read_stream("acct-2", Version::At(0), 100).await.unwrap();
@@ -184,7 +204,7 @@ async fn genuine_reopen_returns_exact_pre_crash_data_then_continues() {
     assert_eq!(s2.len(), 2);
     assert_eq!(s2[0].data, 50i64.to_le_bytes());
     assert_eq!(s2[1].data, 5i64.to_le_bytes());
-    assert_eq!(s2[1].global_position, 6);
+    assert_eq!(s2[1].global_position, 11, "see the `all` table above");
 }
 
 /// bn-1vu — the sealed tier must survive a restart.
@@ -248,7 +268,10 @@ async fn reopen_loads_sealed_sidecars_and_serves_from_sealed_tier() {
     assert_eq!(s[0].stream_id, "acct-1");
     assert_eq!(s[2].message_type, "account.withdrawn");
     assert_eq!(s[2].data, 3i64.to_le_bytes());
-    assert_eq!(s[2].global_position, 2);
+    // `bn-2di`: 3 registrations (acct-1 + two type names) precede the first
+    // append's two events (globals 3,4); a fourth registration
+    // (account.withdrawn) precedes the second append's event (global 6).
+    assert_eq!(s[2].global_position, 6);
     assert_eq!(
         engine.head("acct-1").await.unwrap(),
         Version::At(2),
@@ -256,10 +279,12 @@ async fn reopen_loads_sealed_sidecars_and_serves_from_sealed_tier() {
     );
 
     // read_global still returns the whole durable order.
+    // bn-2di: globals 0,1,2 are the registrations (acct-1 + the two type names
+    // of the first batch), 5 is `account.withdrawn`'s.
     let expected: Vec<(&str, &str, Vec<u8>, u64, u64)> = vec![
-        ("acct-1", "account.opened", b"alice".to_vec(), 0, 0),
-        ("acct-1", "account.deposited", 10i64.to_le_bytes().to_vec(), 1, 1),
-        ("acct-1", "account.withdrawn", 3i64.to_le_bytes().to_vec(), 2, 2),
+        ("acct-1", "account.opened", b"alice".to_vec(), 0, 3),
+        ("acct-1", "account.deposited", 10i64.to_le_bytes().to_vec(), 1, 4),
+        ("acct-1", "account.withdrawn", 3i64.to_le_bytes().to_vec(), 2, 6),
     ];
     assert_global(&engine, &expected).await;
 }

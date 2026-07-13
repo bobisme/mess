@@ -213,10 +213,23 @@ async fn reconcile(cfg: &Config, acks: &[Ack]) -> Result<(), String> {
         .map_err(|e| format!("reopen after kill failed: {e}"))?;
     let total = engine.total_events() as u64;
 
-    // 1) Dense global prefix 0..total (no gap / no dupe survived the kill).
-    let mut expect = 0u64;
+    // 1) The recovered global order is STRICTLY ASCENDING with no duplicates,
+    //    and every position it delivers is below `total`.
+    //
+    //    `bn-2di`: it is no longer *dense*. The engine's log-derived
+    // `$registry`    consumes a global position per name it ever registers,
+    // and never    delivers those records — so the delivered sequence has
+    // holes exactly    where registrations sit, and `total_events()` (which
+    // counts the LOG)    exceeds the number of delivered events by the
+    // number of registrations.    A dropped or duplicated USER event is
+    // still caught here (ascending +    no-dupe), and — the check that
+    // actually matters — by the acked-ledger    verification in step 2,
+    // which demands every acked event be present at    exactly the position
+    // it was acked at.
+    let mut prev: Option<u64> = None;
+    let mut delivered = 0u64;
     let mut after = None;
-    while expect < total {
+    loop {
         let page = engine
             .read_global(after, 4096)
             .await
@@ -225,19 +238,28 @@ async fn reconcile(cfg: &Config, acks: &[Ack]) -> Result<(), String> {
             break;
         }
         for rec in &page {
-            if rec.global_position != expect {
+            if let Some(p) = prev
+                && rec.global_position <= p
+            {
                 return Err(format!(
-                    "recovered global gap/dupe: expected {expect}, got {}",
+                    "recovered global out of order/dupe: {} after {p}",
                     rec.global_position
                 ));
             }
-            expect += 1;
+            if rec.global_position >= total {
+                return Err(format!(
+                    "recovered global {} beyond total_events()={total}",
+                    rec.global_position
+                ));
+            }
+            prev = Some(rec.global_position);
+            delivered += 1;
             after = Some(rec.global_position);
         }
     }
-    if expect != total {
+    if delivered > total {
         return Err(format!(
-            "recovered {expect} events but total_events()={total}"
+            "recovered {delivered} events but total_events()={total}"
         ));
     }
 

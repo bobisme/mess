@@ -45,7 +45,15 @@ async fn inspect_reports_offline_metrics() {
     assert_eq!(m["segment_count"], 1, "one active segment on disk");
     assert_eq!(m["active_segment_count"], 1);
     assert_eq!(m["sealed_segment_count"], 0);
-    assert_eq!(m["durable_event_count"], 3, "3 events across two streams");
+    // 3 user events + 4 `$registry` records (bn-2di): two stream names
+    // (acct-1, acct-2) and two event-type names (Opened, Deposited), each
+    // registered once, ever, as a real log event. `durable_event_count` counts
+    // the LOG, so it counts them — this is the raw-log view, not the
+    // application's (`read_global` never delivers a registry record).
+    assert_eq!(
+        m["durable_event_count"], 7,
+        "3 user events across two streams + 4 $registry registrations"
+    );
     assert!(
         m["total_size_bytes"].as_u64().unwrap() > 0,
         "segment has bytes on disk"

@@ -17,6 +17,15 @@ fn rec(t: &str, d: &[u8]) -> RecordToAppend {
     RecordToAppend { message_type: t.to_string(), data: d.to_vec() }
 }
 
+/// `bn-2di`: the `$registry` records the very first append writes — one naming
+/// the stream, one naming the event type `"E"` — and nothing after that. They
+/// are ordinary log events on the reserved stream 0: they CONSUME the first two
+/// global positions (so the watermark counts them) but are never DELIVERED
+/// (stream 0 is filtered out of every user-facing read). So a subscriber's
+/// first record sits at global position `REG`, and the delivered sequence is
+/// gap-free from there.
+const REG: u64 = 2;
+
 /// Append `n` single-event batches to one stream, one per stream version,
 /// starting at stream version `from` (== the current head's next position).
 async fn append_n(engine: &LogEngine, stream: &str, from: u64, n: u64) {
@@ -49,7 +58,7 @@ async fn subscribe_from_zero_replays_then_tails_live() {
 
     // Pre-populate committed history before anyone subscribes.
     append_n(&engine, "s", 0, PRE).await;
-    assert_eq!(store.watermark().await.unwrap(), PRE);
+    assert_eq!(store.watermark().await.unwrap(), PRE + REG);
 
     // Consumer: drain exactly TOTAL positions. It only ever blocks on
     // `next()` (which parks on the watermark) — no sleeps here.
@@ -71,7 +80,7 @@ async fn subscribe_from_zero_replays_then_tails_live() {
     writer.await.unwrap();
 
     let got = consumer.await.unwrap();
-    let expected: Vec<u64> = (0..TOTAL).collect();
+    let expected: Vec<u64> = (REG..REG + TOTAL).collect();
     assert_eq!(
         got, expected,
         "gap-free, in-order, exactly-once global delivery"
@@ -89,12 +98,12 @@ async fn await_past_wakes_after_commit_passes_position() {
     let engine = LogEngine::open(dir.path()).expect("open");
     let store = EventStore::new(engine.clone());
 
-    // Seed 5 positions (global 0..5, watermark 5).
+    // Seed 5 events (globals 2..7 behind the two registrations, watermark 7).
     append_n(&engine, "s", 0, 5).await;
-    assert_eq!(store.watermark().await.unwrap(), 5);
+    assert_eq!(store.watermark().await.unwrap(), 5 + REG);
 
     // Already-past positions resolve immediately.
-    store.await_past(4).await.unwrap(); // watermark 5 > 4
+    store.await_past(4).await.unwrap(); // watermark 7 > 4
 
     // Park a waiter on position 9 (needs watermark > 9, i.e. >= 10).
     let waiter_store = store.clone();
@@ -102,10 +111,10 @@ async fn await_past_wakes_after_commit_passes_position() {
         waiter_store.await_past(9).await.unwrap();
     });
 
-    // Commit up through position 9 (append 5 more -> watermark 10). The waiter
-    // must wake; bound it so a wedged notification fails instead of hanging.
+    // Commit past position 9 (5 more events -> watermark 12). The waiter must
+    // wake; bound it so a wedged notification fails instead of hanging.
     append_n(&engine, "s", 5, 5).await;
-    assert_eq!(store.watermark().await.unwrap(), 10);
+    assert_eq!(store.watermark().await.unwrap(), 10 + REG);
 
     tokio::time::timeout(Duration::from_secs(10), waiter)
         .await
@@ -126,7 +135,9 @@ async fn subscribe_from_midlog_replays_only_the_suffix() {
     let store = EventStore::new(engine.clone());
 
     const PRE: u64 = 30;
+    /// A mid-log GLOBAL position (the events occupy `REG..REG + PRE`).
     const FROM: u64 = 10;
+    const SUFFIX: u64 = REG + PRE - FROM;
     append_n(&engine, "s", 0, PRE).await;
 
     let mut sub = store.subscribe(Some(FROM));
@@ -138,14 +149,15 @@ async fn subscribe_from_midlog_replays_only_the_suffix() {
         "suffix starts at the requested cursor"
     );
 
-    // Drain the rest of the suffix [FROM, PRE). No writer, so once we have the
+    // Drain the rest of the suffix [FROM, REG + PRE). No writer, so once we
+    // have the
     // suffix the next call would block — we stop exactly at the suffix length.
     let mut got: Vec<u64> = first.iter().map(|r| r.global_position).collect();
-    while (got.len() as u64) < PRE - FROM {
+    while (got.len() as u64) < SUFFIX {
         let batch = sub.next_batch().await.unwrap();
         got.extend(batch.iter().map(|r| r.global_position));
     }
-    let expected: Vec<u64> = (FROM..PRE).collect();
+    let expected: Vec<u64> = (FROM..REG + PRE).collect();
     assert_eq!(
         got, expected,
         "replays exactly the suffix, nothing before FROM"
@@ -199,7 +211,7 @@ async fn dropping_a_subscription_does_not_wedge_the_committer() {
     )
     .await
     .expect("appends wedged after subscriptions were dropped");
-    assert_eq!(store.watermark().await.unwrap(), 25);
+    assert_eq!(store.watermark().await.unwrap(), 25 + REG);
 
     // And a fresh subscription still delivers the whole (gap-free) log.
     let mut sub = store.subscribe(Some(0));
@@ -207,7 +219,7 @@ async fn dropping_a_subscription_does_not_wedge_the_committer() {
     while (got.len() as u64) < 25 {
         got.push(sub.next().await.unwrap().global_position);
     }
-    assert_eq!(got, (0..25).collect::<Vec<_>>());
+    assert_eq!(got, (REG..REG + 25).collect::<Vec<_>>());
 }
 
 // ---------------------------------------------------------------------------

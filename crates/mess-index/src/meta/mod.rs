@@ -85,30 +85,23 @@ const P_CHECKPOINTS: &str = "checkpoints";
 const P_DEDUPE: &str = "dedupe";
 const P_DEDUPE_ORDER: &str = "dedupe_order";
 const P_HW: &str = "hw";
-// bn-20b: interner bijections. The append-only log stores only interned
-// numeric ids (a `stream_id u64` per batch, an `event_type_id u32` per event) —
-// never their names — so a materializing reader that must return
-// `(stream_name, message_type)` bytes cannot reconstruct names from the log
-// alone. These two tables persist the id→name maps the engine's in-process
-// interner assigns, so a fresh open over a populated dir resolves names again.
+// bn-2di: the app-snapshot sidecar's `interim FNV stream_id -> stream name`
+// side map, written ONLY by `mess-store`'s `FjallSnapshotBackend` into its own
+// `<dir>/.snapshots/meta` database.
 //
-// Unlike the other meta tables (derived caches, rebuildable from the log by
-// I5), these are the durable *source of truth* for the name↔id bijection —
-// exactly the role `$registry` plays in the full design, kept here as the
-// smallest durable surface for the engine's lightweight interner. They live
-// in the meta store because that is already the store's durable
-// derived-metadata home, but — unlike every other table here — they are NOT
-// run at plain journal-buffered durability: bn-20b originally documented a
-// buffered write here as "an acceptable, documented limit shared with every
-// other buffered meta table", but it is not, because I5 (rebuildable from
-// the log) does not hold for these two tables. bn-150 closes that gap: the
-// engine (`mess-store`'s `engine.rs`, `LogEngine::persist_new_names`) forces
-// a newly-interned name's row durable (`MetaStore::persist`, a real
-// `fsync`) strictly before its covering append can become durable, so a
-// power-loss crash can no longer separate the two. See that function's doc
-// for the full rationale.
-const P_STREAM_NAMES: &str = "stream_names";
-const P_TYPE_NAMES: &str = "type_names";
+// This is NOT the engine's interner. The engine's `id -> name` bijection lived
+// in `stream_names`/`type_names` here until bn-2di moved it into the log as
+// `$registry`, and those two keyspaces are GONE: the log is the sole source of
+// truth for names, and nothing in the engine writes a name to fjall any more.
+//
+// What survives is this: the snapshot sidecar keys its heads by an *interim FNV
+// hash* of the stream name (spec 05's interim story), not by the interner's
+// dense id, so `mess doctor`'s fold-version check has no way to join a snapshot
+// head back to a stream name without a side map. It is a pure diagnostic, it is
+// journal-buffered like every other row here, and a lost row self-heals (the
+// head still loads by name) — i.e. it is a derived cache, unlike the thing it
+// replaced.
+const P_SNAPSHOT_STREAM_NAMES: &str = "snapshot_stream_names";
 
 // High-water keys inside the `hw` partition. Checkpoints need no entry here:
 // a projection's checkpoint value *is* its high-water.
@@ -208,11 +201,10 @@ pub struct MetaStore {
     stream_heads:           Keyspace,
     snapshot_heads:         Keyspace,
     checkpoints:            Keyspace,
+    snapshot_stream_names:  Keyspace,
     dedupe:                 Keyspace,
     dedupe_order:           Keyspace,
     hw:                     Keyspace,
-    stream_names:           Keyspace,
-    type_names:             Keyspace,
     dedupe_bounds:          Mutex<DedupeBounds>,
     dedupe_capacity:        usize,
     /// Test/diagnostic: counts calls to [`Self::persist`] (bn-150). Lets a
@@ -254,14 +246,14 @@ impl MetaStore {
             db.keyspace(P_SNAPSHOT_HEADS, KeyspaceCreateOptions::default)?;
         let checkpoints =
             db.keyspace(P_CHECKPOINTS, KeyspaceCreateOptions::default)?;
+        let snapshot_stream_names = db.keyspace(
+            P_SNAPSHOT_STREAM_NAMES,
+            KeyspaceCreateOptions::default,
+        )?;
         let dedupe = db.keyspace(P_DEDUPE, KeyspaceCreateOptions::default)?;
         let dedupe_order =
             db.keyspace(P_DEDUPE_ORDER, KeyspaceCreateOptions::default)?;
         let hw = db.keyspace(P_HW, KeyspaceCreateOptions::default)?;
-        let stream_names =
-            db.keyspace(P_STREAM_NAMES, KeyspaceCreateOptions::default)?;
-        let type_names =
-            db.keyspace(P_TYPE_NAMES, KeyspaceCreateOptions::default)?;
 
         // Recover the FIFO seq bounds from the order index: the window's live
         // seqs are the contiguous range [first_key, last_key].
@@ -284,11 +276,10 @@ impl MetaStore {
             stream_heads,
             snapshot_heads,
             checkpoints,
+            snapshot_stream_names,
             dedupe,
             dedupe_order,
             hw,
-            stream_names,
-            type_names,
             dedupe_bounds: Mutex::new(bounds),
             dedupe_capacity,
             persist_calls: std::sync::atomic::AtomicU64::new(0),
@@ -364,72 +355,40 @@ impl MetaStore {
 
     // ---- interner bijections (bn-20b) --------------------------------
 
-    /// Persist a `stream_id → name` interner mapping (idempotent — the same id
-    /// always maps to the same name; re-writing is a no-op-shaped overwrite).
-    /// Called by the engine the first time a stream name is interned, so a
-    /// later reopen can resolve the name the log's numeric `stream_id` stands
-    /// for.
-    pub fn put_stream_name(
+    /// Record the app-snapshot sidecar's `interim stream_id -> name` side map
+    /// (`bn-2di`) — see [`P_SNAPSHOT_STREAM_NAMES`].
+    ///
+    /// Written only by `mess-store`'s `FjallSnapshotBackend`, into its own
+    /// snapshot database. This is a diagnostic side map, NOT the engine's name
+    /// interner: that lives in the log's `$registry` now and never touches
+    /// fjall.
+    pub fn put_snapshot_stream_name(
         &self,
         stream_id: u64,
         name: &str,
     ) -> Result<(), MetaError> {
-        self.stream_names.insert(stream_id.to_be_bytes(), name.as_bytes())?;
+        self.snapshot_stream_names
+            .insert(stream_id.to_be_bytes(), name.as_bytes())?;
         Ok(())
     }
 
-    /// Persist an `event_type_id → name` interner mapping (see
-    /// [`put_stream_name`](Self::put_stream_name)).
-    pub fn put_type_name(
+    /// Every `(interim stream_id, name)` row of the snapshot side map.
+    pub fn snapshot_stream_names(
         &self,
-        event_type_id: u32,
-        name: &str,
-    ) -> Result<(), MetaError> {
-        self.type_names.insert(event_type_id.to_be_bytes(), name.as_bytes())?;
-        Ok(())
-    }
-
-    /// Every persisted `(stream_id, name)` interner mapping, for rebuilding the
-    /// engine's interner on reopen. Order is unspecified (the caller sorts by
-    /// id to reconstruct the dense assignment).
-    pub fn stream_names(&self) -> Result<Vec<(u64, String)>, MetaError> {
+    ) -> Result<Vec<(u64, String)>, MetaError> {
         let mut out = Vec::new();
-        for kv in self.stream_names.iter() {
+        for kv in self.snapshot_stream_names.iter() {
             let (k, v) = kv.into_inner()?;
             let id =
                 u64::from_be_bytes(k.as_ref().try_into().map_err(|_| {
                     DecodeError::Corrupt {
-                        table:  P_STREAM_NAMES,
+                        table:  P_SNAPSHOT_STREAM_NAMES,
                         reason: "stream-name key must be 8 bytes".into(),
                     }
                 })?);
             let name = String::from_utf8(v.to_vec()).map_err(|e| {
                 DecodeError::Corrupt {
-                    table:  P_STREAM_NAMES,
-                    reason: format!("name not utf-8: {e}"),
-                }
-            })?;
-            out.push((id, name));
-        }
-        Ok(out)
-    }
-
-    /// Every persisted `(event_type_id, name)` interner mapping (see
-    /// [`stream_names`](Self::stream_names)).
-    pub fn type_names(&self) -> Result<Vec<(u32, String)>, MetaError> {
-        let mut out = Vec::new();
-        for kv in self.type_names.iter() {
-            let (k, v) = kv.into_inner()?;
-            let id =
-                u32::from_be_bytes(k.as_ref().try_into().map_err(|_| {
-                    DecodeError::Corrupt {
-                        table:  P_TYPE_NAMES,
-                        reason: "type-name key must be 4 bytes".into(),
-                    }
-                })?);
-            let name = String::from_utf8(v.to_vec()).map_err(|e| {
-                DecodeError::Corrupt {
-                    table:  P_TYPE_NAMES,
+                    table:  P_SNAPSHOT_STREAM_NAMES,
                     reason: format!("name not utf-8: {e}"),
                 }
             })?;
@@ -451,17 +410,21 @@ impl MetaStore {
     }
 
     /// Force any buffered writes to disk with a real durability **barrier**
-    /// (`fjall::PersistMode::SyncAll` — an `fsync`). Not needed for
-    /// correctness of the I5 derived-cache tables — a convenience for clean
-    /// shutdown or to bound recovery replay by periodically checkpointing
-    /// durability — but IS the barrier the `stream_names`/`type_names`
-    /// interner bijection tables (the one durable source of truth this store
-    /// holds) ride under a **barriered** engine durability mode
-    /// (`Durability::Os`/`Group`), so a covering log append can only become
-    /// durable once its new name(s) already are (bn-150; see [`MetaStore`]'s
-    /// and `mess-store`'s `engine.rs` `persist_new_names` doc for why). Under
-    /// the barrier-free `Durability::Process` mode the caller uses
-    /// [`persist_buffered`](Self::persist_buffered) instead — see bn-2cj.
+    /// (`fjall::PersistMode::SyncAll` — an `fsync`). A convenience for clean
+    /// shutdown, or to bound recovery replay by periodically checkpointing
+    /// durability. It is **not needed for correctness** by anything in this
+    /// store: since `bn-2di` every table here is an I5 derived cache the log
+    /// can rebuild.
+    ///
+    /// It used to be load-bearing. The `stream_names`/`type_names` interner
+    /// tables were the one durable source of truth fjall held, so a new name
+    /// had to be `fsync`ed HERE before the log append that referenced it could
+    /// become durable (bn-150's `SyncAll` per new name, mode-gated by bn-2cj,
+    /// coalesced by bn-34o). Those keyspaces are gone — names are `$registry`
+    /// records in the log itself now — and with them the barrier: **the engine
+    /// has no production caller of this method at all**, which is what makes
+    /// Spike J's phantom ~953 µs/new-stream `SyncAll` structurally unreachable
+    /// rather than merely unused.
     pub fn persist(&self) -> Result<(), MetaError> {
         self.persist_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.db.persist(fjall::PersistMode::SyncAll)?;

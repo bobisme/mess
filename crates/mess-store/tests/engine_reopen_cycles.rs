@@ -37,23 +37,41 @@ async fn many_reopen_cycles_never_gain_or_duplicate_events() {
         let engine = LogEngine::open_with(&store, opts()).unwrap();
 
         // At every reopen the engine must reproduce EXACTLY the acked set —
-        // same count, dense positions, byte-exact payloads (no phantom,
-        // no duplicate).
+        // same count, same order, byte-exact payloads (no phantom, no
+        // duplicate).
+        //
+        // `bn-2di`: the DELIVERED sequence is what the shadow tracks, and it is
+        // strictly ascending but no longer dense — the engine's `$registry`
+        // records consume global positions and are never delivered. So the
+        // check is: the delivered run reproduces the shadow exactly, in order,
+        // with strictly increasing positions (a duplicate or a lost event still
+        // fails, which is what this test is for). `total_events()` counts the
+        // LOG, registrations included, so it is >= the delivered count.
+        let g =
+            engine.read_global(None, engine.total_events() + 16).await.unwrap();
         assert_eq!(
-            engine.total_events() as usize,
+            g.len(),
             global.len(),
-            "cycle {cycle}: total_events gained/lost vs acked shadow"
+            "cycle {cycle}: delivered events gained/lost vs acked shadow"
         );
-        let g = engine.read_global(None, global.len() + 16).await.unwrap();
-        assert_eq!(g.len(), global.len(), "cycle {cycle}: global length");
+        assert!(
+            engine.total_events() >= global.len(),
+            "cycle {cycle}: the log cannot hold fewer events than were acked"
+        );
+        let mut prev: Option<u64> = None;
         for (i, r) in g.iter().enumerate() {
-            assert_eq!(
-                r.global_position, i as u64,
-                "cycle {cycle}: dense global position"
-            );
+            if let Some(p) = prev {
+                assert!(
+                    r.global_position > p,
+                    "cycle {cycle}: global positions must strictly ascend ({} \
+                     after {p}) — a duplicate publish",
+                    r.global_position
+                );
+            }
+            prev = Some(r.global_position);
             assert_eq!(
                 r.data, global[i].2,
-                "cycle {cycle} gp {i}: payload drift/duplicate"
+                "cycle {cycle} idx {i}: payload drift/duplicate"
             );
         }
 
@@ -106,9 +124,13 @@ async fn many_reopen_cycles_never_gain_or_duplicate_events() {
 
     let engine = LogEngine::open_with(&store, opts()).unwrap();
     assert_eq!(
-        engine.total_events() as usize,
+        engine
+            .read_global(None, engine.total_events() + 16)
+            .await
+            .unwrap()
+            .len(),
         global.len(),
-        "final: total_events"
+        "final: delivered events"
     );
     assert!(
         engine.sealed_segment_count() > 0,

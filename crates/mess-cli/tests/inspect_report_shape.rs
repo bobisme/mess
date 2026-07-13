@@ -103,10 +103,16 @@ async fn stream_heads_resolve_names_and_truncate_by_default() {
     // json is always complete, with every head's name resolved.
     let json = json_of(&report);
     let heads = json["stream_heads"].as_array().expect("stream_heads array");
+    // `bn-2di`: `$registry` (stream 0) is a real stream in the log and carries
+    // a real head, so it appears here alongside the user streams —
+    // deliberately. An operator inspecting a store SHOULD be able to see
+    // how big its registry is; it is hidden only from the
+    // application-facing `read_global`.
     assert_eq!(
         heads.len(),
-        n,
-        "json stream_heads must be complete, not truncated"
+        n + 1,
+        "json stream_heads must be complete (n user streams + $registry), not \
+         truncated"
     );
     assert!(
         heads.iter().all(|h| h["name"].is_string()),
@@ -222,27 +228,59 @@ async fn json_field_names_are_lock_state_independent() {
         "registry field names must not depend on lock state"
     );
 
-    // The degraded case says so explicitly rather than omitting fields.
-    assert_eq!(locked["registry"]["available"], false);
-    assert!(locked["registry"]["stream_names"].as_array().unwrap().is_empty());
+    // `bn-2di`: the registry FOLD needs no lock — names come out of the log's
+    // `$registry` stream, which `inspect` reads straight from the segment
+    // bytes. So a live writer no longer degrades the name report at all: it
+    // resolves identically locked and free. This is strictly better than
+    // what this test used to pin (names unavailable under a lock), and it
+    // is the most direct demonstration that fjall is not in the naming path
+    // any more.
+    assert_eq!(locked["registry"]["available"], true);
     assert_eq!(free["registry"]["available"], true);
-    assert!(!free["registry"]["stream_names"].as_array().unwrap().is_empty());
+    assert_eq!(
+        locked["registry"]["stream_names"], free["registry"]["stream_names"],
+        "names fold out of the log identically, locked or not"
+    );
+    assert!(!locked["registry"]["stream_names"].as_array().unwrap().is_empty());
+
+    // What DOES still need fjall is the app-snapshot side of the report.
+    assert_eq!(locked["registry"]["snapshots_available"], false);
+    assert_eq!(free["registry"]["snapshots_available"], true);
+    assert!(locked["registry"]["snapshots"].as_array().unwrap().is_empty());
 
     let advice = locked["advice"].as_array().unwrap();
     assert!(
         advice.iter().any(|a| a["type"] == "registry-unavailable"),
-        "locked run must advise that the registry is unavailable: {advice:?}"
+        "locked run must advise that the SNAPSHOT half is unavailable: \
+         {advice:?}"
     );
 
     // stream_heads are recovered straight from the log and stay available
-    // regardless of the meta lock — just without resolved names.
+    // regardless of the meta lock — and, since bn-2di, so are their names.
     let locked_heads = locked["stream_heads"].as_array().unwrap();
     assert_eq!(
         locked_heads.len(),
-        3,
-        "stream heads recovered from the log even when meta is locked"
+        4,
+        "stream heads recovered from the log even when meta is locked (3 user \
+         streams + $registry)"
     );
-    assert!(locked_heads.iter().all(|h| h["name"].is_null()));
+    // `bn-2di`: EVERY name resolves, even with the meta store locked — the user
+    // streams' from the log's `$registry` (which `inspect` folds straight out
+    // of the segment bytes, needing no lock), and the reserved `$registry`
+    // stream itself from spec text (REG1: the reserved ids are named by the
+    // specification, not by any record, which is what makes bootstrap
+    // non-circular).
+    for h in locked_heads {
+        assert!(
+            h["name"].is_string(),
+            "every stream name must resolve from the log, lock or no lock: \
+             {h:?}"
+        );
+    }
+    assert!(
+        locked_heads.iter().any(|h| h["name"] == "$registry"),
+        "the reserved stream must be named by spec text"
+    );
 
     let free_heads = free["stream_heads"].as_array().unwrap();
     assert!(free_heads.iter().all(|h| h["name"].is_string()));

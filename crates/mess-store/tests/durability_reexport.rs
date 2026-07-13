@@ -42,7 +42,13 @@ async fn group_durability_selected_via_reexport_commits_events() {
         .await
         .expect("append under Durability::Group");
     assert_eq!(a.version, Version::At(1));
-    assert_eq!(a.last_global_position, 1);
+    // `bn-2di`: this append minted three names — the stream `acct-1` and the
+    // event types `Opened` and `Deposited` — each of which is a `$registry`
+    // record in the log, ordered ahead of the batch that uses it. Registrations
+    // consume global positions (they are real log events), so the two user
+    // events land at globals 3 and 4, not 0 and 1. Stream VERSIONS are
+    // untouched: `$registry` is its own stream.
+    assert_eq!(a.last_global_position, 4);
 
     let b = engine
         .append_batch("acct-1", Version::At(1), &[rec("Withdrew", b"2")])

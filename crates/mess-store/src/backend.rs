@@ -251,11 +251,53 @@ pub trait Backend: Send + Sync + 'static {
     /// Read up to `limit` events across all streams strictly after global
     /// position `after` (exclusive; pass `None` to start from the beginning),
     /// in ascending global order.
+    ///
+    /// **Not necessarily dense.** A backend may consume global positions for
+    /// events it does not deliver here — the [`LogEngine`](crate::LogEngine)'s
+    /// `$registry` stream is one (`bn-2di`: registrations are log records, so
+    /// they take positions, but they are engine bookkeeping and are never
+    /// delivered to an application). So the first record of a page may sit
+    /// *past* `after + 1`, and a page may come back empty while positions
+    /// remain below the watermark. A caller that needs to advance a cursor
+    /// safely across such a gap must use
+    /// [`read_global_page`](Self::read_global_page), which also reports how
+    /// far the scan actually got.
     fn read_global(
         &self,
         after: Option<u64>,
         limit: usize,
     ) -> impl Future<Output = Result<Vec<StoredRecord>, Self::Error>> + Send;
+
+    /// [`read_global`](Self::read_global), plus the **frontier**: the exclusive
+    /// global position the scan reached (`bn-2di`).
+    ///
+    /// The frontier is what makes cursor advancement correct on a backend whose
+    /// global sequence has engine-internal holes. `records` alone cannot
+    /// express "I scanned up to position 40 and found nothing you can see":
+    /// a consumer that resumed from the last delivered record would re-scan
+    /// the same hole forever, and one that jumped to the watermark could
+    /// skip a record the scan had not reached yet (a `limit`-bounded page,
+    /// or a tier handoff that cut the page short). The frontier says
+    /// exactly where to resume.
+    ///
+    /// The default implementation is correct for any backend with a dense
+    /// global sequence (every position is a deliverable record — the
+    /// [`MockBackend`](crate::mock) is): the frontier is simply one past the
+    /// last record delivered, or `after + 1` for an empty page.
+    fn read_global_page(
+        &self,
+        after: Option<u64>,
+        limit: usize,
+    ) -> impl Future<Output = Result<GlobalPage, Self::Error>> + Send {
+        async move {
+            let records = self.read_global(after, limit).await?;
+            let frontier = records.last().map_or_else(
+                || after.map_or(0, |p| p + 1),
+                |r| r.global_position + 1,
+            );
+            Ok(GlobalPage { records, frontier })
+        }
+    }
 
     /// Append `records` to `stream_id` iff it is exactly at `expected`.
     ///
@@ -268,6 +310,18 @@ pub trait Backend: Send + Sync + 'static {
         expected: Version,
         records: &[RecordToAppend],
     ) -> impl Future<Output = Result<Appended, AppendError<Self::Error>>> + Send;
+}
+
+/// One page of the global sequence plus the frontier the scan reached
+/// (`bn-2di`) — see [`Backend::read_global_page`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalPage {
+    /// The deliverable records of this page, in ascending global order.
+    pub records:  Vec<StoredRecord>,
+    /// The exclusive global position the scan reached. Every position below it
+    /// has been examined and is either in `records` or is not deliverable.
+    /// A cursor may safely resume here.
+    pub frontier: u64,
 }
 
 /// A [`Backend`] that also exposes the **committed global watermark** and an

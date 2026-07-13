@@ -1,5 +1,12 @@
 //! Smoke test: the composed engine's append/read/head/conflict path end to
 //! end through the real committer bridge.
+//!
+//! `bn-2di`: global positions are no longer "the index of the Nth user event".
+//! The first append that uses a new stream name or a new message type also
+//! writes a `$registry` record naming it — an ordinary log event that consumes
+//! a global position and is never delivered (stream 0 is filtered out of every
+//! user-facing read). Stream VERSIONS are unaffected; the global positions
+//! below are annotated with the registrations that precede them.
 #![cfg(not(miri))]
 
 use mess_store::backend::{Backend, RecordToAppend};
@@ -28,8 +35,10 @@ async fn append_read_head_conflict() {
         )
         .await
         .expect("append");
+    // gp 0,1,2 = $registry: stream "acct-1", types "Opened", "Deposited".
+    // gp 3,4 = the two events.
     assert_eq!(a.version, Version::At(1));
-    assert_eq!(a.last_global_position, 1);
+    assert_eq!(a.last_global_position, 4);
     assert_eq!(engine.head("acct-1").await.unwrap(), Version::At(1));
 
     // Conflict: stale expected version.
@@ -50,8 +59,9 @@ async fn append_read_head_conflict() {
         .append_batch("acct-1", Version::At(1), &[rec("Withdrew", b"2")])
         .await
         .expect("append 2");
+    // gp 5 = $registry: type "Withdrew" (new). gp 6 = the event.
     assert_eq!(b.version, Version::At(2));
-    assert_eq!(b.last_global_position, 2);
+    assert_eq!(b.last_global_position, 6);
 
     // Second stream, independent positions but shared global order.
     engine
@@ -65,7 +75,7 @@ async fn append_read_head_conflict() {
     assert_eq!(page.len(), 3);
     assert_eq!(page[0].message_type, "Opened");
     assert_eq!(page[0].stream_position, 0);
-    assert_eq!(page[0].global_position, 0);
+    assert_eq!(page[0].global_position, 3);
     assert_eq!(page[2].message_type, "Withdrew");
     assert_eq!(page[2].data, b"2");
     assert_eq!(page[2].stream_position, 2);
@@ -75,11 +85,15 @@ async fn append_read_head_conflict() {
     assert_eq!(tail.len(), 2);
     assert_eq!(tail[0].stream_position, 1);
 
-    // read_global spans both streams densely.
+    // read_global spans both streams in position order, delivering only user
+    // events: gp 7 registered the stream "acct-2", gp 8 is its event.
     let all = engine.read_global(None, 100).await.unwrap();
     assert_eq!(all.len(), 4);
+    assert_eq!(
+        all.iter().map(|r| r.global_position).collect::<Vec<_>>(),
+        vec![3, 4, 6, 8]
+    );
     assert_eq!(all[3].stream_id, "acct-2");
-    assert_eq!(all[3].global_position, 3);
 }
 
 #[tokio::test]

@@ -373,7 +373,13 @@ impl Driver {
                     return Err(self.abort(v));
                 }
             }
-            if let Err(v) = self.subs[which].observe(rec.global_position) {
+            // `bn-2di`: the shadow is the oracle for "is this position a user
+            // event?" — every append it recorded carries the engine-assigned
+            // global position, so a position it does not know is one the engine
+            // consumed for a `$registry` record (and never delivers).
+            let known = |gp: u64| self.shadow.event_at_global(gp).is_some();
+            if let Err(v) = self.subs[which].observe(rec.global_position, known)
+            {
                 return Err(self.abort(v));
             }
         }
@@ -645,7 +651,14 @@ impl Driver {
     /// Also samples per-stream density so a stream whose positions gained a
     /// duplicate/gap is caught even if the global tiling happens to stay dense.
     async fn reconcile_after_reopen(&mut self) -> Result<(), Aborted> {
-        debug_assert!(self.shadow.is_dense(), "driver bug: shadow not dense");
+        // `bn-2di`: the shadow is deliberately SPARSE over global positions
+        // now. The engine's log-derived `$registry` consumes a global
+        // position per name it ever registers, and those records are
+        // never delivered — so the shadow (which records only user
+        // events, at their engine-assigned positions) has holes exactly
+        // where registrations sit. Density is no longer the invariant;
+        // "no acked event is lost, and nothing is fabricated" is, and
+        // that is what the rest of this function checks.
         let engine_total = self.engine().total_events() as u64;
         let shadow_total = self.shadow.total();
 
@@ -693,16 +706,28 @@ impl Driver {
 
         let mut acked_seen = 0u64;
         let mut extras = probe::ExtraCounts::default();
-        for (i, rec) in engine.iter().enumerate() {
-            let gp = i as u64;
-            if rec.global_position != gp {
+        // `bn-2di`: the delivered global order is strictly ascending and
+        // duplicate-free, but NOT dense — the engine consumes a position per
+        // `$registry` registration and never delivers those records. So walk by
+        // the record's OWN position rather than by index, and check the
+        // property that still holds. Nothing is weakened: a dropped
+        // acked event is caught by the `acked_seen != shadow_total`
+        // reckoning below (every acked event must be matched,
+        // byte-exact, at exactly the position it was acked at),
+        // and a fabricated one by the extras classification.
+        let mut prev: Option<u64> = None;
+        for rec in engine.iter() {
+            let gp = rec.global_position;
+            if let Some(p) = prev
+                && gp <= p
+            {
                 return Err(self.abort(Violation::RecoveryLoss {
                     detail: format!(
-                        "recovered global gap/dupe: expected {gp}, got {}",
-                        rec.global_position
+                        "recovered global out of order/dupe: {gp} after {p}"
                     ),
                 }));
             }
+            prev = Some(gp);
             match self.shadow.global_ref(gp) {
                 Some(gref) => {
                     // Part 1: acked event must be byte-exact at its position.

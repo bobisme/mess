@@ -84,11 +84,7 @@ pub struct LiveSnapshot {
 #[derive(Debug, Default)]
 pub struct MetaFacts {
     /// Live snapshots (one per stream that has a snapshot head).
-    pub snapshots:    Vec<LiveSnapshot>,
-    /// `(stream_id, name)` interned pairs.
-    pub stream_names: Vec<(u64, String)>,
-    /// `(event_type_id, name)` interned pairs.
-    pub type_names:   Vec<(u32, String)>,
+    pub snapshots: Vec<LiveSnapshot>,
 }
 
 /// The opaque snapshot-ref v1 layout (mirrors `mess_store::fjall_snapshot`):
@@ -132,18 +128,22 @@ pub fn read(dir: &std::path::Path) -> Result<MetaFacts, String> {
         return Err(format!("no metadata store at {}", meta_path.display()));
     }
     let meta = MetaStore::open(&meta_path).map_err(|e| e.to_string())?;
-    let stream_names = meta.stream_names().map_err(|e| e.to_string())?;
-    let type_names = meta.type_names().map_err(|e| e.to_string())?;
 
+    // `bn-2di`: names no longer come from here at all — fjall has no name
+    // keyspace. The engine's `id -> name` bijection lives in the log's
+    // `$registry` (see `crate::registryfold`). What is still here is the
+    // *snapshot* side map, which the sidecar writes so its FNV-keyed heads can
+    // be joined back to stream names.
+    //
     // Unify the two snapshot id spaces (see the module doc): the engine's own
     // `<dir>/meta` heads (historically empty) PLUS the app snapshot sidecar's
-    // heads, each joined against its own `stream_names` interner.
+    // heads, each joined against its own side map.
     let mut snapshots = snapshots_of(&meta);
     if let Some(app) = open_snapshot_sidecar(dir)? {
         snapshots.extend(snapshots_of(&app));
     }
     snapshots.sort_by_key(|s| s.stream_id);
-    Ok(MetaFacts { snapshots, stream_names, type_names })
+    Ok(MetaFacts { snapshots })
 }
 
 /// Join a meta store's `snapshot_heads` against its `stream_names` interner:
@@ -152,7 +152,7 @@ pub fn read(dir: &std::path::Path) -> Result<MetaFacts, String> {
 /// which the engine interner and (post-bone) the snapshot sidecar both
 /// guarantee — so this same join serves both id spaces.
 fn snapshots_of(meta: &MetaStore) -> Vec<LiveSnapshot> {
-    let Ok(names) = meta.stream_names() else {
+    let Ok(names) = meta.snapshot_stream_names() else {
         return Vec::new();
     };
     let mut out = Vec::new();

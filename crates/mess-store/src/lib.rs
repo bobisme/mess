@@ -61,7 +61,7 @@ pub use anomalies::{
     ProjectionAnomaliesSnapshot,
 };
 pub use backend::{
-    AppendError, Appended, Backend, RecordToAppend, StoredRecord,
+    AppendError, Appended, Backend, GlobalPage, RecordToAppend, StoredRecord,
     SubscribeBackend,
 };
 pub use cache::StateCache;

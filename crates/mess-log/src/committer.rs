@@ -40,11 +40,11 @@
 //! this match the letter of step 3 and shave the residual per-`pwrite`
 //! cost; see the crate's open items.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -58,30 +58,6 @@ use crate::runtime::{Fs, Runtime};
 use crate::watermark::Watermark;
 pub use crate::watermark::Watermark as DurableWatermark;
 use crate::writer::{BatchSpec, SegmentSummary, SegmentWriter, WriteError};
-
-/// A **pre-barrier hook**: a callback the committer invokes on the committer
-/// thread inside each barriered commit window, **strictly before** the log
-/// `fdatasync` and only when that window actually wrote (`policy.barrier &&
-/// wrote_any`). It exists so an owner that keeps a *separate* durable structure
-/// which must be made durable **no later than** the log — e.g. `mess-store`'s
-/// stream/type-name interner tables, whose bytes cannot be re-derived from the
-/// log (bn-150/bn-34o) — can fold its own flush into the committer's group
-/// window: one flush per group, riding the same barrier the group's events do,
-/// instead of one per append upstream of the committer.
-///
-/// # Contract
-///
-/// * Runs on the single committer thread, so it is never re-entered
-///   concurrently and may block (it is expected to `fsync`); it is sequenced
-///   *before* the group's `fdatasync`, so anything it makes durable is durable
-///   before any event in the group is.
-/// * Returns `Ok(())` on success (including a cheap no-op when it has nothing
-///   pending — the common case, so a barriered store pays it nothing on the hot
-///   path). An `Err` is treated exactly like a failed log barrier: the group is
-///   downgraded to [`AppendOutcome::Indeterminate`], the watermark does not
-///   advance, and the store is poisoned (D8) — so no event is ever acked
-///   durable while the hook's companion state failed to become durable.
-pub type PreBarrier = Arc<dyn Fn() -> std::io::Result<()> + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // Public config + request/outcome types
@@ -286,6 +262,28 @@ pub enum AppendError {
     /// [`Appender::is_degraded`] to detect the mode.
     #[error("store poisoned")]
     StorePoisoned,
+    /// An **earlier batch of this ordered unit** ([`Appender::submit_ordered`])
+    /// did not ack, so this batch was skipped and **never written** (`bn-2di`).
+    ///
+    /// `submit_ordered` gives a unit file ORDER; this error is what makes it
+    /// also fail ATOMICALLY. Without it, a unit's first batch could be rejected
+    /// (`SegmentFull` → roll → `StoreFull`) while a later batch of the SAME
+    /// unit — which the earlier one was ordered ahead of *because it
+    /// depends on it* — was accepted and durably committed. For
+    /// `mess-store`'s `$registry` that is unrecoverable corruption: the
+    /// domain batch would reference ids whose `*Registered` records are
+    /// nowhere in the log.
+    ///
+    /// So: the first non-[`Acked`](AppendOutcome::Acked) outcome in a unit
+    /// **poisons the rest of it**. Every later batch of the same unit is failed
+    /// with this error, before any bytes are written and without consuming a
+    /// global position. A caller seeing this knows the batch is definitively
+    /// NOT in the log (unlike [`AppendOutcome::Indeterminate`]) and that the
+    /// real cause is on an earlier batch of the same unit.
+    #[error(
+        "ordered unit aborted: an earlier batch of the unit did not commit"
+    )]
+    UnitAborted,
 }
 
 // ---------------------------------------------------------------------------
@@ -647,8 +645,30 @@ struct CommitReq {
     /// does not re-encode" spirit — it does not recompute the length
     /// either, it reuses this).
     encoded_len:          u64,
+    /// Ordered-unit membership (`bn-2di`), `None` for a standalone batch.
+    /// Carries the atomic-failure rule of [`AppendError::UnitAborted`].
+    unit:                 Option<UnitTag>,
     ack:                  Ack,
 }
+
+/// Which ordered unit a [`CommitReq`] belongs to, and whether it is the unit's
+/// last batch (`bn-2di`).
+///
+/// A unit's batches are not necessarily gathered into ONE commit group — in the
+/// non-coalescing durability modes (`Process`/`Os`) they become *adjacent*
+/// groups — so the set of failed units is committer-loop state, not
+/// `commit_group` state. `last` is what prunes it: the unit's final batch (be
+/// it written or skipped) retires its id from that set, so the set only ever
+/// holds units that are still mid-flight.
+#[derive(Debug, Clone, Copy)]
+struct UnitTag {
+    id:   u64,
+    last: bool,
+}
+
+/// Allocates the process-unique [`UnitTag::id`]s. Monotonic, never reused; a
+/// wrap would need 2^64 ordered units.
+static NEXT_UNIT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// The gather behaviour distilled from a [`Durability`] mode.
 #[derive(Debug, Clone, Copy)]
@@ -901,6 +921,15 @@ fn roll_segment<F: Fs>(
 /// full segment is transparent to appenders. A batch larger than a whole empty
 /// segment still cannot fit and is surfaced as `SegmentFull` (no infinite
 /// roll).
+///
+/// `failed_units` (`bn-2di`): the ordered-unit atomic-failure rule. A unit
+/// ([`Appender::submit_ordered`]) is written batch-by-batch like any other, but
+/// the moment ONE of its batches gets a non-[`Acked`](AppendOutcome::Acked)
+/// outcome the unit is poisoned: every later batch of it is skipped — never
+/// encoded, never written, no global position consumed — and failed with
+/// [`AppendError::UnitAborted`]. The set lives in [`committer_loop`] and is
+/// threaded through here because a unit can span adjacent commit GROUPS in the
+/// non-coalescing modes.
 #[allow(clippy::too_many_arguments)] // internal seam; each arg is a distinct shared handle
 fn commit_group<R: Runtime, F: Fs>(
     rt: &R,
@@ -913,7 +942,7 @@ fn commit_group<R: Runtime, F: Fs>(
     roller: Option<&Roller>,
     chain_enabled: bool,
     heads: &mut HashMap<u64, ChainHead>,
-    pre_barrier: Option<&PreBarrier>,
+    failed_units: &mut HashSet<u64>,
 ) {
     // Steps 2–3: assign positions centrally + write each batch. `next_pos`
     // advances only for successfully written batches.
@@ -921,6 +950,19 @@ fn commit_group<R: Runtime, F: Fs>(
         Vec::with_capacity(group.len());
     let mut wrote_any = false;
     for req in &group {
+        // `bn-2di` (unit atomicity): an earlier batch of this unit already
+        // failed, so this one must never reach the file. Skipped BEFORE the
+        // write — it consumes no position, and the caller learns definitively
+        // that it is not in the log.
+        if let Some(unit) = req.unit
+            && failed_units.contains(&unit.id)
+        {
+            if unit.last {
+                failed_units.remove(&unit.id);
+            }
+            acks.push((req.ack.clone(), Err(AppendError::UnitAborted)));
+            continue;
+        }
         let subs = subframes_of(&req.events);
         // Fold-chain (spec 05 §6, G10): when enabled, stamp this batch's
         // `crypto_chain = h[base-1]` — the current head of this stream, which
@@ -1036,6 +1078,21 @@ fn commit_group<R: Runtime, F: Fs>(
                 )
             }
         };
+        // `bn-2di`: anything but a positive ack poisons the rest of the unit.
+        // `Indeterminate` counts: the batch MAY be durable and MAY not, which
+        // is precisely the state a dependent later batch must not be committed
+        // on top of. (A barrier fault below can still downgrade an `Acked`
+        // batch to `Indeterminate` afterwards — but it downgrades the WHOLE
+        // group together, unit members included, so the unit never splits into
+        // "durable prefix, decided-failed suffix".)
+        if let Some(unit) = req.unit {
+            if !matches!(res, Ok(AppendOutcome::Acked { .. })) {
+                failed_units.insert(unit.id);
+            }
+            if unit.last {
+                failed_units.remove(&unit.id);
+            }
+        }
         acks.push((req.ack.clone(), res));
     }
 
@@ -1048,34 +1105,27 @@ fn commit_group<R: Runtime, F: Fs>(
     // fast (`committer_loop`). The failed barrier is NEVER retried — retrying
     // `fdatasync` after `EIO` is the classic fsyncgate corruption (§2.6) — so
     // no later `commit_group` runs and no `close()` re-issues it.
+    // `bn-2di`: there is nothing to flush before this barrier any more.
+    //
+    // This used to run an owner-supplied `PreBarrier` hook — `mess-store`'s
+    // co-durable name flush (bn-150/bn-2cj/bn-34o), which made the fjall
+    // `stream_names`/`type_names` tables durable inside this window so an event
+    // could never out-live its name. Those tables are gone: names are
+    // `$registry` records in this very log now, written by this very committer,
+    // ordered ahead of the batches that reference them. The invariant is
+    // structural, so the hook — and the fsync it carried — is not merely unused
+    // but *impossible to reintroduce* through this seam.
     let mut barrier_ok = true;
     if policy.barrier && wrote_any {
-        // bn-34o: the owner's co-durable pre-barrier flush rides THIS window,
-        // strictly before the log `fdatasync`, so any separate durable state
-        // the group's events reference (e.g. `mess-store`'s name interner
-        // tables) is on stable storage before the events are — coalesced to one
-        // flush per group instead of one per append. A no-op when the owner has
-        // nothing pending (hot path). A hook failure is a barrier failure: skip
-        // the log sync so the group is downgraded to Indeterminate below (its
-        // events never ack durable while the companion state is not).
-        if let Some(pre) = pre_barrier
-            && let Err(e) = pre()
-        {
-            barrier_ok = false;
-            degraded.poison(PoisonCause::classify(&e));
-        }
-        if barrier_ok {
-            let t0 = rt.now();
-            match writer.sync() {
-                Ok(()) => {
-                    metrics
-                        .record_fsync(rt.now().saturating_duration_since(t0));
-                    metrics.groups.incr();
-                }
-                Err(e) => {
-                    barrier_ok = false;
-                    degraded.poison(PoisonCause::classify(&e));
-                }
+        let t0 = rt.now();
+        match writer.sync() {
+            Ok(()) => {
+                metrics.record_fsync(rt.now().saturating_duration_since(t0));
+                metrics.groups.incr();
+            }
+            Err(e) => {
+                barrier_ok = false;
+                degraded.poison(PoisonCause::classify(&e));
             }
         }
     }
@@ -1121,12 +1171,17 @@ async fn committer_loop<R: Runtime, F: Fs>(
     roller: Option<Roller>,
     chain_enabled: bool,
     mut heads: HashMap<u64, ChainHead>,
-    pre_barrier: Option<PreBarrier>,
 ) {
     // The expected convoy width, seeded at 1 (so the first group and the
     // one-writer case both close immediately) and tracking the last group's
     // size thereafter.
     let mut target = 1usize;
+    // Ordered units (`bn-2di`) one of whose batches has already failed: every
+    // later batch of them must be skipped, never written. Lives here rather
+    // than in `commit_group` because a unit can span adjacent groups under
+    // `Process`/`Os` (no coalescing). Only failures ever enter it and each
+    // unit's last batch retires its id, so it is empty in steady state.
+    let mut failed_units: HashSet<u64> = HashSet::new();
     while let Some(first) = recv_unless_closed(&rx, &closed).await {
         let group = gather(&rt, &rx, first, &policy, &gate, target).await;
         target = group.len().max(1);
@@ -1139,6 +1194,17 @@ async fn committer_loop<R: Runtime, F: Fs>(
         // no `commit_group` runs.
         if degraded.is_poisoned() {
             for req in group {
+                // `bn-2di`: a poisoned unit member fails like any other batch,
+                // and (being non-`Acked`) poisons the rest of its unit too —
+                // which here is belt-and-braces, since every later batch of it
+                // would hit this same guard.
+                if let Some(unit) = req.unit {
+                    if unit.last {
+                        failed_units.remove(&unit.id);
+                    } else {
+                        failed_units.insert(unit.id);
+                    }
+                }
                 fulfill(&req.ack, Err(AppendError::StorePoisoned));
             }
             continue;
@@ -1154,7 +1220,7 @@ async fn committer_loop<R: Runtime, F: Fs>(
             roller.as_ref(),
             chain_enabled,
             &mut heads,
-            pre_barrier.as_ref(),
+            &mut failed_units,
         );
     }
     // Shutdown. On a healthy store, make the handoff durable (a `Process`-mode
@@ -1247,6 +1313,9 @@ async fn submit(
         first_stream_version: req.first_stream_version,
         events: req.events,
         encoded_len,
+        // A standalone batch is its own fate: nothing else depends on it and it
+        // depends on nothing (`bn-2di`).
+        unit: None,
         ack: ack.clone(),
     };
 
@@ -1257,6 +1326,218 @@ async fn submit(
     gate.leave();
 
     AckOrClosed { ack, done: done.clone() }.await
+}
+
+/// Submit N batches as ONE ordered unit and await every outcome, in order
+/// (`bn-2di`). Shared by [`Appender::append_ordered`] and
+/// [`Committer::append_ordered`].
+///
+/// # What this guarantees, and why the registry needs it
+///
+/// `mess-store`'s log-derived `$registry` (spec `04-registry.md` §4.2, REG12)
+/// must get a name's `*Registered` record into the log **no later than** the
+/// first batch that references the id it mints. This function is the primitive
+/// that makes that free rather than expensive:
+///
+/// - **File order.** Every `CommitReq` is pushed into the single gather channel
+///   back-to-back with **no `.await` between the sends**, so the committer
+///   receives them in exactly `reqs` order (the channel is FIFO and this is one
+///   sender). `commit_group` writes a group in gather order, so `reqs[0]`'s
+///   bytes land at a lower offset — and a lower global position — than
+///   `reqs[1]`'s, in the same segment. Recovery accepts a **contiguous prefix**
+///   of valid batches, so no crash can leave `reqs[1]` durable while `reqs[0]`
+///   is not: losing the earlier batch necessarily loses the later one. The
+///   ordering guarantee is the log's own, not a second barrier.
+/// - **One barrier.** The whole sequence submits inside ONE
+///   [`Gate::enter`]/[`Gate::leave`] span, so the committer's `gather` cannot
+///   observe `gate.is_zero()` between the sends and close the window early. In
+///   `Group` mode the drain therefore takes every request of the unit into the
+///   **same commit group**, and its single `fdatasync` covers all of them. In
+///   the non-coalescing modes (`Process`/`Os`, §1.2) they become adjacent
+///   groups — still in the right file order, which is all correctness needs.
+///
+/// # Failure semantics — the unit fails ATOMICALLY (`bn-2di`)
+///
+/// Each batch gets its own [`AppendOutcome`]; the returned `Vec` is
+/// index-aligned with `reqs`. Three rules make a unit's failure atomic rather
+/// than merely ordered:
+///
+/// 1. **Pre-flight rejects the whole unit.** An [`AppendError`]
+///    (`Encode`/`Closed`/`StorePoisoned`) raised here rejects every batch
+///    before anything is sent — no partial submission, and nothing for the
+///    caller to undo.
+/// 2. **A failed batch aborts the rest of its unit.** Every `CommitReq` of a
+///    unit carries its [`UnitTag`]; the first
+///    non-[`Acked`](AppendOutcome::Acked) outcome makes `commit_group` skip
+///    every LATER batch of that unit — unwritten, no position consumed — with
+///    [`AppendError::UnitAborted`]. Without this, file order alone would allow
+///    `reqs[0]` (a `$registry` registration) to be rejected by a full store
+///    while `reqs[1]` (the domain batch that references the ids it registers)
+///    was accepted: permanent corruption from an ordinary `ENOSPC`.
+/// 3. **A barrier fault downgrades the whole covering group together**, unit
+///    members included — so the caller never sees "the registration is durable
+///    but its first use is indeterminate" as a *decided* state.
+///
+/// What is deliberately NOT provided is the converse: an EARLIER batch of the
+/// unit can be durably committed while a LATER one fails (`reqs[1]` too big for
+/// an empty segment, say). That is the point of ordering the dependency first,
+/// and it is why [`Submitted::wait`] hands back one result per batch instead of
+/// short-circuiting — see its docs.
+///
+/// An empty `reqs` is a no-op returning an empty [`Submitted`].
+///
+/// # Why this is synchronous (`bn-2di`)
+///
+/// The push is deliberately **not** `async`: it performs no `.await` at all, so
+/// a caller may hold a plain `std` lock across it. `mess-store` needs exactly
+/// that. Its name interner (the `Book` mutex) is what publishes a
+/// newly-minted id to other appender threads, so the `$registry` record that
+/// mints the id must reach the channel **before that mutex is released** —
+/// otherwise a second thread could observe the id as interned, build a batch
+/// referencing it, and push that batch ahead of the registration. The log's
+/// contiguous-prefix recovery rule would then happily accept a batch whose
+/// `stream_id`/`event_type_id` no `*Registered` record covers, and the store
+/// would fail to open. Pushing under the interner lock closes that window with
+/// the lock the engine already holds; awaiting the acks then happens outside
+/// it, via [`Submitted::wait`].
+fn submit_ordered_now(
+    tx: &Sender<CommitReq>,
+    gate: &Gate,
+    degraded: &Degraded,
+    closed: &Arc<AtomicBool>,
+    done: &Done,
+    reqs: Vec<AppendRequest>,
+) -> Result<Submitted, AppendError> {
+    if reqs.is_empty() {
+        return Ok(Submitted { acks: Vec::new(), done: done.clone() });
+    }
+    // Same two fail-fast gates as `submit`, hoisted ahead of the whole unit:
+    // a poisoned or closed store must reject every batch of it, not strand
+    // half of them in the channel.
+    if degraded.is_poisoned() {
+        return Err(AppendError::StorePoisoned);
+    }
+    if closed.load(Ordering::Acquire) {
+        return Err(AppendError::Closed);
+    }
+
+    // Mark in-flight for the WHOLE unit — entered before the first encode and
+    // left only after the last send. This is what keeps `gather`'s early-close
+    // (`gate.is_zero() && plen >= target`) from firing between our sends and
+    // splitting the unit across two barriers.
+    gate.enter();
+
+    // Pre-flight every batch BEFORE sending any: an `Encode` fault on
+    // `reqs[1]` must not leave `reqs[0]` already committed to the channel.
+    let mut creqs: Vec<CommitReq> = Vec::with_capacity(reqs.len());
+    let mut acks: Vec<Ack> = Vec::with_capacity(reqs.len());
+    // One id for the whole unit (`bn-2di`): a non-`Acked` outcome on any batch
+    // aborts every LATER batch of this id, in `commit_group`. A one-batch unit
+    // has no "rest" to abort, so it needs no id.
+    let unit_id =
+        (reqs.len() > 1).then(|| NEXT_UNIT_ID.fetch_add(1, Ordering::Relaxed));
+    let last_idx = reqs.len() - 1;
+    for (i, req) in reqs.into_iter().enumerate() {
+        let total_len = {
+            let subs = subframes_of(&req.events);
+            let input = BatchInput {
+                segment_epoch:        0,
+                batch_id:             0,
+                first_global_pos:     0,
+                stream_id:            req.stream_id,
+                category_id:          req.category_id,
+                first_stream_version: req.first_stream_version,
+                crypto_chain:         None,
+                subframes:            &subs,
+            };
+            BatchEncoder::total_len(&input)
+        };
+        let encoded_len = match total_len {
+            Ok(n) => n,
+            Err(e) => {
+                gate.leave();
+                return Err(AppendError::Encode(e));
+            }
+        };
+        let ack = new_ack();
+        acks.push(ack.clone());
+        creqs.push(CommitReq {
+            stream_id: req.stream_id,
+            category_id: req.category_id,
+            first_stream_version: req.first_stream_version,
+            events: req.events,
+            encoded_len,
+            unit: unit_id.map(|id| UnitTag { id, last: i == last_idx }),
+            ack,
+        });
+    }
+
+    // Submit the unit back-to-back, then unmark. No `.await` between the sends
+    // (nor between the last send and `leave`), so the committer observes the
+    // whole unit as one contiguous run of the channel — on the single-threaded
+    // sim runtime it cannot interleave at all, and on a real runtime the gate
+    // holds the group window open across them.
+    for creq in creqs {
+        tx.send(creq);
+    }
+    gate.leave();
+
+    Ok(Submitted { acks, done: done.clone() })
+}
+
+/// A pushed-but-not-yet-durable ordered unit (`bn-2di`): the handle
+/// [`Appender::submit_ordered`] returns so the caller can release its own
+/// locks before blocking on the barrier. [`wait`](Submitted::wait) resolves
+/// to one [`AppendOutcome`] per batch, index-aligned with the `reqs` that
+/// produced it.
+///
+/// Dropping a `Submitted` without waiting does **not** cancel anything: the
+/// batches are already in the committer's channel and will be written and
+/// (in a durable mode) barriered like any other. The caller simply never
+/// learns their outcome — the same "a cancelled append still fully commits"
+/// property `spawn_blocking` gives the rest of the append path.
+#[must_use = "the batches are already queued; drop only if the outcome is \
+              genuinely not needed"]
+pub struct Submitted {
+    acks: Vec<Ack>,
+    done: Done,
+}
+
+impl Submitted {
+    /// Await every batch's durability outcome, in submission order — one result
+    /// **per batch**, index-aligned with the `reqs` that produced it.
+    ///
+    /// # Why this is not `Result<Vec<_>>` (`bn-2di`)
+    ///
+    /// A unit can fail *partially*: `reqs[0]` writes and is barriered,
+    /// `reqs[1]` hits [`AppendError::SegmentFull`] (a batch larger than an
+    /// empty segment can never fit, no matter how many times the roller
+    /// rolls). The first batch's global positions are then a permanent,
+    /// irreversible fact — the watermark has already advanced past them —
+    /// and the caller MUST still publish it, or it leaves a
+    /// committed-but-never-published position that stalls every higher
+    /// position forever (the `bn-3nz` hazard).
+    ///
+    /// A short-circuiting `Result<Vec<_>>` would throw that outcome away along
+    /// with the error. So the per-batch results are handed back whole, and it
+    /// is the caller's job to publish everything that landed before
+    /// surfacing the failure. [`append_ordered`](Appender::append_ordered)
+    /// short-circuits, for callers with nothing to publish.
+    pub async fn wait(self) -> Vec<Result<AppendOutcome, AppendError>> {
+        let mut outcomes = Vec::with_capacity(self.acks.len());
+        for ack in self.acks {
+            outcomes.push(AckOrClosed { ack, done: self.done.clone() }.await);
+        }
+        outcomes
+    }
+
+    /// How many batches this unit carries.
+    #[must_use]
+    pub fn len(&self) -> usize { self.acks.len() }
+
+    /// Whether this unit is empty (nothing was pushed).
+    #[must_use]
+    pub fn is_empty(&self) -> bool { self.acks.is_empty() }
 }
 
 /// A cheap-to-clone, `Send + Sync` submit-side handle to a running
@@ -1300,6 +1581,35 @@ impl Appender {
             req,
         )
         .await
+    }
+
+    /// Push N batches into the committer as ONE ordered unit, **synchronously**
+    /// (`bn-2di`), returning a [`Submitted`] to await later. See
+    /// [`submit_ordered_now`] for the file-order and single-barrier guarantees
+    /// this buys, and why the log-derived `$registry` depends on being able to
+    /// push while holding its interner lock.
+    pub fn submit_ordered(
+        &self,
+        reqs: Vec<AppendRequest>,
+    ) -> Result<Submitted, AppendError> {
+        submit_ordered_now(
+            &self.tx,
+            &self.gate,
+            &self.degraded,
+            &self.closed,
+            &self.done,
+            reqs,
+        )
+    }
+
+    /// Durably append N batches as ONE ordered unit and await every outcome —
+    /// [`submit_ordered`](Appender::submit_ordered) followed immediately by
+    /// [`Submitted::wait`], for callers with no lock to release in between.
+    pub async fn append_ordered(
+        &self,
+        reqs: Vec<AppendRequest>,
+    ) -> Result<Vec<AppendOutcome>, AppendError> {
+        self.submit_ordered(reqs)?.wait().await.into_iter().collect()
     }
 
     /// A clone of the durable watermark this committer advances. After a
@@ -1364,7 +1674,7 @@ impl<R: Runtime> Committer<R> {
         F: Fs + Send + 'static,
         F::File: Send,
     {
-        Self::spawn_inner(rt, writer, durability, None, ChainInit::off(), None)
+        Self::spawn_inner(rt, writer, durability, None, ChainInit::off())
     }
 
     /// Spawn the committer with the fold chain enabled (`bn-3l0`, spec 05 §6):
@@ -1381,7 +1691,7 @@ impl<R: Runtime> Committer<R> {
         F: Fs + Send + 'static,
         F::File: Send,
     {
-        Self::spawn_inner(rt, writer, durability, None, chain, None)
+        Self::spawn_inner(rt, writer, durability, None, chain)
     }
 
     /// Spawn the committer with live segment auto-roll (`bn-1vu`): when a batch
@@ -1404,7 +1714,6 @@ impl<R: Runtime> Committer<R> {
             durability,
             Some(roller),
             ChainInit::off(),
-            None,
         )
     }
 
@@ -1423,34 +1732,7 @@ impl<R: Runtime> Committer<R> {
         F: Fs + Send + 'static,
         F::File: Send,
     {
-        Self::spawn_inner(rt, writer, durability, Some(roller), chain, None)
-    }
-
-    /// Like [`spawn_with_roll_chained`](Self::spawn_with_roll_chained), plus a
-    /// [`PreBarrier`] hook the committer runs inside each barriered commit
-    /// window, strictly before the log `fdatasync` (bn-34o). The production
-    /// `mess-store` engine uses it to fold its co-durable stream/type-name
-    /// flush into the group barrier — one flush per group, not one per append.
-    pub fn spawn_with_roll_chained_hooked<F>(
-        rt: &R,
-        writer: SegmentWriter<F>,
-        durability: Durability,
-        roller: Roller,
-        chain: ChainInit,
-        pre_barrier: PreBarrier,
-    ) -> Self
-    where
-        F: Fs + Send + 'static,
-        F::File: Send,
-    {
-        Self::spawn_inner(
-            rt,
-            writer,
-            durability,
-            Some(roller),
-            chain,
-            Some(pre_barrier),
-        )
+        Self::spawn_inner(rt, writer, durability, Some(roller), chain)
     }
 
     fn spawn_inner<F>(
@@ -1459,7 +1741,6 @@ impl<R: Runtime> Committer<R> {
         durability: Durability,
         roller: Option<Roller>,
         chain: ChainInit,
-        pre_barrier: Option<PreBarrier>,
     ) -> Self
     where
         F: Fs + Send + 'static,
@@ -1493,7 +1774,6 @@ impl<R: Runtime> Committer<R> {
             roller,
             chain_enabled,
             heads,
-            pre_barrier,
         )));
 
         Committer {
@@ -1608,6 +1888,29 @@ impl<R: Runtime> Committer<R> {
                 )
                 .await
             }
+            None => Err(AppendError::Closed),
+        }
+    }
+
+    /// Durably append N batches as ONE ordered unit (`bn-2di`) — see
+    /// [`submit_ordered_now`].
+    pub async fn append_ordered(
+        &self,
+        reqs: Vec<AppendRequest>,
+    ) -> Result<Vec<AppendOutcome>, AppendError> {
+        match &self.tx {
+            Some(tx) => submit_ordered_now(
+                tx,
+                &self.gate,
+                &self.degraded,
+                &self.closed,
+                &self.done,
+                reqs,
+            )?
+            .wait()
+            .await
+            .into_iter()
+            .collect(),
             None => Err(AppendError::Closed),
         }
     }
@@ -1781,120 +2084,6 @@ mod tests {
         assert_eq!(
             fsyncs, 0,
             "Process mode must not issue a barrier before shutdown"
-        );
-    }
-
-    // -- Pre-barrier hook (bn-34o) ---------------------------------------
-
-    /// The [`PreBarrier`] hook fires exactly once per barriered group (`Os`:
-    /// per batch), and every batch still acks durable — the committer runs the
-    /// hook inside the window without disturbing the ordinary durable path.
-    #[test]
-    fn pre_barrier_hook_fires_once_per_barriered_group() {
-        let rt = SimRuntime::new(11);
-        let fs = rt.fs();
-        let writer = seg(&fs, Path::new("/seg-hook-os"));
-        let calls = Arc::new(AtomicUsize::new(0));
-        let hook_calls = calls.clone();
-        let pre: PreBarrier = Arc::new(move || {
-            hook_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        });
-        let n = rt.block_on(async {
-            let c = Committer::spawn_inner(
-                &rt,
-                writer,
-                Durability::Os,
-                None,
-                ChainInit::off(),
-                Some(pre),
-            );
-            for v in [0u64, 3, 8] {
-                let out = c.append(req(1, v, 3)).await.unwrap();
-                assert!(
-                    matches!(out, AppendOutcome::Acked { .. }),
-                    "hook must not disturb the durable ack"
-                );
-            }
-            let n = calls.load(Ordering::SeqCst);
-            c.shutdown().await;
-            n
-        });
-        // Os is group-of-one: three batches → three barriered groups → three
-        // hook calls, one per group's fdatasync.
-        assert_eq!(n, 3, "hook must run once per barriered group");
-    }
-
-    /// Under `Process` (no barrier) the committer never invokes the hook — the
-    /// hot-path guarantee that a barrier-free store pays nothing for it.
-    #[test]
-    fn pre_barrier_hook_not_called_under_process() {
-        let rt = SimRuntime::new(12);
-        let fs = rt.fs();
-        let writer = seg(&fs, Path::new("/seg-hook-proc"));
-        let calls = Arc::new(AtomicUsize::new(0));
-        let hook_calls = calls.clone();
-        let pre: PreBarrier = Arc::new(move || {
-            hook_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        });
-        let n = rt.block_on(async {
-            let c = Committer::spawn_inner(
-                &rt,
-                writer,
-                Durability::Process,
-                None,
-                ChainInit::off(),
-                Some(pre),
-            );
-            for v in 0..4u64 {
-                c.append(req(9, v, 1)).await.unwrap();
-            }
-            let n = calls.load(Ordering::SeqCst);
-            c.shutdown().await;
-            n
-        });
-        assert_eq!(n, 0, "Process issues no barrier, so the hook never runs");
-    }
-
-    /// A hook failure is a barrier failure: the group is downgraded to
-    /// [`AppendOutcome::Indeterminate`], the store is poisoned (D8), and — the
-    /// ordering proof — the log `fdatasync` is NEVER issued (`fsync_count ==
-    /// 0`), so the hook ran strictly before the log barrier and gated it.
-    /// No event can be acked durable while the hook's companion state
-    /// failed to flush.
-    #[test]
-    fn pre_barrier_hook_failure_poisons_and_gates_the_log_barrier() {
-        let rt = SimRuntime::new(13);
-        let fs = rt.fs();
-        let writer = seg(&fs, Path::new("/seg-hook-fail"));
-        let pre: PreBarrier =
-            Arc::new(|| Err(io::Error::other("name flush failed")));
-        let (out, degraded, fsyncs) = rt.block_on(async {
-            let c = Committer::spawn_inner(
-                &rt,
-                writer,
-                Durability::Os,
-                None,
-                ChainInit::off(),
-                Some(pre),
-            );
-            let out = c.append(req(1, 0, 2)).await.unwrap();
-            let degraded = c.is_degraded();
-            let fsyncs = c.fsync_count();
-            c.shutdown().await;
-            (out, degraded, fsyncs)
-        });
-        assert_eq!(
-            out,
-            AppendOutcome::Indeterminate,
-            "a hook failure must downgrade the group to Indeterminate"
-        );
-        assert!(degraded, "a hook failure must poison the store (D8)");
-        assert_eq!(
-            fsyncs, 0,
-            "the log fdatasync must NOT run after a hook failure — proof the \
-             hook is sequenced before (and gates) the log barrier"
         );
     }
 

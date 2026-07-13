@@ -65,8 +65,130 @@ pub fn run(dir: &Path, opts: &DoctorOptions) -> Report {
     check_segments(&mut report, dir);
     check_fsync(&mut report, dir);
     check_fold_version(&mut report, dir, opts, &lock);
+    check_registry(&mut report, dir, &lock);
 
     report
+}
+
+/// bn-2di: fold the `$registry` out of the log and report what it names.
+///
+/// The registry IS the log now — there is no second copy of the `id -> name`
+/// bijection anywhere in the store, so there is nothing to diff it against.
+/// What this check buys is that the fold is *exercised* on demand, off the open
+/// path: it re-derives the whole registry from the durable bytes, enforcing
+/// every REG-rule (`RegistryState::apply` — REG14 double registration, REG16
+/// name rebinding, REG12 dangling references), and fails loudly if the log's
+/// own registry does not fold. A store whose registry does not fold is a store
+/// whose ids have no meaning, so an operator wants to hear about it from
+/// `doctor` rather than from a failed open.
+///
+/// Needs the engine (hence the store lock), so against a live writer it
+/// degrades to an info finding rather than failing the command — the same
+/// degradation `check_fold_version` makes, for the same reason.
+fn check_registry(report: &mut Report, dir: &Path, lock: &LockState) {
+    if matches!(lock, LockState::Held { .. }) {
+        report.push_finding(Finding::new(
+            Severity::Info,
+            "registry",
+            "registry-store-locked",
+            "a live writer holds this store, so the $registry fold cannot \
+             run. Run against a stopped writer (or a `mess backup` copy) for \
+             the full check.",
+        ));
+        return;
+    }
+    // Run on a dedicated thread with its own runtime. `doctor::run` is a
+    // synchronous API that callers legitimately invoke from *inside* an async
+    // context (its own test suite does), and `block_on` from within a runtime
+    // panics — so we cannot simply build one here.
+    let dir = dir.to_path_buf();
+    let findings = std::thread::spawn(move || {
+        let mut sub = Report::new("doctor", "checks");
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                sub.push_finding(Finding::new(
+                    Severity::Warn,
+                    "registry",
+                    "registry-runtime",
+                    format!("could not build a runtime for the check: {e}"),
+                ));
+                return sub;
+            }
+        };
+        let engine = match mess_store::LogEngine::open(&dir) {
+            Ok(e) => e,
+            Err(e) => {
+                let msg = e.to_string();
+                let locked = msg.contains("Locked") || msg.contains("lock");
+                sub.push_finding(Finding::new(
+                    if locked { Severity::Info } else { Severity::Warn },
+                    "registry",
+                    if locked {
+                        "registry-store-locked"
+                    } else {
+                        "registry-open"
+                    },
+                    if locked {
+                        "a live writer holds this store, so the $registry fold \
+                         cannot run."
+                            .to_string()
+                    } else {
+                        format!("could not open the store for the check: {e}")
+                    },
+                ));
+                return sub;
+            }
+        };
+        match rt.block_on(engine.fold_registry()) {
+            Ok(state) => sub.push_finding(
+                Finding::new(
+                    Severity::Ok,
+                    "registry",
+                    "registry-folds",
+                    format!(
+                        "the $registry folds cleanly from the log: {} stream \
+                         name(s), {} event-type name(s). The log is the sole \
+                         source of truth for the id->name bijection — there \
+                         is no second copy to drift from.",
+                        state.stream_high_water_mark(),
+                        state.event_type_high_water_mark()
+                    ),
+                )
+                .with("streams", state.stream_high_water_mark())
+                .with("event_types", state.event_type_high_water_mark()),
+            ),
+            Err(e) => sub.push_finding(Finding::new(
+                Severity::Error,
+                "registry",
+                "registry-fold-failed",
+                format!(
+                    "the log's $registry does NOT fold: {e}. Every interned \
+                     id in this store is uninterpretable until this is \
+                     resolved."
+                ),
+            )),
+        }
+        sub
+    })
+    .join();
+
+    match findings {
+        Ok(sub) => {
+            for f in sub.findings {
+                report.push_finding(f);
+            }
+        }
+        Err(_) => report.push_finding(Finding::new(
+            Severity::Warn,
+            "registry",
+            "registry-panic",
+            "the registry check panicked",
+        )),
+    }
 }
 
 fn check_lock(report: &mut Report, lock: &LockState) {

@@ -59,7 +59,7 @@
 
 use std::collections::VecDeque;
 
-use crate::backend::{Backend, StoredRecord, SubscribeBackend};
+use crate::backend::{Backend, GlobalPage, StoredRecord, SubscribeBackend};
 use crate::store::StoreError;
 
 /// A live catch-up → tail subscription over an
@@ -120,23 +120,48 @@ impl<B: SubscribeBackend> Subscription<B> {
             return Ok(self.buffered.drain(..).collect());
         }
         loop {
-            // `read_global(after)` is exclusive of `after`; deliver-from
+            // `read_global_page(after)` is exclusive of `after`; deliver-from
             // `cursor` means read strictly after `cursor - 1` (or
             // from the start at 0).
             let after = self.cursor.checked_sub(1);
             let page = self
                 .backend
-                .read_global(after, self.page_size)
+                .read_global_page(after, self.page_size)
                 .await
                 .map_err(StoreError::Backend)?;
-            if let Some(last) = page.last() {
-                debug_assert_eq!(
-                    page[0].global_position, self.cursor,
-                    "read_global must return a dense run beginning at the \
+            // `bn-2di`: the delivered sequence is no longer necessarily dense.
+            // The engine's `$registry` records consume global positions but are
+            // never delivered, so `page.records[0]` may sit past the cursor and
+            // a page may legitimately come back EMPTY with positions still
+            // below the watermark. `frontier` — how far the scan actually got —
+            // is what makes both cases safe:
+            //
+            //   * a non-empty page: advance past the last delivered record, but
+            //     never behind the frontier (trailing skipped positions must
+            //     not be re-scanned on the next call);
+            //   * an empty page whose frontier moved: the scan crossed a run of
+            //     engine-internal positions and found nothing deliverable. Take
+            //     the frontier and loop — WITHOUT parking on the watermark,
+            //     which is already past the cursor and would spin.
+            //
+            // What we may never do is jump the cursor to the watermark: a page
+            // can also end early because it hit `page_size` or a raced tier
+            // handoff, and the frontier is precisely the value that
+            // distinguishes "examined and empty" from "not examined yet".
+            let GlobalPage { records, frontier } = page;
+            if let Some(last) = records.last() {
+                debug_assert!(
+                    records[0].global_position >= self.cursor,
+                    "read_global_page must not return records before the \
                      cursor",
                 );
-                self.cursor = last.global_position + 1;
-                return Ok(page);
+                self.cursor = (last.global_position + 1).max(frontier);
+                return Ok(records);
+            }
+            if frontier > self.cursor {
+                // Skipped-only run: make progress, then re-read.
+                self.cursor = frontier;
+                continue;
             }
             // Caught up to the watermark: block until a commit passes the
             // cursor, then loop to read the newly-committed
