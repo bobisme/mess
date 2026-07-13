@@ -1,0 +1,41 @@
+!!! mess DEGRADED: seal-fsync latency 109.8 ms crossed 50.0 ms threshold (1 crossings) — near-full/contended device fdatasync stall (docs/spec/03-durability.md §2.6); durable appends are stalling
+[e=2000000 sp=0] OWB seed events=2000000 streams=1000 per_batch=10 payload=64 seal_pack=false wall_s=8.572 ev_per_s=233320 allocs_per_event=12.42 vm_hwm_kib=182464
+[quiet-guard] load1=9.32; sleeping 5s
+[quiet-guard] load1=8.81; sleeping 5s
+[quiet-guard] load1=8.35; sleeping 5s
+[quiet-guard] load1=10.24; sleeping 5s
+[quiet-guard] load1=9.74; sleeping 5s
+[quiet-guard] load1=9.04; sleeping 5s
+[quiet-guard] load1=9.28; sleeping 5s
+[quiet-guard] load1=8.53; sleeping 5s
+[quiet-guard] load1=8.09; sleeping 5s
+[quiet-guard] load1=7.60; sleeping 5s
+[e=2000000 sp=0] OWB open seal_pack=false wall_s=1.6401 total_events=2000000 sealed_segments=23 vm_hwm_kib=105584
+[e=2000000 sp=0] OWB open seal_pack=false wall_s=1.6407 total_events=2000000 sealed_segments=23 vm_hwm_kib=105776
+[e=2000000 sp=0] OWB open seal_pack=false wall_s=1.6407 total_events=2000000 sealed_segments=23 vm_hwm_kib=105840
+[e=2000000 sp=0] disk 241M	/home/bob/.cache/mess-bench/spikeJ-reopen/e2000000-sp0
+[e=2000000 sp=0] seal_files 0
+[e=2000000 sp=0] sidecar_files 0
+[e=2000000 sp=1] OWB seed events=2000000 streams=1000 per_batch=10 payload=64 seal_pack=true wall_s=7.327 ev_per_s=272966 allocs_per_event=12.42 vm_hwm_kib=202908
+[e=2000000 sp=1] OWB open seal_pack=true wall_s=1.6424 total_events=2000000 sealed_segments=23 vm_hwm_kib=125168
+[e=2000000 sp=1] OWB open seal_pack=true wall_s=1.5873 total_events=2000000 sealed_segments=23 vm_hwm_kib=124720
+[e=2000000 sp=1] OWB open seal_pack=true wall_s=1.6088 total_events=2000000 sealed_segments=23 vm_hwm_kib=125044
+[e=2000000 sp=1] disk 243M	/home/bob/.cache/mess-bench/spikeJ-reopen/e2000000-sp1
+[e=2000000 sp=1] seal_files 0
+[e=2000000 sp=1] sidecar_files 0
+!!! mess DEGRADED: seal-fsync latency 61.4 ms crossed 50.0 ms threshold (1 crossings) — near-full/contended device fdatasync stall (docs/spec/03-durability.md §2.6); durable appends are stalling
+[e=10000000 sp=0] OWB seed events=10000000 streams=1000 per_batch=10 payload=64 seal_pack=false wall_s=41.236 ev_per_s=242509 allocs_per_event=12.44 vm_hwm_kib=526092
+[e=10000000 sp=0] OWB open seal_pack=false wall_s=8.2907 total_events=10000000 sealed_segments=118 vm_hwm_kib=274656
+[e=10000000 sp=0] OWB open seal_pack=false wall_s=3.7678 total_events=10000000 sealed_segments=118 vm_hwm_kib=275020
+[e=10000000 sp=0] OWB open seal_pack=false wall_s=3.7634 total_events=10000000 sealed_segments=118 vm_hwm_kib=275144
+[e=10000000 sp=0] disk 1.1G	/home/bob/.cache/mess-bench/spikeJ-reopen/e10000000-sp0
+[e=10000000 sp=0] seal_files 0
+[e=10000000 sp=0] sidecar_files 0
+[e=10000000 sp=1] OWB seed events=10000000 streams=1000 per_batch=10 payload=64 seal_pack=true wall_s=43.095 ev_per_s=232048 allocs_per_event=12.44 vm_hwm_kib=653800
+[quiet-guard] load1=5.39; sleeping 5s
+[e=10000000 sp=1] OWB open seal_pack=true wall_s=8.5076 total_events=10000000 sealed_segments=118 vm_hwm_kib=373316
+[e=10000000 sp=1] OWB open seal_pack=true wall_s=3.7886 total_events=10000000 sealed_segments=118 vm_hwm_kib=374092
+[e=10000000 sp=1] OWB open seal_pack=true wall_s=3.9166 total_events=10000000 sealed_segments=118 vm_hwm_kib=373492
+[e=10000000 sp=1] disk 1.1G	/home/bob/.cache/mess-bench/spikeJ-reopen/e10000000-sp1
+[e=10000000 sp=1] seal_files 0
+[e=10000000 sp=1] sidecar_files 0

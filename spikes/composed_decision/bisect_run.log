@@ -1,0 +1,19 @@
+=== bn-3pz bisect: Group 250B x 1000 x 4w (bpw 100) ===
+HEAD-16243284 rep0 point bare group: 571103 ev/s 1750.999 us/app wall 0.700s p50 6751.4us p99 8653.7us fsyncs 101 mean_fsync 6075.9us
+HEAD-16243284 rep0 point log group: 494575 ev/s 2021.937 us/app wall 0.809s p50 7193.0us p99 11679.7us fsyncs 106 mean_fsync 5930.4us
+HEAD-16243284 rep1 point bare group: 531398 ev/s 1881.829 us/app wall 0.753s p50 7452.8us p99 9597.5us fsyncs 100 mean_fsync 6696.0us
+HEAD-16243284 rep1 point log group: 295275 ev/s 3386.670 us/app wall 1.355s p50 13048.4us p99 24291.3us fsyncs 200 mean_fsync 6324.9us
+HEAD-16243284 rep2 point bare group: 537279 ev/s 1861.231 us/app wall 0.744s p50 7355.4us p99 9044.3us fsyncs 101 mean_fsync 6512.2us
+HEAD-16243284 rep2 point log group: 327525 ev/s 3053.200 us/app wall 1.221s p50 12234.8us p99 15646.3us fsyncs 190 mean_fsync 5848.3us
+pre-C-43e8bd2a rep0 point bare group: 538578 ev/s 1856.742 us/app wall 0.743s p50 6981.8us p99 9108.5us fsyncs 106 mean_fsync 6148.6us
+pre-C-43e8bd2a rep0 point log group: 555176 ev/s 1801.231 us/app wall 0.720s p50 6609.2us p99 13239.8us fsyncs 200 mean_fsync 3159.2us
+pre-C-43e8bd2a rep1 point bare group: 538591 ev/s 1856.696 us/app wall 0.743s p50 7141.6us p99 8954.2us fsyncs 101 mean_fsync 6545.8us
+pre-C-43e8bd2a rep1 point log group: 351065 ev/s 2848.473 us/app wall 1.139s p50 11258.7us p99 14324.9us fsyncs 200 mean_fsync 5265.5us
+pre-C-43e8bd2a rep2 point bare group: 556448 ev/s 1797.112 us/app wall 0.719s p50 7100.2us p99 8400.8us fsyncs 101 mean_fsync 6309.2us
+pre-C-43e8bd2a rep2 point log group: 433239 ev/s 2308.193 us/app wall 0.923s p50 8722.7us p99 12314.8us fsyncs 200 mean_fsync 4152.1us
+pre-34o-a3d40ff1 rep0 point bare group: 560394 ev/s 1784.460 us/app wall 0.714s p50 6818.9us p99 10508.1us fsyncs 102 mean_fsync 6128.0us
+pre-34o-a3d40ff1 rep0 point log group: 321466 ev/s 3110.748 us/app wall 1.244s p50 9991.7us p99 84640.7us fsyncs 200 mean_fsync 5809.8us
+pre-34o-a3d40ff1 rep1 point bare group: 583171 ev/s 1714.762 us/app wall 0.686s p50 6802.8us p99 8216.6us fsyncs 101 mean_fsync 5884.6us
+pre-34o-a3d40ff1 rep1 point log group: 570839 ev/s 1751.806 us/app wall 0.701s p50 6588.6us p99 12809.1us fsyncs 200 mean_fsync 3085.3us
+pre-34o-a3d40ff1 rep2 point bare group: 549671 ev/s 1819.270 us/app wall 0.728s p50 7095.0us p99 10969.2us fsyncs 101 mean_fsync 6369.0us
+pre-34o-a3d40ff1 rep2 point log group: 317843 ev/s 3146.208 us/app wall 1.258s p50 12140.8us p99 17467.5us fsyncs 200 mean_fsync 5869.4us

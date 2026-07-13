@@ -1,0 +1,174 @@
+== cell convoy-b10-w1: payload=250 batch=10 writers=1 bpw=2000 kind=stable mode=group seg=256MiB total_events=20000
+[quiet-guard] contended (load1=8.67 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=8.62 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=9.53 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=9.97 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=9.73 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=9.27 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=9.09 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=9.48 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=9.28 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=8.62 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=8.09 procs=[]); sleeping 5s
+[quiet-guard] contended (load1=7.68 procs=[]); sleeping 5s
+  bare   rep0:         3350 ev/s  2984.996 us/app  wall 5.970s  p50 2642.2us  p99 5727.7us  fsyncs 2000  mean_fsync 2957.3us
+  log    rep0:         3263 ev/s  3064.259 us/app  wall 6.129s  p50 2722.0us  p99 5717.6us  fsyncs 2000  mean_fsync 2997.6us
+  b0d    rep0:         3443 ev/s  2904.610 us/app  wall 5.809s  p50 2702.8us  p99 5823.8us  fsyncs 2000  mean_fsync 2673.4us
+  b0d    rep1:         3636 ev/s  2750.200 us/app  wall 5.500s  p50 2693.9us  p99 5788.0us  fsyncs 2000  mean_fsync 2518.5us
+  log    rep1:         3883 ev/s  2575.165 us/app  wall 5.150s  p50 2509.6us  p99 5622.4us  fsyncs 2000  mean_fsync 2508.5us
+  bare   rep1:         3958 ev/s  2526.775 us/app  wall 5.054s  p50 2482.7us  p99 5554.0us  fsyncs 2000  mean_fsync 2500.5us
+  bare   rep2:         3938 ev/s  2539.665 us/app  wall 5.079s  p50 2486.3us  p99 5610.7us  fsyncs 2000  mean_fsync 2513.8us
+  log    rep2:         3902 ev/s  2562.997 us/app  wall 5.126s  p50 2503.6us  p99 5615.7us  fsyncs 2000  mean_fsync 2499.9us
+  b0d    rep2:         3459 ev/s  2890.840 us/app  wall 5.782s  p50 2702.3us  p99 5754.9us  fsyncs 2000  mean_fsync 2661.4us
+  bare   SUMMARY best         3958  median         3938 ev/s  vs_bare  100.0%  vs_log  101.4%  fsyncs [2000, 2000, 2000]
+  log    SUMMARY best         3902  median         3883 ev/s  vs_bare   98.6%  vs_log  100.0%  fsyncs [2000, 2000, 2000]
+  b0d    SUMMARY best         3636  median         3459 ev/s  vs_bare   87.9%  vs_log   89.1%  fsyncs [2000, 2000, 2000]
+== cell convoy-b10-w4: payload=250 batch=10 writers=4 bpw=500 kind=stable mode=group seg=256MiB total_events=20000
+  bare   rep0:        14020 ev/s   713.255 us/app  wall 1.427s  p50 2531.1us  p99 5714.8us  fsyncs 502  mean_fsync 2787.1us
+  log    rep0:        14000 ev/s   714.310 us/app  wall 1.429s  p50 2617.9us  p99 4770.1us  fsyncs 509  mean_fsync 2651.8us
+  b0d    rep0:        14660 ev/s   682.148 us/app  wall 1.364s  p50 2703.3us  p99 3300.6us  fsyncs 500  mean_fsync 2480.7us
+  b0d    rep1:        14114 ev/s   708.498 us/app  wall 1.417s  p50 2703.1us  p99 6008.0us  fsyncs 500  mean_fsync 2589.3us
+  log    rep1:         8589 ev/s  1164.298 us/app  wall 2.329s  p50 4983.1us  p99 11184.7us  fsyncs 903  mean_fsync 2541.2us
+  bare   rep1:        15790 ev/s   633.329 us/app  wall 1.267s  p50 2503.4us  p99 2701.6us  fsyncs 501  mean_fsync 2473.1us
+  bare   rep2:         9487 ev/s  1054.031 us/app  wall 2.108s  p50 4936.2us  p99 8223.8us  fsyncs 816  mean_fsync 2552.6us
+  log    rep2:        14784 ev/s   676.399 us/app  wall 1.353s  p50 2600.0us  p99 5709.0us  fsyncs 504  mean_fsync 2546.9us
+  b0d    rep2:        14379 ev/s   695.453 us/app  wall 1.391s  p50 2703.1us  p99 5917.6us  fsyncs 500  mean_fsync 2536.5us
+  bare   SUMMARY best        15790  median        14020 ev/s  vs_bare  100.0%  vs_log  100.1%  fsyncs [502, 501, 816]
+  log    SUMMARY best        14784  median        14000 ev/s  vs_bare   99.9%  vs_log  100.0%  fsyncs [509, 903, 504]
+  b0d    SUMMARY best        14660  median        14379 ev/s  vs_bare  102.6%  vs_log  102.7%  fsyncs [500, 500, 500]
+== cell convoy-b10-w8: payload=250 batch=10 writers=8 bpw=250 kind=stable mode=group seg=256MiB total_events=20000
+  bare   rep0:        30947 ev/s   323.132 us/app  wall 0.646s  p50 2559.5us  p99 2811.8us  fsyncs 252  mean_fsync 2485.4us
+  log    rep0:        16759 ev/s   596.691 us/app  wall 1.193s  p50 4998.5us  p99 11153.0us  fsyncs 455  mean_fsync 2543.5us
+  b0d    rep0:        28130 ev/s   355.492 us/app  wall 0.711s  p50 2706.0us  p99 8905.9us  fsyncs 250  mean_fsync 2582.6us
+  b0d    rep1:        29148 ev/s   343.082 us/app  wall 0.686s  p50 2717.8us  p99 2981.5us  fsyncs 250  mean_fsync 2478.5us
+  log    rep1:        25800 ev/s   387.603 us/app  wall 0.775s  p50 2717.1us  p99 8210.4us  fsyncs 272  mean_fsync 2584.0us
+  bare   rep1:        30168 ev/s   331.477 us/app  wall 0.663s  p50 2503.7us  p99 5684.9us  fsyncs 251  mean_fsync 2574.2us
+  bare   rep2:        31076 ev/s   321.793 us/app  wall 0.644s  p50 2516.4us  p99 2826.0us  fsyncs 251  mean_fsync 2496.8us
+  log    rep2:        28192 ev/s   354.716 us/app  wall 0.709s  p50 2705.0us  p99 5258.6us  fsyncs 259  mean_fsync 2487.2us
+  b0d    rep2:        29195 ev/s   342.523 us/app  wall 0.685s  p50 2705.9us  p99 3021.1us  fsyncs 250  mean_fsync 2478.7us
+  bare   SUMMARY best        31076  median        30947 ev/s  vs_bare  100.0%  vs_log  120.0%  fsyncs [252, 251, 251]
+  log    SUMMARY best        28192  median        25800 ev/s  vs_bare   83.4%  vs_log  100.0%  fsyncs [455, 272, 259]
+  b0d    SUMMARY best        29195  median        29148 ev/s  vs_bare   94.2%  vs_log  113.0%  fsyncs [250, 250, 250]
+== cell convoy-b10-w16: payload=250 batch=10 writers=16 bpw=125 kind=stable mode=group seg=256MiB total_events=20000
+  bare   rep0:        55975 ev/s   178.652 us/app  wall 0.357s  p50 2598.3us  p99 8898.8us  fsyncs 126  mean_fsync 2707.5us
+  log    rep0:        42490 ev/s   235.350 us/app  wall 0.471s  p50 2958.5us  p99 11545.8us  fsyncs 156  mean_fsync 2642.0us
+  b0d    rep0:        55578 ev/s   179.926 us/app  wall 0.360s  p50 2801.0us  p99 3989.3us  fsyncs 126  mean_fsync 2541.8us
+  b0d    rep1:        53493 ev/s   186.941 us/app  wall 0.374s  p50 2797.6us  p99 5917.4us  fsyncs 125  mean_fsync 2690.3us
+  log    rep1:        48095 ev/s   207.923 us/app  wall 0.416s  p50 2950.5us  p99 5480.5us  fsyncs 141  mean_fsync 2486.7us
+  bare   rep1:        54982 ev/s   181.879 us/app  wall 0.364s  p50 2609.3us  p99 8896.5us  fsyncs 126  mean_fsync 2734.4us
+  bare   rep2:        59321 ev/s   168.575 us/app  wall 0.337s  p50 2600.7us  p99 3686.2us  fsyncs 127  mean_fsync 2510.6us
+  log    rep2:        48083 ev/s   207.973 us/app  wall 0.416s  p50 2961.9us  p99 6216.5us  fsyncs 138  mean_fsync 2534.3us
+  b0d    rep2:        56696 ev/s   176.380 us/app  wall 0.353s  p50 2796.3us  p99 3776.8us  fsyncs 125  mean_fsync 2519.0us
+  bare   SUMMARY best        59321  median        55975 ev/s  vs_bare  100.0%  vs_log  116.4%  fsyncs [126, 126, 127]
+  log    SUMMARY best        48095  median        48083 ev/s  vs_bare   85.9%  vs_log  100.0%  fsyncs [156, 141, 138]
+  b0d    SUMMARY best        56696  median        55578 ev/s  vs_bare   99.3%  vs_log  115.6%  fsyncs [126, 125, 125]
+== cell convoy-b10-w32: payload=250 batch=10 writers=32 bpw=62 kind=stable mode=group seg=256MiB total_events=19840
+  bare   rep0:       107253 ev/s    93.237 us/app  wall 0.185s  p50 2790.3us  p99 4301.4us  fsyncs 64  mean_fsync 2558.4us
+  log    rep0:        69448 ev/s   143.993 us/app  wall 0.286s  p50 3780.1us  p99 6405.8us  fsyncs 90  mean_fsync 2581.4us
+  b0d    rep0:       108418 ev/s    92.236 us/app  wall 0.183s  p50 2900.7us  p99 3378.4us  fsyncs 62  mean_fsync 2547.8us
+  b0d    rep1:       109817 ev/s    91.060 us/app  wall 0.181s  p50 2902.0us  p99 3126.0us  fsyncs 62  mean_fsync 2542.2us
+  log    rep1:        68821 ev/s   145.305 us/app  wall 0.288s  p50 3469.6us  p99 12085.0us  fsyncs 86  mean_fsync 2733.2us
+  bare   rep1:       108404 ev/s    92.248 us/app  wall 0.183s  p50 2742.7us  p99 3796.3us  fsyncs 65  mean_fsync 2536.8us
+  bare   rep2:       111268 ev/s    89.873 us/app  wall 0.178s  p50 2714.3us  p99 3757.1us  fsyncs 64  mean_fsync 2518.4us
+  log    rep2:        68434 ev/s   146.127 us/app  wall 0.290s  p50 5433.9us  p99 8773.7us  fsyncs 97  mean_fsync 2544.6us
+  b0d    rep2:       107154 ev/s    93.323 us/app  wall 0.185s  p50 2911.7us  p99 6218.7us  fsyncs 62  mean_fsync 2608.4us
+  bare   SUMMARY best       111268  median       108404 ev/s  vs_bare  100.0%  vs_log  157.5%  fsyncs [64, 65, 64]
+  log    SUMMARY best        69448  median        68821 ev/s  vs_bare   63.5%  vs_log  100.0%  fsyncs [90, 86, 97]
+  b0d    SUMMARY best       109817  median       108418 ev/s  vs_bare  100.0%  vs_log  157.5%  fsyncs [62, 62, 62]
+== cell convoy-b10-w64: payload=250 batch=10 writers=64 bpw=50 kind=stable mode=group seg=256MiB total_events=32000
+  bare   rep0:       199520 ev/s    50.120 us/app  wall 0.160s  p50 3081.2us  p99 4021.8us  fsyncs 51  mean_fsync 2689.7us
+  log    rep0:       110517 ev/s    90.484 us/app  wall 0.290s  p50 5902.7us  p99 9918.2us  fsyncs 83  mean_fsync 2657.9us
+  b0d    rep0:       199315 ev/s    50.172 us/app  wall 0.161s  p50 3199.6us  p99 3416.9us  fsyncs 50  mean_fsync 2703.3us
+  b0d    rep1:       197436 ev/s    50.649 us/app  wall 0.162s  p50 3201.4us  p99 4591.8us  fsyncs 50  mean_fsync 2717.8us
+  log    rep1:       111482 ev/s    89.701 us/app  wall 0.287s  p50 4689.4us  p99 7499.6us  fsyncs 74  mean_fsync 2641.3us
+  bare   rep1:       183686 ev/s    54.441 us/app  wall 0.174s  p50 3110.0us  p99 9386.3us  fsyncs 51  mean_fsync 2924.3us
+  bare   rep2:       199436 ev/s    50.141 us/app  wall 0.160s  p50 3088.9us  p99 6383.3us  fsyncs 51  mean_fsync 2745.5us
+  log    rep2:       104429 ev/s    95.759 us/app  wall 0.306s  p50 5881.3us  p99 7688.9us  fsyncs 86  mean_fsync 2699.9us
+  b0d    rep2:       155250 ev/s    64.412 us/app  wall 0.206s  p50 3476.4us  p99 7684.1us  fsyncs 50  mean_fsync 3598.1us
+  bare   SUMMARY best       199520  median       199436 ev/s  vs_bare  100.0%  vs_log  180.5%  fsyncs [51, 51, 51]
+  log    SUMMARY best       111482  median       110517 ev/s  vs_bare   55.4%  vs_log  100.0%  fsyncs [83, 74, 86]
+  b0d    SUMMARY best       199315  median       197436 ev/s  vs_bare   99.0%  vs_log  178.6%  fsyncs [50, 50, 50]
+== cell convoy-b1000-w1: payload=250 batch=1000 writers=1 bpw=400 kind=stable mode=group seg=512MiB total_events=400000
+  bare   rep0:       266058 ev/s  3758.574 us/app  wall 1.503s  p50 3316.2us  p99 6209.0us  fsyncs 400  mean_fsync 3404.3us
+  log    rep0:       209776 ev/s  4766.991 us/app  wall 1.907s  p50 4799.3us  p99 7340.9us  fsyncs 400  mean_fsync 4282.6us
+  b0d    rep0:       198040 ev/s  5049.475 us/app  wall 2.020s  p50 4858.0us  p99 9417.6us  fsyncs 400  mean_fsync 4502.5us
+  b0d    rep1:       210589 ev/s  4748.582 us/app  wall 1.899s  p50 4525.6us  p99 8102.1us  fsyncs 400  mean_fsync 4220.1us
+  log    rep1:       242287 ev/s  4127.341 us/app  wall 1.651s  p50 3627.9us  p99 6234.6us  fsyncs 400  mean_fsync 3685.7us
+  bare   rep1:       252904 ev/s  3954.072 us/app  wall 1.582s  p50 3391.6us  p99 6520.9us  fsyncs 400  mean_fsync 3601.5us
+  bare   rep2:       239182 ev/s  4180.911 us/app  wall 1.672s  p50 3702.2us  p99 7781.6us  fsyncs 400  mean_fsync 3794.6us
+  log    rep2:       307190 ev/s  3255.317 us/app  wall 1.302s  p50 3097.1us  p99 6223.9us  fsyncs 400  mean_fsync 2821.6us
+  b0d    rep2:       294644 ev/s  3393.923 us/app  wall 1.358s  p50 3221.5us  p99 6279.3us  fsyncs 400  mean_fsync 2856.9us
+  bare   SUMMARY best       266058  median       252904 ev/s  vs_bare  100.0%  vs_log  104.4%  fsyncs [400, 400, 400]
+  log    SUMMARY best       307190  median       242287 ev/s  vs_bare   95.8%  vs_log  100.0%  fsyncs [400, 400, 400]
+  b0d    SUMMARY best       294644  median       210589 ev/s  vs_bare   83.3%  vs_log   86.9%  fsyncs [400, 400, 400]
+== cell convoy-b1000-w4: payload=250 batch=1000 writers=4 bpw=100 kind=stable mode=group seg=512MiB total_events=400000
+  bare   rep0:      1017591 ev/s   982.713 us/app  wall 0.393s  p50 3656.9us  p99 7037.7us  fsyncs 101  mean_fsync 3074.0us
+  log    rep0:       599217 ev/s  1668.845 us/app  wall 0.668s  p50 6430.3us  p99 9730.1us  fsyncs 187  mean_fsync 3066.4us
+  b0d    rep0:       767076 ev/s  1303.651 us/app  wall 0.521s  p50 4059.8us  p99 7943.4us  fsyncs 123  mean_fsync 2963.1us
+  b0d    rep1:       535324 ev/s  1868.028 us/app  wall 0.747s  p50 6622.3us  p99 13236.7us  fsyncs 122  mean_fsync 4907.0us
+  log    rep1:       360253 ev/s  2775.831 us/app  wall 1.110s  p50 10868.9us  p99 15435.1us  fsyncs 197  mean_fsync 5213.9us
+  bare   rep1:       583225 ev/s  1714.605 us/app  wall 0.686s  p50 6726.0us  p99 9362.0us  fsyncs 101  mean_fsync 5987.4us
+  bare   rep2:       579523 ev/s  1725.558 us/app  wall 0.690s  p50 6735.2us  p99 8689.5us  fsyncs 101  mean_fsync 5998.5us
+  log    rep2:       321503 ev/s  3110.387 us/app  wall 1.244s  p50 12117.9us  p99 16806.8us  fsyncs 200  mean_fsync 5840.1us
+  b0d    rep2:       686288 ev/s  1457.115 us/app  wall 0.583s  p50 5631.1us  p99 7525.3us  fsyncs 100  mean_fsync 4434.9us
+  bare   SUMMARY best      1017591  median       583225 ev/s  vs_bare  100.0%  vs_log  161.9%  fsyncs [101, 101, 101]
+  log    SUMMARY best       599217  median       360253 ev/s  vs_bare   61.8%  vs_log  100.0%  fsyncs [187, 197, 200]
+  b0d    SUMMARY best       767076  median       686288 ev/s  vs_bare  117.7%  vs_log  190.5%  fsyncs [123, 122, 100]
+== cell convoy-b1000-w8: payload=250 batch=1000 writers=8 bpw=50 kind=stable mode=group seg=512MiB total_events=400000
+  bare   rep0:       945063 ev/s  1058.131 us/app  wall 0.423s  p50 8450.4us  p99 10915.7us  fsyncs 51  mean_fsync 6774.5us
+  log    rep0:       665275 ev/s  1503.137 us/app  wall 0.601s  p50 11273.3us  p99 16878.5us  fsyncs 90  mean_fsync 5383.8us
+[quiet-guard] contended (load1=2.81 procs=[67360:cargo,68191:rustc,68223:rustc,68246:rustc]); sleeping 5s
+  b0d    rep0:       655013 ev/s  1526.687 us/app  wall 0.611s  p50 9077.8us  p99 20215.2us  fsyncs 78  mean_fsync 6281.0us
+  b0d    rep1:      1068989 ev/s   935.463 us/app  wall 0.374s  p50 5131.3us  p99 12900.6us  fsyncs 75  mean_fsync 3396.5us
+  log    rep1:       568673 ev/s  1758.480 us/app  wall 0.703s  p50 13253.8us  p99 19167.1us  fsyncs 92  mean_fsync 6484.3us
+  bare   rep1:       763750 ev/s  1309.329 us/app  wall 0.524s  p50 10052.4us  p99 15390.5us  fsyncs 51  mean_fsync 8777.2us
+  bare   rep2:       766576 ev/s  1304.503 us/app  wall 0.522s  p50 9892.5us  p99 15439.6us  fsyncs 52  mean_fsync 8565.2us
+  log    rep2:       555988 ev/s  1798.599 us/app  wall 0.719s  p50 13534.1us  p99 20186.5us  fsyncs 91  mean_fsync 6804.3us
+  b0d    rep2:       767103 ev/s  1303.605 us/app  wall 0.521s  p50 9430.8us  p99 15660.1us  fsyncs 68  mean_fsync 5925.3us
+  bare   SUMMARY best       945063  median       766576 ev/s  vs_bare  100.0%  vs_log  134.8%  fsyncs [51, 51, 52]
+  log    SUMMARY best       665275  median       568673 ev/s  vs_bare   74.2%  vs_log  100.0%  fsyncs [90, 92, 91]
+  b0d    SUMMARY best      1068989  median       767103 ev/s  vs_bare  100.1%  vs_log  134.9%  fsyncs [78, 75, 68]
+== cell convoy-b1000-w16: payload=250 batch=1000 writers=16 bpw=50 kind=stable mode=group seg=1024MiB total_events=800000
+  bare   rep0:       732518 ev/s  1365.155 us/app  wall 1.092s  p50 20714.1us  p99 29629.0us  fsyncs 51  mean_fsync 18593.7us
+  log    rep0:      1472345 ev/s   679.188 us/app  wall 0.543s  p50 9337.0us  p99 16105.5us  fsyncs 77  mean_fsync 3937.4us
+  b0d    rep0:       932305 ev/s  1072.610 us/app  wall 0.858s  p50 18057.8us  p99 25642.0us  fsyncs 90  mean_fsync 7251.9us
+  b0d    rep1:       696409 ev/s  1435.939 us/app  wall 1.149s  p50 26183.8us  p99 34068.5us  fsyncs 84  mean_fsync 11151.6us
+  log    rep1:       683054 ev/s  1464.012 us/app  wall 1.171s  p50 21580.9us  p99 36044.4us  fsyncs 77  mean_fsync 12042.7us
+  bare   rep1:      1249873 ev/s   800.081 us/app  wall 0.640s  p50 12225.1us  p99 14955.4us  fsyncs 51  mean_fsync 9754.8us
+  bare   rep2:      1055564 ev/s   947.361 us/app  wall 0.758s  p50 14924.4us  p99 19442.9us  fsyncs 51  mean_fsync 11952.9us
+  log    rep2:       858344 ev/s  1165.033 us/app  wall 0.932s  p50 16037.5us  p99 30059.0us  fsyncs 75  mean_fsync 9103.7us
+  b0d    rep2:       930441 ev/s  1074.760 us/app  wall 0.860s  p50 19272.1us  p99 23088.7us  fsyncs 82  mean_fsync 7779.9us
+  bare   SUMMARY best      1249873  median      1055564 ev/s  vs_bare  100.0%  vs_log  123.0%  fsyncs [51, 51, 51]
+  log    SUMMARY best      1472345  median       858344 ev/s  vs_bare   81.3%  vs_log  100.0%  fsyncs [77, 77, 75]
+  b0d    SUMMARY best       932305  median       930441 ev/s  vs_bare   88.1%  vs_log  108.4%  fsyncs [90, 84, 82]
+== cell convoy-b1000-w32: payload=250 batch=1000 writers=32 bpw=50 kind=stable mode=group seg=2048MiB total_events=1600000
+  bare   rep0:      1075885 ev/s   929.467 us/app  wall 1.487s  p50 28824.1us  p99 31797.9us  fsyncs 52  mean_fsync 23252.4us
+  log    rep0:       781927 ev/s  1278.892 us/app  wall 2.046s  p50 38910.5us  p99 64190.2us  fsyncs 76  mean_fsync 20649.2us
+  b0d    rep0:       802500 ev/s  1246.106 us/app  wall 1.994s  p50 40921.0us  p99 52159.9us  fsyncs 94  mean_fsync 16708.5us
+  b0d    rep1:       948967 ev/s  1053.777 us/app  wall 1.686s  p50 36608.5us  p99 42199.0us  fsyncs 94  mean_fsync 13526.1us
+  log    rep1:       852844 ev/s  1172.547 us/app  wall 1.876s  p50 33182.6us  p99 66436.0us  fsyncs 74  mean_fsync 18551.5us
+  bare   rep1:      1087357 ev/s   919.662 us/app  wall 1.471s  p50 28722.6us  p99 35619.2us  fsyncs 53  mean_fsync 22251.4us
+  bare   rep2:       787630 ev/s  1269.632 us/app  wall 2.031s  p50 43933.2us  p99 47313.2us  fsyncs 52  mean_fsync 33685.7us
+  log    rep2:       934915 ev/s  1069.616 us/app  wall 1.711s  p50 31571.0us  p99 55783.9us  fsyncs 73  mean_fsync 16558.0us
+  b0d    rep2:       786494 ev/s  1271.465 us/app  wall 2.034s  p50 45043.9us  p99 55898.6us  fsyncs 89  mean_fsync 18191.1us
+  bare   SUMMARY best      1087357  median      1075885 ev/s  vs_bare  100.0%  vs_log  126.2%  fsyncs [52, 53, 52]
+  log    SUMMARY best       934915  median       852844 ev/s  vs_bare   79.3%  vs_log  100.0%  fsyncs [76, 74, 73]
+  b0d    SUMMARY best       948967  median       802500 ev/s  vs_bare   74.6%  vs_log   94.1%  fsyncs [94, 94, 89]
+== cell convoy-b1000-w64: payload=250 batch=1000 writers=64 bpw=50 kind=stable mode=group seg=4096MiB total_events=3200000
+!!! mess DEGRADED: fdatasync latency 56.6 ms crossed 50.0 ms threshold (1 crossings) — near-full/contended device fdatasync stall (docs/spec/03-durability.md §2.6); durable appends are stalling
+  bare   rep0:       920744 ev/s  1086.078 us/app  wall 3.475s  p50 68594.8us  p99 80561.8us  fsyncs 52  mean_fsync 56158.5us
+!!! mess DEGRADED: fdatasync latency 54.7 ms crossed 50.0 ms threshold (1 crossings) — near-full/contended device fdatasync stall (docs/spec/03-durability.md §2.6); durable appends are stalling
+  log    rep0:       906728 ev/s  1102.867 us/app  wall 3.529s  p50 65788.8us  p99 134984.8us  fsyncs 77  mean_fsync 33781.9us
+  b0d    rep0:      1045463 ev/s   956.514 us/app  wall 3.061s  p50 52352.7us  p99 85634.8us  fsyncs 121  mean_fsync 18573.1us
+  b0d    rep1:      1495974 ev/s   668.461 us/app  wall 2.139s  p50 33402.6us  p99 88894.2us  fsyncs 123  mean_fsync 10635.2us
+  log    rep1:      1023260 ev/s   977.269 us/app  wall 3.127s  p50 61042.7us  p99 100406.7us  fsyncs 78  mean_fsync 28476.4us
+!!! mess DEGRADED: fdatasync latency 68.7 ms crossed 50.0 ms threshold (1 crossings) — near-full/contended device fdatasync stall (docs/spec/03-durability.md §2.6); durable appends are stalling
+  bare   rep1:      2158649 ev/s   463.253 us/app  wall 1.482s  p50 19314.2us  p99 55619.4us  fsyncs 52  mean_fsync 17840.2us
+!!! mess DEGRADED: fdatasync latency 59.4 ms crossed 50.0 ms threshold (1 crossings) — near-full/contended device fdatasync stall (docs/spec/03-durability.md §2.6); durable appends are stalling
+  bare   rep2:       998234 ev/s  1001.769 us/app  wall 3.206s  p50 69210.8us  p99 74679.7us  fsyncs 53  mean_fsync 49867.9us
+!!! mess DEGRADED: fdatasync latency 51.0 ms crossed 50.0 ms threshold (1 crossings) — near-full/contended device fdatasync stall (docs/spec/03-durability.md §2.6); durable appends are stalling
+  log    rep2:       766666 ev/s  1304.349 us/app  wall 4.174s  p50 83759.9us  p99 132324.2us  fsyncs 78  mean_fsync 41804.2us
+  b0d    rep2:      1317739 ev/s   758.876 us/app  wall 2.428s  p50 44283.3us  p99 73423.3us  fsyncs 122  mean_fsync 13132.9us
+  bare   SUMMARY best      2158649  median       998234 ev/s  vs_bare  100.0%  vs_log  110.1%  fsyncs [52, 52, 53]
+  log    SUMMARY best      1023260  median       906728 ev/s  vs_bare   90.8%  vs_log  100.0%  fsyncs [77, 78, 78]
+  b0d    SUMMARY best      1495974  median      1317739 ev/s  vs_bare  132.0%  vs_log  145.3%  fsyncs [121, 123, 122]

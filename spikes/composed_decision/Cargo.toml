@@ -1,0 +1,37 @@
+[package]
+name = "composed_decision"
+version = "0.1.0"
+edition = "2024"
+
+# Standalone spike: opt out of the repo's root workspace.
+[workspace]
+
+[lib]
+name = "composed_decision"
+path = "src/lib.rs"
+
+[[bin]]
+name = "composed_decision"
+path = "src/main.rs"
+
+[dependencies]
+# The REAL committer/writer/scanner — v3 on-disk bytes, the bare lower bound
+# AND the segment-header primitives the Spike-F global-seek check needs.
+mess-log = { path = "../../crates/mess-log" }
+# The current composed engine on main (post bn-34o/bn-2cj/bn-2ib/E/I).
+mess-store = { path = "../../crates/mess-store" }
+# The REAL incumbent ActiveIndex — the F0 comparator for the Spike-F
+# global-seek carry-forward (path dep, not a copy).
+mess-index = { path = "../../crates/mess-index" }
+# Self-sweeping ext4 scratch dirs (same namespace every repo bench uses).
+mess-testkit = { path = "../../crates/mess-testkit" }
+tokio = { version = "1.52", features = ["full"] }
+futures = "0.3"
+thiserror = "2"
+
+[dev-dependencies]
+rand = "0.8"
+
+[profile.release]
+lto = "thin"
+debug = true # symbols for perf record/report

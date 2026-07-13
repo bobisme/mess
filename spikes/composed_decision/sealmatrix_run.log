@@ -1,0 +1,36 @@
+== cell seal-p24-b100-w4: payload=24 batch=100 writers=4 bpw=5000 kind=stable mode=process seg=8MiB total_events=2000000
+  log    rep0:      1810786 ev/s    55.225 us/app  wall 1.104s  p50 141.5us  p99 429.4us  fsyncs 0  mean_fsync 0.0us
+  logsp  rep0:      1804799 ev/s    55.408 us/app  wall 1.108s  p50 140.9us  p99 383.9us  fsyncs 0  mean_fsync 0.0us
+  logsp  rep1:      1814377 ev/s    55.115 us/app  wall 1.102s  p50 140.7us  p99 416.6us  fsyncs 0  mean_fsync 0.0us
+  log    rep1:      1864997 ev/s    53.619 us/app  wall 1.072s  p50 136.5us  p99 332.5us  fsyncs 0  mean_fsync 0.0us
+  log    rep2:      1793088 ev/s    55.770 us/app  wall 1.115s  p50 139.6us  p99 720.9us  fsyncs 0  mean_fsync 0.0us
+  logsp  rep2:      1812615 ev/s    55.169 us/app  wall 1.103s  p50 139.3us  p99 544.5us  fsyncs 0  mean_fsync 0.0us
+  log    SUMMARY best      1864997  median      1810786 ev/s  vs_log  100.0%  fsyncs [0, 0, 0]
+  logsp  SUMMARY best      1814377  median      1812615 ev/s  vs_log  100.1%  fsyncs [0, 0, 0]
+== cell seal-p24-b1000-w4: payload=24 batch=1000 writers=4 bpw=500 kind=stable mode=process seg=8MiB total_events=2000000
+  log    rep0:      3107593 ev/s   321.792 us/app  wall 0.644s  p50 559.3us  p99 10843.5us  fsyncs 0  mean_fsync 0.0us
+  logsp  rep0:      3100949 ev/s   322.482 us/app  wall 0.645s  p50 598.4us  p99 9365.3us  fsyncs 0  mean_fsync 0.0us
+  logsp  rep1:      3109171 ev/s   321.629 us/app  wall 0.643s  p50 610.2us  p99 9173.8us  fsyncs 0  mean_fsync 0.0us
+  log    rep1:      3070807 ev/s   325.647 us/app  wall 0.651s  p50 568.8us  p99 11403.0us  fsyncs 0  mean_fsync 0.0us
+  log    rep2:      3088792 ev/s   323.751 us/app  wall 0.648s  p50 584.6us  p99 10535.9us  fsyncs 0  mean_fsync 0.0us
+  logsp  rep2:      2105496 ev/s   474.948 us/app  wall 0.950s  p50 598.4us  p99 37015.4us  fsyncs 0  mean_fsync 0.0us
+  log    SUMMARY best      3107593  median      3088792 ev/s  vs_log  100.0%  fsyncs [0, 0, 0]
+  logsp  SUMMARY best      3109171  median      3100949 ev/s  vs_log  100.4%  fsyncs [0, 0, 0]
+== cell seal-p250-b100-w4: payload=250 batch=100 writers=4 bpw=5000 kind=stable mode=process seg=8MiB total_events=2000000
+  log    rep0:       592931 ev/s   168.654 us/app  wall 3.373s  p50 172.7us  p99 30302.8us  fsyncs 0  mean_fsync 0.0us
+  logsp  rep0:       764252 ev/s   130.847 us/app  wall 2.617s  p50 173.0us  p99 11133.7us  fsyncs 0  mean_fsync 0.0us
+  logsp  rep1:      1051731 ev/s    95.081 us/app  wall 1.902s  p50 174.0us  p99 9220.4us  fsyncs 0  mean_fsync 0.0us
+  log    rep1:      1037846 ev/s    96.353 us/app  wall 1.927s  p50 173.2us  p99 10768.8us  fsyncs 0  mean_fsync 0.0us
+  log    rep2:       734315 ev/s   136.181 us/app  wall 2.724s  p50 175.8us  p99 21953.1us  fsyncs 0  mean_fsync 0.0us
+  logsp  rep2:       785378 ev/s   127.327 us/app  wall 2.547s  p50 173.5us  p99 20410.0us  fsyncs 0  mean_fsync 0.0us
+  log    SUMMARY best      1037846  median       734315 ev/s  vs_log  100.0%  fsyncs [0, 0, 0]
+  logsp  SUMMARY best      1051731  median       785378 ev/s  vs_log  107.0%  fsyncs [0, 0, 0]
+== cell seal-p250-b1000-w4: payload=250 batch=1000 writers=4 bpw=500 kind=stable mode=process seg=8MiB total_events=2000000
+  log    rep0:       830608 ev/s  1203.938 us/app  wall 2.408s  p50 1040.7us  p99 29369.4us  fsyncs 0  mean_fsync 0.0us
+  logsp  rep0:       842761 ev/s  1186.576 us/app  wall 2.373s  p50 1023.1us  p99 29603.3us  fsyncs 0  mean_fsync 0.0us
+  logsp  rep1:       960570 ev/s  1041.048 us/app  wall 2.082s  p50 1032.4us  p99 23822.7us  fsyncs 0  mean_fsync 0.0us
+  log    rep1:      1402148 ev/s   713.192 us/app  wall 1.426s  p50 1032.0us  p99 14414.5us  fsyncs 0  mean_fsync 0.0us
+  log    rep2:      1451993 ev/s   688.709 us/app  wall 1.377s  p50 1031.7us  p99 14024.3us  fsyncs 0  mean_fsync 0.0us
+  logsp  rep2:      1462553 ev/s   683.736 us/app  wall 1.367s  p50 1037.7us  p99 13332.7us  fsyncs 0  mean_fsync 0.0us
+  log    SUMMARY best      1451993  median      1402148 ev/s  vs_log  100.0%  fsyncs [0, 0, 0]
+  logsp  SUMMARY best      1462553  median       960570 ev/s  vs_log   68.5%  fsyncs [0, 0, 0]

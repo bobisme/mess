@@ -1,0 +1,16 @@
+== Spike F carry-forward: stride-8 global seek on a REAL v3 segment
+  batch=1 payload=24 batches=200000 bytes/batch=140 seg=26.7MiB
+    stride-8 WARM   headers/seek 4.51 (max 8)  p50 2380 ns  p90 3790 ns  p99 4360 ns  p99.9 11450 ns
+    stride-8 WARM mmap  (no syscall/header)      p50 210 ns  p90 360 ns  p99 3730 ns  p99.9 90840 ns
+    stride-8 COLD   (fadvise DONTNEED)          p50 74970 ns  p90 118400 ns  p99 169620 ns  p99.9 195720 ns
+    F0 ActiveIndex  global_range(p,1) in-memory  p50 240 ns  p90 420 ns  p99 740 ns  p99.9 1090 ns   resident 40 B/batch
+  batch=10 payload=250 batches=40000 bytes/batch=2868 seg=109.4MiB
+    stride-8 WARM   headers/seek 4.51 (max 8)  p50 2660 ns  p90 4580 ns  p99 5760 ns  p99.9 12979 ns
+    stride-8 WARM mmap  (no syscall/header)      p50 250 ns  p90 2750 ns  p99 125930 ns  p99.9 187600 ns
+    stride-8 COLD   (fadvise DONTNEED)          p50 161960 ns  p90 230150 ns  p99 310469 ns  p99.9 344560 ns
+    F0 ActiveIndex  global_range(p,1) in-memory  p50 190 ns  p90 230 ns  p99 270 ns  p99.9 340 ns   resident 40 B/batch
+  batch=100 payload=250 batches=10000 bytes/batch=27888 seg=266.0MiB
+    stride-8 WARM   headers/seek 4.49 (max 8)  p50 2390 ns  p90 4280 ns  p99 5530 ns  p99.9 13730 ns
+    stride-8 WARM mmap  (no syscall/header)      p50 230 ns  p90 1240 ns  p99 206730 ns  p99.9 439810 ns
+    stride-8 COLD   (fadvise DONTNEED)          p50 114750 ns  p90 386070 ns  p99 469020 ns  p99.9 517750 ns
+    F0 ActiveIndex  global_range(p,1) in-memory  p50 140 ns  p90 160 ns  p99 190 ns  p99.9 280 ns   resident 40 B/batch

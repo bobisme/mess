@@ -95,6 +95,15 @@ fn msgpack_payload(i: u64, bytes: usize) -> Vec<u8> {
 
 fn stream_name(s: u64) -> String { format!("acct-{s:06}") }
 
+/// Spike I (bn-3of): `EngineOptions::seal_pack` is OFF by default. Set
+/// `OWB_SEAL_PACK=1` to seed/reopen the SAME corpus shape through the
+/// consolidated `.seal` pack instead of the `.pidx`/`.filter`/`.pcol` sidecar
+/// trio, so Spike J can measure reopen wall + peak RSS both ways with one
+/// binary (bn-2gu).
+fn seal_pack() -> bool {
+    std::env::var("OWB_SEAL_PACK").map(|v| v == "1").unwrap_or(false)
+}
+
 fn open(dir: &str) -> LogEngine {
     LogEngine::open_with(
         dir,
@@ -102,6 +111,7 @@ fn open(dir: &str) -> LogEngine {
             durability: Durability::Process,
             // Small segments so a multi-segment sealed corpus forms.
             segment_size: 8 * 1024 * 1024,
+            seal_pack: seal_pack(),
             ..Default::default()
         },
     )
@@ -128,6 +138,7 @@ fn seed(dir: &str, args: &[String]) {
         EngineOptions {
             durability: Durability::Process,
             segment_size: seg_mb * 1024 * 1024,
+            seal_pack: seal_pack(),
             ..Default::default()
         },
     )
@@ -165,8 +176,9 @@ fn seed(dir: &str, args: &[String]) {
     let total = batches * per_batch;
     println!(
         "OWB seed events={total} streams={streams} per_batch={per_batch} \
-         payload={payload} wall_s={secs:.3} ev_per_s={:.0} \
+         payload={payload} seal_pack={} wall_s={secs:.3} ev_per_s={:.0} \
          allocs_per_event={:.2} vm_hwm_kib={}",
+        seal_pack(),
         total as f64 / secs,
         (a1 - a0) as f64 / total as f64,
         vm_hwm_kib()
@@ -178,8 +190,9 @@ fn open_phase(dir: &str) {
     let engine = open(dir);
     let secs = started.elapsed().as_secs_f64();
     println!(
-        "OWB open wall_s={secs:.4} total_events={} sealed_segments={} \
-         vm_hwm_kib={}",
+        "OWB open seal_pack={} wall_s={secs:.4} total_events={} \
+         sealed_segments={} vm_hwm_kib={}",
+        seal_pack(),
         engine.total_events(),
         engine.sealed_segment_count(),
         vm_hwm_kib()
