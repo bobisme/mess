@@ -2,3 +2,4 @@
 {"ts":"2026-07-14T16:58:27.401890252Z","author":"mess-design-reconcile","event":"ReviewersRequested","data":{"review_id":"cr-2kayb5","reviewers":["mess-design"]}}
 {"ts":"2026-07-14T17:04:10.930590852Z","author":"mess-dev","event":"ReviewerVoted","data":{"review_id":"cr-2kayb5","vote":"lgtm"}}
 {"ts":"2026-07-14T17:04:10.969563687Z","author":"mess-dev","event":"ReviewApproved","data":{"review_id":"cr-2kayb5"}}
+{"ts":"2026-07-14T17:05:05.484858847Z","author":"mess-dev","event":"ReviewMerged","data":{"review_id":"cr-2kayb5","final_commit":"92762eb37d5e339d58a8598dcbc5ddf0e9b5232c"}}
