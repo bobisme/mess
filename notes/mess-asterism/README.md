@@ -19,6 +19,8 @@ The central claim is:
 - [`research/08-risk-register.md`](research/08-risk-register.md) — FMEA-style risk register and kill criteria.
 - [`research/09-wire-format-v4-sketch.md`](research/09-wire-format-v4-sketch.md) — byte-level sketch for commit capsules with engine-control preludes.
 - [`research/10-formal-verification-plan.md`](research/10-formal-verification-plan.md) — state-machine, concurrency, codec, and crash-model verification plan.
+- [`research/11-review.md`](research/11-review.md) — adversarial reconciliation of the original pack with the engine and measured spikes.
+- [`research/13-authority-and-fjall-deletion-map.md`](research/13-authority-and-fjall-deletion-map.md) — post-flat-owner source audit of every remaining in-memory/Fjall state item, its real authority and recovery path, integration surface, measurement contract, and safe deletion order.
 
 ## Status vocabulary
 
