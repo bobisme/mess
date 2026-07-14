@@ -99,6 +99,26 @@ async fn metrics_move_under_durable_workload() {
     assert!(m.commit.groups >= 1, "at least one barriered group");
     assert_eq!(m.commit.fsync.count, m.commit.groups, "one barrier per group");
     assert!(m.commit.bytes > 0, "durable bytes counted");
+    assert!(
+        m.commit.direct_scratch_retained_batches > 0
+            && m.commit.direct_scratch_retained_batches <= 256,
+        "owner scratch is visible and count-capped: {}",
+        m.commit.direct_scratch_retained_batches
+    );
+    assert!(
+        m.commit.direct_scratch_retained_bytes <= 1024 * 1024,
+        "owner scratch is byte-capped: {}",
+        m.commit.direct_scratch_retained_bytes
+    );
+    assert_eq!(
+        m.commit.direct_subframe_spills, 0,
+        "small owner batches stay in the inline subframe scratch"
+    );
+    assert!(
+        m.owner_outcome_scratch_retained_slots > 0
+            && m.owner_outcome_scratch_retained_slots <= 256
+    );
+    assert!(m.owner_outcome_scratch_retained_bytes <= 1024 * 1024);
     assert_eq!(
         m.durable_watermark,
         4 + REGISTRY_EVENTS,

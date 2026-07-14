@@ -1,0 +1,4 @@
+phase,batch,rep,appends,alloc_calls,alloc_bytes,alloc_calls_per_append,alloc_bytes_per_append,thread_cpu_ns_per_append,wall_ns_per_append,events_per_s,fsyncs
+post-fix,100,0,256,256,1310720,1.000000,5120.000,7700.238,7792.020,12833643,0
+post-fix,100,1,256,256,1310720,1.000000,5120.000,7426.566,7484.246,13361399,0
+post-fix,100,2,256,256,1310720,1.000000,5120.000,9549.219,9636.590,10377115,0

@@ -14,6 +14,10 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use mess_log::committer::{
+    AppendRequest, ChainInit, DirectAppendRequest, DirectCommitter, Durability,
+    EventInput, Roller,
+};
 use mess_log::encode::{BatchEncoder, BatchInput, Subframe};
 use mess_log::runtime::{RealRuntime, Runtime};
 use mess_log::writer::{BatchSpec, SegmentParams, SegmentWriter};
@@ -130,5 +134,66 @@ fn zero_allocs_per_event_on_the_hot_path() {
         append_allocs, 0,
         "encode+append allocated {append_allocs} times over {N} batches (want \
          0)"
+    );
+
+    // --- Part 3: the owner-only direct seam is zero-alloc after warmup -----
+    const DIRECT_N: usize = 128;
+    let direct_path = dir.path().join("direct-hotpath.seg");
+    let mut params = SegmentParams::new(2, 0, 2, 1);
+    params.segment_size = 1024 * 1024;
+    let direct_writer =
+        SegmentWriter::create(&rt.fs(), &direct_path, params).unwrap();
+    let roll_root = dir.path().to_path_buf();
+    let (roll_tx, _roll_rx) = std::sync::mpsc::channel();
+    let roller = Roller::new(
+        move |id| roll_root.join(format!("direct-{id}.seg")),
+        roll_tx,
+    );
+    let mut direct = DirectCommitter::with_roll_chained(
+        &rt,
+        direct_writer,
+        Durability::Process,
+        roller,
+        ChainInit::off(),
+    );
+    let make_units = |version| {
+        (0..DIRECT_N)
+            .map(|stream| {
+                vec![DirectAppendRequest::Inputs(AppendRequest {
+                    stream_id:            stream as u64 + 1,
+                    category_id:          0,
+                    first_stream_version: version,
+                    events:               vec![EventInput::plain(
+                        1,
+                        0,
+                        0,
+                        vec![0xCD; 24],
+                    )],
+                })]
+            })
+            .collect()
+    };
+    direct
+        .commit_ordered_group(make_units(0), |_, _, outcome| {
+            std::hint::black_box(outcome);
+        })
+        .unwrap();
+    let measured = make_units(1);
+    let before = allocs();
+    let mut completed = 0;
+    direct
+        .commit_ordered_group(measured, |unit, batch, outcome| {
+            assert_eq!(unit, completed);
+            assert_eq!(batch, 0);
+            completed += 1;
+            std::hint::black_box(outcome);
+        })
+        .unwrap();
+    let direct_allocs = allocs() - before;
+    assert_eq!(completed, DIRECT_N);
+    assert_eq!(
+        direct_allocs, 0,
+        "warmed DirectCommitter allocated {direct_allocs} times for \
+         {DIRECT_N} small appends"
     );
 }

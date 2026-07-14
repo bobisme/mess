@@ -123,8 +123,8 @@ use mess_index::sealed::{
 use mess_index::{ActiveIndex, BatchEntry, EventPtr, GlobalEntry, StreamEntry};
 use mess_log::committer::{
     AppendOutcome, AppendRequest, ChainInit, CommitterMetricsHandle,
-    DirectAppendRequest, DirectBatchEvents, DirectCommitter, Durability,
-    EventInput, LatencySnapshot, Roller,
+    DirectAppendRequest, DirectBatchEvents, DirectBatchOutcome,
+    DirectCommitter, Durability, EventInput, LatencySnapshot, Roller,
 };
 use mess_log::encode::{BatchInput, PreparedBatch, Subframe};
 use mess_log::fold_chain::ChainHead;
@@ -1202,8 +1202,11 @@ impl Drop for InFlightGuard {
 }
 
 struct OwnerStatus {
-    metrics:  CommitterMetricsHandle,
-    degraded: AtomicBool,
+    metrics:                        CommitterMetricsHandle,
+    degraded:                       AtomicBool,
+    outcome_scratch_retained_slots: AtomicUsize,
+    outcome_scratch_retained_bytes: AtomicUsize,
+    outcome_scratch_trims:          AtomicUsize,
 }
 
 struct AppendOwner {
@@ -1232,13 +1235,80 @@ struct DomainPlan {
     _permit:  OwnedSemaphorePermit,
 }
 
+#[derive(Default)]
+struct PlanOutcomes {
+    registry: Option<DirectBatchOutcome>,
+    domain:   Option<DirectBatchOutcome>,
+}
+
+const OWNER_OUTCOME_RETAINED_SLOTS: usize = 256;
+const OWNER_OUTCOME_RETAINED_BYTE_CAP: usize = 1024 * 1024;
+const _: () = assert!(
+    OWNER_OUTCOME_RETAINED_SLOTS * std::mem::size_of::<PlanOutcomes>()
+        <= OWNER_OUTCOME_RETAINED_BYTE_CAP
+);
+
+fn cap_plan_outcomes(outcomes: &mut Vec<PlanOutcomes>) -> bool {
+    if outcomes.capacity() > OWNER_OUTCOME_RETAINED_SLOTS {
+        *outcomes = Vec::with_capacity(OWNER_OUTCOME_RETAINED_SLOTS);
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+mod owner_outcome_scratch_tests {
+    use super::*;
+
+    #[test]
+    fn oversize_result_scratch_is_shed_to_named_count_and_byte_caps() {
+        let mut outcomes = Vec::with_capacity(OWNER_OUTCOME_RETAINED_SLOTS + 1);
+        outcomes.resize_with(
+            OWNER_OUTCOME_RETAINED_SLOTS + 1,
+            PlanOutcomes::default,
+        );
+        outcomes.clear();
+        assert!(cap_plan_outcomes(&mut outcomes));
+        assert!(outcomes.capacity() <= OWNER_OUTCOME_RETAINED_SLOTS);
+        assert!(
+            outcomes.capacity() * std::mem::size_of::<PlanOutcomes>()
+                <= OWNER_OUTCOME_RETAINED_BYTE_CAP
+        );
+    }
+}
+
+impl PlanOutcomes {
+    fn record(
+        &mut self,
+        has_registry: bool,
+        batch: usize,
+        outcome: DirectBatchOutcome,
+    ) {
+        let slot = if has_registry {
+            match batch {
+                0 => &mut self.registry,
+                1 => &mut self.domain,
+                _ => panic!("domain unit has at most two batches"),
+            }
+        } else {
+            assert_eq!(batch, 0, "domain-only unit has one batch");
+            &mut self.domain
+        };
+        assert!(slot.replace(outcome).is_none(), "duplicate direct outcome");
+    }
+}
+
 struct FlatOwner {
-    direct:     DirectCommitter<RealRuntime, EngineFs>,
-    publish:    Arc<PublishState>,
-    durability: Durability,
-    inflight:   Arc<AtomicUsize>,
-    status:     Arc<OwnerStatus>,
-    target:     usize,
+    direct:                          DirectCommitter<RealRuntime, EngineFs>,
+    publish:                         Arc<PublishState>,
+    durability:                      Durability,
+    inflight:                        Arc<AtomicUsize>,
+    status:                          Arc<OwnerStatus>,
+    target:                          usize,
+    outcomes:                        Vec<PlanOutcomes>,
+    outcome_reported_retained_slots: usize,
+    outcome_reported_retained_bytes: usize,
 }
 
 impl FlatOwner {
@@ -1427,7 +1497,17 @@ impl FlatOwner {
         }
         let units =
             plans.iter_mut().map(|p| std::mem::take(&mut p.reqs)).collect();
-        let outcomes = self.direct.commit_ordered_group(units);
+        let mut completed = std::mem::take(&mut self.outcomes);
+        completed.clear();
+        completed.resize_with(plans.len(), PlanOutcomes::default);
+        let outcomes =
+            self.direct.commit_ordered_group(units, |unit, batch, outcome| {
+                completed[unit].record(
+                    plans[unit].reg_span.is_some(),
+                    batch,
+                    outcome,
+                );
+            });
         self.refresh_status();
         match outcomes {
             Err(e) => {
@@ -1437,27 +1517,47 @@ impl FlatOwner {
                     )));
                 }
             }
-            Ok(outcomes) => {
-                for (plan, unit) in plans.into_iter().zip(outcomes) {
-                    self.retire_domain(plan, unit);
+            Ok(()) => {
+                for (plan, outcomes) in
+                    plans.into_iter().zip(completed.drain(..))
+                {
+                    self.retire_domain(plan, outcomes);
                 }
             }
         }
+        completed.clear();
+        let trimmed = cap_plan_outcomes(&mut completed);
+        if trimmed {
+            self.status.outcome_scratch_trims.fetch_add(1, Ordering::Relaxed);
+        }
+        let retained_slots = completed.capacity();
+        let retained_bytes =
+            retained_slots * std::mem::size_of::<PlanOutcomes>();
+        debug_assert!(retained_bytes <= OWNER_OUTCOME_RETAINED_BYTE_CAP);
+        if trimmed || retained_slots != self.outcome_reported_retained_slots {
+            self.status
+                .outcome_scratch_retained_slots
+                .store(retained_slots, Ordering::Relaxed);
+            self.outcome_reported_retained_slots = retained_slots;
+        }
+        if trimmed || retained_bytes != self.outcome_reported_retained_bytes {
+            self.status
+                .outcome_scratch_retained_bytes
+                .store(retained_bytes, Ordering::Relaxed);
+            self.outcome_reported_retained_bytes = retained_bytes;
+        }
+        self.outcomes = completed;
     }
 
-    fn retire_domain(
-        &mut self,
-        plan: DomainPlan,
-        outcomes: Vec<mess_log::committer::DirectBatchOutcome>,
-    ) {
+    fn retire_domain(&mut self, plan: DomainPlan, outcomes: PlanOutcomes) {
         let DomainPlan { pre, staged, reg_span, done, .. } = plan;
+        let PlanOutcomes { registry, domain } = outcomes;
         let Pre::Proceed { sid, first_stream_pos, tids } = pre else {
             unreachable!()
         };
-        let mut iter = outcomes.into_iter();
         let mut first_error: Option<EngineError> = None;
         if let Some((first_version, count)) = reg_span {
-            match iter.next().expect("registry outcome").outcome {
+            match registry.expect("registry outcome").outcome {
                 Ok(outcome) => match expect_acked(outcome) {
                     Ok(placed) => {
                         {
@@ -1490,7 +1590,7 @@ impl FlatOwner {
                 }
             }
         }
-        let domain = iter.next().expect("domain outcome");
+        let domain = domain.expect("domain outcome");
         let placed = match domain.outcome {
             Ok(outcome) => match expect_acked(outcome) {
                 Ok(p) => Some(p),
@@ -1611,14 +1711,17 @@ impl FlatOwner {
             }
             (book.registry_next_version, trial)
         };
-        let result = self.direct.commit_ordered_group(vec![vec![
-            registry_append_request(first_version, &records).into(),
-        ]]);
+        let mut outcome = None;
+        let result = self.direct.commit_ordered_group(
+            vec![vec![registry_append_request(first_version, &records).into()]],
+            |unit, batch, completed| {
+                assert_eq!((unit, batch), (0, 0));
+                assert!(outcome.replace(completed).is_none());
+            },
+        );
         self.refresh_status();
         let outcome = match result {
-            Ok(mut units) => {
-                units.pop().and_then(|mut u| u.pop()).expect("registry outcome")
-            }
+            Ok(()) => outcome.expect("registry outcome"),
             Err(e) => {
                 let _ = done.send(Err(AppendError::Backend(
                     EngineError::Append(e.to_string()),
@@ -1987,7 +2090,7 @@ pub use mess_log::committer::CommitterMetrics;
 pub struct EngineMetrics {
     /// Durable committer metrics: `fdatasync` p50/p95/p99, the degradation
     /// flag (§2.6), and append-throughput counters.
-    pub commit:                    CommitterMetrics,
+    pub commit: CommitterMetrics,
     /// The direct owner's durable watermark position (highest durable global
     /// position + 1). It can lead the published read watermark while the
     /// in-process index tiers catch up. Consequently, app-facing subscription
@@ -1995,44 +2098,50 @@ pub struct EngineMetrics {
     /// watermark exposed as [`EngineMetrics::total_events`], not this field.
     /// Both values include filtered `$registry` positions and neither is an
     /// application-event backlog count.
-    pub durable_watermark:         u64,
+    pub durable_watermark: u64,
     /// Whether a barrier fault has poisoned the store (D8): writes fail fast,
     /// reads clamp to the frozen watermark. Distinct from `fsync_degraded`
     /// (merely slow but still `Ok`, §2.6).
-    pub degraded_poisoned:         bool,
+    pub degraded_poisoned: bool,
+    /// FlatOwner result slots retained for index-aligned publication.
+    pub owner_outcome_scratch_retained_slots: usize,
+    /// FlatOwner result scratch retained bytes.
+    pub owner_outcome_scratch_retained_bytes: usize,
+    /// Oversize owner result groups whose transient capacity was shed.
+    pub owner_outcome_scratch_trims: usize,
     /// Cumulative sealed block-cache hits.
-    pub cache_hits:                u64,
+    pub cache_hits: u64,
     /// Cumulative sealed block-cache misses.
-    pub cache_misses:              u64,
+    pub cache_misses: u64,
     /// Block-cache hit rate over all lookups so far, `[0, 1]`.
-    pub cache_hit_rate:            f64,
+    pub cache_hit_rate: f64,
     /// Live cached blocks.
-    pub cache_entries:             usize,
+    pub cache_entries: usize,
     /// Resident cache weight in bytes.
-    pub cache_weight_bytes:        u64,
+    pub cache_weight_bytes: u64,
     /// Sealed segments installed in the cold tier.
-    pub sealed_segment_count:      usize,
+    pub sealed_segment_count: usize,
     /// Total canonical v3 events committed and published (the published read
     /// watermark), including filtered `$registry` events. Not the number of
     /// application-visible records.
-    pub total_events:              u64,
+    pub total_events: u64,
     /// Age of the active segment since this process opened it, in seconds.
-    pub active_segment_age_secs:   f64,
+    pub active_segment_age_secs: f64,
     /// Seal-path durability-barrier (`fsync`) latency (`bn-e2y`): the
     /// sidecar + directory fsyncs the sealer issues off the append path.
     /// A near-full SSD stalls these exactly as it stalls the commit
     /// barrier, so they are timed and alarmed separately from
     /// [`commit`](Self::commit)`.fsync`.
-    pub seal_fsync:                LatencySnapshot,
+    pub seal_fsync: LatencySnapshot,
     /// Whether seal-path barrier latency has crossed the degradation threshold
     /// — the sticky store-status flag (§2.6) for the seal durability site.
-    pub seal_fsync_degraded:       bool,
+    pub seal_fsync_degraded: bool,
     /// Seal-path barriers that crossed the threshold.
     pub seal_fsync_degraded_trips: u64,
     /// Seal duration (`roll → sealed installed`) latency distribution.
-    pub seal_duration:             LatencySnapshot,
+    pub seal_duration: LatencySnapshot,
     /// Segments sealed since this process opened.
-    pub seals:                     u64,
+    pub seals: u64,
     /// Seals skipped rather than completed (`bn-u6o`): the background
     /// roll-sealer gave up waiting for the hot index/watermark to catch up
     /// (its
@@ -2041,7 +2150,7 @@ pub struct EngineMetrics {
     /// stays durable and unsealed — served from the log until it is resealed
     /// or the store reopens — but an operator MUST be able to see it happened;
     /// see `mess_index::sealed::SealMetrics::record_seal_skipped`.
-    pub seals_skipped:             u64,
+    pub seals_skipped: u64,
 }
 
 impl Default for EngineOptions {
@@ -2266,8 +2375,11 @@ impl LogEngine {
         let owner_bytes = Arc::new(Semaphore::new(OWNER_RING_BYTES));
         let owner_inflight = Arc::new(AtomicUsize::new(0));
         let owner_status = Arc::new(OwnerStatus {
-            metrics:  direct.metrics_handle(),
-            degraded: AtomicBool::new(false),
+            metrics:                        direct.metrics_handle(),
+            degraded:                       AtomicBool::new(false),
+            outcome_scratch_retained_slots: AtomicUsize::new(0),
+            outcome_scratch_retained_bytes: AtomicUsize::new(0),
+            outcome_scratch_trims:          AtomicUsize::new(0),
         });
         let owner = FlatOwner {
             direct,
@@ -2276,6 +2388,9 @@ impl LogEngine {
             inflight: Arc::clone(&owner_inflight),
             status: Arc::clone(&owner_status),
             target: 1,
+            outcomes: Vec::new(),
+            outcome_reported_retained_slots: 0,
+            outcome_reported_retained_bytes: 0,
         };
         let owner_join = std::thread::Builder::new()
             .name("mess-flat-owner".into())
@@ -3072,6 +3187,24 @@ impl LogEngine {
                 .status
                 .degraded
                 .load(Ordering::Acquire),
+            owner_outcome_scratch_retained_slots: self
+                .inner
+                .owner
+                .status
+                .outcome_scratch_retained_slots
+                .load(Ordering::Relaxed),
+            owner_outcome_scratch_retained_bytes: self
+                .inner
+                .owner
+                .status
+                .outcome_scratch_retained_bytes
+                .load(Ordering::Relaxed),
+            owner_outcome_scratch_trims: self
+                .inner
+                .owner
+                .status
+                .outcome_scratch_trims
+                .load(Ordering::Relaxed),
             cache_hits: cache.hits(),
             cache_misses: cache.misses(),
             cache_hit_rate: cache.hit_rate(),

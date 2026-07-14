@@ -1,0 +1,20 @@
+[package]
+name = "direct_outcomes"
+version = "0.1.0"
+edition = "2024"
+
+# Standalone measurement harness; it is intentionally outside the root
+# workspace so release-profile measurements do not perturb workspace policy.
+[workspace]
+
+[dependencies]
+libc = "0.2"
+mess-log = { path = "../../crates/mess-log" }
+mess-store = { path = "../../crates/mess-store" }
+mess-testkit = { path = "../../crates/mess-testkit" }
+tokio = { version = "1.52", features = ["full"] }
+
+[profile.release]
+lto = "thin"
+debug = true
+

@@ -48,12 +48,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use smallvec::SmallVec;
+
 use crate::degraded::{Degraded, PoisonCause};
 pub use crate::degraded::{
     Degraded as StoreDegraded, PoisonCause as BarrierPoisonCause,
 };
 use crate::encode::{
     BatchEncoder, BatchInput, EncodeError, PreparedBatch, Subframe,
+    SubframeError,
 };
 use crate::fold_chain::ChainHead;
 use crate::runtime::{Fs, Runtime};
@@ -333,31 +336,44 @@ pub use crate::metrics::{DEFAULT_FSYNC_THRESHOLD, LatencySnapshot};
 /// loudly), and the append-throughput counters, all lock-free.
 struct Metrics {
     /// `fdatasync` barrier latency distribution.
-    fsync:   LatencyHistogram,
+    fsync:                           LatencyHistogram,
     /// The mandatory degradation alarm on barrier latency (§2.6).
-    alarm:   DegradationAlarm,
+    alarm:                           DegradationAlarm,
     /// Commit groups committed (one barrier each in a barriered mode).
-    groups:  Counter,
+    groups:                          Counter,
     /// Batches durably written.
-    batches: Counter,
+    batches:                         Counter,
     /// Events durably written.
-    events:  Counter,
+    events:                          Counter,
     /// Payload+framing bytes durably written (the `encoded_len` sum).
-    bytes:   Counter,
+    bytes:                           Counter,
+    /// Direct-owner retained batch slots after the most recent commit.
+    direct_scratch_retained_batches: AtomicU64,
+    /// Direct-owner retained request/effect/index bytes after the most recent
+    /// commit.
+    direct_scratch_retained_bytes:   AtomicU64,
+    /// Oversize direct groups whose transient capacity was shed on return.
+    direct_scratch_trims:            Counter,
+    /// Input batches whose subframe descriptors exceeded the inline stack.
+    direct_subframe_spills:          Counter,
 }
 
 impl Default for Metrics {
     fn default() -> Self {
         Metrics {
-            fsync:   LatencyHistogram::new(),
-            alarm:   DegradationAlarm::new(
+            fsync:                           LatencyHistogram::new(),
+            alarm:                           DegradationAlarm::new(
                 "fdatasync",
                 DEFAULT_FSYNC_THRESHOLD,
             ),
-            groups:  Counter::new(),
-            batches: Counter::new(),
-            events:  Counter::new(),
-            bytes:   Counter::new(),
+            groups:                          Counter::new(),
+            batches:                         Counter::new(),
+            events:                          Counter::new(),
+            bytes:                           Counter::new(),
+            direct_scratch_retained_batches: AtomicU64::new(0),
+            direct_scratch_retained_bytes:   AtomicU64::new(0),
+            direct_scratch_trims:            Counter::new(),
+            direct_subframe_spills:          Counter::new(),
         }
     }
 }
@@ -373,14 +389,22 @@ impl Metrics {
 
     fn snapshot(&self) -> CommitterMetrics {
         CommitterMetrics {
-            fsync:                 self.fsync.snapshot(),
-            fsync_degraded:        self.alarm.is_tripped(),
-            fsync_degraded_trips:  self.alarm.trips(),
-            fsync_threshold_nanos: self.alarm.threshold_nanos(),
-            groups:                self.groups.get(),
-            batches:               self.batches.get(),
-            events:                self.events.get(),
-            bytes:                 self.bytes.get(),
+            fsync:                           self.fsync.snapshot(),
+            fsync_degraded:                  self.alarm.is_tripped(),
+            fsync_degraded_trips:            self.alarm.trips(),
+            fsync_threshold_nanos:           self.alarm.threshold_nanos(),
+            groups:                          self.groups.get(),
+            batches:                         self.batches.get(),
+            events:                          self.events.get(),
+            bytes:                           self.bytes.get(),
+            direct_scratch_retained_batches: self
+                .direct_scratch_retained_batches
+                .load(Ordering::Relaxed),
+            direct_scratch_retained_bytes:   self
+                .direct_scratch_retained_bytes
+                .load(Ordering::Relaxed),
+            direct_scratch_trims:            self.direct_scratch_trims.get(),
+            direct_subframe_spills:          self.direct_subframe_spills.get(),
         }
     }
 }
@@ -393,23 +417,31 @@ impl Metrics {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CommitterMetrics {
     /// `fdatasync` barrier latency (p50/p95/p99/max/mean, nanoseconds).
-    pub fsync:                 LatencySnapshot,
+    pub fsync:                           LatencySnapshot,
     /// Whether barrier latency has crossed the degradation threshold — the
     /// sticky store-status flag (§2.6). `true` means the device has shown
     /// degraded-load `fdatasync` latency at least once.
-    pub fsync_degraded:        bool,
+    pub fsync_degraded:                  bool,
     /// Number of barriers that crossed the threshold.
-    pub fsync_degraded_trips:  u64,
+    pub fsync_degraded_trips:            u64,
     /// The active degradation threshold, in nanoseconds.
-    pub fsync_threshold_nanos: u64,
+    pub fsync_threshold_nanos:           u64,
     /// Commit groups committed.
-    pub groups:                u64,
+    pub groups:                          u64,
     /// Batches durably written.
-    pub batches:               u64,
+    pub batches:                         u64,
     /// Events durably written.
-    pub events:                u64,
+    pub events:                          u64,
     /// Payload+framing bytes durably written.
-    pub bytes:                 u64,
+    pub bytes:                           u64,
+    /// Direct-owner request/effect slots retained for reuse.
+    pub direct_scratch_retained_batches: u64,
+    /// Direct-owner request/effect/index storage retained for reuse, in bytes.
+    pub direct_scratch_retained_bytes:   u64,
+    /// Number of oversize calls whose transient scratch was shed.
+    pub direct_scratch_trims:            u64,
+    /// Input batches larger than the 16-subframe inline direct scratch.
+    pub direct_subframe_spills:          u64,
 }
 
 /// Cloneable query-side view of a committer's lock-free metrics core.
@@ -705,7 +737,65 @@ struct CommitReq {
     /// Ordered-unit membership (`bn-2di`), `None` for a standalone batch.
     /// Carries the atomic-failure rule of [`AppendError::UnitAborted`].
     unit:                 Option<UnitTag>,
+    /// `Some` only on the asynchronous path. `Option<Arc<_>>` has the same
+    /// size/layout as the old mandatory `Ack`; direct indexes live in a
+    /// parallel owner-only scratch vector, keeping async `CommitReq`
+    /// unchanged.
+    ack:                  Option<Ack>,
+}
+
+// Layout oracle for the async path before direct-owner completions were added.
+// Keep this field-for-field copy local: a future field addition or a loss of
+// `Arc`'s null niche must fail compilation rather than silently increasing the
+// shared request allocation that `bn-21ew` is required to leave unchanged.
+#[allow(dead_code)]
+struct CommitReqWithMandatoryAck {
+    stream_id:            u64,
+    category_id:          u64,
+    first_stream_version: u64,
+    events:               CommitEvents,
+    encoded_len:          u64,
+    unit:                 Option<UnitTag>,
     ack:                  Ack,
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<Option<Ack>>() == std::mem::size_of::<Ack>());
+    assert!(std::mem::align_of::<Option<Ack>>() == std::mem::align_of::<Ack>());
+    assert!(
+        std::mem::size_of::<CommitReq>()
+            == std::mem::size_of::<CommitReqWithMandatoryAck>()
+    );
+    assert!(
+        std::mem::align_of::<CommitReq>()
+            == std::mem::align_of::<CommitReqWithMandatoryAck>()
+    );
+};
+
+struct CommitEffect {
+    /// Present only for the async path. `Option<Arc<_>>` uses Arc's null
+    /// niche, so the async per-group allocation keeps the exact old `(Ack,
+    /// Result)` size while direct effects carry no synchronization object.
+    ack:     Option<Ack>,
+    outcome: Result<AppendOutcome, AppendError>,
+}
+
+// The async wrapper deliberately keeps its old per-group allocation size.
+const _: () = assert!(
+    std::mem::size_of::<CommitEffect>()
+        == std::mem::size_of::<(Ack, Result<AppendOutcome, AppendError>,)>()
+);
+const _: () = assert!(
+    std::mem::align_of::<CommitEffect>()
+        == std::mem::align_of::<(Ack, Result<AppendOutcome, AppendError>,)>()
+);
+
+fn commit_effect(
+    req: &CommitReq,
+    outcome: Result<AppendOutcome, AppendError>,
+) -> CommitEffect {
+    let ack = req.ack.as_ref().map(Arc::clone);
+    CommitEffect { ack, outcome }
 }
 
 enum CommitEvents {
@@ -779,22 +869,95 @@ fn subframes_of(events: &[EventInput]) -> Vec<Subframe<'_>> {
         .collect()
 }
 
+/// Most owner batches are homogeneous and small. Keep their borrowed framing
+/// descriptors on the stack; a larger batch may spill for this call, but that
+/// allocation is dropped immediately and can never become retained scratch.
+const DIRECT_INLINE_SUBFRAMES: usize = 16;
+type DirectSubframes<'a> = SmallVec<[Subframe<'a>; DIRECT_INLINE_SUBFRAMES]>;
+
+fn direct_subframes_of(events: &[EventInput]) -> DirectSubframes<'_> {
+    events
+        .iter()
+        .map(|e| {
+            Subframe::plain(
+                e.event_type_id,
+                e.schema_version,
+                e.codec_id,
+                &e.payload,
+            )
+        })
+        .collect()
+}
+
+/// Allocation-free preflight for [`EventInput`]'s guaranteed-plain framing.
+/// It is the closed form of `BatchEncoder::total_len`: `EventInput` fixes
+/// compression/metadata to zero, so payload representability and the A2/A5
+/// bounds are the only fallible subframe properties.
+fn direct_total_len(
+    events: &[EventInput],
+    chain_enabled: bool,
+) -> Result<u64, EncodeError> {
+    if events.is_empty() {
+        return Err(EncodeError::EmptyBatch);
+    }
+    if u32::try_from(events.len()).is_err() {
+        return Err(EncodeError::TooManyFrames { count: events.len() });
+    }
+    let mut frames_len = 0u64;
+    for (index, event) in events.iter().enumerate() {
+        if u32::try_from(event.payload.len()).is_err() {
+            return Err(EncodeError::Subframe {
+                index,
+                reason: SubframeError::PayloadTooLarge {
+                    len: event.payload.len(),
+                },
+            });
+        }
+        frames_len = frames_len.saturating_add(
+            crate::format::SUBFRAME_HDR_LEN as u64 + event.payload.len() as u64,
+        );
+    }
+    let total_len = crate::format::HEADER_LEN as u64
+        + if chain_enabled { crate::format::CHAIN_LEN as u64 } else { 0 }
+        + frames_len
+        + crate::format::MARKER_LEN as u64;
+    if total_len > crate::format::MAX_BATCH_LEN {
+        return Err(EncodeError::BatchTooLarge {
+            total_len,
+            max: crate::format::MAX_BATCH_LEN,
+        });
+    }
+    Ok(total_len)
+}
+
 fn append_commit_req<F: Fs>(
     writer: &mut SegmentWriter<F>,
     req: &mut CommitReq,
     crypto_chain: Option<&[u8; crate::format::CHAIN_LEN]>,
 ) -> Result<crate::writer::Receipt, WriteError> {
     match &mut req.events {
-        CommitEvents::Inputs(events) => {
-            let subs = subframes_of(events);
-            writer.append(&BatchSpec {
-                stream_id: req.stream_id,
-                category_id: req.category_id,
-                first_stream_version: req.first_stream_version,
-                crypto_chain,
-                subframes: &subs,
-            })
-        }
+        CommitEvents::Inputs(events) => match req.ack.as_ref() {
+            Some(_) => {
+                let subs = subframes_of(events);
+                writer.append(&BatchSpec {
+                    stream_id: req.stream_id,
+                    category_id: req.category_id,
+                    first_stream_version: req.first_stream_version,
+                    crypto_chain,
+                    subframes: &subs,
+                })
+            }
+            None => {
+                let subs = direct_subframes_of(events);
+                writer.append(&BatchSpec {
+                    stream_id: req.stream_id,
+                    category_id: req.category_id,
+                    first_stream_version: req.first_stream_version,
+                    crypto_chain,
+                    subframes: &subs,
+                })
+            }
+        },
         CommitEvents::Prepared(batch) => writer.append_prepared(
             &PreparedBatchSpec {
                 stream_id: req.stream_id,
@@ -1001,10 +1164,11 @@ fn roll_segment<F: Fs>(
     Ok(())
 }
 
-/// Write, barrier, advance the watermark, and ack one gathered group
+/// Write, barrier, advance the watermark, and finalize one gathered group
 /// (§2.1 steps 2–6). Pure blocking fs work — no `.await`, so no
-/// appender-facing lock spans the barrier (§2.5). Returns nothing; every
-/// request in `group` is resolved through its ack.
+/// appender-facing lock spans the barrier (§2.5). Appends one effect per
+/// request; its caller either fulfills the async ack or consumes the direct
+/// index-aligned result.
 ///
 /// `roller` (`bn-1vu`): when a batch would overflow the active segment (A8),
 /// the committer rolls to a fresh segment and retries the batch once, so a
@@ -1021,7 +1185,7 @@ fn roll_segment<F: Fs>(
 /// threaded through here because a unit can span adjacent commit GROUPS in the
 /// non-coalescing modes.
 #[allow(clippy::too_many_arguments)] // internal seam; each arg is a distinct shared handle
-fn commit_group<R: Runtime, F: Fs>(
+fn commit_group_inner<R: Runtime, F: Fs>(
     rt: &R,
     writer: &mut SegmentWriter<F>,
     group: &mut [CommitReq],
@@ -1033,11 +1197,11 @@ fn commit_group<R: Runtime, F: Fs>(
     chain_enabled: bool,
     heads: &mut HashMap<u64, ChainHead>,
     failed_units: &mut HashSet<u64>,
+    effects: &mut Vec<CommitEffect>,
 ) {
+    let effect_start = effects.len();
     // Steps 2–3: assign positions centrally + write each batch. `next_pos`
     // advances only for successfully written batches.
-    let mut acks: Vec<(Ack, Result<AppendOutcome, AppendError>)> =
-        Vec::with_capacity(group.len());
     let mut wrote_any = false;
     for req in group {
         // `bn-2di` (unit atomicity): an earlier batch of this unit already
@@ -1050,7 +1214,7 @@ fn commit_group<R: Runtime, F: Fs>(
             if unit.last {
                 failed_units.remove(&unit.id);
             }
-            acks.push((req.ack.clone(), Err(AppendError::UnitAborted)));
+            effects.push(commit_effect(req, Err(AppendError::UnitAborted)));
             continue;
         }
         // Fold-chain (spec 05 §6, G10): when enabled, stamp this batch's
@@ -1184,7 +1348,7 @@ fn commit_group<R: Runtime, F: Fs>(
                 failed_units.remove(&unit.id);
             }
         }
-        acks.push((req.ack.clone(), res));
+        effects.push(commit_effect(req, res));
     }
 
     // Step 4: the barrier. One `fdatasync` covers every `pwrite` above
@@ -1229,21 +1393,60 @@ fn commit_group<R: Runtime, F: Fs>(
         watermark.advance(writer.next_pos());
     }
 
-    // Step 6: ack, in position order (acks was built in gather order, which
-    // is position order). Positions are already watermark-covered by step 5.
-    for (ack, res) in acks {
-        let res = if barrier_ok {
-            res
-        } else {
-            match res {
+    // Step 6: finalize in position order (effects were built in gather order,
+    // which is position order). The async wrapper fulfills ack slots; the
+    // owner consumes the same effects directly by index.
+    if !barrier_ok {
+        for effect in &mut effects[effect_start..] {
+            effect.outcome = match std::mem::replace(
+                &mut effect.outcome,
+                Ok(AppendOutcome::Indeterminate),
+            ) {
                 Ok(AppendOutcome::Acked { .. })
                 | Ok(AppendOutcome::Indeterminate) => {
                     Ok(AppendOutcome::Indeterminate)
                 }
                 other => other,
-            }
-        };
-        fulfill(&ack, res);
+            };
+        }
+    }
+}
+
+/// Async compatibility wrapper. This deliberately preserves the existing ack
+/// machinery and allocation shape; only `DirectCommitter` supplies reusable
+/// effect storage and index completions.
+#[allow(clippy::too_many_arguments)]
+fn commit_group<R: Runtime, F: Fs>(
+    rt: &R,
+    writer: &mut SegmentWriter<F>,
+    group: &mut [CommitReq],
+    policy: &Policy,
+    watermark: &Watermark,
+    metrics: &Metrics,
+    degraded: &Degraded,
+    roller: Option<&Roller>,
+    chain_enabled: bool,
+    heads: &mut HashMap<u64, ChainHead>,
+    failed_units: &mut HashSet<u64>,
+) {
+    let mut effects = Vec::with_capacity(group.len());
+    commit_group_inner(
+        rt,
+        writer,
+        group,
+        policy,
+        watermark,
+        metrics,
+        degraded,
+        roller,
+        chain_enabled,
+        heads,
+        failed_units,
+        &mut effects,
+    );
+    for effect in effects {
+        let ack = effect.ack.expect("async effect carries its ack");
+        fulfill(&ack, effect.outcome);
     }
 }
 
@@ -1296,7 +1499,8 @@ async fn committer_loop<R: Runtime, F: Fs>(
                         failed_units.insert(unit.id);
                     }
                 }
-                fulfill(&req.ack, Err(AppendError::StorePoisoned));
+                let ack = req.ack.expect("async request carries its ack");
+                fulfill(&ack, Err(AppendError::StorePoisoned));
             }
             continue;
         }
@@ -1407,7 +1611,7 @@ async fn submit(
         // A standalone batch is its own fate: nothing else depends on it and it
         // depends on nothing (`bn-2di`).
         unit: None,
-        ack: ack.clone(),
+        ack: Some(ack.clone()),
     };
 
     // Submit, then unmark. No `.await` between the two, so a single-threaded
@@ -1559,7 +1763,7 @@ fn submit_ordered_now(
             events: CommitEvents::Inputs(req.events),
             encoded_len,
             unit: unit_id.map(|id| UnitTag { id, last: i == last_idx }),
-            ack,
+            ack: Some(ack),
         });
     }
 
@@ -1773,6 +1977,52 @@ pub struct DirectCommitter<R: Runtime, F: Fs> {
     chain_enabled: bool,
     heads:         HashMap<u64, ChainHead>,
     failed_units:  HashSet<u64>,
+    scratch:       DirectScratch,
+}
+
+const DIRECT_RETAINED_BATCHES: usize = 256;
+const DIRECT_RETAINED_BYTE_CAP: usize = 1024 * 1024;
+#[derive(Clone, Copy)]
+struct DirectIndex {
+    unit:  u32,
+    batch: u32,
+}
+const _: () = assert!(
+    DIRECT_RETAINED_BATCHES
+        * (std::mem::size_of::<CommitReq>()
+            + std::mem::size_of::<CommitEffect>()
+            + std::mem::size_of::<DirectIndex>())
+        <= DIRECT_RETAINED_BYTE_CAP
+);
+
+#[derive(Default)]
+struct DirectScratch {
+    requests:         Vec<CommitReq>,
+    effects:          Vec<CommitEffect>,
+    indexes:          Vec<DirectIndex>,
+    reported_batches: usize,
+    reported_bytes:   usize,
+}
+
+impl DirectScratch {
+    /// An untrusted group may temporarily grow either vector. Never let that
+    /// capacity become a permanent owner-thread memory tax.
+    fn cap_retained(&mut self) -> bool {
+        let mut trimmed = false;
+        if self.requests.capacity() > DIRECT_RETAINED_BATCHES {
+            self.requests = Vec::with_capacity(DIRECT_RETAINED_BATCHES);
+            trimmed = true;
+        }
+        if self.effects.capacity() > DIRECT_RETAINED_BATCHES {
+            self.effects = Vec::with_capacity(DIRECT_RETAINED_BATCHES);
+            trimmed = true;
+        }
+        if self.indexes.capacity() > DIRECT_RETAINED_BATCHES {
+            self.indexes = Vec::with_capacity(DIRECT_RETAINED_BATCHES);
+            trimmed = true;
+        }
+        trimmed
+    }
 }
 
 impl<R: Runtime, F: Fs> DirectCommitter<R, F> {
@@ -1798,19 +2048,24 @@ impl<R: Runtime, F: Fs> DirectCommitter<R, F> {
             chain_enabled,
             heads,
             failed_units: HashSet::new(),
+            scratch: DirectScratch::default(),
         }
     }
 
     /// Commit a gathered set of ordered units with one covering durability
-    /// decision. Each inner vector is one ordered unit; its results are index
-    /// aligned. Preflight validates the gathered set before any write, so an
-    /// invalid later member cannot strand an earlier registry record. A
-    /// failure in one unit never aborts an unrelated unit once writing begins,
-    /// while a failed member aborts every later member of that same unit.
+    /// decision. Each inner vector is one ordered unit. After the covering
+    /// barrier and watermark decision, `complete(unit_index, batch_index,
+    /// outcome)` is invoked exactly once per input in gather order; no ack
+    /// lock or nested result shape is materialized. Preflight validates the
+    /// gathered set before any write, so an invalid later member cannot strand
+    /// an earlier registry record. A failure in one unit never aborts an
+    /// unrelated unit once writing begins, while a failed member aborts every
+    /// later member of that same unit.
     pub fn commit_ordered_group(
         &mut self,
         units: Vec<Vec<DirectAppendRequest>>,
-    ) -> Result<Vec<Vec<DirectBatchOutcome>>, AppendError> {
+        mut complete: impl FnMut(usize, usize, DirectBatchOutcome),
+    ) -> Result<(), AppendError> {
         if self.degraded.is_poisoned() {
             return Err(AppendError::StorePoisoned);
         }
@@ -1819,40 +2074,47 @@ impl<R: Runtime, F: Fs> DirectCommitter<R, F> {
         // batch immediately before the domain batch that first uses its ids.
         // Validate every member before the first byte lands. Prepared batches
         // already carry validated final framing, so their check is O(1);
-        // ordinary inputs retain the canonical encoder validation pass.
-        let placeholder_chain = [0u8; crate::format::CHAIN_LEN];
-        for req in units.iter().flatten() {
-            match req {
-                DirectAppendRequest::Inputs(req) => {
-                    let subs = subframes_of(&req.events);
-                    BatchEncoder::total_len(&BatchInput {
-                        segment_epoch:        0,
-                        batch_id:             0,
-                        first_global_pos:     0,
-                        stream_id:            req.stream_id,
-                        category_id:          req.category_id,
-                        first_stream_version: req.first_stream_version,
-                        crypto_chain:         self
-                            .chain_enabled
-                            .then_some(&placeholder_chain),
-                        subframes:            &subs,
-                    })
-                    .map_err(AppendError::Encode)?;
+        // ordinary plain inputs use the canonical framing formula without
+        // materializing borrowed subframes (differentially tested below).
+        let mut subframe_spills = 0u64;
+        let preflight: Result<(), AppendError> = (|| {
+            for req in units.iter().flatten() {
+                match req {
+                    DirectAppendRequest::Inputs(req) => {
+                        if req.events.len() > DIRECT_INLINE_SUBFRAMES {
+                            subframe_spills += 1;
+                        }
+                        direct_total_len(&req.events, self.chain_enabled)
+                            .map_err(AppendError::Encode)?;
+                    }
+                    DirectAppendRequest::Prepared { batch, .. } => batch
+                        .validate_for_chain(self.chain_enabled)
+                        .map_err(AppendError::Encode)?,
                 }
-                DirectAppendRequest::Prepared { batch, .. } => batch
-                    .validate_for_chain(self.chain_enabled)
-                    .map_err(AppendError::Encode)?,
             }
+            Ok(())
+        })();
+        if subframe_spills != 0 {
+            self.metrics.direct_subframe_spills.add(subframe_spills);
         }
+        preflight?;
 
-        let shape: Vec<usize> = units.iter().map(Vec::len).collect();
-        let mut group = Vec::with_capacity(shape.iter().sum());
-        let mut acks = Vec::with_capacity(group.capacity());
-        for reqs in units {
+        debug_assert!(self.scratch.requests.is_empty());
+        debug_assert!(self.scratch.effects.is_empty());
+        debug_assert!(self.scratch.indexes.is_empty());
+        let request_count = units.iter().map(Vec::len).sum();
+        self.scratch.requests.reserve(request_count);
+        self.scratch.effects.reserve(request_count);
+        self.scratch.indexes.reserve(request_count);
+        for (unit_index, reqs) in units.into_iter().enumerate() {
+            let unit_index = u32::try_from(unit_index)
+                .expect("a direct group cannot contain 2^32 ordered units");
             let unit_id = (reqs.len() > 1)
                 .then(|| NEXT_UNIT_ID.fetch_add(1, Ordering::Relaxed));
             let last_idx = reqs.len().saturating_sub(1);
-            for (i, req) in reqs.into_iter().enumerate() {
+            for (batch_index, req) in reqs.into_iter().enumerate() {
+                let batch_index = u32::try_from(batch_index)
+                    .expect("an ordered unit cannot contain 2^32 batches");
                 let (stream_id, category_id, first_stream_version, events) =
                     match req {
                         DirectAppendRequest::Inputs(req) => (
@@ -1873,9 +2135,7 @@ impl<R: Runtime, F: Fs> DirectCommitter<R, F> {
                             CommitEvents::Prepared(batch),
                         ),
                     };
-                let ack = new_ack();
-                acks.push(ack.clone());
-                group.push(CommitReq {
+                self.scratch.requests.push(CommitReq {
                     stream_id,
                     category_id,
                     first_stream_version,
@@ -1886,8 +2146,15 @@ impl<R: Runtime, F: Fs> DirectCommitter<R, F> {
                     // walk here; SegmentWriter performs the authoritative
                     // validation while encoding below.
                     encoded_len: 0,
-                    unit: unit_id.map(|id| UnitTag { id, last: i == last_idx }),
-                    ack,
+                    unit: unit_id.map(|id| UnitTag {
+                        id,
+                        last: batch_index as usize == last_idx,
+                    }),
+                    ack: None,
+                });
+                self.scratch.indexes.push(DirectIndex {
+                    unit:  unit_index,
+                    batch: batch_index,
                 });
             }
         }
@@ -1896,7 +2163,7 @@ impl<R: Runtime, F: Fs> DirectCommitter<R, F> {
             // `Os` is sync-per-batch by contract. Ordered-unit members remain
             // adjacent and share `failed_units`, but each accepted batch earns
             // its own fdatasync before the next is written.
-            for req in &mut group {
+            for req in &mut self.scratch.requests {
                 if self.degraded.is_poisoned() {
                     if let Some(unit) = req.unit {
                         if unit.last {
@@ -1905,10 +2172,13 @@ impl<R: Runtime, F: Fs> DirectCommitter<R, F> {
                             self.failed_units.insert(unit.id);
                         }
                     }
-                    fulfill(&req.ack, Err(AppendError::StorePoisoned));
+                    self.scratch.effects.push(CommitEffect {
+                        ack:     None,
+                        outcome: Err(AppendError::StorePoisoned),
+                    });
                     continue;
                 }
-                commit_group(
+                commit_group_inner(
                     &self.rt,
                     self.writer.as_mut().expect("direct committer is live"),
                     std::slice::from_mut(req),
@@ -1920,13 +2190,14 @@ impl<R: Runtime, F: Fs> DirectCommitter<R, F> {
                     self.chain_enabled,
                     &mut self.heads,
                     &mut self.failed_units,
+                    &mut self.scratch.effects,
                 );
             }
-        } else if !group.is_empty() {
-            commit_group(
+        } else if !self.scratch.requests.is_empty() {
+            commit_group_inner(
                 &self.rt,
                 self.writer.as_mut().expect("direct committer is live"),
-                &mut group,
+                &mut self.scratch.requests,
                 &self.policy,
                 &self.watermark,
                 &self.metrics,
@@ -1935,16 +2206,27 @@ impl<R: Runtime, F: Fs> DirectCommitter<R, F> {
                 self.chain_enabled,
                 &mut self.heads,
                 &mut self.failed_units,
+                &mut self.scratch.effects,
             );
         }
 
-        let mut flat = acks.into_iter().zip(group).map(|(ack, req)| {
-            let outcome = ack
-                .lock()
-                .expect("direct ack poisoned")
-                .outcome
-                .take()
-                .expect("direct commit resolves every request");
+        debug_assert_eq!(
+            self.scratch.requests.len(),
+            self.scratch.effects.len()
+        );
+        debug_assert_eq!(
+            self.scratch.requests.len(),
+            self.scratch.indexes.len()
+        );
+        for ((req, effect), index) in self
+            .scratch
+            .requests
+            .drain(..)
+            .zip(self.scratch.effects.drain(..))
+            .zip(self.scratch.indexes.drain(..))
+        {
+            debug_assert!(req.ack.is_none());
+            debug_assert!(effect.ack.is_none());
             let events = match req.events {
                 CommitEvents::Inputs(events) => {
                     DirectBatchEvents::Inputs(events)
@@ -1953,12 +2235,53 @@ impl<R: Runtime, F: Fs> DirectCommitter<R, F> {
                     DirectBatchEvents::Prepared(batch)
                 }
             };
-            DirectBatchOutcome { outcome, events }
-        });
-        Ok(shape
-            .into_iter()
-            .map(|len| flat.by_ref().take(len).collect())
-            .collect())
+            complete(
+                index.unit as usize,
+                index.batch as usize,
+                DirectBatchOutcome { outcome: effect.outcome, events },
+            );
+        }
+        let trimmed = self.scratch.cap_retained();
+        if trimmed {
+            self.metrics.direct_scratch_trims.incr();
+        }
+        let retained_batches = self
+            .scratch
+            .requests
+            .capacity()
+            .max(self.scratch.effects.capacity())
+            .max(self.scratch.indexes.capacity());
+        if trimmed || retained_batches != self.scratch.reported_batches {
+            self.metrics
+                .direct_scratch_retained_batches
+                .store(retained_batches as u64, Ordering::Relaxed);
+            self.scratch.reported_batches = retained_batches;
+        }
+        let retained_bytes = self
+            .scratch
+            .requests
+            .capacity()
+            .saturating_mul(std::mem::size_of::<CommitReq>())
+            .saturating_add(
+                self.scratch
+                    .effects
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<CommitEffect>()),
+            )
+            .saturating_add(
+                self.scratch
+                    .indexes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<DirectIndex>()),
+            );
+        debug_assert!(retained_bytes <= DIRECT_RETAINED_BYTE_CAP);
+        if trimmed || retained_bytes != self.scratch.reported_bytes {
+            self.metrics
+                .direct_scratch_retained_bytes
+                .store(retained_bytes as u64, Ordering::Relaxed);
+            self.scratch.reported_bytes = retained_bytes;
+        }
+        Ok(())
     }
 
     pub fn watermark(&self) -> Watermark { self.watermark.clone() }
@@ -2829,12 +3152,20 @@ mod tests {
             "/direct-group",
         );
         fs.syncs.store(0, Ordering::SeqCst);
-        let outcomes = direct
-            .commit_ordered_group(vec![
-                vec![req(1, 0, 2).into()],
-                vec![req(2, 0, 3).into()],
-                vec![req(3, 0, 1).into()],
-            ])
+        let mut outcomes: Vec<Vec<DirectBatchOutcome>> =
+            (0..3).map(|_| Vec::new()).collect();
+        direct
+            .commit_ordered_group(
+                vec![
+                    vec![req(1, 0, 2).into()],
+                    vec![req(2, 0, 3).into()],
+                    vec![req(3, 0, 1).into()],
+                ],
+                |unit, batch, outcome| {
+                    assert_eq!(batch, outcomes[unit].len());
+                    outcomes[unit].push(outcome);
+                },
+            )
             .unwrap();
         let spans: Vec<(u64, u64)> = outcomes
             .into_iter()
@@ -2851,6 +3182,33 @@ mod tests {
     }
 
     #[test]
+    fn direct_plain_preflight_matches_canonical_encoder() {
+        let chain = [0u8; crate::format::CHAIN_LEN];
+        for count in [1usize, DIRECT_INLINE_SUBFRAMES, 17, 1000] {
+            let request = req(7, 9, count);
+            let subframes = subframes_of(&request.events);
+            for chain_enabled in [false, true] {
+                let canonical = BatchEncoder::total_len(&BatchInput {
+                    segment_epoch:        0,
+                    batch_id:             0,
+                    first_global_pos:     0,
+                    stream_id:            request.stream_id,
+                    category_id:          request.category_id,
+                    first_stream_version: request.first_stream_version,
+                    crypto_chain:         chain_enabled.then_some(&chain),
+                    subframes:            &subframes,
+                });
+                assert_eq!(
+                    direct_total_len(&request.events, chain_enabled),
+                    canonical,
+                    "count={count} chain={chain_enabled}"
+                );
+            }
+        }
+        assert_eq!(direct_total_len(&[], false), Err(EncodeError::EmptyBatch));
+    }
+
+    #[test]
     fn direct_os_uses_one_barrier_per_batch() {
         let rt = SimRuntime::new(92);
         let fs = BarrierFaultFs {
@@ -2861,19 +3219,258 @@ mod tests {
         let mut direct =
             direct_fault_core(&rt, Durability::Os, &fs, "/direct-os");
         fs.syncs.store(0, Ordering::SeqCst);
-        let outcomes = direct
-            .commit_ordered_group(vec![vec![
-                req(1, 0, 1).into(),
-                req(1, 1, 1).into(),
-            ]])
+        let mut outcomes = Vec::new();
+        direct
+            .commit_ordered_group(
+                vec![vec![req(1, 0, 1).into(), req(1, 1, 1).into()]],
+                |unit, batch, outcome| {
+                    assert_eq!(unit, 0);
+                    assert_eq!(batch, outcomes.len());
+                    outcomes.push(outcome);
+                },
+            )
             .unwrap();
         assert!(
-            outcomes[0]
+            outcomes
                 .iter()
                 .all(|o| matches!(o.outcome, Ok(AppendOutcome::Acked { .. })))
         );
         assert_eq!(fs.syncs.load(Ordering::SeqCst), 2);
         assert_eq!(direct.metrics().groups, 2);
+    }
+
+    #[test]
+    fn direct_scratch_is_index_aligned_observable_and_sheds_oversize_capacity()
+    {
+        let rt = SimRuntime::new(94);
+        let fs = BarrierFaultFs {
+            inner: SimFs::new(Fault::Tail),
+            errno: Arc::new(AtomicI32::new(0)),
+            syncs: Arc::new(AtomicUsize::new(0)),
+        };
+        let mut direct =
+            direct_fault_core(&rt, Durability::Process, &fs, "/direct-cap");
+        let count = DIRECT_RETAINED_BATCHES + 1;
+        let units =
+            (0..count).map(|i| vec![req(i as u64 + 1, 0, 1).into()]).collect();
+        let mut completed = 0;
+        direct
+            .commit_ordered_group(units, |unit, batch, outcome| {
+                assert_eq!(unit, completed);
+                assert_eq!(batch, 0);
+                assert!(matches!(
+                    outcome.outcome,
+                    Ok(AppendOutcome::Acked { .. })
+                ));
+                completed += 1;
+            })
+            .unwrap();
+        assert_eq!(completed, count);
+        let metrics = direct.metrics();
+        assert_eq!(metrics.direct_scratch_trims, 1);
+        assert!(direct.scratch.requests.capacity() <= DIRECT_RETAINED_BATCHES);
+        assert!(direct.scratch.effects.capacity() <= DIRECT_RETAINED_BATCHES);
+        assert!(direct.scratch.indexes.capacity() <= DIRECT_RETAINED_BATCHES);
+        assert!(
+            metrics.direct_scratch_retained_batches
+                <= DIRECT_RETAINED_BATCHES as u64
+        );
+        let retained_bytes = direct.scratch.requests.capacity()
+            * std::mem::size_of::<CommitReq>()
+            + direct.scratch.effects.capacity()
+                * std::mem::size_of::<CommitEffect>()
+            + direct.scratch.indexes.capacity()
+                * std::mem::size_of::<DirectIndex>();
+        assert_eq!(
+            metrics.direct_scratch_retained_bytes,
+            retained_bytes as u64
+        );
+        assert!(
+            metrics.direct_scratch_retained_bytes
+                <= DIRECT_RETAINED_BYTE_CAP as u64
+        );
+        direct
+            .commit_ordered_group(
+                vec![vec![req(1, 1, DIRECT_INLINE_SUBFRAMES + 1).into()]],
+                |unit, batch, outcome| {
+                    assert_eq!((unit, batch), (0, 0));
+                    assert!(matches!(
+                        outcome.outcome,
+                        Ok(AppendOutcome::Acked { .. })
+                    ));
+                },
+            )
+            .unwrap();
+        let metrics = direct.metrics();
+        assert_eq!(metrics.direct_subframe_spills, 1);
+        assert_eq!(metrics.direct_scratch_trims, 1);
+        let retained_batches = metrics.direct_scratch_retained_batches;
+        let retained_bytes = metrics.direct_scratch_retained_bytes;
+        let mut completed = 0;
+        direct
+            .commit_ordered_group(
+                vec![
+                    vec![req(2, 0, DIRECT_INLINE_SUBFRAMES + 1).into()],
+                    vec![req(3, 0, DIRECT_INLINE_SUBFRAMES + 2).into()],
+                ],
+                |unit, batch, outcome| {
+                    assert_eq!((unit, batch), (completed, 0));
+                    assert!(matches!(
+                        outcome.outcome,
+                        Ok(AppendOutcome::Acked { .. })
+                    ));
+                    completed += 1;
+                },
+            )
+            .unwrap();
+        assert_eq!(completed, 2);
+        let metrics = direct.metrics();
+        assert_eq!(metrics.direct_subframe_spills, 3);
+        assert_eq!(metrics.direct_scratch_retained_batches, retained_batches);
+        assert_eq!(metrics.direct_scratch_retained_bytes, retained_bytes);
+    }
+
+    #[test]
+    fn direct_ordered_unit_keeps_partial_success_and_aborts_later_members() {
+        let rt = SimRuntime::new(95);
+        let fs = rt.fs();
+        let mut params = SegmentParams::new(10, 0, 100, 0);
+        // Exactly one 132-byte small batch fits in the 200-byte content area.
+        params.segment_size = 252;
+        let writer =
+            SegmentWriter::create(&fs, Path::new("/direct-unit"), params)
+                .unwrap();
+        let (roll_tx, roll_rx) = std::sync::mpsc::channel();
+        let roller = Roller::new(
+            |id| PathBuf::from(format!("/direct-unit-{id}")),
+            roll_tx,
+        );
+        let mut direct = DirectCommitter::with_roll_chained(
+            &rt,
+            writer,
+            Durability::Process,
+            roller,
+            ChainInit::off(),
+        );
+        let too_large = AppendRequest {
+            stream_id:            1,
+            category_id:          0,
+            first_stream_version: 1,
+            events:               vec![EventInput::plain(
+                1,
+                1,
+                0,
+                vec![0xAB; 512],
+            )],
+        };
+        let mut outcomes = Vec::new();
+        direct
+            .commit_ordered_group(
+                vec![vec![
+                    req(1, 0, 1).into(),
+                    too_large.into(),
+                    req(1, 2, 1).into(),
+                ]],
+                |unit, batch, outcome| {
+                    assert_eq!(unit, 0);
+                    assert_eq!(batch, outcomes.len());
+                    outcomes.push(outcome.outcome);
+                },
+            )
+            .unwrap();
+        assert!(matches!(outcomes[0], Ok(AppendOutcome::Acked { .. })));
+        assert!(matches!(outcomes[1], Err(AppendError::SegmentFull { .. })));
+        assert_eq!(outcomes[2], Err(AppendError::UnitAborted));
+        assert_eq!(direct.watermark().get(), 1);
+        assert_eq!(direct.metrics().batches, 1);
+        assert!(roll_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn direct_live_roll_preserves_dense_outcomes_and_reports_segment() {
+        let rt = SimRuntime::new(96);
+        let fs = rt.fs();
+        let mut params = SegmentParams::new(10, 0, 100, 0);
+        // 52-byte segment header + 200 bytes: one 132-byte small batch fits,
+        // and the second forces a live roll into the same-sized segment.
+        params.segment_size = 252;
+        let writer =
+            SegmentWriter::create(&fs, Path::new("/direct-roll"), params)
+                .unwrap();
+        let (roll_tx, roll_rx) = std::sync::mpsc::channel();
+        let roller = Roller::new(
+            |id| PathBuf::from(format!("/direct-roll-{id}")),
+            roll_tx,
+        );
+        let mut direct = DirectCommitter::with_roll_chained(
+            &rt,
+            writer,
+            Durability::Process,
+            roller,
+            ChainInit::off(),
+        );
+        let mut placed = Vec::new();
+        direct
+            .commit_ordered_group(
+                vec![vec![req(1, 0, 1).into(), req(1, 1, 1).into()]],
+                |_, _, outcome| placed.push(outcome.outcome.unwrap()),
+            )
+            .unwrap();
+        let positions: Vec<_> = placed
+            .iter()
+            .map(|outcome| match outcome {
+                AppendOutcome::Acked { first_position, segment_id, .. } => {
+                    (*first_position, *segment_id)
+                }
+                AppendOutcome::Indeterminate => panic!("healthy roll"),
+            })
+            .collect();
+        assert_eq!(positions, vec![(0, 10), (1, 11)]);
+        let rolled = roll_rx.try_recv().expect("old segment reported");
+        assert_eq!(rolled.segment_id, 10);
+        assert_eq!(direct.watermark().get(), 2);
+    }
+
+    #[test]
+    fn direct_roll_enospc_keeps_prefix_and_aborts_dependent_member() {
+        let rt = SimRuntime::new(97);
+        let fs = rt.fs();
+        let mut params = SegmentParams::new(10, 0, 100, 0);
+        params.segment_size = 252;
+        let writer =
+            SegmentWriter::create(&fs, Path::new("/direct-enospc"), params)
+                .unwrap();
+        let next = Path::new("/direct-enospc-11");
+        fs.inject_enospc(next, EnospcSite::Allocate);
+        let (roll_tx, roll_rx) = std::sync::mpsc::channel();
+        let roller = Roller::new(
+            |id| PathBuf::from(format!("/direct-enospc-{id}")),
+            roll_tx,
+        );
+        let mut direct = DirectCommitter::with_roll_chained(
+            &rt,
+            writer,
+            Durability::Process,
+            roller,
+            ChainInit::off(),
+        );
+        let mut outcomes = Vec::new();
+        direct
+            .commit_ordered_group(
+                vec![vec![
+                    req(1, 0, 1).into(),
+                    req(1, 1, 1).into(),
+                    req(1, 2, 1).into(),
+                ]],
+                |_, _, outcome| outcomes.push(outcome.outcome),
+            )
+            .unwrap();
+        assert!(matches!(outcomes[0], Ok(AppendOutcome::Acked { .. })));
+        assert_eq!(outcomes[1], Err(AppendError::StoreFull));
+        assert_eq!(outcomes[2], Err(AppendError::UnitAborted));
+        assert_eq!(direct.watermark().get(), 1);
+        assert!(roll_rx.try_recv().is_err(), "failed roll is not reported");
+        assert!(fs.open(next, OpenOpts::read_only()).is_err());
     }
 
     #[test]
@@ -2892,14 +3489,27 @@ mod tests {
         );
         fs.syncs.store(0, Ordering::SeqCst);
         fs.errno.store(libc::EIO, Ordering::SeqCst);
-        let first = direct
-            .commit_ordered_group(vec![vec![req(1, 0, 1).into()]])
+        let mut first = None;
+        direct
+            .commit_ordered_group(
+                vec![vec![req(1, 0, 1).into()]],
+                |unit, batch, outcome| {
+                    assert_eq!((unit, batch), (0, 0));
+                    first = Some(outcome);
+                },
+            )
             .unwrap();
-        assert_eq!(first[0][0].outcome, Ok(AppendOutcome::Indeterminate));
+        assert_eq!(
+            first.expect("direct outcome").outcome,
+            Ok(AppendOutcome::Indeterminate)
+        );
         assert!(direct.is_degraded());
         assert_eq!(direct.watermark().get(), 0);
         assert!(matches!(
-            direct.commit_ordered_group(vec![vec![req(1, 0, 1).into()]]),
+            direct.commit_ordered_group(
+                vec![vec![req(1, 0, 1).into()]],
+                |_, _, _| {}
+            ),
             Err(AppendError::StorePoisoned)
         ));
         assert_eq!(fs.syncs.load(Ordering::SeqCst), 1);
@@ -2909,6 +3519,35 @@ mod tests {
             1,
             "poisoned drop must not retry the failed barrier"
         );
+    }
+
+    #[test]
+    fn direct_barrier_enospc_is_indeterminate_and_freezes_watermark() {
+        let rt = SimRuntime::new(98);
+        let fs = BarrierFaultFs {
+            inner: SimFs::new(Fault::Tail),
+            errno: Arc::new(AtomicI32::new(0)),
+            syncs: Arc::new(AtomicUsize::new(0)),
+        };
+        let mut direct = direct_fault_core(
+            &rt,
+            Durability::group_default(),
+            &fs,
+            "/direct-enospc-barrier",
+        );
+        fs.syncs.store(0, Ordering::SeqCst);
+        fs.errno.store(libc::ENOSPC, Ordering::SeqCst);
+        let mut outcome = None;
+        direct
+            .commit_ordered_group(
+                vec![vec![req(1, 0, 1).into()]],
+                |_, _, completed| outcome = Some(completed.outcome),
+            )
+            .unwrap();
+        assert_eq!(outcome, Some(Ok(AppendOutcome::Indeterminate)));
+        assert!(direct.is_degraded());
+        assert_eq!(direct.watermark().get(), 0);
+        assert_eq!(fs.syncs.load(Ordering::SeqCst), 1);
     }
 
     /// One good `Os`-mode append (barrier succeeds), then a second whose

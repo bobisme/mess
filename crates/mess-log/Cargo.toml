@@ -13,6 +13,9 @@ blake3 = "1"
 # bn-36y: `fallocate(2)`/`FALLOC_FL_KEEP_SIZE` for segment preallocation and
 # `ENOSPC` classification. Unix-only; the crate already targets Unix (`std::os::unix`).
 libc = "0.2"
+# The direct owner keeps the common small-event shape entirely inline while
+# dropping attacker-sized spill storage after each batch.
+smallvec = "1.15"
 
 [dev-dependencies]
 stateright = "0.31"

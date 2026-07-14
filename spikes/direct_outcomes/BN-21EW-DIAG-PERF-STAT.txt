@@ -1,0 +1,44 @@
+# started on Tue Jul 14 13:52:49 2026
+
+0,,context-switches:u,2090572748,100.00,0.0,cs/sec  cs_per_second
+0,,cpu-migrations:u,2090572748,100.00,0.0,migrations/sec  migrations_per_second
+7957,,page-faults:u,2090572748,100.00,3806.1,faults/sec  page_faults_per_second
+2090.57,msec,task-clock:u,2090572748,100.00,0.1,CPUs  CPUs_utilized
+7789283,,branch-misses:u,1042987150,50.00,1.0,%  branch_miss_rate
+738387817,,branches:u,1054649047,50.00,353.2,M/sec  branch_frequency
+3703581893,,cpu-cycles:u,1396389409,67.00,1.8,GHz  cycles_frequency
+3583035853,,instructions:u,1047585598,50.00,1.0,instructions  insn_per_cycle
+358412892,,stalled-cycles-frontend:u,1035923701,49.00,0.10,frontend_cycles_idle
+# started on Tue Jul 14 13:53:11 2026
+
+0,,context-switches:u,2151013129,100.00,0.0,cs/sec  cs_per_second
+0,,cpu-migrations:u,2151013129,100.00,0.0,migrations/sec  migrations_per_second
+8736,,page-faults:u,2151013129,100.00,4061.3,faults/sec  page_faults_per_second
+2151.01,msec,task-clock:u,2151013129,100.00,1.5,CPUs  CPUs_utilized
+7732038,,branch-misses:u,1066314842,49.00,1.0,%  branch_miss_rate
+744358058,,branches:u,1063054195,49.00,346.0,M/sec  branch_frequency
+3863505976,,cpu-cycles:u,1417701942,66.00,1.8,GHz  cycles_frequency
+3597311060,,instructions:u,1084698287,50.00,0.9,instructions  insn_per_cycle
+370331978,,stalled-cycles-frontend:u,1087958934,50.00,0.10,frontend_cycles_idle
+# started on Tue Jul 14 13:53:21 2026
+
+0,,context-switches:u,2109046431,100.00,0.0,cs/sec  cs_per_second
+0,,cpu-migrations:u,2109046431,100.00,0.0,migrations/sec  migrations_per_second
+7948,,page-faults:u,2109046431,100.00,3768.5,faults/sec  page_faults_per_second
+2109.05,msec,task-clock:u,2109046431,100.00,1.9,CPUs  CPUs_utilized
+7751535,,branch-misses:u,1050514758,49.00,1.0,%  branch_miss_rate
+742910359,,branches:u,1025483026,48.00,352.2,M/sec  branch_frequency
+3778993006,,cpu-cycles:u,1372916634,65.00,1.8,GHz  cycles_frequency
+3682233334,,instructions:u,1058531673,50.00,1.0,instructions  insn_per_cycle
+371807327,,stalled-cycles-frontend:u,1083563405,52.00,0.10,frontend_cycles_idle
+# started on Tue Jul 14 13:53:28 2026
+
+0,,context-switches:u,2095167391,100.00,0.0,cs/sec  cs_per_second
+0,,cpu-migrations:u,2095167391,100.00,0.0,migrations/sec  migrations_per_second
+9162,,page-faults:u,2095167391,100.00,4372.9,faults/sec  page_faults_per_second
+2095.17,msec,task-clock:u,2095167391,100.00,1.9,CPUs  CPUs_utilized
+7407108,,branch-misses:u,1042214598,50.00,1.0,%  branch_miss_rate
+740493597,,branches:u,1050925018,50.00,353.4,M/sec  branch_frequency
+3721487171,,cpu-cycles:u,1412713438,68.00,1.8,GHz  cycles_frequency
+3561904284,,instructions:u,1052952793,50.00,1.0,instructions  insn_per_cycle
+355428049,,stalled-cycles-frontend:u,1044242373,50.00,0.10,frontend_cycles_idle
