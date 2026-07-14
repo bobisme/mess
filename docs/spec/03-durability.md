@@ -26,9 +26,11 @@ The key words MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY are to be
 interpreted as described in RFC 2119.
 
 ```text
-position        a dense, monotone, zero-based integer (global_pos) assigned
-                 to each committed batch's first frame, per D2/A1; matches
-                 `first_global_pos` in BatchHeader
+position        a canonical, monotone, zero-based integer (global_pos)
+                 assigned to every v3 event frame, including `$registry`, per
+                 D2/A1; a batch's first matches `first_global_pos` in
+                 BatchHeader. Canonical positions are dense; the subset
+                 returned by application-facing global reads need not be.
 batch           the atomic append unit defined in 01-log-format.md (D2):
                  BatchHeader, one or more EventSubframes, CommitMarker
 committer       the single thread (per store, per D9) that gathers batches,
@@ -42,13 +44,14 @@ watermark       the single integer, the durable watermark (D7) — also
                  D11 protocol; this document uses "the durable watermark
                  (D7)" as the canonical name and "watermark" as shorthand
                  throughout — such that read_from and the live feed
-                 (06-subscriptions.md) MUST serve/publish position p only
-                 once the watermark >= p
+                 (06-subscriptions.md) MUST scan/publish position p only once
+                 the watermark > p. The watermark includes filtered
+                 `$registry` positions and is not an application-event count.
 log end         the watermark's value at any instant; after a crash, the
                  value recovery (02-recovery.md, D1) will re-establish
 ```
 
-There is exactly one watermark — not an immediately-advancing "visible"
+There is exactly one **protocol watermark** — not an immediately-advancing "visible"
 watermark and a separate, later-catching-up "confirmed" watermark that
 the reader waits for. D7 collapses that two-state distinction on purpose
 ("marker durable = ack. One fewer state; keep it.") into the single
@@ -57,6 +60,14 @@ that the watermark's *meaning* (how strong a guarantee "past the watermark"
 carries) depends on the configured `Durability` mode. Sections 1–2 make that
 meaning precise per mode; Section 6 explains why the collapse still produces
 a real, typed hazard (`CursorRegressed`) rather than silent data loss.
+
+This protocol rule does not forbid an implementation pipeline from measuring
+an earlier durability boundary internally. The current composed `LogEngine`
+does exactly that: its direct owner advances a **durable watermark** at ack,
+then the engine advances a distinct **published read watermark** after its
+index tiers can account for the same positions. `mess-store`'s `EventStore`
+subscription API exposes and waits on the latter, stricter boundary; it MUST
+NOT use the earlier direct-owner value as proof that history is readable.
 
 ## 1. The `Durability` enum
 
@@ -125,9 +136,9 @@ caller, and how strong a promise that success carries.
     closed** when the process or OS crashes: never acked at all — this is
     not data loss, it is the ordinary "the call never returned" case, and
     the client's retry path (§7) applies.
-  - Section 6 covers a narrower, MUST-bounded hazard specific to
-    `Process` and to the open-window portion of `Group` that is about
-    *visibility*, not about the strength of an ack already given.
+  - Section 6 covers the visibility hazard in `Process`. Standard `Group`
+    reads do not expose an open, pre-barrier window; any internal optimistic
+    path that did so would be outside this contract.
 
 ### 1.4 Summary table
 
@@ -325,17 +336,17 @@ requires:
 
 ## 3. The position-ordered durable watermark
 
-The committer advances the watermark **once per group** (§2.1 step 5),
-to the highest position covered by that group's now-durable barrier, and
-only after the barrier returns. Because positions are assigned centrally
-and monotonically (§2.1 step 2), "advance to the group's highest
-position" is equivalent to "advance to cover every position in the
-group" — there are no gaps to reason about within a single group.
+The committer advances the exclusive watermark **once per group** (§2.1 step
+5), to one past the highest position covered by that group's now-durable
+barrier, and only after the barrier returns. Because positions are assigned
+centrally and monotonically (§2.1 step 2), that exclusive end covers every
+position in the group — there are no gaps to reason about within a single
+group.
 
 This watermark is the durable watermark (D7) that 06-subscriptions.md's
 protocol (D11) reads: `read_from` MUST serve, and the
-live feed MUST publish, position `p` only once the watermark has reached
-`p`, and a batch's positions MUST become visible together (watermark
+live feed MUST publish, position `p` only once the watermark has advanced
+strictly past `p`, and a batch's positions MUST become visible together (watermark
 advance, then publish the batch's positions in order) — never
 interleaved with, or ahead of, the watermark advance that covers them.
 This document is the definition of *when* that watermark is permitted to
@@ -463,14 +474,12 @@ NVMe device.
 
 ### 6.1 The rule
 
-Under `Durability::Process`, and — bounded to the currently-open
-window — under `Durability::Group`, the watermark can advance (§3) on a
-weaker guarantee than "this will survive an OS crash": `Process`'s
-watermark advances on a bare page-cache write with no barrier at all
-(§1.1), and `Group`'s watermark, though barrier-backed once it advances,
-does not advance for a batch until that batch's group closes — meaning
-between position assignment and the group's barrier, that batch is
-gathered but not yet acked or watermark-covered by §3's rule.
+Under `Durability::Process`, the watermark can advance (§3) on a weaker
+guarantee than "this will survive an OS crash": it advances on a bare
+page-cache write with no barrier at all (§1.1). `Group` is different: its
+watermark does not advance until the group closes and its barrier returns.
+Between position assignment and that barrier, a Group batch is gathered but
+not acked, watermark-covered, or visible through the standard read path.
 
 Because the watermark is the single gate `06-subscriptions.md` reads
 (§3), and `Process`'s watermark is honestly weaker than "this position
@@ -518,7 +527,7 @@ silently override:
    spike (5,600 randomized scenarios, 10,617 subscriber sequences verified
    gapless and duplicate-free) and is stated as a mode-unconditional
    writer obligation: "for every committed position `p`: advance the
-   committed watermark to >= `p` *before* offering `p` to any live
+   committed watermark past `p` *before* offering `p` to any live
    buffer" — no `Durability`-mode carve-out appears anywhere in that
    protocol. Reading (a) requires inventing a `Group`-specific exception
    to an already-verified, unconditional rule that the source material

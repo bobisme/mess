@@ -125,11 +125,14 @@ impl Backend for MockBackend {
     ) -> Result<Vec<StoredRecord>, Self::Error> {
         let inner = self.inner.lock().expect("mock lock poisoned");
         // Global positions are assigned densely from 0, so `after` maps
-        // straight to a slice offset.
-        let start = after.map_or(0, |p| p as usize + 1);
-        Ok(inner
-            .global
-            .get(start..)
+        // straight to a slice offset. An unrepresentable successor (including
+        // `u64::MAX`) is the terminal cursor and therefore an empty read.
+        let start = match after {
+            None => Some(0),
+            Some(p) => p.checked_add(1).and_then(|n| usize::try_from(n).ok()),
+        };
+        Ok(start
+            .and_then(|start| inner.global.get(start..))
             .unwrap_or(&[])
             .iter()
             .take(limit)

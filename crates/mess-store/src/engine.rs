@@ -81,7 +81,13 @@
 //!   prefix, so no crash can keep the reference and lose the registration, and
 //!   there is no second storage system to `fsync` (the fjall
 //!   `stream_names`/`type_names` tables, and the barrier bn-150 needed to keep
-//!   them co-durable, are **deleted**).
+//!   them co-durable, are **deleted**). These are ordinary v3 event frames, so
+//!   they consume canonical global positions.
+//!   [`read_global`](Backend::read_global) filters stream 0 from application
+//!   results in both hot and sealed tiers; later visible records keep their
+//!   assigned positions and can therefore have gaps. Public global positions
+//!   and subscription cursors are opaque monotone resume tokens, never dense
+//!   application-event indexes.
 //!
 //! What remains of the book is deliberately tiny and history-**independent**
 //! per event: the folded [`registry::RegistryState`] plus the per-stream head
@@ -1064,8 +1070,9 @@ fn publish_batch(
     // Publish complete: every position `< watermark` is now servable through
     // the index tiers. Advance the published watermark LAST, still holding this
     // batch's publish turn (`_turn`), so it moves in strict global-position
-    // order and never announces a position `read_global` cannot yet serve. This
-    // is the wake that drives every live-tail subscriber parked on
+    // order and never announces a position `read_global_page` cannot yet
+    // account for (as a delivered record or a filtered-position frontier).
+    // This is the wake that drives every live-tail subscriber parked on
     // `await_watermark_past`.
     inner.read_watermark.advance(watermark);
 }
@@ -1091,9 +1098,10 @@ struct Recovered {
     plan:        ResumePlan,
     /// Per-stream fold-chain exit heads (chain-on stores only; spec 05 §6).
     chain_heads: HashMap<u64, ChainHead>,
-    /// The recovered durable/published event count — the exclusive end of
-    /// the readable global-position sequence, seeding both the publish
-    /// sequencer and the published read watermark.
+    /// The recovered durable/published canonical event count — the exclusive
+    /// end of the global-position sequence, including `$registry` events that
+    /// application reads filter. Seeds both the publish sequencer and the
+    /// published read watermark.
     watermark:   u64,
     /// Payload frames materialised during recovery — 0 on every chain-off
     /// open (the bn-2ib gate observable,
@@ -1801,16 +1809,19 @@ struct Inner {
     /// every chain-off open; chain-on stores still fold every durable
     /// payload (spec 05 §6 requires it).
     recover_decodes:      u64,
-    /// The **published** global watermark — the exclusive end of the readable
-    /// global-position sequence. Advanced at
+    /// The **published** global watermark — the exclusive end of the canonical
+    /// global-position sequence, including filtered `$registry` events.
+    /// Advanced at
     /// the end of each append's publish step (after the head/index/meta
     /// are updated, in publish-turn order), so it tracks what
-    /// [`read_global`](Backend::read_global) can serve, NOT merely what the
-    /// direct committer has durably covered. The app-facing subscription /
+    /// [`read_global_page`](Backend::read_global_page) can account for as a
+    /// record or scan frontier, NOT merely what the direct committer has
+    /// durably covered. The app-facing subscription /
     /// live-tail
     /// API ([`SubscribeBackend`](crate::backend::SubscribeBackend)) awaits
     /// this value; a woken subscriber is therefore guaranteed the position
-    /// it waited for is already servable through the index tiers. Distinct
+    /// it waited for is already scannable through the index tiers, though an
+    /// engine-internal position itself is not delivered. Distinct
     /// from
     /// the direct owner's durable watermark,
     /// which advances a step earlier (at ack, before the in-process
@@ -1977,10 +1988,13 @@ pub struct EngineMetrics {
     /// Durable committer metrics: `fdatasync` p50/p95/p99, the degradation
     /// flag (§2.6), and append-throughput counters.
     pub commit:                    CommitterMetrics,
-    /// The durable watermark position (highest durable global position + 1).
-    /// A subscription's lag (SUB9, `docs/spec/06-subscriptions.md`) is
-    /// `durable_watermark - subscriber_cursor`, computed per subscription by
-    /// the subscription layer against this value.
+    /// The direct owner's durable watermark position (highest durable global
+    /// position + 1). It can lead the published read watermark while the
+    /// in-process index tiers catch up. Consequently, app-facing subscription
+    /// lag (SUB9, `docs/spec/06-subscriptions.md`) uses the published read
+    /// watermark exposed as [`EngineMetrics::total_events`], not this field.
+    /// Both values include filtered `$registry` positions and neither is an
+    /// application-event backlog count.
     pub durable_watermark:         u64,
     /// Whether a barrier fault has poisoned the store (D8): writes fail fast,
     /// reads clamp to the frozen watermark. Distinct from `fsync_degraded`
@@ -1998,7 +2012,9 @@ pub struct EngineMetrics {
     pub cache_weight_bytes:        u64,
     /// Sealed segments installed in the cold tier.
     pub sealed_segment_count:      usize,
-    /// Total events committed and published (the published read watermark).
+    /// Total canonical v3 events committed and published (the published read
+    /// watermark), including filtered `$registry` events. Not the number of
+    /// application-visible records.
     pub total_events:              u64,
     /// Age of the active segment since this process opened it, in seconds.
     pub active_segment_age_secs:   f64,
@@ -3017,10 +3033,10 @@ impl LogEngine {
         (store, ids, pending)
     }
 
-    /// Test/diagnostic: total events committed and published — the exclusive
-    /// end of the readable global-position sequence (the published read
-    /// watermark; before bn-2ib this was the record book's dense length,
-    /// which tracked the same value).
+    /// Test/diagnostic: total canonical v3 events committed and published —
+    /// the exclusive end of the global-position sequence (the published read
+    /// watermark). This includes `$registry` events filtered from
+    /// application-facing global reads, so it is not a visible-event count.
     #[must_use]
     pub fn total_events(&self) -> usize {
         self.inner.read_watermark.get() as usize
@@ -3756,7 +3772,9 @@ impl Backend for LogEngine {
         // the same bound the record book's length used to impose. What is NOT
         // dense is the subset of them this method delivers (see above).
         let wm = self.inner.read_watermark.get();
-        let start = after.map_or(0, |p| p + 1);
+        // `u64::MAX` is the terminal public cursor. Saturation keeps an EOF
+        // query at EOF instead of wrapping it back to position 0.
+        let start = after.map_or(0, |p| p.saturating_add(1));
         let mut picks: Vec<(Arc<DecodedBatch>, usize)> = Vec::new();
         let mut pos = start;
         // Built lazily: only reads that reach positions the hot index no

@@ -43,6 +43,20 @@ pub enum StoreError<E> {
     /// back to full replay.
     #[error("state codec error: {0}")]
     State(#[source] StateCodecError),
+    /// A persisted subscription cursor is beyond the current published log
+    /// end, normally because recovery discarded a previously visible tail.
+    /// The caller must acknowledge and reconcile the lost range before
+    /// choosing a new cursor; the subscription never rewinds silently.
+    #[error(
+        "cursor {cursor} regressed past log end {log_end} (positions \
+         {log_end}..{cursor} no longer exist)"
+    )]
+    CursorRegressed {
+        /// The persisted next-to-deliver cursor supplied by the consumer.
+        cursor:  u64,
+        /// The freshly observed exclusive published read end.
+        log_end: u64,
+    },
 }
 
 /// The outcome of an **authored** command
@@ -133,8 +147,9 @@ pub struct Loaded<A> {
 pub struct Commit {
     /// The stream's version after the commit.
     pub version:              Version,
-    /// Global position of the last event written, or `None` when nothing was
-    /// appended (e.g. a command that decided zero events).
+    /// Canonical global position of the last event written, or `None` when
+    /// nothing was appended (e.g. a command that decided zero events). Treat
+    /// it as an ordering/resume token, not a dense application-event index.
     pub last_global_position: Option<u64>,
     /// How many events were appended.
     pub events_appended:      usize,
@@ -506,18 +521,23 @@ impl<B: Backend> EventStore<B> {
 }
 
 impl<B: SubscribeBackend> EventStore<B> {
-    /// The current committed global watermark: the exclusive end of the
-    /// committed global-position sequence — every global position `< watermark`
-    /// is committed and visible to
-    /// [`backend().read_global`](crate::backend::Backend::read_global), and it
-    /// is the count of committed events. Monotone non-decreasing while the
-    /// store is live.
+    /// The current published read watermark: the exclusive end of the
+    /// readable canonical global-position sequence.
+    ///
+    /// Every position below it has reached the published read path, but not
+    /// every position is application-visible: the v3
+    /// [`LogEngine`](crate::LogEngine) assigns positions to `$registry`
+    /// events and filters those events from global reads. The watermark is
+    /// therefore neither an application-event count nor a dense read index.
+    /// It is monotone non-decreasing while the store is live.
     pub async fn watermark(&self) -> Result<u64, StoreError<B::Error>> {
         self.backend.watermark().await.map_err(StoreError::Backend)
     }
 
-    /// Await until the committed watermark passes global position `pos` — i.e.
-    /// until `pos` is committed and visible to
+    /// Await until the published read watermark passes global position `pos` —
+    /// i.e.
+    /// until `pos` has reached the published read path. An engine-internal
+    /// position may be filtered from
     /// [`backend().read_global`](crate::backend::Backend::read_global).
     /// Resolves immediately if already past.
     ///
@@ -545,11 +565,17 @@ impl<B: SubscribeBackend + Clone> EventStore<B> {
     /// The returned handle first **replays committed history** from `from` a
     /// page at a time (page size = this store's
     /// [`page_size`](Self::with_page_size)), then switches to a **live tail**
-    /// driven by commit notification — the durable watermark, not busy polling.
+    /// driven by publication notification — the read watermark, not busy
+    /// polling.
     /// Pull records in global order with
     /// [`Subscription::next_batch`] / [`Subscription::next`]; delivery is
-    /// gap-free and in ascending global position. See [`Subscription`] for the
-    /// full delivery, cancellation, and drop contract.
+    /// exactly-once and ascending, but visible positions may have gaps where
+    /// v3 `$registry` events were filtered. Treat `from` and returned global
+    /// positions as opaque monotone cursors, not dense application-event
+    /// indexes. See [`Subscription`] for the full delivery, cancellation, and
+    /// drop contract. The first pull returns
+    /// [`StoreError::CursorRegressed`] if `from` is beyond the current
+    /// published log end; the subscription never rewinds it silently.
     ///
     /// The subscription holds its own cheap clone of the backend handle, so it
     /// is independent of this `EventStore` and of every other subscriber: a

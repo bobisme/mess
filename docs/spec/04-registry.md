@@ -434,6 +434,36 @@ registry-corruption condition and fail loudly — never silently overwrite the e
 (REG3 already forbids a *correct* writer from doing this; REG14 is the reader-side guard against
 a corrupted or adversarial log doing it anyway.)
 
+### 4.3 Canonical positions and application visibility (v3)
+
+`$registry` records are real v3 event frames, not out-of-band metadata. Each
+record consumes the canonical global position assigned by
+[01-log-format.md §4.2.2](01-log-format.md#422-canonical-positions-include-system-events),
+and the registry batch must occupy earlier positions than the first domain
+batch that references its IDs (REG12). A new stream or event type can therefore
+insert one or more registry positions anywhere in the canonical sequence—not
+only at genesis.
+
+Application-facing global reads and subscriptions MUST filter `stream_id == 0`:
+registry records are needed by recovery, raw inspection, and registry replay,
+but they are not domain events. Filtering changes visibility, not allocation:
+the watermark and subsequent domain events retain their canonical positions.
+Thus returned domain records are ordered by `global_position`, but their
+positions can have gaps where `$registry` records landed.
+
+A consumer MUST treat `global_position` as an opaque monotone ordering/resume
+cursor. It MUST NOT assume that it is a zero-based index into the visible event
+sequence, use position differences as visible-event counts, or require the next
+visible record to have the immediately following integer. Filtered paging needs
+an explicit scan frontier so a registry-only range can advance the cursor even
+when no domain record is returned; [06-subscriptions.md](06-subscriptions.md)
+defines that contract.
+
+The v4 control-prelude design is a later, separately gated alternative that can
+avoid spending domain positions on control-only capsules. It does not change
+the accepted v3 behavior specified here and MUST NOT be read as adopted by this
+document.
+
 ## 5. Name resolution and aliasing
 
 Renaming is `NameAliased`, never mutation of the original `*Registered` record (D3, verbatim:

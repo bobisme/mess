@@ -1,6 +1,7 @@
 //! Integration tests for the app-facing subscription / live-tail API
 //! (`EventStore::subscribe`, `watermark`, `await_past`) over the real composed
-//! [`LogEngine`] — the durable committer + record book + `mess-log` watermark.
+//! [`LogEngine`] — the durable committer plus its later published read
+//! watermark.
 //!
 //! THE point of this bone: a read model no longer hand-rolls a 1ms polling
 //! adapter over `read_global`. So these tests deliberately contain **no polling
@@ -21,9 +22,10 @@ fn rec(t: &str, d: &[u8]) -> RecordToAppend {
 /// the stream, one naming the event type `"E"` — and nothing after that. They
 /// are ordinary log events on the reserved stream 0: they CONSUME the first two
 /// global positions (so the watermark counts them) but are never DELIVERED
-/// (stream 0 is filtered out of every user-facing read). So a subscriber's
-/// first record sits at global position `REG`, and the delivered sequence is
-/// gap-free from there.
+/// (stream 0 is filtered out of every user-facing global read). So a
+/// subscriber's first record sits at global position `REG`; this initial gap
+/// is the simplest example of positions being cursors, not visible-event
+/// indexes.
 const REG: u64 = 2;
 
 /// Append `n` single-event batches to one stream, one per stream version,
@@ -83,7 +85,7 @@ async fn subscribe_from_zero_replays_then_tails_live() {
     let expected: Vec<u64> = (REG..REG + TOTAL).collect();
     assert_eq!(
         got, expected,
-        "gap-free, in-order, exactly-once global delivery"
+        "complete, in-order, exactly-once global delivery"
     );
 }
 
@@ -213,13 +215,141 @@ async fn dropping_a_subscription_does_not_wedge_the_committer() {
     .expect("appends wedged after subscriptions were dropped");
     assert_eq!(store.watermark().await.unwrap(), 25 + REG);
 
-    // And a fresh subscription still delivers the whole (gap-free) log.
+    // And a fresh subscription still delivers every application event.
     let mut sub = store.subscribe(Some(0));
     let mut got = Vec::new();
     while (got.len() as u64) < 25 {
         got.push(sub.next().await.unwrap().global_position);
     }
     assert_eq!(got, (REG..REG + 25).collect::<Vec<_>>());
+}
+
+// ---------------------------------------------------------------------------
+// (e) a new event type inserts a `$registry` position in the MIDDLE of the
+//     user-visible sequence. The subscription crosses it through the scan
+//     frontier and does not mistake position arithmetic for event counting.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subscription_cursor_crosses_midlog_registry_gap() {
+    let dir = mess_testkit::sweeping_temp_dir(
+        "subscription-cursor-crosses-midlog-registry-gap",
+    );
+    let engine = LogEngine::open(dir.path()).expect("open");
+
+    engine
+        .append_batch("s", Version::NoStream, &[rec("A", b"first")])
+        .await
+        .expect("first append");
+    // `B` is new: its registration consumes position 3, then the domain event
+    // lands at 4. Application reads must expose [2, 4], never `$registry` at 3.
+    engine
+        .append_batch("s", Version::At(0), &[rec("B", b"second")])
+        .await
+        .expect("second append");
+
+    let store = EventStore::new(engine).with_page_size(1);
+    assert_eq!(store.watermark().await.unwrap(), 5);
+
+    let mut sub = store.subscribe(None);
+    let first = sub.next_batch().await.unwrap();
+    assert_eq!(
+        first.iter().map(|r| r.global_position).collect::<Vec<_>>(),
+        vec![2]
+    );
+    assert_eq!(sub.position(), 3, "cursor is the next position to scan");
+
+    let second = sub.next_batch().await.unwrap();
+    assert_eq!(
+        second.iter().map(|r| r.global_position).collect::<Vec<_>>(),
+        vec![4]
+    );
+    assert_eq!(
+        sub.position(),
+        5,
+        "cursor crossed the filtered registry position without delivering it"
+    );
+    assert_eq!(
+        second[0].global_position - first[0].global_position,
+        2,
+        "visible position deltas are not visible-event counts"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn next_position_accounts_for_prefetched_records() {
+    let dir = mess_testkit::sweeping_temp_dir(
+        "subscription-next-position-accounts-for-prefetch",
+    );
+    let engine = LogEngine::open(dir.path()).expect("open");
+    engine
+        .append_batch("s", Version::NoStream, &[rec("A", b"first")])
+        .await
+        .expect("first append");
+    engine
+        .append_batch("s", Version::At(0), &[rec("B", b"second")])
+        .await
+        .expect("second append");
+
+    // `next()` fetches visible positions [2, 4], returns 2, buffers 4, and
+    // advances its internal scan frontier to 5. The public checkpoint must
+    // remain 4 so persisting it cannot skip the buffered record.
+    let store = EventStore::new(engine).with_page_size(2);
+    let mut sub = store.subscribe(Some(0));
+    let first = sub.next().await.expect("first");
+    assert_eq!(first.global_position, 2);
+    assert_eq!(
+        sub.position(),
+        4,
+        "position accounts for the first unread prefetched record"
+    );
+
+    let mut resumed = store.subscribe(Some(sub.position()));
+    assert_eq!(resumed.next().await.expect("resumed").global_position, 4);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cursor_past_published_log_end_surfaces_regression() {
+    let dir = mess_testkit::sweeping_temp_dir(
+        "subscription-cursor-past-published-end-regresses",
+    );
+    let engine = LogEngine::open(dir.path()).expect("open");
+    append_n(&engine, "s", 0, 1).await;
+    let store = EventStore::new(engine);
+    let log_end = store.watermark().await.expect("watermark");
+
+    let mut sub = store.subscribe(Some(log_end + 1));
+    let err = sub.next_batch().await.expect_err("cursor must regress");
+    assert!(matches!(
+        err,
+        mess_store::StoreError::CursorRegressed {
+            cursor,
+            log_end: observed,
+        } if cursor == log_end + 1 && observed == log_end
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn max_global_cursor_is_terminal_without_wrapping() {
+    let dir = mess_testkit::sweeping_temp_dir(
+        "subscription-max-global-cursor-is-terminal",
+    );
+    let engine = LogEngine::open(dir.path()).expect("open");
+    append_n(&engine, "s", 0, 1).await;
+
+    let page = engine
+        .read_global_page(Some(u64::MAX), 10)
+        .await
+        .expect("terminal page");
+    assert!(page.records.is_empty());
+    assert_eq!(page.frontier, u64::MAX);
+    assert!(
+        engine
+            .read_global(Some(u64::MAX), 10)
+            .await
+            .expect("terminal read")
+            .is_empty()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -268,4 +398,16 @@ async fn mock_backend_subscribe_catches_up_and_tails() {
 
     let got = consumer.await.unwrap();
     assert_eq!(got, (0..25).collect::<Vec<_>>());
+}
+
+#[cfg(feature = "mock")]
+#[tokio::test]
+async fn mock_max_global_cursor_is_terminal_without_wrapping() {
+    use mess_store::MockBackend;
+
+    let backend = MockBackend::new();
+    let page =
+        backend.read_global_page(Some(u64::MAX), 10).await.expect("infallible");
+    assert!(page.records.is_empty());
+    assert_eq!(page.frontier, u64::MAX);
 }

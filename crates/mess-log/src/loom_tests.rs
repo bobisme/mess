@@ -75,11 +75,11 @@ fn count_iteration(counter: &AtomicUsize) {
 
 /// The **W1 gapless invariant** as a message-passing litmus.
 ///
-/// `06-subscriptions.md` W1: *"For every committed position `p`: the durable
-/// watermark MUST be advanced to `>= p` **before** `p` is offered to any live
-/// buffer."* `03-durability.md` §3: *"watermark advance, then publish the
-/// batch's positions in order — never ... ahead of the watermark advance that
-/// covers them."*
+/// `06-subscriptions.md` W1: *"For every committed position `p`: the exclusive
+/// durable watermark MUST be advanced past `p` **before** `p` is offered to
+/// any live buffer."* `03-durability.md` §3: *"watermark advance, then publish
+/// the batch's positions in order — never ... ahead of the watermark advance
+/// that covers them."*
 ///
 /// Modelled as: the committer writes the batch's data cell, then advances the
 /// watermark; a subscriber loads the watermark and, if it is past the

@@ -6,6 +6,14 @@
 **Scope:** single-node embedded/server storage; canonical event log, exact metadata, snapshots, replay, subscriptions, and future media placement  
 **Non-goal:** a general-purpose ordered key/value engine
 
+**Implementation status (2026-07-14).** The production path remains format
+v3. Its registry is now log-derived as explicit `$registry` event batches;
+those batches consume canonical global positions and are filtered from
+application-facing global reads, so visible positions can have gaps. The v4
+control-prelude prototype is proven but held behind its admission gates. This
+document describes v4 only as a later alternative; no section below should be
+read as saying that v4 is adopted or enabled by default.
+
 ---
 
 ## 0. Decision in one page
@@ -23,7 +31,7 @@ The current architecture already has the crucial premise: the event log is the s
 
 Asterism replaces this with five coupled mechanisms:
 
-1. **Commit capsules.** Generalize the batch format so an engine-generated control prelude—registry assignments, a dedupe key, snapshot installation, checkpoint movement—commits under the same CRC and marker as the user events. One capsule is one atomic state transition. A new stream can be registered and used in the same durability barrier.
+1. **Commit capsules (gated v4 target).** If the format gate is later opened, generalize the batch format so an engine-generated control prelude—registry assignments, a dedupe key, snapshot installation, checkpoint movement—commits under the same CRC and marker as the user events. One capsule is one atomic state transition. The adopted v3 path instead commits an explicit `$registry` batch immediately before the domain batch in one ordered durability unit.
 
 2. **A flat-combined state kernel.** One dedicated committer thread owns validation, global-position assignment, stream heads, registry allocation, active dedupe, and the append-visible state transition. Producers enqueue intents and await completions. There is no per-append `spawn_blocking`, no per-stream lock held across I/O, no out-of-order publish tail, and no post-commit Fjall write.
 
@@ -47,7 +55,7 @@ producer intent
     -> complete waiters
 ```
 
-For an ordinary append, the only durable bytes are the canonical capsule bytes. No second database write exists. For a new-name append, the registration is in the same capsule, so there is still one barrier. For a crash, the same capsule scanner decides both event visibility and metadata visibility; there is no cross-engine lag state to reconcile.
+For an ordinary append, the only durable bytes are canonical log bytes. No second database write exists. On the current v3 path, a new-name append writes the registration batch and first-use domain batch as one ordered unit covered by the same group barrier; on the gated v4 alternative, both would share one capsule. In either case the log scanner decides both event visibility and metadata visibility, so there is no cross-engine lag state to reconcile.
 
 This is not a promise that a prototype will beat Fjall. It is a claim that **specialization creates a plausible path to eliminate entire classes of work**. The design is accepted only if the composed implementation reaches the quantitative gates in §18–§19.
 
@@ -103,11 +111,19 @@ After the canonical log append is acknowledged, the current engine updates the `
 
 Asterism derives the same rows from the capsule itself and applies them in memory after the durability barrier. The persistent state transition and the event are the same bytes.
 
-### 2.3 The exceptional name barrier
+### 2.3 The registry position cost
 
-The current runtime log stores numeric stream and type IDs, while the implemented registry source of truth is a pair of Fjall name tables. When a new name appears, the name row is forced durable before the event append can become durable. This is correct but creates two ordered persistence domains and usually two barriers for the rare but latency-sensitive “first event for a new stream/type” path.
+The runtime now derives stream and event-type names from the v3 log. A first
+use writes an explicit `$registry` batch immediately before the domain batch as
+one ordered unit, eliminating Fjall's authoritative name tables and separate
+name barrier without requiring v4.
 
-The normative research design already calls for an event-sourced registry. Asterism closes the implementation gap by placing the registration records in the control prelude of the same capsule that first uses the IDs.
+The accepted v3 cost is position-space visibility: `$registry` records are real
+event frames, so they consume canonical global positions. Application-facing
+global reads filter stream 0 rather than renumber later domain events; visible
+positions are therefore monotone but can have gaps. Cursors must be treated as
+opaque ordering/resume tokens, not dense indexes or event counts. The v4
+control prelude would avoid that cost, but remains a later gated alternative.
 
 ### 2.4 The all-history `Book`
 
@@ -242,9 +258,19 @@ The capsule’s full bytes are covered by the existing split CRC discipline. The
 - a name alias or dictionary registration;
 - ordinary events with no control records.
 
-### 5.2 Control records do not consume user global positions
+### 5.2 Gated v4 alternative: controls do not consume domain positions
 
-Registry and checkpoint operations are engine control, not domain events. Global event positions remain dense over domain events only. Therefore v4 introduces an internal capsule sequence—per-segment `batch_id` becomes recovery-significant—and permits a control-only capsule with `event_count == 0` when `control_count > 0`.
+The adopted v3 path does **not** have this property. Its explicit `$registry`
+batches consume canonical positions, and application filtering leaves gaps in
+the visible domain-event positions. That is the accepted cost of preserving
+v3 recovery semantics without making new format bytes a prerequisite for the
+log-derived registry.
+
+If v4 is later admitted, registry and checkpoint operations become engine
+control rather than event frames. Domain positions can then remain dense over
+domain events only. The v4 design introduces an internal capsule sequence—per-
+segment `batch_id` becomes recovery-significant—and permits a control-only
+capsule with `event_count == 0` when `control_count > 0`.
 
 Recovery validates both:
 
@@ -260,7 +286,9 @@ expected_batch_id += 1
 expected_global_pos += event_count
 ```
 
-This preserves dense domain cursors while giving zero-event controls a total order and stale-data defense.
+If adopted, this would restore dense domain positions while giving zero-event
+controls a total order and stale-data defense. It is an argument for the later
+v4 gate, not a description of current v3 cursor semantics.
 
 ### 5.3 Prelude-first decode
 
@@ -1323,7 +1351,13 @@ Every checkpoint is anchored and discardable. Missing pages, stale manifests, or
 
 ### 21.7 Format surface
 
-v4 adds control records and zero-event capsules. The formal state machine and crash model must land before production bytes. If this cannot be modeled cleanly, keep registry as explicit `$registry` event batches and accept the extra global positions rather than weakening recovery.
+The current decision is to keep the registry as explicit v3 `$registry` event
+batches and accept the canonical positions they consume. Application-facing
+reads filter those records, so visible positions have gaps and remain opaque
+monotone cursors. v4 adds control records and zero-event capsules that could
+restore dense domain positions, but its formal/crash proof is an admission
+prerequisite, not sufficient by itself to turn the format on. Until a separate
+gate explicitly adopts it, v4 remains off and v3 semantics govern.
 
 ### 21.8 Kill criteria
 

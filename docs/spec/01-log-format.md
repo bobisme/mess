@@ -401,6 +401,34 @@ CommitMarker                   §4.5   (16 bytes)
 | 0 | `CRYPTO_CHAIN` | A 32-byte `crypto_chain` value (§4.4) is present immediately after this header. |
 | 1–15 | reserved | MUST be `0` in v3; readers MUST reject a batch with an unknown flag bit set (it indicates a newer format the reader cannot validate). |
 
+#### 4.2.2 Canonical positions include system events
+
+For v3, every `EventSubframe` consumes one **canonical global position**,
+regardless of its stream. The subframe at zero-based index `i` in a batch has
+position `first_global_pos + i`; the next accepted batch begins at the previous
+batch's `first_global_pos + frame_count`. A1 is therefore dense over **all**
+accepted v3 event frames.
+
+This includes `$registry` (`stream_id == 0`) frames. They are ordinary v3 event
+frames for framing, recovery, ordering, and watermark advancement, so a
+registry batch inserted before the first domain event that uses a new ID
+consumes the earlier position or positions. The application-facing global read
+and subscription APIs filter stream 0 because registry records are engine
+bookkeeping, not domain events. Consequently, the positions visible through
+those APIs are strictly increasing but **not necessarily consecutive**.
+
+Consumers MUST treat a visible `global_position` as an opaque monotone ordering
+and resume cursor, not as a dense array index or application-event count. In
+particular, `global_position == N` does not mean that the record is the `N`th
+visible event, and subtracting two visible positions does not count the visible
+events between them. Cursor/frontier semantics for a filtered global scan are
+specified in [06-subscriptions.md](06-subscriptions.md); registry visibility is
+specified in [04-registry.md](04-registry.md).
+
+The Asterism v4 control-prelude format sketches a later alternative in which
+control-only capsules do not consume domain positions. It is not the normative
+format here and is not adopted by this v3 rule.
+
 > ### Decision D-FMT-5 — `batch_id` is per-segment
 >
 > The v1 dialect used a log-global `batch_id`; v2 reset it to `0` per segment.

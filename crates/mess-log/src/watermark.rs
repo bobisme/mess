@@ -90,7 +90,7 @@ impl Watermark {
     /// watermark is already there. This is the primitive an appender uses
     /// to await its batch's ack and a D11 subscriber uses to gate a read.
     pub fn wait_for(&self, threshold: u64) -> WaitFor {
-        WaitFor { inner: self.inner.clone(), threshold }
+        WaitFor { inner: self.inner.clone(), threshold: Some(threshold) }
     }
 
     /// Resolve once **position** `position` has become durable — i.e. once
@@ -106,28 +106,36 @@ impl Watermark {
     ///
     /// Position-ordered by construction: `await_past(a)` resolves no later
     /// than `await_past(b)` for `a <= b`, since one monotone value gates
-    /// both. `position == u64::MAX` saturates to waiting for
-    /// `value == u64::MAX` (the log can hold no position past it).
+    /// both. There is no representable exclusive end past `u64::MAX`, so
+    /// `await_past(u64::MAX)` remains pending forever rather than weakening
+    /// "past" into "reached" or spinning a terminal subscriber.
     pub fn await_past(&self, position: u64) -> WaitFor {
-        self.wait_for(position.saturating_add(1))
+        WaitFor {
+            inner:     self.inner.clone(),
+            threshold: position.checked_add(1),
+        }
     }
 }
 
 /// The future returned by [`Watermark::wait_for`].
 pub struct WaitFor {
     inner:     Arc<Mutex<State>>,
-    threshold: u64,
+    /// `None` represents the impossible threshold beyond `u64::MAX`.
+    threshold: Option<u64>,
 }
 
 impl Future for WaitFor {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let Some(threshold) = self.threshold else {
+            return Poll::Pending;
+        };
         let mut st = self.inner.lock().unwrap();
-        if st.value >= self.threshold {
+        if st.value >= threshold {
             Poll::Ready(())
         } else {
-            st.waiters.push((self.threshold, cx.waker().clone()));
+            st.waiters.push((threshold, cx.waker().clone()));
             Poll::Pending
         }
     }
@@ -269,15 +277,20 @@ mod tests {
     }
 
     #[test]
-    fn await_past_saturates_at_u64_max() {
-        // No off-by-one panic at the top of the range: await_past(MAX) folds
-        // to wait_for(MAX), satisfied only at the maximal value.
+    fn await_past_u64_max_is_an_impossible_threshold() {
+        // Reaching MAX is distinct from advancing past MAX. The former is a
+        // valid wait_for threshold; the latter is unrepresentable and must
+        // remain pending instead of producing a ready-loop.
         let wm = Watermark::new(u64::MAX);
         let w = Arc::new(Noop(AtomicBool::new(false)));
         let waker = Waker::from(w.clone());
         let mut cx = Context::from_waker(&waker);
         assert_eq!(
             Box::pin(wm.await_past(u64::MAX)).as_mut().poll(&mut cx),
+            Poll::Pending
+        );
+        assert_eq!(
+            Box::pin(wm.wait_for(u64::MAX)).as_mut().poll(&mut cx),
             Poll::Ready(())
         );
     }

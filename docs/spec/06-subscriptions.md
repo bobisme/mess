@@ -14,9 +14,9 @@ written in Phase 3.
 
 ## 1. Scope
 
-A **subscription** delivers committed events from the log to a consumer, in
-position order, starting just after a given cursor, continuing live as new
-events are committed. This document specifies:
+A **subscription** delivers committed application events from the log to a
+consumer in canonical global-position order, beginning at a given scan cursor
+and continuing live as new events are committed. This document specifies:
 
 - the delivery guarantee a subscription MUST provide (§2),
 - the two data sources a subscription is built from and their relative
@@ -27,7 +27,7 @@ events are committed. This document specifies:
 - operational requirements: lag metric, buffer sizing (§9),
 - interaction with cursor regression after a crash (§10),
 - the conformance bar new implementations must clear (§11),
-- alternatives considered and rejected, with rationale (§12).
+- alternatives considered, with acceptance/rejection rationale (§12).
 
 Out of scope, owned by sibling docs:
 
@@ -38,6 +38,8 @@ Out of scope, owned by sibling docs:
   `03-durability.md` (D7).
 - the single-writer process model that makes write-ordering free — D9,
   owned by `03-durability.md` / `04-registry.md` as applicable.
+- registry encoding and the v3 rule that `$registry` frames consume canonical
+  positions while application reads filter them — `04-registry.md` §4.3.
 - wire encoding for an eventual out-of-process client protocol (D9's
   "server mode: clients speak a protocol"). No such protocol exists yet;
   this document specifies the in-process subscription contract only. See
@@ -45,28 +47,41 @@ Out of scope, owned by sibling docs:
 
 ## 2. The guarantee
 
-> A subscription created at cursor `c` MUST deliver exactly the committed
-> positions `c+1, c+2, …` in ascending order, with no gaps and no
-> duplicates, regardless of concurrent appends, consumer speed, or how many
-> times the subscriber falls behind and recovers.
+> A subscription created at scan cursor `c` MUST deliver exactly every
+> committed, application-visible event whose canonical global position is
+> `>= c`, in ascending position order and without duplicates, regardless of
+> concurrent appends, consumer speed, or how many times the subscriber falls
+> behind and recovers.
 
 This is the only externally observable contract. Everything below is the
 mechanism that makes it true, plus the operational consequences (overflow,
 lag, cursor regression) that a caller must handle.
 
-Positions are dense and monotone by construction: `01-log-format.md`
-requires each batch's `first_global_pos` to equal the running expected
-position, and `02-recovery.md`'s A1 (position contiguity) makes that check
-normative and rejects any byte-valid batch that lands at the wrong
-position — together these rule out both gaps and reordering. D10 (`doc 12
-convergence`) restates this as settled design premise ("positions are
-dense/monotone by construction") when it rejects a learned position→offset
-index as unnecessary. (The architecture-thesis note I2 frames strictly-
-increasing positions as a per-"writer-shard" property, anticipating a
-future multi-writer design; under the current single-writer model, D9,
-shard and log coincide, so this reduces to the same A1/D10 guarantee.) The
-guarantee is stated over positions, not stream versions, because a
-subscription is a log-wide construct, not a per-stream one.
+Canonical positions are dense and monotone over **all v3 event frames** by
+construction: `01-log-format.md` requires each batch's `first_global_pos` to
+equal the running expected position, and `02-recovery.md`'s A1 rejects any
+byte-valid batch that lands at the wrong position. `$registry` frames are part
+of that canonical sequence and consume positions like any other v3 event.
+
+The application-visible subset is deliberately **not dense**. Global reads
+and subscriptions filter `$registry` (`stream_id == 0`), so consecutive
+delivered events can have non-consecutive positions, including gaps introduced
+mid-log when a new stream or event type is registered. “Without gaps” in this
+document means no eligible application event is omitted; it never means that
+the delivered numeric values form an integer range.
+
+The protocol cursor is the next canonical position to **scan**, not necessarily the
+position of the next event that will be delivered. It may point at or advance
+past a filtered registry event. Consumers MUST treat it as an opaque monotone
+ordering/resume token: compare it and pass it back to resume, but do not use it
+as an array index or subtract cursors to count application events. A persisted
+processing checkpoint MUST NOT advance past a visible record the consumer has
+not processed. Thus a page consumer may persist the page frontier only after
+processing the whole page. An API such as `mess-store`'s `Subscription::next`
+may prefetch a page internally, but its public `position()` accounts for the
+first unread buffered record and remains a safe resume cursor after the single
+returned record is processed. Cursor `0` begins at the canonical start of the
+log.
 
 ## 3. Sources
 
@@ -74,23 +89,34 @@ A subscriber is fed by two sources with asymmetric authority:
 
 | Source | Definition | Authority |
 |---|---|---|
-| **History** | Paged reads `read_from(cursor, limit)`, serving only positions `<=` the durable watermark (D7) (see `03-durability.md`). | **Authoritative.** Nothing unacknowledged is ever visible through it. |
-| **Live feed** | A bounded, per-subscriber buffer fed by the committing writer as each position becomes committed. | **Optimization only.** Carries zero correctness weight. A subscription that never used the live feed at all — i.e., polled history exclusively — would still satisfy §2, merely with worse tail latency and higher read amplification. |
+| **History** | Paged scans `read_from(cursor, limit) -> { records, frontier }`, serving only canonical positions below the durable watermark (D7). `records` contains application-visible events; the exclusive `frontier` reports how far the canonical scan progressed, including filtered positions. | **Authoritative.** Nothing unacknowledged is ever visible through it, and the frontier is the only safe cursor advance across a filtered-only range. |
+| **Live feed** | A bounded, per-subscriber buffer fed by the committing writer as each canonical position becomes committed. It MUST include internal positions or equivalent frontier markers even when the corresponding record is filtered. | **Optimization only.** Carries zero correctness weight. A subscription that never used the live feed at all — i.e., waited for a watermark advance and scanned history — would still satisfy §2, merely with different tail-latency/read-amplification tradeoffs. |
+
+Here “watermark” means the protocol boundary below which history is
+authoritative and readable. In the normative direct-owner design it coincides
+with D7's durable watermark. The current composed `LogEngine` has an earlier
+direct-owner durable counter and a later published read watermark after its
+index tiers catch up; `EventStore` uses the latter for this protocol. That
+stricter implementation boundary must not be described or consumed as the
+direct owner's durable watermark.
 
 Because the live feed carries no correctness weight, every requirement in
 this document that looks like it is about the live feed is really about
-history remaining a complete, gap-free fallback at all times, and about
-the subscriber never trusting the live feed further than it is entitled
-to.
+history remaining a complete fallback at all times, and about the subscriber
+never trusting the live feed further than it is entitled to. A history page's
+record list alone is insufficient: an empty list with an advanced frontier
+means “only filtered positions were scanned,” not “caught up.”
 
 ## 4. Writer obligation — invariant W1
 
 This is the invariant everything else rests on. It binds the **writer**
 (the commit path), not the subscriber:
 
-> **W1.** For every committed position `p`: the durable watermark (D7) MUST
-> be advanced to `>= p` **before** `p` is offered to any live buffer, and
-> live-feed publish order MUST equal position order.
+> **W1.** For every committed canonical position `p`, including a filtered
+> `$registry` position: the exclusive durable watermark (D7) MUST be advanced
+> past `p` (`watermark > p`)
+> **before** `p` (or an equivalent frontier marker) is offered to any live
+> buffer, and live-feed publish order MUST equal canonical position order.
 
 Both clauses are mandatory and independent — satisfying one does not imply
 the other:
@@ -107,9 +133,11 @@ the other:
 
 Batch atomicity (D2, `01-log-format.md`) makes the batch, not the frame,
 the unit of visibility: a batch's positions become visible together —
-watermark advances to the batch's last position, *then* the batch's
-positions are published to the live feed in order. A subscriber MUST NOT
-observe a position from an in-flight, not-yet-committed batch.
+watermark advances to one past the batch's last position, *then* the batch's
+positions are published to the live feed in order. Filtering `$registry`
+from application delivery happens after this ordering step and does not
+renumber later events. A subscriber MUST NOT observe a position from an
+in-flight, not-yet-committed batch.
 
 The single-writer rule (D9) makes W1 free to satisfy in the current design
 — one writer holding one lock across both the watermark advance and the
@@ -124,6 +152,12 @@ async-publish design MUST re-derive W1 by construction, not by inspection.
 
 ## 5. Subscriber state machine
 
+The state machine below is for the direct-live-feed implementation. The
+conforming watermark-notify + authoritative-pull variant (§12(c)) remains in
+`CatchUp`, waits only when an empty scan makes no frontier progress, and then
+repeats the scan; `Switching`, `Live`, overlap dedupe, and overflow are absent
+because notifications carry no records.
+
 ```text
 states:      CatchUp -> Switching -> Live
 overflow:    {Switching, Live} --overflow--> CatchUp
@@ -131,9 +165,9 @@ overflow:    {Switching, Live} --overflow--> CatchUp
 
 | State | Meaning | Entered when |
 |---|---|---|
-| `CatchUp` | Paging through history from `last`. | Subscription start (`last := c`); or an overflow signal in `Switching`/`Live` (`last := last_delivered`). |
-| `Switching` | History exhausted (as of the read that found it empty); draining the live buffer, has not yet delivered a live position since entering this state. | A `read_from(last, limit)` call in `CatchUp` returns an empty page. |
-| `Live` | Delivering live positions in order; has delivered at least one live position since the last (re)entry into `Switching`. | The first live position `== last + 1` is delivered while in `Switching`. |
+| `CatchUp` | Paging through history from the next-to-scan `cursor`. | Subscription start (`cursor := c`); or an overflow signal in `Switching`/`Live` (`cursor` unchanged). |
+| `Switching` | History is caught up (an empty scan made no frontier progress); draining the live buffer, has not yet processed a new live position since entering this state. | A `read_from(cursor, limit)` call in `CatchUp` returns no records **and** `frontier == cursor`. |
+| `Live` | Processing live canonical positions in order; application delivery remains filtered. | The first live position `== cursor` is processed while in `Switching` (it advances `cursor` whether visible or filtered). |
 
 `Switching` and `Live` share one code path (§7); the distinction is purely
 observational (has a live delivery happened since the last switch) and MAY
@@ -147,40 +181,47 @@ the transition table in §7 is honored.
 subscribe(c):
     1. attach to the live feed FIRST (start := live buffer begins
        accumulating on the subscriber's behalf)
-    2. THEN enter CatchUp with last := c
+    2. THEN enter CatchUp with cursor := c
 
 CatchUp:
-    page := read_from(last, limit)
-    if page is non-empty:
-        deliver page in order; last := page's final position; repeat
-    if page is empty:
+    page := read_from(cursor, limit)
+    deliver page.records in order
+    if page.frontier > cursor:
+        cursor := page.frontier; repeat
+    if page.records is empty and page.frontier == cursor:
         -> Switching
 
 Switching / Live:
     on next live position p:
-        p <= last     -> drop p                    (§7 overlap dedupe)
-        p == last + 1 -> deliver p; last := p; (Switching -> Live)
-        overflow       -> last unchanged; -> CatchUp (§8)
+        p < cursor  -> drop p                      (§7 overlap dedupe)
+        p == cursor -> cursor := p + 1;
+                       deliver only if visible; (Switching -> Live)
+        p > cursor  -> anomaly; -> CatchUp         (§8)
+        overflow    -> cursor unchanged; -> CatchUp (§8)
 ```
 
-**SUB1 (subscribe-before-read order).** A subscriber MUST attach to the
-live feed before issuing its first `read_from` call. This is what makes
-gaplessness provable: everything published after attach is either received
+**SUB1 (subscribe-before-read order).** A direct-live-feed subscriber MUST
+attach to the live feed before issuing its first `read_from` call. This is what
+makes completeness provable: everything published after attach is either received
 on the live channel or covered by an explicit overflow signal (S1, below)
 — nothing published after attach can fall in the gap between "history
 already read" and "not yet subscribed", because there is no such gap.
 
-**SUB2 (history-empty is the only switch trigger).** The `CatchUp ->
-Switching` transition MUST be triggered only by an empty page from
-`read_from`, not by a timeout, a position estimate, or any other heuristic.
-An empty page is proof — not a guess — that the subscriber has reached the
-durable watermark (D7) as of that read. This is also what makes the "no
-flapping" property (§9) hold: the switch condition is self-verifying.
+**SUB2 (no-record/no-progress is the only switch trigger).** The `CatchUp ->
+Switching` transition MUST be triggered only when `read_from` returns both an
+empty `records` list and `frontier == cursor`, not by an empty record list
+alone, a timeout, a position estimate, or any other heuristic. An empty list
+with `frontier > cursor` proves only that the scan crossed filtered system
+positions; it MUST advance the cursor and remain in `CatchUp`. Empty with no
+frontier progress is proof — not a guess — that the subscriber has reached the
+durable watermark (D7) as of that read.
 
-**SUB3 (deliver-in-order).** History pages MUST be delivered to the
-consumer in position order and MUST be contiguous (`read_from` returning a
-page with an internal gap is a violation of history's contract, not
-something a subscriber is expected to handle).
+**SUB3 (deliver-in-order).** History records MUST be delivered to the consumer
+in strictly ascending canonical position order. Numeric gaps are legal and
+expected when every intervening position is accounted for by the page's scan
+frontier and filtering policy. A record position below the incoming cursor, a
+non-increasing pair of returned record positions, or a record at/above the
+exclusive frontier is a history-contract violation.
 
 ### Correctness argument (S1)
 
@@ -189,49 +230,46 @@ restated here because it is short, and because an implementer who
 understands *why* the protocol works is much less likely to break it under
 refactoring pressure.
 
-> **S1.** If a subscriber subscribes at time `T0` and later finishes
-> catch-up at watermark `W_end` (its last, empty `read_from`), then every
-> position `p > W_end` was published on the live feed **after** `T0`: by
-> W1, `p`'s publish happens only once the watermark is already `>= p >
-> W_end`, and the watermark at `T0` was `<= W_end` (`read_from` never
-> serves positions beyond the watermark, and `W_end` is itself a watermark
-> value observed at or after `T0`). Therefore `p` is in the subscriber's
-> live buffer, delivered by `recv()` in position order, or the buffer
-> overflowed and an explicit overflow signal was raised instead — never
-> silently absent.
+> **S1.** If a subscriber subscribes at time `T0` and later finishes catch-up
+> at exclusive frontier `W_end` (its empty, no-progress `read_from`), then
+> every canonical position `p >= W_end` was published on the live feed after
+> `T0`: by W1, `p`'s publish happens only once the watermark covers `p`, while
+> the scan observed `W_end` at or after `T0`. Therefore `p` (including a
+> filtered-position marker) is in the subscriber's live buffer in canonical
+> order, or the buffer overflowed and raised an explicit signal—never silently
+> absent. History remains authoritative for materializing visible records.
 
-Combined with the overlap dedupe rule (§7), delivery is exactly `c+1, c+2,
-…, final_watermark`, independent of how many times the subscriber
-regresses from `Live`/`Switching` back to `CatchUp`.
+Combined with the overlap dedupe rule (§7), delivery is exactly the ordered
+subset of application-visible records at canonical positions `>= c` and below
+the final watermark, independent of how many times the subscriber regresses
+from `Live`/`Switching` back to `CatchUp`.
 
-## 7. Overlap dedupe — MUST be `<=`, not `==`
+## 7. Overlap dedupe — MUST cover every position below the cursor
 
 **SUB4 (dedupe comparator).** In `Switching`/`Live`, a received live
-position `p` MUST be dropped whenever `p <= last`, not merely when `p ==
-last`.
+position `p` MUST be dropped whenever `p < cursor`, not merely when `p ==
+cursor - 1`.
 
 This is the second load-bearing detail in this document, alongside W1.
 Getting the comparator wrong does not fail loudly — it fails as an
 under-delivery that surfaces only once catch-up has run at least twice, so
 it is very easy to write, test lightly, and ship.
 
-> **Decision — why `<=` and not `==`.**
+> **Decision — why `< cursor` and not `== cursor - 1`.**
 > **Rationale:** after an overflow-driven regression (§8), `CatchUp` can
-> legitimately overshoot far past whatever positions are still queued in
-> the live buffer from before the regression — the buffer isn't cleared on
-> regression, and re-draining it is what the next `Switching` phase does.
-> On the next switch, the live receiver yields arbitrarily stale
-> positions, not just the single boundary position at `last + 1`. An
-> `== last` comparator drops exactly one stale duplicate and then
-> misclassifies every further stale position as an in-order gap (`p >
-> last + 1` with no overflow signal), triggering the anomaly path (§11)
-> or, worse in an implementation that doesn't have one, delivering out of
-> order or throwing away real data.
+> legitimately scan far past whatever positions are still queued in the live
+> buffer from before the regression. The buffer is not cleared on regression,
+> and re-draining it is what the next `Switching` phase does. On the next
+> switch, the live receiver yields arbitrarily stale positions, not just the
+> one immediately before the cursor. An `== cursor - 1` comparator drops
+> exactly one stale duplicate and then mishandles the rest. Filtered registry
+> positions do not weaken this rule: they advance the same canonical scan
+> cursor even though they emit no application record.
 > **Evidence:** the spike's randomized suite recorded 43,161 dedupe drops
 > in one 4,000-scenario run alone (52,438 total across the full suite),
 > many multi-position per switch after a regression — this is not a rare
 > edge case, it is the normal shape of a regression's aftermath.
-> **Rejected alternative:** `== last` only. Looks sufficient under a
+> **Rejected alternative:** `== cursor - 1` only. Looks sufficient under a
 > single dry-run switch; fails the moment a subscriber has regressed even
 > once. No sources propose this as viable; it is recorded here because it
 > is the natural first draft.
@@ -253,7 +291,7 @@ and "channel closed".
 
 **SUB6 (overflow regresses, does not fail the subscription).** On an
 overflow signal, the subscriber MUST transition to `CatchUp` with
-`last` unchanged (i.e. from the last position it actually delivered), and
+`cursor` unchanged (the next canonical position not yet processed), and
 MUST NOT terminate the subscription or surface an error to the consumer on
 this path alone. History is authoritative and complete up to the current
 watermark (§3); nothing is lost. Overflow is normal operation under load,
@@ -273,10 +311,10 @@ design, bounded memory demands it), loud at the observability layer
 
 ### Anomaly path (defense in depth)
 
-**SUB8.** A received live position `p` with `p > last + 1` that arrives
+**SUB8.** A received live position `p` with `p > cursor` that arrives
 **without** a preceding overflow signal is impossible under W1 + SUB1 (this
 is exactly what S1 proves). An implementation MUST nonetheless treat this
-case defensively — regress to `CatchUp` from `last`, exactly as for a
+case defensively — regress to `CatchUp` from `cursor`, exactly as for a
 genuine overflow — and MUST count it separately from ordinary overflow
 regressions (the spike's suite calls this `anomaly_regressions`). This
 counter is the tripwire for a W1 violation reaching production: it MUST be
@@ -295,18 +333,22 @@ exclusion) and warrants investigation.
 **No flapping (informative).** A subscriber persistently slower than the
 writer settles into `CatchUp` and stays there — it does not oscillate
 between `CatchUp` and `Switching`/`Live`. This falls directly out of SUB2:
-while the subscriber is behind, `read_from` never returns an empty page,
-so the `CatchUp -> Switching` transition never fires. Flapping would
+while the subscriber is behind, `read_from` either returns visible records or
+advances the scan frontier, so the `CatchUp -> Switching` transition never
+fires. Flapping would
 require repeatedly reaching (and leaving) the caught-up state, which by
 definition means the subscriber is not persistently behind. No additional
 hysteresis or debouncing logic is needed or wanted.
 
-**SUB9 (lag metric).** Implementations MUST expose `watermark - cursor`
-as a per-subscription lag metric. The protocol tolerates unbounded lag
-silently with respect to correctness (bounded memory, unbounded delivery
-debt is a legal steady state — see §12's rejected alternatives for why
-that is the right trade); an operator has no way to notice a permanently
-behind subscriber without this metric.
+**SUB9 (lag metric).** Implementations MUST expose `watermark - cursor` as
+the per-subscription **canonical-position lag**. Because that span can include
+filtered `$registry` positions, it is an ordering-distance/scan-debt metric,
+not a count of application events awaiting delivery. Implementations MAY also
+expose a visible-event backlog estimate, but MUST label it separately. The
+protocol tolerates unbounded lag silently with respect to correctness (bounded
+memory, unbounded delivery debt is a legal steady state — see §12's rejected
+alternatives for why that is the right trade); an operator has no way to
+notice a permanently behind subscriber without this metric.
 
 > **Decision — live buffer capacity is not specified as a constant.**
 > Sources establish that correctness is independent of capacity (the
@@ -329,25 +371,28 @@ behind subscriber without this metric.
 
 ## 10. Interaction with cursor regression (D7)
 
-Under `Process` durability, and inside a `Group` durability window
-(`03-durability.md`, D7), visibility can precede durability: a subscriber
-may hold a cursor pointing past the log end that survives a crash.
+Under `Process` durability (`03-durability.md`, D7), visibility can precede
+crash durability: a subscriber may hold a cursor pointing past the log end
+that survives a crash. Standard `Group` reads expose positions only after the
+covering barrier and therefore do not create a separate cursor-regression
+window; an internal optimistic pre-barrier path would be non-conforming.
 
-**SUB10.** When `read_from(last, …)` (or a re-attach after a connection
-loss) is called with `last > log_end`, the store MUST return the typed
+**SUB10.** When `read_from(cursor, …)` (or a re-attach after a connection
+loss) is called with `cursor > log_end`, the store MUST return the typed
 error `CursorRegressed { cursor, log_end }` (D7; full production semantics
 in `03-durability.md` / `02-recovery.md`). This MUST propagate to the
 consumer and MUST NOT be silently absorbed by an automatic re-subscribe:
-positions `log_end+1 ..= cursor` were delivered to the consumer but no
-longer exist after recovery, and only the consumer's application logic
-knows whether downstream effects of those deliveries need compensating.
+canonical positions `[log_end, cursor)` were previously scanned but no longer
+exist after recovery. Some may have produced application deliveries and some
+may have been filtered system events; only the consumer's application logic
+knows whether downstream effects of the delivered subset need compensating.
 After the consumer acknowledges `CursorRegressed`, the subscription
 re-enters `CatchUp` from `log_end` under the ordinary protocol of §6.
 
 This is a re-attach/recovery-time phenomenon only: within one process's
 uptime, the bounded live buffer never spans a crash, so `CursorRegressed`
 cannot arise mid-`Live`/`Switching` — it is only ever observed at
-subscribe/re-subscribe time, when `last` is being validated against a
+subscribe/re-subscribe time, when `cursor` is being validated against a
 freshly recovered `log_end`.
 
 ## 11. Conformance bar
@@ -359,8 +404,13 @@ before being considered conformant. At minimum such a suite MUST:
 - generate randomized scenarios varying live-buffer capacity, append burst
   size and timing, number of concurrent subscribers, and subscription
   start cursor (including 0, mid-history, and exactly-at-watermark);
-- check delivered sequences **element-for-element** against
-  `cursor+1 ..= final_watermark` for every subscriber in every scenario;
+- insert hidden/system positions at genesis, between visible events, and in
+  filtered-only runs, including runs longer than one history page;
+- check delivered sequences **element-for-element** against the ordered subset
+  of application-visible records at positions from the start cursor through
+  the final watermark—not against a dense integer range;
+- assert every reported cursor/frontier is monotone, never skips an eligible
+  record, and can advance across an empty filtered-only page;
 - assert an anomaly counter (SUB8) is 0 across the entire run;
 - include the naive "catch-up-then-subscribe" protocol (§12(a)) as an
   executable negative control, and assert that it demonstrably loses
@@ -380,10 +430,11 @@ protocol, precisely because its failure mode (SUB4 done wrong, W1 violated
 by a refactor) does not show up in small, sequential, single-subscriber
 tests.
 
-## 12. Alternatives considered and rejected
+## 12. Alternatives considered
 
 > **Decision — subscribe-first + overlap dedupe (the specified protocol),
-> vs. three alternatives.**
+> with watermark-notify + authoritative pull as a conforming implementation
+> option.**
 
 **(a) Catch-up-until-empty, then subscribe.** Reverse the order of SUB1:
 drain history to empty, *then* attach to the live feed. **Rejected.** Any
@@ -409,20 +460,20 @@ specific to subscriptions).
 **(c) Watermark-only `watch` + pull (no event broadcast).** The writer
 publishes only the current watermark on a coalescing `watch`-style
 channel; subscribers stay permanently in pull mode — wake on watermark
-change, page history. **Rejected as the primary mechanism**, though it is
-the honest degenerate case the specified protocol falls back to under
-sustained lag (a subscriber pinned in `CatchUp` is, functionally, exactly
-this). Trivially gapless (one code path, no dedupe, no overflow states),
-but every subscriber pays a history read for every commit even while fully
-caught up — N live subscribers means N re-reads of the tail instead of one
-shared in-memory fan-out — and tail latency becomes wake-plus-page-read
-instead of direct channel delivery. A `watch`-style channel also
-coalesces updates with no per-receiver queue, so it structurally cannot
-provide the overflow signal SUB5 requires — it cannot distinguish "I was
-slow and missed updates" from "nothing changed", which is exactly the
-distinction the protocol's regression logic depends on. A broadcast-style
-channel with a bounded per-receiver buffer and an explicit overflow error
-was chosen specifically because it provides that signal.
+change, then page history. **Accepted as an equivalent implementation when
+history returns the explicit scan frontier required by §3.** Coalescing is safe
+because the watermark is only a wake signal, never a delivery source: after
+every wake the subscriber scans authoritative history until it makes no
+frontier progress. It therefore needs neither live overlap dedupe nor an
+overflow signal. This is the shape used by `mess-store`'s application-facing
+subscription, and it handles filtered `$registry` runs naturally.
+
+The tradeoff is performance, not correctness: every subscriber pays a history
+read after a commit even while fully caught up, and tail latency includes wake
+plus page read. A direct broadcast remains a conforming optimization when it
+obeys W1 and SUB1–SUB8, including canonical-position markers for filtered
+events. Implementations MAY choose either shape and MUST expose the same §2
+delivery and opaque-cursor contract.
 
 ## 13. Non-goals
 
@@ -432,7 +483,7 @@ was chosen specifically because it provides that signal.
   such wire protocol would need to preserve, not the wire protocol itself.
   A future client-protocol spec MUST preserve W1, SUB1, and SUB4
   end-to-end — e.g. a network hop MUST NOT reorder live-feed deliveries,
-  and the client-side reassembly MUST apply the same `<=` dedupe — but the
+  and the client-side reassembly MUST apply the same `< cursor` dedupe — but the
   framing/byte layout for that protocol is undesigned and out of scope
   here.
 - **Retry/dedupe window for re-submitted commands.** Doc 12 lists an open,

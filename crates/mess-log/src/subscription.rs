@@ -3,20 +3,20 @@
 //! primitives — the durable [`Watermark`](crate::watermark::Watermark) and
 //! the paged, watermark-clamped [`ReadView`](crate::reader::ReadView).
 //!
-//! # The guarantee (spec §2)
+//! # Canonical-position transport below the app-facing contract
 //!
-//! A subscription created at cursor `c` delivers **exactly** the committed
-//! positions `c, c+1, …, watermark-1` in ascending order, with no gaps and
-//! no duplicates, regardless of concurrent appends, consumer speed, or how
-//! many times the subscriber falls behind and recovers.
+//! This low-level runtime transports **every canonical log position** before
+//! application filtering. Because v3 `$registry` frames are real canonical
+//! events, its dense guarantee is intentionally stronger/different in shape
+//! than spec §2's public guarantee: an app-facing subscription filters system
+//! records and therefore delivers a non-dense visible subset.
 //!
-//! (The spec states the guarantee over positions with a 1-based cursor —
-//! "deliver `c+1, c+2, …`". mess-log positions are 0-based with an
-//! *exclusive* durable end, so this module takes `cursor` to be the **next
-//! position to deliver**: a subscription at `cursor = 0` replays the whole
-//! log; one at `cursor = watermark` is exactly-at-head. The delivered
-//! sequence is `cursor .. final_watermark`. This is the same guarantee in
-//! 0-based clothing — see the note on the `<` dedupe comparator below.)
+//! A low-level subscription created at cursor `c` therefore delivers exactly
+//! canonical positions `c, c+1, …, watermark-1` in ascending order, with no
+//! gaps and no duplicates. Positions are 0-based and the durable end is
+//! exclusive: `cursor = 0` replays the whole canonical log and `cursor =
+//! watermark` is exactly at head. `mess-store` layers the spec §2 visibility
+//! policy and explicit scan-frontier semantics over this transport.
 //!
 //! # Two sources, asymmetric authority (spec §3)
 //!

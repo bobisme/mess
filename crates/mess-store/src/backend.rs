@@ -44,7 +44,14 @@ pub struct StoredRecord {
     pub data:            Vec<u8>,
     /// 0-based position of this event within its stream.
     pub stream_position: u64,
-    /// Monotonic position of this event across the whole store.
+    /// Canonical, monotonic position of this event across the whole store.
+    ///
+    /// Treat this value as an opaque ordering/resume token, not as an index
+    /// into the records returned by [`Backend::read_global`]. The v3
+    /// [`LogEngine`](crate::LogEngine) assigns positions to its internal
+    /// `$registry` events too, then filters those events from application
+    /// reads, so consecutive returned records can have non-consecutive
+    /// positions.
     pub global_position: u64,
 }
 
@@ -180,7 +187,9 @@ pub struct Appended {
     /// The stream's version after the append (position of the last event
     /// written).
     pub version:              Version,
-    /// Global position of the last event written.
+    /// Canonical global position of the last event written. This is an
+    /// ordering/resume token, not an application-event index; earlier
+    /// `$registry` events may have consumed intervening positions.
     pub last_global_position: u64,
 }
 
@@ -252,7 +261,8 @@ pub trait Backend: Send + Sync + 'static {
     /// position `after` (exclusive; pass `None` to start from the beginning),
     /// in ascending global order.
     ///
-    /// **Not necessarily dense.** A backend may consume global positions for
+    /// **Not necessarily dense.** A backend may consume canonical global
+    /// positions for
     /// events it does not deliver here — the [`LogEngine`](crate::LogEngine)'s
     /// `$registry` stream is one (`bn-2di`: registrations are log records, so
     /// they take positions, but they are engine bookkeeping and are never
@@ -261,7 +271,11 @@ pub trait Backend: Send + Sync + 'static {
     /// remain below the watermark. A caller that needs to advance a cursor
     /// safely across such a gap must use
     /// [`read_global_page`](Self::read_global_page), which also reports how
-    /// far the scan actually got.
+    /// far the scan actually got. Callers MUST treat positions as opaque,
+    /// monotone cursors: compare them and pass them back to resume, but do not
+    /// use subtraction to count application events or use a position as an
+    /// index into the returned sequence. `Some(u64::MAX)` is a terminal cursor:
+    /// there is no representable position after it, so the result is empty.
     fn read_global(
         &self,
         after: Option<u64>,
@@ -283,7 +297,9 @@ pub trait Backend: Send + Sync + 'static {
     /// The default implementation is correct for any backend with a dense
     /// global sequence (every position is a deliverable record — the
     /// [`MockBackend`](crate::mock) is): the frontier is simply one past the
-    /// last record delivered, or `after + 1` for an empty page.
+    /// last record delivered, or the saturating successor of `after` for an
+    /// empty page. In particular, `after == Some(u64::MAX)` returns an empty
+    /// page with frontier `u64::MAX` rather than wrapping to zero.
     fn read_global_page(
         &self,
         after: Option<u64>,
@@ -292,8 +308,8 @@ pub trait Backend: Send + Sync + 'static {
         async move {
             let records = self.read_global(after, limit).await?;
             let frontier = records.last().map_or_else(
-                || after.map_or(0, |p| p + 1),
-                |r| r.global_position + 1,
+                || after.map_or(0, |p| p.saturating_add(1)),
+                |r| r.global_position.saturating_add(1),
             );
             Ok(GlobalPage { records, frontier })
         }
@@ -324,7 +340,7 @@ pub struct GlobalPage {
     pub frontier: u64,
 }
 
-/// A [`Backend`] that also exposes the **committed global watermark** and an
+/// A [`Backend`] that also exposes the **published read watermark** and an
 /// event-bounded wait on it — the two primitives the app-facing subscription /
 /// live-tail API ([`EventStore::subscribe`](crate::EventStore::subscribe),
 /// [`EventStore::watermark`](crate::EventStore::watermark),
@@ -333,41 +349,47 @@ pub struct GlobalPage {
 /// This is an **additive** capability trait: the base [`Backend`] seam (and its
 /// [`read_global`](Backend::read_global) catch-up path) is untouched, so a
 /// backend that only stores events need not implement it. A backend that *does*
-/// implement it promises a monotone commit-notification hook rather than a
+/// implement it promises a monotone publish-notification hook rather than a
 /// parallel signalling system — internally both shipped backends reuse the
-/// `mess-log` durable watermark (`mess_log::watermark::Watermark`, the same
-/// primitive the log's D11 subscription runtime awaits).
+/// [`mess_log::watermark::Watermark`] notification primitive.
 ///
 /// # Watermark meaning
 ///
-/// The watermark is the **exclusive end of the committed global-position
-/// sequence**: every global position `< watermark` is committed and visible to
-/// [`read_global`](Backend::read_global), and no position `>= watermark` is yet
-/// readable. Equivalently it is the count of committed events. It is monotone
-/// non-decreasing while the store is live (it can only regress across a crash +
-/// recovery, never in-process).
+/// The watermark is the **exclusive end of the published global-position
+/// sequence**: every canonical global position `< watermark` is committed and
+/// can be accounted for by the published read path, and no position `>=
+/// watermark` is yet readable. It counts canonical v3 log events, including
+/// engine-internal `$registry` events that
+/// [`read_global`](Backend::read_global) filters out; it is therefore neither a
+/// count of application events nor a promise that every lower position will be
+/// returned. It is monotone non-decreasing while the store is live (it can only
+/// regress across a crash + recovery, never in-process).
 ///
-/// For the composed [`LogEngine`](crate::LogEngine) the watermark tracks the
-/// **published** end — a position is counted only once its payload is resident
-/// in the read path that [`read_global`](Backend::read_global) serves, which is
-/// strictly after the durable committer acked it. So a waiter woken by
+/// For the composed [`LogEngine`](crate::LogEngine) this is distinct from the
+/// direct owner's durable watermark: a position is counted here only once its
+/// payload is resident in the read path that
+/// [`read_global`](Backend::read_global) serves, strictly after the durable
+/// committer acked it. So a waiter woken by
 /// [`await_watermark_past`](SubscribeBackend::await_watermark_past) is
-/// guaranteed the position it waited for is already readable, not merely
-/// durable-but-not-yet-materialised.
+/// guaranteed the position it waited for has reached the published read path,
+/// not merely durable-but-not-yet-materialised. That position can itself be a
+/// filtered engine event; callers waiting for an application write should use
+/// that write's [`Appended::last_global_position`].
 pub trait SubscribeBackend: Backend {
-    /// The current committed global watermark (see the trait docs): the
+    /// The current published read watermark (see the trait docs): the
     /// exclusive end of the readable global-position sequence.
     fn watermark(
         &self,
     ) -> impl Future<Output = Result<u64, Self::Error>> + Send;
 
-    /// Resolve once the committed watermark has advanced strictly **past**
+    /// Resolve once the published read watermark has advanced strictly **past**
     /// global position `pos` — i.e. once `watermark > pos`, so position `pos`
-    /// is committed and visible to [`read_global`](Backend::read_global).
+    /// has reached the published read path. It may be filtered from
+    /// [`read_global`](Backend::read_global) if it is engine-internal.
     /// Resolves immediately if the watermark is already there.
     ///
     /// This is the event-bounded live-tail primitive: it is driven by commit
-    /// notification (the durable watermark's waker list), never by busy
+    /// notification (the read watermark's waker list), never by busy
     /// polling. Dropping the returned future (e.g. a cancelled `next_batch`)
     /// deregisters the waiter and can never wedge the committer.
     fn await_watermark_past(

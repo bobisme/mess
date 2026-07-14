@@ -3,56 +3,73 @@
 //!
 //! This is the store-level counterpart of `mess-log`'s D11 subscription
 //! runtime (`mess_log::subscription`). It reuses the *same* commit-notification
-//! primitive — the durable [`Watermark`](mess_log::watermark::Watermark),
-//! surfaced through [`SubscribeBackend`] — rather than duplicating a signalling
-//! system, but it serves **history from the app-facing read path**
+//! primitive — [`Watermark`](mess_log::watermark::Watermark), surfaced through
+//! [`SubscribeBackend`] — rather than duplicating a signalling system. For
+//! [`LogEngine`](crate::LogEngine) this is the **published read watermark**,
+//! which advances after the direct owner's durable watermark, once the index
+//! tiers can serve the covered positions. The subscription serves **history
+//! from that same app-facing read path**
 //! ([`Backend::read_global`](crate::backend::Backend::read_global), i.e. the
 //! record book with materialised payloads and stream names) so a delivered
 //! [`StoredRecord`] is exactly what every other read returns.
 //!
 //! # Catch-up → live handoff
 //!
-//! A subscription is a cursor `c` over the **global** position sequence: the
-//! next global position it will deliver.
+//! A subscription is a cursor `c` over the **canonical global** position
+//! sequence: the next position it will scan. The cursor is an opaque monotone
+//! resume token, not a dense index into application events.
 //! [`next_batch`](Subscription::next_batch) runs one step of the D11 state
 //! machine:
 //!
 //! 1. **Catch-up.** Read a page of history from `c` via `read_global`. If it is
 //!    non-empty, advance `c` past it and hand it back — the subscriber is
 //!    replaying committed history and never blocks.
-//! 2. **Live tail.** An empty page proves `c` reached the watermark. Park on
+//! 2. **Live tail.** An empty page proves `c` reached the published read
+//!    watermark. Park on
 //!    [`await_watermark_past(c)`](SubscribeBackend::await_watermark_past) — an
 //!    **event-bounded** wait woken by the next commit that passes `c`, *not* a
 //!    poll — then loop back to step 1, where the read now returns the freshly
 //!    committed positions.
 //!
 //! History is authoritative; the watermark is only the wake signal. There is no
-//! window in which a committed position is in neither source: the watermark is
-//! advanced (by the backend) only after the position is resident in the read
-//! path `read_global` serves, and the subscriber always re-reads history after
-//! a wake. So a subscription started at `c` delivers **exactly** the positions
-//! `c, c+1, …` as they commit — gap-free, in ascending global order, each once.
+//! window in which a committed application record is in neither source: the
+//! watermark is advanced (by the backend) only after the covered canonical
+//! positions are resident in the read path `read_global` serves, and the
+//! subscriber always re-reads history after a wake.
+//!
+//! The v3 [`LogEngine`](crate::LogEngine) also assigns canonical positions to
+//! `$registry` events and then filters those engine records from this
+//! application-facing path. A subscription therefore delivers every visible
+//! record at or after `c`, once and in ascending order, but it does **not**
+//! promise consecutive numeric positions. [`GlobalPage::frontier`] advances
+//! the scan cursor safely across filtered-only ranges.
 //!
 //! # Delivery guarantees
 //!
-//! - **Gap-free & in-order.** Each batch is a dense ascending run of global
-//!   positions beginning at the cursor; the cursor advances by exactly the
-//!   batch length. No position is skipped or reordered.
-//! - **At-least-once framing, exactly-once positions.** A delivered position is
-//!   never re-delivered by the same subscription. (A subscription does not
-//!   persist its cursor; a consumer that wants resumption records the last
-//!   delivered [`StoredRecord::global_position`] and re-subscribes `from` the
-//!   next one.)
+//! - **Complete & in-order.** No application-visible record at or after the
+//!   starting cursor is skipped or reordered. Numeric gaps are expected when
+//!   engine records occupy the intervening canonical positions.
+//! - **At-least-once framing, exactly-once records.** A delivered record is
+//!   never re-delivered by the same subscription. A subscription does not
+//!   persist a processing checkpoint. After successfully processing a
+//!   `next_batch` page or a single `next` record, a consumer may persist
+//!   [`position`](Subscription::position); while `next` has prefetched later
+//!   records, `position()` reports the first buffered record rather than the
+//!   farther-ahead internal scan frontier. Do not derive a backlog count from
+//!   cursor subtraction.
 //! - **Live is not busy-polling.** While caught up, the subscription is parked
 //!   on the watermark and consumes no CPU until a commit wakes it.
 //!
 //! # Cancellation / drop
 //!
 //! [`next_batch`](Subscription::next_batch) and [`next`](Subscription::next)
-//! are cancellation-safe: dropping the returned future before it resolves
-//! leaves the cursor unchanged (nothing was consumed) and deregisters the
-//! watermark waiter. Dropping the whole [`Subscription`] simply releases its
-//! backend handle and any parked waiter — it can **never** wedge the committer,
+//! are cancellation-safe for visible delivery: dropping the returned future
+//! before it resolves never consumes or skips an application record. A scan
+//! may already have advanced internally across filtered-only positions before
+//! it parks, and that progress is safe because nothing was delivered or
+//! buffered there. Cancellation deregisters the watermark waiter. Dropping the
+//! whole [`Subscription`] simply releases its backend handle and any parked
+//! waiter — it can **never** wedge the committer,
 //! because the watermark drains and re-wakes its waiter set on every advance
 //! regardless of which waiters are still alive. A store supports one writer and
 //! many independent subscribers this way; subscribers come and go freely.
@@ -72,8 +89,11 @@ use crate::store::StoreError;
 /// commit. See the [module docs](self) for the full delivery contract.
 pub struct Subscription<B: Backend> {
     backend:   B,
-    /// Next global position to deliver.
+    /// Next canonical global position to scan.
     cursor:    u64,
+    /// Whether the starting/resumed cursor has been checked against the
+    /// current published log end (SUB10).
+    validated: bool,
     /// Catch-up page size for `read_global`.
     page_size: usize,
     /// One-at-a-time buffer for [`next`](Self::next): the unread tail of the
@@ -83,36 +103,69 @@ pub struct Subscription<B: Backend> {
 }
 
 impl<B: SubscribeBackend> Subscription<B> {
-    /// Create a subscription whose first delivered global position is `from`.
-    /// Internal — callers use
+    /// Create a subscription whose first canonical position scanned is `from`;
+    /// it delivers the first application-visible record at or after that
+    /// position. Internal — callers use
     /// [`EventStore::subscribe`](crate::EventStore::subscribe).
     pub(crate) fn new(backend: B, from: u64, page_size: usize) -> Self {
         Subscription {
             backend,
             cursor: from,
+            validated: false,
             page_size: page_size.max(1),
             buffered: VecDeque::new(),
         }
     }
 
-    /// The next global position this subscription will deliver — its cursor.
-    /// After delivering position `p` this reads `p + 1`.
+    /// The safe next-to-deliver resume cursor for records already handed to
+    /// the caller.
+    ///
+    /// It can point at a filtered `$registry` position and can advance past
+    /// positions that were not delivered. [`next`](Self::next) may prefetch a
+    /// whole page and move the internal scan frontier farther ahead; while its
+    /// private buffer is non-empty, this method instead returns the first
+    /// buffered record's position so persisting it cannot skip unread records.
+    ///
+    /// Persist this value only after successfully processing the entire
+    /// `next_batch` result or the preceding single `next` result, then pass it
+    /// back to [`EventStore::subscribe`](crate::EventStore::subscribe). It is
+    /// not an application-event count or dense index.
     #[must_use]
-    pub fn position(&self) -> u64 { self.cursor }
+    pub fn position(&self) -> u64 {
+        self.buffered
+            .front()
+            .map_or(self.cursor, |record| record.global_position)
+    }
 
-    /// Deliver the next non-empty batch of committed records, in ascending
-    /// global order starting at the cursor.
+    /// Deliver the next non-empty batch of committed application records, in
+    /// ascending canonical global order at or after the cursor.
     ///
     /// Replays history a page at a time until caught up, then parks
     /// (event-bounded) on the watermark and returns the next committed page as
     /// soon as a writer commits past the cursor. Never returns an empty batch:
     /// it blocks until at least one record is available (or the backend
-    /// errors).
+    /// errors). Consecutive returned records may have non-consecutive global
+    /// positions because engine-internal records are filtered.
+    ///
+    /// On the first pull, a resumed cursor beyond the current published log
+    /// end returns [`StoreError::CursorRegressed`] rather than hanging or
+    /// rewinding silently.
     ///
     /// Cancellation-safe — see the [module docs](self).
     pub async fn next_batch(
         &mut self,
     ) -> Result<Vec<StoredRecord>, StoreError<B::Error>> {
+        if !self.validated {
+            let log_end =
+                self.backend.watermark().await.map_err(StoreError::Backend)?;
+            if self.cursor > log_end {
+                return Err(StoreError::CursorRegressed {
+                    cursor: self.cursor,
+                    log_end,
+                });
+            }
+            self.validated = true;
+        }
         // Drain any records a prior `next` walk fetched but did not hand out,
         // so `next` and `next_batch` can be interleaved without dropping
         // events.
@@ -155,7 +208,8 @@ impl<B: SubscribeBackend> Subscription<B> {
                     "read_global_page must not return records before the \
                      cursor",
                 );
-                self.cursor = (last.global_position + 1).max(frontier);
+                self.cursor =
+                    last.global_position.saturating_add(1).max(frontier);
                 return Ok(records);
             }
             if frontier > self.cursor {
@@ -177,8 +231,10 @@ impl<B: SubscribeBackend> Subscription<B> {
     ///
     /// A thin buffered convenience over [`next_batch`](Self::next_batch): it
     /// fetches a page when its buffer runs dry and hands records out one at a
-    /// time. Same blocking / cancellation semantics as
-    /// [`next_batch`](Self::next_batch).
+    /// time. Although the internal scan cursor advances for the fetched page,
+    /// [`position`](Self::position) accounts for the unread buffer and remains
+    /// a safe resume cursor after the returned record has been processed. Same
+    /// blocking / cancellation semantics as [`next_batch`](Self::next_batch).
     pub async fn next(&mut self) -> Result<StoredRecord, StoreError<B::Error>> {
         if let Some(rec) = self.buffered.pop_front() {
             return Ok(rec);
