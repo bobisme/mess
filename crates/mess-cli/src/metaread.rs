@@ -10,11 +10,11 @@
 //!
 //! Snapshots live in **two** places, and this module reads both:
 //!
-//! 1. the engine's own `<dir>/meta` `snapshot_heads` table, keyed by the engine
-//!    interner's dense `stream_id` (the ids `stream_names` maps). The composed
-//!    [`LogEngine`](mess_store::LogEngine) never actually writes a snapshot
-//!    head here, so in practice this set is empty — reading it is for
-//!    completeness and for tests that inject heads directly.
+//! 1. the optional legacy `<dir>/meta` `snapshot_heads` table, keyed by the
+//!    engine interner's dense `stream_id` (the ids `stream_names` maps). The
+//!    flat append owner does not create this store, so in practice this set is
+//!    absent — reading it is for compatibility and tests that inject heads
+//!    directly.
 //! 2. the **app snapshot sidecar** `<dir>/.snapshots/meta`
 //!    ([`store::snapshot_meta_dir`](crate::store::snapshot_meta_dir)), where a
 //!    [`FjallSnapshotBackend`](mess_store::FjallSnapshotBackend) actually
@@ -119,15 +119,17 @@ pub fn is_locked_error(reason: &str) -> bool {
     reason.contains("FjallError: Locked")
 }
 
-/// Open the metadata store read-only and pull the facts. Returns an error
-/// string (never panics) when the store can't be opened — e.g. it is locked by
-/// a live writer, or absent on a fresh directory.
+/// Open the optional metadata stores and pull the facts. An absent legacy
+/// engine store is the normal flat-owner state and contributes no snapshots.
+/// Returns an error string (never panics) when a store that does exist cannot
+/// be opened — e.g. it is locked by a live writer.
 pub fn read(dir: &std::path::Path) -> Result<MetaFacts, String> {
     let meta_path = crate::store::meta_dir(dir);
-    if !meta_path.exists() {
-        return Err(format!("no metadata store at {}", meta_path.display()));
+    let mut snapshots = Vec::new();
+    if meta_path.exists() {
+        let meta = MetaStore::open(&meta_path).map_err(|e| e.to_string())?;
+        snapshots.extend(snapshots_of(&meta));
     }
-    let meta = MetaStore::open(&meta_path).map_err(|e| e.to_string())?;
 
     // `bn-2di`: names no longer come from here at all — fjall has no name
     // keyspace. The engine's `id -> name` bijection lives in the log's
@@ -138,7 +140,6 @@ pub fn read(dir: &std::path::Path) -> Result<MetaFacts, String> {
     // Unify the two snapshot id spaces (see the module doc): the engine's own
     // `<dir>/meta` heads (historically empty) PLUS the app snapshot sidecar's
     // heads, each joined against its own side map.
-    let mut snapshots = snapshots_of(&meta);
     if let Some(app) = open_snapshot_sidecar(dir)? {
         snapshots.extend(snapshots_of(&app));
     }

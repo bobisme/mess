@@ -134,6 +134,140 @@ pub struct BatchInput<'a, 'p> {
     pub subframes:            &'a [Subframe<'p>],
 }
 
+/// A byte-complete batch whose producer-independent fields can be stamped by
+/// the single writer immediately before I/O.
+///
+/// Building this on the submitting thread moves the payload copy and frame
+/// layout work out of the serial owner. The owner remains authoritative: it
+/// supplies type IDs, positions, segment epoch, batch ID, stream identity,
+/// and the optional chain value, then recomputes the covering CRC before the
+/// writer accepts any byte.
+#[derive(Debug)]
+pub struct PreparedBatch {
+    bytes:           Vec<u8>,
+    type_id_offsets: Vec<u32>,
+    payload_ranges:  Vec<(u32, u32)>,
+    chain:           bool,
+    type_ids_set:    bool,
+}
+
+impl PreparedBatch {
+    /// Pre-encode the common plain-event shape with placeholder authoritative
+    /// fields. `event_type_id` values in `input` are ignored and must be set
+    /// with [`set_event_type_ids`](Self::set_event_type_ids) before writing.
+    pub fn encode(input: &BatchInput<'_, '_>) -> Result<Self, EncodeError> {
+        let mut encoder = BatchEncoder::new();
+        encoder.encode(input)?;
+        let chain = input.crypto_chain.is_some();
+        let mut cursor = HEADER_LEN + usize::from(chain) * CHAIN_LEN;
+        let mut type_id_offsets = Vec::with_capacity(input.subframes.len());
+        let mut payload_ranges = Vec::with_capacity(input.subframes.len());
+        for sf in input.subframes {
+            type_id_offsets.push(cursor as u32);
+            let payload_start = cursor + SUBFRAME_HDR_LEN;
+            let payload_end = payload_start + sf.payload.len();
+            payload_ranges.push((payload_start as u32, payload_end as u32));
+            cursor = payload_end;
+        }
+        debug_assert_eq!(cursor + MARKER_LEN, encoder.buf.len());
+        Ok(PreparedBatch {
+            bytes: encoder.buf,
+            type_id_offsets,
+            payload_ranges,
+            chain,
+            type_ids_set: false,
+        })
+    }
+
+    pub fn frame_count(&self) -> u32 { self.type_id_offsets.len() as u32 }
+
+    pub fn total_len(&self) -> u64 { self.bytes.len() as u64 }
+
+    pub fn payload_ranges(&self) -> &[(u32, u32)] { &self.payload_ranges }
+
+    pub fn bytes(&self) -> &[u8] { &self.bytes }
+
+    pub fn into_bytes_and_payload_ranges(self) -> (Vec<u8>, Vec<(u32, u32)>) {
+        (self.bytes, self.payload_ranges)
+    }
+
+    pub fn set_event_type_ids(
+        &mut self,
+        ids: &[u32],
+    ) -> Result<(), EncodeError> {
+        if ids.len() != self.type_id_offsets.len() {
+            return Err(EncodeError::PreparedTypeIdCount {
+                expected: self.type_id_offsets.len(),
+                actual:   ids.len(),
+            });
+        }
+        for (&off, &id) in self.type_id_offsets.iter().zip(ids) {
+            let off = off as usize;
+            self.bytes[off..off + 4].copy_from_slice(&id.to_le_bytes());
+        }
+        self.type_ids_set = true;
+        Ok(())
+    }
+
+    pub(crate) fn validate_for_chain(
+        &self,
+        chain_requested: bool,
+    ) -> Result<(), EncodeError> {
+        if !self.type_ids_set {
+            return Err(EncodeError::PreparedTypeIdsUnset);
+        }
+        if self.chain != chain_requested {
+            return Err(EncodeError::PreparedChainMismatch {
+                prepared:  self.chain,
+                requested: chain_requested,
+            });
+        }
+        Ok(())
+    }
+
+    /// Stamp every writer-owned field and recompute the split-coverage CRC.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn finish(
+        &mut self,
+        segment_epoch: u64,
+        batch_id: u64,
+        first_global_pos: u64,
+        stream_id: u64,
+        category_id: u64,
+        first_stream_version: u64,
+        crypto_chain: Option<&[u8; CHAIN_LEN]>,
+    ) -> Result<(), EncodeError> {
+        self.validate_for_chain(crypto_chain.is_some())?;
+        put_u64(&mut self.bytes, BH_BATCH_ID_OFF, batch_id);
+        put_u64(&mut self.bytes, BH_FIRST_GLOBAL_POS_OFF, first_global_pos);
+        put_u64(&mut self.bytes, BH_SEGMENT_EPOCH_OFF, segment_epoch);
+        put_u64(&mut self.bytes, BH_STREAM_ID_OFF, stream_id);
+        put_u64(&mut self.bytes, BH_CATEGORY_ID_OFF, category_id);
+        put_u64(
+            &mut self.bytes,
+            BH_FIRST_STREAM_VERSION_OFF,
+            first_stream_version,
+        );
+        if let Some(chain) = crypto_chain {
+            self.bytes[HEADER_LEN..HEADER_LEN + CHAIN_LEN]
+                .copy_from_slice(chain);
+        }
+        self.bytes[HEADER_CRC_OFF..HEADER_CRC_OFF + 4]
+            .copy_from_slice(&0u32.to_le_bytes());
+        let echo = self.bytes.len() - MARKER_LEN + CM_BATCH_CRC_ECHO_OFF;
+        self.bytes[echo..echo + 4].copy_from_slice(&0u32.to_le_bytes());
+        let crc = batch_crc(&self.bytes).to_le_bytes();
+        self.bytes[HEADER_CRC_OFF..HEADER_CRC_OFF + 4].copy_from_slice(&crc);
+        self.bytes[echo..echo + 4].copy_from_slice(&crc);
+        Ok(())
+    }
+}
+
+#[inline]
+fn put_u64(buf: &mut [u8], off: usize, value: u64) {
+    buf[off..off + 8].copy_from_slice(&value.to_le_bytes());
+}
+
 /// A batch that could not be encoded. Pure (no I/O); the
 /// [`SegmentWriter`](crate::writer) wraps these alongside its own faults.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -149,6 +283,23 @@ pub enum EncodeError {
     /// `frame_count` exceeds `u32::MAX` — not representable in the header.
     #[error("too many subframes: {count} exceeds u32::MAX")]
     TooManyFrames { count: usize },
+    /// A prepared batch must receive exactly one resolved type id per frame.
+    #[error(
+        "prepared batch type-id count mismatch: expected {expected}, got \
+         {actual}"
+    )]
+    PreparedTypeIdCount { expected: usize, actual: usize },
+    /// A prepared batch cannot be written before its placeholder type ids are
+    /// replaced with owner-resolved ids.
+    #[error("prepared batch event type ids were not resolved")]
+    PreparedTypeIdsUnset,
+    /// Chain presence affects the physical frame layout and must be chosen at
+    /// preparation time.
+    #[error(
+        "prepared batch chain shape mismatch: prepared={prepared}, \
+         requested={requested}"
+    )]
+    PreparedChainMismatch { prepared: bool, requested: bool },
     /// A subframe's on-disk payload exceeds `u32::MAX` (`compressed_len` is a
     /// u32), or its declared logical lengths are inconsistent (D-FMT-7).
     #[error("subframe {index} invalid: {reason}")]
@@ -428,6 +579,89 @@ mod tests {
         );
         // And it must equal an independent split-coverage recomputation.
         assert_eq!(header_crc, batch_crc(bytes).to_le_bytes());
+    }
+
+    #[test]
+    fn prepared_finish_is_byte_identical_to_normal_encode() {
+        let p0 = b"first payload";
+        let p1 = b"second";
+        let actual_chain = [0xA5; CHAIN_LEN];
+        let actual_frames =
+            [Subframe::plain(17, 2, 3, p0), Subframe::plain(29, 4, 5, p1)];
+        let actual = BatchInput {
+            segment_epoch:        11,
+            batch_id:             12,
+            first_global_pos:     13,
+            stream_id:            14,
+            category_id:          15,
+            first_stream_version: 16,
+            crypto_chain:         Some(&actual_chain),
+            subframes:            &actual_frames,
+        };
+        let expected = BatchEncoder::new().encode(&actual).unwrap().to_vec();
+
+        let placeholder_chain = [0u8; CHAIN_LEN];
+        let placeholder_frames =
+            [Subframe::plain(0, 2, 3, p0), Subframe::plain(0, 4, 5, p1)];
+        let mut prepared = PreparedBatch::encode(&BatchInput {
+            segment_epoch:        0,
+            batch_id:             0,
+            first_global_pos:     0,
+            stream_id:            0,
+            category_id:          0,
+            first_stream_version: 0,
+            crypto_chain:         Some(&placeholder_chain),
+            subframes:            &placeholder_frames,
+        })
+        .unwrap();
+        prepared.set_event_type_ids(&[17, 29]).unwrap();
+        prepared.finish(11, 12, 13, 14, 15, 16, Some(&actual_chain)).unwrap();
+
+        assert_eq!(prepared.bytes(), expected);
+        assert_eq!(
+            prepared
+                .payload_ranges()
+                .iter()
+                .map(|&(start, end)| {
+                    &prepared.bytes()[start as usize..end as usize]
+                })
+                .collect::<Vec<_>>(),
+            vec![p0.as_slice(), p1.as_slice()]
+        );
+    }
+
+    #[test]
+    fn prepared_requires_resolved_ids_and_matching_chain_shape() {
+        let payload = b"payload";
+        let frames = [Subframe::plain(0, 0, 0, payload)];
+        let mut prepared = PreparedBatch::encode(&BatchInput {
+            segment_epoch:        0,
+            batch_id:             0,
+            first_global_pos:     0,
+            stream_id:            0,
+            category_id:          0,
+            first_stream_version: 0,
+            crypto_chain:         None,
+            subframes:            &frames,
+        })
+        .unwrap();
+        assert_eq!(
+            prepared.finish(1, 2, 3, 4, 5, 6, None),
+            Err(EncodeError::PreparedTypeIdsUnset)
+        );
+        assert_eq!(
+            prepared.set_event_type_ids(&[]),
+            Err(EncodeError::PreparedTypeIdCount { expected: 1, actual: 0 })
+        );
+        prepared.set_event_type_ids(&[7]).unwrap();
+        let chain = [0u8; CHAIN_LEN];
+        assert_eq!(
+            prepared.finish(1, 2, 3, 4, 5, 6, Some(&chain)),
+            Err(EncodeError::PreparedChainMismatch {
+                prepared:  false,
+                requested: true,
+            })
+        );
     }
 
     #[test]

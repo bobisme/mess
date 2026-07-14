@@ -533,10 +533,13 @@ async fn the_engine_opens_and_serves_with_the_whole_meta_directory_deleted() {
             .expect("append");
     }
 
-    // Nuke the ENTIRE fjall metadata store — every keyspace it has.
+    // Nuke the ENTIRE fjall metadata store — every keyspace it has. The flat
+    // owner no longer writes the derived stream-head cache, so an append-only
+    // fixture may legitimately never create this directory at all.
     let meta_dir = store_path.join("meta");
-    assert!(meta_dir.exists(), "the fixture must actually have a meta dir");
-    std::fs::remove_dir_all(&meta_dir).expect("delete the meta directory");
+    if meta_dir.exists() {
+        std::fs::remove_dir_all(&meta_dir).expect("delete the meta directory");
+    }
 
     let engine = open_with(&store_path, Durability::Process);
     for i in 0..6u64 {

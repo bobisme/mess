@@ -9,24 +9,14 @@
 //!
 //! # How the pieces compose
 //!
-//! - **Durability spine** — every non-empty
-//!   [`append_batch`](Backend::append_batch) is a single-stream batch handed to
-//!   a `mess-log` [`Committer`] running on a `mess-log` [`RealRuntime`]. The
-//!   committer assigns dense, event-counted global positions (A1), does group
-//!   commit under the configured [`Durability`], and advances the durable
-//!   watermark. Because the [`Backend`] trait is async (tokio) and the
-//!   committer is driven by `mess-log`'s own `block_on`/OS-thread runtime, the
-//!   append crosses the seam via
-//!   [`spawn_blocking`](tokio::task::spawn_blocking) — the minimal adapter
-//!   between the two executors.
-//! - **Exact-version gate** — a per-stream sharded async mutex ([`AppendGate`],
-//!   bn-1s0) serialises the check-head → append → apply critical section **per
-//!   stream**, so two writers that loaded the same [`Version`] on the *same*
-//!   stream genuinely race and exactly one wins with a
-//!   [`AppendError::Conflict`], while writers on *different* streams no longer
-//!   queue behind one store-wide lock. (The committer still serialises the
-//!   durable write itself across all streams; the gate's job is only to make
-//!   the version check atomic with the append, per stream.)
+//! - **Flat append owner** — async producers enqueue owned intents into one
+//!   count- and byte-bounded ring. One OS thread validates expected versions in
+//!   dequeue order, stages registry ids, owns the `mess-log` segment writer,
+//!   assigns positions, writes, issues the covering durability barrier, applies
+//!   index/head effects, advances the published watermark, and completes
+//!   callers. There is no blocking-pool hop, per-stream gate, second committer
+//!   thread, or publish sequencer. Dropping a caller after enqueue only drops
+//!   its completion receiver; the owner still retires and publishes the intent.
 //! - **Hot reads** — committed batches are applied to a `mess-index`
 //!   [`ActiveIndex`] via `apply_committed` — with their **real** `(segment_id,
 //!   offset)` pointer from the committer's ack — **only after the committer
@@ -41,8 +31,9 @@
 //!   [`EventStore::load`](crate::EventStore::load) of a sealed corpus runs the
 //!   real sealed-replay path, with payload bytes reassembled from the columnar
 //!   `.pcol` sidecar where one exists.
-//! - **Meta** — durable stream heads and the dedupe window live in the
-//!   `mess-index` fjall [`MetaStore`].
+//! - **Derived state** — stream heads and active pointers are published in
+//!   memory after the covering write/barrier and rebuilt from the log on open;
+//!   the append path writes no Fjall metadata.
 //! - **Recovery** — on open the engine enumerates segment files and runs
 //!   `mess-log` `recover_whole_log` (fast path + advisory manifest) and
 //!   `mess-index` `rebuild` (F6) to rehydrate the active index.
@@ -81,16 +72,16 @@
 //! - **Names** come from the log itself (`bn-2di`). Frames carry only interned
 //!   numeric ids (`stream_id u64`, `event_type_id u32`), so the `id → name`
 //!   bijection is written as `$registry` records — spec 04's system stream,
-//!   `stream_id 0` — by the very same committer, in the very same segment.
-//!   [`append_batch`](Backend::append_batch) pushes a new name's `*Registered`
-//!   record and the batch that first references its id as ONE ordered unit
-//!   (`Appender::submit_ordered`), so the registration lands at a LOWER global
-//!   position than its first use, in the same commit group, under the same
-//!   barrier. That ordering is what makes the name durable "for free": recovery
-//!   accepts a contiguous prefix, so no crash can keep the reference and lose
-//!   the registration, and there is no second storage system to `fsync` (the
-//!   fjall `stream_names`/`type_names` tables, and the barrier bn-150 needed to
-//!   keep them co-durable, are **deleted**).
+//!   `stream_id 0` — by the same flat owner, in the same segment.
+//!   [`append_batch`](Backend::append_batch) writes a new name's `*Registered`
+//!   record and the batch that first references its id as ONE direct ordered
+//!   unit, so the registration lands at a LOWER global position than its first
+//!   use, in the same commit group, under the same barrier. That ordering is
+//!   what makes the name durable "for free": recovery accepts a contiguous
+//!   prefix, so no crash can keep the reference and lose the registration, and
+//!   there is no second storage system to `fsync` (the fjall
+//!   `stream_names`/`type_names` tables, and the barrier bn-150 needed to keep
+//!   them co-durable, are **deleted**).
 //!
 //! What remains of the book is deliberately tiny and history-**independent**
 //! per event: the folded [`registry::RegistryState`] plus the per-stream head
@@ -113,22 +104,27 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use mess_index::meta::{CommitGroup, Head, MetaStore, StreamId};
 use mess_index::sealed::{
     BlockCache, NoDicts, ReplaySet, SealBatch, SealDriver, SealInput,
     SealMetrics, SealStream, SealedSegmentIndex, SealedSegmentRef, SealedStore,
 };
 use mess_index::{ActiveIndex, BatchEntry, EventPtr, GlobalEntry, StreamEntry};
 use mess_log::committer::{
-    AppendOutcome, AppendRequest, Appender, ChainInit, Committer, Durability,
+    AppendOutcome, AppendRequest, ChainInit, CommitterMetricsHandle,
+    DirectAppendRequest, DirectBatchEvents, DirectCommitter, Durability,
     EventInput, LatencySnapshot, Roller,
 };
+use mess_log::encode::{BatchInput, PreparedBatch, Subframe};
 use mess_log::fold_chain::ChainHead;
+use mess_log::format::{
+    CHAIN_LEN, HEADER_LEN, MARKER_LEN, MAX_BATCH_LEN, SUBFRAME_HDR_LEN,
+};
 use mess_log::lock::StoreLock;
 use mess_log::runtime::{
     FileHandle, Fs as LogFs, OpenOpts, RealRuntime, Runtime,
@@ -141,7 +137,9 @@ use mess_log::writer::{
 };
 use quick_cache::sync::{Cache, DefaultLifecycle};
 use quick_cache::{DefaultHashBuilder, OptionsBuilder, Weighter};
-use tokio::sync::watch;
+use tokio::sync::{
+    OwnedSemaphorePermit, Semaphore, mpsc as tokio_mpsc, oneshot,
+};
 
 use crate::backend::{
     AppendError, Appended, Backend, GlobalPage, RecordToAppend, StoredRecord,
@@ -227,43 +225,18 @@ struct Book {
     /// at publish time, after the ack) — two concurrent new-stream appends
     /// would both read the same head and write two batches claiming the
     /// same version. It is allocated here instead, at **submit** time,
-    /// under the same `Book` mutex that orders the pushes into the
-    /// committer channel, which makes it a correct monotonic allocator:
-    /// submit order == channel order == global- position order == version
-    /// order.
+    /// by the single owner after the registration earns a positive ack. Owner
+    /// dequeue order == file order == global-position order == version order.
     ///
     /// Seeded on open from the folded registry's record count (stream 0's
     /// versions are dense from 0, so the count *is* the next version).
     registry_next_version: u64,
-    /// Ids whose `$registry` record is in the committer's channel but whose
-    /// durability the engine has not observed yet (`bn-2di`, review F1/F4).
+    /// Sticky: an already-landed `$registry` record could not be folded into
+    /// the live registry (an internal invariant failure).
     ///
-    /// An append that would *reference* one of these ids parks on the
-    /// [`watch`](tokio::sync::watch) channel here until the registration's
-    /// outcome is known, instead of racing ahead of it. That closes the last
-    /// window in which a domain batch could be durably committed while the
-    /// registration it depends on was rejected (a full store rejecting the
-    /// registration but accepting a smaller batch behind it): a batch is never
-    /// pushed against an id whose registration might still fail. It costs
-    /// nothing on the hot path — both maps are empty unless a brand-new name
-    /// is in flight *right now*, and the appender that minted the id never
-    /// waits on itself.
-    pending_streams:       HashMap<u64, watch::Receiver<bool>>,
-    /// See [`pending_streams`](Book::pending_streams). Event types are the ids
-    /// that genuinely can be raced for: two appenders on DIFFERENT streams (so
-    /// not serialised by the per-stream [`AppendGate`]) can use the same new
-    /// message type.
-    pending_types:         HashMap<u32, watch::Receiver<bool>>,
-    /// Sticky: a `$registry` batch this process pushed did NOT land
-    /// (`bn-2di`).
-    ///
-    /// The ids it minted are in this `Book` but may not be in the log, so the
-    /// in-memory registry can no longer be trusted to agree with the durable
-    /// one, and no further append may mint or reference an id. Reachable only
-    /// when the store is already failing (full/poisoned/closed — the ordinary
-    /// pre-commit rejections never mint anything). Reopening rebuilds the
-    /// `Book` from the log alone, which is consistent by construction, and is
-    /// the only exit.
+    /// The owner stages ids locally and folds them only after a positive ack,
+    /// so ordinary encode/write/barrier failures cannot set this. If an
+    /// impossible fold mismatch does, reopening from the log is the only exit.
     registry_lost:         bool,
 }
 
@@ -429,9 +402,7 @@ type EngineFile = <EngineFs as LogFs>::File;
 ///
 /// Frame `k` (0-based within the batch) is the event at stream position
 /// `first_stream_version + k`, global position `first_global_pos + k`, with
-/// event-type id `type_ids[k]` and payload
-/// `data[offs[k] as usize..offs[k + 1] as usize]` (a single arena, not one
-/// allocation per event).
+/// event-type id `type_ids[k]` and the corresponding payload.
 struct DecodedBatch {
     stream_id:            u64,
     first_stream_version: u64,
@@ -439,17 +410,29 @@ struct DecodedBatch {
     frame_count:          u32,
     /// Per-frame interned event-type id.
     type_ids:             Vec<u32>,
-    /// Payload arena; see the struct doc for the slicing contract.
+    /// One owned byte arena. Disk-decoded capsules pack only payload bytes;
+    /// producer-prepared append capsules adopt the final framed bytes.
     data:                 Vec<u8>,
-    /// `frame_count + 1` arena boundaries.
-    offs:                 Vec<u32>,
+    /// How each payload is located in `data`.
+    payloads:             PayloadLayout,
+}
+
+enum PayloadLayout {
+    /// `frame_count + 1` compact-arena boundaries.
+    Arena(Vec<u32>),
+    /// One `(start, end)` range per payload in producer-prepared framed bytes.
+    Framed(Vec<(u32, u32)>),
 }
 
 impl DecodedBatch {
     /// Frame `k`'s payload bytes.
     #[inline]
     fn payload(&self, k: usize) -> &[u8] {
-        &self.data[self.offs[k] as usize..self.offs[k + 1] as usize]
+        let (start, end) = match &self.payloads {
+            PayloadLayout::Arena(offs) => (offs[k], offs[k + 1]),
+            PayloadLayout::Framed(ranges) => ranges[k],
+        };
+        &self.data[start as usize..end as usize]
     }
 
     /// Every frame's payload, in subframe order — the shape the `$registry`
@@ -462,8 +445,12 @@ impl DecodedBatch {
 
     /// Resident bytes for the cache weighter.
     fn weight_bytes(&self) -> u64 {
+        let layout_bytes = match &self.payloads {
+            PayloadLayout::Arena(offs) => offs.len() * 4,
+            PayloadLayout::Framed(ranges) => ranges.len() * 8,
+        };
         (self.data.len()
-            + self.offs.len() * 4
+            + layout_bytes
             + self.type_ids.len() * 4
             + std::mem::size_of::<DecodedBatch>()) as u64
     }
@@ -933,7 +920,7 @@ impl BlockReader {
                     frame_count: b.frame_count,
                     type_ids,
                     data,
-                    offs,
+                    payloads: PayloadLayout::Arena(offs),
                 });
             }
         }
@@ -978,7 +965,7 @@ impl BlockReader {
             frame_count: b.frame_count,
             type_ids,
             data,
-            offs,
+            payloads: PayloadLayout::Arena(offs),
         })
     }
 }
@@ -1002,84 +989,6 @@ fn pread_exact(
         off += n as u64;
     }
     Ok(())
-}
-
-/// Number of shards in the per-stream append gate (bn-1s0). A fixed-size
-/// array — it never grows, so a store is never on the hook for one lock per
-/// stream it has ever seen; only for whether two streams alias onto the same
-/// shard, which costs extra serialisation, never correctness.
-const APPEND_GATE_SHARDS: usize = 256;
-
-/// Per-stream exact-version gate (bn-1s0 — replaces the store-wide mutex).
-///
-/// Serialises the check-head → reserve critical section **per stream**, so
-/// appends to different streams no longer queue behind one lock while an
-/// `Exact(v)` race on the *same* stream still resolves to exactly one
-/// winner.
-///
-/// Design: a fixed array of `APPEND_GATE_SHARDS` async mutexes, indexed by
-/// `stream_id % APPEND_GATE_SHARDS`, chosen over a keyed map (e.g. a dashmap
-/// of `Arc<Mutex<()>>` per stream id) for two reasons:
-/// - **No unbounded growth.** A store that has ever seen a million distinct
-///   streams still costs exactly `APPEND_GATE_SHARDS` mutexes — a keyed map
-///   would need its own eviction/GC policy (or leak one entry per stream
-///   forever) to avoid the same hazard.
-/// - **No hashing needed.** Stream ids are dense `u64`s minted by the book's
-///   interner (1, 2, 3, …), so `% N` already spreads consecutive ids
-///   round-robin across shards.
-///
-/// Two distinct streams that alias onto the same shard serialise against
-/// each other unnecessarily — a bounded throughput cost, never a
-/// correctness hazard: the version check inside the shard still reads the
-/// true per-stream head from the book.
-///
-/// Each shard is an `Arc<Mutex>` (not a bare `Mutex`) so the guard can be
-/// handed out as an [`OwnedMutexGuard`](tokio::sync::OwnedMutexGuard) — a
-/// `'static` guard that [`append_batch`](LogEngine::append_batch) moves into
-/// its non-cancellable commit+publish blocking task (bn-3nz). Holding the
-/// shard across the publish is what keeps the check-head → append → publish
-/// section atomic per stream; carrying an OWNED guard (rather than a
-/// borrowed `MutexGuard` held on the async future) means a cancelled append
-/// future can no longer release the shard early and let a concurrent
-/// same-stream append double-write the same stream version while the
-/// cancelled append's committed batch is still publishing.
-struct AppendGate {
-    shards: [Arc<tokio::sync::Mutex<()>>; APPEND_GATE_SHARDS],
-}
-
-impl AppendGate {
-    fn new() -> Self {
-        AppendGate {
-            shards: std::array::from_fn(|_| {
-                Arc::new(tokio::sync::Mutex::new(()))
-            }),
-        }
-    }
-
-    /// Acquire the shard guarding `stream_id`'s check-and-reserve section,
-    /// as an owned guard that can be moved into the commit+publish blocking
-    /// task and released only once the publish completes (bn-3nz).
-    ///
-    /// `bn-2di`: keyed by the stream **name**, not its interned id. The two are
-    /// interchangeable for the gate's purpose — it only needs "the same stream
-    /// always maps to the same shard, and different streams usually don't" —
-    /// but the name is available *before* the interner runs, and the id is not.
-    /// That matters now: interning a new stream must happen in the same
-    /// `Book`-locked section as the push into the committer (so a registration
-    /// cannot be overtaken by a batch referencing the id it mints), and that
-    /// section has to sit INSIDE the gate. Keying on the id would require
-    /// interning first — back outside the gate, which is exactly the split this
-    /// bone had to close.
-    async fn lock_for_name(
-        &self,
-        stream_name: &str,
-    ) -> tokio::sync::OwnedMutexGuard<()> {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        stream_name.hash(&mut h);
-        let idx = (h.finish() as usize) % APPEND_GATE_SHARDS;
-        Arc::clone(&self.shards[idx]).lock_owned().await
-    }
 }
 
 /// Where the committer durably placed one batch — the `Acked` half of an
@@ -1124,22 +1033,15 @@ fn expect_acked(outcome: AppendOutcome) -> Result<Placed, EngineError> {
 /// AFTER `apply_committed`, so a concurrent `head()` can never name a version
 /// the index cannot yet serve.
 fn publish_batch(
-    inner: &Inner,
+    inner: &PublishState,
     sid: u64,
     first_stream_version: u64,
     frame_count: u32,
     placed: Placed,
-) -> Result<(), EngineError> {
+) {
     let Placed { first_global, last_global, segment_id, offset } = placed;
     let watermark = last_global + 1;
     let last_stream_pos = first_stream_version + u64::from(frame_count) - 1;
-
-    // Wait this batch's turn to publish (bn-1s0): concurrent distinct-stream
-    // commits can ack out of position order, but the book/index/meta below all
-    // require strictly increasing-by-position writes. `_turn`'s `Drop` advances
-    // the sequence past `watermark` on EVERY exit path (success, error, or
-    // unwind), so the next position never stalls behind this one.
-    let _turn = inner.publish_seq.turn(first_global, watermark);
 
     inner.active.apply_committed(
         watermark,
@@ -1159,16 +1061,6 @@ fn publish_batch(
         book.heads.insert(sid, last_stream_pos);
     }
 
-    let mut group = CommitGroup::new(watermark);
-    group.stream_heads.push((
-        StreamId(sid),
-        Head { version: last_stream_pos, global_position: last_global },
-    ));
-    inner
-        .meta
-        .apply_group(&group)
-        .map_err(|e| EngineError::Meta(e.to_string()))?;
-
     // Publish complete: every position `< watermark` is now servable through
     // the index tiers. Advance the published watermark LAST, still holding this
     // batch's publish turn (`_turn`), so it moves in strict global-position
@@ -1176,123 +1068,6 @@ fn publish_batch(
     // is the wake that drives every live-tail subscriber parked on
     // `await_watermark_past`.
     inner.read_watermark.advance(watermark);
-    Ok(())
-}
-
-/// What the interner-locked section of
-/// [`append_batch`](LogEngine::append_batch) decided and pushed (`bn-2di`).
-struct SubmitPlan {
-    /// The version-check verdict.
-    pre:       Pre,
-    /// The ordered unit already in the committer's channel: the `$registry`
-    /// batch (if this append minted an id) followed by the domain batch (if
-    /// the version check passed). `None` when neither applies — the hot
-    /// conflict/empty path, which touches the committer not at all.
-    submitted: Option<mess_log::committer::Submitted>,
-    /// `(first stream version, record count)` of the `$registry` batch, if one
-    /// was pushed — what its publish needs, and the signal that outcome `[0]`
-    /// belongs to it rather than to the domain batch.
-    reg_span:  Option<(u64, usize)>,
-    /// Settles the in-flight registration this append minted (if any): clears
-    /// the pending markers, wakes parked appenders, and poisons the `Book` if
-    /// the record never landed. `None` when nothing was minted.
-    guard:     Option<RegistrationGuard>,
-}
-
-/// Orders the post-ack publish step (stream head + active index + meta head)
-/// across concurrently-committing streams (bn-1s0), and — since bn-3nz — is
-/// waited on **from the committer-side blocking task**, not the async
-/// caller's future, so a cancelled append can never strand an assigned
-/// position (see below).
-///
-/// The durable committer assigns each accepted batch a dense, globally
-/// unique position range, but once distinct streams can have appends in
-/// flight at the same time — the whole point of the per-stream
-/// [`AppendGate`] — their `spawn_blocking` acks can resolve in ANY order,
-/// not necessarily the order the committer assigned positions in.
-/// `ActiveIndex::apply_committed` / `MetaStore::apply_group` require
-/// in-position-order application (they carry out-of-order asserts), and the
-/// published read watermark must advance densely — so every publish must
-/// wait its turn here before touching any of them.
-///
-/// # Why this is a *blocking* primitive (bn-3nz)
-///
-/// The append's position is assigned by the durable committer *inside* the
-/// `spawn_blocking` task in [`append_batch`](LogEngine::append_batch). A
-/// `spawn_blocking` task is **never cancelled** — it always runs to
-/// completion even if its `JoinHandle` (the caller's `.await`) is dropped.
-/// [`append_batch`](LogEngine::append_batch) therefore also takes its
-/// [`turn`](PublishSequencer::turn) and performs the whole book/index/meta
-/// publish *within that same non-cancellable task*, so the assign→publish
-/// sequence is atomic against API-future cancellation: a dropped append future
-/// can no longer commit a position durably and then skip publishing it, which
-/// would have left [`turn`](PublishSequencer::turn)'s strict `== next` wait
-/// stalling every higher-positioned publish forever. Because the wait now
-/// happens on a blocking thread (not a tokio task), it is a plain
-/// [`Condvar`], not a `tokio::sync::watch`.
-///
-/// This only ever guards the in-memory publish step (a handful of
-/// `Vec`/`HashMap` writes) — never the slow durable write itself, which the
-/// committer already serialises regardless. So it does not reintroduce the
-/// store-wide throughput ceiling bn-1s0 removes; it just re-serialises a
-/// microseconds-long tail, in position order instead of ack-arrival order.
-struct PublishSequencer {
-    /// The global position a publish must match to go next, behind a
-    /// [`Condvar`]. Waiters block until it equals their `first_global`; the
-    /// publisher advances it via [`PublishTurn`]'s `Drop`.
-    next:     Mutex<u64>,
-    advanced: Condvar,
-}
-
-impl PublishSequencer {
-    /// `start` is the first position a publish is allowed to claim — the
-    /// recovered durable event count on open (0 for a fresh store).
-    fn new_at(start: u64) -> Self {
-        PublishSequencer {
-            next:     Mutex::new(start),
-            advanced: Condvar::new(),
-        }
-    }
-
-    /// Block until `first_global` is next in line, then hold the turn: the
-    /// returned guard advances the sequence to `watermark` when dropped —
-    /// on ANY exit path (success, error, or unwind), since the durable
-    /// committer has already permanently assigned this position range
-    /// regardless of whether the local head/index/meta publish fully
-    /// succeeds. Failing to advance on an error path would deadlock every
-    /// higher-positioned publish behind this one forever.
-    ///
-    /// Called on the [`append_batch`](LogEngine::append_batch) blocking task
-    /// (a `spawn_blocking` thread), never on an async executor thread — the
-    /// wait is a real blocking [`Condvar`] wait.
-    fn turn(&self, first_global: u64, watermark: u64) -> PublishTurn<'_> {
-        let mut next = self.next.lock().expect("publish sequencer poisoned");
-        while *next != first_global {
-            next =
-                self.advanced.wait(next).expect("publish sequencer poisoned");
-        }
-        PublishTurn { seq: self, watermark }
-    }
-}
-
-/// RAII hold on [`PublishSequencer`]'s turn; see [`PublishSequencer::turn`].
-struct PublishTurn<'a> {
-    seq:       &'a PublishSequencer,
-    watermark: u64,
-}
-
-impl Drop for PublishTurn<'_> {
-    fn drop(&mut self) {
-        {
-            let mut next =
-                self.seq.next.lock().expect("publish sequencer poisoned");
-            *next = self.watermark;
-        }
-        // Wake every waiter: exactly one has the matching `first_global`, the
-        // rest re-check and block again. The waiter set is at most the number
-        // of appends in flight, so this is cheap.
-        self.seq.advanced.notify_all();
-    }
 }
 
 /// How [`LogEngine::recover`] resolved the active segment: continue an existing
@@ -1371,16 +1146,635 @@ struct ResumeInfo {
     event_count:   u64,
 }
 
+const OWNER_RING_CAPACITY: usize = 1024;
+const OWNER_RING_BYTES: usize = 64 * 1024 * 1024;
+/// Above this encoded size, prepare the immutable frame bodies on the producer
+/// task. The large-batch append spike measured a decisive crossover here;
+/// smaller batches retain the owner's reusable encoder and avoid a fresh
+/// producer allocation per append.
+const PREPARE_MIN_ENCODED_BYTES: usize = 16 * 1024;
+
+type OwnerResult = Result<Appended, AppendError<EngineError>>;
+
+enum OwnerIntentKind {
+    Domain { stream: String, expected: Version, input: DomainInput },
+    Registry { expected: Version, records: Vec<RegistryRecord> },
+}
+
+enum DomainInput {
+    Records(Vec<RecordToAppend>),
+    Prepared {
+        /// Distinct type names; `type_slots` indexes this table per frame.
+        type_names: Vec<String>,
+        type_slots: Vec<u32>,
+        batch:      PreparedBatch,
+    },
+}
+
+impl DomainInput {
+    fn is_empty(&self) -> bool {
+        match self {
+            DomainInput::Records(records) => records.is_empty(),
+            DomainInput::Prepared { batch, .. } => batch.frame_count() == 0,
+        }
+    }
+}
+
+struct OwnerIntent {
+    kind:    OwnerIntentKind,
+    cost:    usize,
+    done:    oneshot::Sender<OwnerResult>,
+    _permit: OwnedSemaphorePermit,
+}
+
+struct InFlightGuard(Arc<AtomicUsize>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) { self.0.fetch_sub(1, Ordering::AcqRel); }
+}
+
+struct OwnerStatus {
+    metrics:  CommitterMetricsHandle,
+    degraded: AtomicBool,
+}
+
+struct AppendOwner {
+    tx:                Option<tokio_mpsc::Sender<OwnerIntent>>,
+    bytes:             Arc<Semaphore>,
+    inflight:          Arc<AtomicUsize>,
+    durable_watermark: Watermark,
+    status:            Arc<OwnerStatus>,
+    chain_enabled:     bool,
+    join:              Option<JoinHandle<()>>,
+}
+
+struct PublishState {
+    active:         Arc<ActiveIndex>,
+    book:           Arc<Mutex<Book>>,
+    reader:         Arc<BlockReader>,
+    read_watermark: Watermark,
+}
+
+struct DomainPlan {
+    pre:      Pre,
+    reqs:     Vec<DirectAppendRequest>,
+    staged:   Vec<RegistryRecord>,
+    reg_span: Option<(u64, usize)>,
+    done:     oneshot::Sender<OwnerResult>,
+    _permit:  OwnedSemaphorePermit,
+}
+
+struct FlatOwner {
+    direct:     DirectCommitter<RealRuntime, EngineFs>,
+    publish:    Arc<PublishState>,
+    durability: Durability,
+    inflight:   Arc<AtomicUsize>,
+    status:     Arc<OwnerStatus>,
+    target:     usize,
+}
+
+impl FlatOwner {
+    fn gather(
+        &mut self,
+        rx: &mut tokio_mpsc::Receiver<OwnerIntent>,
+        first: OwnerIntent,
+    ) -> Vec<OwnerIntent> {
+        // `Os` is deliberately sync-per-batch. It is a durability contract,
+        // not merely a performance setting, so it never coalesces here.
+        if matches!(self.durability, Durability::Os) {
+            return vec![first];
+        }
+        let mut bytes = first.cost;
+        let mut group = vec![first];
+        let start = Instant::now();
+        let deadline = match self.durability {
+            Durability::Group { max_delay, .. } => start + max_delay,
+            Durability::Process => start + Duration::from_micros(3),
+            Durability::Os => unreachable!(),
+        };
+        let max_bytes = match self.durability {
+            Durability::Group { max_bytes, .. } => max_bytes as usize,
+            Durability::Process => OWNER_RING_BYTES,
+            Durability::Os => unreachable!(),
+        };
+        let grace = start + Duration::from_micros(200);
+        while group.len() < OWNER_RING_CAPACITY && bytes < max_bytes {
+            match rx.try_recv() {
+                Ok(intent) => {
+                    bytes = bytes.saturating_add(intent.cost);
+                    group.push(intent);
+                }
+                Err(tokio_mpsc::error::TryRecvError::Disconnected) => break,
+                Err(tokio_mpsc::error::TryRecvError::Empty) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    if matches!(self.durability, Durability::Group { .. })
+                        && self.inflight.load(Ordering::Acquire) == 0
+                        && group.len() >= self.target
+                        && now >= grace
+                    {
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+            }
+        }
+        self.target = group.len().max(1);
+        group
+    }
+
+    fn plan_domain(
+        &self,
+        stream: String,
+        expected: Version,
+        input: DomainInput,
+        done: oneshot::Sender<OwnerResult>,
+        permit: OwnedSemaphorePermit,
+    ) -> DomainPlan {
+        let book = self.publish.book.lock().expect("book lock");
+        let mut staged = Vec::new();
+        let sid = book.registry.stream_id(&stream).unwrap_or_else(|| {
+            let id = book.registry.stream_high_water_mark() + 1;
+            staged.push(registry::stream_registered(id, &stream));
+            id
+        });
+        let actual = book.head(sid);
+        let mut reqs = Vec::new();
+        let mut reg_span = None;
+        let pre = if actual != expected {
+            staged.clear();
+            Pre::Conflict(actual)
+        } else if input.is_empty() {
+            staged.clear();
+            Pre::Empty
+        } else {
+            let mut next_tid = book.registry.event_type_high_water_mark();
+            let (tids, domain_req) = match input {
+                DomainInput::Records(records) => {
+                    // Resolve each distinct message type once per batch. The
+                    // last-name check makes homogeneous batches a comparison
+                    // plus integer copy per frame, matching the frozen spike;
+                    // the map handles non-consecutive repeats exactly.
+                    let mut resolved: HashMap<&str, u32> = HashMap::new();
+                    let mut last: Option<(&str, u32)> = None;
+                    let mut tids = Vec::with_capacity(records.len());
+                    for r in &records {
+                        let name = r.message_type.as_str();
+                        let tid = if let Some((last_name, id)) = last
+                            && last_name == name
+                        {
+                            id
+                        } else if let Some(&id) = resolved.get(name) {
+                            last = Some((name, id));
+                            id
+                        } else {
+                            let id = if let Some(id) =
+                                book.registry.event_type_id(name)
+                            {
+                                id
+                            } else {
+                                next_tid += 1;
+                                staged.push(registry::event_type_registered(
+                                    next_tid, name,
+                                ));
+                                next_tid
+                            };
+                            resolved.insert(name, id);
+                            last = Some((name, id));
+                            id
+                        };
+                        tids.push(tid);
+                    }
+                    drop(resolved);
+                    let events = records
+                        .into_iter()
+                        .zip(&tids)
+                        .map(|(r, &tid)| EventInput::plain(tid, 0, 0, r.data))
+                        .collect();
+                    let first_stream_pos = expected.next_position();
+                    (
+                        tids,
+                        DirectAppendRequest::Inputs(AppendRequest {
+                            stream_id: sid,
+                            category_id: CATEGORY_ID,
+                            first_stream_version: first_stream_pos,
+                            events,
+                        }),
+                    )
+                }
+                DomainInput::Prepared { type_names, type_slots, mut batch } => {
+                    let mut unique_tids = Vec::with_capacity(type_names.len());
+                    for name in &type_names {
+                        let id = if let Some(id) =
+                            book.registry.event_type_id(name)
+                        {
+                            id
+                        } else {
+                            next_tid += 1;
+                            staged.push(registry::event_type_registered(
+                                next_tid, name,
+                            ));
+                            next_tid
+                        };
+                        unique_tids.push(id);
+                    }
+                    let tids: Vec<u32> = type_slots
+                        .into_iter()
+                        .map(|slot| unique_tids[slot as usize])
+                        .collect();
+                    batch
+                        .set_event_type_ids(&tids)
+                        .expect("prepared type-id shape matches frame count");
+                    let first_stream_pos = expected.next_position();
+                    (
+                        tids,
+                        DirectAppendRequest::Prepared {
+                            stream_id: sid,
+                            category_id: CATEGORY_ID,
+                            first_stream_version: first_stream_pos,
+                            batch,
+                        },
+                    )
+                }
+            };
+            let first_stream_pos = expected.next_position();
+            if !staged.is_empty() {
+                let first_version = book.registry_next_version;
+                reg_span = Some((first_version, staged.len()));
+                reqs.push(
+                    registry_append_request(first_version, &staged).into(),
+                );
+            }
+            reqs.push(domain_req);
+            Pre::Proceed { sid, first_stream_pos, tids }
+        };
+        DomainPlan { pre, reqs, staged, reg_span, done, _permit: permit }
+    }
+
+    fn commit_plans(&mut self, mut plans: Vec<DomainPlan>) {
+        if plans.is_empty() {
+            return;
+        }
+        let units =
+            plans.iter_mut().map(|p| std::mem::take(&mut p.reqs)).collect();
+        let outcomes = self.direct.commit_ordered_group(units);
+        self.refresh_status();
+        match outcomes {
+            Err(e) => {
+                for plan in plans {
+                    let _ = plan.done.send(Err(AppendError::Backend(
+                        EngineError::Append(e.to_string()),
+                    )));
+                }
+            }
+            Ok(outcomes) => {
+                for (plan, unit) in plans.into_iter().zip(outcomes) {
+                    self.retire_domain(plan, unit);
+                }
+            }
+        }
+    }
+
+    fn retire_domain(
+        &mut self,
+        plan: DomainPlan,
+        outcomes: Vec<mess_log::committer::DirectBatchOutcome>,
+    ) {
+        let DomainPlan { pre, staged, reg_span, done, .. } = plan;
+        let Pre::Proceed { sid, first_stream_pos, tids } = pre else {
+            unreachable!()
+        };
+        let mut iter = outcomes.into_iter();
+        let mut first_error: Option<EngineError> = None;
+        if let Some((first_version, count)) = reg_span {
+            match iter.next().expect("registry outcome").outcome {
+                Ok(outcome) => match expect_acked(outcome) {
+                    Ok(placed) => {
+                        {
+                            let mut book =
+                                self.publish.book.lock().expect("book lock");
+                            book.alloc_registry_versions(count as u64);
+                            for record in staged {
+                                if let Err(e) = book.apply_registration(record)
+                                {
+                                    book.registry_lost = true;
+                                    first_error.get_or_insert(e);
+                                }
+                            }
+                        }
+                        publish_batch(
+                            &self.publish,
+                            registry::REGISTRY_STREAM_ID,
+                            first_version,
+                            count as u32,
+                            placed,
+                        );
+                    }
+                    Err(e) => {
+                        first_error.get_or_insert(e);
+                    }
+                },
+                Err(e) => {
+                    first_error
+                        .get_or_insert(EngineError::Append(e.to_string()));
+                }
+            }
+        }
+        let domain = iter.next().expect("domain outcome");
+        let placed = match domain.outcome {
+            Ok(outcome) => match expect_acked(outcome) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    first_error.get_or_insert(e);
+                    None
+                }
+            },
+            Err(e) => {
+                first_error.get_or_insert(EngineError::Append(e.to_string()));
+                None
+            }
+        };
+        let mut appended = None;
+        if let Some(placed) = placed {
+            let frame_count = tids.len() as u32;
+            let last_stream = first_stream_pos + u64::from(frame_count) - 1;
+
+            // Preserve bn-2ib's write-through capsule warm: the first
+            // read-after-write is an in-memory hit rather than a header+batch
+            // pread, CRC validation, and decode. The cache is bounded and
+            // transparent; disabled/rejected/evicted entries fall back to the
+            // same durable bytes.
+            let (data, payloads) = match domain.events {
+                DirectBatchEvents::Inputs(events) => {
+                    let payload_bytes =
+                        events.iter().map(|event| event.payload.len()).sum();
+                    let mut data = Vec::with_capacity(payload_bytes);
+                    let mut offs = Vec::with_capacity(events.len() + 1);
+                    for event in events {
+                        offs.push(data.len() as u32);
+                        data.extend_from_slice(&event.payload);
+                    }
+                    offs.push(data.len() as u32);
+                    (data, PayloadLayout::Arena(offs))
+                }
+                DirectBatchEvents::Prepared(batch) => {
+                    let (bytes, ranges) = batch.into_bytes_and_payload_ranges();
+                    (bytes, PayloadLayout::Framed(ranges))
+                }
+            };
+            self.publish.reader.insert(
+                placed.segment_id,
+                placed.offset,
+                Arc::new(DecodedBatch {
+                    stream_id: sid,
+                    first_stream_version: first_stream_pos,
+                    first_global_pos: placed.first_global,
+                    frame_count,
+                    type_ids: tids,
+                    data,
+                    payloads,
+                }),
+            );
+            publish_batch(
+                &self.publish,
+                sid,
+                first_stream_pos,
+                frame_count,
+                placed,
+            );
+            appended = Some(Appended {
+                version:              Version::At(last_stream),
+                last_global_position: placed.last_global,
+            });
+        }
+        let result = match first_error {
+            Some(e) => Err(AppendError::Backend(e)),
+            None => Ok(appended.expect("successful domain outcome")),
+        };
+        let _ = done.send(result);
+    }
+
+    fn process_registry(
+        &mut self,
+        expected: Version,
+        records: Vec<RegistryRecord>,
+        done: oneshot::Sender<OwnerResult>,
+        _permit: OwnedSemaphorePermit,
+    ) {
+        let (first_version, trial) = {
+            let book = self.publish.book.lock().expect("book lock");
+            if book.registry_lost {
+                let _ =
+                    done.send(Err(AppendError::Backend(registry_lost_error())));
+                return;
+            }
+            let actual = book.registry_head();
+            if actual != expected {
+                let _ =
+                    done.send(Err(AppendError::Conflict { expected, actual }));
+                return;
+            }
+            if records.is_empty() {
+                let _ = done.send(Ok(Appended {
+                    version:              expected,
+                    last_global_position: self
+                        .publish
+                        .read_watermark
+                        .get()
+                        .saturating_sub(1),
+                }));
+                return;
+            }
+            let mut trial = book.registry.clone();
+            for record in &records {
+                if let Err(e) =
+                    trial.apply::<std::convert::Infallible>(record.clone())
+                {
+                    let _ = done.send(Err(AppendError::Backend(
+                        EngineError::Append(format!(
+                            "{}: {e}",
+                            registry::RESERVED_STREAM_NAME
+                        )),
+                    )));
+                    return;
+                }
+            }
+            (book.registry_next_version, trial)
+        };
+        let result = self.direct.commit_ordered_group(vec![vec![
+            registry_append_request(first_version, &records).into(),
+        ]]);
+        self.refresh_status();
+        let outcome = match result {
+            Ok(mut units) => {
+                units.pop().and_then(|mut u| u.pop()).expect("registry outcome")
+            }
+            Err(e) => {
+                let _ = done.send(Err(AppendError::Backend(
+                    EngineError::Append(e.to_string()),
+                )));
+                return;
+            }
+        };
+        let placed = match outcome.outcome.and_then(expect_acked_log) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = done.send(Err(AppendError::Backend(
+                    EngineError::Append(e.to_string()),
+                )));
+                return;
+            }
+        };
+        {
+            let mut book = self.publish.book.lock().expect("book lock");
+            book.registry = trial;
+            book.rebuild_arcs();
+            book.alloc_registry_versions(records.len() as u64);
+        }
+        publish_batch(
+            &self.publish,
+            registry::REGISTRY_STREAM_ID,
+            first_version,
+            records.len() as u32,
+            placed,
+        );
+        let _ = done.send(Ok(Appended {
+            version:              Version::At(
+                first_version + records.len() as u64 - 1,
+            ),
+            last_global_position: placed.last_global,
+        }));
+    }
+
+    fn refresh_status(&self) {
+        self.status
+            .degraded
+            .store(self.direct.is_degraded(), Ordering::Release);
+    }
+
+    fn run(mut self, mut rx: tokio_mpsc::Receiver<OwnerIntent>) {
+        while let Some(first) = rx.blocking_recv() {
+            let gathered = self.gather(&mut rx, first);
+            let mut pending = Vec::new();
+            let mut streams = HashSet::new();
+            for intent in gathered {
+                match intent.kind {
+                    OwnerIntentKind::Registry { expected, records } => {
+                        self.commit_plans(std::mem::take(&mut pending));
+                        streams.clear();
+                        self.process_registry(
+                            expected,
+                            records,
+                            intent.done,
+                            intent._permit,
+                        );
+                    }
+                    OwnerIntentKind::Domain { stream, expected, input } => {
+                        // Re-plan after flushing a prior append to this stream;
+                        // that makes dequeue order the exact-version arbiter.
+                        let repeated = {
+                            let book =
+                                self.publish.book.lock().expect("book lock");
+                            book.registry
+                                .stream_id(&stream)
+                                .is_some_and(|sid| streams.contains(&sid))
+                        };
+                        if repeated {
+                            self.commit_plans(std::mem::take(&mut pending));
+                            streams.clear();
+                        }
+                        if self
+                            .publish
+                            .book
+                            .lock()
+                            .expect("book lock")
+                            .registry_lost
+                        {
+                            let _ = intent.done.send(Err(
+                                AppendError::Backend(registry_lost_error()),
+                            ));
+                            continue;
+                        }
+                        let plan = self.plan_domain(
+                            stream,
+                            expected,
+                            input,
+                            intent.done,
+                            intent._permit,
+                        );
+                        match plan.pre {
+                            Pre::Conflict(actual) => {
+                                let expected = match &plan.pre {
+                                    Pre::Conflict(_) => expected,
+                                    _ => unreachable!(),
+                                };
+                                let _ = plan.done.send(Err(
+                                    AppendError::Conflict { expected, actual },
+                                ));
+                            }
+                            Pre::Empty => {
+                                let _ = plan.done.send(Ok(Appended {
+                                    version:              expected,
+                                    last_global_position: self
+                                        .publish
+                                        .read_watermark
+                                        .get()
+                                        .saturating_sub(1),
+                                }));
+                            }
+                            Pre::Proceed { sid, .. } => {
+                                if !plan.staged.is_empty()
+                                    || matches!(self.durability, Durability::Os)
+                                {
+                                    self.commit_plans(std::mem::take(
+                                        &mut pending,
+                                    ));
+                                    streams.clear();
+                                    self.commit_plans(vec![plan]);
+                                } else {
+                                    streams.insert(sid);
+                                    pending.push(plan);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            self.commit_plans(pending);
+        }
+        self.refresh_status();
+    }
+}
+
+fn expect_acked_log(
+    outcome: AppendOutcome,
+) -> Result<Placed, mess_log::committer::AppendError> {
+    match outcome {
+        AppendOutcome::Acked {
+            first_position,
+            last_position,
+            segment_id,
+            offset,
+        } => Ok(Placed {
+            first_global: first_position,
+            last_global: last_position,
+            segment_id,
+            offset,
+        }),
+        AppendOutcome::Indeterminate => {
+            Err(mess_log::committer::AppendError::StorePoisoned)
+        }
+    }
+}
+
 /// Shared engine state behind one `Arc`.
 struct Inner {
     rt:                   RealRuntime,
-    appender:             Appender,
-    /// Kept alive so the commit thread lives as long as the engine; also the
-    /// owner we `shutdown` on a clean close. `Option` so [`Inner::drop`] can
-    /// drop it *first* — joining the committer task, which drops its
-    /// [`Roller`] and so closes the roll channel — before joining the seal
-    /// thread (`bn-1vu`).
-    committer:            Option<Committer<RealRuntime>>,
+    /// The one flat-combined owner. Its thread owns the segment writer and
+    /// performs validation, write, barrier, apply, publish, and completion.
+    owner:                AppendOwner,
     /// The background auto-roll sealer thread (`bn-1vu`): receives each rolled
     /// segment's [`SegmentSummary`] over the committer's roll channel and
     /// builds its sidecars + finalizes its footer off the append path.
@@ -1397,16 +1791,11 @@ struct Inner {
     /// degradation alarm and seal durations, aggregated across the background
     /// roll-sealer and any on-demand [`LogEngine::seal_active`].
     seal_metrics:         Arc<SealMetrics>,
-    /// The fjall metadata tables — stream heads, snapshot heads, projection
-    /// checkpoints, the dedupe window. Since `bn-2di` every one of them is a
-    /// **derived cache** the log can rebuild (I5); the name tables, which were
-    /// the one exception, are gone.
-    meta:                 Arc<MetaStore>,
     book:                 Arc<Mutex<Book>>,
     /// Block-native byte fetcher: the bounded decoded-capsule cache over the
     /// durable segment blocks (bn-2ib). Every read path resolves positions
     /// through the index tiers and bytes through this.
-    reader:               BlockReader,
+    reader:               Arc<BlockReader>,
     /// Payload frames decoded during [`recover`](LogEngine::recover) — the
     /// bn-2ib "zero old payload decodes on open" gate's observable. `0` for
     /// every chain-off open; chain-on stores still fold every durable
@@ -1417,20 +1806,16 @@ struct Inner {
     /// the end of each append's publish step (after the head/index/meta
     /// are updated, in publish-turn order), so it tracks what
     /// [`read_global`](Backend::read_global) can serve, NOT merely what the
-    /// durable committer has acked. The app-facing subscription / live-tail
+    /// direct committer has durably covered. The app-facing subscription /
+    /// live-tail
     /// API ([`SubscribeBackend`](crate::backend::SubscribeBackend)) awaits
     /// this value; a woken subscriber is therefore guaranteed the position
     /// it waited for is already servable through the index tiers. Distinct
     /// from
-    /// the committer's own durable watermark ([`Appender::watermark`]),
+    /// the direct owner's durable watermark,
     /// which advances a step earlier (at ack, before the in-process
     /// publish).
     read_watermark:       Watermark,
-    /// Serialises the exact-version critical section, per stream (bn-1s0).
-    append_gate:          AppendGate,
-    /// Orders the post-ack book/index/meta publish step by global position
-    /// across concurrently-committing streams (bn-1s0).
-    publish_seq:          PublishSequencer,
     /// When this engine opened — the in-process baseline for the active
     /// segment's age (bn-e2y). Recovery resumes the active segment in place,
     /// so there is no durable per-segment start timestamp to read here;
@@ -1459,13 +1844,16 @@ struct Inner {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        // Order is load-bearing (`bn-1vu`). 1) Drop the committer: its `Drop`
-        // shuts down and joins the commit task, which drops the `Roller` and so
+        // Order is load-bearing (`bn-1vu`). 1) Close and join the owner: it
+        // drains queued intents, drops its direct committer and `Roller`, and
         // closes the roll channel. 2) Join the seal thread: with the channel
         // closed it drains every queued roll seal (making each sidecar + footer
         // durable) and exits — so a drop-then-reopen sees the finished seals on
         // disk, never a half-written tier.
-        drop(self.committer.take());
+        drop(self.owner.tx.take());
+        if let Some(join) = self.owner.join.take() {
+            let _ = join.join();
+        }
         // `bn-u6o`: publish the shared shutdown deadline BEFORE joining, so it
         // is visible to a wait already in flight and to every seal still
         // queued behind the now-closed channel. One deadline covers the whole
@@ -1510,7 +1898,7 @@ impl Default for SpinConfig {
 
 /// The composed `mess-log` + `mess-index` production backend.
 ///
-/// Cheap to clone — every clone shares the same durable committer, index,
+/// Cheap to clone — every clone shares the same flat owner, index,
 /// interners, and caches (matching [`MockBackend`](crate::mock)'s
 /// shared-handle semantics, so a facade reopen over `engine.clone()` sees
 /// the same state).
@@ -1522,11 +1910,11 @@ pub struct LogEngine {
 /// Open-time knobs for [`LogEngine::open_with`].
 #[derive(Debug, Clone)]
 pub struct EngineOptions {
-    /// Durability mode for the commit thread.
+    /// Durability mode for the append owner.
     pub durability:                 Durability,
     /// Active-segment size in bytes (preallocated at open).
     pub segment_size:               u64,
-    /// Dedupe-window capacity for the meta store.
+    /// Reserved capacity for the derived dedupe cache.
     pub dedupe_capacity:            usize,
     /// Sealed pointer-block cache budget in bytes (`bn-e2y` / bn-1hx). `0`
     /// disables the cache (every sealed replay decodes fresh); a non-zero
@@ -1697,18 +2085,6 @@ impl LogEngine {
 
         let rt = RealRuntime::new();
 
-        // The durable metadata store, opened before recovery so the interner's
-        // id→name bijection is available to materialise recovered payloads.
-        // `Arc` so the committer's bn-34o co-durable name pre-barrier hook can
-        // share this exact store and flush it durable inside the group window.
-        let meta = Arc::new(
-            MetaStore::open_with_capacity(
-                dir.join("meta"),
-                opts.dedupe_capacity,
-            )
-            .map_err(|e| EngineError::Meta(e.to_string()))?,
-        );
-
         // Reload the sealed tier from the durable sidecars written by prior
         // seals (see `load_sealed`). Without this the `SealedStore` starts
         // empty on every reopen, so a stream that was sealed before a restart
@@ -1797,14 +2173,14 @@ impl LogEngine {
         } else {
             ChainInit::off()
         };
-        let committer = Committer::spawn_with_roll_chained(
+        let direct = DirectCommitter::with_roll_chained(
             &rt,
             writer,
             opts.durability,
             roller,
             chain_init,
         );
-        let appender = committer.appender();
+        let durable_watermark = direct.watermark();
 
         let book = Arc::new(Mutex::new(book));
 
@@ -1823,10 +2199,10 @@ impl LogEngine {
         let shutdown_deadline: Arc<OnceLock<Instant>> =
             Arc::new(OnceLock::new());
         // The published read watermark seeds at the recovered event count —
-        // 0 on a fresh store — the same baseline the publish sequencer
-        // starts from. Created before the seal thread so the sealer can gate
-        // each rolled segment's seal on the canonical published watermark
-        // (bn-2ib; previously it gated on the record book's length).
+        // 0 on a fresh store. Created before the seal thread so the sealer can
+        // gate each rolled segment's seal on the canonical published
+        // watermark (bn-2ib; previously it gated on the record book's
+        // length).
         let read_watermark = Watermark::new(watermark);
         let seal_thread = {
             let driver =
@@ -1858,19 +2234,52 @@ impl LogEngine {
                 .map_err(|e| EngineError::Open(format!("spawn sealer: {e}")))?
         };
 
-        // The publish sequencer's turn-order starts wherever recovery left
-        // the durable prefix — 0 on a fresh store, or the recovered event
-        // count on a reopen — never a hardcoded 0, or the first post-reopen
-        // publish would wait forever for a position that was already durably
-        // assigned in a previous process lifetime.
-        let recovered_len = watermark;
-
         let rt_fs = rt.fs();
+        let reader = Arc::new(BlockReader::new(
+            rt_fs,
+            dir.to_path_buf(),
+            opts.capsule_cache_budget_bytes,
+        ));
+        let publish = Arc::new(PublishState {
+            active:         Arc::clone(&active),
+            book:           Arc::clone(&book),
+            reader:         Arc::clone(&reader),
+            read_watermark: read_watermark.clone(),
+        });
+        let (owner_tx, owner_rx) = tokio_mpsc::channel(OWNER_RING_CAPACITY);
+        let owner_bytes = Arc::new(Semaphore::new(OWNER_RING_BYTES));
+        let owner_inflight = Arc::new(AtomicUsize::new(0));
+        let owner_status = Arc::new(OwnerStatus {
+            metrics:  direct.metrics_handle(),
+            degraded: AtomicBool::new(false),
+        });
+        let owner = FlatOwner {
+            direct,
+            publish,
+            durability: opts.durability,
+            inflight: Arc::clone(&owner_inflight),
+            status: Arc::clone(&owner_status),
+            target: 1,
+        };
+        let owner_join = std::thread::Builder::new()
+            .name("mess-flat-owner".into())
+            .spawn(move || owner.run(owner_rx))
+            .map_err(|e| {
+                EngineError::Open(format!("spawn append owner: {e}"))
+            })?;
+
         Ok(LogEngine {
             inner: Arc::new(Inner {
                 rt,
-                appender,
-                committer: Some(committer),
+                owner: AppendOwner {
+                    tx: Some(owner_tx),
+                    bytes: owner_bytes,
+                    inflight: owner_inflight,
+                    durable_watermark,
+                    status: owner_status,
+                    chain_enabled: opts.chain,
+                    join: Some(owner_join),
+                },
                 seal_thread: Some(seal_thread),
                 _lock: lock,
                 active,
@@ -1888,17 +2297,10 @@ impl LogEngine {
                     )
                 },
                 seal_metrics,
-                meta,
                 book,
-                reader: BlockReader::new(
-                    rt_fs,
-                    dir.to_path_buf(),
-                    opts.capsule_cache_budget_bytes,
-                ),
+                reader,
                 recover_decodes: decodes,
                 read_watermark,
-                append_gate: AppendGate::new(),
-                publish_seq: PublishSequencer::new_at(recovered_len),
                 opened_at: Instant::now(),
                 dir: dir.to_path_buf(),
                 seal_pack: opts.seal_pack,
@@ -2346,14 +2748,15 @@ impl LogEngine {
         // payloads, so there is no "headers only" pread of a segment.
         //
         // They do not need to be read, because a dangling id cannot reach them:
-        // a registration is pushed AHEAD of the batch that first references its
-        // id (`plan_and_submit`), so it holds a LOWER global position; recovery
-        // accepts a contiguous PREFIX of positions, so anything below a durable
-        // batch is durable too; and a sealed segment is by construction wholly
-        // below the recovered head. The only way a use could ever out-live its
-        // registration was a partial commit (a rejected `$registry` batch with
+        // a registration is written AHEAD of the batch that first references
+        // its id (one owner-side ordered unit), so it holds a LOWER global
+        // position; recovery accepts a contiguous PREFIX of positions,
+        // so anything below a durable batch is durable too; and a
+        // sealed segment is by construction wholly below the recovered
+        // head. The only way a use could ever out-live its registration
+        // was a partial commit (a rejected `$registry` batch with
         // an accepted batch behind it), which `AppendError::UnitAborted` and
-        // the pending-registration park now make impossible — and
+        // serial owner-side staging now make impossible — and
         // which, if it ever did happen, would strike the live tail,
         // which IS scanned.
         if max_event_type_id != registry::REGISTRY_EVENT_TYPE_ID
@@ -2641,18 +3044,18 @@ impl LogEngine {
     /// ages/sizes); the in-process surface here is the API operators poll.
     #[must_use]
     pub fn metrics(&self) -> EngineMetrics {
-        let commit = self
-            .inner
-            .committer
-            .as_ref()
-            .map(mess_log::committer::Committer::metrics)
-            .unwrap_or_default();
+        let commit = self.inner.owner.status.metrics.snapshot();
         let cache = &self.inner.block_cache;
         let seal = self.inner.seal_metrics.snapshot();
         EngineMetrics {
             commit,
-            durable_watermark: self.inner.appender.watermark().get(),
-            degraded_poisoned: self.inner.appender.is_degraded(),
+            durable_watermark: self.inner.owner.durable_watermark.get(),
+            degraded_poisoned: self
+                .inner
+                .owner
+                .status
+                .degraded
+                .load(Ordering::Acquire),
             cache_hits: cache.hits(),
             cache_misses: cache.misses(),
             cache_hit_rate: cache.hit_rate(),
@@ -2878,244 +3281,6 @@ impl LogEngine {
         Ok(out)
     }
 
-    /// The whole `Book`-locked section of
-    /// [`append_batch`](Backend::append_batch) (`bn-2di`, review F1): plan
-    /// every id, push the ordered unit, and only THEN mint anything.
-    ///
-    /// # Nothing is minted until its `$registry` record cannot be lost
-    ///
-    /// The order here is the fix, and it is deliberately the reverse of the
-    /// obvious one:
-    ///
-    /// 1. **Stage.** Resolve each name against the registry; for a name that
-    ///    has none, compute the id it *would* get (`hwm + 1`, the same
-    ///    allocation rule [`Registry`](crate::registry::Registry) uses) and
-    ///    build its `*Registered` record — all in locals. `book` is untouched.
-    /// 2. **Push.** Submit `[$registry batch, domain batch]` as one ordered
-    ///    unit. This is where every pre-commit failure lives: an unencodable
-    ///    batch (a >64 MiB domain batch is an ordinary, documented user error),
-    ///    a closed committer, a poisoned store. `submit_ordered` pre-flights
-    ///    EVERY batch of the unit before sending ANY of them, so an `Err` here
-    ///    means nothing was sent, nothing was written — and, because we have
-    ///    not touched `book` yet, nothing was minted. The caller simply gets
-    ///    the error, and the next append to the same stream re-stages the same
-    ///    ids and registers them properly.
-    /// 3. **Mint.** Fold the staged records into the live registry and hand out
-    ///    the ids. Still under the same lock, so the ordering invariant the
-    ///    whole design rests on is unchanged: any thread that can *see* one of
-    ///    these ids necessarily took this lock after we released it, hence
-    ///    after our registration was already in the committer's FIFO, hence its
-    ///    own batch is written at a HIGHER offset than the registration.
-    ///
-    /// Before this, ids were minted in step 1 and never rolled back: a >64 MiB
-    /// batch to a new stream left the id published to every other thread with
-    /// its registration nowhere in the log, and the NEXT (perfectly ordinary)
-    /// append to that stream saw the id as already-registered, emitted no
-    /// registry record, and committed events referencing an id with no meaning.
-    /// The store would then never open again. Staging makes that state
-    /// unrepresentable rather than merely undone.
-    ///
-    /// # The one thing left to wait for
-    ///
-    /// A minted id is in the `Book` before its registration is *durable* — it
-    /// has to be, or two appenders would mint two ids for the same name. The
-    /// residual window (the registration is in the channel; its outcome is
-    /// unknown) is closed two ways. Within the unit,
-    /// [`AppendError::UnitAborted`] guarantees the domain batch is never
-    /// written if its registration was not (review F4). Across units, an
-    /// appender that would REFERENCE an id whose registration is still in
-    /// flight parks on it here ([`Planned::WaitFor`]) instead of pushing a
-    /// batch that a rejected registration would strand. Both maps are empty
-    /// unless a brand-new name is in flight right now, so the hot path pays
-    /// one `is_empty` check.
-    fn plan_and_submit(
-        &self,
-        book: &mut Book,
-        stream_id: &str,
-        expected: Version,
-        records: &[RecordToAppend],
-    ) -> Result<Planned, AppendError<EngineError>> {
-        if book.registry_lost {
-            return Err(AppendError::Backend(registry_lost_error()));
-        }
-
-        // Park on an in-flight registration this append would REFERENCE (never
-        // on one it is about to mint itself — that has not been staged yet).
-        if !book.pending_streams.is_empty()
-            && let Some(sid) = book.registry.stream_id(stream_id)
-            && let Some(rx) = book.pending_streams.get(&sid)
-        {
-            return Ok(Planned::WaitFor(rx.clone()));
-        }
-        if !book.pending_types.is_empty() {
-            for r in records {
-                if let Some(tid) = book.registry.event_type_id(&r.message_type)
-                    && let Some(rx) = book.pending_types.get(&tid)
-                {
-                    return Ok(Planned::WaitFor(rx.clone()));
-                }
-            }
-        }
-
-        // ---- Step 1: STAGE. Not one byte of `book` is written below this
-        // point until the push has succeeded.
-        let mut staged: Vec<RegistryRecord> = Vec::new();
-        let mut new_streams: Vec<u64> = Vec::new();
-        let mut new_types: Vec<u32> = Vec::new();
-
-        let sid = match book.registry.stream_id(stream_id) {
-            Some(id) => id,
-            None => {
-                let id = book.registry.stream_high_water_mark() + 1;
-                staged.push(registry::stream_registered(id, stream_id));
-                new_streams.push(id);
-                id
-            }
-        };
-
-        let actual = book.head(sid);
-        // The encoded events, moved straight into the `AppendRequest` below —
-        // never cloned. (They carry every payload byte of the batch.)
-        let mut domain_events: Option<Vec<EventInput>> = None;
-        let pre = if actual != expected {
-            // A conflict mints NOTHING (not even the stream id): the append is
-            // rejected, so there is no event to name and no reason to burn an
-            // id and a global position on a registration nobody references. The
-            // pre-bn-2di code had to persist the fjall name here because the id
-            // had already been handed out; staging means it never was.
-            staged.clear();
-            new_streams.clear();
-            Pre::Conflict(actual)
-        } else if records.is_empty() {
-            // Same for an empty batch: it validated `expected` and wrote
-            // nothing, so it registers nothing.
-            staged.clear();
-            new_streams.clear();
-            Pre::Empty
-        } else {
-            let mut next_tid = book.registry.event_type_high_water_mark();
-            // Two records of the same brand-new message type in ONE batch must
-            // share one staged id and one registration.
-            let mut minted: HashMap<&str, u32> = HashMap::new();
-            let mut tids: Vec<u32> = Vec::with_capacity(records.len());
-            let mut events: Vec<EventInput> = Vec::with_capacity(records.len());
-            for r in records {
-                let tid = match book.registry.event_type_id(&r.message_type) {
-                    Some(id) => id,
-                    None => match minted.get(r.message_type.as_str()) {
-                        Some(&id) => id,
-                        None => {
-                            next_tid += 1;
-                            minted.insert(r.message_type.as_str(), next_tid);
-                            staged.push(registry::event_type_registered(
-                                next_tid,
-                                &r.message_type,
-                            ));
-                            new_types.push(next_tid);
-                            next_tid
-                        }
-                    },
-                };
-                tids.push(tid);
-                events.push(EventInput::plain(tid, 0, 0, r.data.clone()));
-            }
-            domain_events = Some(events);
-            Pre::Proceed {
-                sid,
-                first_stream_pos: expected.next_position(),
-                tids,
-            }
-        };
-
-        // ---- Step 2: PUSH. The `$registry` batch first (lower offset, lower
-        // global position), the domain batch second — one ordered unit, one
-        // commit group, one barrier, atomic in failure.
-        let mut reqs: Vec<AppendRequest> = Vec::new();
-        let mut reg_span: Option<(u64, usize)> = None;
-        if !staged.is_empty() {
-            // The version is *staged* too: `registry_next_version` only
-            // advances in step 3.
-            let first_version = book.registry_next_version;
-            reg_span = Some((first_version, staged.len()));
-            reqs.push(registry_append_request(first_version, &staged));
-        }
-        if let (Pre::Proceed { sid, first_stream_pos, .. }, Some(events)) =
-            (&pre, domain_events)
-        {
-            reqs.push(AppendRequest {
-                stream_id: *sid,
-                category_id: CATEGORY_ID,
-                first_stream_version: *first_stream_pos,
-                events,
-            });
-        }
-        if reqs.is_empty() {
-            // The hot conflict/empty path on an already-registered stream:
-            // nothing to push, nothing to mint.
-            return Ok(Planned::Ready(SubmitPlan {
-                pre,
-                submitted: None,
-                reg_span: None,
-                guard: None,
-            }));
-        }
-        let submitted =
-            self.inner.appender.submit_ordered(reqs).map_err(|e| {
-                AppendError::Backend(EngineError::Append(e.to_string()))
-            })?;
-
-        // ---- Step 3: MINT. The unit is irrevocably in the committer's
-        // channel; only now do the ids come into existence.
-        let guard = if staged.is_empty() {
-            None
-        } else {
-            book.alloc_registry_versions(staged.len() as u64);
-            for record in staged {
-                if let Err(e) = book.apply_registration(record) {
-                    // Unreachable: every staged record mints `hwm + 1` for a
-                    // name the registry does not know, which `apply` cannot
-                    // reject. If it somehow did, the record is ALREADY in the
-                    // channel, so the `Book` and the log have diverged — the
-                    // one state this design must never guess its way out of.
-                    book.registry_lost = true;
-                    return Err(AppendError::Backend(e));
-                }
-            }
-            Some(self.mark_pending(book, new_streams, new_types))
-        };
-        Ok(Planned::Ready(SubmitPlan {
-            pre,
-            submitted: Some(submitted),
-            reg_span,
-            guard,
-        }))
-    }
-
-    /// Mark the ids of an in-flight registration pending and hand back the
-    /// [`RegistrationGuard`] that settles them (`bn-2di`). Callers hold the
-    /// `Book` lock.
-    fn mark_pending(
-        &self,
-        book: &mut Book,
-        streams: Vec<u64>,
-        types: Vec<u32>,
-    ) -> RegistrationGuard {
-        let (tx, rx) = watch::channel(false);
-        for &id in &streams {
-            book.pending_streams.insert(id, rx.clone());
-        }
-        for &id in &types {
-            book.pending_types.insert(id, rx.clone());
-        }
-        RegistrationGuard {
-            book: Arc::clone(&self.inner.book),
-            streams,
-            types,
-            tx,
-            landed: false,
-        }
-    }
-
     /// Append to `$registry` (stream 0) through the [`Backend`] seam — spec
     /// 04's [`Registry`](crate::registry::Registry) writer path, over the real
     /// engine (`bn-2di`, review F2).
@@ -3140,6 +3305,7 @@ impl LogEngine {
         &self,
         expected: Version,
         records: &[RecordToAppend],
+        inflight: InFlightGuard,
     ) -> Result<Appended, AppendError<EngineError>> {
         // Decode BEFORE anything else. A caller writing arbitrary domain frames
         // to the literal name `"$registry"` is refused right here — those bytes
@@ -3167,112 +3333,52 @@ impl LogEngine {
             decoded.push(record);
         }
 
-        let plan = {
-            let mut book = self.inner.book.lock().expect("book lock");
-            if book.registry_lost {
-                return Err(AppendError::Backend(registry_lost_error()));
-            }
-            let actual = book.registry_head();
-            if actual != expected {
-                return Err(AppendError::Conflict { expected, actual });
-            }
-            if decoded.is_empty() {
-                let last_global =
-                    self.inner.read_watermark.get().saturating_sub(1);
-                return Ok(Appended {
-                    version:              expected,
-                    last_global_position: last_global,
-                });
-            }
-
-            // REG13: validate the whole batch against a scratch fold first. A
-            // record that cannot be applied never reaches the log.
-            let mut trial = book.registry.clone();
-            for record in &decoded {
-                trial
-                    .apply::<std::convert::Infallible>(record.clone())
-                    .map_err(|e| {
-                        AppendError::Backend(EngineError::Append(format!(
-                            "{}: {e}",
-                            registry::RESERVED_STREAM_NAME
-                        )))
-                    })?;
-            }
-
-            // Push before minting, exactly as `plan_and_submit` does: an `Err`
-            // here must leave the `Book` untouched.
-            let first_version = book.registry_next_version;
-            let submitted = self
-                .inner
-                .appender
-                .submit_ordered(vec![registry_append_request(
-                    first_version,
-                    &decoded,
-                )])
-                .map_err(|e| {
-                    AppendError::Backend(EngineError::Append(e.to_string()))
-                })?;
-
-            // Adopt the already-validated fold (folding twice could not fail
-            // differently, and this keeps ONE apply per record).
-            book.registry = trial;
-            book.rebuild_arcs();
-            book.alloc_registry_versions(decoded.len() as u64);
-
-            // Ids this batch MINTS are in the `Book` but not yet durable — the
-            // same in-flight window an engine mint opens, closed the same way.
-            // Aliases need no marker: they rebind a name to an id that is
-            // already durably registered, so a batch referencing it is safe
-            // whatever happens to the alias record.
-            let mut new_streams = Vec::new();
-            let mut new_types = Vec::new();
-            for record in &decoded {
-                match record {
-                    RegistryRecord::StreamRegistered { stream_id, .. } => {
-                        new_streams.push(*stream_id);
-                    }
-                    RegistryRecord::EventTypeRegistered {
-                        event_type_id,
-                        ..
-                    } => new_types.push(*event_type_id),
-                    _ => {}
-                }
-            }
-            let guard = self.mark_pending(&mut book, new_streams, new_types);
-            (submitted, guard, first_version, decoded.len())
-        };
-        let (submitted, guard, first_version, count) = plan;
-
-        let inner = self.inner.clone();
-        tokio::task::spawn_blocking(move || -> Result<Appended, EngineError> {
-            let mut reg_guard = guard;
-            let outcome = inner
-                .rt
-                .block_on(submitted.wait())
-                .pop()
-                .expect("one outcome per batch");
-            let placed = expect_acked(
-                outcome.map_err(|e| EngineError::Append(e.to_string()))?,
-            )?;
-            reg_guard.landed();
-            let last_global = placed.last_global;
-            publish_batch(
-                &inner,
-                registry::REGISTRY_STREAM_ID,
-                first_version,
-                count as u32,
-                placed,
-            )?;
-            Ok(Appended {
-                version:              Version::At(
-                    first_version + count as u64 - 1,
-                ),
-                last_global_position: last_global,
-            })
-        })
+        self.enqueue_owner(
+            OwnerIntentKind::Registry { expected, records: decoded },
+            records.iter().map(|r| r.data.len() + r.message_type.len()).sum(),
+            inflight,
+        )
         .await
-        .expect("append task panicked")
-        .map_err(AppendError::Backend)
+    }
+
+    async fn enqueue_owner(
+        &self,
+        kind: OwnerIntentKind,
+        cost: usize,
+        inflight: InFlightGuard,
+    ) -> OwnerResult {
+        // One oversized intent may occupy the whole byte budget; the direct
+        // committer's preflight then returns the real typed encode error. It
+        // never waits forever trying to acquire more permits than exist.
+        let permits = cost.clamp(1, OWNER_RING_BYTES) as u32;
+        let permit = Arc::clone(&self.inner.owner.bytes)
+            .acquire_many_owned(permits)
+            .await
+            .map_err(|_| {
+                AppendError::Backend(EngineError::Append(
+                    "append owner is closed".into(),
+                ))
+            })?;
+        let (done, rx) = oneshot::channel();
+        let intent = OwnerIntent { kind, cost, done, _permit: permit };
+        self.inner
+            .owner
+            .tx
+            .as_ref()
+            .expect("live engine has owner sender")
+            .send(intent)
+            .await
+            .map_err(|_| {
+                AppendError::Backend(EngineError::Append(
+                    "append owner is closed".into(),
+                ))
+            })?;
+        drop(inflight);
+        rx.await.map_err(|_| {
+            AppendError::Backend(EngineError::Append(
+                "append owner exited before completing intent".into(),
+            ))
+        })?
     }
 }
 
@@ -3311,64 +3417,6 @@ fn registry_lost_error() -> EngineError {
          the log alone) to continue."
             .to_string(),
     )
-}
-
-/// Settles ONE in-flight `$registry` registration (`bn-2di`, review F1/F4).
-///
-/// Created under the `Book` lock the instant a registration is pushed, and
-/// dropped — on EVERY path, including a panic — inside the blocking task that
-/// learns its outcome, before the append gate is released. Dropping it clears
-/// the pending markers and wakes every appender parked on those ids.
-///
-/// If [`landed`](Self::landed) was never called, the record did NOT reach the
-/// log while its ids are already in the `Book`: the in-memory registry now
-/// disagrees with the durable one, so the `Book` is poisoned
-/// ([`Book::registry_lost`]) and every further append is refused. This is only
-/// reachable when the store is already failing (`StoreFull`, `StorePoisoned`,
-/// `Closed`, or an indeterminate barrier) — the ordinary pre-commit rejections
-/// never get this far, because nothing is minted until the push has succeeded.
-struct RegistrationGuard {
-    book:    Arc<Mutex<Book>>,
-    streams: Vec<u64>,
-    types:   Vec<u32>,
-    tx:      watch::Sender<bool>,
-    landed:  bool,
-}
-
-impl RegistrationGuard {
-    /// The registration is durably in the log: its ids are real.
-    fn landed(&mut self) { self.landed = true; }
-}
-
-impl Drop for RegistrationGuard {
-    fn drop(&mut self) {
-        {
-            let mut book = self.book.lock().expect("book lock");
-            for id in &self.streams {
-                book.pending_streams.remove(id);
-            }
-            for id in &self.types {
-                book.pending_types.remove(id);
-            }
-            if !self.landed {
-                book.registry_lost = true;
-            }
-        }
-        // Wake the parked appenders. A `watch` send is never missed: a receiver
-        // cloned before this sees the change, and one cloned after this never
-        // existed (the markers are gone above, under the lock).
-        let _ = self.tx.send(true);
-    }
-}
-
-/// What one attempt at [`LogEngine::plan_and_submit`] decided.
-enum Planned {
-    /// Planned, pushed, minted — carry on.
-    Ready(SubmitPlan),
-    /// An id this append must REFERENCE has a `$registry` record in the
-    /// committer's channel whose outcome is not decided yet. Park on this
-    /// channel (off the `Book` lock) and re-plan.
-    WaitFor(watch::Receiver<bool>),
 }
 
 /// The outcome of the exact-version pre-check in [`LogEngine::append_batch`],
@@ -3682,7 +3730,7 @@ impl Backend for LogEngine {
     /// # Why this engine's global sequence has holes
     ///
     /// `$registry` (stream 0) is a real stream in the log: its batches are
-    /// committed by the same committer and consume global positions like any
+    /// committed by the same flat owner and consume global positions like any
     /// other (the accepted cost of landing the registry on v3 rather than
     /// waiting for v4 control capsules). But a registration is engine
     /// bookkeeping, not an application event — delivering `RegistryEventV1`
@@ -3821,6 +3869,11 @@ impl Backend for LogEngine {
         expected: Version,
         records: &[RecordToAppend],
     ) -> Result<Appended, AppendError<Self::Error>> {
+        // D7: count from the very first API instruction through enqueue. This
+        // covers registry decoding, the owned-record copy, and byte-budget
+        // waiting — not merely the final channel send.
+        self.inner.owner.inflight.fetch_add(1, Ordering::AcqRel);
+        let inflight = InFlightGuard(Arc::clone(&self.inner.owner.inflight));
         // `$registry` (stream 0) is a system stream with its own write path
         // (`bn-2di`, review F2): it takes only `RegistryEventV1` records, each
         // of which must decode and fold cleanly, and it never mints an id from
@@ -3833,320 +3886,110 @@ impl Backend for LogEngine {
         // `"$registry"` is still refused (loudly, at the decode), because those
         // frames are the ones recovery interprets as registry records.
         if stream_id == registry::RESERVED_STREAM_NAME {
-            return self.append_registry(expected, records).await;
+            return self.append_registry(expected, records, inflight).await;
         }
 
-        // Serialise the exact-version critical section PER STREAM (bn-1s0):
-        // two appenders racing `Exact(v)` on the SAME stream still resolve to
-        // exactly one winner; appenders on DIFFERENT streams no longer queue
-        // behind one store-wide lock. An OWNED guard (bn-3nz): on the
-        // Proceed path it is moved into the commit+publish blocking task and
-        // released only after the publish, so the shard stays held across the
-        // whole check-head → append → publish section even if this async
-        // future is cancelled — otherwise a dropped future could free the
-        // shard while its committed batch is still publishing and let a
-        // concurrent same-stream append double-write the same stream version.
-        //
-        // `bn-2di`: the shard is keyed by the stream NAME's hash, not by its
-        // interned id. It used to be keyed by `sid`, which forced the interning
-        // to happen *before* the gate (the gate had nothing to key on
-        // otherwise) and so split it from the version check. Interning and
-        // submitting must now happen in ONE `Book`-locked section (see
-        // [`plan_and_submit`](Self::plan_and_submit)), so the gate has to be
-        // takeable without an id. Hashing the name gives the identical
-        // guarantee — same stream, same shard — with no ordering constraint.
-        let gate = self.inner.append_gate.lock_for_name(stream_id).await;
-
-        // Plan + push, under one `Book` lock. Retries only in the rare case
-        // where a name this append REFERENCES has a `$registry` record in
-        // flight whose fate is not decided yet — see `plan_and_submit`.
-        let plan = loop {
-            let parked = {
-                let mut book = self.inner.book.lock().expect("book lock");
-                match self
-                    .plan_and_submit(&mut book, stream_id, expected, records)?
-                {
-                    Planned::Ready(plan) => break plan,
-                    Planned::WaitFor(rx) => rx,
-                }
-            };
-            // Off the `Book` lock (and off the committer's back): park until
-            // the registration we would depend on is decided, then re-plan
-            // from scratch — the head, the ids, and the store's health may all
-            // have changed while we waited.
-            let mut parked = parked;
-            let _ = parked.changed().await;
-        };
-        let SubmitPlan { pre, submitted, reg_span, guard } = plan;
-
-        // `bn-2di`: THERE IS NO NAME FLUSH. This is where the barrier used to
-        // be.
-        //
-        // The invariant recovery needs is "no committed event may out-live its
-        // stream/type name." That used to span TWO storage systems — the log
-        // and fjall's `stream_names`/`type_names` — and upholding it
-        // cost a real barrier: bn-150 added a `SyncAll` per new name
-        // (~3.4 ms/new-stream, 98.8% of new-stream latency per spike
-        // bn-1jg), bn-2cj gated it by durability mode, bn-34o coalesced
-        // it into the committer's group window, and Spike J *still*
-        // found a second serialized `SyncAll` worth ~953 µs/new-stream
-        // that the `commit.fsync` counter could not see.
-        //
-        // All of it is gone. A name is a `$registry` record — written by the
-        // same committer, into the same segment, in the same commit group, at a
-        // LOWER offset than the batch that first references its id, in the same
-        // atomically-failing ordered unit (`submit_ordered`, review F4).
-        // Recovery accepts a contiguous prefix of the log, so a crash cannot
-        // keep the reference and lose the registration; the unit's atomic
-        // failure means a rejected registration cannot be overtaken by its own
-        // domain batch; and no id is minted into the `Book` at all until its
-        // record is irrevocably in the committer's channel (`plan_and_submit`).
-        // The ordering is structural, and structure needs no fsync.
-        //
-        // The committer no longer even HAS a pre-barrier hook to hang a name
-        // flush on (`mess-log`'s `PreBarrier` was deleted with this bone), so
-        // this is not merely "no flush today" — it is a flush that cannot be
-        // reintroduced through this seam.
-
-        // Nothing reached the committer at all: the hot conflict/empty path
-        // on a stream whose names are already registered. Return without ever
-        // touching a blocking thread — exactly as before this bone.
-        let Some(submitted) = submitted else {
-            return match pre {
-                Pre::Conflict(actual) => {
-                    Err(AppendError::Conflict { expected, actual })
-                }
-                Pre::Empty => {
-                    let last_global =
-                        self.inner.read_watermark.get().saturating_sub(1);
-                    Ok(Appended {
-                        version:              expected,
-                        last_global_position: last_global,
-                    })
-                }
-                Pre::Proceed { .. } => {
-                    unreachable!("a Proceed always pushes its domain batch")
-                }
-            };
-        };
-
-        // Durable wait + publish, both inside ONE `spawn_blocking` task
-        // (bn-3nz). This is the structural fix for the "dropped append future
-        // gaps the position sequence" hazard: the durable committer assigns
-        // this batch's global position range as a permanent, irreversible
-        // fact, and the book/index/meta publish plus its
-        // [`PublishSequencer`] turn are what make that position visible and
-        // let the NEXT position publish. If those two steps could be split by
-        // a cancellation point — as they were when the publish lived back on
-        // the async caller's future, awaiting `spawn_blocking(append)` and
-        // then `turn()` separately — a caller that dropped its append future
-        // (e.g. a `tokio::select!` timeout) between them would leave a
-        // committed-but-never-published position, and `turn`'s strict
-        // `== next` wait would stall every higher position forever.
-        //
-        // A `spawn_blocking` task is never cancelled: it runs to completion
-        // even if this `.await`'s `JoinHandle` is dropped. Doing the wait AND
-        // the publish inside it therefore makes the whole
-        // ack→turn→publish sequence atomic against API-future
-        // cancellation. A cancelled append still fully publishes (its events
-        // are already durable, so full visibility is the only consistent
-        // outcome — never a torn or missing slot); the caller simply never
-        // observes the returned [`Appended`].
-        //
-        // `bn-2di`: the batches were PUSHED earlier (under the `Book` lock, so
-        // a registration is ordered ahead of its first use — see
-        // `plan_and_submit`). What happens here is the durable *wait* and then
-        // up to two publishes, in position order: the `$registry` batch first
-        // (it holds the lower positions), then the domain batch.
-        let domain_pre = match &pre {
-            Pre::Proceed { sid, first_stream_pos, tids, .. } => {
-                Some((*sid, *first_stream_pos, tids.clone()))
+        let encoded_estimate = HEADER_LEN
+            .saturating_add(MARKER_LEN)
+            .saturating_add(
+                usize::from(self.inner.owner.chain_enabled) * CHAIN_LEN,
+            )
+            .saturating_add(records.len().saturating_mul(SUBFRAME_HDR_LEN))
+            .saturating_add(
+                records
+                    .iter()
+                    .map(|record| record.data.len())
+                    .fold(0usize, usize::saturating_add),
+            );
+        let (input, cost) = if !records.is_empty()
+            && encoded_estimate >= PREPARE_MIN_ENCODED_BYTES
+            // Keep invalid-input error precedence unchanged: the owner first
+            // validates `expected`, then its ordinary encoder reports the
+            // typed size/count error. Producer preparation is only selected
+            // for the common plain shape already known to be representable.
+            && (encoded_estimate as u64) <= MAX_BATCH_LEN
+            && records.len() <= u32::MAX as usize
+            && records.iter().all(|record| record.data.len() <= u32::MAX as usize)
+        {
+            // Pure producer-side preparation: copy payload bytes directly
+            // into their final framed positions while this task can run in
+            // parallel with other producers. Every authoritative field is a
+            // placeholder; the sole owner resolves type names and the direct
+            // writer stamps ids/positions/epoch/chain + covering CRC.
+            let mut names: HashMap<&str, u32> = HashMap::new();
+            let mut type_names = Vec::new();
+            let mut type_slots = Vec::with_capacity(records.len());
+            for record in records {
+                let name = record.message_type.as_str();
+                let slot = if let Some(&slot) = names.get(name) {
+                    slot
+                } else {
+                    let slot =
+                        u32::try_from(type_names.len()).map_err(|_| {
+                            AppendError::Backend(EngineError::Append(
+                                "too many distinct event types in one batch"
+                                    .to_string(),
+                            ))
+                        })?;
+                    type_names.push(name.to_owned());
+                    names.insert(name, slot);
+                    slot
+                };
+                type_slots.push(slot);
             }
-            Pre::Conflict(_) | Pre::Empty => None,
+            let subframes: Vec<Subframe<'_>> = records
+                .iter()
+                .map(|record| Subframe::plain(0, 0, 0, &record.data))
+                .collect();
+            let zero_chain = [0u8; CHAIN_LEN];
+            let batch = PreparedBatch::encode(&BatchInput {
+                segment_epoch:        0,
+                batch_id:             0,
+                first_global_pos:     0,
+                stream_id:            0,
+                category_id:          0,
+                first_stream_version: 0,
+                crypto_chain:         self
+                    .inner
+                    .owner
+                    .chain_enabled
+                    .then_some(&zero_chain),
+                subframes:            &subframes,
+            })
+            .map_err(|e| {
+                AppendError::Backend(EngineError::Append(e.to_string()))
+            })?;
+            let cost = stream_id
+                .len()
+                .saturating_add(batch.total_len() as usize)
+                .saturating_add(
+                    type_names
+                        .iter()
+                        .map(String::len)
+                        .fold(0usize, usize::saturating_add),
+                )
+                .saturating_add(type_slots.len() * 4);
+            (DomainInput::Prepared { type_names, type_slots, batch }, cost)
+        } else {
+            let cost = stream_id.len().saturating_add(
+                records
+                    .iter()
+                    .map(|r| r.message_type.len() + r.data.len())
+                    .fold(0usize, usize::saturating_add),
+            );
+            (DomainInput::Records(records.to_vec()), cost)
         };
-        // Owned copy of the records for the publish step, which runs in a
-        // `'static` blocking closure and so cannot borrow `records`. Used
-        // only to warm the capsule cache with the just-published batch (the
-        // book's per-event payload copy is gone, bn-2ib).
-        let records_owned: Vec<RecordToAppend> = records.to_vec();
-        let inner = self.inner.clone();
-        let published = tokio::task::spawn_blocking(
-            move || -> Result<Option<Appended>, EngineError> {
-                // Hold the per-stream gate (moved in from the async future) for
-                // the whole wait+publish, releasing it only when this closure
-                // ends — AFTER the publish below, and after `reg_guard` has
-                // settled the registration. Because a `spawn_blocking` task
-                // always runs to completion, the shard cannot be freed early by
-                // a cancelled append future (bn-3nz).
-                //
-                // DECLARATION ORDER IS LOAD-BEARING: locals drop in reverse, so
-                // `reg_guard` (declared second) settles the in-flight
-                // registration — clearing the pending markers, waking parked
-                // appenders, and poisoning the `Book` if the record did not
-                // land — strictly BEFORE the gate is released.
-                let _gate = gate;
-                let mut reg_guard = guard;
-
-                // 1) Await the ordered unit — ONE RESULT PER BATCH.
-                //
-                //    A unit fails atomically FORWARD (a rejected `$registry`
-                //    batch aborts the domain batch behind it — review F4), but
-                //    not backward: the tiny `$registry` batch can commit while
-                //    the domain batch behind it dies of `SegmentFull` (a batch
-                //    bigger than an EMPTY segment can never fit, however often
-                //    the roller rolls — bn-u6o). The registration's global
-                //    positions are then a permanent, irreversible fact with the
-                //    watermark already past them, and dropping it on the floor
-                //    would leave a committed-but-never-published position that
-                //    stalls `PublishSequencer::turn` — and hence EVERY later
-                //    append — forever. That is precisely the bn-3nz hazard.
-                //
-                //    So: publish everything that LANDED, in position order, and
-                //    only then surface the failure (review F5).
-                let outcomes = inner.rt.block_on(submitted.wait());
-                let mut acked = outcomes.into_iter();
-                let mut failure: Option<EngineError> = None;
-
-                // 2) Publish the `$registry` batch, if this append minted one.
-                //    It holds the LOWER positions, so it must publish first —
-                //    `turn` would otherwise wait forever for a position the
-                //    domain batch had already skipped past.
-                if let Some((first_version, count)) = reg_span {
-                    let outcome = acked.next().expect("registry outcome");
-                    // A registration that did NOT land took no position, so
-                    // there is nothing to publish and nothing to stall — but it
-                    // DID leave its ids in the `Book`, so `reg_guard` stays
-                    // un-landed and poisons the book on drop.
-                    if let Ok(AppendOutcome::Acked {
-                        first_position,
-                        last_position,
-                        segment_id,
-                        offset,
-                    }) = outcome
-                    {
-                        if let Some(g) = reg_guard.as_mut() {
-                            g.landed();
-                        }
-                        if let Err(e) = publish_batch(
-                            &inner,
-                            registry::REGISTRY_STREAM_ID,
-                            first_version,
-                            count as u32,
-                            Placed {
-                                first_global: first_position,
-                                last_global: last_position,
-                                segment_id,
-                                offset,
-                            },
-                        ) {
-                            // Remember it; the domain batch below is at HIGHER
-                            // positions and is already durable — failing out
-                            // here without publishing it is the bn-3nz stall,
-                            // one level up (review F5).
-                            failure.get_or_insert(e);
-                        }
-                    }
-                }
-
-                // 3) Publish the domain batch, if there was one (a conflicting
-                //    or empty append that merely registered a name stops here).
-                let Some((sid, first_stream_pos, tids)) = domain_pre else {
-                    return match failure {
-                        Some(e) => Err(e),
-                        None => Ok(None),
-                    };
-                };
-                let placed = match acked.next().expect("domain outcome") {
-                    Ok(outcome) => match expect_acked(outcome) {
-                        Ok(placed) => placed,
-                        Err(e) => return Err(failure.unwrap_or(e)),
-                    },
-                    Err(e) => {
-                        return Err(failure
-                            .unwrap_or(EngineError::Append(e.to_string())));
-                    }
-                };
-                let Placed { first_global, last_global, segment_id, offset } =
-                    placed;
-                let frame_count = (last_global - first_global + 1) as u32;
-                let last_stream_pos =
-                    first_stream_pos + u64::from(frame_count) - 1;
-
-                // Warm the capsule cache with the batch just published, so an
-                // immediate read-back (the overwhelmingly common hot-stream
-                // shape) is a cache hit instead of a `pread` + decode.
-                // Bounded + transparent: if the cache rejects or evicts it,
-                // the read decodes the same durable bytes.
-                {
-                    let mut data = Vec::with_capacity(
-                        records_owned.iter().map(|r| r.data.len()).sum(),
-                    );
-                    let mut offs = Vec::with_capacity(records_owned.len() + 1);
-                    for rec in &records_owned {
-                        offs.push(data.len() as u32);
-                        data.extend_from_slice(&rec.data);
-                    }
-                    offs.push(data.len() as u32);
-                    inner.reader.insert(
-                        segment_id,
-                        offset,
-                        Arc::new(DecodedBatch {
-                            stream_id: sid,
-                            first_stream_version: first_stream_pos,
-                            first_global_pos: first_global,
-                            frame_count,
-                            type_ids: tids,
-                            data,
-                            offs,
-                        }),
-                    );
-                }
-
-                if let Err(e) = publish_batch(
-                    &inner,
-                    sid,
-                    first_stream_pos,
-                    frame_count,
-                    placed,
-                ) {
-                    failure.get_or_insert(e);
-                }
-                if let Some(e) = failure {
-                    return Err(e);
-                }
-
-                Ok(Some(Appended {
-                    version:              Version::At(last_stream_pos),
-                    last_global_position: last_global,
-                }))
-            },
-        )
-        .await
-        .expect("append task panicked")
-        .map_err(AppendError::Backend)?;
-
-        // A registration-only commit (the append itself conflicted or was
-        // empty): the name is now durably registered, and the caller still
-        // gets the verdict its `expected` version earned.
-        match published {
-            Some(appended) => Ok(appended),
-            None => match pre {
-                Pre::Conflict(actual) => {
-                    Err(AppendError::Conflict { expected, actual })
-                }
-                Pre::Empty => {
-                    let last_global =
-                        self.inner.read_watermark.get().saturating_sub(1);
-                    Ok(Appended {
-                        version:              expected,
-                        last_global_position: last_global,
-                    })
-                }
-                Pre::Proceed { .. } => {
-                    unreachable!("a Proceed always publishes a domain batch")
-                }
-            },
-        }
+        return self
+            .enqueue_owner(
+                OwnerIntentKind::Domain {
+                    stream: stream_id.to_owned(),
+                    expected,
+                    input,
+                },
+                cost,
+                inflight,
+            )
+            .await;
     }
 }
 

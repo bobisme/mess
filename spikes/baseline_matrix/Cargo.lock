@@ -378,6 +378,7 @@ dependencies = [
 name = "mess-index"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "crc32c",
  "fjall",
  "mess-log",

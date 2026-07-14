@@ -275,11 +275,20 @@ fn run_log(wl: Workload, durability: Durability) -> RunResult {
         out
     });
     let wall_s = start.elapsed().as_secs_f64();
-    // Logical result check: published event count must equal what we wrote.
+    // Logical result check. Since bn-2di the v3 `$registry` records are real
+    // log events and therefore advance the durable/published watermark even
+    // though `read_global` filters them from the user event stream. Account
+    // for one event-type registration plus either one stream per writer
+    // (stable shape) or one stream per append (new-name shape).
+    let registry_positions = if wl.new_name {
+        wl.total_appends() + 1
+    } else {
+        wl.writers + 1
+    };
     assert_eq!(
         engine.total_events() as u64,
-        wl.total_events(),
-        "composed watermark must equal total committed events"
+        wl.total_events() + registry_positions,
+        "composed watermark must cover domain plus registry events"
     );
     let m = engine.metrics();
     let fsyncs = m.commit.fsync.count;

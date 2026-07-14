@@ -45,7 +45,9 @@
 use std::io;
 use std::path::Path;
 
-use crate::encode::{BatchEncoder, BatchInput, EncodeError, Subframe};
+use crate::encode::{
+    BatchEncoder, BatchInput, EncodeError, PreparedBatch, Subframe,
+};
 use crate::format::*;
 use crate::runtime::{FileHandle, Fs, OpenOpts};
 
@@ -135,6 +137,15 @@ pub struct BatchSpec<'a, 'p> {
     pub crypto_chain:         Option<&'a [u8; CHAIN_LEN]>,
     /// The subframes (A5: non-empty).
     pub subframes:            &'a [Subframe<'p>],
+}
+
+/// Writer-owned fields for a producer-prepared batch.
+#[derive(Debug, Clone, Copy)]
+pub struct PreparedBatchSpec<'a> {
+    pub stream_id:            u64,
+    pub category_id:          u64,
+    pub first_stream_version: u64,
+    pub crypto_chain:         Option<&'a [u8; CHAIN_LEN]>,
 }
 
 /// What one successful [`append`](SegmentWriter::append) committed to the
@@ -473,6 +484,54 @@ impl<F: Fs> SegmentWriter<F> {
         self.batch_count += 1;
         self.event_count += u64::from(frame_count);
 
+        Ok(Receipt {
+            batch_id,
+            first_global_pos,
+            frame_count,
+            total_len,
+            offset,
+        })
+    }
+
+    /// Stamp and append a producer-prepared batch. The preparation is only a
+    /// CPU/copy optimization: this writer still assigns every authoritative
+    /// position/identity field and recomputes the CRC immediately before the
+    /// same canonical positioned write used by [`append`](Self::append).
+    pub fn append_prepared(
+        &mut self,
+        spec: &PreparedBatchSpec<'_>,
+        batch: &mut PreparedBatch,
+    ) -> Result<Receipt, WriteError> {
+        if self.poisoned {
+            return Err(WriteError::StorePoisoned);
+        }
+        let total_len = batch.total_len();
+        let remaining = self.remaining();
+        if total_len > remaining {
+            return Err(WriteError::SegmentFull {
+                needed: total_len,
+                remaining,
+            });
+        }
+        let frame_count = batch.frame_count();
+        let first_global_pos = self.next_pos;
+        let batch_id = self.next_batch_id;
+        let offset = self.write_off;
+        batch.finish(
+            self.epoch,
+            batch_id,
+            first_global_pos,
+            spec.stream_id,
+            spec.category_id,
+            spec.first_stream_version,
+            spec.crypto_chain,
+        )?;
+        write_all_at(&self.file, offset, batch.bytes())?;
+        self.write_off += total_len;
+        self.next_batch_id += 1;
+        self.next_pos += u64::from(frame_count);
+        self.batch_count += 1;
+        self.event_count += u64::from(frame_count);
         Ok(Receipt {
             batch_id,
             first_global_pos,

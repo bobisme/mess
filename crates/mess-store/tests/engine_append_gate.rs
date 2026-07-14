@@ -1,10 +1,10 @@
-//! bn-1s0: per-stream append gate.
+//! Flat-owner append ordering and convoy formation.
 //!
 //! `LogEngine::append_batch` used to serialise the whole check-head → append
 //! → apply critical section behind ONE store-wide `tokio::sync::Mutex<()>`,
 //! so appends to two completely unrelated streams queued behind each other.
-//! This bone replaces it with a fixed-shard, per-stream gate
-//! (`engine::AppendGate`). Two properties must survive the swap:
+//! The flat-combined owner replaces those gates entirely. Two properties must
+//! survive the swap:
 //!
 //! 1. The `ExpectedVersion` check-and-reserve is still atomic PER STREAM: N
 //!    tasks racing `Exact(v)` against the SAME stream must yield exactly one
@@ -203,6 +203,7 @@ async fn distinct_streams_overlap_under_durable_commit_path() {
     // concurrently in flight, so every group is pinned at size 1 regardless
     // of gate design; this is the "no coalescing possible" reference point.
     let serial_start = std::time::Instant::now();
+    let fsync_before_serial = engine.metrics().commit.fsync.count;
     for i in 0..N {
         engine
             .append_batch(
@@ -214,6 +215,7 @@ async fn distinct_streams_overlap_under_durable_commit_path() {
             .expect("serial append");
     }
     let serial_total = serial_start.elapsed();
+    let fsync_after_serial = engine.metrics().commit.fsync.count;
 
     // Phase 2 — CONCURRENT: the same N appends, to N other distinct
     // (already-primed) streams, all submitted at once. Under the per-stream
@@ -239,12 +241,15 @@ async fn distinct_streams_overlap_under_durable_commit_path() {
         h.await.expect("task panicked");
     }
     let concurrent_total = concurrent_start.elapsed();
+    let fsync_after_concurrent = engine.metrics().commit.fsync.count;
+    let serial_fsyncs = fsync_after_serial - fsync_before_serial;
+    let concurrent_fsyncs = fsync_after_concurrent - fsync_after_serial;
 
     eprintln!(
         "distinct_streams_overlap_under_durable_commit_path: serial {N}x = \
          {serial_total:?}, concurrent {N}x = {concurrent_total:?} (speedup \
-         {:.2}x)",
-        serial_total.as_secs_f64() / concurrent_total.as_secs_f64().max(1e-9)
+         {:.2}x), fsyncs serial={serial_fsyncs} concurrent={concurrent_fsyncs}",
+        serial_total.as_secs_f64() / concurrent_total.as_secs_f64().max(1e-9),
     );
 
     assert!(
@@ -254,6 +259,13 @@ async fn distinct_streams_overlap_under_durable_commit_path() {
          coalesce concurrently in-flight requests into fewer fdatasync \
          calls); got serial={serial_total:?} concurrent={concurrent_total:?} \
          — looks like appends are still effectively serialised"
+    );
+    assert_eq!(serial_fsyncs, N as u64, "serial appends are singleton groups");
+    assert!(
+        concurrent_fsyncs <= (N / 2) as u64,
+        "D7 target/in-flight/200us grace must prevent the concurrent convoy \
+         splitting into near-singleton barriers: {concurrent_fsyncs} fsyncs \
+         for {N} appends"
     );
 
     // Sanity: every stream actually landed both its priming event (version 0)
@@ -268,4 +280,98 @@ async fn distinct_streams_overlap_under_durable_commit_path() {
             Version::At(1)
         );
     }
+}
+
+/// `Os` durability is intentionally one fdatasync per written batch, even
+/// though the flat owner can see multiple producer intents at once. A new-name
+/// append writes a registry batch plus its domain batch, so it earns two.
+#[tokio::test]
+async fn os_durability_remains_sync_per_batch() {
+    let dir = mess_testkit::sweeping_temp_dir("flat-owner-os-singleton");
+    let engine = LogEngine::open_with(
+        dir.path(),
+        EngineOptions {
+            durability: Durability::Os,
+            ..EngineOptions::default()
+        },
+    )
+    .expect("open");
+
+    engine
+        .append_batch("os-stream", Version::NoStream, &[rec("Opened", b"x")])
+        .await
+        .expect("new-name append");
+    assert_eq!(engine.metrics().commit.fsync.count, 2);
+
+    engine
+        .append_batch("os-stream", Version::At(0), &[rec("Opened", b"y")])
+        .await
+        .expect("hot append");
+    assert_eq!(engine.metrics().commit.fsync.count, 3);
+}
+
+/// Regression for bn-3pz: after each covering barrier wakes the producers,
+/// they build and re-enter at slightly different times. The owner must not
+/// close on the momentary empty-ring/in-flight-zero gap and split a stable
+/// four-writer convoy into roughly two batches per fsync.
+#[tokio::test]
+async fn repeated_four_writer_convoy_reforms_before_early_close() {
+    const WRITERS: usize = 4;
+    const ROUNDS: u64 = 100;
+    let dir = mess_testkit::sweeping_temp_dir("flat-owner-d7-convoy");
+    let engine = LogEngine::open_with(
+        dir.path(),
+        EngineOptions {
+            durability: Durability::group_default(),
+            ..EngineOptions::default()
+        },
+    )
+    .expect("open");
+
+    for writer in 0..WRITERS {
+        engine
+            .append_batch(
+                &format!("convoy-{writer}"),
+                Version::NoStream,
+                &[rec("Tick", b"seed")],
+            )
+            .await
+            .expect("prime stream and names");
+    }
+
+    let before = engine.metrics().commit.fsync.count;
+    let rendezvous = std::sync::Arc::new(tokio::sync::Barrier::new(WRITERS));
+    let mut tasks = Vec::new();
+    for writer in 0..WRITERS {
+        let engine = engine.clone();
+        let rendezvous = rendezvous.clone();
+        tasks.push(tokio::spawn(async move {
+            rendezvous.wait().await;
+            for round in 0..ROUNDS {
+                engine
+                    .append_batch(
+                        &format!("convoy-{writer}"),
+                        Version::At(round),
+                        &[rec("Tick", &round.to_le_bytes())],
+                    )
+                    .await
+                    .expect("convoy append");
+            }
+        }));
+    }
+    for task in tasks {
+        task.await.expect("writer task");
+    }
+    let fsyncs = engine.metrics().commit.fsync.count - before;
+    let batches = WRITERS as u64 * ROUNDS;
+    eprintln!(
+        "repeated_four_writer_convoy: batches={batches} fsyncs={fsyncs} \
+         batches/fsync={:.2}",
+        batches as f64 / fsyncs as f64,
+    );
+    assert!(
+        fsyncs <= 150,
+        "D7 convoy split: expected substantially better than the known ~200 \
+         fsync defect for {batches} batches, got {fsyncs}"
+    );
 }

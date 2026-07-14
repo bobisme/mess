@@ -52,12 +52,16 @@ use crate::degraded::{Degraded, PoisonCause};
 pub use crate::degraded::{
     Degraded as StoreDegraded, PoisonCause as BarrierPoisonCause,
 };
-use crate::encode::{BatchEncoder, BatchInput, EncodeError, Subframe};
+use crate::encode::{
+    BatchEncoder, BatchInput, EncodeError, PreparedBatch, Subframe,
+};
 use crate::fold_chain::ChainHead;
 use crate::runtime::{Fs, Runtime};
 use crate::watermark::Watermark;
 pub use crate::watermark::Watermark as DurableWatermark;
-use crate::writer::{BatchSpec, SegmentSummary, SegmentWriter, WriteError};
+use crate::writer::{
+    BatchSpec, PreparedBatchSpec, SegmentSummary, SegmentWriter, WriteError,
+};
 
 // ---------------------------------------------------------------------------
 // Public config + request/outcome types
@@ -214,6 +218,35 @@ pub enum AppendOutcome {
     Indeterminate,
 }
 
+/// A direct-owner result paired with the input events it consumed.
+///
+/// Returning ownership lets a caller reuse the already-owned payloads for
+/// publication caches after the write, instead of cloning a large batch solely
+/// to keep those bytes alive across the commit.
+pub enum DirectBatchEvents {
+    Inputs(Vec<EventInput>),
+    Prepared(PreparedBatch),
+}
+
+pub struct DirectBatchOutcome {
+    pub outcome: Result<AppendOutcome, AppendError>,
+    pub events:  DirectBatchEvents,
+}
+
+pub enum DirectAppendRequest {
+    Inputs(AppendRequest),
+    Prepared {
+        stream_id:            u64,
+        category_id:          u64,
+        first_stream_version: u64,
+        batch:                PreparedBatch,
+    },
+}
+
+impl From<AppendRequest> for DirectAppendRequest {
+    fn from(value: AppendRequest) -> Self { DirectAppendRequest::Inputs(value) }
+}
+
 /// A pre-flight rejection of an [`append`](Committer::append): detected
 /// before the batch is durable, and distinct from an [`AppendOutcome`]
 /// (which is a durability verdict on an accepted request).
@@ -337,6 +370,19 @@ impl Metrics {
         self.fsync.record(dt);
         self.alarm.observe(dt);
     }
+
+    fn snapshot(&self) -> CommitterMetrics {
+        CommitterMetrics {
+            fsync:                 self.fsync.snapshot(),
+            fsync_degraded:        self.alarm.is_tripped(),
+            fsync_degraded_trips:  self.alarm.trips(),
+            fsync_threshold_nanos: self.alarm.threshold_nanos(),
+            groups:                self.groups.get(),
+            batches:               self.batches.get(),
+            events:                self.events.get(),
+            bytes:                 self.bytes.get(),
+        }
+    }
 }
 
 /// A point-in-time snapshot of a committer's runtime metrics (`bn-e2y`).
@@ -364,6 +410,17 @@ pub struct CommitterMetrics {
     pub events:                u64,
     /// Payload+framing bytes durably written.
     pub bytes:                 u64,
+}
+
+/// Cloneable query-side view of a committer's lock-free metrics core.
+/// Recording remains on the append path; the O(histogram-buckets) percentile
+/// scan occurs only when an operator asks for a snapshot.
+#[derive(Clone)]
+pub struct CommitterMetricsHandle(Arc<Metrics>);
+
+impl CommitterMetricsHandle {
+    #[must_use]
+    pub fn snapshot(&self) -> CommitterMetrics { self.0.snapshot() }
 }
 
 // ---------------------------------------------------------------------------
@@ -639,7 +696,7 @@ struct CommitReq {
     stream_id:            u64,
     category_id:          u64,
     first_stream_version: u64,
-    events:               Vec<EventInput>,
+    events:               CommitEvents,
     /// Precomputed on-disk `total_len`, for the `max_bytes` window bound
     /// (computed once by the appender at submit time, §2.1's "committer
     /// does not re-encode" spirit — it does not recompute the length
@@ -649,6 +706,11 @@ struct CommitReq {
     /// Carries the atomic-failure rule of [`AppendError::UnitAborted`].
     unit:                 Option<UnitTag>,
     ack:                  Ack,
+}
+
+enum CommitEvents {
+    Inputs(Vec<EventInput>),
+    Prepared(PreparedBatch),
 }
 
 /// Which ordered unit a [`CommitReq`] belongs to, and whether it is the unit's
@@ -715,6 +777,34 @@ fn subframes_of(events: &[EventInput]) -> Vec<Subframe<'_>> {
             )
         })
         .collect()
+}
+
+fn append_commit_req<F: Fs>(
+    writer: &mut SegmentWriter<F>,
+    req: &mut CommitReq,
+    crypto_chain: Option<&[u8; crate::format::CHAIN_LEN]>,
+) -> Result<crate::writer::Receipt, WriteError> {
+    match &mut req.events {
+        CommitEvents::Inputs(events) => {
+            let subs = subframes_of(events);
+            writer.append(&BatchSpec {
+                stream_id: req.stream_id,
+                category_id: req.category_id,
+                first_stream_version: req.first_stream_version,
+                crypto_chain,
+                subframes: &subs,
+            })
+        }
+        CommitEvents::Prepared(batch) => writer.append_prepared(
+            &PreparedBatchSpec {
+                stream_id: req.stream_id,
+                category_id: req.category_id,
+                first_stream_version: req.first_stream_version,
+                crypto_chain,
+            },
+            batch,
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -934,7 +1024,7 @@ fn roll_segment<F: Fs>(
 fn commit_group<R: Runtime, F: Fs>(
     rt: &R,
     writer: &mut SegmentWriter<F>,
-    group: Vec<CommitReq>,
+    group: &mut [CommitReq],
     policy: &Policy,
     watermark: &Watermark,
     metrics: &Metrics,
@@ -949,7 +1039,7 @@ fn commit_group<R: Runtime, F: Fs>(
     let mut acks: Vec<(Ack, Result<AppendOutcome, AppendError>)> =
         Vec::with_capacity(group.len());
     let mut wrote_any = false;
-    for req in &group {
+    for req in group {
         // `bn-2di` (unit atomicity): an earlier batch of this unit already
         // failed, so this one must never reach the file. Skipped BEFORE the
         // write — it consumes no position, and the caller learns definitively
@@ -963,7 +1053,6 @@ fn commit_group<R: Runtime, F: Fs>(
             acks.push((req.ack.clone(), Err(AppendError::UnitAborted)));
             continue;
         }
-        let subs = subframes_of(&req.events);
         // Fold-chain (spec 05 §6, G10): when enabled, stamp this batch's
         // `crypto_chain = h[base-1]` — the current head of this stream, which
         // starts at `genesis(stream_id)` the first time the stream is seen. The
@@ -988,13 +1077,6 @@ fn commit_group<R: Runtime, F: Fs>(
             None
         };
         let entry_bytes = entry.map(|h| h.entry());
-        let spec = BatchSpec {
-            stream_id:            req.stream_id,
-            category_id:          req.category_id,
-            first_stream_version: req.first_stream_version,
-            crypto_chain:         entry_bytes.as_ref(),
-            subframes:            &subs,
-        };
         // `bn-1vu`: try the append; on A8 SegmentFull with auto-roll wired,
         // roll to a fresh segment and retry the SAME batch once. Positions stay
         // dense — the new segment's `base_pos == next_pos`, so the retried
@@ -1006,13 +1088,13 @@ fn commit_group<R: Runtime, F: Fs>(
         // waste a near-empty segment before hitting the same typed error, and a
         // retrying caller would proliferate one such segment per attempt. Check
         // BEFORE rolling and surface the typed error immediately instead.
-        let mut outcome = writer.append(&spec);
+        let mut outcome = append_commit_req(writer, req, entry_bytes.as_ref());
         if let (Err(WriteError::SegmentFull { needed, .. }), Some(roller)) =
             (&outcome, roller)
             && *needed <= writer.empty_segment_capacity()
         {
             outcome = match roll_segment(writer, roller) {
-                Ok(()) => writer.append(&spec),
+                Ok(()) => append_commit_req(writer, req, entry_bytes.as_ref()),
                 Err(e) => Err(e),
             };
         }
@@ -1034,9 +1116,18 @@ fn commit_group<R: Runtime, F: Fs>(
                     let head = heads
                         .get_mut(&req.stream_id)
                         .expect("chain head inserted above");
-                    head.absorb_batch(
-                        req.events.iter().map(|e| e.payload.as_slice()),
-                    );
+                    match &req.events {
+                        CommitEvents::Inputs(events) => head.absorb_batch(
+                            events.iter().map(|e| e.payload.as_slice()),
+                        ),
+                        CommitEvents::Prepared(batch) => head.absorb_batch(
+                            batch.payload_ranges().iter().map(
+                                |&(start, end)| {
+                                    &batch.bytes()[start as usize..end as usize]
+                                },
+                            ),
+                        ),
+                    };
                 }
                 let first_position = receipt.first_global_pos;
                 let last_position =
@@ -1183,7 +1274,7 @@ async fn committer_loop<R: Runtime, F: Fs>(
     // unit's last batch retires its id, so it is empty in steady state.
     let mut failed_units: HashSet<u64> = HashSet::new();
     while let Some(first) = recv_unless_closed(&rx, &closed).await {
-        let group = gather(&rt, &rx, first, &policy, &gate, target).await;
+        let mut group = gather(&rt, &rx, first, &policy, &gate, target).await;
         target = group.len().max(1);
         // D8 sticky poison (`bn-25e`, §2.6): once a barrier has failed, the
         // durable state is unknowable. NEVER write atop it and NEVER re-issue
@@ -1212,7 +1303,7 @@ async fn committer_loop<R: Runtime, F: Fs>(
         commit_group(
             &rt,
             &mut writer,
-            group,
+            &mut group,
             &policy,
             &watermark,
             &metrics,
@@ -1311,7 +1402,7 @@ async fn submit(
         stream_id: req.stream_id,
         category_id: req.category_id,
         first_stream_version: req.first_stream_version,
-        events: req.events,
+        events: CommitEvents::Inputs(req.events),
         encoded_len,
         // A standalone batch is its own fate: nothing else depends on it and it
         // depends on nothing (`bn-2di`).
@@ -1465,7 +1556,7 @@ fn submit_ordered_now(
             stream_id: req.stream_id,
             category_id: req.category_id,
             first_stream_version: req.first_stream_version,
-            events: req.events,
+            events: CommitEvents::Inputs(req.events),
             encoded_len,
             unit: unit_id.map(|id| UnitTag { id, last: i == last_idx }),
             ack,
@@ -1661,6 +1752,239 @@ pub struct Committer<R: Runtime> {
     rt:        R,
 }
 
+/// Synchronous commit core for a caller that is itself the single append
+/// owner. Unlike [`Committer`], this owns no channel or worker task: the caller
+/// gathers and validates work, then invokes [`commit_ordered_group`] on the
+/// same thread that owns the [`SegmentWriter`]. This is the B0Direct seam used
+/// by `mess-store`'s flat-combined append owner.
+///
+/// All durability behavior remains shared with the asynchronous committer:
+/// live roll, fold-chain stamping, ordered-unit forward atomicity, sticky D8
+/// poison, watermark discipline, and the existing metrics implementation all
+/// run through [`commit_group`].
+pub struct DirectCommitter<R: Runtime, F: Fs> {
+    rt:            R,
+    writer:        Option<SegmentWriter<F>>,
+    policy:        Policy,
+    watermark:     Watermark,
+    metrics:       Arc<Metrics>,
+    degraded:      Degraded,
+    roller:        Option<Roller>,
+    chain_enabled: bool,
+    heads:         HashMap<u64, ChainHead>,
+    failed_units:  HashSet<u64>,
+}
+
+impl<R: Runtime, F: Fs> DirectCommitter<R, F> {
+    /// Build a direct commit core with the production roll and fold-chain
+    /// behavior. The caller becomes the sole owner of `writer`.
+    pub fn with_roll_chained(
+        rt: &R,
+        writer: SegmentWriter<F>,
+        durability: Durability,
+        roller: Roller,
+        chain: ChainInit,
+    ) -> Self {
+        let watermark = Watermark::new(writer.next_pos());
+        let ChainInit { enabled: chain_enabled, heads } = chain;
+        DirectCommitter {
+            rt: rt.clone(),
+            writer: Some(writer),
+            policy: Policy::from(durability),
+            watermark,
+            metrics: Arc::new(Metrics::default()),
+            degraded: Degraded::new(),
+            roller: Some(roller),
+            chain_enabled,
+            heads,
+            failed_units: HashSet::new(),
+        }
+    }
+
+    /// Commit a gathered set of ordered units with one covering durability
+    /// decision. Each inner vector is one ordered unit; its results are index
+    /// aligned. Preflight validates the gathered set before any write, so an
+    /// invalid later member cannot strand an earlier registry record. A
+    /// failure in one unit never aborts an unrelated unit once writing begins,
+    /// while a failed member aborts every later member of that same unit.
+    pub fn commit_ordered_group(
+        &mut self,
+        units: Vec<Vec<DirectAppendRequest>>,
+    ) -> Result<Vec<Vec<DirectBatchOutcome>>, AppendError> {
+        if self.degraded.is_poisoned() {
+            return Err(AppendError::StorePoisoned);
+        }
+
+        // Load-bearing ordered-unit preflight: the engine may put a registry
+        // batch immediately before the domain batch that first uses its ids.
+        // Validate every member before the first byte lands. Prepared batches
+        // already carry validated final framing, so their check is O(1);
+        // ordinary inputs retain the canonical encoder validation pass.
+        let placeholder_chain = [0u8; crate::format::CHAIN_LEN];
+        for req in units.iter().flatten() {
+            match req {
+                DirectAppendRequest::Inputs(req) => {
+                    let subs = subframes_of(&req.events);
+                    BatchEncoder::total_len(&BatchInput {
+                        segment_epoch:        0,
+                        batch_id:             0,
+                        first_global_pos:     0,
+                        stream_id:            req.stream_id,
+                        category_id:          req.category_id,
+                        first_stream_version: req.first_stream_version,
+                        crypto_chain:         self
+                            .chain_enabled
+                            .then_some(&placeholder_chain),
+                        subframes:            &subs,
+                    })
+                    .map_err(AppendError::Encode)?;
+                }
+                DirectAppendRequest::Prepared { batch, .. } => batch
+                    .validate_for_chain(self.chain_enabled)
+                    .map_err(AppendError::Encode)?,
+            }
+        }
+
+        let shape: Vec<usize> = units.iter().map(Vec::len).collect();
+        let mut group = Vec::with_capacity(shape.iter().sum());
+        let mut acks = Vec::with_capacity(group.capacity());
+        for reqs in units {
+            let unit_id = (reqs.len() > 1)
+                .then(|| NEXT_UNIT_ID.fetch_add(1, Ordering::Relaxed));
+            let last_idx = reqs.len().saturating_sub(1);
+            for (i, req) in reqs.into_iter().enumerate() {
+                let (stream_id, category_id, first_stream_version, events) =
+                    match req {
+                        DirectAppendRequest::Inputs(req) => (
+                            req.stream_id,
+                            req.category_id,
+                            req.first_stream_version,
+                            CommitEvents::Inputs(req.events),
+                        ),
+                        DirectAppendRequest::Prepared {
+                            stream_id,
+                            category_id,
+                            first_stream_version,
+                            batch,
+                        } => (
+                            stream_id,
+                            category_id,
+                            first_stream_version,
+                            CommitEvents::Prepared(batch),
+                        ),
+                    };
+                let ack = new_ack();
+                acks.push(ack.clone());
+                group.push(CommitReq {
+                    stream_id,
+                    category_id,
+                    first_stream_version,
+                    events,
+                    // Direct groups are already gathered by the owner, so
+                    // they do not need the asynchronous committer's byte
+                    // window accounting. Avoid a second O(events) framing
+                    // walk here; SegmentWriter performs the authoritative
+                    // validation while encoding below.
+                    encoded_len: 0,
+                    unit: unit_id.map(|id| UnitTag { id, last: i == last_idx }),
+                    ack,
+                });
+            }
+        }
+
+        if self.policy.barrier && !self.policy.coalesce {
+            // `Os` is sync-per-batch by contract. Ordered-unit members remain
+            // adjacent and share `failed_units`, but each accepted batch earns
+            // its own fdatasync before the next is written.
+            for req in &mut group {
+                if self.degraded.is_poisoned() {
+                    if let Some(unit) = req.unit {
+                        if unit.last {
+                            self.failed_units.remove(&unit.id);
+                        } else {
+                            self.failed_units.insert(unit.id);
+                        }
+                    }
+                    fulfill(&req.ack, Err(AppendError::StorePoisoned));
+                    continue;
+                }
+                commit_group(
+                    &self.rt,
+                    self.writer.as_mut().expect("direct committer is live"),
+                    std::slice::from_mut(req),
+                    &self.policy,
+                    &self.watermark,
+                    &self.metrics,
+                    &self.degraded,
+                    self.roller.as_ref(),
+                    self.chain_enabled,
+                    &mut self.heads,
+                    &mut self.failed_units,
+                );
+            }
+        } else if !group.is_empty() {
+            commit_group(
+                &self.rt,
+                self.writer.as_mut().expect("direct committer is live"),
+                &mut group,
+                &self.policy,
+                &self.watermark,
+                &self.metrics,
+                &self.degraded,
+                self.roller.as_ref(),
+                self.chain_enabled,
+                &mut self.heads,
+                &mut self.failed_units,
+            );
+        }
+
+        let mut flat = acks.into_iter().zip(group).map(|(ack, req)| {
+            let outcome = ack
+                .lock()
+                .expect("direct ack poisoned")
+                .outcome
+                .take()
+                .expect("direct commit resolves every request");
+            let events = match req.events {
+                CommitEvents::Inputs(events) => {
+                    DirectBatchEvents::Inputs(events)
+                }
+                CommitEvents::Prepared(batch) => {
+                    DirectBatchEvents::Prepared(batch)
+                }
+            };
+            DirectBatchOutcome { outcome, events }
+        });
+        Ok(shape
+            .into_iter()
+            .map(|len| flat.by_ref().take(len).collect())
+            .collect())
+    }
+
+    pub fn watermark(&self) -> Watermark { self.watermark.clone() }
+
+    pub fn is_degraded(&self) -> bool { self.degraded.is_poisoned() }
+
+    pub fn metrics(&self) -> CommitterMetrics { self.metrics.snapshot() }
+
+    /// Shared query-side view for a direct core hosted on a private owner
+    /// thread. Cloning it is O(1); percentile scans happen only on `snapshot`.
+    pub fn metrics_handle(&self) -> CommitterMetricsHandle {
+        CommitterMetricsHandle(Arc::clone(&self.metrics))
+    }
+}
+
+impl<R: Runtime, F: Fs> Drop for DirectCommitter<R, F> {
+    fn drop(&mut self) {
+        let Some(writer) = self.writer.take() else { return };
+        if self.degraded.is_poisoned() {
+            drop(writer);
+        } else {
+            let _ = writer.close();
+        }
+    }
+}
+
 impl<R: Runtime> Committer<R> {
     /// Spawn the committer over `writer` in the given [`Durability`] mode.
     /// The committer thread/task takes ownership of `writer` and runs until
@@ -1841,19 +2165,7 @@ impl<R: Runtime> Committer<R> {
     /// (`bn-e2y`): barrier-latency percentiles (p50/p95/p99), the mandatory
     /// degradation flag (§2.6), and append-throughput counters. Lock-free and
     /// cheap — safe to poll from any thread while the committer runs.
-    pub fn metrics(&self) -> CommitterMetrics {
-        let m = &*self.metrics;
-        CommitterMetrics {
-            fsync:                 m.fsync.snapshot(),
-            fsync_degraded:        m.alarm.is_tripped(),
-            fsync_degraded_trips:  m.alarm.trips(),
-            fsync_threshold_nanos: m.alarm.threshold_nanos(),
-            groups:                m.groups.get(),
-            batches:               m.batches.get(),
-            events:                m.events.get(),
-            bytes:                 m.bytes.get(),
-        }
-    }
+    pub fn metrics(&self) -> CommitterMetrics { self.metrics.snapshot() }
 
     /// Whether barrier latency has crossed the degradation threshold at least
     /// once — the sticky store-status flag §2.6 makes mandatory. `true` means
@@ -1990,7 +2302,7 @@ impl<R: Runtime> Drop for Committer<R> {
 #[cfg(test)]
 mod tests {
     use std::io;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicI32};
 
     use super::*;
@@ -2478,6 +2790,125 @@ mod tests {
         fn allocate(&self, len: u64) -> io::Result<()> {
             self.inner.allocate(len)
         }
+    }
+
+    fn direct_fault_core(
+        rt: &SimRuntime,
+        durability: Durability,
+        fs: &BarrierFaultFs,
+        path: &'static str,
+    ) -> DirectCommitter<SimRuntime, BarrierFaultFs> {
+        let writer = seg(fs, Path::new(path));
+        let (roll_tx, _roll_rx) = std::sync::mpsc::channel();
+        let prefix = path.to_string();
+        let roller = Roller::new(
+            move |id| PathBuf::from(format!("{prefix}-{id}")),
+            roll_tx,
+        );
+        DirectCommitter::with_roll_chained(
+            rt,
+            writer,
+            durability,
+            roller,
+            ChainInit::off(),
+        )
+    }
+
+    #[test]
+    fn direct_group_uses_one_barrier_and_returns_dense_ordered_outcomes() {
+        let rt = SimRuntime::new(91);
+        let fs = BarrierFaultFs {
+            inner: SimFs::new(Fault::Tail),
+            errno: Arc::new(AtomicI32::new(0)),
+            syncs: Arc::new(AtomicUsize::new(0)),
+        };
+        let mut direct = direct_fault_core(
+            &rt,
+            Durability::group_default(),
+            &fs,
+            "/direct-group",
+        );
+        fs.syncs.store(0, Ordering::SeqCst);
+        let outcomes = direct
+            .commit_ordered_group(vec![
+                vec![req(1, 0, 2).into()],
+                vec![req(2, 0, 3).into()],
+                vec![req(3, 0, 1).into()],
+            ])
+            .unwrap();
+        let spans: Vec<(u64, u64)> = outcomes
+            .into_iter()
+            .map(|mut unit| match unit.remove(0).outcome.unwrap() {
+                AppendOutcome::Acked {
+                    first_position, last_position, ..
+                } => (first_position, last_position),
+                AppendOutcome::Indeterminate => panic!("healthy group"),
+            })
+            .collect();
+        assert_eq!(spans, vec![(0, 1), (2, 4), (5, 5)]);
+        assert_eq!(fs.syncs.load(Ordering::SeqCst), 1);
+        assert_eq!(direct.watermark().get(), 6);
+    }
+
+    #[test]
+    fn direct_os_uses_one_barrier_per_batch() {
+        let rt = SimRuntime::new(92);
+        let fs = BarrierFaultFs {
+            inner: SimFs::new(Fault::Tail),
+            errno: Arc::new(AtomicI32::new(0)),
+            syncs: Arc::new(AtomicUsize::new(0)),
+        };
+        let mut direct =
+            direct_fault_core(&rt, Durability::Os, &fs, "/direct-os");
+        fs.syncs.store(0, Ordering::SeqCst);
+        let outcomes = direct
+            .commit_ordered_group(vec![vec![
+                req(1, 0, 1).into(),
+                req(1, 1, 1).into(),
+            ]])
+            .unwrap();
+        assert!(
+            outcomes[0]
+                .iter()
+                .all(|o| matches!(o.outcome, Ok(AppendOutcome::Acked { .. })))
+        );
+        assert_eq!(fs.syncs.load(Ordering::SeqCst), 2);
+        assert_eq!(direct.metrics().groups, 2);
+    }
+
+    #[test]
+    fn direct_barrier_eio_is_indeterminate_sticky_and_never_retried_on_drop() {
+        let rt = SimRuntime::new(93);
+        let fs = BarrierFaultFs {
+            inner: SimFs::new(Fault::Tail),
+            errno: Arc::new(AtomicI32::new(0)),
+            syncs: Arc::new(AtomicUsize::new(0)),
+        };
+        let mut direct = direct_fault_core(
+            &rt,
+            Durability::group_default(),
+            &fs,
+            "/direct-eio",
+        );
+        fs.syncs.store(0, Ordering::SeqCst);
+        fs.errno.store(libc::EIO, Ordering::SeqCst);
+        let first = direct
+            .commit_ordered_group(vec![vec![req(1, 0, 1).into()]])
+            .unwrap();
+        assert_eq!(first[0][0].outcome, Ok(AppendOutcome::Indeterminate));
+        assert!(direct.is_degraded());
+        assert_eq!(direct.watermark().get(), 0);
+        assert!(matches!(
+            direct.commit_ordered_group(vec![vec![req(1, 0, 1).into()]]),
+            Err(AppendError::StorePoisoned)
+        ));
+        assert_eq!(fs.syncs.load(Ordering::SeqCst), 1);
+        drop(direct);
+        assert_eq!(
+            fs.syncs.load(Ordering::SeqCst),
+            1,
+            "poisoned drop must not retry the failed barrier"
+        );
     }
 
     /// One good `Os`-mode append (barrier succeeds), then a second whose
