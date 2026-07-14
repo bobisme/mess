@@ -18,6 +18,11 @@ full differential oracle  -> optimized state == canonical fold
 
 No single layer substitutes for the others.
 
+**Status.** Production uses the v3 flat owner/direct committer. V4's byte/crash
+prototype passed its stated gates but remains off by default. Snapshot
+discovery follows ADR 0002's discardable sidecar model; projection and exact
+idempotency models are conditional. Legacy migration modeling is historical.
+
 ## 2. Protocol state machine
 
 ### 2.1 State variables
@@ -29,7 +34,8 @@ queue: sequence<Intent>
 owner_state: Idle | Gathering | Writing | Syncing | Applying | Publishing
 spec_heads: map Stream -> Version
 committed_capsules: sequence<Capsule>
-durable_prefix_len: Nat
+written_prefix_len: Nat
+crash_stable_prefix_len: Nat | UnknownInProcessMode
 published_prefix_len: Nat
 completions: map IntentId -> Pending | Success | Conflict | Duplicate | Error
 segment_epoch: Nat
@@ -79,8 +85,10 @@ S2 NoPartialVisibility:
 S3 ControlEventAtomicity:
    same-capsule controls and events are both applied or neither applied
 
-S4 DenseGlobalPositions:
-   visible user events occupy exactly [0, log_end)
+S4 CanonicalPositionContinuity:
+   accepted v3 event frames occupy the canonical contiguous prefix; filtered
+   application delivery may have `$registry` gaps and treats positions as
+   opaque ordered cursors
 
 S5 StreamContinuity:
    each stream's accepted transitions form one path with no gap/overlap
@@ -89,7 +97,8 @@ S6 RegistryBeforeUse:
    every accepted event reference resolves after applying prior/same-capsule controls
 
 S7 PublishAfterDurability:
-   under Os/closed Group, published_prefix <= durable_prefix
+   under Os/closed Group, published_prefix <= crash_stable_prefix; under
+   Process no runtime-known crash-stable frontier is asserted
 
 S8 CompletionAfterPublish:
    Success implies the corresponding effects are reader-visible
@@ -119,7 +128,8 @@ Under fair scheduling and successful I/O:
 
 ```text
 queued intent eventually completes
-published watermark eventually reaches durable watermark
+after successful Os/closed Group I/O, published eventually reaches the
+crash-stable frontier
 seal backlog eventually drains below bound
 checkpoint request eventually installs or reports failure
 bounded reader retry eventually returns or takes slow path
@@ -155,10 +165,12 @@ window span 2–4 positions
 
 Small domains are enough to find ordering/state bugs.
 
-Model both:
+Model:
 
 - centralized owner reference;
-- implementation refinements such as receiver cancellation and early-close grouping.
+- implementation refinements such as receiver cancellation, FIFO space
+  admission, and early-close grouping. B1 cross-barrier pipelining is rejected
+  evidence, not a normative refinement.
 
 The refinement mapping projects implementation state to canonical accepted capsule sequence and folded kernel state.
 
@@ -226,6 +238,12 @@ Model bounded MPSC producer pushes, owner drain, cancellation/drop, and completi
 - dropped receiver does not leak ring capacity;
 - owner never reads partially initialized intent;
 - wake cannot be lost.
+- strict FIFO admission prevents starvation while exposing deliberate
+  head-of-line blocking;
+- an oversize intent fails rather than waits forever;
+- dropping before space admission unlinks a waiter that reserved zero bytes;
+- dropping after admission releases the exact byte reservation at terminal
+  owner state even when the completion receiver is gone.
 
 ### 5.4 Checkpoint snapshot generation
 
@@ -333,7 +351,11 @@ Crash during page write, rename, manifest write, current-slot update, and page G
 
 ### 8.4 Snapshot matrix
 
-Crash during blob record, pack barrier, install capsule, and head publish. Verify head/blob ordering and fallback.
+Crash during commit-framed record append, pack roll, discovery-page build,
+complete-closure promotion, proof-ledger publication, root publication, root
+prune, and content deletion. Verify Buffered/Durable distinction, retained-root
+closure, stale-descriptor non-ABA, and miss/replay fallback. No install capsule
+exists under ADR 0002.
 
 ## 9. Differential state testing
 
@@ -363,6 +385,13 @@ state digest
 Run after every simulated crash/reopen, not only at sequence end.
 
 ## 10. Dedupe adversarial suite
+
+Run only if `bn-2ctq` admits product idempotency. Require `W > 0`, greatest
+committed inclusive position `w`, and
+`window_start = w.saturating_sub(W)`. The key at `window_start` is live; the
+one before it is expired. Segment retention uses
+`end_exclusive <= window_start` (or strict `<` for an inclusive end) unless a
+canonical boundary carries all live keys/results.
 
 Inject a test fingerprint function with configurable bit width, including zero bits, so all keys collide. Generate:
 
@@ -401,7 +430,11 @@ construction failure falls back deterministically
 
 For MPHF/Ribbon, explicitly test arbitrary nonmember outputs are rejected by exact key verification.
 
-## 12. Migration verification
+## 12. Historical migration verification
+
+This section is retained as a future compatibility template only. Mess has no
+users or existing stores; research 06's M0–M9 program is superseded and is not
+a release gate for current fresh-store work.
 
 Model migration phases and crashes:
 
@@ -437,11 +470,11 @@ Process
 Os
 Group low/high concurrency
 new-name registration + first event
-control-only checkpoints
-snapshot install
+control-only checkpoints, only if the capability is admitted
+snapshot pack/root publication and GC
 segment roll/seal
 checkpoint install/GC
-migration cutover
+historical migration cutover fixture, only if a future migration exists
 ```
 
 After each kill:
@@ -477,7 +510,7 @@ Kani proof results
 fuzz corpus/hash and run duration
 crash/torn/SIGKILL totals
 mixed-version upgrade fixture results
-benchmark ledger and raw samples
+benchmark ledger, accepted/rejected raw per-cell matrices, and machine/load metadata
 golden wire fixtures
 format/spec commit hash
 known limitations

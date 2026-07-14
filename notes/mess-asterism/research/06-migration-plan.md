@@ -226,9 +226,19 @@ Write a small human-readable `FORMAT` advisory file and rely on actual segment h
 
 Dedupe is particularly sensitive because a retry may target a pre-upgrade event.
 
+> **Current qualification:** production dedupe was dormant and there are no
+> stores to migrate. A hypothetical future M0 must run `mess doctor
+> dedupe-status`; only a nonempty externally populated `MetaStore` would enter
+> the import path below. An empty inventory means idempotency, if admitted, is
+> a new feature rather than a migration.
+
 ### M6.1 Seed live window
 
-At cutover watermark `w`, export every Fjall dedupe row with `position >= w-W` into canonical dedupe epoch records or a `DedupeWindowImported` control object. Include full keys and canonical capsule pointers where available.
+At greatest committed inclusive position `w`, require `W > 0`, compute
+`window_start = w.saturating_sub(W)`, and export every Fjall dedupe row with
+`position >= window_start` into canonical dedupe epoch records or a
+`DedupeWindowImported` control object. Include full keys, original results, and
+canonical capsule pointers where available.
 
 If current v3 event bytes do not contain full dedupe keys, the import record becomes their canonical source until they expire. Do not store only fingerprints.
 
@@ -250,6 +260,11 @@ Rollback before expiry: continue using Fjall. Rollback after Fjall deletion requ
 ## 10. Phase M7 — snapshots and checkpoints
 
 ### 10.1 Snapshot migration
+
+> **Current qualification:** ADR 0002 rejects this authority transfer for the
+> actual product. Snapshot discovery remains discardable and moves to immutable
+> packs/copy-on-write discovery without a `SnapshotInstalled` v3/v4 record.
+> The steps below are counterfactual only.
 
 For every live Fjall snapshot head:
 

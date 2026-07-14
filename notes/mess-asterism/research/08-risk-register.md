@@ -18,7 +18,7 @@ Scale:
 | R5 | discardable snapshot discovery publishes missing, misidentified, non-durable-closure, or semantically overclaimed pack bytes | 4 | 2 | 4 | 32 | exclusive writer; UUID/PackId; commit frames; complete-closure durable proof; explicit trust mode; corruption always falls back | any snapshot changes the result vs full replay or makes canonical reads unavailable |
 | R6 | checkpoint accepted for the wrong prefix of a fresh store's canonical log | 5 | 2 | 4 | 40 | segment epoch/cursor/root anchor; fallback; corruption suite | checkpoint+suffix digest differs from full scan |
 | R7 | sequence-counter implementation has Rust UB/torn state | 5 | 2 | 5 | 50 | atomic fields only, Loom, bounded latch fallback | sanitizer/Loom issue or unexplained head pair |
-| R8 | single owner becomes CPU bottleneck | 3 | 4 | 2 | 24 | profile, preallocation, vectorized group validation, bulk mode | composed <85% bare log |
+| R8 | single owner becomes CPU bottleneck | 3 | 4 | 2 | 24 | profile, preallocation, vectorized group validation, bulk mode | current phase misses any prelocked `BN-2SU-FINAL` per-cell throughput/p99/barrier budget, uses an undeclared tolerance, or omits the raw matrix |
 | R9 | SealPack install ordering trusts missing/corrupt pack | 4 | 2 | 4 | 32 | pack durable+dir sync before footer, hash binding, raw fallback | any wrong read rather than fallback/error |
 | R10 | checkpoint/snapshot page GC deletes live pages | 5 | 2 | 5 | 50 | complete-closure Durable GC root, immutable IDs, ordered prune/delete, interrupted-GC model | acknowledged durable retained root references missing page |
 | R11 | static function returns wrong nonmember result | 5 | 3 | 4 | 60 | exact key comparison; optional structure only | any result path omits verification |
@@ -27,10 +27,12 @@ Scale:
 | R14 | checkpoint/open still loads all names/heads and misses scale goal | 3 | 4 | 2 | 24 | resident/tiered profiles, compressed registry base, lazy pages | 100M-event open remains event-count proportional |
 | R15 | per-segment effects grow with events rather than touched keys | 3 | 3 | 2 | 18 | net final updates only; dedupe separately epoched | effect size exceeds declared per-key gate |
 | R16 | seal/checkpoint backlog grows without bound | 4 | 3 | 3 | 36 | bounded queues, backpressure/roll policy, operator alarms | unbounded disk/RSS or append outage |
-| R17 | async caller cancellation leaks completion/queue state | 3 | 3 | 3 | 27 | owner owns lifecycle; dropped receiver only; state-machine tests | committed capsule not published or queue slot leaked |
+| R17 | async caller cancellation leaks completion/queue state | 3 | 3 | 3 | 27 | owner owns admitted lifecycle; FIFO space-waiter drop reserves nothing; state-machine tests | committed capsule not published or queue bytes leaked |
 | R18 | control TLV parser becomes attack surface | 5 | 3 | 3 | 45 | fixed caps, checked arithmetic, fuzz/Kani, frozen codec | panic/OOM/out-of-bounds on arbitrary bytes |
 | R19 | unknown or mismatched segment version is silently skipped or opened writable | 5 | 2 | 4 | 40 | fail-closed decoder dispatch; v3-only open refusal; downgrade tests | any binary writes after encountering an unsupported version |
 | R20 | performance claims depend on warm cache/device state | 2 | 5 | 3 | 30 | cold/warm separate, interleaved runs, raw samples, device telemetry | result not reproducible within tolerance |
+| R21 | admitted dedupe retention deletes still-live canonical keys/results | 5 | 3 | 5 | 75 | exact `end_exclusive <= window_start` law or canonical boundary carrying live keys | dangling verification pointer, false absorb/miss, or checkpoint-loss rebuild mismatch |
+| R22 | byte-ring admission starves a large waiter or cancellation leaks capacity | 3 | 3 | 3 | 27 | strict FIFO space waiters, oversize rejection, explicit drop states, Loom | indefinite waiter or reserved-byte mismatch |
 
 ## 2. Correctness risks in detail
 
@@ -200,7 +202,34 @@ separate background seal/checkpoint
 range-reservation bulk API for trusted construction
 ```
 
-Do not shard the canonical log prematurely. If the owner cannot reach 85% of bare log, profile first. A sharded validation front end with one final ordered committer is a later option, but it increases state complexity.
+Do not shard the canonical log prematurely. The historical Spike B
+`Process >=1.20x` pre-flat-owner admission gate has already passed; the flat
+owner is now the production baseline. Gate Phase 4 and later changes against
+the prelocked `BN-2SU-FINAL` cells: Process and Group throughput, p99, and
+barrier parity are compared per cell; no Process regression is accepted
+without explicit product approval; and every tolerance is declared before the
+run. Raw matrices are mandatory. The old 85%-of-bare headline was narrowed
+after profiling showed it priced async API wake topology. A sharded validation
+front end with one final ordered committer is a later option, but it increases
+state complexity.
+
+### R21 — dedupe retention boundary
+
+If exact idempotency is admitted, canonical full keys and original results must
+remain readable for the entire inclusive position window. With `W > 0`,
+`window_start = w.saturating_sub(W)`. A segment `[base, end_exclusive)` is
+deletable for dedupe only when `end_exclusive <= window_start`; an inclusive
+end uses strict `<`. Otherwise a canonical retention boundary must carry every
+still-live full key/result. Ambiguous `end_position` comparisons are forbidden.
+
+### R22 — byte-ring fairness and cancellation
+
+Space admission is strict FIFO. This avoids starvation but deliberately
+accepts head-of-line blocking behind a large intent; an intent larger than the
+total bound fails immediately. Dropping before admission unlinks a waiter that
+reserved nothing. Dropping after admission leaves terminal processing to the
+owner, which releases the exact byte reservation even if completion delivery
+fails. Loom covers both cancellation phases and queue shutdown.
 
 ### R13 — no Book means more I/O
 
@@ -323,7 +352,8 @@ state digest mismatch count (must stay zero)
 
 ## 6. Maintainability guardrails
 
-1. One canonical `Effect` definition.
+1. One canonical `Effect` definition, with registry application delegated to
+   strict `RegistryState` after stable control-identity deduplication.
 2. One decoder per format version with golden fixtures.
 3. Every optional accelerator implements a simple exact fallback trait.
 4. No unsafe code in format decoding; unsafe SIMD isolated behind tested scalar equivalence.
@@ -338,13 +368,16 @@ state digest mismatch count (must stay zero)
 ## 7. Final risk posture
 
 The legacy-store migration risk is retired: there are no users or existing
-stores, and names already live in the canonical log. The remaining Fjall roles
-still require an authority audit; no keyspace is deleted until it is
-log-derived or proven safely discardable. The highest remaining risks are
-therefore the v4 shift from event-only batches to mixed control/event capsules
-(if v4 is adopted), fail-closed handling of unsupported formats, exact
-replacement-state semantics, and accepting an accelerator or checkpoint for the
-wrong canonical prefix.
+stores, and names already live in the canonical log. Research 13 and ADR 0002
+completed the Fjall authority classification: snapshot discovery is the only
+live Fjall-backed state role and is safely discardable, while direct CLI
+`metaread`/doctor/inspect/retention and `rebuild-index --meta` paths remain
+operational consumers to migrate or remove. `bn-3l8n` is the end-to-end
+application/offline-tool adoption gate before deletion. The highest remaining
+risks are therefore the v4 shift from event-only batches to mixed control/event
+capsules (if v4 is adopted), fail-closed handling of unsupported formats,
+exact replacement-state semantics, and accepting an accelerator or checkpoint
+for the wrong canonical prefix.
 
 The safest high-value subset is therefore:
 

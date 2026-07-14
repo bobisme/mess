@@ -10,7 +10,10 @@
 - **Source:** [Fjall repository](https://github.com/fjall-rs/fjall), [docs.rs](https://docs.rs/fjall/3.1.6/fjall/)
 - **Maturity:** active production-grade Rust project; current inspected Mess pin is 3.1.6.
 - **Relevant ideas:** safe-Rust LSM, keyspaces, atomic batches, journal/memtable absorption, range/prefix reads, block tables, filters, compaction, optional KV separation.
-- **What Asterism borrows:** none of the physical LSM machinery; Fjall remains the control implementation and migration fallback.
+- **What Asterism borrows:** none of the physical LSM machinery; Fjall remains
+  the measured control implementation and a short-term operational rollback
+  option while the replacement is adopted. There is no legacy-store migration
+  or migration-fallback program; canonical replay is the correctness fallback.
 - **Why specialization can win:** Mess needs dense latest-value tables, an append-only registry, and a bounded recent set—not arbitrary ordered mutation/ranges. Asterism removes journal/memtable/SST/compaction work rather than reimplementing it.
 - **Caution:** any claim to “beat Fjall” must use the actual Mess operation mix, not a cherry-picked direct-array microbenchmark.
 
@@ -115,7 +118,10 @@
 - **Maturity:** research design, specifically matched to sliding-window duplicate detection.
 - **Author claim:** blocked variant with roughly 2–3 cache-line accesses per insertion and 2–4 per query, trading moderate slack for compactness.
 - **Asterism use:** age partitioning and a negative filter in front of exact fingerprint/canonical-key candidates.
-- **Not adopted:** probabilistic “duplicate” as final answer. Mess promises exact dedupe inside the configured window.
+- **Not adopted:** probabilistic “duplicate” as a final answer. Exact batch
+  idempotency is an optional product capability under `bn-2ctq` and ADR 0002,
+  not a current public Mess contract. If admitted, its configured window must
+  use canonical-key verification and remain exact.
 
 ### Cuckoo, quotient, BinaryFuse, Ribbon filters
 

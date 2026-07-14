@@ -8,11 +8,18 @@ This note makes the “metadata is a fold of the log” claim precise enough to 
 2. compact per-segment summaries that can replace event-by-event metadata recovery;
 3. parallel recovery whose result is provably identical to sequential log replay.
 
+**Status.** Spike D proved the algebra/checkpoint mechanism but production has
+not integrated it. ADR 0002 narrows the product: current canonical state is
+heads + strict registry + allocator/bookkeeping. Snapshot discovery is a
+discardable sidecar; projection checkpoints and exact idempotency are optional
+capabilities. The product below is parameterized, not a claim that every
+component exists in current log bytes.
+
 ## 2. Accepted capsules and state
 
 Let `C*` be the finite sequences of accepted commit capsules. Concatenation with the empty sequence makes `C*` a free monoid.
 
-Define logical kernel state:
+Define the superset logical kernel state:
 
 ```text
 K = H × S × P × R × D × A
@@ -26,6 +33,11 @@ where:
 - `R` — registry state: ID/name bijections and immutable codec/dictionary objects;
 - `D` — exact dedupe state for the defined recent window;
 - `A` — auxiliary monotone counters/allocators such as next IDs.
+
+Current v3 recovery supplies `H`, `R`, and required parts of `A`. Include `S`,
+`P`, or `D` only after the corresponding authority/product decision admits
+canonical bytes. ADR 0002 explicitly keeps snapshot discovery outside this
+canonical product.
 
 Every capsule `c` has a deterministic interpreter:
 
@@ -44,8 +56,13 @@ fold(K0, cs) = δ(cn)(...δ(c2)(δ(c1)(K0))...)
 The core recovery requirement is:
 
 ```text
-live incremental state == fold(K0, accepted durable capsules)
+recovered state == fold(K0, recovered accepted prefix)
 ```
+
+For `Os` and a closed `Group`, acknowledged capsules are crash-stable. For
+`Process`, the published runtime prefix can exceed the prefix recovered after
+a crash, so this law deliberately does not invent a runtime-known durable
+frontier.
 
 ## 3. Stream updates as path composition
 
@@ -113,24 +130,30 @@ This applies directly to:
 - stream heads;
 - snapshot-head slots;
 - single-position projection checkpoints;
-- next-ID allocator values;
+- overwrite-allowed configuration values (allocator continuity instead uses
+  first/last boundaries in §8);
 - “latest configuration” records where overwriting is allowed.
 
 ## 5. Semilattice checkpoint composition
 
-A future multi-shard projection checkpoint is a frontier:
+A future multi-shard projection checkpoint is a frontier with explicit
+existence:
 
 ```text
-F : ShardId -> Position
+F : ShardId -> Absent | Present(Position)
 ```
 
 with join:
 
 ```text
-(F ⊔ G)(s) = max(F(s), G(s))
+(Absent ⊔ x) = x
+(Present(a) ⊔ Present(b)) = Present(max(a, b))
 ```
 
-Pointwise maximum is associative, commutative, and idempotent. A checkpoint update can therefore merge retries or concurrent worker progress without order sensitivity.
+Absence is the bottom element. Numeric zero is a valid exclusive frontier and
+must not double as “missing.” With that existence bit, pointwise join is
+associative, commutative, and idempotent. A checkpoint update can therefore
+merge retries or concurrent worker progress without order sensitivity.
 
 For single-node v1, the frontier has one coordinate. Keeping the algebra in the state type avoids a future format break.
 
@@ -156,7 +179,13 @@ R ⊎ empty = R
 
 The operation is commutative for disjoint immutable assignments, but aliases may have explicit commit-order rules. The simplest implementation keeps primary assignments immutable and stores aliases as a separate append-only set; name resolution rejects ambiguous aliases rather than silently selecting by time.
 
-A SegmentEffect carries registry additions exactly once. If a checkpoint’s registry base conflicts with a later canonical record, the checkpoint is invalid.
+A SegmentEffect carries registry additions exactly once. The existing
+`RegistryState` is the one canonical strict fold and continues to reject
+`AlreadyRegistered`. The effect layer provides repair/reapplication
+idempotence by discarding an already-applied stable control identity before it
+feeds each canonical assignment exactly once into `RegistryState`; it does not
+make duplicate canonical registration legal. If a checkpoint's registry base
+conflicts with a later canonical record, the checkpoint is invalid.
 
 ## 7. Dedupe as an indexed set with a moving predicate
 
@@ -166,10 +195,12 @@ Let each committed dedupe record be:
 x = (scope, full_key, fingerprint, position, capsule_ptr)
 ```
 
-At current durable end `w` and configured span `W`, membership is:
+At greatest committed inclusive position `w` and configured span `W > 0`,
+membership is:
 
 ```text
-live_w(x) iff x.position >= w-W
+window_start = w.saturating_sub(W)
+live_w(x) iff x.position >= window_start
 ```
 
 The logical dedupe set is:
@@ -186,7 +217,11 @@ representation_superset != semantic false positive
 
 It only creates candidate work.
 
-A frozen epoch effect is immutable. Composition concatenates ordered epoch descriptors and drops epochs whose maximum position is below the exact boundary. This is associative when parameterized by the final watermark and applied in order.
+A frozen epoch effect is immutable. Composition concatenates ordered epoch
+descriptors and drops epochs whose maximum position is below the exact
+boundary. This is associative when parameterized by the final watermark and
+applied in order. When `w < W`, the whole committed prefix is live; a key at
+`window_start` remains live.
 
 ## 8. The product effect
 
@@ -205,13 +240,18 @@ E1 ⊗ E2 = (
   EP1 ⊔/▷ EP2,
   ER1 ⊎ ER2,
   ED1 ++ ED2 with expiry,
-  EA1 ▷ EA2
+  EA1 ; EA2
 )
 ```
 
 The head component uses path-aware right override: if both effects touch a stream, the end of the first transition must equal the start of the second. A mismatch yields `⊥`.
 
 On valid ordered histories, `⊗` is associative and has an empty effect as identity. This is enough for ordered tree reduction.
+
+Allocator effects are path-like, not last-value-only: each carries the
+first/incoming and last/outgoing allocator value. Composition requires the
+left last value to equal the right first value. This preserves monotonicity and
+detects gaps across independently built effects.
 
 ## 9. SegmentEffect construction
 
@@ -226,11 +266,26 @@ for capsule in segment order:
   checkpoint[projection] = join/replace
   registry_delta += immutable assignments
   dedupe_epoch_builder += dedupe record
+  first_allocator ||= incoming allocator value
+  last_allocator = outgoing allocator value
 ```
 
 Emit only net values and continuity boundaries. No event payload decode is necessary for head/checkpoint/registry mechanics when the control prelude and subframe lengths are independently parseable.
 
 The builder also computes a canonical effect hash over sorted logical entries. The hash is not commit authority; it detects sidecar corruption and makes differential tests concise.
+
+The v3 extension region and R2 advisory manifest are useful design ancestors,
+but not substitutes. The specified `StreamHeadTable` carries only
+`(stream_id, last_version, head_hash)`, so it is partial evidence for the head
+component and durable fold-certificate material rather than a complete
+`SegmentEffect`. Production Phase 3 segments currently emit an empty extension
+region. An implementation must therefore build effects from accepted batch
+headers/raw records unless a valid table is actually present, and even then
+must not treat that table as a scan waiver for omitted components. Store the
+rebuildable effect in SealPack and the durable fold anchor in the extension
+region without creating two authorities for one field. A kernel checkpoint
+manifest can share R2's anchor/validation concepts without physically replacing
+the segment-catalog manifest.
 
 ## 10. Ordered parallel recovery
 
@@ -244,7 +299,7 @@ segment bytes -> validated capsule sequence -> E_i
 
 This runs in parallel because it does not need the incoming global kernel state except to validate cross-segment transition boundaries. The effect records those boundaries for the reduce phase.
 
-### 10.2 Reduce phase
+### 10.2 Reduce phase (algebraic option)
 
 Reduce effects in segment order. A parallel tree may compute:
 
@@ -258,7 +313,14 @@ The tree must preserve the left-to-right order; it may not arbitrarily shuffle o
 
 ### 10.3 Apply phase
 
-Apply the final effect to the checkpoint state or genesis. Since the effect already stores final per-key values, this is proportional to distinct touched keys, not event count.
+Accepted Spike D evidence changes the implementation choice. Parallel effect
+build scaled 6.8x at eight threads, but materializing a full ordered tree
+composition took about 7.0 s at one thread versus about 0.3 s for applying the
+effects sequentially into the dense kernel. Production should parallelize
+build, then apply each effect sequentially in segment order (24.3M measured
+head transitions/s), or chunk-reduce only when a merged summary is itself an
+output. Ordered tree reduction remains a correctness oracle and algebraic
+capability, not the default performance path.
 
 ## 11. Checkpoint theorem
 
@@ -287,7 +349,8 @@ Not every effect is idempotent.
 
 - Setting a head to the same final value is idempotent.
 - Joining a frontier is idempotent.
-- Reapplying an identical immutable registry assignment is idempotent.
+- Reapplying an identical immutable registry assignment directly to strict
+  `RegistryState` is an error; only the effect-identity filter is idempotent.
 - Inserting a dedupe record into a multiset is not automatically idempotent unless keyed by capsule identity.
 
 Therefore every control/effect record carries a stable identity derived from `(segment_epoch, batch_id, control_ordinal)`. Effect application uses that identity where replay might otherwise duplicate a logical row. The canonical log scan itself never repeats capsules, but shadow migrations and repair tools must be safe under reapplication.
@@ -302,9 +365,16 @@ head transition/fold-chain anchor
 snapshot reference + state hash + fold version
 registry/checkpoint state needed beyond boundary
 retention certificate hash
+every still-live exact dedupe key/result, if the capability is admitted
 ```
 
 The boundary becomes the new genesis for that retained stream range. This proves continuity and prefix identity, not semantic correctness of the aggregate fold. The same honesty required by existing fold certificates applies.
+
+For exact position-window dedupe without such a boundary, a segment covering
+`[base, end_exclusive)` is deletable only when
+`end_exclusive <= window_start`. If an implementation records an inclusive end,
+the test is strictly `end_inclusive < window_start`; ambiguous `end_position`
+terminology is forbidden.
 
 ## 14. Formal test oracles
 

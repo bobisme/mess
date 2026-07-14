@@ -1,6 +1,8 @@
 # Asterism: a log-derived state kernel for Mess
 
-This package proposes a storage-engine redesign for Mess that removes Fjall from the steady-state write and read paths rather than attempting to build a more general LSM tree.
+This package records the Asterism storage-engine program: its original target,
+the spike results that narrowed it, the portions already merged, and the
+remaining decisions. It does not propose replacing Fjall with a general LSM.
 
 The central claim is:
 
@@ -23,6 +25,35 @@ The central claim is:
 - [`research/11-review.md`](research/11-review.md) — adversarial reconciliation of the original pack with the engine and measured spikes.
 - [`research/13-authority-and-fjall-deletion-map.md`](research/13-authority-and-fjall-deletion-map.md) — post-flat-owner source audit of every remaining in-memory/Fjall state item, its real authority and recovery path, integration surface, measurement contract, and safe deletion order.
 
+`research/11-review.md` and `research/12-response.md` are review supplements,
+not normative authority. Where they disagree with merged
+code, accepted spike reports, research 13, or ADR 0002, those later sources
+win. The response's accepted corrections have been incorporated into the
+normative documents; the supplements remain outside the integrity manifest.
+
+## Current versus target
+
+As of 2026-07-14 the production v3 engine already has the flat owner,
+log-derived strict `RegistryState`, block-native reads, an O(streams + event
+types) `Book`, and no `MetaStore` call in engine append/read/recovery. The
+current committer issues positioned writes; `Process` has no barrier, `Os`
+syncs each batch, and `Group` uses one covering barrier for the gathered group.
+Snapshot discovery through `FjallSnapshotBackend` is the only live
+Fjall-backed state role and deletion blocker; its head is discardable and loss
+falls back to full replay. It is not the only consumer of the library: CLI
+`metaread` (and therefore doctor/inspect/retention) plus
+`rebuild-index --meta` open `MetaStore` directly. `bn-3l8n` must migrate or
+remove those operational paths together with application adoption before
+Fjall deletion.
+
+The remaining Asterism mechanisms are not one indivisible roadmap. Dense heads,
+microblocks, SegmentEffects/checkpoints, bitrank directories, SealPack, exact
+batch idempotency, projection controls, snapshot packs, and v4 each retain the
+admission status recorded in the design and spike ledger. In particular,
+ADR 0002 admits snapshot packs with discardable discovery, leaves projection
+checkpoints and idempotency optional, and emits no `SnapshotInstalled` log
+record.
+
 ## Status vocabulary
 
 The documents deliberately distinguish four classes of statement:
@@ -34,12 +65,30 @@ The documents deliberately distinguish four classes of statement:
 
 No projected throughput number is represented as measured.
 
-## Proposed decision
+## Current decision
 
-Build Asterism as a series of reversible replacements behind the current `Backend` seam. The first milestone is not a format rewrite. It is a composed-engine spike that replaces:
+Continue Asterism as reversible, separately gated replacements. The first
+milestone is complete: production now replaces the old append/publish chain
+and unbounded payload mirror with:
 
-1. per-append Fjall metadata batches,
-2. the global `Book` payload mirror,
-3. per-append gate/publish sequencing,
+1. a flat owner that is the direct committer/writer;
+2. canonical `$registry` batches and a strict shared `RegistryState` fold;
+3. block-native reads and bounded caches instead of an all-history payload
+   mirror.
 
-with a single-owner state kernel fed directly by the existing durable committer. If this cannot reduce composed overhead to within 15% of the bare log on equal workloads, stop. If it does, the v4 commit-capsule format and persistent kernel checkpoints become justified.
+The old single 85%-of-bare gate was rejected as an unstratified API/topology
+gate: accepted evidence reports every batch-size cell and preserves the raw
+matrix. Current work follows ADR 0002 and research 13: replace snapshot
+discovery end to end, then remove the dormant MetaStore/Fjall surface. Optional
+idempotency, projection controls, kernel checkpoints, and v4 proceed only
+through their own product and format gates.
+
+## Integrity manifest coverage
+
+[`MANIFEST.sha256`](MANIFEST.sha256) covers the normative design snapshot:
+this README, `design.md`, research 01–10 and 13, and ADR 0002. It deliberately
+excludes review supplements 11 and 12, spike reports/raw matrices, and source
+code: those are independently versioned evidence and may receive review-side
+edits without invalidating the normative snapshot. Paths in the manifest are
+repository-root-relative and are verified with `sha256sum -c` from the
+repository root.

@@ -6,6 +6,12 @@
 bones. This document describes the code that exists, not the older engine
 described by research 01 or the target architecture in `design.md`.
 
+**Decision overlay:** ADR 0002 has since accepted the audit's bounded choice:
+snapshot discovery moves to immutable self-describing packs plus discardable
+copy-on-write metadata; projection checkpoints and exact idempotency remain
+optional. The source inventory below remains evidence, while the ADR is
+normative where this note still says “choose.”
+
 The audit used the current call graph as authority and reconciled it with the
 accepted corrections in research 11/12. In particular, a statement that a
 value is "rebuildable" below always names the bytes and procedure that rebuild
@@ -20,11 +26,15 @@ Its only source-level tie to `mess-index::meta` is the unused
 the accepted log prefix; its resident `Book` is O(streams + event types) and is
 rebuilt from log headers, sealed directories, and `$registry` payloads.
 
-Fjall has one production consumer: the opt-in, publicly exported
-`FjallSnapshotBackend<B>`. It uses a separate database under the snapshot
-sidecar root for snapshot discovery. The social example constructs
-`FjallSnapshotBackend<LogEngine>` by default, so Fjall is not in the event
-engine but is still in a real application composition.
+Snapshot discovery through the opt-in, publicly exported
+`FjallSnapshotBackend<B>` is the only live Fjall-backed state role and deletion
+blocker. It uses a separate database under the snapshot sidecar root, and the
+social example constructs `FjallSnapshotBackend<LogEngine>` by default. Fjall
+also has direct operational consumers: CLI `metaread` opens the application
+snapshot and legacy meta directories for doctor/inspect/retention, while
+`rebuild-index --meta` opens and writes the legacy `MetaStore`. Thus Fjall is
+not in the event engine, but application and offline-tool adoption must move
+together under `bn-3l8n` before deletion.
 
 Three corrections change the roadmap:
 
@@ -49,9 +59,8 @@ Three corrections change the roadmap:
 Therefore the true Fjall deletion critical path is:
 
 ```text
-choose snapshot semantics
-  -> replace FjallSnapshotBackend end to end
-  -> move doctor/inspect/retention/examples/goldens to that replacement
+implement ADR-0002 snapshot pack/discovery semantics
+  -> bn-3l8n: replace FjallSnapshotBackend and move applications/offline tools
   -> remove the dormant MetaStore API and stale <store>/meta surfaces
   -> remove fjall from the dependency graph
 ```
@@ -76,14 +85,25 @@ The audit uses five classifications:
 - **Runtime-only state:** neither durable nor meant to be rebuilt exactly
   across a process. It is reinitialized or recomputed.
 
-The current engine has two relevant frontiers:
+The current owner flow must be described with four concepts even though only
+some are exported as watermarks:
 
-- **writer-accepted/durable watermark:** the `DirectCommitter` watermark after
-  an `Acked` outcome. Under `Process`, this means the covering `pwrite` returned;
-  under `Os`/`Group`, the covering barrier completed.
-- **published/read watermark:** advanced only after `ActiveIndex` and the
-  per-stream Book head have been installed. Every event position below it is
+- **speculative:** validation/staging accepted the intent; I/O failure can still
+  discard it;
+- **written/accepted:** the write returned. This is the `Process` completion
+  eligibility boundary, not a runtime-known durability claim;
+- **crash-stable:** a successful `Os` per-batch or `Group` covering barrier
+  proves the prefix. Under `Process` the exact persisted prefix is unknowable
+  until recovery;
+- **published/read:** `ActiveIndex` and the per-stream Book head are installed
+  and the read watermark has advanced. Every event position below it is
   serviceable by the read path.
+
+For `Os` and closed `Group`, published never exceeds crash-stable and success
+completion implies both, although barrier success can briefly lead publication.
+For `Process`, published can exceed the eventual recovered prefix. The
+`DirectCommitter` field named `durable_watermark` is therefore a mode-dependent
+accepted watermark in Process mode; documents and metrics must state the mode.
 
 Registry state is folded after a positive ack and immediately before its
 `$registry` batch is installed into `ActiveIndex`. The one flat owner serializes
@@ -326,7 +346,7 @@ CLI that consumes the bytes.
 These changes follow directly from the call graph and should be applied before
 Phase 7 starts.
 
-### `bn-k8qd` — correct the decision premise
+### `bn-k8qd` — resolved by ADR 0002
 
 Replace "Fjall cannot be removed until snapshot installs, projection
 checkpoints, and any admitted dedupe keys are canonical in the log" with the
@@ -336,19 +356,18 @@ classification in this audit:
 - MetaStore projection checkpoints and dedupe are dormant;
 - `$registry` is already canonical in the log.
 
-Require the ADR to decide independently for snapshots, projection
-checkpoints, and optional idempotency whether to preserve discardable sidecar
-semantics or add canonical v3/v4 controls. Include a minimum no-Fjall snapshot
-manifest/pack alternative. Do not make a log-control decision an unstated
-dependency-cleanup requirement.
+ADR 0002 chose immutable self-describing snapshot packs plus discardable
+copy-on-write discovery, left projection checkpoints and idempotency optional,
+and emitted no snapshot install control. Do not make either optional control an
+unstated dependency-cleanup requirement.
 
 ### `bn-ozi5` — fix authority wording and compare both replacement shapes
 
 Change the context from "Fjall snapshot-head advancement is authoritative" to
 "Fjall is the only discovery copy of a discardable snapshot accelerator; event
-truth remains the log and head loss falls back to replay." Make the goal
-conditional on `bn-k8qd`'s choice: either an immutable/current-pointer snapshot
-pack that preserves current semantics, or a canonical install transition.
+truth remains the log and head loss falls back to replay." The goal is to
+implement ADR 0002's immutable pack/copy-on-write discovery contract while
+preserving replay fallback and discardable authority.
 
 Add acceptance for:
 
@@ -384,16 +403,16 @@ misleading `EngineError::Meta`, remove `rebuild-index --meta` and stale backup
 goldens, and distinguish production manifests from historical spike-only
 Fjall dependencies.
 
-### Add one integration bone between snapshot implementation and deletion
+### `bn-3l8n` — integration gate between implementation and deletion
 
-Create a medium, risk-high child under Phase 7 named approximately **"Adopt the
-snapshot replacement across applications and offline tooling"**. It should be
-blocked by `bn-ozi5` and block `bn-fj34`. Scope: social construction and
-benches, public exports/errors, metaread, doctor, inspect, retention, backup
-policy/restore, goldens, concurrent offline reads, corruption fallback, and
-the full snapshot law. This separation keeps `bn-ozi5` focused on storage
-mechanics while making integration a first-class gate rather than cleanup
-inside the final deletion commit.
+The medium, risk-high **"Adopt snapshot replacement across applications and
+offline tooling"** bone now exists. It is blocked by `bn-ozi5` and blocks
+`bn-fj34`. Its scope includes social construction and benches, public
+exports/errors, metaread, doctor, inspect, retention, backup policy/restore,
+goldens, concurrent offline reads, corruption fallback, and the full snapshot
+law. This separation keeps `bn-ozi5` focused on storage mechanics while making
+integration a first-class gate rather than cleanup inside the final deletion
+commit.
 
 ### `bn-1sh8` and dedupe graph
 

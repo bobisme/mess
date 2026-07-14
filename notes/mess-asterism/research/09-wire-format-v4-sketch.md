@@ -7,15 +7,19 @@
 > projection and exact batch-idempotency decisions. V4 itself remains subject
 > to the separate `bn-1ojm` gate.
 
-**Status:** non-normative spike specification.  
-**Purpose:** make the control-prelude idea concrete enough for a byte-compatible prototype and crash model.  
-**Rule:** this document does not supersede v3 `docs/spec/01-log-format.md` until the exhaustive and randomized gates pass.
+**Status:** implemented format prototype; format-admissibility gates passed;
+production v4 writes remain off and product admission remains separate.
+
+**Purpose:** record the byte-compatible prototype and crash model.
+
+**Rule:** this document does not supersede v3 `docs/spec/01-log-format.md`.
 
 ## 1. Design requirements
 
 V4 must:
 
-1. preserve all v3 A1–A12 guarantees;
+1. preserve A1–A4 and A6–A12; replace A5 with the safety-preserving
+   nonempty-capsule rule in §6;
 2. keep one-stream domain event batches;
 3. atomically commit engine control records and domain events;
 4. permit control-only capsules without consuming domain global positions;
@@ -54,10 +58,11 @@ CapsuleHeader                   96 bytes
 [CryptoChainEntry]              32 bytes when flag set
 ControlRecord × control_count   variable, total control_len
 EventSubframe × event_count     variable, total event_region_len
-CommitMarker                    24 bytes
+CommitMarker                    32 bytes
 ```
 
-The exact 96-byte size is a spike choice, not yet frozen.
+The prototype fixes these sizes at 96 and 32 bytes. Product normativity could
+still version them; it must not silently reinterpret this prototype.
 
 ## 4. CapsuleHeader
 
@@ -80,20 +85,15 @@ All integers are little-endian. No implicit alignment padding exists.
 | 72 | 4 | u32 | `control_len` | exact bytes occupied by all control TLVs |
 | 76 | 4 | u32 | `event_region_len` | exact bytes occupied by subframes + payloads |
 | 80 | 4 | u32 | `capsule_crc` | CRC32C under split coverage; excluded from itself |
-| 84 | 4 | u32 | `header_crc` | optional early-reject CRC over header excluding both CRC fields; see decision below |
+| 84 | 4 | u32 | `reserved_header` | MUST-BE-ZERO; `header_crc` was rejected |
 | 88 | 4 | u32 | `logical_flags` | engine semantics; all unknown bits reject |
 | 92 | 4 | u32 | `reserved` | must be zero |
 
-### Decision to spike: keep or remove `header_crc`
+### Resolved: remove `header_crc`
 
-The full capsule CRC is authoritative and mandatory. A header CRC can reject corrupt lengths before allocating/reading a large claimed capsule, but v3 already uses sanity caps and full verification. The spike should compare:
-
-```text
-A. header CRC + full CRC
-B. no header CRC; checked fields + total_len cap + full CRC
-```
-
-If header CRC adds complexity without measurable recovery safety/performance value, reuse those four bytes as reserved.
+The prototype uses checked caps before allocation and the mandatory full
+capsule CRC. The header-only CRC added nested coverage and fixture surface with
+no safety value, so offset 84 is reserved zero.
 
 ## 5. Flags
 
@@ -102,8 +102,7 @@ If header CRC adds complexity without measurable recovery safety/performance val
 | bit | name | meaning |
 |---:|---|---|
 | 0 | `CRYPTO_CHAIN` | 32-byte chain entry follows header |
-| 1 | `CONTROL_COMPRESSED` | control region uses a frozen compression framing; **probably reject for v4** |
-| 2–15 | reserved | zero |
+| 1–15 | reserved | zero; controls are uncompressed in v4 |
 
 Recommendation: keep control records uncompressed. They are small, bootstrap-critical, and must be parseable without registry dictionaries.
 
@@ -191,7 +190,9 @@ Every length has a format cap lower than its integer maximum. UTF-8 validation a
 
 ## 9. Initial control kinds
 
-Suggested IDs:
+Prototype IDs. Registry, category, dedupe, snapshot, and projection codecs are
+implemented; aliases/dictionaries/migration controls below remain reserved
+design space, not current product capabilities:
 
 | kind | name | purpose |
 |---:|---|---|
@@ -267,6 +268,12 @@ Rules:
 - exact key bytes are canonical for dedupe rebuild;
 - append validation checks the configured window before writing the capsule.
 
+This is a new batch/capsule-level API decision. Per-event idempotency requires
+one capsule per event or a future vector-valued control. Retry order is
+`resolve registration -> exact dedupe -> expected version`: a matching live
+key returns the original commit, while a missing/expired key follows normal
+expected-version behavior and cannot silently duplicate an event.
+
 A 128-bit fingerprint is computed in memory; it is not stored as authority, though storing it as a redundant acceleration hint is possible if the reader verifies it.
 
 ## 13. `SnapshotInstalledV1`
@@ -282,11 +289,18 @@ pack_id: u64
 pack_offset: u64
 blob_len: u32
 codec_id: u16
-fold_version: u16 or u32 (settle width)
-state_hash: Hash256
-event_prefix_hash: Hash256
-blob_hash: Hash256
+fold_version: u32
+hash_presence: u8
+reserved: [u8; 3]
+[state_hash: Hash256]         # when bit 0 is set
+[event_prefix_hash: Hash256] # when bit 1 is set
+[blob_hash: Hash256]          # when bit 2 is set
 ```
+
+The fixed prefix is 62 bytes; present hashes follow in the order above.
+Current snapshot state/prefix hashes are normally absent. Presence flags let
+the tested codec represent that reality without making fold certificates a
+hidden prerequisite.
 
 Rules:
 
@@ -295,6 +309,10 @@ Rules:
 - fold/prefix metadata validate before publish;
 - snapshot head advances monotonically by covered version;
 - older/lower install controls remain in history but do not move the head backward.
+
+ADR 0002 does not admit this transition. Production snapshot discovery uses a
+discardable pack/root sidecar and emits no `SnapshotInstalledV1`; this codec is
+retained format research only.
 
 ## 14. `ProjectionCheckpointV1`
 
@@ -318,6 +336,11 @@ pair_count
 ```
 
 Checkpoint controls may be Process/Group durable depending on API; their visibility follows the capsule’s durability mode.
+
+Position zero is a valid exclusive frontier. Logical state therefore carries
+an explicit absent/present bit (absence is semilattice bottom); an absent
+checkpoint must never be encoded as a present zero value. ADR 0002 leaves this
+product capability optional.
 
 ## 15. EventSubframe
 
@@ -359,17 +382,7 @@ a per-stream fold chain: event frames only, seeded by stream ID
 
 ## 17. CommitMarker
 
-Suggested 24-byte marker:
-
-| offset | size | field |
-|---:|---:|---|
-| 0 | 4 | marker magic |
-| 4 | 4 | reserved/flags |
-| 8 | 8 | `batch_id_echo` |
-| 16 | 4 | `total_len_echo` (u32 if MAX capsule <4GiB) or rearrange for u64 |
-| 20 | 4 | `capsule_crc_echo` |
-
-A safer fully 64-bit-length layout is 32 bytes:
+The prototype selected the 32-byte fully 64-bit-length marker:
 
 ```text
 magic u32
@@ -380,7 +393,8 @@ capsule_crc_echo u32
 marker_crc/reserved u32
 ```
 
-Recommendation: use the 32-byte marker unless the four-byte saving is measured important. Explicit echoes simplify scan diagnostics and bind zero-event ordering.
+Explicit `batch_id`, total-length, and CRC echoes simplify scan diagnostics and
+bind zero-event ordering. The final word is reserved zero.
 
 ## 18. CRC coverage
 
@@ -398,7 +412,8 @@ skip crc_echo
 CRC over remaining marker bytes
 ```
 
-If `header_crc` exists, exclude it from the full CRC or define nested coverage precisely. Golden fixtures must encode the exact byte ranges.
+Offset 84 is reserved zero rather than a header CRC. Golden fixtures encode the
+exact byte ranges.
 
 ## 19. Maximums
 
@@ -426,7 +441,7 @@ fn scan_v4_segment(bytes: &[u8], seed: ScanSeed) -> ScanResult {
     let mut semantic_heads = seed.head_boundary_view;
 
     loop {
-        let h = parse_bounded_header(bytes, off)?;
+        let h = validate_capsule(bytes, off)?; // allocation-free physical path
         require(h.version == 4);
         require(h.segment_epoch == seed.epoch);
         require(h.batch_id == expected_batch);
@@ -435,8 +450,9 @@ fn scan_v4_segment(bytes: &[u8], seed: ScanSeed) -> ScanResult {
         let capsule = slice_exact(bytes, off, h.total_len)?;
         require(marker_echoes_match(capsule, h));
         require(full_crc_matches(capsule, h));
-        let controls = parse_control_tiling(capsule, h)?;
-        let events = parse_event_tiling(capsule, h)?;
+        // Materialize only what the semantic/registry seam actually needs.
+        let controls = decode_controls_on_demand(capsule, h)?;
+        let events = event_type_ids_on_demand(capsule, h)?;
 
         let speculative_registry = registry.apply_in_order(controls.registry_records())?;
         validate_controls(controls, &speculative_registry, semantic_heads)?;
@@ -453,7 +469,9 @@ fn scan_v4_segment(bytes: &[u8], seed: ScanSeed) -> ScanResult {
 }
 ```
 
-Physical scan and semantic validation may be staged for speed, but an accepted effect/checkpoint cannot ignore semantic continuity.
+Physical scan and semantic validation are staged: the hot physical accept path
+is allocation-free, while controls/event identities materialize on demand. An
+accepted effect/checkpoint cannot ignore semantic continuity.
 
 ## 21. Global and commit cursors
 
@@ -481,26 +499,27 @@ A control-only capsule advances `CommitCursor` but not `GlobalCursor`. User subs
 
 - v3 reader knows only v3 segments and must refuse a directory containing v4 in write mode.
 - v4 reader handles both versions.
-- v3 segments obtain registry meaning from the canonical import made at the v4 boundary.
+- v3 segments obtain registry meaning from their canonical earlier `$registry`
+  batches; no migration import is required for fresh stores.
 - no v3 file is edited to claim v4.
 - a segment footer records matching format version and effect/SealPack references.
 
-## 23. Open decisions before normativity
+## 23. Prototype decisions and remaining product decisions
 
-1. 88/92/96-byte header final size.
-2. Whether header CRC earns its bytes.
-3. 24 vs 32-byte marker.
-4. Fold-version width.
-5. Whether checkpoint/snapshot controls belong in the main capsule log or a separate control lane; this design recommends main log.
-6. Exact control-kind evolution policy.
-7. Whether one capsule may carry both snapshot/checkpoint controls and domain events; recommendation: yes only when semantics require atomicity, otherwise separate control capsule.
-8. Whether global audit chain covers control-only capsules.
-9. Control payload canonical string normalization.
-10. Maximum dedupe key and registry import chunk sizes.
+The spike resolved: 96-byte header; no header CRC; 32-byte marker; `u32` fold
+version; all v4 control kinds critical/unknown-reject; controls and domain
+events may share a capsule; UTF-8 validation with registry-layer
+canonicalization; 1 MiB dedupe/control caps; and main-log framing for the tested
+controls. The global audit-chain question remains deferred.
+
+Those format resolutions do not decide whether snapshot, projection, or
+idempotency controls are product capabilities. ADR 0002 rejects snapshot
+installs and delegates the other two. V4 default-write admission is separately
+owned by `bn-1ojm`.
 
 ## 24. Admission criteria
 
-The v4 format becomes normative only after:
+The format-admissibility spike completed:
 
 ```text
 byte-exact encoder/decoder fixtures
@@ -514,5 +533,12 @@ control-only cursor tests
 full-scan vs SegmentEffect digest equivalence
 measured scan overhead <2% for ordinary no-control capsules
 ```
+
+Result: 96,654 exhaustive states, 24,000 sector-reorder cases, three 10M fuzz
+soaks, D4 retry tests, and v3 suites passed. Allocation-free structural
+`validate_capsule` plus on-demand materialization measured +0.47% per byte;
+materialize-everything measured +24.5% and is forbidden on the scan hot path.
+A real v4-committer SIGKILL scenario remains a production-write prerequisite,
+not a reason to discard the byte-layer crash proof.
 
 The format’s novelty is useful only if the crash story remains as boring and absolute as v3.

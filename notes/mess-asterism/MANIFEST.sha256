@@ -1,0 +1,14 @@
+ba627e2ecbc9164f482b19089283c428eab969858da6551d659dae0b491bbb38  docs/adr/0002-asterism-capability-authority.md
+17bd61aa50993ff73330b1913ac73cb03fd9df2f3fe9a9dca79b3911609cc486  notes/mess-asterism/README.md
+d5cfb258f869dfa736ddbe19047f11d5fe0708826fcad0adb7528191a5c6c3e9  notes/mess-asterism/design.md
+a2f2a1ae747f878d25b67c0ca66c86bc1a999f5a2f518a0a811f6e3f32e5cedb  notes/mess-asterism/research/01-current-engine-and-fjall-gap.md
+364605e43c8f774542e73fee704453f92b27b3eff7929c1ae2f661938d03b019  notes/mess-asterism/research/02-algebraic-state-kernel.md
+7cd38ae7ff4e02a23f5396b3770f6d728292e20fe70acb3996081492349e73ba  notes/mess-asterism/research/03-succinct-indexes-and-dedupe.md
+1ee64cc646c64528d63269b5a597510fb4c0a7d0679a621bb3e6a61687abca9e  notes/mess-asterism/research/04-durability-media-and-file-layout.md
+1e7d389f9445d274b8023a947ac058e4de9a56ec2b297a105a08d71410ba40b8  notes/mess-asterism/research/05-benchmark-and-spike-plan.md
+c8a72394b0d41ca25930fbb4326471d2826766744ec56d1f21a9e88e66309b99  notes/mess-asterism/research/06-migration-plan.md
+04798eae0712a9cb3f6b13efe24b43cb4b84928f4930600b36370ca11ec8cf5c  notes/mess-asterism/research/07-literature-map.md
+5d38f8e294b1e10050947f09159bf6343ebb98d7fa9f6cae0064d6eb46e9ccf0  notes/mess-asterism/research/08-risk-register.md
+f0b09ec45c6e41f4149775a53cf4966a1b2177603a1bec06f13857b8d5bcdbd0  notes/mess-asterism/research/09-wire-format-v4-sketch.md
+d038820da72ccac0fb3a63d694f11455ee43c1bd53d2e770782ac46ffe92d3df  notes/mess-asterism/research/10-formal-verification-plan.md
+595ff5befb52ab0577a1a7f9e7ce1d73d657ee044733feb7deda7b722d57c18b  notes/mess-asterism/research/13-authority-and-fjall-deletion-map.md

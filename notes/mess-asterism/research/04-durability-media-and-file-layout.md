@@ -6,30 +6,49 @@ The custom engine must be more durable because it has fewer authoritative states
 
 The target rule is:
 
-> One accepted commit capsule is the only durable fact needed to reconstruct event visibility, stream heads, registry interpretation, dedupe state, and control metadata. Every other file is an accelerator or blob whose installation ordering is explicit.
+> Accepted log bytes are the only durable fact needed to reconstruct event
+> visibility, stream heads, and registry interpretation. Optional dedupe or
+> projection state joins that authority only after its own product decision and
+> atomic encoding. Every checkpoint/sidecar is either explicitly discardable
+> or a named blob whose publication ordering is explicit.
 
 This note extends the existing A1–A12 crash model rather than replacing it.
+
+**Status.** Production remains v3. The flat owner/direct committer and
+block-native read/seal path are current. SealPack is admitted default-off;
+SegmentEffects/checkpoints are proven but not integrated; v4 is format
+admissible but not a product default. ADR 0002 is normative for snapshot packs
+and keeps discovery discardable with no `SnapshotInstalled` log record.
 
 ## 2. Authority classes
 
 | artifact | authority | failure consequence |
 |---|---|---|
 | event/control capsule in `.log` | sole commit authority | invalid capsule terminates accepted prefix |
-| snapshot blob pack | authoritative blob bytes only after referenced by capsule | orphan blob or fallback to older snapshot |
+| snapshot pack + discovery root | discardable acceleration; event log remains authority | older candidate or full replay |
 | SealPack | advisory/rebuildable | scan raw segment and rebuild |
 | SegmentEffect | advisory/rebuildable | scan that segment |
 | kernel checkpoint pages/manifest | advisory/rebuildable | use older checkpoint or fold log/effects |
 | filter/static function | advisory | exact fallback |
 | parity pack | repair aid | no change to normal visibility |
 | `current.a/b` checkpoint pointer | advisory hint | enumerate/validate manifests |
+| optional dedupe/projection control | no current product authority | canonical only after a later product decision and atomic encoding |
 
 No manifest or sidecar advances event visibility.
 
 ## 3. Commit-capsule durability
 
+This section specifies the gated v4 alternative. Current v3 registry/domain
+batches are adjacent members of one ordered unit, not one capsule.
+
 ### 3.1 Physical write
 
-A commit group contains one or more individually framed capsules. The writer may encode them into one contiguous buffer or `writev` vector. Each capsule has its own CRC and marker so recovery can accept a prefix of the group only if those capsules reached disk completely. A group acknowledgment waits for the durability barrier covering all its capsules.
+A commit group contains one or more individually framed capsules. The writer
+may encode them into one contiguous buffer or `writev` vector. Each capsule has
+its own CRC and marker so recovery can accept a prefix of the group only if
+those capsules reached disk completely. Acknowledgment follows the configured
+mode: `Process` has no barrier, `Os` syncs each capsule/batch, and `Group` waits
+for one covering barrier for the gathered group.
 
 ### 3.2 Control/event atomicity
 
@@ -40,7 +59,7 @@ capsule absent/torn/invalid -> neither control nor events exist
 capsule accepted            -> both control and events exist
 ```
 
-There is no state in which a stream registration is durable but the same-capsule first event is not accepted, or vice versa. If the entire capsule is written but unacknowledged before crash, recovery may surface it under the existing “unacked but committed” rule; retry dedupe owns that case.
+There is no state in which a stream registration is durable but the same-capsule first event is not accepted, or vice versa. If the entire capsule is written but unacknowledged before crash, recovery may surface it under the existing “unacked but committed” rule. A retry first resolves the recovered name to its existing ID. If product idempotency is admitted, a matching live key returns the original commit; otherwise expected-version checking conflicts and appends nothing. Registry idempotence alone never silently duplicates the event.
 
 ### 3.3 Zero-event control capsules
 
@@ -59,14 +78,14 @@ The existing torn-write work established that marker/header structure is insuffi
 
 ## 4. Group commit
 
-The existing single-committer design should remain:
+The current flat owner is the direct committer. In `Group` mode its shape is:
 
 ```text
 gather intents
 validate and assign centrally
-one coalesced write
+current: k positioned writes; target: gathered/coalesced write where possible
 one durability barrier
-advance durable watermark in position order
+advance crash-stable watermark in position order
 publish effects
 ack
 ```
@@ -78,7 +97,11 @@ Window closure:
 - close at `max_delay` as a latency cap;
 - close before the next capsule would cross a segment boundary.
 
-Asterism’s state-kernel owner should be the committer rather than an additional layer around it.
+`Process` runs the ordered write/apply/publish sequence without a barrier. `Os`
+is deliberately sync-per-batch; a current v3 `$registry`+domain ordered unit
+therefore has two syncs, whereas one future v4 mixed capsule would have one.
+The state-kernel owner must remain the committer rather than an additional
+layer around it. B1 cross-barrier pipelining is rejected by measured evidence.
 
 ## 5. Failure-state table
 
@@ -86,16 +109,16 @@ Asterism’s state-kernel owner should be the committer rather than an additiona
 |---|---|---|
 | before capsule write | no capsule | nothing |
 | partial header/control/event/marker | invalid capsule | stop at capsule start; truncate tail if configured |
-| complete capsule before barrier | may survive or disappear | accepted if fully valid; client retry resolved by dedupe |
+| complete capsule before barrier | may survive or disappear | accepted if fully valid; retry resolves registration, then admitted dedupe or expected-version conflict |
 | barrier success before state publish | capsule durable | recovery folds it; in-process owner must publish before ack |
-| after publish before caller receives ack | capsule durable and visible | retry sees dedupe/conflict |
+| after publish before caller receives ack | capsule durable and visible | retry sees admitted dedupe or expected-version conflict |
 | during SealPack temp write | raw segment durable; temp partial | delete/ignore temp |
 | SealPack durable before rename | orphan temp/final candidate | verify and reuse or delete |
 | SealPack rename before segment footer | orphan valid pack | verify and attach during resumed seal or delete |
 | footer durable | segment + named pack complete | fast open permitted |
-| snapshot blob partial | no install capsule | ignore partial/temp |
-| blob durable, install capsule absent | orphan blob | reclaim later |
-| install capsule durable | referenced blob must pre-exist | publish/load; corruption falls back |
+| snapshot record partial | no committed record | truncate/ignore tail |
+| record/pages exist without root | unreachable orphan | reclaim under writer lock later |
+| snapshot root published | every named record validates; Durable mode also proves complete closure | load candidate or fall back/replay |
 | checkpoint page partial | no valid page hash | checkpoint invalid/older used |
 | manifest partial | invalid manifest | older checkpoint |
 | current pointer stale/torn | advisory only | enumerate manifests |
@@ -131,13 +154,17 @@ struct SectionRef {
 }
 ```
 
-The whole pack also has a content hash. Section checksums support localized diagnosis; the whole hash binds the footer reference.
+The trailer hashes the header and section directory. Directory entries bind
+each section's CRC and content-hash prefix, so mandatory-section corruption
+rejects the pack while an optional-section failure can degrade locally. The
+segment-footer-to-pack-hash binding remains a required follow-up before the
+default-off SealPack can become default-on.
 
 ### 6.2 Ordering
 
 ```text
 write pack.tmp
-verify every section against raw segment
+verify first/last pointers and semantic payload/type equality against raw input
 fdatasync(pack.tmp)
 rename(pack.tmp, pack)
 fsync(seals directory)
@@ -183,17 +210,30 @@ GC computes reachability from retained valid manifests, writes a durable GC plan
 
 ## 8. Snapshot-pack durability
 
-A snapshot pack is append-only while active. Each blob record has independent length/checksum framing so a torn tail truncates cleanly. The install control capsule is written only after the blob’s durability promise is met.
+ADR 0002 selects a separate snapshot sidecar, not a log install control. One OS
+writer lock owns a UUID namespace. An active `.open` pack contains independently
+commit-framed records; rolling appends and syncs an index/footer, renames to an
+immutable `.pack`, and syncs the directory. Discovery is a bounded immutable
+copy-on-write tree keyed by stream plus stable snapshot compatibility identity,
+under immutable generation roots. Offline readers are read-only and use exact
+range `pread`; missing/corrupt artifacts are a miss/replay.
 
-Possible policies:
+Two publication modes are explicit:
 
 ```text
-SnapshotDurability::Process  -> blob may be lost; install control also Process
-SnapshotDurability::Os       -> sync blob before Os install capsule
-SnapshotDurability::Group    -> group blob writes, sync pack, then group installs
+Buffered -> atomic process visibility; no power-loss promise
+Durable  -> every pack range/page/directory entry reachable from the complete
+            root is proven durable before the root is acknowledged
 ```
 
-An install capsule must never be made more durable than its blob. The simple implementation always syncs the blob pack before submitting installs.
+`Durable` is a complete-closure promise, not “sync the new record.” A
+checksummed durability-proof ledger may avoid repeat I/O only for exact
+previously proven immutable identities/frontiers. GC first publishes a new
+complete-closure Durable root, retains at least two validated roots, syncs root
+pruning, then deletes unreachable content and syncs deletion directories.
+Snapshot roots never authorize event-log retention. ADR 0002 remains normative
+for identity, `Empty < Through(0)`, trust modes, administrative scans,
+same-coverage conflicts/repair, and the required evidence matrix.
 
 ## 9. Out-of-place storage and SSD behavior
 
@@ -297,6 +337,13 @@ WriteManifest
 BarrierManifest
 WriteCurrentSlot
 BarrierKernelDir
+WriteSnapshotRecord
+SealSnapshotPack
+PromoteSnapshotClosure
+WriteSnapshotProofLedger
+PublishSnapshotRoot
+PruneSnapshotRoots
+DeleteSnapshotContent
 ```
 
 Model arbitrary persistence subsets between barriers, stale prior-generation sectors, rename durability, and crash at every operation. Safety properties:
@@ -307,7 +354,8 @@ no control/event split
 no acked capsule lost under promised durability
 checkpoint never causes state beyond accepted log
 footer never causes corrupt pack to be trusted
-snapshot install never names a non-durable blob under its mode
+snapshot Buffered roots remain discardable; acknowledged Durable roots have a
+complete proven closure and GC never deletes retained-root content
 recovery is idempotent
 ```
 

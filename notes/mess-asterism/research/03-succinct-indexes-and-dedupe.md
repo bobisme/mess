@@ -14,6 +14,14 @@ exact identity             -> canonical key comparison
 
 No approximate or static function is allowed to decide a user-visible fact without exact verification.
 
+**Evidence status.** Spike A admitted packed `AtomicU128` heads with a page-
+seqlock fallback. Spike F admitted stream microblocks with linear search and an
+eight-block skip chain, rejected binary search, and Spike J rejected stride-8
+global checkpoints in favor of stride-1. Spike H admitted bitvector+rank for
+dense/real sealed directories with a deterministic fallback. Spike G admitted
+the G2 epoch mechanism, but ADR 0002 leaves product idempotency optional; none
+of that makes current production dedupe live.
+
 ## 2. Dense head tables
 
 ### 2.1 Addressing
@@ -101,14 +109,23 @@ For a recent stream version:
 
 1. load tail block ID;
 2. compare version against block range;
-3. binary search or linear scan up to 32 entries;
+3. linear scan up to 32 entries;
 4. follow `previous` only when needed.
 
-Linear scan may beat binary search because 32 compact entries fit in a few cache lines and branch prediction is good. Benchmark both. For very hot streams, add every eighth block to a per-stream skip chain.
+Spike F measured and rejected binary search inside the block. Linear scan wins
+because 32 compact entries fit in a few cache lines and branch prediction is
+good. The accepted hot-stream shape adds an every-eighth-block skip chain.
 
 ### 3.4 Slab reclamation
 
 Allocate blocks in segment-generation slabs. Once a segment’s SealPack is installed and active readers release that generation, free the whole slab. No per-block free list or epoch reclamation is required.
+
+### 3.5 Global lookup
+
+Use a stride-1 resident batch-offset directory (16 bytes/batch). Spike J
+rejected the stride-8 alternative: scanning up to seven real headers through
+`pread` made seeks 10–17x slower than the incumbent despite the smaller index.
+Do not reintroduce that page-cache assumption without a new composed I/O gate.
 
 ## 4. Sealed stream-directory representations
 
@@ -245,18 +262,28 @@ For point reads, small bit-packed fixed-width partition columns may be faster th
 
 ## 7. Exact epoch dedupe design
 
+This is candidate machinery for `bn-2ctq`, not a current contract. Production
+append carries no key, and the Fjall comparison was a synthetic component
+baseline. Spike G's accepted shape is a `hashbrown` active table plus sorted
+frozen epochs and one BinaryFuse16 negative filter per epoch. Freeze/build runs
+off the append owner; the spike's roughly 15 ms full-epoch freeze is not an
+acceptable foreground outlier.
+
 ### 7.1 Semantic model
 
 Configuration:
 
 ```rust
 struct DedupeWindow {
-    span_positions: u64,
+    span_positions: NonZeroU64,
     epoch_positions: u64, // e.g. span/8, rounded
 }
 ```
 
-A key committed at position `p` is live at end `w` iff `p >= w-span`.
+Positions are zero-based and inclusive. With greatest committed position `w`,
+`window_start = w.saturating_sub(span)`. A key at `p` is live iff
+`p >= window_start`. When `w < span`, the whole prefix is live. A zero span is
+rejected.
 
 ### 7.2 Canonical record
 
@@ -270,6 +297,12 @@ full key bytes
 ```
 
 The full key is stored once. The resident index stores a keyed BLAKE3/AES-derived 128-bit fingerprint and capsule pointer.
+
+One canonical key covers the entire capsule/batch. This is a new API decision,
+not a narrowing of existing behavior. Per-event idempotency needs one capsule
+per event or a future vector-valued record. A live match returns the original
+commit after `resolve registration -> exact dedupe -> expected version`; an
+expired/missing key follows expected-version semantics.
 
 ### 7.3 Active table
 
@@ -304,17 +337,18 @@ Pseudo-code:
 
 ```rust
 fn is_duplicate(scope: Scope, key: &[u8], w: u64) -> bool {
+    let window_start = w.saturating_sub(span.get());
     let fp = keyed_fingerprint(scope, key);
     for candidate in active.equal_fingerprint(fp) {
-        if candidate.position >= w - span && canonical_key(candidate.ptr) == key {
+        if candidate.position >= window_start && canonical_key(candidate.ptr) == key {
             return true;
         }
     }
     for epoch in frozen.iter().rev() {
-        if epoch.max_position < w - span { break; }
+        if epoch.max_position < window_start { break; }
         if !epoch.filter.maybe_contains(fp) { continue; }
         for candidate in epoch.equal_fingerprint(fp) {
-            if candidate.position >= w - span && canonical_key(candidate.ptr) == key {
+            if candidate.position >= window_start && canonical_key(candidate.ptr) == key {
                 return true;
             }
         }
@@ -324,6 +358,12 @@ fn is_duplicate(scope: Scope, key: &[u8], w: u64) -> bool {
 ```
 
 Synthetic tests force identical fingerprints for distinct keys to prove no overwrite/false-negative bug exists.
+
+Canonical key bytes must outlive the exact window. A segment covering
+`[base, end_exclusive)` may be deleted for dedupe only when
+`end_exclusive <= window_start`, unless a canonical retention boundary carries
+all still-live full keys and original results. An inclusive end instead uses
+`end_inclusive < window_start`.
 
 ### 7.6 Age-Partitioned Bloom relevance
 

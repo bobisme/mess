@@ -30,22 +30,44 @@ read as saying that v4 is adopted or enabled by default.
 > a prerequisite for Fjall deletion. V4 remains a separate decision at
 > `bn-1ojm`.
 
-Fjall was the correct choice for Mess when the problem was “we need a fast, safe, pure-Rust exact metadata store while the custom log stabilizes.” The next performance step is **not** to build a slightly faster Fjall. It is to delete the generic KV problem from the hot path.
+Fjall was the correct choice for Mess when the problem was “we need a fast,
+safe, pure-Rust exact metadata store while the custom log stabilizes.” The
+accepted spikes and subsequent implementation have already deleted the generic
+KV problem from the event-engine hot path.
 
-The current architecture already has the crucial premise: the event log is the sole commit authority, active pointer indexes live in memory, and sealed indexes are immutable and rebuildable. Yet the composed engine still performs work that belongs to a generic database rather than an event-log kernel:
+The original 2026-07-11 architecture performed the following work. This list
+is historical motivation, not a description of the current engine:
 
-- it persists a Fjall metadata batch after each committed append;
-- it performs a separate durable Fjall flush before an append that introduces a stream or event-type name;
-- it duplicates every payload into an in-memory `Book` and reconstructs that book by decoding the entire history on open;
-- it uses per-stream append gates, per-append blocking tasks, a global publish sequencer, a global book mutex, the active index, and Fjall in one publish tail;
+- it persisted a Fjall metadata batch after each committed append;
+- it performed a separate durable Fjall flush before an append that introduced a stream or event-type name;
+- it duplicated every payload into an in-memory `Book` and reconstructed that book by decoding the entire history on open;
+- it used per-stream append gates, per-append blocking tasks, a global publish sequencer, a global book mutex, the active index, and Fjall in one publish tail;
 - it materializes sealed indexes into a per-segment `HashMap`, even though the key set is immutable and the stream ID universe is dense;
-- it maintains an exact sliding dedupe window as mutable KV rows plus an order index and deletion/tombstone work.
+- it exposed mutable dedupe rows and an order index in `MetaStore`, although
+  production append never populated or queried them.
+
+Today the v3 engine has the accepted flat owner/direct committer, canonical
+`$registry`, block-native reads, and an O(streams + event types) `Book`. The
+only live Fjall-backed state role is the opt-in snapshot wrapper; direct CLI
+`MetaStore` consumers remain operational integration/deletion work. The safest
+high-value subset therefore exists independently of v4: single owner on v3,
+log-derived registry, bounded payload caches, and header/directory recovery.
+Effects/checkpoints and dense state remain independently gated follow-ons.
 
 Asterism replaces this with five coupled mechanisms:
 
-1. **Commit capsules (gated v4 target).** If the format gate is later opened, generalize the batch format so an engine-generated control prelude—registry assignments, a dedupe key, snapshot installation, checkpoint movement—commits under the same CRC and marker as the user events. One capsule is one atomic state transition. The adopted v3 path instead commits an explicit `$registry` batch immediately before the domain batch in one ordered durability unit.
+1. **Commit capsules (gated v4 target).** If the format gate is later opened,
+   generalize the batch format so an engine-generated control prelude commits
+   under the same CRC and marker as user events. Registry codecs are proven;
+   dedupe/projection controls require their independent product decisions, and
+   ADR 0002 admits no snapshot-install control. One capsule is one atomic state
+   transition. The adopted v3 path instead commits an explicit `$registry`
+   batch immediately before the domain batch in one ordered durability unit.
 
-2. **A flat-combined state kernel.** One dedicated committer thread owns validation, global-position assignment, stream heads, registry allocation, active dedupe, and the append-visible state transition. Producers enqueue intents and await completions. There is no per-append `spawn_blocking`, no per-stream lock held across I/O, no out-of-order publish tail, and no post-commit Fjall write.
+2. **A flat-combined state kernel (adopted on v3).** One owner is the direct
+   committer/writer and owns validation, position assignment, registry
+   allocation, heads, and publication. It does not front a second committer.
+   Exact dedupe is not current owner state; it remains an optional feature.
 
 3. **Workload-shaped resident structures.** Dense writer-assigned stream IDs address chunked head/snapshot arrays directly. Active stream pointers live in immutable append-only microblocks. Reader consistency is provided by published group epochs and atomic fields, not by a generic MVCC tree.
 
@@ -60,14 +82,22 @@ producer intent
     -> MPSC ring
     -> single state-kernel owner validates against speculative group state
     -> encode one or more commit capsules
-    -> one coalesced write
-    -> one durability barrier for the group
+    -> current: k positioned writes; target: one gathered/coalesced write where it fits
+    -> durability: none (Process), per batch (Os), or one covering group barrier
     -> apply already-computed effects to resident arrays/microblocks
     -> release-publish one group watermark
     -> complete waiters
 ```
 
-For an ordinary append, the only durable bytes are canonical log bytes. No second database write exists. On the current v3 path, a new-name append writes the registration batch and first-use domain batch as one ordered unit covered by the same group barrier; on the gated v4 alternative, both would share one capsule. In either case the log scanner decides both event visibility and metadata visibility, so there is no cross-engine lag state to reconcile.
+For an ordinary append, the only durable event-engine bytes are canonical log
+bytes. No second database write exists. On the current v3 path, a new-name
+append writes the registration batch and first-use domain batch as one ordered
+unit. `Process` issues no barrier, `Os` syncs each of those two batches, and
+`Group` can cover the gathered group with one barrier. On the gated v4
+alternative, both would share one capsule, reducing `Os` to one sync. In either
+case the log scanner decides event and registry
+visibility. Snapshot discovery remains a separate discardable sidecar by ADR
+0002; it is not append authority.
 
 This is not a promise that a prototype will beat Fjall. It is a claim that **specialization creates a plausible path to eliminate entire classes of work**. The design is accepted only if the composed implementation reaches the quantitative gates in §18–§19.
 
@@ -79,7 +109,7 @@ Asterism keeps the strongest parts of the current design unchanged.
 
 ### 1.1 Canonical log authority
 
-The normative v3 log establishes that a batch is committed only when its marker and full-batch CRC validate, with global-position contiguity, segment generation, length bounds, no resynchronization past a hole, and no CRC-off fast path. The existing crash matrix, torn-write matrix, and real `SIGKILL` tests are an unusually strong foundation. Asterism does not weaken any A1–A12 rule.
+The normative v3 log establishes that a batch is committed only when its marker and full-batch CRC validate, with global-position contiguity, segment generation, length bounds, no resynchronization past a hole, and no CRC-off fast path. The existing crash matrix, torn-write matrix, and real `SIGKILL` tests are an unusually strong foundation. Asterism preserves A1–A4 and A6–A12. Format v4 replaces A5 with a safety-preserving nonempty-capsule rule, `control_count + event_count >= 1`, and promotes contiguous `batch_id` validation to a recovery-significant rule.
 
 ### 1.2 Active/sealed lifecycle
 
@@ -91,7 +121,13 @@ A user append is stream-constant, so a batch header carries one stream ID, one c
 
 ### 1.4 Group commit and one durability spine
 
-The committer already gathers appends, assigns positions centrally, coalesces writes, performs one `fdatasync`, and advances a durable watermark. The bare log has demonstrated high buffered and durable throughput. Asterism moves more state ownership into that same thread instead of adding another concurrency system.
+The current flat owner gathers and validates appends and owns the
+`DirectCommitter`. The current physical implementation issues positioned
+writes. `Process` has no barrier, `Os` is sync-per-batch by contract, and
+`Group` performs one covering barrier for the gathered group. Asterism's
+retained target is one gathered/coalesced write where size permits, with
+`writev` or bounded chunks for oversized groups. This distinction is
+performance-only; capsule framing and the group barrier define correctness.
 
 ### 1.5 Sealed columnar payloads
 
@@ -101,9 +137,16 @@ Columnar shredding has already produced byte-exact reassembly, compact storage, 
 
 ## 2. The real Fjall gap
 
-### 2.1 Fjall is not being used as a B-tree-like primary store
+### 2.1 Fjall is no longer in the event engine
 
-Fjall is a safe-Rust LSM engine with sorted keyspaces, journals, memtables, block tables, filters, compaction, and range semantics. Mess uses only a narrow subset: point heads, snapshot heads, projection checkpoints, an exact dedupe map plus order index, high-water rows, and temporary name maps. The event payloads and active pointer index are already outside Fjall.
+The current `LogEngine` does not construct `MetaStore` during open, append,
+read, seal, or recovery. `stream_heads`, `checkpoints`, `dedupe`,
+`dedupe_order`, and their shared high-water rows are dormant public component
+surfaces. `FjallSnapshotBackend<LogEngine>` supplies the only live Fjall-backed
+state role, discardable snapshot discovery outside the event engine. CLI
+metaread/doctor/inspect/retention and `rebuild-index --meta` still open
+`MetaStore` directly. Research 13 contains the source-complete keyspace and
+caller inventory.
 
 This means the target is not “outperform Fjall at arbitrary KV workloads.” The target is:
 
@@ -117,11 +160,17 @@ append-only source log
 
 That problem has more structure than KV and can use less machinery.
 
-### 2.2 The dual-write tail
+### 2.2 The removed dual-write tail
 
-After the canonical log append is acknowledged, the current engine updates the `Book`, active index, and a Fjall `CommitGroup`, then advances a read watermark. Even though the Fjall write is not `fsync`ed, it still performs key encoding, batch construction, journal/memtable insertion, sequence management, allocation, and later maintenance. It also creates a second progress domain that can lag and must be repaired by replay.
+The pre-flat-owner engine updated the `Book`, active index, and a Fjall
+`CommitGroup` after the canonical append. Production now publishes the compact
+Book heads/registry and active pointers from the one owner and performs no
+post-commit Fjall write. This section records the removed cost; it is not a
+remaining implementation task.
 
-Asterism derives the same rows from the capsule itself and applies them in memory after the durability barrier. The persistent state transition and the event are the same bytes.
+Asterism's current v3 path derives heads and registry from accepted log bytes.
+Optional future capabilities must earn their own canonical encoding rather
+than reviving an implicit metadata database.
 
 ### 2.3 The registry position cost
 
@@ -137,16 +186,24 @@ positions are therefore monotone but can have gaps. Cursors must be treated as
 opaque ordering/resume tokens, not dense indexes or event counts. The v4
 control prelude would avoid that cost, but remains a later gated alternative.
 
-### 2.4 The all-history `Book`
+### 2.4 The retired all-history `Book`
 
-The current `Book` stores an `Arc` payload plus repeated name/type references for every committed event, along with per-stream global-position vectors and heads. A fresh open scans every event, materializes every payload, resolves names, and rebuilds the book densely. This creates four costs:
+Before Spike C, `Book` stored an `Arc` payload plus repeated name/type
+references for every committed event, along with per-stream global-position
+vectors and heads. That created four costs:
 
 1. startup is proportional to total event count, even when every old segment is sealed;
 2. memory is proportional to all retained payload bytes plus object/allocator overhead;
 3. append copies payload bytes into both the canonical log encoder and the book;
 4. the global `Book` mutex is in the post-commit publish tail and read paths.
 
-The log and sealed payload packs already contain the data. The book is a cache without a bound or eviction policy. Asterism deletes it.
+Spike C deleted those all-history fields. The current `Book` contains only the
+strict registry fold, interned string arcs, heads, and registry allocator
+bookkeeping: O(streams + event types), not O(events). Active/sealed payload
+reads use raw log/columnar bytes plus bounded caches, and sealing re-reads the
+rolled raw segment after the published watermark covers it. “Remove the Book”
+below means retire or replace that remaining compact publication structure,
+not repeat the completed payload-mirror work.
 
 ### 2.5 General structures on dense IDs and immutable sets
 
@@ -162,7 +219,11 @@ Asterism adds the following invariants to the existing log invariants.
 
 ### K1. One authoritative transition
 
-Every durable change that can affect append validity or externally visible metadata is represented in a CRC-covered, marker-terminated commit capsule. No mutable metadata database is authoritative.
+Every durable change that can affect append validity or canonical event
+interpretation is represented in CRC-covered, marker-terminated accepted log
+bytes. No mutable metadata database is event authority. ADR 0002 deliberately
+keeps snapshot discovery as discardable sidecar state; its loss selects replay
+and therefore does not violate this invariant.
 
 ### K2. Deterministic fold
 
@@ -238,9 +299,14 @@ mess/
   LOCK
 ```
 
-Fjall remains an implementation dependency while its remaining roles are
-audited. Each role must become log-derived or be proven safely discardable
-before deletion; no legacy-store migration compatibility feature is planned.
+Fjall remains an implementation dependency, but its authority audit is
+complete in research 13 and ADR 0002. Snapshot discovery is the only live
+Fjall-backed state role and is proven safely discardable; loss falls back to
+canonical replay. Direct operational CLI consumers (`metaread`,
+doctor/inspect/retention, and `rebuild-index --meta`) still open `MetaStore`.
+`bn-3l8n` must migrate applications and offline tooling to the selected
+snapshot-pack contract before final API/keyspace/dependency deletion. No
+legacy-store migration compatibility feature is planned.
 
 ---
 
@@ -334,6 +400,13 @@ in-memory kernel proves its foreground advantage.
 
 ## 6. Single-owner flat-combined state kernel
 
+**Current status:** the v3 flat owner is production. Accepted Spike B evidence
+requires the owner to own the writer/barrier (`B0Direct`); placing the old
+committer behind it costs 35%. The speculative cross-barrier `B1` pipeline is
+rejected: it produced no durable win, lost 5–18% at 64 writers, and would make
+the exact barrier cut nondeterministic. This section specifies the adopted B0
+shape plus optional future state components.
+
 ### 6.1 Ownership model
 
 One dedicated OS thread owns:
@@ -341,7 +414,7 @@ One dedicated OS thread owns:
 - the writer-side head table;
 - stream/type/category ID allocation;
 - the active registry overlay;
-- active dedupe epochs;
+- active dedupe epochs, only if `bn-2ctq` later admits idempotency;
 - capsule sequence and global position assignment;
 - segment writer and roll decisions;
 - speculative state for the current commit group.
@@ -377,9 +450,32 @@ For each intent:
 
 Two same-stream requests in one group therefore have deterministic semantics. An `Exact(v)` followed by another `Exact(v)` yields one success and one conflict. An internal command-retry path may instead submit the second with the updated version.
 
+The implementation names four frontiers rather than calling all owner state
+“durable”:
+
+```text
+speculative       validated; discardable on write failure
+written/accepted  write returned; Process completion may become eligible
+crash-stable      covered by a successful Os/Group barrier
+published         reader-visible effects
+```
+
+For `Os` and a closed `Group`, `published <= crash-stable`; a successful API
+completion implies the capsule is both crash-stable and published. A short
+post-barrier interval may still have `published < crash-stable`. Under
+`Process`, the exact crash-stable prefix is unknowable until recovery and
+`published` may exceed the recovered prefix. Code, metrics, and formal models
+must not label the Process watermark “durable.”
+
 ### 6.3 One encode/write/barrier
 
-Accepted capsule descriptors are encoded into preallocated group buffers. Large payloads can use `writev` slices to avoid copies; small payloads are copied into a contiguous buffer to minimize syscalls. The owner performs one coalesced write and one durability barrier according to the existing group-commit policy.
+Accepted capsule descriptors are encoded into preallocated group buffers. The
+current writer performs positioned writes: none are followed by a barrier in
+`Process`, each accepted batch is synced in `Os`, and a gathered `Group` gets
+one covering barrier. The
+retained target gathers them into one coalesced write where size permits, using
+`writev` or bounded chunks for oversized groups. Large payloads need not be
+copied merely to achieve syscall-count aesthetics.
 
 The important performance property is not “one thread.” It is **one ownership boundary and one ordering decision**. The existing log has already demonstrated that one committer can approach the device bandwidth ceiling for the target workload.
 
@@ -399,9 +495,20 @@ No committed group can acknowledge before its reader state is publishable. Becau
 
 Dropping an async caller only drops its receiver. The intent in the owner queue either has not been accepted, or the owner runs it to a terminal result. A committed capsule always publishes. This preserves the current non-cancellable post-assignment guarantee without one blocking task per append.
 
+Dropping a producer while it waits for ring space removes only that waiter: it
+has reserved no position, completion slot, queue bytes, or capsule identity.
+Dropping after admission releases no owner responsibility; the owner completes
+or fails the admitted intent and then releases its byte reservation.
+
 ### 6.6 Backpressure
 
-The ring is bounded by bytes, not only intent count. When full, producers await space. The kernel exports:
+The ring is bounded by bytes, not only intent count. Admission is strict FIFO
+among space waiters. This prevents a large request from starving behind a
+stream of small requests, at the deliberate cost of head-of-line blocking;
+requests larger than the total byte bound are rejected rather than waiting
+forever. A cancelled space waiter is unlinked without changing reserved bytes.
+Loom/model tests cover both space-waiter and completion-waiter cancellation.
+The kernel exports:
 
 ```text
 queue bytes / intents
@@ -475,7 +582,12 @@ A snapshot-head cell need not store a variable-length pointer. Store an atomic `
 struct SnapshotSlot(u64); // 0 = none
 ```
 
-The directory entry contains stream/version, blob-pack location, fold version, prefix hash, and state hash. Entries never mutate; advancing the head is one atomic slot store.
+The directory entry contains stable compatibility identity, explicit
+`Empty`/`Through(v)` coverage, blob-pack location, fold version, trust mode,
+and hash-presence flags. State and event-prefix hashes are optional together
+for an unverified cache and required together for a certified reference;
+current snapshot hashes are otherwise `None`. Entries never mutate; advancing
+the head is one atomic slot store.
 
 Projection checkpoints are fewer and named. Keep a small dynamic overlay in memory and checkpoint them as a static registry/table. A future sharded frontier is encoded as an immutable record referenced by a slot.
 
@@ -519,6 +631,14 @@ This is the decisive simplification over a general KV engine.
 
 The current active index is already much better than an LSM, but every stream lookup hashes the stream ID, takes a shard lock, and accesses a growable `Vec`. Append can reallocate a hot stream vector; readers contend briefly with the single writer; global entries are duplicated in a separate vector even though the log is already globally ordered.
 
+Spike F accepted stream-side fixed microblocks with linear within-block search
+and an every-eight-block skip chain. It rejected binary search within a
+32-entry block. Spike J then rejected F's stride-8 global checkpoint array:
+the required real `pread` header scan was 10–17x slower than the incumbent.
+The accepted global fallback is stride-1, 16 bytes per batch, with no forward
+scan. These are target choices; production still uses `ActiveIndex` until the
+integration bone lands.
+
 ### 8.2 Microblock arena
 
 Use an append-only arena of fixed-capacity stream microblocks:
@@ -549,7 +669,11 @@ Each microblock records its covered version range. To resolve a recent version, 
 
 ### 8.4 Global active reads
 
-Global replay scans the canonical active segment. Seeking uses a sparse batch-offset array maintained by the writer and published with the group epoch. No separate `Vec<GlobalEntry>` is necessary for the hot path.
+Global replay scans the canonical active segment. Seeking uses a stride-1
+resident batch-offset directory maintained by the writer and published with
+the group epoch. Do not use stride-8 plus header `pread` scans; that composed
+assumption was measured and rejected. A future mmap variant would need its own
+fault-tail gate before reconsideration.
 
 ### 8.5 Memory reclamation
 
@@ -627,6 +751,11 @@ A sharded checkpoint frontier uses pointwise maximum:
 
 This component is associative, commutative, and idempotent. It composes safely under retries.
 
+The algebra needs an explicit bottom/existence state. `0` is a valid exclusive
+frontier (for example a projection checkpoint at genesis), so absence cannot
+be encoded as numeric zero. A component is `Absent` or `Present(position)`;
+join uses `Absent` as bottom and pointwise maximum only for present values.
+
 ### 9.5 Registry effects
 
 Registry assignments use disjoint union with a conflict state `⊥`:
@@ -636,17 +765,25 @@ R1 ⊎ R2 = union, if names and IDs agree on overlap
         = ⊥, otherwise
 ```
 
-On valid histories, composition never reaches `⊥`. A checkpoint or SegmentEffect that disagrees with a later canonical registration is rejected as corrupt.
+On valid histories, composition never reaches `⊥`. A checkpoint or
+SegmentEffect that disagrees with a later canonical registration is rejected
+as corrupt. Recovery reuses the existing strict `RegistryState` fold. Effect
+idempotence is implemented above it: discard a repeated stable control
+identity, then feed each canonical assignment exactly once into
+`RegistryState`. Do not weaken `AlreadyRegistered`.
 
 ### 9.6 Dedupe effects
 
 Dedupe is parameterized by the current global watermark `w` and exact window span `W`. An entry `(fingerprint, position, key_ptr)` is live iff:
 
 ```text
-position >= w - W
+position >= w.saturating_sub(W)
 ```
 
-Segment effects store entries grouped by coarse epochs. Composition concatenates epochs and drops only epochs whose maximum position is older than the exact boundary. Retained slack never changes correctness because every candidate position is checked against the exact boundary.
+`W` must be nonzero. Segment effects store entries grouped by coarse epochs.
+Composition concatenates epochs and drops only epochs whose maximum position
+is older than the exact boundary. Retained slack never changes correctness
+because every candidate position is checked against the exact boundary.
 
 ### 9.7 SegmentEffect
 
@@ -664,15 +801,34 @@ struct SegmentEffect {
     checkpoint_updates: Vec<CheckpointEffect>,
     registry_delta: RegistryPack,
     dedupe_epochs: Vec<FrozenDedupeEpoch>,
+    allocator_boundaries: AllocatorFirstLast,
     effect_hash: Hash256,
 }
 ```
 
-The effect is derived from already-validated capsules. It is not commit authority. On corruption, rebuild it by scanning the segment.
+Allocator components carry both first/incoming and last/outgoing values, just
+as heads carry path boundaries; a last-only override cannot prove monotonic
+continuity across independently built effects. The effect is derived from
+already-validated capsules. It is not commit authority. On corruption, rebuild
+it by scanning the segment.
+
+The existing v3 extension-region framing and the R2 advisory manifest are
+design ancestors, not interchangeable implementations. A specified
+`StreamHeadTable` entry contains only `(stream_id, last_version, head_hash)`:
+it is partial evidence for the head component and durable fold-certificate
+material, not a complete independently composable effect. Production Phase 3
+segments currently have empty extension regions, so recovery cannot assume
+such a table exists or use it as a scan waiver. Keep rebuildable
+`SegmentEffect` bytes in SealPack and durable fold anchors in the extension
+region; never publish two authoritative copies of one logical field. A kernel
+checkpoint manifest may reuse R2's anchoring and validation discipline while
+remaining a separate artifact with its own lifetime and failure domain.
 
 ### 9.8 Parallel recovery
 
-Suppose effects `E1 ... En` are in segment order. Since composition is associative, recovery may use a balanced ordered reduction:
+Suppose effects `E1 ... En` are in segment order. Associativity permits a
+balanced ordered reduction, but accepted Spike D evidence says not to use one
+as the production default:
 
 ```text
 (((E1 ▷ E2) ▷ E3) ▷ ...)
@@ -684,7 +840,13 @@ or:
 reduce_ordered_tree(E1 ... En)
 ```
 
-provided it never permutes operands. Segment decode/build can run independently in parallel; only the effect merge preserves order. This extracts multicore recovery parallelism without changing semantics.
+provided it never permutes operands. Segment decode/build can run independently
+in parallel. The measured implementation scaled effect build 6.8x at eight
+threads, while a full tree composition took about 7.0 s at one thread versus
+about 0.3 s for direct sequential apply. Production therefore parallelizes
+effect build and applies the ordered effects sequentially into dense resident
+state (24.3M head transitions/s measured), or chunk-reduces only when a merged
+summary is itself required. Algebraic permission is not a performance mandate.
 
 ### 9.9 Correctness theorem
 
@@ -943,6 +1105,13 @@ keyed_128_bit_fingerprint -> one or more (position, capsule pointer)
 
 The hash is keyed per store to resist adversarial collision attacks. A fingerprint hit always reads/compares the full key from the capsule before declaring a duplicate. Every colliding entry is retained in a small overflow chain or sorted equal-fingerprint run, so hash collisions cannot create false negatives.
 
+This is a new batch/capsule-level API decision, not a migration of current
+runtime behavior. One key covers the whole batch. Per-event idempotency requires
+one capsule per event or a later vector-valued canonical record. Retry order is
+`resolve registration -> exact dedupe -> expected version`: a matching live key
+returns the original commit; a missing/expired key follows expected-version
+semantics and never silently appends a recovered event twice.
+
 ### 13.3 Epochs
 
 Divide positions into coarse epochs, for example `W/8` positions each:
@@ -980,11 +1149,20 @@ The common miss path touches a few compact filters and no mutable LSM. There are
 
 ### 13.5 Dedupe checkpointing
 
-The current mutable epoch and references to live frozen epochs are included in the kernel checkpoint. Because full keys remain in canonical capsules until the dedupe window expires, a lost checkpoint can rebuild exact state from the relevant log suffix.
+The current mutable epoch and references to live frozen epochs are included in
+the kernel checkpoint. Because full keys remain in canonical capsules until
+the dedupe window expires, a lost checkpoint can rebuild exact state from the
+relevant log suffix. Retention must preserve those bytes: a segment
+`[base, end_exclusive)` is deletable for dedupe only when
+`end_exclusive <= window_start`, unless a canonical retention boundary carries
+every still-live full key and original result.
 
 ---
 
-## 14. Delete the Book; make reads block-native
+## 14. Block-native reads after the payload-Book deletion
+
+Spike C implemented this section in production. The remaining compact `Book`
+holds registry/heads/interned arcs, not payload history.
 
 ### 14.1 Active reads
 
@@ -993,6 +1171,13 @@ An active stream pointer resolves to a capsule offset. A reader issues `pread` o
 ### 14.2 Sealed reads
 
 A SealPack directory resolves stream/version to payload block and event ordinal. The columnar reader decompresses only required columns and returns an immutable block-backed `RecordBatch`.
+
+Sealing no longer consumes `Book.payloads`: it waits for the rolled range to be
+covered by the canonical published watermark, re-reads the raw segment, and
+builds the pack. The correctness contract is semantic—byte-identical
+reassembled payloads and identical pointer/version/position results, with
+corruption fallback. Compressed `.pcol` byte identity is only a same-build
+regression check.
 
 ### 14.3 API evolution
 
@@ -1155,7 +1340,13 @@ A mismatch discards the effect and scans the corresponding raw segment. The repa
 
 ### 16.3 Parallelism
 
-Sealed segments with missing effects can be scanned independently. Their effects are then merged in segment order. Payload decompression is unnecessary for head/registry/dedupe recovery except where a control record’s exact key bytes must be extracted; control preludes are independently length-framed.
+Sealed segments with missing effects can be scanned independently. Build those
+effects in parallel, then apply them sequentially in segment order to resident
+state. Do not default to materializing a full ordered tree-reduced effect: Spike
+D measured that path substantially slower than direct apply. Payload
+decompression is unnecessary for head/registry/dedupe recovery except where a
+control record’s exact key bytes must be extracted; control preludes are
+independently length-framed.
 
 ### 16.4 Recovery digest
 
@@ -1177,18 +1368,24 @@ Differential tests compare fast checkpoint recovery, effect-only recovery, and f
 
 ### 17.1 Stronger by subtraction
 
-Asterism improves durability primarily by removing cross-file transactional states:
+Asterism improves event-engine durability primarily by removing cross-file
+transactional states. The pre-flat-owner comparison was:
 
 ```text
-current ordinary append:
+historical ordinary append:
   log capsule durable
   then derived Fjall batch may lag and is repaired
 
-Asterism ordinary append:
+current v3 ordinary append:
   log capsule durable == event + metadata effect durable
 ```
 
-For new names, the current ordered Fjall-name barrier plus log barrier becomes one capsule barrier. Checkpoints and SealPacks are explicitly non-authoritative.
+For new names, current v3 writes `$registry` plus first use in one ordered unit:
+zero barriers under `Process`, one sync per batch under `Os`, or one covering
+barrier under `Group`. V4 could put both in one capsule (and reduce `Os` to one
+sync) but is not required.
+Snapshot discovery follows ADR 0002's separate discardable pack/root protocol;
+kernel checkpoints and SealPacks remain non-authoritative.
 
 ### 17.2 Existing modes remain
 
@@ -1200,7 +1397,9 @@ enum Durability {
 }
 ```
 
-Group commit retains early close when all in-flight producers are pending, byte close near the device knee, and a maximum delay cap. The group owner advances a position-ordered durable watermark only after the barrier.
+Group commit retains early close when all in-flight producers are pending, byte
+close near the device knee, and a maximum delay cap. The group owner advances
+the position-ordered crash-stable watermark only after the covering barrier.
 
 ### 17.3 EIO
 
@@ -1244,16 +1443,38 @@ All figures below are **targets or derived budgets**, not measured Asterism resu
 
 ### 18.1 Foreground append budget
 
-The current repository has measured a bare-log buffered path in the millions of events per second and a composed engine below that ceiling. Asterism’s primary gate is ratio-based:
+The original single 85%-of-bare gate is historical. The locked matched matrix
+showed that composed/bare ratio varies primarily by batch size: the
+pre-flat-owner engine was 17–39% of bare for 4-writer batches 1–100 and 86–95%
+at batch 1000. The accepted flat owner lifted the small/medium cells
+substantially and beat that predecessor in every measured cell, but still
+failed 85% below batch 1000 because the remaining cost is producer/API wake
+topology. A single headline ratio, including the earlier matched 4x10 ~84%
+orientation row, must not stand in for the matrix.
+
+The historical Spike B admission gate, already passed, was:
 
 ```text
-composed Process-mode append throughput
-    >= 85% of bare-log throughput
+Process >= 1.20x matched pre-flat-owner engine
+Group >= 95% matched pre-flat-owner engine at >=4 writers
+p99 <= matched pre-flat-owner engine
+barrier count == matched bare log
 ```
 
-under identical payload, batch, concurrency, filesystem, and device state.
+The flat owner is now production, so that threshold is not a perpetual demand
+for another 20% over itself. Phase 4 and later use
+[`BN-2SU-FINAL.csv`](../../spikes/baseline_matrix/BN-2SU-FINAL.csv) as the
+prelocked per-cell baseline: Process and Group throughput, p99, and barrier
+budgets are compared cell by cell; no Process cell regresses without explicit
+product approval; Group non-regression and barrier parity hold; and any allowed
+tolerance is declared before measurement. Every result retains its raw matrix.
 
-Why 85%: the custom kernel must perform version validation, dedupe, and reader publication, but it should not pay a generic journal/memtable path or payload mirror. Failing this ratio means the redesign has not removed enough foreground work.
+Every cell controls payload size, batch size, concurrency, stream distribution,
+filesystem, device/cache state, and producer topology. Reports commit accepted
+and rejected raw rows, machine/load metadata, and barrier counts. The old 85%
+line remains an aspirational API gate for a separately measured owned-record,
+interned-type, producer-combining design; it is not a reason to discard the
+already-adopted owner.
 
 ### 18.2 Absolute reference gates
 
@@ -1267,7 +1488,7 @@ frozen dedupe negative:       <= 80 ns per whole window target
 ordinary metadata apply:      >= 20M capsule effects/s, one owner, no I/O
 foreground allocations:       zero after warm-up for <=4-event append
 ordinary metadata syscalls:   zero beyond canonical log write/barrier
-new-name barriers:            exactly one group barrier
+new-name barriers:            Process 0; Os 2 for v3 registry+domain; Group 1 covering
 ```
 
 These values are aggressive and intended to kill weak designs early.
@@ -1290,6 +1511,11 @@ A more portable ratio gate is:
 checkpoint open <= 10% of full scanner+Book-rebuild time
 ```
 
+Run the 100M-event open case early with the existing recovery-scale harness,
+even if the corpus is synthetic. Until that run exists, keep extrapolations
+derived and publish the measured 1M/10M results separately; do not promote the
+100M target or arithmetic reachability to a measured claim.
+
 ### 18.4 Memory and disk
 
 ```text
@@ -1306,60 +1532,45 @@ The metadata write-amplification target counts checkpoint/SealPack bytes and div
 ### 18.5 Durability
 
 ```text
-Os/Group throughput: no worse than bare log by >5%
+Group throughput/p99: meet the prelocked BN-2SU-FINAL per-cell budget
+Os throughput/p99: meet a separately prelocked matched per-cell budget
+all tolerances: declared before measurement
+barrier count: matched bare-log parity
 acked losses: 0
 partial/control-only capsules visible: 0
 registry/event split-brain outcomes: 0
 checkpoint-caused wrong state: 0
 ```
 
-Durable throughput is often device-barrier-bound, so the expected win is lower CPU and one barrier for new-name operations, not magical elimination of flash latency.
+Durable throughput is often device-barrier-bound, so the expected win is lower
+CPU and Group coalescing—not magical elimination of flash latency. V3 `Os`
+deliberately remains sync-per-batch; only a same-capsule v4 registration could
+make registry+first-use one `Os` sync.
 
 ---
 
-## 19. Required spikes and admission gates
+## 19. Spike ledger and admission results
 
-The detailed plan is in `research/05-benchmark-and-spike-plan.md`. The order matters.
+The authoritative detail and committed raw artifacts live under `spikes/`;
+research 05 preserves the original methods and gates. Lettering is A–J
+everywhere:
 
-### Spike A — `state_kernel_dense_heads`
+| spike | result carried into the design |
+|---|---|
+| A — dense heads | **ADOPT mechanism:** packed lock-free `AtomicU128` when available, page seqlock fallback; not yet integrated. |
+| B — flat owner | **ADOPT and integrated:** owner must be the direct writer/committer. Reject a second committer and reject B1 barrier pipelining. |
+| C — no payload Book | **ADOPT and integrated:** block-native reads, bounded caches, raw-segment seal source, watermark readiness. |
+| D — SegmentEffect/checkpoint | **PROCEED:** all equivalence/open/apply gates passed. Parallel build, sequential ordered apply; explicit frontier bottom and allocator first/last boundaries. Not yet integrated. |
+| E — v4 control prelude | **FORMAT ADMISSIBLE, product OFF:** crash/fuzz/scan gates passed; mandatory allocation-free validate/materialize split. ADR/product gates still control use. |
+| F — active microblocks | **ADOPT stream side:** linear 32-entry blocks + skip every eight blocks. Reject binary search; reject stride-8 globals after J and use stride-1. Not yet integrated. |
+| G — exact epoch dedupe | **ADOPT candidate mechanism, optional product:** G2 hashbrown active + sorted frozen epochs + BinaryFuse16; Fjall baseline was synthetic. |
+| H — static directory | **ADOPT density arm:** bitvector+rank for dense/real regions with deterministic sorted/HashMap fallback; reject PEF/PtrHash/k-bin candidates tested. |
+| I — SealPack | **ADMIT behind default-off option:** semantic replay and install/open gates passed; default-on still requires its named RSS/footer-binding follow-ups. |
+| J — composed decision | **NARROW/ADOPT proven parts:** flat owner highest priority, Book win retained, per-cell gates replace one ratio; no integrated “all Asterism” engine was claimed. |
 
-Compare Fjall, `HashMap`, direct pages with atomics, page seqlock, and double-buffer cells. Measure reads, updates, memory, and concurrent tails. **Gate:** direct form reaches the head targets and has no Loom-detected race.
-
-### Spike B — `flat_combined_append`
-
-Replace append gates, per-append blocking tasks, publish sequencer, and post-commit Fjall head updates with one owner while retaining v3 bytes. **Gate:** composed throughput reaches ≥85% of bare log and crash/cancellation tests remain exact.
-
-### Spike C — `open_without_book`
-
-Read active bytes from the log and sealed bytes from payload packs; remove the all-history payload mirror. **Gate:** equal API results, no payload scan on checkpoint open, bounded cache, and lower peak RSS.
-
-### Spike D — `segment_effect`
-
-Build/compose effects, compare against full recovery, checkpoint them, corrupt them, and fall back. **Gate:** byte-equivalent state in at least 100k randomized histories; ordered parallel reduction equals sequential fold.
-
-### Spike E — `capsule_v4_control_prelude`
-
-Implement registration + first event in one capsule and control-only checkpoints. Extend the crash/torn matrix. **Gate:** no accepted split registration/event outcome over exhaustive model + randomized sector reorder.
-
-### Spike F — `succinct_directory`
-
-Compare current `HashMap`, sorted arrays, bitmap/rank, partitioned Elias–Fano, PtrHash, k-PHF, and Ribbon retrieval on actual segment distributions. **Gate:** a candidate must improve the declared objective by ≥20% without regressing seal time beyond its budget. Otherwise keep the current simple map.
-
-### Spike G — `epoch_dedupe`
-
-Compare Fjall dedupe, active Swiss/low-associativity table + frozen epochs, APBF/BinaryFuse negative layers, and exact collision overflow. **Gate:** exact differential result, lower write amp, and latency gates under adversarial keys.
-
-### Spike H — `seal_pack`
-
-Combine current sidecars. **Gate:** identical payloads/pointers, fewer opens/installation states, seal no slower by >10%, open faster or simpler with measurable operational benefit.
-
-### Spike I — `composed_no_fjall`
-
-Full stack under one API and one crash harness. **Gate:** all targets that matter to the product, not isolated microbench wins.
-
-The project should not make v4 the fresh-store default before A–D prove that the
-in-memory and recovery architecture is worth the format cost. This is a format
-admission gate, not a migration phase; see §20.
+V4 remains a separate admission decision, not a migration phase and not an
+automatic consequence of its format proof. Snapshot discovery follows ADR
+0002 and emits no v4 install control.
 
 ---
 
@@ -1452,14 +1663,16 @@ gate explicitly adopts it, v4 remains off and v3 semantics govern.
 
 ### 21.8 Kill criteria
 
-Stop or narrow the custom engine if any is true after the composed spike:
+Stop or narrow a remaining mechanism if any is true in its matched composed
+matrix. The historical 85%-of-bare line is no longer a universal kill switch:
 
 ```text
-composed append < 85% of bare log on equal workload
+the current phase misses a prelocked BN-2SU-FINAL per-cell throughput, p99, or
+  barrier budget; uses an undeclared tolerance; or omits the raw matrix
 clean checkpoint open still scans old payloads
 resident metadata > 2x its packed information content without a measured reason
 v4 crash model admits any split control/event state
-exact dedupe is slower than Fjall by >20% at the product's real window and load
+admitted dedupe fails exactness, composed public-path gates, or bounded work
 maintenance burden causes the crash/formal suites to be bypassed
 ```
 
@@ -1479,22 +1692,25 @@ The claim is not that each data structure is new. The claim is that an event sto
 
 ---
 
-## 23. Recommended build order
+## 23. Current implementation order
 
 ```text
-1. Dense head/snapshot tables + shadow comparison
-2. Single-owner append/publish path on v3 format
-3. Remove all-history Book; block-native reads
-4. SegmentEffect + checkpoint prototype
-5. Epoch dedupe
-6. Consolidated SealPack
-7. v4 control prelude + event-sourced runtime registry
-8. Snapshot packs + control installs
-9. Succinct directory experiments
-10. Optional FDP/ZNS placement backend
+done: log-derived v3 registry
+done: direct flat owner/writer
+done: all-history payload-Book removal and block-native reads
+next: ADR-0002 snapshot packs/discovery + full app/CLI adoption
+then: remove dormant MetaStore/Fjall production surfaces
+independent integration: dense heads, stream microblocks + stride-1 globals,
+  SegmentEffects/checkpoints, bitrank directory, SealPack follow-ups
+conditional: exact batch idempotency (bn-2ctq), projection controls (bn-11mk)
+separate format decision: v4 (bn-1ojm)
+optional: FDP/ZNS placement backend
 ```
 
-Items 1–4 determine whether the architecture is real. Items 5–8 remove Fjall completely. Item 9 is an optimization tournament, not a prerequisite. Item 10 is a hardware specialization, not part of the correctness story.
+Snapshot replacement plus end-to-end adoption is the only live Fjall-deletion
+critical path. Dedupe, projection controls, SegmentEffects, and v4 do not block
+that deletion. Already accepted component mechanisms still require production
+integration evidence; a spike result is not a claim that current code uses it.
 
 ---
 
@@ -1504,12 +1720,19 @@ Fjall gave Mess a robust, fast metadata substrate while the custom log, crash se
 
 Asterism’s wager is sharper:
 
-> An immutable event store should not maintain its current state by writing a second mutable database. It should encode the authoritative state transition in the same commit capsule as the event, publish the hot result into direct resident structures, and periodically collapse the history into algebraic effects and self-verifying pages.
+> An immutable event store should not maintain canonical current state by
+> writing a second mutable database. It should encode authoritative transitions
+> in accepted log bytes—one ordered v3 unit today or one gated v4 capsule—publish
+> the hot result into direct resident structures, and, where admitted,
+> periodically collapse history into algebraic effects and self-verifying pages.
 
-If the wager is right, Mess gains more than a faster head lookup. It gains:
+The implemented subset already realizes the Fjall-free event path and payload-
+Book removal; the remaining bullets mix current gains with separately admitted
+targets:
 
 - one durability authority instead of a log plus lagging metadata state;
-- one barrier for first-use registration instead of an ordered metadata flush plus log barrier;
+- no Fjall name flush; v3 first use uses Process 0 barriers, Os one sync per
+  registry/domain batch, or one covering Group barrier;
 - no per-append generic KV write, compaction, or tombstone path;
 - no all-history payload mirror or payload-proportional startup;
 - deterministic, parallelizable recovery from composable effects;
@@ -1525,14 +1748,17 @@ That is the design worth trying to make Fjall unnecessary—not by cloning it, b
 
 ### Mess implementation and measurements
 
-- [Current `mess-index` Fjall metadata implementation](https://github.com/bobisme/mess/blob/43e4aca0192f01bb47670627f41182bca182759e/crates/mess-index/src/meta/mod.rs)
-- [Current composed engine and `Book`](https://github.com/bobisme/mess/blob/43e4aca0192f01bb47670627f41182bca182759e/crates/mess-store/src/engine.rs)
-- [Current active index](https://github.com/bobisme/mess/blob/43e4aca0192f01bb47670627f41182bca182759e/crates/mess-index/src/active.rs)
-- [Current sealed sidecar](https://github.com/bobisme/mess/blob/43e4aca0192f01bb47670627f41182bca182759e/crates/mess-index/src/sealed/segment.rs)
-- [Performance and correctness envelope](https://github.com/bobisme/mess/blob/43e4aca0192f01bb47670627f41182bca182759e/docs/perf/envelope.md)
-- [Normative v3 log format](https://github.com/bobisme/mess/blob/43e4aca0192f01bb47670627f41182bca182759e/docs/spec/01-log-format.md)
-- [Normative registry design](https://github.com/bobisme/mess/blob/43e4aca0192f01bb47670627f41182bca182759e/docs/spec/04-registry.md)
-- [Existing D10 static-directory experiments](https://github.com/bobisme/mess/blob/43e4aca0192f01bb47670627f41182bca182759e/docs/perf/experiments-d10.md)
+- [Accepted capability authority](../../docs/adr/0002-asterism-capability-authority.md)
+- [Current source/authority audit](research/13-authority-and-fjall-deletion-map.md)
+- [Current composed engine and compact `Book`](../../crates/mess-store/src/engine.rs)
+- [Current direct committer](../../crates/mess-log/src/committer.rs)
+- [Current snapshot wrapper](../../crates/mess-store/src/fjall_snapshot.rs)
+- [Current/dormant Fjall metadata component](../../crates/mess-index/src/meta/mod.rs)
+- [Flat-owner evidence](../../spikes/flat_combined_append/REPORT.md)
+- [Composed decision and raw-artifact index](../../spikes/composed_decision/REPORT.md)
+- [Historical performance and correctness envelope](../../docs/perf/envelope.md)
+- [Normative v3 log format](../../docs/spec/01-log-format.md)
+- [Normative registry design](../../docs/spec/04-registry.md)
 
 ### External primary work
 
