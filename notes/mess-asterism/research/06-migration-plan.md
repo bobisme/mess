@@ -1,5 +1,44 @@
 # Research 06: migration from Fjall/v3 to Asterism/v4
 
+> [!IMPORTANT]
+> **Historical design record — superseded 2026-07-13.** Mess has no users and
+> no existing stores, so there is no installed v3/Fjall state to migrate. The
+> M0–M9 rollout, compatibility shadows, rollback matrix, mixed-version cutover,
+> and `mess migrate` commands below are **not on the implementation roadmap and
+> will not be built**. Development proceeds from fresh stores instead: names are
+> already canonical `$registry` records in the log. Fjall retirement requires
+> auditing every remaining keyspace and making each role log-derived or
+> explicitly discardable, but it does not require migrating legacy stores. See
+> [design §20](../design.md#20-migration) for the current decision.
+>
+> This document remains intentionally intact as counterfactual architecture and
+> trap analysis. Its authority inventory, ordering rules, downgrade fences, and
+> data-loss cases are useful if Mess ever acquires persisted stores before a
+> future format transition. In the remainder, “must”, phase exits, and operator
+> commands describe that hypothetical legacy-store migration; they are not
+> commitments to ship migration machinery.
+
+## 0. Why this superseded plan is retained
+
+The plan identified a durable lesson even though its rollout is unnecessary:
+before deleting a persistence domain, classify every value as canonical,
+derivable, or operationally optional. At the time of writing, Fjall's name
+tables were the sole non-derivable authority. That finding led directly to the
+log-derived `$registry`; it did **not** justify carrying the rest of the
+migration program forward once the project confirmed that no stores exist.
+
+The remaining reusable traps are independent of this abandoned rollout:
+
+- a referenced numeric ID must always have an earlier canonical registration;
+- dedupe migration, if ever needed, requires full keys rather than fingerprints;
+- snapshot heads must not outrun durable blobs;
+- checkpoints must bind to the exact log prefix they summarize;
+- unknown on-disk versions must be refused, never skipped or truncated.
+
+---
+
+## Historical migration design (not scheduled)
+
 ## 1. Migration constraints
 
 The current store has three distinct truth classes:
@@ -335,4 +374,8 @@ mixed v3/v4 recovery and export are tested
 rollback/compatibility policy is documented and executable
 ```
 
-The migration is part of the storage engine, not an afterthought. The temporary Fjall name authority is the one place where the current “everything rebuildable from log” invariant does not yet hold; closing it safely is the prerequisite for the alien machinery.
+In the historical scenario this migration would have been part of the storage
+engine, not an afterthought. Its most important diagnosis has since been acted
+on: the temporary Fjall name authority was removed by making `$registry` part of
+the canonical log. With no legacy stores, none of the rollout machinery above
+is required.

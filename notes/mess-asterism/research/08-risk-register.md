@@ -12,24 +12,24 @@ Scale:
 | ID | risk | S | L | D | RPN | primary mitigation | kill/rollback trigger |
 |---|---|---:|---:|---:|---:|---|---|
 | R1 | v4 zero-event/control capsule weakens crash acceptance | 5 | 3 | 4 | 60 | mandatory batch-ID continuity, full CRC, epoch, exhaustive model, no resync | any control/event split or stale control acceptance |
-| R2 | removal of Fjall creates a second, buggy metadata implementation | 5 | 3 | 4 | 60 | canonical fold, shadow comparison, full-scan oracle, checkpoints discardable | persistent digest mismatch or bypassed oracle |
-| R3 | current authoritative name mappings lost during migration | 5 | 3 | 4 | 60 | canonical registry import with row-by-row verification before v4 writes | any referenced v3 ID unresolved |
+| R2 | fresh-store Fjall replacement diverges from the canonical log fold | 5 | 2 | 3 | 30 | one effect path, full-scan oracle, differential tests, checkpoints discardable | persistent digest mismatch or bypassed oracle |
+| R3 | **RETIRED:** authoritative name mappings lost during legacy-store migration | — | — | — | — | no legacy stores; names now live in canonical `$registry` records | re-open only if persisted pre-registry stores ever exist |
 | R4 | exact dedupe becomes probabilistic by accident | 5 | 3 | 4 | 60 | retain all same-fingerprint candidates; compare full key; forced-collision tests | any synthetic collision false negative |
 | R5 | snapshot install references non-durable blob | 5 | 2 | 5 | 50 | blob barrier before install capsule; crash model | any recovered head with unavailable promised blob |
-| R6 | checkpoint accepted for wrong log prefix | 5 | 2 | 5 | 50 | segment epoch/cursor/root anchor; fallback; corruption suite | checkpoint+suffix digest differs from full scan |
+| R6 | checkpoint accepted for the wrong prefix of a fresh store's canonical log | 5 | 2 | 4 | 40 | segment epoch/cursor/root anchor; fallback; corruption suite | checkpoint+suffix digest differs from full scan |
 | R7 | sequence-counter implementation has Rust UB/torn state | 5 | 2 | 5 | 50 | atomic fields only, Loom, bounded latch fallback | sanitizer/Loom issue or unexplained head pair |
 | R8 | single owner becomes CPU bottleneck | 3 | 4 | 2 | 24 | profile, preallocation, vectorized group validation, bulk mode | composed <85% bare log |
 | R9 | SealPack install ordering trusts missing/corrupt pack | 4 | 2 | 4 | 32 | pack durable+dir sync before footer, hash binding, raw fallback | any wrong read rather than fallback/error |
 | R10 | checkpoint page GC deletes live pages | 5 | 2 | 5 | 50 | durable reachability set, retain generations, interrupted-GC model | valid retained manifest references missing page |
 | R11 | static function returns wrong nonmember result | 5 | 3 | 4 | 60 | exact key comparison; optional structure only | any result path omits verification |
-| R12 | direct arrays explode on sparse/malicious IDs | 3 | 3 | 2 | 18 | writer-only dense allocator; import remapping; sparse page directory | external ID directly controls page index |
+| R12 | direct arrays explode on sparse/malicious IDs | 3 | 3 | 2 | 18 | writer-only dense allocator; validate/remap external IDs; sparse page directory | external ID directly controls page index |
 | R13 | Book removal regresses hot aggregate loads | 3 | 3 | 2 | 18 | bounded capsule/block caches; block-native views | >10% sustained hot-load regression without RSS win justification |
 | R14 | checkpoint/open still loads all names/heads and misses scale goal | 3 | 4 | 2 | 24 | resident/tiered profiles, compressed registry base, lazy pages | 100M-event open remains event-count proportional |
 | R15 | per-segment effects grow with events rather than touched keys | 3 | 3 | 2 | 18 | net final updates only; dedupe separately epoched | effect size exceeds declared per-key gate |
 | R16 | seal/checkpoint backlog grows without bound | 4 | 3 | 3 | 36 | bounded queues, backpressure/roll policy, operator alarms | unbounded disk/RSS or append outage |
 | R17 | async caller cancellation leaks completion/queue state | 3 | 3 | 3 | 27 | owner owns lifecycle; dropped receiver only; state-machine tests | committed capsule not published or queue slot leaked |
 | R18 | control TLV parser becomes attack surface | 5 | 3 | 3 | 45 | fixed caps, checked arithmetic, fuzz/Kani, frozen codec | panic/OOM/out-of-bounds on arbitrary bytes |
-| R19 | mixed v3/v4 recovery silently skips unknown version | 5 | 2 | 4 | 40 | stop/refuse unknown; per-segment dispatch; downgrade fence | old binary can write after v4 boundary |
+| R19 | unknown or mismatched segment version is silently skipped or opened writable | 5 | 2 | 4 | 40 | fail-closed decoder dispatch; v3-only open refusal; downgrade tests | any binary writes after encountering an unsupported version |
 | R20 | performance claims depend on warm cache/device state | 2 | 5 | 3 | 30 | cold/warm separate, interleaved runs, raw samples, device telemetry | result not reproducible within tolerance |
 
 ## 2. Correctness risks in detail
@@ -46,21 +46,31 @@ Scale:
 
 **Failure mode:** a fast path updates direct heads/dedupe differently from full recovery; a clean process appears correct until restart or a rare sequence.
 
-**Mitigation:** one `Effect` type and one application routine are used by live commit, suffix recovery, and shadow replay. The oracle has a separately implemented boring model. State digests are compared continuously in tests and sampled in shadow mode.
+**Mitigation:** one `Effect` type and one application routine are used by live
+commit and suffix recovery. The oracle has a separately implemented boring
+model. State digests are compared continuously in tests and against full-scan
+recovery; there is no legacy Fjall shadow-deployment phase to operate.
 
 **Operational response:** poison writes on a live digest mismatch. Do not “repair” by choosing the in-memory answer.
 
-### R3 — registry migration loss
+### R3 — registry migration loss (**retired**)
 
 **Failure mode:** v3 log bytes contain only numeric IDs; deleting Fjall name rows makes records uninterpretable.
 
-**Mitigation:** migration inventory scans every v3 referenced ID and proves it exists in the canonical import. Dense ID/name bijection and source digest are stored. Fjall is retired only after full reopen without it.
+**Retirement basis:** Mess has no existing stores to migrate, and names now live
+as canonical `$registry` records ordered before their first references. There
+are no legacy Fjall name rows to import or lose. The general lesson remains:
+never delete a persistence domain until every referenced ID resolves from an
+earlier canonical record. Re-open this risk if persisted pre-registry stores ever
+exist; do not silently revive the old M0–M9 plan.
 
 ### R4 — dedupe collision
 
 **Failure mode:** two keys share a compact fingerprint; an implementation stores only one, causing the other to be forgotten and a duplicate accepted.
 
-**Mitigation:** fingerprint maps to a run/list of candidates; full keys live in capsules/import records; every candidate is compared. Test hash function injection deliberately maps all keys to the same fingerprint.
+**Mitigation:** fingerprint maps to a run/list of candidates; full keys live in
+canonical records; every candidate is compared. Test hash function injection
+deliberately maps all keys to the same fingerprint.
 
 ### R5 — snapshot head outruns blob
 
@@ -74,6 +84,10 @@ Scale:
 
 **Mitigation:** manifest carries exact commit cursor, segment epoch, end global position, registry version, and cryptographic prefix/fold anchor. Validation cross-checks the canonical segment footer/chain. No heuristic “watermark only” match.
 
+**Narrowed scope:** there is no imported Fjall state or mixed-v3/v4 migration
+boundary to bind. The remaining risk is entirely within one fresh store: a
+checkpoint from one canonical prefix must never be paired with another suffix.
+
 ### R7 — publication races
 
 **Failure mode:** reader sees new version with old global position, follows a freed page, or loops indefinitely on a hot sequence counter.
@@ -85,6 +99,18 @@ Scale:
 **Failure mode:** a footer or manifest makes a partially installed artifact look complete, or GC removes still-referenced content.
 
 **Mitigation:** temp write, file barrier, rename, directory barrier, then durable reference; immutable content hashes; at least two retained checkpoint generations; GC from a durable reachability snapshot.
+
+### R19 — unknown-format open
+
+**Failure mode:** a v3-only binary encounters a v4 or otherwise unsupported
+segment and skips, truncates, or opens the directory writable. This can happen
+with fresh stores through binary downgrade, copied directories, or operator
+error; it does not require a fleet migration.
+
+**Mitigation:** decoder dispatch is fail-closed before any writable open. A
+v3-only binary must loudly refuse a store containing v4 segments, and unknown
+versions are never treated as an empty tail. Exercise downgrade and
+unknown-version fixtures even while v4 remains off by default.
 
 ## 3. Performance risks
 
@@ -108,7 +134,7 @@ writev for large payloads
 preallocated group/effect arenas
 bulk completion wakeups
 separate background seal/checkpoint
-range-reservation bulk API for trusted import
+range-reservation bulk API for trusted construction
 ```
 
 Do not shard the canonical log prematurely. If the owner cannot reach 85% of bare log, profile first. A sharded validation front end with one final ordered committer is a later option, but it increases state complexity.
@@ -220,7 +246,7 @@ state digest mismatch count (must stay zero)
 - Control/event length fields have hard caps and checked arithmetic before allocation.
 - Static-function builders run with memory/time budgets; hostile distributions fall back.
 - Registry names have byte-length and UTF-8/canonicalization rules; aliases cannot create ambiguous resolution silently.
-- Imported IDs are validated before allocating dense pages.
+- Externally supplied IDs are validated before allocating dense pages.
 - Corrupt sidecars cannot influence commit acceptance.
 - Decompression has output caps equal to authenticated uncompressed lengths.
 - CLI forensic modes avoid trusting filenames and advisory manifests.
@@ -234,13 +260,21 @@ state digest mismatch count (must stay zero)
 5. No performance optimization may disable CRC/hash validation in production paths.
 6. Every benchmark variant computes result identity.
 7. Every new background worker has bounded queues and shutdown/drain semantics.
-8. “Temporary” authorities are documented with a removal phase and migration test.
+8. “Temporary” authorities are documented with a removal condition and a
+   canonical rebuild proof.
 9. Fresh-paper mechanisms stay feature-gated until multiple architectures reproduce wins.
 10. The regression suite is a release requirement, not a research artifact.
 
 ## 7. Final risk posture
 
-The highest-risk part is not direct arrays or compressed directories. It is the v4 shift from event-only batches to mixed control/event capsules and the migration of currently authoritative names/dedupe/snapshot state. The plan intentionally delays that shift until the v3-compatible owner, no-Book reads, and SegmentEffect checkpoint prove the payoff.
+The legacy-store migration risk is retired: there are no users or existing
+stores, and names already live in the canonical log. The remaining Fjall roles
+still require an authority audit; no keyspace is deleted until it is
+log-derived or proven safely discardable. The highest remaining risks are
+therefore the v4 shift from event-only batches to mixed control/event capsules
+(if v4 is adopted), fail-closed handling of unsupported formats, exact
+replacement-state semantics, and accepting an accelerator or checkpoint for the
+wrong canonical prefix.
 
 The safest high-value subset is therefore:
 
@@ -248,7 +282,10 @@ The safest high-value subset is therefore:
 single owner on v3
 resident direct heads
 remove Book
-SegmentEffects/checkpoints derived from v3 + Fjall import
+SegmentEffects/checkpoints derived from the canonical log
 ```
 
-Even if v4 is rejected, that subset can materially improve startup, memory, and composed throughput while keeping Fjall only for the semantic states that v3 cannot encode.
+Even if v4 is rejected, that subset can materially improve startup, memory, and
+composed throughput. Fjall can be removed without a legacy migration only after
+the authority audit and proven replacements settle every remaining role; no
+import or compatibility rollout is implied.

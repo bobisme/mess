@@ -14,7 +14,7 @@ The central claim is:
 - [`research/03-succinct-indexes-and-dedupe.md`](research/03-succinct-indexes-and-dedupe.md) — dense tables, active microblocks, Elias–Fano, rank/select, PtrHash, k-perfect hashing, Ribbon retrieval, and exact epoch dedupe.
 - [`research/04-durability-media-and-file-layout.md`](research/04-durability-media-and-file-layout.md) — capsule durability, checkpoint atomicity, seal packs, SSD placement, ZNS/FDP paths, and failure handling.
 - [`research/05-benchmark-and-spike-plan.md`](research/05-benchmark-and-spike-plan.md) — falsifiable spikes, workloads, baselines, acceptance gates, and measurement discipline.
-- [`research/06-migration-plan.md`](research/06-migration-plan.md) — safe v3/Fjall-to-Asterism migration, shadow validation, rollback, and format transition.
+- [`research/06-migration-plan.md`](research/06-migration-plan.md) — **superseded historical** v3/Fjall migration and rollback analysis; retained for its authority inventory and data-loss traps, not as an implementation roadmap.
 - [`research/07-literature-map.md`](research/07-literature-map.md) — annotated primary-source map, including July 2026 work and explicit maturity warnings.
 - [`research/08-risk-register.md`](research/08-risk-register.md) — FMEA-style risk register and kill criteria.
 - [`research/09-wire-format-v4-sketch.md`](research/09-wire-format-v4-sketch.md) — byte-level sketch for commit capsules with engine-control preludes.

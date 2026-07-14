@@ -210,7 +210,9 @@ mess/
   LOCK
 ```
 
-Fjall remains available behind a compatibility feature during migration, but it is not part of the target steady-state architecture.
+Fjall remains an implementation dependency while its remaining roles are
+audited. Each role must become log-derived or be proven safely discardable
+before deletion; no legacy-store migration compatibility feature is planned.
 
 ---
 
@@ -281,9 +283,12 @@ Head(stream) : (first_stream_version - 1) ->
 
 At append time, the kernel validates the expected prior version. At recovery time, it verifies that the recorded transition continues the reconstructed stream head. A gap or overlap is corruption even if the capsule CRC was somehow recomputed by a malicious actor; with the optional fold chain enabled, the content is additionally tamper-evident.
 
-### 5.5 Compatibility path
+### 5.5 V3 implementation path
 
-The initial state-kernel spike does not require v4. It can derive head/dedupe effects from v3 batches and keep name registration in the temporary Fjall path. The v4 prelude is justified only after the in-memory kernel proves its foreground advantage.
+The initial state-kernel work does not require v4. It can derive head/dedupe
+effects from v3 batches, while name registration already comes from the
+canonical `$registry` stream. The v4 prelude is justified only after the
+in-memory kernel proves its foreground advantage.
 
 ---
 
@@ -1233,47 +1238,56 @@ Combine current sidecars. **Gate:** identical payloads/pointers, fewer opens/ins
 
 Full stack under one API and one crash harness. **Gate:** all targets that matter to the product, not isolated microbench wins.
 
-The project should not begin the irreversible v4 migration before A–D prove that the in-memory and recovery architecture is worth the format cost.
+The project should not make v4 the fresh-store default before A–D prove that the
+in-memory and recovery architecture is worth the format cost. This is a format
+admission gate, not a migration phase; see §20.
 
 ---
 
 ## 20. Migration
 
-### 20.1 Preserve current names first
+### 20.1 Status: no migration program
 
-The current implementation’s name tables are authoritative and not derivable from v3 log bytes. Before Fjall can be removed, export every `(id, name, category/type metadata)` mapping into a canonical registry import record or v4 control capsules. The migration must verify a bijection and dense-ID continuity.
+As confirmed on 2026-07-13, Mess has no users and no existing stores. There is
+therefore no installed v3/Fjall corpus to preserve, shadow, import, roll back, or
+upgrade in place. The M0–M9 program in
+[Research 06](research/06-migration-plan.md) is superseded and retained only as
+historical architecture and data-loss-trap analysis. Its `mess migrate`
+commands, compatibility releases, mixed-version cutover, and rollback tooling
+will not be implemented.
 
-### 20.2 Shadow state kernel
+Development uses fresh stores. Fjall retirement is consequently an authority
+audit plus direct implementation change, not a legacy-store migration:
 
-Run Fjall and Asterism state side by side:
+1. stream and event-type names are already canonical `$registry` records in the
+   log, so Fjall no longer holds the non-rebuildable name authority that
+   originally required an import;
+2. every remaining Fjall keyspace must be audited for hidden authority, then
+   made log-derived or proven safely discardable before it is deleted;
+3. no temporary Fjall compatibility view or shadow-write release is required;
+4. v4, if adopted, is a format decision for fresh stores rather than an upgrade
+   path for a legacy fleet.
 
-```text
-append -> canonical v3 log
-       -> current publish/Fjall
-       -> shadow state-kernel effect
-```
+Book retirement and the single-owner append path were implementation steps, not
+migration phases. Their correctness remains covered by recovery, differential,
+crash, and cancellation tests rather than a legacy-store shadow deployment.
 
-Compare heads, dedupe answers, snapshot heads, checkpoints, and registry digest continuously. Shadow mismatches fail tests and emit fatal diagnostics in development builds.
+### 20.2 Lessons retained from the historical plan
 
-### 20.3 Read cutover
+Removing the rollout does not erase the hazards it exposed. Any future change
+that deletes or replaces persistent state must still:
 
-1. serve head reads from the direct table, compare sampled results to Fjall;
-2. serve dedupe from epochs, compare every result during soak;
-3. serve snapshot/checkpoint heads from slots;
-4. stop writing the corresponding Fjall keyspaces one at a time;
-5. retain a rebuild/verification command that can reconstruct a temporary Fjall view for one or two releases.
+- inventory which values are canonical versus rebuildable before deletion;
+- prove every numeric ID resolves from earlier canonical log state;
+- preserve full dedupe keys if state ever crosses an authority boundary;
+- order durable snapshot blobs before the heads that promise them;
+- bind checkpoints to the exact canonical log prefix and fall back on mismatch;
+- refuse unknown on-disk versions instead of skipping, truncating, or silently
+  downgrading them.
 
-### 20.4 Book removal
-
-Introduce block-native reads behind the existing API, then stop adding new payloads to the Book, then remove Book recovery. This can land before v4.
-
-### 20.5 Format v4
-
-Create a new segment at the version boundary. v3 segments remain readable and get synthetic effects during seal/rebuild. New v4 segments use control preludes. The log is a sequence of format-versioned segments; no in-place rewrite is required.
-
-### 20.6 Rollback
-
-Before v4 becomes default, retain a build mode that writes v3 plus Fjall. Once a store writes v4 control capsules, older binaries must refuse read-write open and may support explicit read-only export. Silent downgrade is forbidden.
+If persisted stores exist before some future incompatible transition, that is a
+new product decision. Research 06 is input to a newly scoped plan, not a dormant
+roadmap to activate unchanged.
 
 ---
 
@@ -1281,7 +1295,11 @@ Before v4 becomes default, retain a build mode that writes v3 plus Fjall. Once a
 
 ### 21.1 Complexity moves into Mess
 
-Removing Fjall means Mess owns metadata concurrency, checkpoint formats, dedupe indexing, and migration. This is justified only by end-to-end wins and stronger single-authority semantics. A pile of clever microstructures that does not improve the composed path should be deleted.
+Removing Fjall means Mess owns metadata concurrency, checkpoint formats, dedupe
+indexing, and rebuild verification. With no existing stores, it does not also
+require a compatibility migration layer. The replacement is justified only by
+end-to-end wins and stronger single-authority semantics. A pile of clever
+microstructures that does not improve the composed path should be deleted.
 
 ### 21.2 Dense IDs are a contract
 
