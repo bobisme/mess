@@ -8,6 +8,7 @@ The central claim is:
 
 ## Documents
 
+- [`../../docs/adr/0002-asterism-capability-authority.md`](../../docs/adr/0002-asterism-capability-authority.md) — accepted bounded decision: discardable snapshot packs are selected; projection checkpoints and exact batch idempotency remain optional decisions with frozen authority/encoding constraints; v4 remains a separate gate.
 - [`design.md`](design.md) — the complete proposed architecture, on-disk model, algorithms, invariants, performance targets, and go/no-go criteria.
 - [`research/01-current-engine-and-fjall-gap.md`](research/01-current-engine-and-fjall-gap.md) — current code-path analysis and where the remaining cost actually lives.
 - [`research/02-algebraic-state-kernel.md`](research/02-algebraic-state-kernel.md) — state-transition algebra, segment effects, parallel recovery, and proof obligations.

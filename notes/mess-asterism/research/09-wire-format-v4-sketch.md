@@ -1,5 +1,12 @@
 # Research 09: v4 commit-capsule wire-format sketch
 
+> **Product-admission note (2026-07-14):** ADR 0002 does not itself admit
+> `DedupeKeyV1`, `SnapshotInstalledV1`, or `ProjectionCheckpointV1` as product
+> capabilities. Their proven codecs remain format research. Snapshot discovery
+> uses a discardable sidecar; `bn-11mk` and `bn-2ctq` own the optional
+> projection and exact batch-idempotency decisions. V4 itself remains subject
+> to the separate `bn-1ojm` gate.
+
 **Status:** non-normative spike specification.  
 **Purpose:** make the control-prelude idea concrete enough for a byte-compatible prototype and crash model.  
 **Rule:** this document does not supersede v3 `docs/spec/01-log-format.md` until the exhaustive and randomized gates pass.

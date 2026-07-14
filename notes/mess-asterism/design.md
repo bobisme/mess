@@ -1,6 +1,9 @@
 # Design: Asterism, a log-derived state kernel for Mess
 
-**Status:** research design; implementation requires the spike gates in §19  
+**Status:** research design; capability authority amended by
+[ADR 0002](../../docs/adr/0002-asterism-capability-authority.md); implementation
+requires the spike gates in §19
+
 **Target repository:** `bobisme/mess`, inspected at commit `43e4aca0192f01bb47670627f41182bca182759e`  
 **Date:** 2026-07-11  
 **Scope:** single-node embedded/server storage; canonical event log, exact metadata, snapshots, replay, subscriptions, and future media placement  
@@ -17,6 +20,15 @@ read as saying that v4 is adopted or enabled by default.
 ---
 
 ## 0. Decision in one page
+
+> **Post-audit capability boundary (2026-07-14).** ADR 0002 is normative where
+> this older target design groups snapshot installs, projection checkpoints,
+> exact dedupe, and registry controls together. Registry remains canonical.
+> Snapshot discovery is implemented as immutable self-describing packs with
+> discardable discovery metadata. Projection checkpoints and exact batch
+> idempotency remain optional decisions in `bn-11mk` and `bn-2ctq`; neither is
+> a prerequisite for Fjall deletion. V4 remains a separate decision at
+> `bn-1ojm`.
 
 Fjall was the correct choice for Mess when the problem was “we need a fast, safe, pure-Rust exact metadata store while the custom log stabilizes.” The next performance step is **not** to build a slightly faster Fjall. It is to delete the generic KV problem from the hot path.
 
@@ -451,6 +463,12 @@ A simpler alternative—two copies plus an atomic active-copy selector—is also
 
 ### 7.3 Snapshot and checkpoint heads
 
+**Capability amendment:** the structures below remain design alternatives, not
+automatically admitted resident components. ADR 0002 keeps snapshot discovery
+in a discardable sidecar. Projection checkpoints remain application-owned
+unless `bn-11mk` admits a canonical product capability. Do not build dense
+snapshot/projection slots without an admitted consumer.
+
 A snapshot-head cell need not store a variable-length pointer. Store an atomic `SnapshotSlot` into an append-only snapshot directory:
 
 ```rust
@@ -550,6 +568,12 @@ Let kernel state be:
 ```text
 K = H × S × P × R × D
 ```
+
+**Capability amendment:** the production fold currently admits `H` and `R`
+(plus required allocator/frontier bookkeeping). ADR 0002 excludes `S` because
+snapshot discovery is a discardable sidecar. `P` and `D` remain conditional on
+the product decisions in `bn-11mk` and `bn-2ctq`. The product notation above is
+a superset, not required Phase-7 state.
 
 where:
 
@@ -881,6 +905,11 @@ The chooser may use benchmark-calibrated CPU coefficients, but the chosen repres
 
 ## 13. Exact epoch dedupe without mutable KV deletion
 
+> **Optional, not yet admitted.** Spike G proved this component mechanically,
+> but `bn-2ctq` owns the exact batch-idempotency product decision. Keep this
+> section as research input; do not implement it, add canonical keys, or block
+> Fjall deletion unless that bone selects ADMIT.
+
 ### 13.1 Define the semantic window
 
 Asterism makes dedupe extent explicit:
@@ -892,10 +921,17 @@ WindowByGlobalPosition { span: W }
 At durable event end `w`, a prior key is a duplicate iff its committed position `p` satisfies:
 
 ```text
-p >= w - W
+p >= w.saturating_sub(W)
 ```
 
-A retry after expiry may append a duplicate and is documented as such. Time-based policies can be built later using an event-time index, but global-position windows are deterministic under recovery.
+Positions and `w` are zero-based and inclusive, and `W` must be nonzero. When
+`w < W`, the window begins at zero. A key exactly at the window start remains
+live; a segment covering `[base, end_exclusive)` is reclaimable for dedupe only
+when `end_exclusive <= window_start`. Equivalently, an inclusive segment end
+must be strictly less than `window_start`. A retry after expiry may append a
+duplicate and is documented as such. Time-based policies can be built later
+using an event-time index, but global-position windows are deterministic under
+recovery.
 
 ### 13.2 Store full keys once
 
@@ -1001,34 +1037,89 @@ Admission uses measured reuse or TinyLFU-style frequency estimates; correctness 
 
 ## 15. Snapshots without one file per version
 
+> **Install amendment:** ADR 0002 selects immutable self-describing packs plus
+> discardable, atomically published copy-on-write discovery roots. The
+> canonical `SnapshotInstalled` capsule from the original research proposal is
+> not admitted in v3 or v4. The remainder of this section summarizes the
+> amended sidecar; ADR 0002 is normative. Missing or corrupt discovery state
+> falls back to full replay.
+
 ### 15.1 Snapshot packs
 
-Append snapshot blobs to large immutable snapshot pack files:
+One OS-locked writer appends independently commit-framed records to one active
+footerless `.open` pack. Offline readers are strictly read-only and use bounded
+exact-range reads. Each record carries stable author-supplied
+aggregate/schema, fold, and codec identity; coverage ordered as
+`Empty < Through(0) < Through(1) ...`; trust mode; and exact
+`(store UUID, PackId, offset, length, record hash)` binding.
 
 ```text
-SnapshotPackHeader
-BlobRecord*
-PackIndex / Footer
+active: SnapshotPackHeader + CommittedRecord*
+sealed: SnapshotPackHeader + CommittedRecord* + PackIndex + Footer
 ```
 
-A blob record carries stream ID, covered version, codec, fold version, state hash, prefix hash, length, and checksum. Packs roll by size and are sealed like event segments.
+Roll appends and syncs the index/footer, renames to `.pack`, syncs the
+directory, and never appends to that sealed pack again. UUID-scoped IDs are
+never reused, so stale descriptors cannot observe ABA.
 
 ### 15.2 Install protocol
 
-1. append the blob record;
-2. make the blob durable according to snapshot durability policy;
-3. append a `SnapshotInstalled` control capsule referencing `(pack_id, offset, len, hashes)`;
-4. after that capsule is durable, publish the stream’s atomic snapshot slot.
+1. append and validate complete record frames under the shared writer owner;
+2. copy-on-write only changed discovery-tree leaves and paths;
+3. in `Durable` mode, compare the whole reachable root closure with a prior
+   acknowledged durable root/checksummed durable-proof ledger and promote every
+   unproven pack frontier, page/file, and creation/rename directory entry;
+4. durably publish the proof ledger, then sync and rename a small independently
+   resolvable UUID/generation root that marks complete-closure durability and
+   binds the proof generation/closure hash, then sync its directory;
+5. publish in-process and acknowledge only after the complete closure survives.
 
-A crash between 2 and 3 leaves an orphan blob. A crash after 3 has both blob and head. There is no head that can outrun its blob.
+`Buffered` is the default discardable-cache mode and makes no power-loss
+promise. `Durable` promises the ordered barriers above for every head reachable
+from the root, not just the newly saved head. A Buffered page/record inherited
+by a later Durable root is promoted even when it belongs to another key. An
+existing content-addressed page whose write was skipped still needs file and
+directory promotion unless a prior durable proof covers it; a newly created
+active `.open` pack needs its creation directory synced. Clone saves may group
+under bounded count/bytes/deadline policy; any durable member makes the whole
+group durable. Promotion bytes/files/frontiers and data, directory, ledger, and
+root barriers are measured. No save rewrites a flat all-head manifest.
 
 ### 15.3 Recovery and corruption
 
-Snapshot heads are part of the kernel fold/checkpoint. If a blob checksum, state hash, fold version, or prefix certificate fails, walk the previous snapshot chain or replay from the log. The event log remains authoritative.
+If a root/page/frame, compatibility identity, codec, or semantic certificate
+fails, try an explicitly retained older root/candidate or replay from the log.
+At equal coverage, validate the current record first: an invalid record may be
+repaired, an identical valid record is idempotent, and a different valid record
+is a conflict. Unverified cache mode omits both semantic hashes; certified mode
+requires both, but even a record hash plus semantic hashes is not proof that a
+malicious writer executed the fold. The event log remains authoritative.
+
+Ordinary open and point lookup never enumerate all heads. Doctor, inspect, and
+retention use a pinned-root `scan_snapshots(cursor, limit)` seam: the pin holds
+a shared deletion lease on one UUID/generation, the opaque cursor is bound to
+that root and last tree position, and capped pages use memory bounded by tree
+height plus `limit`. Diagnostics may explicitly report a validated partial
+scan. Destructive retention requires a complete corruption-free traversal and
+same-root revalidation; cursor mismatch, lost pin, or a corrupt/missing page
+fails closed. The one-million-head full scan has explicit wall-time and peak-
+RSS gates in addition to ordinary point-lookup gates.
 
 ### 15.4 Retention
 
-Snapshot packs make deletion segment-like: retain packs containing live heads or configured history. Fold-certificate frame/anchor requirements remain explicit blockers. Orphan blobs and obsolete snapshot versions are reclaimed by whole-pack rewrite only when the savings exceed a threshold; no foreground compaction exists.
+Retain at least two complete root generations. Under the writer lock, GC first
+promotes the complete reachable closure and acknowledges a new Durable root;
+graph readability alone is not sufficient. It then validates every additional
+retained root graph, prunes old roots and unconditionally syncs that directory,
+and only then deletes sealed packs/pages unreachable from remaining roots plus
+the active pack. It unconditionally syncs all deletion directories before
+completion.
+This destructive ordering applies even when ordinary snapshot saves are
+`Buffered`; buffered GC may defer deletion but cannot prune non-durably and
+then reclaim. A promotion/root failure prevents pruning and a prune barrier
+failure prevents dependent deletion. Crashes can leave extra roots or orphans;
+the GC Durable root remains fully resolvable. Snapshot roots never authorize
+event-log deletion.
 
 ---
 

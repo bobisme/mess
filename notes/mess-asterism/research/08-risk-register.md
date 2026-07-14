@@ -14,13 +14,13 @@ Scale:
 | R1 | v4 zero-event/control capsule weakens crash acceptance | 5 | 3 | 4 | 60 | mandatory batch-ID continuity, full CRC, epoch, exhaustive model, no resync | any control/event split or stale control acceptance |
 | R2 | fresh-store Fjall replacement diverges from the canonical log fold | 5 | 2 | 3 | 30 | one effect path, full-scan oracle, differential tests, checkpoints discardable | persistent digest mismatch or bypassed oracle |
 | R3 | **RETIRED:** authoritative name mappings lost during legacy-store migration | — | — | — | — | no legacy stores; names now live in canonical `$registry` records | re-open only if persisted pre-registry stores ever exist |
-| R4 | exact dedupe becomes probabilistic by accident | 5 | 3 | 4 | 60 | retain all same-fingerprint candidates; compare full key; forced-collision tests | any synthetic collision false negative |
-| R5 | snapshot install references non-durable blob | 5 | 2 | 5 | 50 | blob barrier before install capsule; crash model | any recovered head with unavailable promised blob |
+| R4 | **CONDITIONAL:** admitted exact dedupe becomes probabilistic by accident | 5 | 3 | 4 | 60 | retain all same-fingerprint candidates; compare full canonical key; forced-collision tests | any synthetic collision false absorb/miss |
+| R5 | discardable snapshot discovery publishes missing, misidentified, non-durable-closure, or semantically overclaimed pack bytes | 4 | 2 | 4 | 32 | exclusive writer; UUID/PackId; commit frames; complete-closure durable proof; explicit trust mode; corruption always falls back | any snapshot changes the result vs full replay or makes canonical reads unavailable |
 | R6 | checkpoint accepted for the wrong prefix of a fresh store's canonical log | 5 | 2 | 4 | 40 | segment epoch/cursor/root anchor; fallback; corruption suite | checkpoint+suffix digest differs from full scan |
 | R7 | sequence-counter implementation has Rust UB/torn state | 5 | 2 | 5 | 50 | atomic fields only, Loom, bounded latch fallback | sanitizer/Loom issue or unexplained head pair |
 | R8 | single owner becomes CPU bottleneck | 3 | 4 | 2 | 24 | profile, preallocation, vectorized group validation, bulk mode | composed <85% bare log |
 | R9 | SealPack install ordering trusts missing/corrupt pack | 4 | 2 | 4 | 32 | pack durable+dir sync before footer, hash binding, raw fallback | any wrong read rather than fallback/error |
-| R10 | checkpoint page GC deletes live pages | 5 | 2 | 5 | 50 | durable reachability set, retain generations, interrupted-GC model | valid retained manifest references missing page |
+| R10 | checkpoint/snapshot page GC deletes live pages | 5 | 2 | 5 | 50 | complete-closure Durable GC root, immutable IDs, ordered prune/delete, interrupted-GC model | acknowledged durable retained root references missing page |
 | R11 | static function returns wrong nonmember result | 5 | 3 | 4 | 60 | exact key comparison; optional structure only | any result path omits verification |
 | R12 | direct arrays explode on sparse/malicious IDs | 3 | 3 | 2 | 18 | writer-only dense allocator; validate/remap external IDs; sparse page directory | external ID directly controls page index |
 | R13 | Book removal regresses hot aggregate loads | 3 | 3 | 2 | 18 | bounded capsule/block caches; block-native views | >10% sustained hot-load regression without RSS win justification |
@@ -72,11 +72,52 @@ exist; do not silently revive the old M0–M9 plan.
 canonical records; every candidate is compared. Test hash function injection
 deliberately maps all keys to the same fingerprint.
 
-### R5 — snapshot head outruns blob
+**Decision status:** this risk is conditional. ADR 0002 leaves exact batch
+idempotency optional and routes ADMIT/DECLINE to `bn-2ctq`; dormant Fjall
+dedupe does not block deletion. If admitted, `bn-2ctq` must also freeze atomic
+key+event encoding, retention, retry-result, authorization, allocation caps,
+and composed A/B evidence before this component ships.
 
-**Failure mode:** install capsule survives but blob does not, making the latest head unusable.
+### R5 — snapshot publication outruns or overclaims bytes
 
-**Mitigation:** durable blob first. The install capsule includes blob hash and pack/offset. A snapshot durability mode cannot exceed blob durability. On checksum failure, fall back to previous snapshot/full replay and mark suspect.
+**Failure mode:** discovery becomes visible while referenced pack bytes are
+partial/missing, belong to a reused filename or another stream/schema, or are
+only physically checksummed but presented as proof of a correct fold. A second
+writer or flat all-head rewrite can also lose an otherwise valid concurrent
+head.
+
+**Mitigation:** ADR 0002 admits one OS-locked writer owner shared by all clones,
+non-reused `(store UUID, PackId)` identities, independently commit-framed build
+records, sealed-pack roll ordering, and immutable content-addressed discovery
+pages under an independently resolvable generation root. `Buffered` and
+`Durable` publication are explicit. `Durable` means complete-root survival: it
+promotes every reachable pack frontier/page plus creation/rename directory
+entry not proven by a prior acknowledged Durable root or synced proof ledger.
+This includes unrelated state inherited from Buffered roots, existing
+content-addressed pages whose writes were skipped, and a new active `.open`
+pack directory entry. Readability or hash equality alone is not durability.
+Any failed promotion, ledger/root barrier, validation, unknown sidecar version,
+or corrupt page prevents acknowledgement or selects an older root/full replay
+without blocking canonical reads. Equal coverage first validates the current
+record, allowing corrupt-current repair while rejecting a different valid
+state.
+
+Discovery is keyed by stream plus stable author-supplied aggregate/schema,
+fold, and codec identities; compiler names and unstable hashes are forbidden.
+Coverage orders `Empty < Through(0) < Through(1) ...`. Copy-on-write updates
+are bounded by changed paths rather than `O(all heads)`, and pack GC validates
+every retained root graph before pruning roots and only then deletes unreachable
+sealed content. UUID and pack ID non-reuse make stale-FD outcomes old-correct or
+miss/replay, never ABA.
+
+The physical record hash is not a fold proof. `UnverifiedCache` omits both
+semantic hashes and assumes an honest producer. `CertifiedSnapshotRef` requires
+and validates both state and canonical prefix hashes, but still cannot prove a
+malicious writer executed the fold; that threat requires replay-and-compare or
+a future proof system. Exactly one semantic hash is invalid.
+
+Snapshot discovery remains acceleration, not authority. It emits no v3/v4
+`SnapshotInstalled` record and cannot authorize deletion of canonical events.
 
 ### R6 — false checkpoint anchor
 
@@ -96,9 +137,31 @@ checkpoint from one canonical prefix must never be paired with another suffix.
 
 ### R9/R10 — accelerator install/GC
 
-**Failure mode:** a footer or manifest makes a partially installed artifact look complete, or GC removes still-referenced content.
+**Failure mode:** a footer/root makes a partially installed artifact look
+complete, a Durable root reuses Buffered-only bytes that disappear after power
+loss, or GC mistakes a readable but non-durable graph for a safe deletion
+anchor. A corrupt administrative traversal can also omit a live reference from
+a destructive retention decision.
 
-**Mitigation:** temp write, file barrier, rename, directory barrier, then durable reference; immutable content hashes; at least two retained checkpoint generations; GC from a durable reachability snapshot.
+**Mitigation:** temp write, file barrier, rename, directory barrier, then durable
+reference; immutable content hashes and UUID-scoped IDs; at least two retained
+root generations. Reuse without I/O requires an exact prior acknowledged
+Durable-root/ledger proof; otherwise existing pages, pack frontiers, and their
+creation/rename directories are promoted before root acknowledgement.
+Destructive GC is a durability boundary independent of save mode: under the
+writer lock it first publishes a new Durable root with complete durable
+closure, then validates additional retained graphs, prunes obsolete roots and
+syncs the root directory, and only then deletes unreachable sealed content and
+syncs every deletion directory. A promotion/root failure prevents pruning; a
+failed prune barrier aborts before content deletion. `Buffered` may defer
+reclamation but cannot weaken this ordering. The active build pack is never
+collected.
+
+Administrative enumeration pins one root with a shared deletion lease and uses
+root-bound capped cursors with bounded memory. Doctor/inspect may label a scan
+partial; retention must complete and revalidate the same root with no corrupt
+page or cursor error before mutation. A one-million-head full traversal has
+wall-time/RSS evidence.
 
 ### R19 — unknown-format open
 
@@ -237,6 +300,13 @@ SealPack/effect fallback counts
 dedupe epoch/filter candidate rates
 seqlock retries/slow-path count
 cache hit/miss/eviction bytes
+snapshot save group count/bytes/deadline and barrier count
+snapshot root update bytes/pages and retained generations
+snapshot durable-closure promotion bytes/files/pack frontiers
+snapshot data/directory/proof-ledger/root barrier counts
+snapshot administrative scan entries/pages/wall time/peak RSS/partial count
+snapshot unverified/certified/invalid record counts
+snapshot same-coverage repair/conflict counts
 state digest mismatch count (must stay zero)
 ```
 
