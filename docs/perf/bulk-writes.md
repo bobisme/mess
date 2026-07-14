@@ -75,36 +75,43 @@ any single round trip cheaper.
 
 ### 2.1 Why it's safe
 
-`LogEngine`'s per-stream [`AppendGate`](../../crates/mess-store/src/engine.rs)
-(bn-1s0) serialises the check-head → append → publish critical section **per
-stream**, not store-wide:
+`LogEngine`'s flat append owner
+([`engine.rs`](../../crates/mess-store/src/engine.rs)) serialises validation,
+commit, and publication in dequeue order without holding a producer-side
+store-wide mutex across a durability barrier.
 
-> Serialises the check-head → reserve critical section **per stream**, so
-> appends to different streams no longer queue behind one lock while an
-> `Exact(v)` race on the *same* stream still resolves to exactly one winner.
-
-Two commands to two different stream ids never contend for the same shard's
-version check (mod a bounded, non-correctness-affecting shard collision —
-`APPEND_GATE_SHARDS = 256`), so there is no `AppendError::Conflict` risk
-between them at all. And the durable committer itself is a **single gather
-point per store** (`docs/spec/03-durability.md` §2.4-§2.5) that never holds
-the append path across the barrier — which is precisely what lets
-concurrently in-flight requests, from any streams, coalesce into one
-`fdatasync` "for free":
+The owner flushes and re-plans before validating a repeated stream, so an
+`Exact(v)` race on one stream still has exactly one winner. Distinct streams
+can instead occupy one owner group and one direct-committer call. That direct
+committer is the **single durability point per store**
+(`docs/spec/03-durability.md` §2.4-§2.5), and one `fdatasync` covers every
+batch in the group:
 
 > This property ... is what gives group commit its pipelining for free ...
 > an explicit pipeline stage ... produced **no additional win** over
 > inline-barrier code, because a design that already never holds the append
 > path across the barrier gets the overlap automatically.
 
-`crates/mess-store/tests/engine_append_gate.rs`'s
-`distinct_streams_overlap_under_durable_commit_path` proves this directly one
-layer down (raw `append_batch`, not the `command` facade): K concurrent
-appends to K distinct streams under a real durability barrier are at least
-2x faster than the same K appends run sequentially, because the committer
-coalesces them into far fewer `fdatasync` calls. §6 below proves the same
-thing at the `EventStore::command` layer, plus the safety claim the raw-level
-test doesn't need to make (no `decide`/retry loop down there).
+`engine::append_gate_tests::distinct_streams_overlap_under_durable_commit_path`
+proves the underlying structure directly one layer down (raw `append_batch`,
+not the `command` facade). Its private, `cfg(test)`-only rendezvous parks the
+owner after the first intent has crossed the bounded channel, waits until all
+K intents have crossed that same admission boundary, then releases that exact
+owner-visible cohort. Exact committer counters prove K hot batches become one
+commit group and one `fdatasync`; the fully awaited control produces exactly K
+singleton groups. The rendezvous and all of its state are absent from release
+builds.
+
+That is a structural capability proof, not a promise that arbitrary production
+task scheduling always puts K near-simultaneous calls into one group (or even
+at most K/2 groups). Without the test rendezvous, coalescing quality depends on
+when producers reach the owner relative to its gather window, host load, batch
+size, and the configured delay/byte caps. The committer metrics remain exact
+observations of whatever grouping occurred; tune bounded concurrency from
+those observations rather than treating a group-count ratio as an engine
+invariant. §6 below measures the higher-level `EventStore::command` speedup and
+makes the safety claim the raw-level test doesn't need to make (no
+`decide`/retry loop down there).
 
 ### 2.2 The pattern
 
@@ -167,15 +174,16 @@ can hold (§4 below explains why "more" isn't "faster" past that point).
 
 ### 2.3 Why NOT same-stream concurrency
 
-The per-stream `AppendGate` makes *distinct*-stream concurrency safe; it does
+The flat owner makes *distinct*-stream concurrency safe to group; it does
 **not** make *same*-stream concurrency fast. If N commands race the same
 stream:
 
 1. All N call `load`, most of them observing the *same* version (whichever
    racer's `append_batch` hasn't landed yet).
 2. All N call `decide` against that state — wasted work for every loser.
-3. All N call `append_batch` at the same expected version. The `AppendGate`
-   still resolves this to exactly one winner (that's its whole job — see
+3. All N call `append_batch` at the same expected version. The owner flushes
+   and re-plans repeated-stream intents, resolving this to exactly one winner
+   (see
    `engine_append_gate.rs`'s `same_stream_exact_version_race_has_exactly_one_winner`,
    which proves exactly-one-winner and exactly-correct-conflict-actual for
    32 racers on one stream) — but every loser gets
@@ -227,8 +235,8 @@ different axis from pipelining, and the two compose rather than substitute:
   already pays, so `command_cached` buys nothing over plain `command` for
   that shape.
 - **Doesn't make same-stream fan-out safe**: concurrent `command_cached`
-  calls against the same stream race the identical `AppendGate` version
-  check as plain `command` and degrade into the same optimistic-retry
+  calls against the same stream race the identical owner-side version check
+  as plain `command` and degrade into the same optimistic-retry
   contention (§2.3) — cheaper per retry, but not a different *pattern*, and
   the module's own doc comment says as much (quoted above).
 
@@ -293,13 +301,13 @@ overwhelming cost even at 23x speedup):
    not free, and it's paid once per command regardless of pipelining. A
    batch API that knows *up front* which streams are new (skip the read
    entirely) or that fuses many streams' `decide` outputs into one
-   already-locked committer submission (skipping N separate `AppendGate`
-   acquisitions in favor of one) could shave that residual per-command
+   owner submission (skipping N separate producer submissions in favor of
+   one) could shave that residual per-command
    overhead further. This is speculative and unmeasured — nothing in this
    bone's numbers shows it's the bottleneck (the barrier still dominates by
    1-2 orders of magnitude at present event sizes) — and it would need its
-   own design pass against `crates/mess-store/src/engine.rs`'s `AppendGate`/
-   `PublishSequencer` machinery before it's more than a hunch. File-worthy
+   own design pass against `crates/mess-store/src/engine.rs`'s flat-owner
+   machinery before it's more than a hunch. File-worthy
    only once a real workload's profile points at per-command scheduling/read
    overhead specifically, not before.
 

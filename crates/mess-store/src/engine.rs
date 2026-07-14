@@ -1201,6 +1201,141 @@ impl Drop for InFlightGuard {
     fn drop(&mut self) { self.0.fetch_sub(1, Ordering::AcqRel); }
 }
 
+/// One-shot, test-only rendezvous at the append owner's admission boundary.
+///
+/// The owner removes the first intent from the 1,024-slot channel and parks
+/// before gathering. Producers then admit the remaining intents (the test
+/// cohort is deliberately much smaller than `OWNER_RING_CAPACITY + 1`) and
+/// wake the owner only when the complete cohort is visible to `gather`.
+/// Every part of this seam is compiled out of non-test builds.
+#[cfg(test)]
+#[derive(Default)]
+struct TestOwnerCohortGate {
+    state: TestOwnerCohortMutex,
+    ready: std::sync::Condvar,
+}
+
+#[cfg(test)]
+type TestOwnerCohortMutex = Mutex<TestOwnerCohortState>;
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestOwnerCohortState {
+    generation: u64,
+    armed:      Option<TestOwnerCohort>,
+}
+
+#[cfg(test)]
+struct TestOwnerCohort {
+    expected: usize,
+    admitted: usize,
+}
+
+#[cfg(test)]
+impl TestOwnerCohortGate {
+    fn arm(self: &Arc<Self>, expected: usize) -> TestOwnerCohortGuard {
+        assert!(expected > 0, "owner cohort must contain an intent");
+        assert!(
+            expected <= OWNER_RING_CAPACITY + 1,
+            "owner can park one received intent plus at most the channel's \
+             {OWNER_RING_CAPACITY} queued intents"
+        );
+        let mut state = self.state.lock().expect("owner cohort gate lock");
+        assert!(state.armed.is_none(), "owner cohort gate already armed");
+        state.generation = state.generation.wrapping_add(1);
+        let generation = state.generation;
+        state.armed = Some(TestOwnerCohort { expected, admitted: 0 });
+        TestOwnerCohortGuard { gate: Arc::clone(self), generation }
+    }
+
+    /// Record an intent only after the bounded owner channel owns it, while
+    /// its producer-side in-flight guard is still held.
+    fn record_admitted(&self) {
+        let mut state = self.state.lock().expect("owner cohort gate lock");
+        let Some(cohort) = state.armed.as_mut() else { return };
+        cohort.admitted += 1;
+        assert!(
+            cohort.admitted <= cohort.expected,
+            "more intents admitted than the armed test cohort"
+        );
+        self.ready.notify_all();
+    }
+
+    fn wait_until_admitted(&self, at_least: usize) {
+        let mut state = self.state.lock().expect("owner cohort gate lock");
+        assert!(
+            state
+                .armed
+                .as_ref()
+                .is_some_and(|cohort| at_least <= cohort.expected),
+            "admission wait must target the armed cohort"
+        );
+        while state
+            .armed
+            .as_ref()
+            .is_some_and(|cohort| cohort.admitted < at_least)
+        {
+            state = self.ready.wait(state).expect("owner cohort gate wait");
+        }
+        assert!(
+            state
+                .armed
+                .as_ref()
+                .is_some_and(|cohort| cohort.admitted >= at_least),
+            "owner cohort was disarmed before the requested admission"
+        );
+    }
+
+    /// Park the owner after its first receive and before `gather` until the
+    /// complete armed cohort is resident in the owner/channel boundary.
+    fn wait_until_cohort_admitted(&self) {
+        let mut state = self.state.lock().expect("owner cohort gate lock");
+        let Some(cohort) = state.armed.as_ref() else { return };
+        let generation = state.generation;
+        let expected = cohort.expected;
+        while state.generation == generation
+            && state
+                .armed
+                .as_ref()
+                .is_some_and(|cohort| cohort.admitted < expected)
+        {
+            state = self.ready.wait(state).expect("owner cohort gate wait");
+        }
+        if state.generation == generation
+            && state
+                .armed
+                .as_ref()
+                .is_some_and(|cohort| cohort.admitted == expected)
+        {
+            // One shot: later owner receives and producer admissions proceed
+            // normally even while the test retains its safety guard.
+            state.armed = None;
+            self.ready.notify_all();
+        }
+    }
+
+    fn disarm(&self, generation: u64) {
+        let mut state = self.state.lock().expect("owner cohort gate lock");
+        if state.generation == generation && state.armed.is_some() {
+            state.armed = None;
+            self.ready.notify_all();
+        }
+    }
+}
+
+/// Panic/timeout safety: abandoning an armed cohort can never strand the
+/// owner's thread or wedge `Inner::drop` while it joins that thread.
+#[cfg(test)]
+struct TestOwnerCohortGuard {
+    gate:       Arc<TestOwnerCohortGate>,
+    generation: u64,
+}
+
+#[cfg(test)]
+impl Drop for TestOwnerCohortGuard {
+    fn drop(&mut self) { self.gate.disarm(self.generation); }
+}
+
 struct OwnerStatus {
     metrics:                        CommitterMetricsHandle,
     degraded:                       AtomicBool,
@@ -1217,6 +1352,8 @@ struct AppendOwner {
     status:            Arc<OwnerStatus>,
     chain_enabled:     bool,
     join:              Option<JoinHandle<()>>,
+    #[cfg(test)]
+    cohort_gate:       Arc<TestOwnerCohortGate>,
 }
 
 struct PublishState {
@@ -1309,6 +1446,8 @@ struct FlatOwner {
     outcomes:                        Vec<PlanOutcomes>,
     outcome_reported_retained_slots: usize,
     outcome_reported_retained_bytes: usize,
+    #[cfg(test)]
+    cohort_gate:                     Arc<TestOwnerCohortGate>,
 }
 
 impl FlatOwner {
@@ -1767,6 +1906,8 @@ impl FlatOwner {
 
     fn run(mut self, mut rx: tokio_mpsc::Receiver<OwnerIntent>) {
         while let Some(first) = rx.blocking_recv() {
+            #[cfg(test)]
+            self.cohort_gate.wait_until_cohort_admitted();
             let gathered = self.gather(&mut rx, first);
             let mut pending = Vec::new();
             let mut streams = HashSet::new();
@@ -2374,6 +2515,8 @@ impl LogEngine {
         let (owner_tx, owner_rx) = tokio_mpsc::channel(OWNER_RING_CAPACITY);
         let owner_bytes = Arc::new(Semaphore::new(OWNER_RING_BYTES));
         let owner_inflight = Arc::new(AtomicUsize::new(0));
+        #[cfg(test)]
+        let owner_cohort_gate = Arc::new(TestOwnerCohortGate::default());
         let owner_status = Arc::new(OwnerStatus {
             metrics:                        direct.metrics_handle(),
             degraded:                       AtomicBool::new(false),
@@ -2391,6 +2534,8 @@ impl LogEngine {
             outcomes: Vec::new(),
             outcome_reported_retained_slots: 0,
             outcome_reported_retained_bytes: 0,
+            #[cfg(test)]
+            cohort_gate: Arc::clone(&owner_cohort_gate),
         };
         let owner_join = std::thread::Builder::new()
             .name("mess-flat-owner".into())
@@ -2410,6 +2555,8 @@ impl LogEngine {
                     status: owner_status,
                     chain_enabled: opts.chain,
                     join: Some(owner_join),
+                    #[cfg(test)]
+                    cohort_gate: owner_cohort_gate,
                 },
                 seal_thread: Some(seal_thread),
                 _lock: lock,
@@ -3522,6 +3669,8 @@ impl LogEngine {
                     "append owner is closed".into(),
                 ))
             })?;
+        #[cfg(test)]
+        self.inner.owner.cohort_gate.record_admitted();
         drop(inflight);
         rx.await.map_err(|_| {
             AppendError::Backend(EngineError::Append(
@@ -4166,6 +4315,9 @@ impl SubscribeBackend for LogEngine {
 /// bound. This needs access to private items (`run_roll_sealer`,
 /// `SpinConfig`), so it lives inside this module rather than as a `tests/`
 /// integration test.
+#[cfg(all(test, not(miri)))]
+mod append_gate_tests;
+
 #[cfg(test)]
 mod seal_skip_tests {
     use mess_index::sealed::SealedStore;
