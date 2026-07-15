@@ -1,14 +1,16 @@
 //! The [`Backend`] trait: the engine-agnostic seam the [`EventStore`] facade
 //! sits on.
 //!
-//! The facade never names a storage engine. It speaks four operations —
+//! The facade never names a storage engine. Its original four operations —
 //! [`head`](Backend::head), [`read_stream`](Backend::read_stream),
 //! [`read_global`](Backend::read_global), and
 //! [`append_batch`](Backend::append_batch) — distilled from how
 //! `spikes/dx_api/src/store.rs` drove the `mess_db` actor. Payloads cross this
 //! seam as opaque `(message_type, data)` byte records: encoding is the
 //! facade's job (via [`mess_core::Event`]), durability and ordering are the
-//! backend's.
+//! backend's. The additive [`append_batch_owned`](Backend::append_batch_owned)
+//! method preserves that contract while allowing capable backends to retain
+//! payload ownership; its default adapter keeps older implementations valid.
 //!
 //! [`EventStore`](crate::EventStore) is generic over `B: Backend`, so the
 //! trait uses native `async fn` (return-position `impl Future`) with explicit
@@ -17,7 +19,11 @@
 //! implements it with real expected-version conflict semantics; the RocksDB
 //! wrapper is Phase 2 work.
 
+use std::collections::HashMap;
 use std::future::Future;
+use std::hash::{DefaultHasher, Hash, Hasher};
+
+use smallvec::{SmallVec, smallvec};
 
 use crate::version::Version;
 
@@ -30,6 +36,330 @@ pub struct RecordToAppend {
     pub message_type: String,
     /// The encoded event payload (`mess_core::Event::encode`).
     pub data:         Vec<u8>,
+}
+
+/// An owned append submission whose payload buffers cross the backend seam by
+/// move instead of through a borrowed slice.
+///
+/// Message types are represented once per distinct name plus a batch-local
+/// slot map. Those slots are deliberately **not** registry ids: only the
+/// backend owner may resolve a durable event-type id, against its current
+/// [`RegistryState`](crate::registry::RegistryState), immediately before
+/// commit. The common homogeneous batch stores no slot array at all, and up to
+/// four payload buffers remain inline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedAppendBatch {
+    pub(crate) payloads:      SmallVec<[Vec<u8>; 4]>,
+    pub(crate) types:         OwnedTypeLayout,
+    pub(crate) payload_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OwnedTypeLayout {
+    Empty,
+    Homogeneous(String),
+    /// Boxed so the common homogeneous layout stays one `String` wide; the
+    /// inline name/slot arrays are paid only by genuinely mixed batches.
+    Heterogeneous(Box<HeterogeneousTypes>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HeterogeneousTypes {
+    pub(crate) names: SmallVec<[String; 4]>,
+    pub(crate) slots: SmallVec<[usize; 8]>,
+    /// Installed after the fourth distinct name. Hash hits retain candidate
+    /// slots and are always verified against the full string.
+    pub(crate) index: Option<HashMap<u64, SmallVec<[usize; 2]>>>,
+}
+
+fn type_name_hash(name: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    name.hash(&mut hasher);
+    hasher.finish()
+}
+
+enum TypeName<'a> {
+    Borrowed(&'a str),
+    Owned(String),
+}
+
+impl TypeName<'_> {
+    fn as_str(&self) -> &str {
+        match self {
+            TypeName::Borrowed(name) => name,
+            TypeName::Owned(name) => name,
+        }
+    }
+
+    fn into_owned(self) -> String {
+        match self {
+            TypeName::Borrowed(name) => name.to_owned(),
+            TypeName::Owned(name) => name,
+        }
+    }
+}
+
+impl OwnedAppendBatch {
+    /// An empty owned batch.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            payloads:      SmallVec::new(),
+            types:         OwnedTypeLayout::Empty,
+            payload_bytes: 0,
+        }
+    }
+
+    /// Move ordinary public records into the compact owned representation.
+    /// Payload buffers are never copied; duplicate message-type strings are
+    /// discarded after their batch-local slot is recorded.
+    #[must_use]
+    pub fn from_records(records: Vec<RecordToAppend>) -> Self {
+        let mut batch = Self::new();
+        for record in records {
+            batch.push_owned(record.message_type, record.data);
+        }
+        batch.finish()
+    }
+
+    /// Number of event frames in this batch.
+    #[must_use]
+    pub fn len(&self) -> usize { self.payloads.len() }
+
+    /// Whether this batch contains no event frames.
+    #[must_use]
+    pub fn is_empty(&self) -> bool { self.payloads.is_empty() }
+
+    /// Exact sum of encoded event payload bytes.
+    #[must_use]
+    pub fn payload_bytes(&self) -> usize { self.payload_bytes }
+
+    pub(crate) fn push(&mut self, message_type: &str, data: Vec<u8>) {
+        self.push_inner(TypeName::Borrowed(message_type), data);
+    }
+
+    /// Drop builder-only lookup scratch before the immutable batch crosses the
+    /// backend seam. The owner needs only exact names and frame slots.
+    pub(crate) fn finish(mut self) -> Self {
+        if let OwnedTypeLayout::Heterogeneous(types) = &mut self.types {
+            types.index = None;
+        }
+        self
+    }
+
+    fn push_owned(&mut self, message_type: String, data: Vec<u8>) {
+        self.push_inner(TypeName::Owned(message_type), data);
+    }
+
+    fn push_inner(&mut self, message_type: TypeName<'_>, data: Vec<u8>) {
+        let prior = self.payloads.len();
+        match &mut self.types {
+            OwnedTypeLayout::Empty => {
+                self.types =
+                    OwnedTypeLayout::Homogeneous(message_type.into_owned());
+            }
+            OwnedTypeLayout::Homogeneous(name)
+                if name == message_type.as_str() => {}
+            OwnedTypeLayout::Homogeneous(_) => {
+                let OwnedTypeLayout::Homogeneous(first) =
+                    std::mem::replace(&mut self.types, OwnedTypeLayout::Empty)
+                else {
+                    unreachable!()
+                };
+                let second = message_type.into_owned();
+                self.types = OwnedTypeLayout::Heterogeneous(Box::new(
+                    HeterogeneousTypes {
+                        names: smallvec![first, second],
+                        slots: std::iter::repeat_n(0, prior)
+                            .chain(std::iter::once(1))
+                            .collect(),
+                        index: None,
+                    },
+                ));
+            }
+            OwnedTypeLayout::Heterogeneous(types) => {
+                let HeterogeneousTypes { names, slots, index } = types.as_mut();
+                let hash = type_name_hash(message_type.as_str());
+                let slot = index.as_ref().map_or_else(
+                    || {
+                        names
+                            .iter()
+                            .position(|name| name == message_type.as_str())
+                    },
+                    |index| {
+                        index.get(&hash).and_then(|candidates| {
+                            candidates.iter().copied().find(|&candidate| {
+                                names[candidate] == message_type.as_str()
+                            })
+                        })
+                    },
+                );
+                let slot = slot.unwrap_or_else(|| {
+                    names.push(message_type.into_owned());
+                    let slot = names.len() - 1;
+                    if index.is_none() && names.len() > 4 {
+                        let mut built: HashMap<u64, SmallVec<[usize; 2]>> =
+                            HashMap::with_capacity(names.len());
+                        for (slot, name) in names.iter().enumerate() {
+                            built
+                                .entry(type_name_hash(name))
+                                .or_default()
+                                .push(slot);
+                        }
+                        *index = Some(built);
+                    } else if let Some(index) = index {
+                        index.entry(hash).or_default().push(slot);
+                    }
+                    slot
+                });
+                slots.push(slot);
+            }
+        }
+        self.payload_bytes = self.payload_bytes.saturating_add(data.len());
+        self.payloads.push(data);
+    }
+
+    pub(crate) fn type_count(&self) -> usize {
+        match &self.types {
+            OwnedTypeLayout::Empty => 0,
+            OwnedTypeLayout::Homogeneous(_) => 1,
+            OwnedTypeLayout::Heterogeneous(types) => types.names.len(),
+        }
+    }
+
+    pub(crate) fn type_name(&self, slot: usize) -> &str {
+        match &self.types {
+            OwnedTypeLayout::Empty => panic!("empty batch has no type names"),
+            OwnedTypeLayout::Homogeneous(name) => {
+                assert_eq!(slot, 0, "homogeneous batch has only slot zero");
+                name
+            }
+            OwnedTypeLayout::Heterogeneous(types) => &types.names[slot],
+        }
+    }
+
+    pub(crate) fn type_slot(&self, frame: usize) -> usize {
+        match &self.types {
+            OwnedTypeLayout::Empty => panic!("empty batch has no type slots"),
+            OwnedTypeLayout::Homogeneous(_) => 0,
+            OwnedTypeLayout::Heterogeneous(types) => types.slots[frame],
+        }
+    }
+
+    pub(crate) fn type_name_bytes(&self) -> usize {
+        (0..self.type_count()).map(|slot| self.type_name(slot).len()).sum()
+    }
+
+    pub(crate) fn queued_bytes(&self) -> usize {
+        let slot_bytes = match &self.types {
+            OwnedTypeLayout::Heterogeneous(types) => {
+                types.slots.len().saturating_mul(std::mem::size_of::<usize>())
+            }
+            OwnedTypeLayout::Empty | OwnedTypeLayout::Homogeneous(_) => 0,
+        };
+        self.payload_bytes
+            .saturating_add(self.type_name_bytes())
+            .saturating_add(slot_bytes)
+    }
+
+    /// Consume this batch and restore the ordinary record representation.
+    ///
+    /// The returned message types are the raw names supplied to this batch,
+    /// expanded back into frame order. They are batch-local input only: they
+    /// are not durable registry ids and carry no authority over the backend's
+    /// current registry state.
+    #[must_use]
+    pub fn into_records(self) -> Vec<RecordToAppend> {
+        let OwnedAppendBatch { payloads, types, .. } = self;
+        payloads
+            .into_iter()
+            .enumerate()
+            .map(|(frame, data)| {
+                let message_type = match &types {
+                    OwnedTypeLayout::Empty => {
+                        unreachable!("a frame requires a type")
+                    }
+                    OwnedTypeLayout::Homogeneous(name) => name.clone(),
+                    OwnedTypeLayout::Heterogeneous(types) => {
+                        types.names[types.slots[frame]].clone()
+                    }
+                };
+                RecordToAppend { message_type, data }
+            })
+            .collect()
+    }
+}
+
+impl Default for OwnedAppendBatch {
+    fn default() -> Self { Self::new() }
+}
+
+impl From<Vec<RecordToAppend>> for OwnedAppendBatch {
+    fn from(records: Vec<RecordToAppend>) -> Self {
+        Self::from_records(records)
+    }
+}
+
+#[cfg(test)]
+mod owned_batch_tests {
+    use super::{OwnedAppendBatch, OwnedTypeLayout, RecordToAppend};
+
+    #[test]
+    fn heterogeneous_builder_sheds_hash_index_before_transfer() {
+        let mut batch = OwnedAppendBatch::new();
+        for i in 0..1_000 {
+            batch.push_owned(format!("type-{i}"), vec![i as u8]);
+        }
+        batch.push_owned("type-7".into(), vec![7]);
+        assert_eq!(batch.type_count(), 1_000);
+        assert_eq!(batch.type_slot(1_000), 7);
+        let OwnedTypeLayout::Heterogeneous(types) = &batch.types else {
+            panic!("many names must use heterogeneous layout")
+        };
+        assert!(
+            types.index.is_some(),
+            "more than four names installs hash index"
+        );
+        let batch = batch.finish();
+        let OwnedTypeLayout::Heterogeneous(types) = &batch.types else {
+            unreachable!()
+        };
+        assert!(
+            types.index.is_none(),
+            "queued ownership retains no hash buckets"
+        );
+    }
+
+    #[test]
+    fn hash_candidates_are_verified_against_the_full_name() {
+        let mut batch = OwnedAppendBatch::new();
+        for i in 0..5 {
+            batch.push_owned(format!("type-{i}"), vec![]);
+        }
+        let wanted = "collision-probe";
+        let hash = super::type_name_hash(wanted);
+        let OwnedTypeLayout::Heterogeneous(types) = &mut batch.types else {
+            unreachable!()
+        };
+        types.index.as_mut().unwrap().insert(hash, smallvec::smallvec![0]);
+        batch.push_owned(wanted.into(), vec![]);
+        assert_eq!(
+            batch.type_slot(5),
+            5,
+            "hash-only match must not alias slot 0"
+        );
+    }
+
+    #[test]
+    fn homogeneous_small_batch_keeps_names_and_payloads_inline() {
+        let batch = OwnedAppendBatch::from_records(vec![RecordToAppend {
+            message_type: "same".into(),
+            data:         vec![1, 2, 3],
+        }]);
+        assert!(!batch.payloads.spilled());
+        assert_eq!(batch.type_count(), 1);
+        assert_eq!(batch.type_slot(0), 0);
+    }
 }
 
 /// One event as read back from a backend: the stored bytes plus the positions
@@ -326,6 +656,26 @@ pub trait Backend: Send + Sync + 'static {
         expected: Version,
         records: &[RecordToAppend],
     ) -> impl Future<Output = Result<Appended, AppendError<Self::Error>>> + Send;
+
+    /// Append an owned batch, allowing payload buffers to cross the facade /
+    /// backend boundary without a defensive deep clone.
+    ///
+    /// This additive method has a borrowed compatibility adapter so existing
+    /// backend implementations and callers remain source-compatible. Backends
+    /// that can retain ownership should override it; wrappers should forward it
+    /// so an owned submission is not accidentally materialized in the middle.
+    fn append_batch_owned<'a>(
+        &'a self,
+        stream_id: &'a str,
+        expected: Version,
+        batch: OwnedAppendBatch,
+    ) -> impl Future<Output = Result<Appended, AppendError<Self::Error>>> + Send + 'a
+    {
+        async move {
+            let records = batch.into_records();
+            self.append_batch(stream_id, expected, &records).await
+        }
+    }
 }
 
 /// One page of the global sequence plus the frontier the scan reached

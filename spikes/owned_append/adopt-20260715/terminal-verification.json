@@ -1,0 +1,20 @@
+{
+  "errors": [],
+  "outcome": "TERMINAL_VERIFIED",
+  "output_dir": "/home/bob/.cache/mess-bench/results/bn-22it-t1-e5c3da6-20260715-1945",
+  "pair_claim_path": "/home/bob/.cache/mess-bench/prepared/bn-22it-t1-e5c3da6-0890cec-20260715-1943/consumption.json",
+  "pair_claim_sha256": "1fe0c1350a35e139987e0912abd6ff73dcaf03a79acb3172271c4418f7bd2835",
+  "pre_release_path": "/home/bob/.cache/mess-bench/results/bn-22it-t1-e5c3da6-20260715-1945/terminal_pre_release.json",
+  "pre_release_sha256": "58a7143b72cce6acc026b62f3e721ee163166fb18c69e98402c5d12b89420d8e",
+  "protocol": "bn-22it-process-owned-v1",
+  "provenance_path": "/home/bob/.cache/mess-bench/results/bn-22it-t1-e5c3da6-20260715-1945/provenance.txt",
+  "provenance_sha256": "1a59ee4a97e5bf4e0d915e63b58d53781700846839c1e69e699cc28f14c6e9e9",
+  "release_path": "/home/bob/.cache/mess-bench/results/bn-22it-t1-e5c3da6-20260715-1945/lease_release.json",
+  "release_sha256": "3d611ca2e0108818646d3674f34a9c3027fc62f816d2682e2138bc387093b4d6",
+  "result_path": "/home/bob/.cache/mess-bench/results/bn-22it-t1-e5c3da6-20260715-1945/result.json",
+  "result_sha256": "6714401d9db3b6c329ff299f772f757d17e9352ce8ca18516feb83db8edd9086",
+  "schema": "bn-22it-terminal-verification-v1",
+  "terminal_path": "/home/bob/.cache/mess-bench/results/bn-22it-t1-e5c3da6-20260715-1945/terminal.json",
+  "terminal_sha256": "94e1660c9e76c01508f7f43a63df6c2f48e3acdfea18a9e2a7b52984678041b1",
+  "verified_at": "2026-07-15T23:46:55.189237+00:00"
+}

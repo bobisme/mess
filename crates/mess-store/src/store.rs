@@ -6,7 +6,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use mess_core::{Actor, Aggregate, CodecError, CommandError, Decide, Event};
 
-use crate::backend::{AppendError, Backend, RecordToAppend, SubscribeBackend};
+use crate::backend::{
+    AppendError, Backend, OwnedAppendBatch, SubscribeBackend,
+};
 use crate::cache::StateCache;
 use crate::retry::RetryPolicy;
 use crate::snapshot::{
@@ -395,7 +397,11 @@ impl<B: Backend> EventStore<B> {
         let records = encode_events(events).map_err(|e| {
             AppendError::Backend(StoreError::<B::Error>::Codec(e))
         })?;
-        match self.backend.append_batch(stream_id, expected, &records).await {
+        match self
+            .backend
+            .append_batch_owned(stream_id, expected, records)
+            .await
+        {
             Ok(appended) => Ok(Commit {
                 version:              appended.version,
                 last_global_position: (!events.is_empty())
@@ -457,7 +463,7 @@ impl<B: Backend> EventStore<B> {
                 .map_err(|e| CommandError::Store(StoreError::Codec(e)))?;
             match self
                 .backend
-                .append_batch(stream_id, loaded.version, &records)
+                .append_batch_owned(stream_id, loaded.version, records)
                 .await
             {
                 Ok(appended) => {
@@ -903,7 +909,10 @@ impl<B: SnapshotStore> EventStore<B> {
             }
             let records = encode_events(&events)
                 .map_err(|e| CommandError::Store(StoreError::Codec(e)))?;
-            match self.backend.append_batch(stream_id, version, &records).await
+            match self
+                .backend
+                .append_batch_owned(stream_id, version, records)
+                .await
             {
                 Ok(appended) => {
                     // Write-through fold: fold the events we just wrote into
@@ -1083,14 +1092,10 @@ fn check_actor<C: Actor, R, S>(
 /// Encode a slice of events into backend append records.
 fn encode_events<E: Event>(
     events: &[E],
-) -> Result<Vec<RecordToAppend>, CodecError> {
-    events
-        .iter()
-        .map(|e| {
-            Ok(RecordToAppend {
-                message_type: e.name().to_string(),
-                data:         e.encode()?,
-            })
-        })
-        .collect()
+) -> Result<OwnedAppendBatch, CodecError> {
+    let mut batch = OwnedAppendBatch::new();
+    for event in events {
+        batch.push(event.name(), event.encode()?);
+    }
+    Ok(batch.finish())
 }

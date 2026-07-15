@@ -13,7 +13,8 @@ use std::future::Future;
 use std::sync::Arc;
 
 use mess_store::backend::{
-    AppendError, Appended, Backend, RecordToAppend, StoredRecord,
+    AppendError, Appended, Backend, OwnedAppendBatch, RecordToAppend,
+    StoredRecord,
 };
 use mess_store::snapshot::{SnapshotStore, StoredSnapshot};
 use mess_store::{FjallSnapshotBackend, LogEngine, MockBackend, Version};
@@ -178,6 +179,16 @@ impl<B: Backend + Clone> Backend for Tmp<B> {
     ) -> impl Future<Output = Result<Appended, AppendError<Self::Error>>> + Send
     {
         self.backend.append_batch(stream_id, expected, records)
+    }
+
+    fn append_batch_owned<'a>(
+        &'a self,
+        stream_id: &'a str,
+        expected: Version,
+        batch: OwnedAppendBatch,
+    ) -> impl Future<Output = Result<Appended, AppendError<Self::Error>>> + Send + 'a
+    {
+        self.backend.append_batch_owned(stream_id, expected, batch)
     }
 }
 

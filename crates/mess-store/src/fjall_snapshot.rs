@@ -97,8 +97,8 @@ use mess_index::meta::{
 };
 
 use crate::backend::{
-    AppendError, Appended, Backend, RecordToAppend, StoredRecord,
-    SubscribeBackend,
+    AppendError, Appended, Backend, OwnedAppendBatch, RecordToAppend,
+    StoredRecord, SubscribeBackend,
 };
 use crate::snapshot::{
     BlobPtr, SnapshotRef, SnapshotStore, StoredSnapshot, interim_stream_id,
@@ -360,6 +360,23 @@ impl<B: Backend> Backend for FjallSnapshotBackend<B> {
         records: &[RecordToAppend],
     ) -> Result<Appended, AppendError<Self::Error>> {
         match self.inner.append_batch(stream_id, expected, records).await {
+            Ok(appended) => Ok(appended),
+            Err(AppendError::Conflict { expected, actual }) => {
+                Err(AppendError::Conflict { expected, actual })
+            }
+            Err(AppendError::Backend(e)) => {
+                Err(AppendError::Backend(SnapshotBackendError::Inner(e)))
+            }
+        }
+    }
+
+    async fn append_batch_owned(
+        &self,
+        stream_id: &str,
+        expected: Version,
+        batch: OwnedAppendBatch,
+    ) -> Result<Appended, AppendError<Self::Error>> {
+        match self.inner.append_batch_owned(stream_id, expected, batch).await {
             Ok(appended) => Ok(appended),
             Err(AppendError::Conflict { expected, actual }) => {
                 Err(AppendError::Conflict { expected, actual })

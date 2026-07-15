@@ -26,6 +26,7 @@ mess-log = { workspace = true }
 # so `mess-store` takes no direct fjall/serialization dep of its own.
 mess-index = { workspace = true }
 quick_cache = { workspace = true }
+smallvec = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 

@@ -49,6 +49,7 @@ ident = { git = "https://github.com/bobisme/ident" }
 konst = "0.4.3"
 parking_lot = { version = "0.12.5", features = ["arc_lock"] }
 quick_cache = "0.7.0"
+smallvec = "1.15.2"
 thiserror = "2.0.18"
 tokio = { version = "1.52", features = ["full"] }
 tokio-util = "0.7.18"

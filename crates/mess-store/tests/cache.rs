@@ -21,7 +21,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use mess_core::{Aggregate, CodecError, CommandError, Decide, Event};
 use mess_store::backend::{
-    AppendError, Appended, Backend, RecordToAppend, StoredRecord,
+    AppendError, Appended, Backend, OwnedAppendBatch, RecordToAppend,
+    StoredRecord,
 };
 use mess_store::snapshot::{SnapshotStore, StoredSnapshot};
 use mess_store::{
@@ -102,6 +103,15 @@ impl<B: Backend> Backend for Counting<B> {
         records: &[RecordToAppend],
     ) -> Result<Appended, AppendError<Self::Error>> {
         self.inner.append_batch(stream_id, expected, records).await
+    }
+
+    async fn append_batch_owned(
+        &self,
+        stream_id: &str,
+        expected: Version,
+        batch: OwnedAppendBatch,
+    ) -> Result<Appended, AppendError<Self::Error>> {
+        self.inner.append_batch_owned(stream_id, expected, batch).await
     }
 }
 

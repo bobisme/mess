@@ -1,0 +1,219 @@
+{
+  "artifacts": {
+    "child_manifest": {
+      "path": "/home/bob/.cache/mess-bench/results/bn-22it-t1-e5c3da6-20260715-1945/child_manifest.jsonl",
+      "records": 80,
+      "sha256": "b1ba90c9c994f0a01d343c8ff83ff2002c6d79d4e51396e6279dff9ded0c83c0"
+    },
+    "guard_manifest": {
+      "path": "/home/bob/.cache/mess-bench/results/bn-22it-t1-e5c3da6-20260715-1945/guard_manifest.jsonl",
+      "records": 161,
+      "sha256": "1048e4b991c836b22a497774b3caeda1ce1c8c9a8297f7381c444b4735045518"
+    },
+    "lease_event": {
+      "path": "/home/bob/.cache/mess-bench/results/bn-22it-t1-e5c3da6-20260715-1945/lease_event.jsonl",
+      "records": 1,
+      "sha256": "af5b67834d92b45c1018af0576e2ca97c765a3af1f403785ed3a55c8dbf28061"
+    },
+    "paired_csv": {
+      "columns": 32,
+      "path": "/home/bob/.cache/mess-bench/results/bn-22it-t1-e5c3da6-20260715-1945/paired.csv",
+      "rows": 80,
+      "sha256": "5715cf6883c8561560770f70181b50dcdab9cb66b239ef9a4552e8c1377f0d3b"
+    },
+    "provenance": {
+      "path": "/home/bob/.cache/mess-bench/results/bn-22it-t1-e5c3da6-20260715-1945/provenance.txt",
+      "sha256": "1a59ee4a97e5bf4e0d915e63b58d53781700846839c1e69e699cc28f14c6e9e9"
+    },
+    "smoke_manifest": {
+      "path": "/home/bob/.cache/mess-bench/results/bn-22it-t1-e5c3da6-20260715-1945/smoke_manifest.jsonl",
+      "records": 1,
+      "sha256": "22910c39c5cd429738a77789271d664590f9012dff432e210796a67587955607"
+    }
+  },
+  "cells": [
+    {
+      "allocs_B_over_A": 0.7589797790766684,
+      "batch": 1,
+      "bytes_B_over_A": 0.8121165799361137,
+      "cycle_ratios": {
+        "allocs": [
+          0.7589159600039922,
+          0.7589797790766684,
+          0.759106511315146,
+          0.7591281878862907,
+          0.758474833337622
+        ],
+        "bytes": [
+          0.8120660118140038,
+          0.8121165799361137,
+          0.812374697639906,
+          0.81262474055382,
+          0.8111635847503833
+        ],
+        "p99": [
+          1.0795568982880162,
+          0.962962962962963,
+          0.8976143141153081,
+          0.9651394422310757,
+          1.006560449859419
+        ],
+        "throughput": [
+          1.001136831699481,
+          1.023215262126082,
+          1.0432902132448685,
+          1.0269723781690117,
+          1.0162820017146026
+        ]
+      },
+      "mode": "process",
+      "p99_B_over_A": 0.9651394422310757,
+      "passed": true,
+      "throughput_B_over_A": 1.023215262126082
+    },
+    {
+      "allocs_B_over_A": 0.4422456561512405,
+      "batch": 10,
+      "bytes_B_over_A": 0.6634993260424564,
+      "cycle_ratios": {
+        "allocs": [
+          0.4422456561512405,
+          0.44260628820097947,
+          0.44119950671709474,
+          0.4425808923907896,
+          0.4414137326915182
+        ],
+        "bytes": [
+          0.6634993260424564,
+          0.6646009391142041,
+          0.661718414183617,
+          0.66393045949573,
+          0.6623787385458493
+        ],
+        "p99": [
+          0.9221168247628556,
+          0.879978471474704,
+          0.8122780314561137,
+          0.8131181676210307,
+          0.7349042709867452
+        ],
+        "throughput": [
+          1.2176408206345068,
+          1.2028016827701888,
+          1.3065486413652843,
+          1.2570116592816298,
+          1.282773747044528
+        ]
+      },
+      "mode": "process",
+      "p99_B_over_A": 0.8131181676210307,
+      "passed": true,
+      "throughput_B_over_A": 1.2570116592816298
+    },
+    {
+      "allocs_B_over_A": 0.538931278112793,
+      "batch": 100,
+      "bytes_B_over_A": 0.8999100139696538,
+      "cycle_ratios": {
+        "allocs": [
+          0.5389999108141051,
+          0.538931278112793,
+          0.5388228905091346,
+          0.5389892313751293,
+          0.5388840151424401
+        ],
+        "bytes": [
+          0.8999156461639638,
+          0.8999100139696538,
+          0.899924324270851,
+          0.8998814632162354,
+          0.8998720758478177
+        ],
+        "p99": [
+          0.643991374240345,
+          0.6154471544715447,
+          0.5734302023871304,
+          0.7890329012961118,
+          0.660810541026153
+        ],
+        "throughput": [
+          1.233621792132147,
+          1.245392979724486,
+          1.2910001380736464,
+          1.1836508204069796,
+          1.2311820864016887
+        ]
+      },
+      "mode": "process",
+      "p99_B_over_A": 0.643991374240345,
+      "passed": true,
+      "throughput_B_over_A": 1.233621792132147
+    },
+    {
+      "allocs_B_over_A": 0.5049998025256964,
+      "batch": 1000,
+      "bytes_B_over_A": 0.9132389329048826,
+      "cycle_ratios": {
+        "allocs": [
+          0.5049998025256964,
+          0.5050061265253369,
+          0.5050244142420897,
+          0.504997572244547,
+          0.5049795220764653
+        ],
+        "bytes": [
+          0.9132389329048826,
+          0.913221955731926,
+          0.9132365764805891,
+          0.9132427515440134,
+          0.9132443165957397
+        ],
+        "p99": [
+          0.4817931933463685,
+          0.5956045114367028,
+          0.5726727904111123,
+          0.4814783774723433,
+          0.6256752655538694
+        ],
+        "throughput": [
+          1.4790410117194899,
+          1.4601490331431295,
+          1.4071241648555481,
+          1.3875787801459716,
+          1.4543274953140997
+        ]
+      },
+      "mode": "process",
+      "p99_B_over_A": 0.5726727904111123,
+      "passed": true,
+      "throughput_B_over_A": 1.4543274953140997
+    }
+  ],
+  "complete_matrix": true,
+  "errors": [],
+  "evaluated_at": "2026-07-15T23:46:54.980864+00:00",
+  "evaluator_path": "/home/bob/src/mess/.maw/workspaces/bn-22it/spikes/owned_append/evaluate.py",
+  "evidence_mode": "admission",
+  "exit_code": 0,
+  "expected_rows": 80,
+  "gate_failures": [],
+  "material": {
+    "allocs_B_over_A": 0.549768173765176,
+    "bytes_B_over_A": 0.8157565909622126,
+    "passed": true,
+    "throughput_B_over_A": 1.2325020228246115
+  },
+  "outcome": "ADOPT",
+  "protocol": "bn-22it-process-owned-v1",
+  "schema": "bn-22it-evaluation-result-v1",
+  "thresholds": {
+    "cell_allocation_bytes_ceiling": 1.05,
+    "cell_allocation_calls_ceiling": 1.05,
+    "cell_p99_ceiling": 1.1,
+    "cell_throughput_floor": 0.97,
+    "material_allocation_bytes_ceiling": 0.9,
+    "material_allocation_calls_ceiling": 0.9,
+    "material_throughput_floor": 1.1
+  },
+  "valid_evidence": true
+}

@@ -3,7 +3,7 @@
 #![cfg(not(miri))]
 
 use mess_log::committer::Durability;
-use mess_store::backend::{Backend, RecordToAppend};
+use mess_store::backend::{Backend, OwnedAppendBatch, RecordToAppend};
 use mess_store::{EngineOptions, LogEngine, Version};
 
 fn batch(seed: u8) -> Vec<RecordToAppend> {
@@ -18,7 +18,15 @@ fn batch(seed: u8) -> Vec<RecordToAppend> {
 
 #[tokio::test]
 async fn prepared_batches_survive_chain_roll_cache_and_reopen() {
-    let dir = mess_testkit::sweeping_temp_dir("engine-prepared-chain-roll");
+    prove_prepared_batches_survive(false).await;
+    prove_prepared_batches_survive(true).await;
+}
+
+async fn prove_prepared_batches_survive(owned: bool) {
+    let mode = if owned { "owned" } else { "borrowed" };
+    let dir = mess_testkit::sweeping_temp_dir(&format!(
+        "engine-prepared-chain-roll-{mode}"
+    ));
     let path = dir.path().join("store");
     let opts = EngineOptions {
         durability: Durability::Process,
@@ -30,14 +38,45 @@ async fn prepared_batches_survive_chain_roll_cache_and_reopen() {
     let first = batch(0x11);
     let second = batch(0x22);
     let engine = LogEngine::open_with(&path, opts.clone()).expect("open");
-    let a = engine
-        .append_batch("stream", Version::NoStream, &first)
-        .await
-        .expect("first prepared append");
-    engine
-        .append_batch("stream", a.version, &second)
-        .await
-        .expect("second prepared append across roll");
+    let a = if owned {
+        engine
+            .append_batch_owned(
+                "stream",
+                Version::NoStream,
+                OwnedAppendBatch::from_records(first.clone()),
+            )
+            .await
+    } else {
+        engine.append_batch("stream", Version::NoStream, &first).await
+    }
+    .expect("first prepared append");
+    if owned {
+        engine
+            .append_batch_owned(
+                "stream",
+                a.version,
+                OwnedAppendBatch::from_records(second.clone()),
+            )
+            .await
+    } else {
+        engine.append_batch("stream", a.version, &second).await
+    }
+    .expect("second prepared append across roll");
+
+    let input = engine.append_input_metrics();
+    if owned {
+        assert_eq!(input.owned_batches, 2);
+        assert_eq!(input.owned_records, 200);
+        assert_eq!(input.borrowed_batches, 0);
+        assert_eq!(input.copied_records, 0);
+        assert_eq!(input.copied_bytes, 0);
+    } else {
+        assert_eq!(input.owned_batches, 0);
+        assert_eq!(input.borrowed_batches, 2);
+        assert_eq!(input.borrowed_records, 200);
+        assert_eq!(input.copied_records, 0, "large batches prepare directly");
+        assert_eq!(input.copied_bytes, 0);
+    }
 
     // Live reads hit the write-through capsule adopted from the prepared
     // framed buffer rather than decoding the segment.

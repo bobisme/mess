@@ -110,7 +110,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -148,8 +148,8 @@ use tokio::sync::{
 };
 
 use crate::backend::{
-    AppendError, Appended, Backend, GlobalPage, RecordToAppend, StoredRecord,
-    SubscribeBackend,
+    AppendError, Appended, Backend, GlobalPage, OwnedAppendBatch,
+    OwnedTypeLayout, RecordToAppend, StoredRecord, SubscribeBackend,
 };
 use crate::registry::{self, RegistryRecord};
 use crate::version::Version;
@@ -1171,6 +1171,7 @@ enum OwnerIntentKind {
 
 enum DomainInput {
     Records(Vec<RecordToAppend>),
+    Owned(OwnedAppendBatch),
     Prepared {
         /// Distinct type names; `type_slots` indexes this table per frame.
         type_names: Vec<String>,
@@ -1183,6 +1184,7 @@ impl DomainInput {
     fn is_empty(&self) -> bool {
         match self {
             DomainInput::Records(records) => records.is_empty(),
+            DomainInput::Owned(batch) => batch.is_empty(),
             DomainInput::Prepared { batch, .. } => batch.frame_count() == 0,
         }
     }
@@ -1350,6 +1352,7 @@ struct AppendOwner {
     inflight:          Arc<AtomicUsize>,
     durable_watermark: Watermark,
     status:            Arc<OwnerStatus>,
+    durability:        Durability,
     chain_enabled:     bool,
     join:              Option<JoinHandle<()>>,
     #[cfg(test)]
@@ -1398,6 +1401,15 @@ fn cap_plan_outcomes(outcomes: &mut Vec<PlanOutcomes>) -> bool {
 mod owner_outcome_scratch_tests {
     use super::*;
 
+    fn direct_outcome(
+        outcome: Result<AppendOutcome, mess_log::committer::AppendError>,
+    ) -> DirectBatchOutcome {
+        DirectBatchOutcome {
+            outcome,
+            events: DirectBatchEvents::Inputs(Vec::new()),
+        }
+    }
+
     #[test]
     fn oversize_result_scratch_is_shed_to_named_count_and_byte_caps() {
         let mut outcomes = Vec::with_capacity(OWNER_OUTCOME_RETAINED_SLOTS + 1);
@@ -1412,6 +1424,35 @@ mod owner_outcome_scratch_tests {
             outcomes.capacity() * std::mem::size_of::<PlanOutcomes>()
                 <= OWNER_OUTCOME_RETAINED_BYTE_CAP
         );
+    }
+
+    #[test]
+    fn new_name_unit_keeps_registry_and_owned_domain_outcomes_distinct() {
+        // An owned append that mints a stream or event-type name is a
+        // two-batch ordered unit: registry first, then domain. Keep callback
+        // results in their semantic slots even when the first failure aborts
+        // the dependent domain batch, so retirement reports the root cause
+        // and never treats the domain payload as committed.
+        let mut outcomes = PlanOutcomes::default();
+        outcomes.record(
+            true,
+            0,
+            direct_outcome(Err(mess_log::committer::AppendError::StoreFull)),
+        );
+        outcomes.record(
+            true,
+            1,
+            direct_outcome(Err(mess_log::committer::AppendError::UnitAborted)),
+        );
+
+        assert!(matches!(
+            &outcomes.registry.as_ref().expect("registry outcome").outcome,
+            Err(mess_log::committer::AppendError::StoreFull)
+        ));
+        assert!(matches!(
+            &outcomes.domain.as_ref().expect("domain outcome").outcome,
+            Err(mess_log::committer::AppendError::UnitAborted)
+        ));
     }
 }
 
@@ -1569,6 +1610,47 @@ impl FlatOwner {
                         .into_iter()
                         .zip(&tids)
                         .map(|(r, &tid)| EventInput::plain(tid, 0, 0, r.data))
+                        .collect();
+                    let first_stream_pos = expected.next_position();
+                    (
+                        tids,
+                        DirectAppendRequest::Inputs(AppendRequest {
+                            stream_id: sid,
+                            category_id: CATEGORY_ID,
+                            first_stream_version: first_stream_pos,
+                            events,
+                        }),
+                    )
+                }
+                DomainInput::Owned(batch) => {
+                    // Batch-local slots carry no authority. Resolve every
+                    // distinct name against the current RegistryState under
+                    // the owner lock, then expand ids in frame order.
+                    let mut unique_tids =
+                        Vec::with_capacity(batch.type_count());
+                    for slot in 0..batch.type_count() {
+                        let name = batch.type_name(slot);
+                        let id = if let Some(id) =
+                            book.registry.event_type_id(name)
+                        {
+                            id
+                        } else {
+                            next_tid += 1;
+                            staged.push(registry::event_type_registered(
+                                next_tid, name,
+                            ));
+                            next_tid
+                        };
+                        unique_tids.push(id);
+                    }
+                    let tids: Vec<u32> = (0..batch.len())
+                        .map(|frame| unique_tids[batch.type_slot(frame)])
+                        .collect();
+                    let events = batch
+                        .payloads
+                        .into_iter()
+                        .zip(&tids)
+                        .map(|(data, &tid)| EventInput::plain(tid, 0, 0, data))
                         .collect();
                     let first_stream_pos = expected.next_position();
                     (
@@ -2027,6 +2109,8 @@ struct Inner {
     /// The one flat-combined owner. Its thread owns the segment writer and
     /// performs validation, write, barrier, apply, publish, and completion.
     owner:                AppendOwner,
+    /// Exact ownership-transfer/copy counters for the public append seam.
+    append_input:         AppendInputCounters,
     /// The background auto-roll sealer thread (`bn-1vu`): receives each rolled
     /// segment's [`SegmentSummary`] over the committer's roll channel and
     /// builds its sidecars + finalizes its footer off the append path.
@@ -2294,6 +2378,64 @@ pub struct EngineMetrics {
     pub seals_skipped: u64,
 }
 
+/// Monotonic in-process counters for the append-input path selected by
+/// [`LogEngine`]. Unlike allocator telemetry their field meanings are
+/// deterministic: copied bytes count only defensive copies at the borrowed
+/// compatibility boundary, never framing or the durable write itself. A
+/// snapshot loads each field independently; cross-field relationships and
+/// interval deltas are coherent only while append submissions are quiescent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AppendInputMetrics {
+    /// Batches submitted through the Process-only owned path.
+    /// Includes conflicts and invalid/empty submissions: this is boundary
+    /// traffic, not a successful-commit counter.
+    pub owned_batches:       u64,
+    /// Records whose payload buffers crossed by move, including submissions
+    /// later rejected by the authoritative owner.
+    pub owned_records:       u64,
+    /// Payload bytes whose buffers crossed by move, including submissions
+    /// later rejected by the authoritative owner.
+    pub owned_payload_bytes: u64,
+    /// Batches entering the borrowed compatibility path, including owned API
+    /// submissions deliberately materialized under Group or Os durability and
+    /// submissions later rejected by the authoritative owner.
+    pub borrowed_batches:    u64,
+    /// Records submitted through the borrowed compatibility method.
+    pub borrowed_records:    u64,
+    /// Records defensively cloned at the borrowed boundary. Large prepared
+    /// batches already frame directly and therefore do not increment this.
+    pub copied_records:      u64,
+    /// Message-type plus payload bytes defensively cloned at that boundary.
+    pub copied_bytes:        u64,
+}
+
+#[derive(Default)]
+struct AppendInputCounters {
+    owned_batches:       AtomicU64,
+    owned_records:       AtomicU64,
+    owned_payload_bytes: AtomicU64,
+    borrowed_batches:    AtomicU64,
+    borrowed_records:    AtomicU64,
+    copied_records:      AtomicU64,
+    copied_bytes:        AtomicU64,
+}
+
+impl AppendInputCounters {
+    fn snapshot(&self) -> AppendInputMetrics {
+        AppendInputMetrics {
+            owned_batches:       self.owned_batches.load(Ordering::Relaxed),
+            owned_records:       self.owned_records.load(Ordering::Relaxed),
+            owned_payload_bytes: self
+                .owned_payload_bytes
+                .load(Ordering::Relaxed),
+            borrowed_batches:    self.borrowed_batches.load(Ordering::Relaxed),
+            borrowed_records:    self.borrowed_records.load(Ordering::Relaxed),
+            copied_records:      self.copied_records.load(Ordering::Relaxed),
+            copied_bytes:        self.copied_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
 impl Default for EngineOptions {
     fn default() -> Self {
         EngineOptions {
@@ -2553,11 +2695,13 @@ impl LogEngine {
                     inflight: owner_inflight,
                     durable_watermark,
                     status: owner_status,
+                    durability: opts.durability,
                     chain_enabled: opts.chain,
                     join: Some(owner_join),
                     #[cfg(test)]
                     cohort_gate: owner_cohort_gate,
                 },
+                append_input: AppendInputCounters::default(),
                 seal_thread: Some(seal_thread),
                 _lock: lock,
                 active,
@@ -3373,6 +3517,17 @@ impl LogEngine {
         }
     }
 
+    /// Ownership-transfer and defensive-copy counters for append submissions
+    /// since this engine opened.
+    ///
+    /// Fields are independently sampled atomics. A snapshot is monotonic, but
+    /// cross-field relationships and deltas are exact only when submissions
+    /// are quiescent across both snapshots.
+    #[must_use]
+    pub fn append_input_metrics(&self) -> AppendInputMetrics {
+        self.inner.append_input.snapshot()
+    }
+
     /// Test/diagnostic: number of sealed segments currently installed in the
     /// cold tier (populated at open by [`load_sealed`], and by
     /// [`seal_active`](Self::seal_active) at runtime).
@@ -3575,6 +3730,112 @@ impl LogEngine {
             });
         }
         Ok(out)
+    }
+
+    async fn enqueue_owned_domain(
+        &self,
+        stream_id: &str,
+        expected: Version,
+        batch: OwnedAppendBatch,
+        inflight: InFlightGuard,
+    ) -> OwnerResult {
+        let encoded_estimate = HEADER_LEN
+            .saturating_add(MARKER_LEN)
+            .saturating_add(
+                usize::from(self.inner.owner.chain_enabled) * CHAIN_LEN,
+            )
+            .saturating_add(batch.len().saturating_mul(SUBFRAME_HDR_LEN))
+            .saturating_add(batch.payload_bytes());
+        let can_prepare = !batch.is_empty()
+            && encoded_estimate >= PREPARE_MIN_ENCODED_BYTES
+            // Invalid-input precedence remains owner-first. Producer
+            // preparation is selected only when every typed bound is already
+            // known to be representable, so framing below cannot introduce an
+            // earlier user-visible error.
+            && (encoded_estimate as u64) <= MAX_BATCH_LEN
+            && batch.len() <= u32::MAX as usize
+            && batch
+                .payloads
+                .iter()
+                .all(|payload| payload.len() <= u32::MAX as usize);
+
+        let (input, cost) = if can_prepare {
+            let OwnedAppendBatch { payloads, types, .. } = batch;
+            let frame_count = payloads.len();
+            let (type_names, type_slots) = match types {
+                OwnedTypeLayout::Empty => {
+                    unreachable!("non-empty batch has a type")
+                }
+                OwnedTypeLayout::Homogeneous(name) => {
+                    (vec![name], vec![0; frame_count])
+                }
+                OwnedTypeLayout::Heterogeneous(types) => (
+                    types.names.into_vec(),
+                    types
+                        .slots
+                        .into_iter()
+                        .map(|slot| {
+                            u32::try_from(slot)
+                                .expect("slot count is bounded by frame count")
+                        })
+                        .collect(),
+                ),
+            };
+            let subframes: Vec<Subframe<'_>> = payloads
+                .iter()
+                .map(|payload| Subframe::plain(0, 0, 0, payload))
+                .collect();
+            let zero_chain = [0u8; CHAIN_LEN];
+            let prepared = PreparedBatch::encode(&BatchInput {
+                segment_epoch:        0,
+                batch_id:             0,
+                first_global_pos:     0,
+                stream_id:            0,
+                category_id:          0,
+                first_stream_version: 0,
+                crypto_chain:         self
+                    .inner
+                    .owner
+                    .chain_enabled
+                    .then_some(&zero_chain),
+                subframes:            &subframes,
+            })
+            .map_err(|e| {
+                AppendError::Backend(EngineError::Append(e.to_string()))
+            })?;
+            let cost = stream_id
+                .len()
+                .saturating_add(prepared.total_len() as usize)
+                .saturating_add(
+                    type_names
+                        .iter()
+                        .map(String::len)
+                        .fold(0usize, usize::saturating_add),
+                )
+                .saturating_add(type_slots.len() * 4);
+            (
+                DomainInput::Prepared {
+                    type_names,
+                    type_slots,
+                    batch: prepared,
+                },
+                cost,
+            )
+        } else {
+            let cost = stream_id.len().saturating_add(batch.queued_bytes());
+            (DomainInput::Owned(batch), cost)
+        };
+
+        self.enqueue_owner(
+            OwnerIntentKind::Domain {
+                stream: stream_id.to_owned(),
+                expected,
+                input,
+            },
+            cost,
+            inflight,
+        )
+        .await
     }
 
     /// Append to `$registry` (stream 0) through the [`Backend`] seam — spec
@@ -4169,11 +4430,19 @@ impl Backend for LogEngine {
         expected: Version,
         records: &[RecordToAppend],
     ) -> Result<Appended, AppendError<Self::Error>> {
-        // D7: count from the very first API instruction through enqueue. This
-        // covers registry decoding, the owned-record copy, and byte-budget
-        // waiting — not merely the final channel send.
+        // D7: establish in-flight ownership at the API boundary, before even
+        // diagnostic counters. This spans registry decoding, record cloning,
+        // byte-budget waiting, enqueue, and every early return.
         self.inner.owner.inflight.fetch_add(1, Ordering::AcqRel);
         let inflight = InFlightGuard(Arc::clone(&self.inner.owner.inflight));
+        self.inner
+            .append_input
+            .borrowed_batches
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .append_input
+            .borrowed_records
+            .fetch_add(records.len() as u64, Ordering::Relaxed);
         // `$registry` (stream 0) is a system stream with its own write path
         // (`bn-2di`, review F2): it takes only `RegistryEventV1` records, each
         // of which must decode and fold cleanly, and it never mints an id from
@@ -4271,6 +4540,22 @@ impl Backend for LogEngine {
                 .saturating_add(type_slots.len() * 4);
             (DomainInput::Prepared { type_names, type_slots, batch }, cost)
         } else {
+            let copied_bytes = records
+                .iter()
+                .map(|r| r.message_type.len() + r.data.len())
+                .fold(0usize, usize::saturating_add);
+            self.inner
+                .append_input
+                .copied_records
+                .fetch_add(records.len() as u64, Ordering::Relaxed);
+            self.inner
+                .append_input
+                .copied_bytes
+                .fetch_add(copied_bytes as u64, Ordering::Relaxed);
+            // Preserve the borrowed path's baseline accounting exactly. A
+            // repeated message-type string remains resident in every cloned
+            // record and therefore counts once per record at the admission
+            // byte boundary; only the Process-owned path uses compact names.
             let cost = stream_id.len().saturating_add(
                 records
                     .iter()
@@ -4279,17 +4564,53 @@ impl Backend for LogEngine {
             );
             (DomainInput::Records(records.to_vec()), cost)
         };
-        return self
-            .enqueue_owner(
-                OwnerIntentKind::Domain {
-                    stream: stream_id.to_owned(),
-                    expected,
-                    input,
-                },
-                cost,
-                inflight,
-            )
-            .await;
+        self.enqueue_owner(
+            OwnerIntentKind::Domain {
+                stream: stream_id.to_owned(),
+                expected,
+                input,
+            },
+            cost,
+            inflight,
+        )
+        .await
+    }
+
+    async fn append_batch_owned(
+        &self,
+        stream_id: &str,
+        expected: Version,
+        batch: OwnedAppendBatch,
+    ) -> Result<Appended, AppendError<Self::Error>> {
+        // Attempt 5 admitted ownership transfer for Process but rejected it as
+        // a mode-independent optimization. Barriered modes retain the public
+        // owned API while deliberately entering the exact borrowed
+        // compatibility implementation: the same counters, validation order,
+        // preparation threshold, owner admission, and completion path.
+        if !matches!(self.inner.owner.durability, Durability::Process) {
+            let records = batch.into_records();
+            return self.append_batch(stream_id, expected, &records).await;
+        }
+
+        // Process is now selected. Establish in-flight ownership before the
+        // Process-only input counters and retain it across every early exit.
+        self.inner.owner.inflight.fetch_add(1, Ordering::AcqRel);
+        let inflight = InFlightGuard(Arc::clone(&self.inner.owner.inflight));
+        self.inner.append_input.owned_batches.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .append_input
+            .owned_records
+            .fetch_add(batch.len() as u64, Ordering::Relaxed);
+        self.inner
+            .append_input
+            .owned_payload_bytes
+            .fetch_add(batch.payload_bytes() as u64, Ordering::Relaxed);
+
+        if stream_id == registry::RESERVED_STREAM_NAME {
+            let records = batch.into_records();
+            return self.append_registry(expected, &records, inflight).await;
+        }
+        self.enqueue_owned_domain(stream_id, expected, batch, inflight).await
     }
 }
 

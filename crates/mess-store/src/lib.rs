@@ -11,13 +11,13 @@
 //!
 //! # Engine-agnostic
 //!
-//! The facade sits on the [`Backend`] trait
-//! (`head` / `read_stream` / `read_global` / `append_batch`), distilled from
-//! how `spikes/dx_api` drove the real `mess_db` actor. This crate ships one
-//! backend — the in-memory [`MockBackend`], which enforces **real**
-//! expected-version conflict semantics under a lock — so the facade, its
-//! retry machinery, and its concurrency guarantees are all testable with no
-//! RocksDB. The `mess_db` wrapper is a separate Phase 2 bone.
+//! The facade sits on the [`Backend`] trait (`head` / `read_stream` /
+//! `read_global` / borrowed and owned append), distilled from how
+//! `spikes/dx_api` drove the original database actor. Production composes
+//! [`FjallSnapshotBackend`] over [`LogEngine`]; the optional in-memory
+//! [`MockBackend`] enforces real expected-version conflict semantics under a
+//! lock so facade retry and concurrency behavior can also be tested without
+//! durable storage.
 //!
 //! # Error shape
 //!
@@ -41,6 +41,7 @@
 //! [`Aggregate`]: mess_core::Aggregate
 //! [`Decide`]: mess_core::Decide
 //! [`Decide::Rejection`]: mess_core::Decide::Rejection
+//! [`MockBackend`]: crate::mock::MockBackend
 
 pub mod anomalies;
 pub mod backend;
@@ -61,12 +62,13 @@ pub use anomalies::{
     ProjectionAnomaliesSnapshot,
 };
 pub use backend::{
-    AppendError, Appended, Backend, GlobalPage, RecordToAppend, StoredRecord,
-    SubscribeBackend,
+    AppendError, Appended, Backend, GlobalPage, OwnedAppendBatch,
+    RecordToAppend, StoredRecord, SubscribeBackend,
 };
 pub use cache::StateCache;
 pub use engine::{
-    CommitterMetrics, EngineError, EngineMetrics, EngineOptions, LogEngine,
+    AppendInputMetrics, CommitterMetrics, EngineError, EngineMetrics,
+    EngineOptions, LogEngine,
 };
 pub use fjall_snapshot::{FjallSnapshotBackend, SnapshotBackendError};
 // Re-export the core command error (with its store-erasure target and the

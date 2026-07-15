@@ -67,8 +67,8 @@ use mess_core::Decide;
 use mess_derive::{Aggregate, Event};
 use mess_store::{
     AppendError, Appended, Backend, EventStore, FjallSnapshotBackend,
-    LogEngine, RecordToAppend, SnapshotStore, Snapshottable, StateCodecError,
-    StoredRecord, StoredSnapshot, SubscribeBackend, Version,
+    LogEngine, OwnedAppendBatch, RecordToAppend, SnapshotStore, Snapshottable,
+    StateCodecError, StoredRecord, StoredSnapshot, SubscribeBackend, Version,
 };
 use mess_testkit::{SweepingTempDir, sweeping_temp_dir};
 use tokio::task::JoinSet;
@@ -243,6 +243,18 @@ impl<B: Backend> Backend for ProfilingBackend<B> {
     ) -> Result<Appended, AppendError<Self::Error>> {
         let t = Instant::now();
         let r = self.inner.append_batch(stream_id, expected, records).await;
+        self.hist.record("append_batch", t.elapsed());
+        r
+    }
+
+    async fn append_batch_owned(
+        &self,
+        stream_id: &str,
+        expected: Version,
+        batch: OwnedAppendBatch,
+    ) -> Result<Appended, AppendError<Self::Error>> {
+        let t = Instant::now();
+        let r = self.inner.append_batch_owned(stream_id, expected, batch).await;
         self.hist.record("append_batch", t.elapsed());
         r
     }

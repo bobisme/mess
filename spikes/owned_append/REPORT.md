@@ -1,8 +1,76 @@
-# bn-2yye public owned-append measurements
+# Public owned-append measurements
 
-## Decision status
+## bn-22it final decision — ADOPT
 
-The owned path is not admitted as currently integrated. The complete
+The narrowed Process-only owned-append candidate is admitted for production
+integration. A fresh, complete 80-row comparison passed every per-cell,
+logical, provenance, source, build, and material-benefit gate. The runner then
+released the global measurement lease and a separate verifier validated the
+complete terminal chain. The final outcome is `ADOPT`; no historical or
+partial row contributed to it.
+
+The exact measured source graph was:
+
+- reviewed tooling baseline
+  `fa6bc0cc2d533a9ef5e9fb54755007e2287ad28d`;
+- neutral control `0890cec2d734b047a71c3236db16faaeb38654df`;
+- candidate `e5c3da658abd619c240851d384642fe741d93047`; and
+- canonical source approval SHA-256
+  `d86203d0b1397d0ee0c5f5d44ee9c5fe09a6e50e57361ee8408f4017ca12fece`.
+
+The five-cycle median ratios were:
+
+| Process batch | throughput B/A | p99 B/A | allocation calls B/A | allocated bytes B/A |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 1.0232 | 0.9651 | 0.7590 | 0.8121 |
+| 10 | 1.2570 | 0.8131 | 0.4422 | 0.6635 |
+| 100 | 1.2336 | 0.6440 | 0.5389 | 0.8999 |
+| 1000 | 1.4543 | 0.5727 | 0.5050 | 0.9132 |
+
+Across all four batch sizes, the geometric mean was **1.2325x throughput**,
+**0.5498x allocation calls**, and **0.8158x allocated bytes**. In plain
+language, the public Process append path was about 23% faster overall, made
+about 45% fewer allocation calls, and allocated about 18% fewer bytes. Every
+individual cell also stayed within the frozen throughput, p99, allocation,
+counter, and correctness limits.
+
+The admitted scope remains intentionally narrow. `EventStore` constructs and
+forwards owned input, and `LogEngine` consumes it directly under
+`Durability::Process`. `Durability::Group` and `Durability::Os` use the
+borrowed-compatible path and are admitted on semantic and structural parity,
+not on a timing claim.
+
+The retained evidence snapshot is under `adopt-20260715/`. Its decisive
+bindings are:
+
+- prepared pair SHA-256
+  `fd5603a9a6c1a70c55a61ecbf296405464dd812ffd5c3117de7b641834256fff`;
+- final CSV SHA-256
+  `5715cf6883c8561560770f70181b50dcdab9cb66b239ef9a4552e8c1377f0d3b`;
+- evaluator result SHA-256
+  `6714401d9db3b6c329ff299f772f757d17e9352ce8ca18516feb83db8edd9086`;
+- terminal SHA-256
+  `94e1660c9e76c01508f7f43a63df6c2f48e3acdfea18a9e2a7b52984678041b1`;
+  and
+- terminal-verification SHA-256
+  `67e1ad0dc0c2e235727c25fed76de9634a4377c490b695415f50e846e76b5fe3`.
+
+The immediately preceding retry completed 80 rows but was classified
+`INVALID_EVIDENCE` because the evaluator mistakenly reapplied a string-only
+external-path validator to an already validated `Path`. Its rows were never
+used for admission. The evaluator boundary was repaired, self-tested,
+reviewed, and frozen in the tooling baseline above before the source graph was
+reapproved, both binaries were rebuilt, and this comparison started from row
+zero.
+
+Any commit after the measured candidate must contain documentation and retained
+evidence only until the candidate is merged. Product integration is authorized
+only because the exact measured candidate remains its ancestor and the public
+correctness matrix is rerun after merge.
+
+## Historical bn-2yye decision status
+
+At the end of bn-2yye, the owned path was not admitted as integrated. The complete
 mode-independent Attempt 5 failed two locked Group cells, and its narrower
 Process-only successor did not produce a decision: Attempt 6 fail-stopped on
 its frozen exact-name process guard after 69 of 80 rows. Attempt 6 is
