@@ -1,0 +1,11 @@
+   Compiling mess-store v0.0.0 (/home/bob/src/mess/.maw/workspaces/bn-2yye/crates/mess-store)
+    Finished `release` profile [optimized] target(s) in 2.96s
+     Running `target/release/examples/owned_append_bench`
+after process batch=1 rep=0 ev/s=152795 p99=46.2us alloc/event=18.0212 bytes/event=2954.3 copy_bytes=0 fsyncs=0 load1=5.89
+after process batch=1 rep=1 ev/s=152147 p99=46.4us alloc/event=17.8925 bytes/event=2934.2 copy_bytes=0 fsyncs=0 load1=5.89
+after process batch=1 rep=2 ev/s=156904 p99=44.2us alloc/event=17.8453 bytes/event=2922.1 copy_bytes=0 fsyncs=0 load1=5.89
+after process batch=10 rep=0 ev/s=1001436 p99=65.6us alloc/event=3.0065 bytes/event=915.7 copy_bytes=0 fsyncs=0 load1=5.58
+after process batch=10 rep=1 ev/s=1012105 p99=69.5us alloc/event=2.9958 bytes/event=913.9 copy_bytes=0 fsyncs=0 load1=5.58
+after process batch=10 rep=2 ev/s=1060434 p99=78.9us alloc/event=2.9773 bytes/event=910.3 copy_bytes=0 fsyncs=0 load1=5.58
+after process batch=100 rep=0 ev/s=4181571 p99=146.2us alloc/event=1.2422 bytes/event=673.2 copy_bytes=0 fsyncs=0 load1=5.58
+after process batch=100 rep=1 ev/s=2742490 p99=832.0us alloc/event=1.2449 bytes/event=672.7 copy_bytes=0 fsyncs=0 load1=5.58

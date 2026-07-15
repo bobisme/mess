@@ -1,0 +1,123 @@
+   Compiling libc v0.2.186
+   Compiling proc-macro2 v1.0.106
+   Compiling unicode-ident v1.0.24
+   Compiling cfg-if v1.0.4
+   Compiling quote v1.0.46
+   Compiling shlex v2.0.1
+   Compiling find-msvc-tools v0.1.9
+   Compiling scopeguard v1.2.0
+   Compiling parking_lot_core v0.9.12
+   Compiling crossbeam-utils v0.8.22
+   Compiling autocfg v1.5.1
+   Compiling zerocopy v0.8.54
+   Compiling smallvec v1.15.2
+   Compiling pkg-config v0.3.33
+   Compiling serde_core v1.0.228
+   Compiling thiserror v2.0.18
+   Compiling crossbeam-epoch v0.9.20
+   Compiling once_cell v1.21.4
+   Compiling getrandom v0.4.3
+   Compiling readme-rustdocifier v0.1.1
+   Compiling rustix v1.1.4
+   Compiling semver v1.0.28
+   Compiling equivalent v1.0.2
+   Compiling bitflags v2.13.0
+   Compiling lock_api v0.4.14
+   Compiling serde v1.0.228
+   Compiling linux-raw-sys v0.12.1
+   Compiling xxhash-rust v0.8.16
+   Compiling zstd-safe v7.2.4
+   Compiling fastrand v2.4.1
+   Compiling libm v0.2.16
+   Compiling twox-hash v2.1.2
+   Compiling byteorder-lite v0.1.0
+   Compiling hashbrown v0.16.1
+   Compiling rustc_version v0.4.1
+   Compiling compare v0.0.6
+   Compiling log v0.4.33
+   Compiling lz4_flex v0.13.1
+   Compiling spin v0.9.9
+   Compiling num-traits v0.2.19
+   Compiling constant_time_eq v0.4.2
+   Compiling arrayvec v0.7.8
+   Compiling rustc-hash v2.1.3
+   Compiling interval-heap v0.0.5
+   Compiling hashbrown v0.14.5
+   Compiling byteview v0.10.1
+   Compiling reed-solomon-simd v3.1.0
+   Compiling sfa v1.0.0
+   Compiling self_cell v1.2.2
+   Compiling arrayref v0.3.9
+   Compiling varint-rs v2.2.1
+   Compiling cpufeatures v0.3.0
+   Compiling flume v0.12.0
+   Compiling foldhash v0.2.0
+   Compiling cpufeatures v0.2.17
+   Compiling hashbrown v0.17.1
+   Compiling fixedbitset v0.5.7
+   Compiling pin-project-lite v0.2.17
+   Compiling bytes v1.12.1
+   Compiling crc32c v0.6.8
+   Compiling syn v2.0.118
+   Compiling quick_cache v0.6.24
+   Compiling crossbeam-skiplist v0.1.3
+   Compiling jobserver v0.1.35
+   Compiling getrandom v0.2.17
+   Compiling errno v0.3.14
+   Compiling mio v1.2.2
+   Compiling socket2 v0.6.5
+   Compiling signal-hook-registry v1.4.8
+   Compiling rmp v0.8.15
+   Compiling rand_core v0.6.4
+   Compiling cc v1.2.67
+   Compiling parking_lot v0.12.5
+   Compiling dashmap v6.2.1
+   Compiling quick_cache v0.7.0
+   Compiling tempfile v3.27.0
+   Compiling zstd-sys v2.0.16+zstd.1.5.7
+   Compiling blake3 v1.8.5
+   Compiling thiserror-impl v2.0.18
+   Compiling serde_derive v1.0.228
+   Compiling enum_dispatch v0.3.13
+   Compiling tokio-macros v2.7.0
+   Compiling ppv-lite86 v0.2.21
+   Compiling tokio v1.52.3
+   Compiling lsm-tree v3.1.6
+   Compiling rand_chacha v0.3.1
+   Compiling rand v0.8.7
+   Compiling mess-log v0.1.0 (/home/bob/src/mess/.maw/workspaces/bn-2yye/crates/mess-log)
+   Compiling xorf v0.12.0
+   Compiling rmp-serde v1.3.1
+   Compiling mess-core v0.0.0 (/home/bob/src/mess/.maw/workspaces/bn-2yye/crates/mess-core)
+   Compiling mess-testkit v0.0.0 (/home/bob/src/mess/.maw/workspaces/bn-2yye/crates/mess-testkit)
+   Compiling fjall v3.1.6
+   Compiling zstd v0.13.3
+   Compiling mess-index v0.0.0 (/home/bob/src/mess/.maw/workspaces/bn-2yye/crates/mess-index)
+   Compiling mess-store v0.0.0 (/home/bob/src/mess/.maw/workspaces/bn-2yye/crates/mess-store)
+    Finished `release` profile [optimized] target(s) in 17.61s
+     Running `target/release/examples/owned_append_bench`
+before process batch=1 rep=0 ev/s=149799 p99=46.9us alloc/event=22.0558 bytes/event=3167.2 copy_bytes=41760000 fsyncs=0 load1=5.73
+before process batch=1 rep=1 ev/s=148595 p99=45.2us alloc/event=21.8778 bytes/event=3147.8 copy_bytes=41760000 fsyncs=0 load1=5.73
+before process batch=1 rep=2 ev/s=162275 p99=39.0us alloc/event=21.8991 bytes/event=3150.6 copy_bytes=41760000 fsyncs=0 load1=5.73
+before process batch=10 rep=0 ev/s=916854 p99=76.5us alloc/event=6.0525 bytes/event=1258.3 copy_bytes=130500000 fsyncs=0 load1=5.43
+before process batch=10 rep=1 ev/s=798952 p99=84.0us alloc/event=6.0806 bytes/event=1262.5 copy_bytes=130500000 fsyncs=0 load1=5.43
+before process batch=10 rep=2 ev/s=816034 p99=86.2us alloc/event=6.0664 bytes/event=1259.6 copy_bytes=130500000 fsyncs=0 load1=5.43
+before process batch=100 rep=0 ev/s=3473231 p99=214.2us alloc/event=2.2737 bytes/event=741.6 copy_bytes=0 fsyncs=0 load1=5.43
+before process batch=100 rep=1 ev/s=3546509 p99=231.9us alloc/event=2.2705 bytes/event=741.6 copy_bytes=0 fsyncs=0 load1=5.24
+before process batch=100 rep=2 ev/s=3533641 p99=212.0us alloc/event=2.2732 bytes/event=741.6 copy_bytes=0 fsyncs=0 load1=5.24
+before process batch=1000 rep=0 ev/s=5316168 p99=1620.6us alloc/event=2.0362 bytes/event=696.6 copy_bytes=0 fsyncs=0 load1=5.24
+before process batch=1000 rep=1 ev/s=5232419 p99=1703.2us alloc/event=2.0361 bytes/event=696.6 copy_bytes=0 fsyncs=0 load1=5.24
+before process batch=1000 rep=2 ev/s=5511459 p99=1767.9us alloc/event=2.0358 bytes/event=696.6 copy_bytes=0 fsyncs=0 load1=5.24
+!!! mess DEGRADED: fdatasync latency 66.2 ms crossed 50.0 ms threshold (1 crossings) — near-full/contended device fdatasync stall (docs/spec/03-durability.md §2.6); durable appends are stalling
+before group batch=1 rep=0 ev/s=1206 p99=24830.7us alloc/event=22.0991 bytes/event=3133.9 copy_bytes=835200 fsyncs=804 load1=4.9
+before group batch=1 rep=1 ev/s=1341 p99=5928.2us alloc/event=22.0981 bytes/event=3130.4 copy_bytes=835200 fsyncs=804 load1=4.75
+before group batch=1 rep=2 ev/s=1387 p99=5912.7us alloc/event=22.0972 bytes/event=3131.1 copy_bytes=835200 fsyncs=804 load1=4.77
+before group batch=10 rep=0 ev/s=12954 p99=5298.7us alloc/event=5.9242 bytes/event=1239.5 copy_bytes=5220000 fsyncs=505 load1=4.77
+before group batch=10 rep=1 ev/s=12644 p99=5881.8us alloc/event=5.9242 bytes/event=1239.5 copy_bytes=5220000 fsyncs=504 load1=4.79
+before group batch=10 rep=2 ev/s=13327 p99=5395.0us alloc/event=5.9242 bytes/event=1239.4 copy_bytes=5220000 fsyncs=505 load1=4.8
+before group batch=100 rep=0 ev/s=122842 p99=6032.5us alloc/event=2.2468 bytes/event=739.3 copy_bytes=0 fsyncs=305 load1=4.8
+before group batch=100 rep=1 ev/s=133862 p99=6079.9us alloc/event=2.2468 bytes/event=739.4 copy_bytes=0 fsyncs=305 load1=4.58
+before group batch=100 rep=2 ev/s=136105 p99=5915.7us alloc/event=2.2468 bytes/event=739.3 copy_bytes=0 fsyncs=304 load1=4.45
+before group batch=1000 rep=0 ev/s=907379 p99=7909.3us alloc/event=2.0369 bytes/event=697.9 copy_bytes=0 fsyncs=108 load1=4.45
+before group batch=1000 rep=1 ev/s=519463 p99=13023.5us alloc/event=2.0369 bytes/event=697.9 copy_bytes=0 fsyncs=105 load1=4.42
+before group batch=1000 rep=2 ev/s=473321 p99=14718.6us alloc/event=2.0370 bytes/event=697.9 copy_bytes=0 fsyncs=110 load1=4.42

@@ -1,0 +1,85 @@
+protocol=bn-2yye-process-successor-v1
+2026-07-15T15:16:21-04:00
+Linux 8o8-arch 7.0.12-arch1-1 #1 SMP PREEMPT_DYNAMIC Wed, 10 Jun 2026 08:58:02 +0000 x86_64 GNU/Linux
+rustc 1.97.0 (2d8144b78 2026-07-07)
+binary: rustc
+commit-hash: 2d8144b7880597b6e6d3dfd63a9a9efae3f533d3
+commit-date: 2026-07-07
+host: x86_64-unknown-linux-gnu
+release: 1.97.0
+LLVM version: 22.1.6
+cargo 1.97.0 (c980f4866 2026-06-30)
+Architecture:                            x86_64
+CPU op-mode(s):                          32-bit, 64-bit
+Address sizes:                           43 bits physical, 48 bits virtual
+Byte Order:                              Little Endian
+CPU(s):                                  24
+On-line CPU(s) list:                     0-23
+Vendor ID:                               AuthenticAMD
+Model name:                              AMD Ryzen 9 3900X 12-Core Processor
+CPU family:                              23
+Model:                                   113
+Thread(s) per core:                      2
+Core(s) per socket:                      12
+Socket(s):                               1
+Stepping:                                0
+Microcode version:                       0x8701035
+Frequency boost:                         enabled
+CPU(s) scaling MHz:                      81%
+CPU max MHz:                             4919.7490
+CPU min MHz:                             592.7410
+BogoMIPS:                                7999.94
+Flags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology nonstop_tsc cpuid extd_apicid aperfmperf rapl pni pclmulqdq monitor ssse3 fma cx16 sse4_1 sse4_2 x2apic movbe popcnt aes xsave avx f16c rdrand lahf_lm cmp_legacy extapic cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw ibs skinit wdt tce topoext perfctr_core perfctr_nb bpext perfctr_llc mwaitx cpb cat_l3 cdp_l3 hw_pstate ssbd mba ibpb stibp vmmcall fsgsbase bmi1 avx2 smep bmi2 cqm rdt_a rdseed adx smap clflushopt clwb sha_ni xsaveopt xsavec xgetbv1 cqm_llc cqm_occup_llc cqm_mbm_total cqm_mbm_local clzero irperf xsaveerptr rdpru wbnoinvd arat npt lbrv svm_lock nrip_save tsc_scale vmcb_clean flushbyasid decodeassists pausefilter pfthreshold avic v_vmsave_vmload vgif v_spec_ctrl umip rdpid overflow_recov succor smca sev sev_es
+L1d cache:                               384 KiB (12 instances)
+L1i cache:                               384 KiB (12 instances)
+L2 cache:                                6 MiB (12 instances)
+L3 cache:                                64 MiB (4 instances)
+NUMA node(s):                            1
+NUMA node0 CPU(s):                       0-23
+Vulnerability Gather data sampling:      Not affected
+Vulnerability Ghostwrite:                Not affected
+Vulnerability Indirect target selection: Not affected
+Vulnerability Itlb multihit:             Not affected
+Vulnerability L1tf:                      Not affected
+Vulnerability Mds:                       Not affected
+Vulnerability Meltdown:                  Not affected
+Vulnerability Mmio stale data:           Not affected
+Vulnerability Old microcode:             Not affected
+Vulnerability Reg file data sampling:    Not affected
+Vulnerability Retbleed:                  Mitigation; untrained return thunk; SMT enabled with STIBP protection
+Vulnerability Spec rstack overflow:      Mitigation; Safe RET
+Vulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl
+Vulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization
+Vulnerability Spectre v2:                Mitigation; Retpolines; IBPB conditional; STIBP always-on; RSB filling; PBRSB-eIBRS Not affected; BHI Not affected
+Vulnerability Srbds:                     Not affected
+Vulnerability Tsa:                       Not affected
+Vulnerability Tsx async abort:           Not affected
+Vulnerability Vmscape:                   Mitigation; IBPB before exit to userspace
+TARGET SOURCE         FSTYPE OPTIONS
+/home  /dev/nvme0n1p3 ext4   rw,relatime
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/nvme0n1p3  1.4T 1016G  257G  80% /home
+control_source=97f73c0d4e478bab1a13f22c8dbd8bbd502393c1
+candidate_source=75694cb483844cbd18f1e1b0ee4164adf278ef58
+control_dirty=false
+candidate_dirty=false
+control_root=/home/bob/src/mess/.maw/workspaces/bn-2yye-control
+candidate_root=/home/bob/src/mess/.maw/workspaces/bn-2yye
+control_binary_path=/home/bob/src/mess/.maw/workspaces/bn-2yye-control/target/release/examples/owned_append_bench
+candidate_binary_path=/home/bob/src/mess/.maw/workspaces/bn-2yye/target/release/examples/owned_append_bench
+control_harness_path=/home/bob/src/mess/.maw/workspaces/bn-2yye-control/crates/mess-store/examples/owned_append_bench.rs
+candidate_harness_path=/home/bob/src/mess/.maw/workspaces/bn-2yye/crates/mess-store/examples/owned_append_bench.rs
+control_cargo_lock_path=/home/bob/src/mess/.maw/workspaces/bn-2yye-control/Cargo.lock
+candidate_cargo_lock_path=/home/bob/src/mess/.maw/workspaces/bn-2yye/Cargo.lock
+runner_path=/home/bob/src/mess/.maw/workspaces/bn-2yye/spikes/owned_append/run_paired.sh
+evaluator_path=/home/bob/src/mess/.maw/workspaces/bn-2yye/spikes/owned_append/evaluate.py
+control_harness_sha256=78f4a65e897b59eb2e46f76ff6ade738e67af317c1d0cdd170d848951ca18eff
+candidate_harness_sha256=78f4a65e897b59eb2e46f76ff6ade738e67af317c1d0cdd170d848951ca18eff
+control_binary_sha256=b11e3c7fea9edc40b76d732c29ae26de922e5a4dcab14c6f947ee25f8734e29f
+candidate_binary_sha256=e11d8951b7735b8b3f8b3dac16f9902e5768da877b3ba1b92f1245a5214bdf08
+control_cargo_lock_sha256=4ba9ac66a698ac043852f33cb2c9a05659fdc548d54d871dc9f91556572436d0
+candidate_cargo_lock_sha256=4ba9ac66a698ac043852f33cb2c9a05659fdc548d54d871dc9f91556572436d0
+runner_sha256=469e16f6ca5205adb07bcf59b540859c19945684dd3ca3bbb9a26d0574f73dba
+evaluator_sha256=dcce45ab9acea3651e16ef521c4048df6e8631bfd6f522e0a4e661184cd58c8a
+governors=performance performance performance performance performance performance performance performance performance performance performance performance performance performance performance performance performance performance performance performance performance performance performance performance 
+command=./spikes/owned_append/run_paired.sh /home/bob/src/mess/.maw/workspaces/bn-2yye-control/target/release/examples/owned_append_bench /home/bob/src/mess/.maw/workspaces/bn-2yye/target/release/examples/owned_append_bench 97f73c0d4e478bab1a13f22c8dbd8bbd502393c1 75694cb483844cbd18f1e1b0ee4164adf278ef58 /home/bob/.cache/mess-bench/results/bn-2yye-attempt6-75694cb-20260715T1920Z
