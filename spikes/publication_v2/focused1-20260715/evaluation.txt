@@ -1,0 +1,4 @@
+mode,batch,throughput_B_over_A,p99_B_over_A,allocs_B_over_A,bytes_B_over_A,fsync_B_minus_A,barriers_B_over_A,verdict
+process,1,0.962144,1.031216,0.999164,0.997984,0.0,1.000000,FAIL
+process,100,1.015569,0.950989,0.999820,1.000007,0.0,1.000000,PASS
+group,1000,1.008579,1.070458,1.000000,1.000000,0.5,1.006944,FAIL

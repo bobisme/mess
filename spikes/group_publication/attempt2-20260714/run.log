@@ -1,0 +1,56 @@
+control cycle=1 slot=1 process batch=1 ev/s=145154 p99=52.3us alloc/event=16.6235 bytes/event=2653.2 copied=160000/41760000 groups/fsyncs=0/0 fsync_p99=0ns degraded=false load=5.16->5.16
+candidate cycle=1 slot=2 process batch=1 ev/s=136420 p99=56.5us alloc/event=16.6043 bytes/event=2646.0 copied=160000/41760000 groups/fsyncs=0/0 fsync_p99=0ns degraded=false load=5.16->5.55
+candidate cycle=1 slot=3 process batch=1 ev/s=133228 p99=60.6us alloc/event=16.5984 bytes/event=2644.0 copied=160000/41760000 groups/fsyncs=0/0 fsync_p99=0ns degraded=false load=5.55->5.55
+control cycle=1 slot=4 process batch=1 ev/s=145760 p99=53.2us alloc/event=16.6206 bytes/event=2652.5 copied=160000/41760000 groups/fsyncs=0/0 fsync_p99=0ns degraded=false load=5.55->5.55
+candidate cycle=2 slot=1 process batch=1 ev/s=137410 p99=56.3us alloc/event=16.5831 bytes/event=2639.4 copied=160000/41760000 groups/fsyncs=0/0 fsync_p99=0ns degraded=false load=5.42->5.42
+control cycle=2 slot=2 process batch=1 ev/s=142377 p99=54.4us alloc/event=16.6386 bytes/event=2658.1 copied=160000/41760000 groups/fsyncs=0/0 fsync_p99=0ns degraded=false load=5.42->5.42
+control cycle=2 slot=3 process batch=1 ev/s=146865 p99=56.1us alloc/event=16.6284 bytes/event=2655.1 copied=160000/41760000 groups/fsyncs=0/0 fsync_p99=0ns degraded=false load=5.42->5.79
+candidate cycle=2 slot=4 process batch=1 ev/s=139542 p99=53.1us alloc/event=16.6043 bytes/event=2645.6 copied=160000/41760000 groups/fsyncs=0/0 fsync_p99=0ns degraded=false load=5.79->5.79
+control cycle=3 slot=1 process batch=1 ev/s=151740 p99=51.2us alloc/event=16.6372 bytes/event=2657.9 copied=160000/41760000 groups/fsyncs=0/0 fsync_p99=0ns degraded=false load=5.79->5.79
+candidate cycle=3 slot=2 process batch=1 ev/s=142266 p99=53.7us alloc/event=16.6009 bytes/event=2644.8 copied=160000/41760000 groups/fsyncs=0/0 fsync_p99=0ns degraded=false load=5.79->5.65
+candidate cycle=3 slot=3 process batch=1 ev/s=134290 p99=57.0us alloc/event=16.5957 bytes/event=2643.3 copied=160000/41760000 groups/fsyncs=0/0 fsync_p99=0ns degraded=false load=5.65->5.65
+control cycle=3 slot=4 process batch=1 ev/s=144764 p99=54.2us alloc/event=16.6261 bytes/event=2654.1 copied=160000/41760000 groups/fsyncs=0/0 fsync_p99=0ns degraded=false load=5.65->5.65
+candidate cycle=4 slot=1 process batch=1 ev/s=142143 p99=57.6us alloc/event=16.5878 bytes/event=2640.9 copied=160000/41760000 groups/fsyncs=0/0 fsync_p99=0ns degraded=false load=5.65->5.75
+control cycle=4 slot=2 process batch=1 ev/s=138718 p99=65.4us alloc/event=16.6503 bytes/event=2662.1 copied=160000/41760000 groups/fsyncs=0/0 fsync_p99=0ns degraded=false load=5.75->5.75
+control cycle=4 slot=3 process batch=1 ev/s=147968 p99=51.4us alloc/event=16.6392 bytes/event=2658.6 copied=160000/41760000 groups/fsyncs=0/0 fsync_p99=0ns degraded=false load=5.75->5.75
+candidate cycle=4 slot=4 process batch=1 ev/s=149860 p99=56.8us alloc/event=16.5732 bytes/event=2636.3 copied=160000/41760000 groups/fsyncs=0/0 fsync_p99=0ns degraded=false load=5.69->5.69
+control cycle=5 slot=1 process batch=1 ev/s=143119 p99=52.6us alloc/event=16.6360 bytes/event=2657.3 copied=160000/41760000 groups/fsyncs=0/0 fsync_p99=0ns degraded=false load=5.69->5.69
+candidate cycle=5 slot=2 process batch=1 ev/s=132613 p99=61.4us alloc/event=16.6128 bytes/event=2648.5 copied=160000/41760000 groups/fsyncs=0/0 fsync_p99=0ns degraded=false load=5.69->7.4
+waiting for load1=7.40 to fall below 6.0
+waiting for load1=7.40 to fall below 6.0
+waiting for load1=7.40 to fall below 6.0
+waiting for load1=7.45 to fall below 6.0
+waiting for load1=7.45 to fall below 6.0
+waiting for load1=7.09 to fall below 6.0
+waiting for load1=7.09 to fall below 6.0
+waiting for load1=7.09 to fall below 6.0
+waiting for load1=7.00 to fall below 6.0
+waiting for load1=7.00 to fall below 6.0
+waiting for load1=6.68 to fall below 6.0
+waiting for load1=6.68 to fall below 6.0
+waiting for load1=6.68 to fall below 6.0
+waiting for load1=6.47 to fall below 6.0
+waiting for load1=6.47 to fall below 6.0
+waiting for load1=6.19 to fall below 6.0
+waiting for load1=6.19 to fall below 6.0
+waiting for load1=6.19 to fall below 6.0
+waiting for load1=6.01 to fall below 6.0
+waiting for load1=6.01 to fall below 6.0
+waiting for load1=6.33 to fall below 6.0
+waiting for load1=6.33 to fall below 6.0
+waiting for load1=6.33 to fall below 6.0
+waiting for load1=6.39 to fall below 6.0
+waiting for load1=6.39 to fall below 6.0
+waiting for load1=6.36 to fall below 6.0
+waiting for load1=6.36 to fall below 6.0
+waiting for load1=6.36 to fall below 6.0
+candidate cycle=5 slot=3 process batch=1 ev/s=131361 p99=60.9us alloc/event=16.6135 bytes/event=2648.6 copied=160000/41760000 groups/fsyncs=0/0 fsync_p99=0ns degraded=false load=5.93->5.93
+control cycle=5 slot=4 process batch=1 ev/s=146072 p99=55.5us alloc/event=16.6419 bytes/event=2659.3 copied=160000/41760000 groups/fsyncs=0/0 fsync_p99=0ns degraded=false load=5.93->5.69
+control cycle=1 slot=1 process batch=10 ev/s=781022 p99=109.0us alloc/event=5.4302 bytes/event=1135.1 copied=500000/130500000 groups/fsyncs=0/0 fsync_p99=0ns degraded=false load=5.69->5.69
+candidate cycle=1 slot=2 process batch=10 ev/s=744137 p99=103.2us alloc/event=5.4453 bytes/event=1141.6 copied=500000/130500000 groups/fsyncs=0/0 fsync_p99=0ns degraded=false load=5.69->5.69
+candidate cycle=1 slot=3 process batch=10 ev/s=772061 p99=104.0us alloc/event=5.4460 bytes/event=1141.8 copied=500000/130500000 groups/fsyncs=0/0 fsync_p99=0ns degraded=false load=5.69->5.69
+control cycle=1 slot=4 process batch=10 ev/s=734757 p99=110.0us alloc/event=5.4358 bytes/event=1137.5 copied=500000/130500000 groups/fsyncs=0/0 fsync_p99=0ns degraded=false load=5.56->5.56
+candidate cycle=2 slot=1 process batch=10 ev/s=828667 p99=94.8us alloc/event=5.4380 bytes/event=1139.1 copied=500000/130500000 groups/fsyncs=0/0 fsync_p99=0ns degraded=false load=5.56->5.56
+control cycle=2 slot=2 process batch=10 ev/s=730909 p99=100.5us alloc/event=5.4377 bytes/event=1137.9 copied=500000/130500000 groups/fsyncs=0/0 fsync_p99=0ns degraded=false load=5.56->5.43
+control cycle=2 slot=3 process batch=10 ev/s=787656 p99=125.0us alloc/event=5.4242 bytes/event=1132.8 copied=500000/130500000 groups/fsyncs=0/0 fsync_p99=0ns degraded=false load=5.43->5.43
+foreign build or benchmark process present; fail-stop
