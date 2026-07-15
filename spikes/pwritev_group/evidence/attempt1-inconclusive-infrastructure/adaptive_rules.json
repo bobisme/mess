@@ -1,0 +1,1190 @@
+[
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 0,
+    "id": "fixed_pwritev_full_8m",
+    "iov": "full",
+    "kind": "fixed",
+    "min_batches": 2,
+    "variant": "pwritev_full_8m"
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 0,
+    "id": "fixed_pwritev_256_8m",
+    "iov": "256",
+    "kind": "fixed",
+    "min_batches": 2,
+    "variant": "pwritev_256_8m"
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 0,
+    "id": "fixed_pwritev_64_8m",
+    "iov": "64",
+    "kind": "fixed",
+    "min_batches": 2,
+    "variant": "pwritev_64_8m"
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 8388608,
+    "id": "fixed_copy_contiguous_8m",
+    "iov": "full",
+    "kind": "fixed",
+    "min_batches": 2,
+    "variant": "copy_contiguous"
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m2_full_1m_c0",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m2_full_1m_c65536",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m2_full_1m_c262144",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m2_full_1m_c1048576",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m2_full_4m_c0",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m2_full_4m_c65536",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m2_full_4m_c262144",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m2_full_4m_c1048576",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m2_full_8m_c0",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m2_full_8m_c65536",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m2_full_8m_c262144",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m2_full_8m_c1048576",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m2_256_1m_c0",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m2_256_1m_c65536",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m2_256_1m_c262144",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m2_256_1m_c1048576",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m2_256_4m_c0",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m2_256_4m_c65536",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m2_256_4m_c262144",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m2_256_4m_c1048576",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m2_256_8m_c0",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m2_256_8m_c65536",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m2_256_8m_c262144",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m2_256_8m_c1048576",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m2_64_1m_c0",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m2_64_1m_c65536",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m2_64_1m_c262144",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m2_64_1m_c1048576",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m2_64_4m_c0",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m2_64_4m_c65536",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m2_64_4m_c262144",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m2_64_4m_c1048576",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m2_64_8m_c0",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m2_64_8m_c65536",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m2_64_8m_c262144",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m2_64_8m_c1048576",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 2
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m4_full_1m_c0",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m4_full_1m_c65536",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m4_full_1m_c262144",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m4_full_1m_c1048576",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m4_full_4m_c0",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m4_full_4m_c65536",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m4_full_4m_c262144",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m4_full_4m_c1048576",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m4_full_8m_c0",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m4_full_8m_c65536",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m4_full_8m_c262144",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m4_full_8m_c1048576",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m4_256_1m_c0",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m4_256_1m_c65536",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m4_256_1m_c262144",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m4_256_1m_c1048576",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m4_256_4m_c0",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m4_256_4m_c65536",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m4_256_4m_c262144",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m4_256_4m_c1048576",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m4_256_8m_c0",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m4_256_8m_c65536",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m4_256_8m_c262144",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m4_256_8m_c1048576",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m4_64_1m_c0",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m4_64_1m_c65536",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m4_64_1m_c262144",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m4_64_1m_c1048576",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m4_64_4m_c0",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m4_64_4m_c65536",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m4_64_4m_c262144",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m4_64_4m_c1048576",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m4_64_8m_c0",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m4_64_8m_c65536",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m4_64_8m_c262144",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m4_64_8m_c1048576",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 4
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m8_full_1m_c0",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m8_full_1m_c65536",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m8_full_1m_c262144",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m8_full_1m_c1048576",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m8_full_4m_c0",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m8_full_4m_c65536",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m8_full_4m_c262144",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m8_full_4m_c1048576",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m8_full_8m_c0",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m8_full_8m_c65536",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m8_full_8m_c262144",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m8_full_8m_c1048576",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m8_256_1m_c0",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m8_256_1m_c65536",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m8_256_1m_c262144",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m8_256_1m_c1048576",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m8_256_4m_c0",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m8_256_4m_c65536",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m8_256_4m_c262144",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m8_256_4m_c1048576",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m8_256_8m_c0",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m8_256_8m_c65536",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m8_256_8m_c262144",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m8_256_8m_c1048576",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m8_64_1m_c0",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m8_64_1m_c65536",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m8_64_1m_c262144",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m8_64_1m_c1048576",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m8_64_4m_c0",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m8_64_4m_c65536",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m8_64_4m_c262144",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m8_64_4m_c1048576",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m8_64_8m_c0",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m8_64_8m_c65536",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m8_64_8m_c262144",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m8_64_8m_c1048576",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 8
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m16_full_1m_c0",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 16
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m16_full_1m_c65536",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 16
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m16_full_1m_c262144",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 16
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m16_full_1m_c1048576",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 16
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m16_full_4m_c0",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 16
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m16_full_4m_c65536",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 16
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m16_full_4m_c262144",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 16
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m16_full_4m_c1048576",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 16
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m16_full_8m_c0",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 16
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m16_full_8m_c65536",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 16
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m16_full_8m_c262144",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 16
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m16_full_8m_c1048576",
+    "iov": "full",
+    "kind": "adaptive",
+    "min_batches": 16
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m16_256_1m_c0",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 16
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m16_256_1m_c65536",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 16
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m16_256_1m_c262144",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 16
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m16_256_1m_c1048576",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 16
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m16_256_4m_c0",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 16
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m16_256_4m_c65536",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 16
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m16_256_4m_c262144",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 16
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m16_256_4m_c1048576",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 16
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m16_256_8m_c0",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 16
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m16_256_8m_c65536",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 16
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m16_256_8m_c262144",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 16
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m16_256_8m_c1048576",
+    "iov": "256",
+    "kind": "adaptive",
+    "min_batches": 16
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m16_64_1m_c0",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 16
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m16_64_1m_c65536",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 16
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m16_64_1m_c262144",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 16
+  },
+  {
+    "byte_cap": "1m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m16_64_1m_c1048576",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 16
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m16_64_4m_c0",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 16
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m16_64_4m_c65536",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 16
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m16_64_4m_c262144",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 16
+  },
+  {
+    "byte_cap": "4m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m16_64_4m_c1048576",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 16
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 0,
+    "id": "adaptive_m16_64_8m_c0",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 16
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 65536,
+    "id": "adaptive_m16_64_8m_c65536",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 16
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 262144,
+    "id": "adaptive_m16_64_8m_c262144",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 16
+  },
+  {
+    "byte_cap": "8m",
+    "copy_ceiling": 1048576,
+    "id": "adaptive_m16_64_8m_c1048576",
+    "iov": "64",
+    "kind": "adaptive",
+    "min_batches": 16
+  }
+]

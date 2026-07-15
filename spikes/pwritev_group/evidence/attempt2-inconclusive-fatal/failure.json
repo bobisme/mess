@@ -1,0 +1,10 @@
+{
+  "classification": "FATAL",
+  "completed_rows": 1528,
+  "error": "[Errno 13] Permission denied: '/home/bob/src/mess/.maw/workspaces/bn-1zv6/spikes/pwritev_group/evaluate.py'",
+  "failed_at_utc": "2026-07-15T19:07:27.663334+00:00",
+  "label": "preflight_or_evaluation",
+  "point": null,
+  "schema": "pwritev_group.failure.v1",
+  "stage": "runner"
+}

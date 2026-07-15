@@ -1,0 +1,18 @@
+[package]
+name = "pwritev_group"
+version = "0.1.0"
+edition = "2024"
+
+# Standalone decision harness: production workspace policy and binaries remain
+# untouched until the measured gate says ADOPT.
+[workspace]
+
+[dependencies]
+libc = "0.2"
+mess-log = { path = "../../crates/mess-log" }
+mess-testkit = { path = "../../crates/mess-testkit" }
+
+[profile.release]
+lto = "thin"
+debug = true
+

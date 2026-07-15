@@ -1,0 +1,41 @@
+{
+  "byte_threshold_device_write_bytes_if_time_not_first": {
+    "boundary": 31584850368,
+    "confirmation": 96452022536,
+    "exploratory": 47985212880
+  },
+  "byte_threshold_logical_bytes_if_time_not_first": {
+    "boundary": 29817329000,
+    "confirmation": 76996656992,
+    "exploratory": 35722075184,
+    "prepared_pipeline": 5384512804
+  },
+  "conservative_wall_seconds": {
+    "boundary": 1320,
+    "confirmation_if_selected": 1762,
+    "correctness_and_setup": 600,
+    "exploratory": 2856,
+    "prepared_pipeline": 204
+  },
+  "conservative_wall_total_seconds": 6742,
+  "counts": {
+    "adaptive_configs": 144,
+    "boundary": 440,
+    "confirmation_if_selected": 480,
+    "exploratory": 952,
+    "fixed_rules": 4,
+    "prepared_pipeline": 136
+  },
+  "guaranteed_minimum_device_write_bytes": {
+    "boundary": 2651225732,
+    "confirmation": 38867159264,
+    "exploratory": 18394584688
+  },
+  "guaranteed_minimum_logical_bytes": {
+    "boundary": 883704364,
+    "confirmation": 19411793720,
+    "exploratory": 6131446992,
+    "prepared_pipeline": 1151800130
+  },
+  "scratch_peak_required_bytes": 17179869184
+}

@@ -1,0 +1,14 @@
+{
+  "absolute_timeout_seconds": 7200,
+  "attempt": 2,
+  "post_row_noise": "retain_and_continue_after_next_pre_row_guard",
+  "prior_attempt_classification": "INCONCLUSIVE_INFRASTRUCTURE",
+  "prior_attempt_evidence": "spikes/pwritev_group/evidence/attempt1-inconclusive-infrastructure",
+  "prior_attempt_timing_rows_reused": false,
+  "row_retry_or_replacement": false,
+  "schema": "pwritev_group.attempt_protocol.v1",
+  "source_commit": "54215100a825da9eb7cfbd8f045e54ef05fb29bd",
+  "stage1_physical_comparison_clean_rows_required": 4,
+  "stage2_adjacent_clean_pairs_required_for_adopt": 6,
+  "started_at_utc": "2026-07-15T18:38:07.509676+00:00"
+}
