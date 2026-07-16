@@ -16,7 +16,9 @@ the historical comparators, resolves their candidate locks offline, and
 retains complete lock diffs. Resolution is bound to the resolved cargo/rustc
 paths, executable hashes, verbose versions, and Rust host triple; these are the
 actual binaries selected by one exact rustup toolchain, not rustup proxies.
-Git and bubblewrap are absolute and hash-bound too. Every Cargo invocation
+Git and bubblewrap are absolute and hash-bound too; every Git identity,
+archive, lock-readback, and overlay operation executes through its retained
+hash-checked descriptor. Every Cargo invocation
 uses a complete allowlisted environment, disabled global/system Git config,
 an offline read-only Cargo home, and a canonical replayed manifest of every
 Cargo config search path. The exact same identity is required for every later
@@ -69,25 +71,61 @@ ledger description, and includes that exact nonce/timestamp event in
 row receives no perf descriptors and emits `perf_disable: null`; every non-CPU
 mode rejects all four perf environment bindings and omits that field.
 
-After an independent review approves the exact tooling commit, candidate
-locks, and exact immutable caller tools manifest, `write-approval --tools`
-creates the canonical source approval. The approval embeds the complete
-canonical tools object and its file hash; `build --tools` requires both to be
-byte-identical before it then:
+After the exact tooling commit is final, an independent Seal review approves
+one structured assertion over the protocol, the tooling commit/tree, the
+candidate locks, the final tools manifest, the lock-review authority and
+bundle, and the immutable preapproval current-child attestation. The canonical
+`bn-3hch-source-review-bundle-v1` contains the detached Git anchor and exact
+`lgtm` verdict; `write-approval` derives `review_id` and `reviewed_at` from
+those events. There are no free-form review-provenance arguments.
+
+The assertion also freezes a release compile-out requirement. That requirement
+binds the preapproval A/product-test-overlay equality proof and requires it to
+be repeated under the eventual real source-approval hash. It intentionally
+does not bind the later proof hash: the proof binds the approval, in one
+direction, so neither the approval nor its review has a hash cycle. The
+approval embeds the complete canonical tools object and its file hash;
+`build --tools` requires both to be byte-identical before it then:
 
 1. rematerializes every exact approved source commit and retains its tar
    archive and manifest in the prepared root;
 2. injects only the approved overlay paths and approved root lock;
 3. makes the complete source tree read-only;
-4. builds `A`, `B`, `C`, and `D` sequentially with `--locked --offline` in a
-   `bubblewrap` sandbox with a read-only host root and no network;
-5. proves the materialized manifest and lock are unchanged;
-6. runs contract mode only, verifies exact canonical output, and retains child
+4. builds ordinary `A`, then a physically distinct proof-only `A` source with
+   the exact reviewed product test overlay, under the same real approval,
+   contract, nonce, lock, toolchain, Cargo environment, normalized sandbox,
+   package/example and fixed guest paths, with no workspace wrapper or
+   `cfg(test)`. Bubblewrap, Cargo, rustc, Git, both source roots, both target
+   roots, and the Cargo/rustup homes are retained by descriptor across their
+   use. The seven core descriptors are followed by four exact config-file
+   descriptors; all eleven ephemeral numbers are normalized, never a guest
+   destination. Cargo-config evidence names the guest cwd/home and all eight
+   searched guest paths. Source and Cargo-home config files are private
+   descriptor mounts containing either the retained reviewed bytes or an
+   immutable empty substitute; ancestor `.cargo` directories are empty
+   read-only mounts. The config-manifest hash is part of the sandbox hash;
+5. proves the two release binaries and their retained-`nm` symbol inventories
+   are byte-identical and contain none of the six reviewed hook strings, emits
+   `manifests/release-compile-out.json`, and publishes only ordinary `A`;
+6. continues the measurement build chronology as `B`, `C`, and `D`, preserving
+   the public `build_order` of exactly `A`, `B`, `C`, `D`;
+7. proves every materialized manifest and lock is unchanged;
+8. runs contract mode only, verifies exact canonical output, and retains child
    identity/reaping records; and
-7. copies binaries, source approval, the canonical tools manifest, and every
+9. copies binaries, source approval, the canonical tools manifest, and every
    source-approved tool/support file into one immutable, single-use
    prepared-artifact root, rechecking every hash, mode, comm, exact set, and
    relocated claim.
+
+The prepared root carries immutable local copies at
+`bindings/source-review-bundle.json`,
+`bindings/current-children-attestation.json`,
+`bindings/lock-review-authority.json`, and
+`bindings/lock-review-bundle.json`. Its prepared manifest binds those four
+copies and `manifests/release-compile-out.json`. The proof-only overlay binary
+is reachable only through that proof: it is absent from variants, prepared
+tools, executable argument plans, and measurement child plans. The ordinary A
+hash in the proof must equal the A hash published by the prepared manifest.
 
 The prepared manifest also binds immutable copies of the exact approved
 protocol document and the historical `BN-2SU-FINAL.csv` input. Downstream
@@ -124,7 +162,9 @@ prepared root is read-only except for its dedicated single-use claims
 directory. Build validation requires every other directory to be exactly
 `0555`, rejects extra support paths, and proves that both relocated Python
 runtimes can import the shared evidence schema without creating `__pycache__`
-or changing any support byte.
+or changing any support byte. Those imports are the last child executions;
+the producer then freezes the tree and terminally replays a whole-tree
+file/directory manifest plus every release compile-out binding and proof.
 
 Contract and transition smokes are not performance evidence. Only the
 separately reviewed runner may drive evidence modes after all prepared hashes
