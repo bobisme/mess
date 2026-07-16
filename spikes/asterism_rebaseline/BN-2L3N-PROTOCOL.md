@@ -2,6 +2,8 @@
 
 ## Status and decision boundary
 
+The canonical protocol identity is `bn-2l3n-asterism-rebaseline-v2`.
+
 This is the frozen pre-build contract for `bn-2l3n`. No benchmark binary,
 correctness build, timing row, or profile row may be produced until this
 document and the measurement tooling that implements it have received an
@@ -9,6 +11,19 @@ independent risk-high review. Tooling may implement this contract; it may not
 change a source checkpoint, workload, order, statistic, gate, or outcome after
 the first build starts. Any such change creates a new protocol version and
 invalidates every prepared artifact and row from this version.
+
+Version 2 supersedes the independently approved version-1 document at
+SHA-256 `19567dd2582de9717be4e7d401a2ddf2c63a076ae58ff0aee01ac49653db5762`
+before any correctness build, benchmark build, timing row, or profile row was
+produced. Its only measurement-contract changes are the `A`/`B` source binding
+below and the corresponding evidence availability: the current source now
+exports read-only owner intent-slot and byte-permit occupancy, so `A` must
+report exact quiescent integers for the already-required zero-reservation
+fairness and cancellation gates instead of `not_available`. All workloads,
+orders, statistics, thresholds, correctness gates, and terminal outcomes are
+unchanged. Every version-1 tooling constant, provisional source plan,
+resolution-only lock candidate, or prepared artifact is invalid and must be
+regenerated from this document after its independent risk-high approval.
 
 The question is deliberately end to end: does the current public storage
 composition preserve the completed flat-owner win, improve materially on the
@@ -39,8 +54,8 @@ Variant letters and order are fixed:
 
 | id | variant | product commit | product tree | timed surface |
 | --- | --- | --- | --- | --- |
-| `A` | `current-public` | `774e6454a1209042bb6ecf61eb10c56430b5e81b` | `b136676ef7aa946a6b90ca15b13acdffb727a91a` | `EventStore<FjallSnapshotBackend<LogEngine>>`, snapshot policy off, using the public batch append surface |
-| `B` | `current-bare` | `774e6454a1209042bb6ecf61eb10c56430b5e81b` | `b136676ef7aa946a6b90ca15b13acdffb727a91a` | raw `mess-log` `Committer`/`Appender`, numeric IDs, no registry or `mess-store` validation |
+| `A` | `current-public` | `1d8a6e0d5382c387e9c327c7382db516f40a63a4` | `48aa4e3b3400549e0e9a939e5ef0bfb2d6492b29` | `EventStore<FjallSnapshotBackend<LogEngine>>`, snapshot policy off, using the public batch append surface |
+| `B` | `current-bare` | `1d8a6e0d5382c387e9c327c7382db516f40a63a4` | `48aa4e3b3400549e0e9a939e5ef0bfb2d6492b29` | raw `mess-log` `Committer`/`Appender`, numeric IDs, no registry or `mess-store` validation |
 | `C` | `fjall-public` | `f0ab89e92e44253f8fe48cf19d7a93e39263585b` | `7ca2228fcd1c65ef942da35144fcf507d8a72e12` | the same public composition, with the baseline-gen2 Fjall-era `LogEngine` |
 | `D` | `flat-public` | `69b95604b9e7c924314cf7d82b86a2edb7dccde6` | `f738cde2b5414d1a2926ac86573163d505754ba9` | the same public composition at the integrated optimized BN-2SU checkpoint |
 
@@ -54,7 +69,10 @@ report correction; `git diff 095460b7..69b95604` must remain limited to that
 report. The earlier `b583fd01` source is the report's explicitly superseded
 pre-optimization checkpoint and is forbidden as `D`. `A` includes direct
 outcomes, owner-ring fairness/publication fixes, and the admitted Process-only
-owned-input path. `B` must be compiled anew from the named current source;
+owned-input path, plus the read-only reservation-occupancy metrics required by
+the frozen fairness gate. The occupancy seam adds no work to append admission,
+ownership, publication, or durability; it is sampled only after the measured
+window at quiescence. `B` must be compiled anew from the named current source;
 historical bare rows may be shown in the report but may not enter a ratio or
 outcome.
 
@@ -256,14 +274,18 @@ producing 64 rows.
 Record per-writer completed appends, elapsed time, p50/p99/max, the Jain index
 of per-writer rates, minimum/median writer rate, maximum/median writer p99,
 aggregate batches/events per committed group, and barrier count. Queue
-intents/bytes, exact group-width distribution, adaptive target, and oldest
-queued age are not exported neutrally by current or historical production
-engines; all variants report those fields as `not_available`, never zero, and
-they are not gates. No wrapper-side estimate may impersonate admission-boundary
-state. Every writer must complete exact work; no aggregate total can hide a
-starved writer. Writer elapsed is the common start release through that
-writer's final append completion, and writer rate is completed domain events
-divided by that elapsed time. Jain fairness is
+depth/bytes, exact group-width distribution, adaptive target, and oldest queued
+age are not exported neutrally by current or historical production engines;
+all variants report those detailed diagnostic fields as `not_available`, never
+zero, and they are not gates. Separately, `A` reports the production engine's
+exact quiescent `waiter_reservations_after` and
+`byte_reservations_after` occupancy as integers in every fairness row; both
+must be zero. `B`, `C`, and `D` report those two fields as `not_available`
+because they do not expose the same admission-boundary state. No wrapper-side
+estimate may impersonate it. Every writer must complete exact work; no
+aggregate total can hide a starved writer. Writer elapsed is the common start
+release through that writer's final append completion, and writer rate is
+completed domain events divided by that elapsed time. Jain fairness is
 `(sum(rate))^2 / (64 * sum(rate^2))`. Per-writer p50 and p99 use nearest-rank
 indexes `ceil(q * n) - 1` on sorted samples; “median writer p99” is the median
 of the 64 resulting p99 values and “maximum writer p99” is their maximum. No
