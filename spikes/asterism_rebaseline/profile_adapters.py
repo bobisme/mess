@@ -581,12 +581,11 @@ def _read_exact_fd(descriptor: int, context: str, limit: int = 16 * 1024 * 1024)
             raise ProfileEvidenceError(f"{context} exceeds {limit} bytes")
 
 
-def _immutable_file_snapshot(
+def _immutable_file_payload(
     path_value: object,
-    claimed_sha256: object,
     expected_mode: int | None,
     context: str,
-) -> tuple[Path, bytes]:
+) -> tuple[Path, bytes, tuple[int, int]]:
     if not isinstance(path_value, str):
         raise ProfileEvidenceError(f"{context} path is not text")
     path = Path(path_value)
@@ -597,8 +596,6 @@ def _immutable_file_snapshot(
         or str(path) != path_value
     ):
         raise ProfileEvidenceError(f"{context} path is not canonical absolute")
-    if not isinstance(claimed_sha256, str) or not _SHA256_RE.fullmatch(claimed_sha256):
-        raise ProfileEvidenceError(f"{context} SHA-256 is malformed")
     directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY
     file_flags = os.O_RDONLY | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
@@ -636,9 +633,33 @@ def _immutable_file_snapshot(
             raise ProfileEvidenceError(f"{context} changed during its one-fd snapshot")
     finally:
         os.close(descriptor)
+    return path, payload, (before.st_dev, before.st_ino)
+
+
+def _immutable_file_snapshot(
+    path_value: object,
+    claimed_sha256: object,
+    expected_mode: int | None,
+    context: str,
+) -> tuple[Path, bytes, tuple[int, int]]:
+    if not isinstance(claimed_sha256, str) or not _SHA256_RE.fullmatch(claimed_sha256):
+        raise ProfileEvidenceError(f"{context} SHA-256 is malformed")
+    path, payload, identity = _immutable_file_payload(
+        path_value, expected_mode, context
+    )
     if _sha256_bytes(payload) != claimed_sha256:
         raise ProfileEvidenceError(f"{context} SHA-256 differs")
-    return path, payload
+    return path, payload, identity
+
+
+def _canonical_json_payload(payload: bytes, context: str) -> dict[str, object]:
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ProfileEvidenceError(f"{context} is not canonical JSON: {error}") from error
+    if not isinstance(value, dict) or canonical_json(value) != payload:
+        raise ProfileEvidenceError(f"{context} is not one canonical JSON object")
+    return value
 
 
 def _canonical_json_snapshot(
@@ -646,14 +667,17 @@ def _canonical_json_snapshot(
     claimed_sha256: object,
     context: str,
 ) -> tuple[Path, dict[str, object]]:
-    path, payload = _immutable_file_snapshot(path_value, claimed_sha256, 0o444, context)
-    try:
-        value = json.loads(payload)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ProfileEvidenceError(f"{context} is not canonical JSON: {error}") from error
-    if not isinstance(value, dict) or canonical_json(value) != payload:
-        raise ProfileEvidenceError(f"{context} is not one canonical JSON object")
-    return path, value
+    path, payload, _identity = _immutable_file_snapshot(
+        path_value, claimed_sha256, 0o444, context
+    )
+    return path, _canonical_json_payload(payload, context)
+
+
+def _unclaimed_canonical_json_snapshot(
+    path_value: object, context: str
+) -> tuple[Path, bytes, dict[str, object]]:
+    path, payload, _identity = _immutable_file_payload(path_value, 0o444, context)
+    return path, payload, _canonical_json_payload(payload, context)
 
 
 def _raw_artifact_snapshot(value: object, context: str) -> tuple[Path, bytes]:
@@ -664,7 +688,7 @@ def _raw_artifact_snapshot(value: object, context: str) -> tuple[Path, bytes]:
     )
     if binding["mode"] != 0o444:
         raise ProfileEvidenceError(f"{context} mode authority differs")
-    path, payload = _immutable_file_snapshot(
+    path, payload, _identity = _immutable_file_snapshot(
         binding["path"], binding["sha256"], 0o444, context
     )
     if _json_nonnegative_integer(binding["bytes"], f"{context} bytes") != len(payload):
@@ -2148,16 +2172,38 @@ def validate_profile_authority(
     if _sha256_bytes(canonical_json(dict(context))) != authority["context_sha256"]:
         raise ProfileEvidenceError("profile context SHA-256 differs")
 
-    source_path, approval = _canonical_json_snapshot(
+    (
+        attempt_approval_path,
+        attempt_approval_payload,
+        attempt_approval_identity,
+    ) = _immutable_file_snapshot(
         authority["source_approval_path"],
         authority["source_approval_sha256"],
+        0o444,
         "profile source approval",
     )
-    prepared_path, prepared = _canonical_json_snapshot(
+    approval = _canonical_json_payload(
+        attempt_approval_payload, "profile source approval"
+    )
+    (
+        attempt_prepared_path,
+        attempt_prepared_payload,
+        attempt_prepared_identity,
+    ) = _immutable_file_snapshot(
         authority["prepared_artifacts_path"],
         authority["prepared_artifacts_sha256"],
+        0o444,
         "profile prepared artifacts",
     )
+    prepared = _canonical_json_payload(
+        attempt_prepared_payload, "profile prepared artifacts"
+    )
+    if (
+        attempt_prepared_path.name != "prepared-artifacts.json"
+        or attempt_approval_path
+        != attempt_prepared_path.with_name("source-approval.json")
+    ):
+        raise ProfileEvidenceError("profile attempt authority paths are not exact siblings")
     if (
         approval.get("schema") != "bn-2l3n-source-approval-v3"
         or approval.get("status") != "approved"
@@ -2211,11 +2257,107 @@ def validate_profile_authority(
         or prepared.get("protocol_sha256") != PROTOCOL_SHA256
     ):
         raise ProfileEvidenceError("profile prepared artifacts are not exact v3")
-    approval_binding = prepared.get("source_approval")
-    if not isinstance(approval_binding, dict) or (
-        approval_binding.get("path"), approval_binding.get("sha256")
-    ) != (str(source_path), authority["source_approval_sha256"]):
+    approval_binding = _exact_mapping(
+        prepared.get("source_approval"),
+        ("path", "sha256"),
+        "prepared source-approval binding",
+    )
+    claim_binding = _exact_mapping(
+        prepared.get("single_use_claim"),
+        ("path",),
+        "prepared single-use claim binding",
+    )
+    claim_path, _claim_payload, prepared_claim = _unclaimed_canonical_json_snapshot(
+        claim_binding["path"], "prepared single-use claim"
+    )
+    if (
+        claim_path.name != "single-use-claim.json"
+        or claim_path.parent.name != "claims"
+    ):
+        raise ProfileEvidenceError("prepared single-use claim path differs")
+    prepared_root = claim_path.parent.parent
+    try:
+        claim_directory_mode = stat.S_IMODE(claim_path.parent.stat().st_mode)
+        prepared_root_mode = stat.S_IMODE(prepared_root.stat().st_mode)
+    except OSError as error:
+        raise ProfileEvidenceError(
+            f"cannot replay prepared root/claims modes: {error}"
+        ) from error
+    if claim_directory_mode != 0o700 or prepared_root_mode != 0o555:
+        raise ProfileEvidenceError("prepared root/claims mode authority differs")
+    expected_claim_fields = (
+        "schema",
+        "protocol",
+        "prepared_artifacts_path",
+        "prepared_artifacts_sha256",
+        "output_dir",
+        "attempt_nonce",
+        "lease_nonce",
+        "claimed_at",
+        "claimed_monotonic_ns",
+    )
+    prepared_claim = _exact_mapping(
+        prepared_claim, expected_claim_fields, "prepared single-use claim"
+    )
+    original_prepared_path = prepared_root / "prepared-artifacts.json"
+    if (
+        original_prepared_path == attempt_prepared_path
+        or prepared_root == attempt_prepared_path.parent
+    ):
+        raise ProfileEvidenceError("original/attempt prepared paths are not distinct")
+    if (
+        prepared_claim["schema"] != "bn-2l3n-prepared-claim-v3"
+        or prepared_claim["protocol"] != PROTOCOL
+        or prepared_claim["prepared_artifacts_path"] != str(original_prepared_path)
+        or prepared_claim["prepared_artifacts_sha256"]
+        != authority["prepared_artifacts_sha256"]
+        or prepared_claim["output_dir"] != str(attempt_prepared_path.parent)
+        or prepared_claim["attempt_nonce"] != authority["attempt_nonce"]
+        or not isinstance(prepared_claim["lease_nonce"], str)
+        or not _SHA256_RE.fullmatch(prepared_claim["lease_nonce"])
+        or not isinstance(prepared_claim["claimed_at"], str)
+        or not prepared_claim["claimed_at"]
+        or isinstance(prepared_claim["claimed_monotonic_ns"], bool)
+        or not isinstance(prepared_claim["claimed_monotonic_ns"], int)
+        or prepared_claim["claimed_monotonic_ns"] <= 0
+    ):
+        raise ProfileEvidenceError("prepared single-use claim authority differs")
+    (
+        original_prepared_path,
+        original_prepared_payload,
+        original_prepared_identity,
+    ) = _immutable_file_snapshot(
+        str(original_prepared_path),
+        authority["prepared_artifacts_sha256"],
+        0o444,
+        "original prepared artifacts",
+    )
+    if original_prepared_identity == attempt_prepared_identity:
+        raise ProfileEvidenceError("original/attempt prepared file identities alias")
+    if original_prepared_payload != attempt_prepared_payload:
+        raise ProfileEvidenceError("original/attempt prepared artifact bytes differ")
+    original_approval_path = prepared_root / "bindings" / "source-approval.json"
+    if original_approval_path == attempt_approval_path:
+        raise ProfileEvidenceError("original/attempt source-approval paths are not distinct")
+    if (
+        approval_binding["path"] != str(original_approval_path)
+        or approval_binding["sha256"] != authority["source_approval_sha256"]
+    ):
         raise ProfileEvidenceError("prepared/source-approval binding differs")
+    (
+        original_approval_path,
+        original_approval_payload,
+        original_approval_identity,
+    ) = _immutable_file_snapshot(
+        str(original_approval_path),
+        authority["source_approval_sha256"],
+        0o444,
+        "original source approval",
+    )
+    if original_approval_identity == attempt_approval_identity:
+        raise ProfileEvidenceError("original/attempt source-approval file identities alias")
+    if original_approval_payload != attempt_approval_payload:
+        raise ProfileEvidenceError("original/attempt source-approval bytes differ")
     support_files = prepared.get("support_files")
     adapter_binding = (
         support_files.get("profile_adapter") if isinstance(support_files, dict) else None
@@ -2270,19 +2412,19 @@ def validate_profile_authority(
             tool["path"], tool["sha256"], 0o555, f"prepared profile tool {name}"
         )
 
-    adapter_path, adapter_payload = _immutable_file_snapshot(
+    adapter_path, adapter_payload, _adapter_identity = _immutable_file_snapshot(
         authority["profile_adapter_path"],
         authority["profile_adapter_sha256"],
         0o444,
         "prepared profile adapter",
     )
-    _, executable_payload = _immutable_file_snapshot(
+    _, executable_payload, _executable_identity = _immutable_file_snapshot(
         authority["executable_path"],
         authority["executable_sha256"],
         0o555,
         "prepared profile executable",
     )
-    _, executed_adapter_payload = _immutable_file_snapshot(
+    _, executed_adapter_payload, _executed_adapter_identity = _immutable_file_snapshot(
         str(Path(__file__).resolve()),
         authority["profile_adapter_sha256"],
         None,
@@ -2306,7 +2448,7 @@ def validate_profile_authority(
     if not isinstance(normalized, dict):
         raise AssertionError("profile authority normalization did not produce an object")
     # Keep local names live for static analyzers: both snapshots are intentional authority.
-    _ = prepared_path, adapter_path
+    _ = original_prepared_path, original_approval_path, adapter_path
     return normalized
 
 

@@ -292,17 +292,22 @@ def live_authority(
     track: str,
     context: dict[str, object],
 ) -> dict[str, object]:
-    bindings = root / "authority"
-    bindings.mkdir()
-    binary = bindings / "bench"
+    prepared_root = root / "prepared"
+    bindings = prepared_root / "bindings"
+    bindings.mkdir(parents=True)
+    artifacts = prepared_root / "artifacts"
+    artifacts.mkdir()
+    attempt_root = root / "attempt"
+    attempt_root.mkdir()
+    binary = artifacts / "bench"
     binary.write_bytes(b"synthetic benchmark executable\n")
     binary.chmod(0o555)
     binary_sha = sha256(binary.read_bytes())
-    adapter = bindings / "profile_adapters.py"
+    adapter = artifacts / "profile_adapters.py"
     adapter.write_bytes(MODULE_PATH.read_bytes())
     adapter.chmod(0o444)
     adapter_sha = sha256(adapter.read_bytes())
-    tools = profile_tools_for(track, bindings)
+    tools = profile_tools_for(track, artifacts)
     source = adapters.VARIANT_SOURCE_BINDINGS[variant]
     role_lifetime: object = (
         adapters.C_ROLE_LIFETIME_CONTRACT if variant == "C" else "not_applicable"
@@ -330,13 +335,18 @@ def live_authority(
             "tools": tools,
         },
     }
-    approval_path = bindings / "source-approval.json"
-    approval_sha = write_canonical(approval_path, approval, 0o444)
+    original_approval_path = bindings / "source-approval.json"
+    approval_sha = write_canonical(original_approval_path, approval, 0o444)
+    claim_path = prepared_root / "claims" / "single-use-claim.json"
     prepared = {
         "schema": "bn-2l3n-prepared-artifacts-v3",
         "protocol": adapters.PROTOCOL,
         "protocol_sha256": adapters.PROTOCOL_SHA256,
-        "source_approval": {"path": str(approval_path), "sha256": approval_sha},
+        "source_approval": {
+            "path": str(original_approval_path),
+            "sha256": approval_sha,
+        },
+        "single_use_claim": {"path": str(claim_path)},
         "support_files": {
             "profile_adapter": {
                 "path": str(adapter),
@@ -359,8 +369,30 @@ def live_authority(
             }
         },
     }
-    prepared_path = bindings / "prepared-artifacts.json"
-    prepared_sha = write_canonical(prepared_path, prepared, 0o444)
+    original_prepared_path = prepared_root / "prepared-artifacts.json"
+    prepared_sha = write_canonical(original_prepared_path, prepared, 0o444)
+    claim = {
+        "schema": "bn-2l3n-prepared-claim-v3",
+        "protocol": adapters.PROTOCOL,
+        "prepared_artifacts_path": str(original_prepared_path),
+        "prepared_artifacts_sha256": prepared_sha,
+        "output_dir": str(attempt_root),
+        "attempt_nonce": "a" * 64,
+        "lease_nonce": "1" * 64,
+        "claimed_at": "2026-07-16T00:00:00+00:00",
+        "claimed_monotonic_ns": 1,
+    }
+    write_canonical(claim_path, claim, 0o444)
+    claim_path.parent.chmod(0o700)
+    bindings.chmod(0o555)
+    artifacts.chmod(0o555)
+    prepared_root.chmod(0o555)
+    attempt_approval_path = attempt_root / "source-approval.json"
+    attempt_prepared_path = attempt_root / "prepared-artifacts.json"
+    attempt_approval_path.write_bytes(original_approval_path.read_bytes())
+    attempt_approval_path.chmod(0o444)
+    attempt_prepared_path.write_bytes(original_prepared_path.read_bytes())
+    attempt_prepared_path.chmod(0o444)
     exe = root / str(pid) / "exe"
     exe.symlink_to(binary)
     authority = synthetic_authority(
@@ -373,9 +405,9 @@ def live_authority(
     )
     authority.update(
         {
-            "prepared_artifacts_path": str(prepared_path),
+            "prepared_artifacts_path": str(attempt_prepared_path),
             "prepared_artifacts_sha256": prepared_sha,
-            "source_approval_path": str(approval_path),
+            "source_approval_path": str(attempt_approval_path),
             "source_approval_sha256": approval_sha,
             "profile_adapter_path": str(adapter),
             "profile_adapter_sha256": adapter_sha,
@@ -780,6 +812,85 @@ class AuthorityMutationTests(unittest.TestCase):
             proc_root=self.root,
         )
 
+    def authority_paths(self) -> dict[str, Path]:
+        attempt_prepared = Path(str(self.authority["prepared_artifacts_path"]))
+        attempt_approval = Path(str(self.authority["source_approval_path"]))
+        prepared = json.loads(attempt_prepared.read_bytes())
+        claim = Path(str(prepared["single_use_claim"]["path"]))
+        claim_value = json.loads(claim.read_bytes())
+        original_prepared = Path(str(claim_value["prepared_artifacts_path"]))
+        original = json.loads(original_prepared.read_bytes())
+        original_approval = Path(str(original["source_approval"]["path"]))
+        return {
+            "attempt_prepared": attempt_prepared,
+            "attempt_approval": attempt_approval,
+            "claim": claim,
+            "original_prepared": original_prepared,
+            "original_approval": original_approval,
+        }
+
+    def rewrite_complete_chain(
+        self,
+        *,
+        mutate_approval: object | None = None,
+        mutate_prepared: object | None = None,
+    ) -> dict[str, object]:
+        paths = self.authority_paths()
+        approval = json.loads(paths["original_approval"].read_bytes())
+        if callable(mutate_approval):
+            mutate_approval(approval)
+        paths["original_approval"].chmod(0o644)
+        approval_sha = write_canonical(
+            paths["original_approval"], approval, 0o444
+        )
+        paths["attempt_approval"].chmod(0o644)
+        paths["attempt_approval"].write_bytes(
+            paths["original_approval"].read_bytes()
+        )
+        paths["attempt_approval"].chmod(0o444)
+
+        prepared = json.loads(paths["original_prepared"].read_bytes())
+        prepared["source_approval"]["sha256"] = approval_sha
+        if callable(mutate_prepared):
+            mutate_prepared(prepared)
+        paths["original_prepared"].chmod(0o644)
+        prepared_sha = write_canonical(
+            paths["original_prepared"], prepared, 0o444
+        )
+        paths["attempt_prepared"].chmod(0o644)
+        paths["attempt_prepared"].write_bytes(
+            paths["original_prepared"].read_bytes()
+        )
+        paths["attempt_prepared"].chmod(0o444)
+
+        claim = json.loads(paths["claim"].read_bytes())
+        claim["prepared_artifacts_sha256"] = prepared_sha
+        paths["claim"].chmod(0o644)
+        write_canonical(paths["claim"], claim, 0o444)
+        return {
+            **self.authority,
+            "source_approval_sha256": approval_sha,
+            "prepared_artifacts_sha256": prepared_sha,
+        }
+
+    def test_distinct_attempt_copies_replay_original_authority(self) -> None:
+        paths = self.authority_paths()
+        self.assertNotEqual(
+            paths["attempt_prepared"], paths["original_prepared"]
+        )
+        self.assertNotEqual(
+            paths["attempt_approval"], paths["original_approval"]
+        )
+        self.assertEqual(
+            paths["attempt_prepared"].read_bytes(),
+            paths["original_prepared"].read_bytes(),
+        )
+        self.assertEqual(
+            paths["attempt_approval"].read_bytes(),
+            paths["original_approval"].read_bytes(),
+        )
+        self.construct()
+
     def test_protocol_context_and_executable_mutations_fail(self) -> None:
         for field, value in (
             ("protocol_sha256", "0" * 64),
@@ -795,69 +906,168 @@ class AuthorityMutationTests(unittest.TestCase):
                 self.construct(mutated)
 
     def test_source_approval_schema_identity_is_exact(self) -> None:
-        approval_path = Path(str(self.authority["source_approval_path"]))
-        prepared_path = Path(str(self.authority["prepared_artifacts_path"]))
-        approval = json.loads(approval_path.read_bytes())
+        approval = json.loads(
+            self.authority_paths()["original_approval"].read_bytes()
+        )
         self.assertEqual(approval["schema"], "bn-2l3n-source-approval-v3")
-        approval["schema"] = "asterism-rebaseline-source-approval-v3"
-        approval_path.chmod(0o644)
-        approval_sha = write_canonical(approval_path, approval, 0o444)
-        prepared = json.loads(prepared_path.read_bytes())
-        prepared["source_approval"]["sha256"] = approval_sha
-        prepared_path.chmod(0o644)
-        prepared_sha = write_canonical(prepared_path, prepared, 0o444)
-        mutated = {
-            **self.authority,
-            "source_approval_sha256": approval_sha,
-            "prepared_artifacts_sha256": prepared_sha,
-        }
+        mutated = self.rewrite_complete_chain(
+            mutate_approval=lambda value: value.__setitem__(
+                "schema", "asterism-rebaseline-source-approval-v3"
+            )
+        )
         with self.assertRaises(adapters.ProfileEvidenceError):
             self.construct(mutated)
 
     def test_prepared_artifacts_schema_identity_is_exact(self) -> None:
-        prepared_path = Path(str(self.authority["prepared_artifacts_path"]))
-        prepared = json.loads(prepared_path.read_bytes())
+        prepared = json.loads(
+            self.authority_paths()["original_prepared"].read_bytes()
+        )
         self.assertEqual(prepared["schema"], "bn-2l3n-prepared-artifacts-v3")
-        prepared["schema"] = "asterism-rebaseline-prepared-v3"
-        prepared_path.chmod(0o644)
-        prepared_sha = write_canonical(prepared_path, prepared, 0o444)
-        mutated = {**self.authority, "prepared_artifacts_sha256": prepared_sha}
+        mutated = self.rewrite_complete_chain(
+            mutate_prepared=lambda value: value.__setitem__(
+                "schema", "asterism-rebaseline-prepared-v3"
+            )
+        )
         with self.assertRaises(adapters.ProfileEvidenceError):
             self.construct(mutated)
 
     def test_mutable_or_symlinked_authority_files_fail(self) -> None:
-        approval = Path(str(self.authority["source_approval_path"]))
-        approval.chmod(0o644)
+        paths = self.authority_paths()
+        for name in (
+            "attempt_prepared",
+            "attempt_approval",
+            "original_prepared",
+            "original_approval",
+            "claim",
+        ):
+            path = paths[name]
+            path.chmod(0o644)
+            with self.subTest(name=name), self.assertRaises(
+                adapters.ProfileEvidenceError
+            ):
+                self.construct()
+            path.chmod(0o444)
+        attempt_prepared = paths["attempt_prepared"]
+        payload = attempt_prepared.read_bytes()
+        attempt_prepared.chmod(0o644)
+        attempt_prepared.unlink()
+        target = attempt_prepared.with_suffix(".target")
+        target.write_bytes(payload)
+        target.chmod(0o444)
+        attempt_prepared.symlink_to(target)
         with self.assertRaises(adapters.ProfileEvidenceError):
             self.construct()
 
     def test_role_lifetime_contract_is_source_and_binary_bound(self) -> None:
-        approval_path = Path(str(self.authority["source_approval_path"]))
-        prepared_path = Path(str(self.authority["prepared_artifacts_path"]))
-        approval = json.loads(approval_path.read_bytes())
-        approval["variants"]["A"][
-            "profile_role_lifetime"
-        ] = adapters.C_ROLE_LIFETIME_CONTRACT
-        approval_path.chmod(0o644)
-        approval_sha = write_canonical(approval_path, approval, 0o444)
-        prepared = json.loads(prepared_path.read_bytes())
-        prepared["source_approval"]["sha256"] = approval_sha
-        prepared["variants"]["A"]["contract"][
-            "profile_role_lifetime"
-        ] = adapters.C_ROLE_LIFETIME_CONTRACT
-        prepared_path.chmod(0o644)
-        prepared_sha = write_canonical(prepared_path, prepared, 0o444)
-        mutated = {
-            **self.authority,
-            "source_approval_sha256": approval_sha,
-            "prepared_artifacts_sha256": prepared_sha,
-        }
+        mutated = self.rewrite_complete_chain(
+            mutate_approval=lambda value: value["variants"]["A"].__setitem__(
+                "profile_role_lifetime", adapters.C_ROLE_LIFETIME_CONTRACT
+            ),
+            mutate_prepared=lambda value: value["variants"]["A"][
+                "contract"
+            ].__setitem__(
+                "profile_role_lifetime", adapters.C_ROLE_LIFETIME_CONTRACT
+            ),
+        )
         with self.assertRaises(adapters.ProfileEvidenceError):
             self.construct(mutated)
+
+    def test_rebound_or_divergent_attempt_manifest_is_rejected(self) -> None:
+        paths = self.authority_paths()
+        prepared = json.loads(paths["attempt_prepared"].read_bytes())
+        prepared["source_approval"]["path"] = str(paths["attempt_approval"])
+        paths["attempt_prepared"].chmod(0o644)
+        digest = write_canonical(paths["attempt_prepared"], prepared, 0o444)
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            self.construct({**self.authority, "prepared_artifacts_sha256": digest})
+
+    def test_attempt_authority_paths_must_be_exact_siblings(self) -> None:
+        paths = self.authority_paths()
+        alias = paths["attempt_prepared"].with_name("prepared-alias.json")
+        alias.write_bytes(paths["attempt_prepared"].read_bytes())
+        alias.chmod(0o444)
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            self.construct({**self.authority, "prepared_artifacts_path": str(alias)})
+
+    def test_original_authority_paths_cannot_replace_attempt_paths(self) -> None:
+        paths = self.authority_paths()
+        for field, path in (
+            ("prepared_artifacts_path", paths["original_prepared"]),
+            ("source_approval_path", paths["original_approval"]),
+        ):
+            with self.subTest(field=field), self.assertRaises(
+                adapters.ProfileEvidenceError
+            ):
+                self.construct({**self.authority, field: str(path)})
+
+    def test_attempt_approval_divergence_is_rejected_after_rehash(self) -> None:
+        paths = self.authority_paths()
+        approval = json.loads(paths["attempt_approval"].read_bytes())
+        approval["attempt_only"] = True
+        paths["attempt_approval"].chmod(0o644)
+        digest = write_canonical(paths["attempt_approval"], approval, 0o444)
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            self.construct({**self.authority, "source_approval_sha256": digest})
+
+    def test_attempt_prepared_hardlink_to_original_is_rejected(self) -> None:
+        paths = self.authority_paths()
+        paths["attempt_prepared"].unlink()
+        os.link(paths["original_prepared"], paths["attempt_prepared"])
+        self.assertTrue(
+            os.path.samestat(
+                paths["original_prepared"].stat(),
+                paths["attempt_prepared"].stat(),
+            )
+        )
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            self.construct()
+
+    def test_attempt_approval_hardlink_to_original_is_rejected(self) -> None:
+        paths = self.authority_paths()
+        paths["attempt_approval"].unlink()
+        os.link(paths["original_approval"], paths["attempt_approval"])
+        self.assertTrue(
+            os.path.samestat(
+                paths["original_approval"].stat(),
+                paths["attempt_approval"].stat(),
+            )
+        )
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            self.construct()
+
+    def test_claim_cannot_bind_attempt_manifest(self) -> None:
+        paths = self.authority_paths()
+        claim = json.loads(paths["claim"].read_bytes())
+        claim["prepared_artifacts_path"] = str(paths["attempt_prepared"])
+        paths["claim"].chmod(0o644)
+        write_canonical(paths["claim"], claim, 0o444)
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            self.construct()
+
+    def test_claim_attempt_and_lease_identity_are_exact(self) -> None:
+        paths = self.authority_paths()
+        for field, value in (
+            ("output_dir", str(self.root / "other-attempt")),
+            ("attempt_nonce", "2" * 64),
+            ("lease_nonce", "not-a-lease"),
+        ):
+            claim = json.loads(paths["claim"].read_bytes())
+            original = claim[field]
+            claim[field] = value
+            paths["claim"].chmod(0o644)
+            write_canonical(paths["claim"], claim, 0o444)
+            with self.subTest(field=field), self.assertRaises(
+                adapters.ProfileEvidenceError
+            ):
+                self.construct()
+            claim[field] = original
+            paths["claim"].chmod(0o644)
+            write_canonical(paths["claim"], claim, 0o444)
 
     def test_symlinked_adapter_and_proc_root_fail(self) -> None:
         adapter = Path(str(self.authority["profile_adapter_path"]))
         payload = adapter.read_bytes()
+        adapter.parent.chmod(0o755)
         adapter.chmod(0o644)
         adapter.unlink()
         target = adapter.with_suffix(".target")
