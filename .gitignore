@@ -29,6 +29,8 @@ Cargo.lock
 
 flamegraph.svg
 perf.data*
+__pycache__/
+*.py[cod]
 .tla/
 # maw admin tree (consolidated layout) — runtime/admin only
 /.maw/

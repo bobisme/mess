@@ -1,0 +1,1759 @@
+#!/usr/bin/env python3
+"""Synthetic positive and mutation-negative tests for profile adapters."""
+
+from __future__ import annotations
+
+import importlib.util
+import hashlib
+import json
+import math
+import os
+import shutil
+import stat
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+
+MODULE_PATH = Path(__file__).with_name("profile_adapters.py")
+SPEC = importlib.util.spec_from_file_location("bn2l3n_profile_adapters", MODULE_PATH)
+assert SPEC is not None and SPEC.loader is not None
+adapters = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = adapters
+SPEC.loader.exec_module(adapters)
+
+
+def stat_record(identity: int, comm: str, start_ticks: int) -> str:
+    fields = ["S"] + [str(index) for index in range(4, 22)] + [str(start_ticks)]
+    return f"{identity} ({comm}) {' '.join(fields)}\n"
+
+
+def io_record(offset: int = 0) -> str:
+    return "".join(
+        f"{name}: {offset + index}\n"
+        for index, name in enumerate(adapters.IO_FIELDS, start=1)
+    )
+
+
+def write_task(
+    root: Path,
+    pid: int,
+    tid: int,
+    comm: str,
+    start_ticks: int,
+    *,
+    on_cpu_ns: int = 0,
+    voluntary: int = 0,
+    nonvoluntary: int = 0,
+) -> None:
+    task = root / str(pid) / "task" / str(tid)
+    task.mkdir(parents=True, exist_ok=True)
+    (task / "stat").write_text(stat_record(tid, comm, start_ticks))
+    (task / "schedstat").write_text(f"{on_cpu_ns} 0 0\n")
+    (task / "status").write_text(
+        f"Name: {comm}\n"
+        f"voluntary_ctxt_switches: {voluntary}\n"
+        f"nonvoluntary_ctxt_switches: {nonvoluntary}\n"
+    )
+
+
+def sha256(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def trace_marker(kind: str, path: str) -> dict[str, str]:
+    return {"kind": kind, "path": path}
+
+
+def write_canonical(path: Path, value: object, mode: int) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = adapters.canonical_json(value)
+    path.write_bytes(payload)
+    path.chmod(mode)
+    return sha256(payload)
+
+
+def profile_tools_for(track: str, root: Path | None = None) -> dict[str, object]:
+    names = (
+        ("perf",)
+        if track == "cpu_profiles"
+        else ("strace", "strace_launcher_runtime")
+        if track in {"syscall_profiles", "structural_traces"}
+        else ()
+    )
+    tools: dict[str, object] = {}
+    for name in names:
+        path = (root / name if root is not None else Path(f"/authority/{name}"))
+        digest = "b" * 64
+        if root is not None:
+            path.write_bytes(f"{name}\n".encode())
+            path.chmod(0o555)
+            digest = sha256(path.read_bytes())
+        tools[name] = {
+            "path": str(path),
+            "sha256": digest,
+            "executable_mode": 0o555,
+            "comm": name[:15],
+        }
+    return tools
+
+
+def synthetic_authority(
+    variant: str,
+    track: str,
+    context: dict[str, object],
+    *,
+    pid: int = 10,
+    start_ticks: int = 100,
+    comm: str = "bench",
+) -> dict[str, object]:
+    source = adapters.VARIANT_SOURCE_BINDINGS[variant]
+    role_lifetime: object = (
+        adapters.C_ROLE_LIFETIME_CONTRACT if variant == "C" else "not_applicable"
+    )
+    return {
+        "schema": adapters.AUTHORITY_SCHEMA,
+        "protocol": adapters.PROTOCOL,
+        "protocol_sha256": adapters.PROTOCOL_SHA256,
+        "attempt_nonce": "a" * 64,
+        "child_ordinal": 1,
+        "row_ordinal": 1,
+        "context_sha256": sha256(adapters.canonical_json(context)),
+        "prepared_artifacts_path": "/authority/prepared-artifacts.json",
+        "prepared_artifacts_sha256": "c" * 64,
+        "source_approval_path": "/authority/source-approval.json",
+        "source_approval_sha256": "d" * 64,
+        "profile_adapter_path": "/authority/profile_adapters.py",
+        "profile_adapter_sha256": "e" * 64,
+        "profile_tools": profile_tools_for(track),
+        "perf_permission_result": (
+            "available;perf_event_paranoid=2;scope=user-only"
+            if track == "cpu_profiles"
+            else "not_applicable"
+        ),
+        "variant": variant,
+        "source_commit": source["commit"],
+        "source_tree": source["tree"],
+        "track": track,
+        "executable_path": "/authority/bench",
+        "executable_sha256": "f" * 64,
+        "executable_mode": 0o555,
+        "executable_comm": comm,
+        "child_pid": pid,
+        "child_start_ticks": start_ticks,
+        "control_fd": 9,
+    }
+
+
+def control_events(
+    authority: dict[str, object],
+    *,
+    reopen: bool = False,
+    perf_available: bool = True,
+) -> list[dict[str, object]]:
+    nonce1, nonce2, nonce3, nonce4 = (character * 64 for character in "1234")
+    timestamp = 10
+
+    def child(phase: str, nonce: str | None = None) -> dict[str, object]:
+        nonlocal timestamp
+        if phase == "boot":
+            value: dict[str, object] = {
+                "context_sha256": authority["context_sha256"],
+                "phase": phase,
+                "protocol_sha256": adapters.PROTOCOL_SHA256,
+                "variant": authority["variant"],
+            }
+        elif phase == "ready":
+            ready_ns = 41 if reopen else 61
+            value = {
+                "allocated_bytes_start": 0,
+                "allocation_calls_start": 0,
+                "context_sha256": authority["context_sha256"],
+                "counter_start_monotonic_ns": ready_ns + 1,
+                "nonce": nonce,
+                "phase": phase,
+                "process_system_cpu_start_ns": 10,
+                "process_user_cpu_start_ns": 10,
+                "protocol_sha256": adapters.PROTOCOL_SHA256,
+                "ready_monotonic_ns": ready_ns,
+                "variant": authority["variant"],
+            }
+        elif phase == "opened" and reopen:
+            value = {
+                "nonce": nonce,
+                "opened_monotonic_ns": 62,
+                "open_start_monotonic_ns": 61,
+                "phase": phase,
+            }
+        elif phase == "measured":
+            value = {
+                "allocated_bytes_end": 0,
+                "allocation_calls_end": 0,
+                "counter_end_monotonic_ns": 88,
+                "last_completion_monotonic_ns": 84,
+                "nonce": nonce,
+                "phase": phase,
+                "process_system_cpu_end_ns": 20,
+                "process_user_cpu_end_ns": 30,
+                "release_monotonic_ns": 81,
+                "t0_monotonic_ns": 82,
+                "t1_monotonic_ns": 85,
+            }
+            if authority["track"] == "cpu_profiles":
+                value["perf_disable"] = (
+                    perf_control_events()[1] if perf_available else None
+                )
+        else:
+            value = {"nonce": nonce, "phase": phase}
+        value["_runner_received_monotonic_ns"] = timestamp
+        timestamp += 10
+        return value
+
+    def command(name: str, nonce: str, phase: str | None = None) -> dict[str, object]:
+        nonlocal timestamp
+        value: dict[str, object] = {"command": name, "nonce": nonce}
+        if phase is not None:
+            value["phase"] = phase
+        value["_runner_sent_monotonic_ns"] = timestamp
+        timestamp += 10
+        return value
+
+    if reopen:
+        return [
+            child("boot"), command("continue", nonce1, "boot"),
+            child("runtime", nonce1), command("continue", nonce2, "runtime"),
+            child("ready", nonce2), command("start", nonce3),
+            child("opened", nonce3), command("continue", nonce4, "opened"),
+            child("measured", nonce4), command("release", nonce4),
+        ]
+    return [
+        child("boot"), command("continue", nonce1, "boot"),
+        child("runtime", nonce1), command("continue", nonce2, "runtime"),
+        child("opened", nonce2), command("continue", nonce3, "opened"),
+        child("ready", nonce3), command("start", nonce4),
+        child("measured", nonce4), command("release", nonce4),
+    ]
+
+
+def perf_control_events() -> list[dict[str, object]]:
+    return [
+        {
+            "command": "enable",
+            "nonce": "4" * 64,
+            "sent_monotonic_ns": 71,
+            "ack": "ack",
+            "ack_received_monotonic_ns": 72,
+        },
+        {
+            "command": "disable",
+            "nonce": "4" * 64,
+            "sent_monotonic_ns": 86,
+            "ack": "ack",
+            "ack_received_monotonic_ns": 87,
+        },
+    ]
+
+
+def trace_boundary(
+    authority: dict[str, object], events: list[dict[str, object]]
+) -> dict[str, object]:
+    phases = {
+        event["phase"]: event
+        for event in events
+        if "command" not in event and event.get("phase") in {"ready", "measured"}
+    }
+    return {
+        "child_pid": authority["child_pid"],
+        "control_fd": authority["control_fd"],
+        "begin_event": phases["ready"],
+        "end_event": phases["measured"],
+    }
+
+
+def marker_line(authority: dict[str, object], event: dict[str, object]) -> str:
+    wire = {
+        key: value for key, value in event.items() if not key.startswith("_runner_")
+    }
+    payload = adapters.canonical_json(wire).decode()
+    return (
+        f'{authority["child_pid"]} write({authority["control_fd"]}, '
+        f"{json.dumps(payload)}, {len(payload.encode())}) = {len(payload.encode())}"
+    )
+
+
+def live_authority(
+    root: Path,
+    *,
+    pid: int,
+    start_ticks: int,
+    comm: str,
+    variant: str,
+    track: str,
+    context: dict[str, object],
+) -> dict[str, object]:
+    bindings = root / "authority"
+    bindings.mkdir()
+    binary = bindings / "bench"
+    binary.write_bytes(b"synthetic benchmark executable\n")
+    binary.chmod(0o555)
+    binary_sha = sha256(binary.read_bytes())
+    adapter = bindings / "profile_adapters.py"
+    adapter.write_bytes(MODULE_PATH.read_bytes())
+    adapter.chmod(0o444)
+    adapter_sha = sha256(adapter.read_bytes())
+    tools = profile_tools_for(track, bindings)
+    source = adapters.VARIANT_SOURCE_BINDINGS[variant]
+    role_lifetime: object = (
+        adapters.C_ROLE_LIFETIME_CONTRACT if variant == "C" else "not_applicable"
+    )
+    approval = {
+        "schema": "bn-2l3n-source-approval-v3",
+        "status": "approved",
+        "protocol": adapters.PROTOCOL,
+        "protocol_sha256": adapters.PROTOCOL_SHA256,
+        "variants": {
+            variant: {
+                "product_commit": source["commit"],
+                "product_tree": source["tree"],
+                "profile_role_lifetime": role_lifetime,
+            }
+        },
+        "tools_manifest": {
+            "support_files": {
+                "profile_adapter": {
+                    "path": str(adapter),
+                    "sha256": adapter_sha,
+                    "mode": 0o444,
+                }
+            },
+            "tools": tools,
+        },
+    }
+    approval_path = bindings / "source-approval.json"
+    approval_sha = write_canonical(approval_path, approval, 0o444)
+    prepared = {
+        "schema": "bn-2l3n-prepared-artifacts-v3",
+        "protocol": adapters.PROTOCOL,
+        "protocol_sha256": adapters.PROTOCOL_SHA256,
+        "source_approval": {"path": str(approval_path), "sha256": approval_sha},
+        "support_files": {
+            "profile_adapter": {
+                "path": str(adapter),
+                "sha256": adapter_sha,
+                "mode": 0o444,
+            }
+        },
+        "tools": tools,
+        "variants": {
+            variant: {
+                "binary": {"path": str(binary), "sha256": binary_sha},
+                "executable_mode": 0o555,
+                "comm": comm,
+                "contract": {
+                    "protocol_sha256": adapters.PROTOCOL_SHA256,
+                    "product_commit": source["commit"],
+                    "product_tree": source["tree"],
+                    "profile_role_lifetime": role_lifetime,
+                },
+            }
+        },
+    }
+    prepared_path = bindings / "prepared-artifacts.json"
+    prepared_sha = write_canonical(prepared_path, prepared, 0o444)
+    exe = root / str(pid) / "exe"
+    exe.symlink_to(binary)
+    authority = synthetic_authority(
+        variant,
+        track,
+        context,
+        pid=pid,
+        start_ticks=start_ticks,
+        comm=comm,
+    )
+    authority.update(
+        {
+            "prepared_artifacts_path": str(prepared_path),
+            "prepared_artifacts_sha256": prepared_sha,
+            "source_approval_path": str(approval_path),
+            "source_approval_sha256": approval_sha,
+            "profile_adapter_path": str(adapter),
+            "profile_adapter_sha256": adapter_sha,
+            "profile_tools": tools,
+            "executable_path": str(binary),
+            "executable_sha256": binary_sha,
+        }
+    )
+    return authority
+
+
+class ParseTests(unittest.TestCase):
+    def test_profile_contract_exposes_integration_obligations(self) -> None:
+        contract = adapters.profile_contract()
+        self.assertEqual(
+            contract["profile_inputs_persistence"],
+            {
+                "payload": "child.profile_tool_inputs",
+                "sha256": "child.profile_tool_inputs_sha256",
+                "raw_artifacts": "one-fd-nofollow-0444-sha256-and-byte-length",
+            },
+        )
+        self.assertEqual(
+            contract["perf_disable_owner"],
+            "child-at-t1-before-measured-serialization",
+        )
+        self.assertEqual(
+            contract["perf_ack_ledger"],
+            {
+                "ownership": "one-shared-offset",
+                "artifact_mode": 0o444,
+                "exact_bytes_utf8": "ack\nack\n",
+                "exact_bytes": 8,
+                "sha256": sha256(b"ack\nack\n"),
+            },
+        )
+        self.assertEqual(
+            contract["c_role_lifetime_proof"],
+            [
+                "source-approval-static-proof",
+                "prepared-binary-contract",
+                "runner-child-timeout-cap",
+            ],
+        )
+        self.assertEqual(
+            contract["perf_child_environment"],
+            {
+                "cpu_all": ["ASTERISM_REBASELINE_PERF_PERMISSION_RESULT"],
+                "cpu_available_only": [
+                    "ASTERISM_REBASELINE_PERF_COMMAND_FD",
+                    "ASTERISM_REBASELINE_PERF_ACK_FD",
+                    "ASTERISM_REBASELINE_PERF_ACK_LEDGER_FD",
+                ],
+                "non_cpu": [],
+            },
+        )
+
+    def test_proc_stat_handles_spaces_and_parentheses(self) -> None:
+        payload = stat_record(42, "owner (one) thread", 987654)
+        self.assertEqual(
+            adapters.parse_proc_stat(payload, 42),
+            (42, "owner (one) thread", 987654),
+        )
+
+    def test_proc_stat_rejects_identity_and_short_record(self) -> None:
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters.parse_proc_stat(stat_record(42, "owner", 5), 41)
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters.parse_proc_stat("42 (owner) S 1 2\n", 42)
+
+    def test_proc_io_is_exact(self) -> None:
+        parsed = adapters.parse_proc_io(io_record())
+        self.assertEqual(parsed.read_bytes, 5)
+        signed = io_record().replace("cancelled_write_bytes: 7", "cancelled_write_bytes: -7")
+        self.assertEqual(adapters.parse_proc_io(signed).cancelled_write_bytes, -7)
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters.parse_proc_io(io_record() + "extra: 9\n")
+
+    def test_perf_parser_is_exact_and_integer_lossless(self) -> None:
+        payload = "\n".join(
+            (
+                "9007199254740993,,cycles:u,5000,100.00,",
+                "2000,,instructions:u,5000,100.00,",
+                "3.5,msec,task-clock:u,5000,100.00,",
+                "4,,context-switches:u,5000,100.00,",
+            )
+        )
+        counters = adapters.parse_perf_stat_csv(payload)
+        self.assertEqual(counters[0].value, 9007199254740993)
+        self.assertEqual(counters[2].value, "3.5")
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters.parse_perf_stat_csv(payload.replace("cycles:u", "cycles"))
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters.parse_perf_stat_csv(
+                payload.replace("4,,context-switches:u", "<not supported>,,context-switches:u")
+            )
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters.parse_perf_stat_csv(payload + "\n1,,cycles:u,1,100.00,")
+
+    def test_perf_ack_is_exact(self) -> None:
+        adapters.validate_perf_control_ack("ack\nack\n", perf_control_events())
+        for payload in (
+            "ack\n",
+            " ack \n\nack\t\n",
+            "ack\r\nack\r\n",
+            "ack\n\nack\n",
+            "ack\nack",
+        ):
+            with self.subTest(payload=payload), self.assertRaises(
+                adapters.ProfileEvidenceError
+            ):
+                adapters.validate_perf_control_ack(payload, perf_control_events())
+        inputs = adapters.perf_profile_inputs(
+            "\n".join(
+                (
+                    "1000,,cycles,5000,100.00,",
+                    "2000,,instructions:u,5000,100.00,",
+                    "3.5,msec,task-clock:u,5000,100.00,",
+                    "4,,context-switches:u,5000,100.00,",
+                )
+            ).replace("cycles,", "cycles:u,"),
+            "ack\nack\n",
+            "available;perf_event_paranoid=2;scope=user-only",
+            control_events=perf_control_events(),
+        )
+        self.assertTrue(inputs["perf_control_acknowledged"])
+        self.assertEqual(len(inputs["perf_counters"]), 4)
+        unavailable = adapters.perf_profile_inputs(
+            "", "", "not_available;perf_event_paranoid=4;scope=user-only;exit_status=255"
+        )
+        self.assertFalse(unavailable["perf_control_acknowledged"])
+        self.assertEqual(unavailable["perf_control_events"], [])
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters.perf_profile_inputs(
+                "",
+                "",
+                "not_available;perf_event_paranoid=4;scope=user-only;exit_status=255",
+                control_events=perf_control_events(),
+            )
+        self.assertTrue(
+            all(
+                counter["status"] == "not_available"
+                for counter in unavailable["perf_counters"]
+            )
+        )
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters.perf_profile_inputs("", "ack\n", "permission-denied")
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters.perf_profile_inputs(
+                inputs["perf_counters"] and "1,,cycles:u,1,100,\n",
+                "ack\nack\n",
+                "not_available;perf_event_paranoid=4;scope=user-only;exit_status=255",
+            )
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters.perf_profile_inputs(
+                "",
+                "",
+                "not_available;perf_event_paranoid=4;scope=user-only;exit_status=0",
+            )
+
+    def test_strace_summary(self) -> None:
+        payload = """% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ----------------
+ 80.00    0.000008           4         2           write
+ 20.00    0.000002           2         1         1 openat
+------ ----------- ----------- --------- --------- ----------------
+100.00    0.000010           3         3         1 total
+"""
+        parsed = {entry.syscall: entry for entry in adapters.parse_strace_summary(payload)}
+        self.assertEqual(parsed["write"].calls, 2)
+        self.assertEqual(parsed["openat"].errors, 1)
+
+    def test_raw_trace_interval_excludes_markers_and_resumed_line(self) -> None:
+        authority = synthetic_authority("A", "syscall_profiles", {}, pid=101)
+        events = control_events(authority)
+        boundary = trace_boundary(authority, events)
+        begin = marker_line(authority, boundary["begin_event"])
+        end = marker_line(authority, boundary["end_event"])
+        payload = f"""{begin}
+101 1.1 pwrite64(3, \"x\", 1, 0) = 1
+[pid 102] 1.2 futex(0x1, FUTEX_WAIT, 0, NULL <unfinished ...>
+[pid 102] 1.3 <... futex resumed>) = 0
+101 1.4 fdatasync(3) = 0
+{end}
+"""
+        counts = adapters.trace_interval_counts(
+            payload,
+            boundary,
+            allowed_syscalls=("pwrite64", "futex", "fdatasync"),
+        )
+        self.assertEqual(counts, {"fdatasync": 1, "futex": 1, "pwrite64": 1})
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters.trace_interval_counts(payload.replace(end, "101 write(9, \"missing\", 7) = 7"), boundary)
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters.trace_interval_counts(
+                payload.replace("101 1.1 pwrite64", "unparsed garbage\n101 1.1 pwrite64"),
+                boundary,
+            )
+        forged = payload.replace(
+            "101 1.1 pwrite64",
+            f'101 openat(AT_FDCWD, {json.dumps(begin)}, O_RDONLY) = 4\n101 1.1 pwrite64',
+        )
+        self.assertEqual(
+            adapters.trace_interval_counts(
+                forged, boundary, allowed_syscalls=("pwrite64", "futex", "fdatasync")
+            ),
+            counts,
+        )
+
+    def test_raw_trace_metrics_partition_sync_and_file_operations(self) -> None:
+        authority = synthetic_authority("A", "structural_traces", {}, pid=1)
+        events = control_events(authority)
+        boundary = trace_boundary(authority, events)
+        payload = f"""{marker_line(authority, boundary["begin_event"])}
+1 openat(AT_FDCWD, \"/store/meta\", O_CREAT|O_RDWR, 0600) = 3</store/meta>
+1 renameat(AT_FDCWD, \"/store/a\", AT_FDCWD, \"/store/b\") = 0
+1 unlink(\"/store/b\") = 0
+1 fdatasync(4</store/log/active>) = 0
+1 fsync(3</store/meta>) = 0
+{marker_line(authority, boundary["end_event"])}
+"""
+        metrics = adapters.trace_interval_metrics(
+            payload,
+            boundary,
+            log_path_markers=(trace_marker("directory_prefix", "/store/log/"),),
+            metadata_path_markers=(trace_marker("exact", "/store/meta"),),
+        )
+        self.assertEqual(metrics["file_create"], 1)
+        self.assertEqual(metrics["file_rename"], 1)
+        self.assertEqual(metrics["file_unlink"], 1)
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters.trace_interval_metrics(
+                payload,
+                boundary,
+                log_path_markers=(1,),
+                metadata_path_markers=(trace_marker("exact", "/store/meta"),),
+            )
+        self.assertEqual(metrics["log_sync_calls"], 1)
+        self.assertEqual(metrics["metadata_sync_calls"], 1)
+        normalized = adapters.strace_profile_inputs(
+            payload,
+            boundary,
+            log_path_markers=(trace_marker("file_prefix", "/store/log/act"),),
+            metadata_path_markers=(trace_marker("exact", "/store/meta"),),
+        )
+        self.assertEqual(normalized["begin_markers"], 1)
+        self.assertEqual(normalized["trace_counts"], metrics)
+        log_only_payload = payload.replace("1 fsync(3</store/meta>) = 0\n", "")
+        log_only = adapters.trace_interval_metrics(
+            log_only_payload,
+            boundary,
+            log_path_markers=(trace_marker("exact", "/store/log/active"),),
+            metadata_path_markers=(),
+        )
+        self.assertEqual(log_only["metadata_sync_calls"], 0)
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters.trace_interval_metrics(
+                log_only_payload,
+                boundary,
+                log_path_markers=(),
+                metadata_path_markers=(),
+            )
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters.trace_interval_metrics(
+                log_only_payload,
+                boundary,
+                log_path_markers=(
+                    trace_marker("directory_prefix", "/store/log"),
+                ),
+                metadata_path_markers=(),
+            )
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters.trace_interval_metrics(
+                payload,
+                boundary,
+                log_path_markers=(trace_marker("directory_prefix", "/store/"),),
+                metadata_path_markers=(trace_marker("exact", "/store/meta"),),
+            )
+        spoofed = payload.replace(
+            "4</store/log/active>", "4</tmp/evil/store/log/active>"
+        )
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters.trace_interval_metrics(
+                spoofed,
+                boundary,
+                log_path_markers=(trace_marker("directory_prefix", "/store/log/"),),
+                metadata_path_markers=(trace_marker("exact", "/store/meta"),),
+            )
+        for target in ("/store/log/active (deleted)", r"/store/log/bad\x20name"):
+            mutated = payload.replace("/store/log/active", target)
+            with self.subTest(target=target), self.assertRaises(
+                adapters.ProfileEvidenceError
+            ):
+                adapters.trace_interval_metrics(
+                    mutated,
+                    boundary,
+                    log_path_markers=(
+                        trace_marker("directory_prefix", "/store/log/"),
+                    ),
+                    metadata_path_markers=(trace_marker("exact", "/store/meta"),),
+                )
+
+
+class SnapshotTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.pid = 100
+        self.tid = 101
+        process = self.root / str(self.pid)
+        task = process / "task" / str(self.tid)
+        task.mkdir(parents=True)
+        (process / "stat").write_text(stat_record(self.pid, "bench", 900))
+        (process / "status").write_text(
+            "Name:\tbench\nVmHWM:\t128 kB\n"
+            "voluntary_ctxt_switches:\t3\n"
+            "nonvoluntary_ctxt_switches:\t1\n"
+        )
+        (process / "io").write_text(io_record(10))
+        (task / "stat").write_text(stat_record(self.tid, "mess-flat-owner", 901))
+        (task / "schedstat").write_text("1000 20 3\n")
+        (task / "status").write_text(
+            "Name:\tmess-flat-owner\n"
+            "voluntary_ctxt_switches:\t4\n"
+            "nonvoluntary_ctxt_switches:\t2\n"
+        )
+        self.reader = adapters.ProcReader(self.root)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_identity_bound_task_and_process_deltas(self) -> None:
+        identity = self.reader.tasks(self.pid)[0]
+        before_task = self.reader.task_counters(identity)
+        before_process = self.reader.process_counters(self.pid)
+
+        task = self.root / str(self.pid) / "task" / str(self.tid)
+        (task / "schedstat").write_text("1900 25 4\n")
+        (task / "status").write_text(
+            "voluntary_ctxt_switches: 9\nnonvoluntary_ctxt_switches: 3\n"
+        )
+        process = self.root / str(self.pid)
+        (process / "status").write_text(
+            "VmHWM: 256 kB\n"
+            "voluntary_ctxt_switches: 8\n"
+            "nonvoluntary_ctxt_switches: 3\n"
+        )
+        (process / "io").write_text(io_record(20))
+
+        task_delta = adapters.task_delta(before_task, self.reader.task_counters(identity))
+        process_delta = adapters.process_delta(
+            before_process, self.reader.process_counters(self.pid)
+        )
+        self.assertEqual(task_delta.on_cpu_ns, 900)
+        self.assertEqual(task_delta.voluntary_context_switches, 5)
+        self.assertEqual(process_delta.io.read_bytes, 10)
+        self.assertEqual(process_delta.vm_hwm_bytes, 256 * 1024)
+        self.assertEqual(process_delta.voluntary_context_switches, 5)
+        self.assertEqual(process_delta.nonvoluntary_context_switches, 2)
+
+    def test_tid_reuse_is_rejected(self) -> None:
+        identity = self.reader.tasks(self.pid)[0]
+        path = self.root / str(self.pid) / "task" / str(self.tid) / "stat"
+        path.write_text(stat_record(self.tid, "mess-flat-owner", 999))
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            self.reader.task_counters(identity)
+
+
+class AuthorityMutationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.pid = 150
+        process = self.root / str(self.pid)
+        process.mkdir(parents=True)
+        (process / "stat").write_text(stat_record(self.pid, "bench", 700))
+        (process / "status").write_text(
+            "VmHWM: 1 kB\nvoluntary_ctxt_switches: 0\n"
+            "nonvoluntary_ctxt_switches: 0\n"
+        )
+        (process / "io").write_text(io_record())
+        write_task(self.root, self.pid, self.pid, "bench", 700)
+        self.authority = live_authority(
+            self.root,
+            pid=self.pid,
+            start_ticks=700,
+            comm="bench",
+            variant="A",
+            track="primary",
+            context={},
+        )
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def construct(self, authority: dict[str, object] | None = None) -> object:
+        return adapters.ProfileCoordinator.for_child(
+            self.pid,
+            "A",
+            "primary",
+            authority=self.authority if authority is None else authority,
+            proc_root=self.root,
+        )
+
+    def test_protocol_context_and_executable_mutations_fail(self) -> None:
+        for field, value in (
+            ("protocol_sha256", "0" * 64),
+            ("context_sha256", "0" * 64),
+            ("executable_sha256", "0" * 64),
+            ("source_commit", "0" * 40),
+        ):
+            mutated = dict(self.authority)
+            mutated[field] = value
+            with self.subTest(field=field), self.assertRaises(
+                adapters.ProfileEvidenceError
+            ):
+                self.construct(mutated)
+
+    def test_source_approval_schema_identity_is_exact(self) -> None:
+        approval_path = Path(str(self.authority["source_approval_path"]))
+        prepared_path = Path(str(self.authority["prepared_artifacts_path"]))
+        approval = json.loads(approval_path.read_bytes())
+        self.assertEqual(approval["schema"], "bn-2l3n-source-approval-v3")
+        approval["schema"] = "asterism-rebaseline-source-approval-v3"
+        approval_path.chmod(0o644)
+        approval_sha = write_canonical(approval_path, approval, 0o444)
+        prepared = json.loads(prepared_path.read_bytes())
+        prepared["source_approval"]["sha256"] = approval_sha
+        prepared_path.chmod(0o644)
+        prepared_sha = write_canonical(prepared_path, prepared, 0o444)
+        mutated = {
+            **self.authority,
+            "source_approval_sha256": approval_sha,
+            "prepared_artifacts_sha256": prepared_sha,
+        }
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            self.construct(mutated)
+
+    def test_prepared_artifacts_schema_identity_is_exact(self) -> None:
+        prepared_path = Path(str(self.authority["prepared_artifacts_path"]))
+        prepared = json.loads(prepared_path.read_bytes())
+        self.assertEqual(prepared["schema"], "bn-2l3n-prepared-artifacts-v3")
+        prepared["schema"] = "asterism-rebaseline-prepared-v3"
+        prepared_path.chmod(0o644)
+        prepared_sha = write_canonical(prepared_path, prepared, 0o444)
+        mutated = {**self.authority, "prepared_artifacts_sha256": prepared_sha}
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            self.construct(mutated)
+
+    def test_mutable_or_symlinked_authority_files_fail(self) -> None:
+        approval = Path(str(self.authority["source_approval_path"]))
+        approval.chmod(0o644)
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            self.construct()
+
+    def test_role_lifetime_contract_is_source_and_binary_bound(self) -> None:
+        approval_path = Path(str(self.authority["source_approval_path"]))
+        prepared_path = Path(str(self.authority["prepared_artifacts_path"]))
+        approval = json.loads(approval_path.read_bytes())
+        approval["variants"]["A"][
+            "profile_role_lifetime"
+        ] = adapters.C_ROLE_LIFETIME_CONTRACT
+        approval_path.chmod(0o644)
+        approval_sha = write_canonical(approval_path, approval, 0o444)
+        prepared = json.loads(prepared_path.read_bytes())
+        prepared["source_approval"]["sha256"] = approval_sha
+        prepared["variants"]["A"]["contract"][
+            "profile_role_lifetime"
+        ] = adapters.C_ROLE_LIFETIME_CONTRACT
+        prepared_path.chmod(0o644)
+        prepared_sha = write_canonical(prepared_path, prepared, 0o444)
+        mutated = {
+            **self.authority,
+            "source_approval_sha256": approval_sha,
+            "prepared_artifacts_sha256": prepared_sha,
+        }
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            self.construct(mutated)
+
+    def test_symlinked_adapter_and_proc_root_fail(self) -> None:
+        adapter = Path(str(self.authority["profile_adapter_path"]))
+        payload = adapter.read_bytes()
+        adapter.chmod(0o644)
+        adapter.unlink()
+        target = adapter.with_suffix(".target")
+        target.write_bytes(payload)
+        target.chmod(0o444)
+        adapter.symlink_to(target)
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            self.construct()
+        proc_link = self.root.parent / f"{self.root.name}-link"
+        proc_link.symlink_to(self.root, target_is_directory=True)
+        try:
+            with self.assertRaises(adapters.ProfileEvidenceError):
+                adapters.ProcReader(proc_link)
+        finally:
+            proc_link.unlink()
+
+
+class RoleAndResolutionTests(unittest.TestCase):
+    def identity(self, tid: int, start: int, comm: str) -> object:
+        return adapters.TaskIdentity(1, tid, start, comm)
+
+    def test_role_births_and_named_owner(self) -> None:
+        before = (self.identity(1, 10, "bench"),)
+        owner = self.identity(2, 11, "mess-flat-owner")
+        helper = self.identity(3, 12, "fjall-worker")
+        after = (*before, owner, helper)
+        self.assertEqual(adapters.require_unique_comm(after, "mess-flat-owner", "owner"), owner)
+        self.assertEqual(
+            adapters.bind_unique_birth(
+                "committer", before, after, excluded_comms=("fjall-worker",)
+            ),
+            owner,
+        )
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters.bind_unique_birth("committer", before, after)
+
+    def test_tid_reuse_across_phase_is_rejected(self) -> None:
+        before = (self.identity(2, 10, "old"),)
+        after = (self.identity(2, 11, "new"),)
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters.task_births(before, after)
+
+    def test_schedstat_resolution_and_floor(self) -> None:
+        resolution = adapters.schedstat_resolution((100, 100, 150, 240))
+        self.assertEqual(resolution.minimum_nonzero_increment_ns, 50)
+        adapters.require_measurable_role_cpu(1000, resolution)
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters.require_measurable_role_cpu(999, resolution)
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters.schedstat_resolution((100, 90, 120))
+
+    def test_allocation_and_rusage_deltas_fail_closed(self) -> None:
+        allocation = adapters.allocation_delta(
+            adapters.AllocationCounters(100, 1000),
+            adapters.AllocationCounters(125, 1400),
+        )
+        self.assertEqual(allocation, adapters.AllocationCounters(25, 400))
+        rusage = adapters.rusage_delta(
+            adapters.RusageCounters(50, 10), adapters.RusageCounters(80, 20)
+        )
+        self.assertEqual(rusage, adapters.RusageCounters(30, 10))
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters.allocation_delta(
+                adapters.AllocationCounters(100, 1000),
+                adapters.AllocationCounters(99, 1400),
+            )
+
+
+class CoordinatorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.pid = 200
+        process = self.root / str(self.pid)
+        process.mkdir(parents=True)
+        (process / "stat").write_text(stat_record(self.pid, "public-bench", 1000))
+        (process / "status").write_text(
+            "VmHWM: 100 kB\n"
+            "voluntary_ctxt_switches: 10\n"
+            "nonvoluntary_ctxt_switches: 2\n"
+        )
+        (process / "io").write_text(io_record(100))
+        write_task(self.root, self.pid, self.pid, "public-bench", 1000)
+
+    def authority(
+        self, variant: str, track: str, context: dict[str, object]
+    ) -> dict[str, object]:
+        return live_authority(
+            self.root,
+            pid=self.pid,
+            start_ticks=1000,
+            comm="public-bench",
+            variant=variant,
+            track=track,
+            context=context,
+        )
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_fjall_phase_roles_and_window(self) -> None:
+        context = {"cell": "group-b1"}
+        authority = self.authority("C", "cpu_profiles", context)
+        coordinator = adapters.ProfileCoordinator.for_child(
+            self.pid,
+            "C",
+            "cpu_profiles",
+            authority=authority,
+            context=context,
+            proc_root=self.root,
+        )
+        coordinator.capture_phase("boot")
+        write_task(self.root, self.pid, 201, "tokio-runtime-w", 1001, on_cpu_ns=50)
+        coordinator.capture_phase("runtime")
+        write_task(self.root, self.pid, 202, "public-bench", 1002, on_cpu_ns=100)
+        coordinator.capture_phase("opened")
+        coordinator.capture_phase("ready")
+        start = coordinator.begin()
+        self.assertEqual([role.label for role in start.roles], ["committer", "producer-runtime"])
+
+        write_task(
+            self.root,
+            self.pid,
+            201,
+            "tokio-runtime-w",
+            1001,
+            on_cpu_ns=550,
+            voluntary=3,
+        )
+        write_task(
+            self.root,
+            self.pid,
+            202,
+            "public-bench",
+            1002,
+            on_cpu_ns=900,
+            nonvoluntary=2,
+        )
+        write_task(
+            self.root,
+            self.pid,
+            203,
+            "tokio-runtime-w",
+            1003,
+            on_cpu_ns=300,
+            voluntary=1,
+        )
+        process = self.root / str(self.pid)
+        (process / "status").write_text(
+            "VmHWM: 200 kB\n"
+            "voluntary_ctxt_switches: 14\n"
+            "nonvoluntary_ctxt_switches: 5\n"
+        )
+        (process / "io").write_text(io_record(110))
+        result = coordinator.end()
+        rendered = coordinator.finish()
+        roles = {role["label"]: role for role in rendered["roles"]}
+        self.assertEqual(roles["committer"]["on_cpu_ns"], 800)
+        self.assertEqual(roles["producer-runtime"]["on_cpu_ns"], 500)
+        self.assertEqual(roles["spawn_blocking-publication"]["on_cpu_ns"], 300)
+        self.assertTrue(roles["spawn_blocking-publication"]["born_in_window"])
+        self.assertEqual(rendered["context"], {"cell": "group-b1"})
+        self.assertEqual(result.process.io.read_bytes, 10)
+
+    def test_phase_order_and_early_finish_fail(self) -> None:
+        authority = self.authority("A", "primary", {})
+        coordinator = adapters.ProfileCoordinator.for_child(
+            self.pid, "A", "primary", authority=authority, proc_root=self.root
+        )
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            coordinator.capture_phase("runtime")
+        coordinator.capture_phase("boot")
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            coordinator.capture_phase("boot")
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            coordinator.finish()
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters.ProfileCoordinator.for_child(
+                self.pid,
+                "A",
+                "primary",
+                authority=authority,
+                context={"bad": math.nan},
+                proc_root=self.root,
+            )
+
+    def test_reopen_phase_order_keeps_open_after_start_boundary(self) -> None:
+        context = {"trace_kind": "reopen"}
+        authority = self.authority("A", "reopen", context)
+        coordinator = adapters.ProfileCoordinator.for_child(
+            self.pid,
+            "A",
+            "reopen",
+            authority=authority,
+            context=context,
+            proc_root=self.root,
+        )
+        coordinator.capture_phase("boot")
+        coordinator.capture_phase("runtime")
+        coordinator.capture_phase("ready")
+        start = coordinator.begin()
+        self.assertEqual(start.roles, ())
+        # The timed open may legitimately create engine workers. Reopen does
+        # not relabel them as append-critical roles.
+        write_task(self.root, self.pid, 250, "mess-flat-owner", 1050)
+        coordinator.capture_phase("opened")
+        process = self.root / str(self.pid)
+        (process / "status").write_text(
+            "VmHWM: 220 kB\n"
+            "voluntary_ctxt_switches: 13\n"
+            "nonvoluntary_ctxt_switches: 4\n"
+        )
+        (process / "io").write_text(io_record(120))
+        coordinator.end()
+        # `measured` is proof-only for reopen; the process/io delta was frozen
+        # at the immediately post-open `opened` stop.
+        coordinator.capture_phase("measured")
+        result = coordinator.finish()
+        self.assertEqual(
+            [phase["phase"] for phase in result["phase_snapshots"]],
+            ["boot", "runtime", "ready", "opened", "measured"],
+        )
+        fields = adapters.profile_fields(
+            "reopen",
+            result,
+            raw_point={"track": "reopen", "variant": "A"},
+            control_events=control_events(authority, reopen=True),
+            authority=authority,
+        )
+        self.assertEqual(fields["peak_rss_bytes"], 220 * 1024)
+        self.assertEqual(fields["proc_read_syscalls"], 20)
+
+    def test_unreviewed_open_birth_and_transient_publication_fail(self) -> None:
+        context = {"cell": "group-b1"}
+        authority = self.authority("C", "cpu_profiles", context)
+        coordinator = adapters.ProfileCoordinator.for_child(
+            self.pid,
+            "C",
+            "cpu_profiles",
+            authority=authority,
+            context=context,
+            proc_root=self.root,
+        )
+        coordinator.capture_phase("boot")
+        write_task(self.root, self.pid, 201, adapters.TOKIO_WORKER_COMM, 1001)
+        coordinator.capture_phase("runtime")
+        write_task(self.root, self.pid, 202, "public-bench", 1002)
+        write_task(self.root, self.pid, 204, "unreviewed", 1004)
+        coordinator.capture_phase("opened")
+        coordinator.capture_phase("ready")
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            coordinator.begin()
+
+        for tid in (201, 202, 204):
+            shutil.rmtree(self.root / str(self.pid) / "task" / str(tid))
+        coordinator = adapters.ProfileCoordinator.for_child(
+            self.pid,
+            "C",
+            "cpu_profiles",
+            authority=authority,
+            context=context,
+            proc_root=self.root,
+        )
+        coordinator.capture_phase("boot")
+        write_task(self.root, self.pid, 201, adapters.TOKIO_WORKER_COMM, 1001)
+        coordinator.capture_phase("runtime")
+        write_task(self.root, self.pid, 202, "public-bench", 1002)
+        coordinator.capture_phase("opened")
+        coordinator.capture_phase("ready")
+        coordinator.begin()
+        write_task(self.root, self.pid, 205, adapters.TOKIO_WORKER_COMM, 1005)
+        shutil.rmtree(self.root / str(self.pid) / "task" / "205")
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            coordinator.end()
+
+
+class ProfileFieldTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.artifact_root = Path(self.temporary.name)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def raw_artifact(self, name: str, payload: bytes) -> dict[str, object]:
+        path = self.artifact_root / name
+        path.write_bytes(payload)
+        path.chmod(0o444)
+        return {
+            "path": str(path),
+            "sha256": sha256(payload),
+            "bytes": len(payload),
+            "mode": 0o444,
+        }
+
+    @staticmethod
+    def process() -> dict[str, object]:
+        return {
+            "pid": 10,
+            "start_ticks": 100,
+            "vm_hwm_bytes": 4096,
+            "voluntary_context_switches": 8,
+            "nonvoluntary_context_switches": 3,
+            "io": {
+                "rchar": 1,
+                "wchar": 2,
+                "syscr": 3,
+                "syscw": 4,
+                "read_bytes": 5,
+                "write_bytes": 6,
+                "cancelled_write_bytes": 0,
+            },
+        }
+
+    @classmethod
+    def rich(
+        cls,
+        track: str,
+        *,
+        variant: str = "A",
+        roles: list[dict[str, object]] | None = None,
+        context: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        context = {} if context is None else context
+        if track in {"syscall_profiles", "structural_traces"}:
+            context = {
+                **context,
+                "trace_path_markers": {
+                    "log": [trace_marker("directory_prefix", "/store/log/")],
+                    "metadata": [trace_marker("exact", "/store/meta")],
+                },
+            }
+        reopen = track == "reopen" or (
+            track == "structural_traces" and context.get("trace_kind") == "reopen"
+        )
+        phases = (
+            adapters.ProfileCoordinator.REOPEN_PHASES
+            if reopen
+            else adapters.ProfileCoordinator.APPEND_PHASES
+        )
+        authority = synthetic_authority(variant, track, context)
+        main_task = {
+            "pid": 10,
+            "tid": 10,
+            "start_ticks": 100,
+            "comm": "bench",
+        }
+        role_values = [] if roles is None else roles
+        snapshots = []
+        for phase in phases:
+            tasks = [main_task]
+            for role in role_values:
+                if role["label"] == "spawn_blocking-publication" and phase != phases[-1]:
+                    continue
+                tasks.extend(task["identity"] for task in role["tasks"])
+            snapshots.append(
+                {
+                    "phase": phase,
+                    "pid": 10,
+                    "process_start_ticks": 100,
+                    "tasks": tasks,
+                }
+            )
+        return {
+            "schema": adapters.PROFILE_SCHEMA,
+            "protocol": adapters.PROTOCOL,
+            "authority": authority,
+            "variant": variant,
+            "track": track,
+            "context": context,
+            "process": cls.process(),
+            "roles": role_values,
+            "phase_snapshots": snapshots,
+            "unattributed_births": [],
+        }
+
+    @staticmethod
+    def owner_role(cpu_ns: int = 400) -> dict[str, object]:
+        return {
+            "label": "owner",
+            "born_in_window": False,
+            "on_cpu_ns": cpu_ns,
+            "voluntary_context_switches": 2,
+            "nonvoluntary_context_switches": 1,
+            "tasks": [
+                {
+                    "identity": {
+                        "pid": 10,
+                        "tid": 11,
+                        "start_ticks": 101,
+                        "comm": "mess-flat-owner",
+                    },
+                    "on_cpu_ns": cpu_ns,
+                    "voluntary_context_switches": 2,
+                    "nonvoluntary_context_switches": 1,
+                }
+            ],
+        }
+
+    @staticmethod
+    def role(
+        label: str,
+        tid: int,
+        start_ticks: int,
+        comm: str,
+        *,
+        born_in_window: bool = False,
+    ) -> dict[str, object]:
+        return {
+            "label": label,
+            "born_in_window": born_in_window,
+            "on_cpu_ns": 2_000,
+            "voluntary_context_switches": 2,
+            "nonvoluntary_context_switches": 1,
+            "tasks": [
+                {
+                    "identity": {
+                        "pid": 10,
+                        "tid": tid,
+                        "start_ticks": start_ticks,
+                        "comm": comm,
+                    },
+                    "on_cpu_ns": 2_000,
+                    "voluntary_context_switches": 2,
+                    "nonvoluntary_context_switches": 1,
+                }
+            ],
+        }
+
+    @classmethod
+    def c_rich(cls) -> dict[str, object]:
+        roles = [
+            cls.role("committer", 12, 102, "bench"),
+            cls.role("producer-runtime", 11, 101, adapters.TOKIO_WORKER_COMM),
+            cls.role(
+                "spawn_blocking-publication",
+                13,
+                103,
+                adapters.TOKIO_WORKER_COMM,
+                born_in_window=True,
+            ),
+        ]
+        main = {"pid": 10, "tid": 10, "start_ticks": 100, "comm": "bench"}
+        producer = roles[1]["tasks"][0]["identity"]
+        committer = roles[0]["tasks"][0]["identity"]
+        publication = roles[2]["tasks"][0]["identity"]
+        tasks = {
+            "boot": [main],
+            "runtime": [main, producer],
+            "opened": [main, producer, committer],
+            "ready": [main, producer, committer],
+            "measured": [main, producer, committer, publication],
+        }
+        context: dict[str, object] = {}
+        authority = synthetic_authority("C", "cpu_profiles", context)
+        return {
+            "schema": adapters.PROFILE_SCHEMA,
+            "protocol": adapters.PROTOCOL,
+            "authority": authority,
+            "variant": "C",
+            "track": "cpu_profiles",
+            "context": context,
+            "process": cls.process(),
+            "roles": roles,
+            "phase_snapshots": [
+                {
+                    "phase": phase,
+                    "pid": 10,
+                    "process_start_ticks": 100,
+                    "tasks": phase_tasks,
+                }
+                for phase, phase_tasks in tasks.items()
+            ],
+            "unattributed_births": [],
+        }
+
+    def test_role_replay_rejects_forged_births_and_hidden_tasks(self) -> None:
+        rich = self.c_rich()
+        self.assertEqual(
+            [role["label"] for role in adapters._roles(rich)],
+            ["committer", "producer-runtime", "spawn_blocking-publication"],
+        )
+        phase_index = {
+            phase["phase"]: index
+            for index, phase in enumerate(rich["phase_snapshots"])
+        }
+        mutations: list[dict[str, object]] = []
+        committer_early = json.loads(adapters.canonical_json(rich))
+        committer_early["phase_snapshots"][phase_index["runtime"]]["tasks"].append(
+            rich["roles"][0]["tasks"][0]["identity"]
+        )
+        mutations.append(committer_early)
+        producer_early = json.loads(adapters.canonical_json(rich))
+        producer_early["phase_snapshots"][phase_index["boot"]]["tasks"].append(
+            rich["roles"][1]["tasks"][0]["identity"]
+        )
+        mutations.append(producer_early)
+        hidden_terminal = json.loads(adapters.canonical_json(rich))
+        hidden_terminal["phase_snapshots"][phase_index["measured"]]["tasks"].append(
+            {
+                "pid": 10,
+                "tid": 14,
+                "start_ticks": 104,
+                "comm": adapters.TOKIO_WORKER_COMM,
+            }
+        )
+        mutations.append(hidden_terminal)
+        unreviewed_open = json.loads(adapters.canonical_json(rich))
+        unreviewed_open["phase_snapshots"][phase_index["opened"]]["tasks"].append(
+            {"pid": 10, "tid": 15, "start_ticks": 105, "comm": "unreviewed"}
+        )
+        mutations.append(unreviewed_open)
+        for index, mutated in enumerate(mutations):
+            with self.subTest(index=index), self.assertRaises(
+                adapters.ProfileEvidenceError
+            ):
+                adapters._roles(mutated)
+
+    def test_primary_fields_are_exact_and_apply_resolution_floor(self) -> None:
+        rich = self.rich("primary", roles=[self.owner_role()])
+        inputs = {"schedstat_resolution_ns": 20}
+        fields = adapters.profile_fields(
+            "primary",
+            rich,
+            raw_point={"track": "primary", "variant": "A"},
+            control_events=control_events(rich["authority"]),
+            authority=rich["authority"],
+            profile_inputs=inputs,
+        )
+        self.assertEqual(fields["process_user_cpu_ns"], 20)
+        self.assertEqual(fields["serialized_role"], "mess-flat-owner")
+        self.assertEqual(fields["serialized_role_cpu_ns"], 400)
+        inputs["schedstat_resolution_ns"] = 21
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters.profile_fields(
+                "primary",
+                rich,
+                raw_point={"track": "primary", "variant": "A"},
+                control_events=control_events(rich["authority"]),
+                authority=rich["authority"],
+                profile_inputs=inputs,
+            )
+
+    def test_cpu_fields_flatten_roles_and_perf(self) -> None:
+        rich = self.rich("cpu_profiles", roles=[self.owner_role(2_000)])
+        stat_payload = "\n".join(
+            (
+                "1000,,cycles:u,5000,100.0,",
+                "2000,,instructions:u,5000,100.0,",
+                "1.5,msec,task-clock:u,5000,100.0,",
+                "8,,context-switches:u,5000,100.0,",
+            )
+        ).encode()
+        ack = b"ack\nack\n"
+        events = control_events(rich["authority"])
+        inputs = {
+            "schedstat_resolution_ns": 50,
+            "perf_permission": "available;perf_event_paranoid=2;scope=user-only",
+            "perf_control_events": perf_control_events(),
+            "perf_raw_artifacts": {
+                "stat": self.raw_artifact("perf.csv", stat_payload),
+                "ack": self.raw_artifact("perf.ack", ack),
+            },
+        }
+        fields = adapters.profile_fields(
+            "cpu_profiles",
+            rich,
+            raw_point={"track": "cpu_profiles", "variant": "A"},
+            control_events=events,
+            authority=rich["authority"],
+            profile_inputs=inputs,
+        )
+        self.assertEqual(fields["task_clock_ns"], 1_500_000)
+        self.assertEqual(fields["role_samples_json"][0]["role"], "mess-flat-owner")
+        self.assertEqual(fields["process_voluntary_switches"], 8)
+
+        for field, value in (
+            ("nonce", "0" * 64),
+            ("ack_received_monotonic_ns", 81),
+        ):
+            mutated = {
+                **inputs,
+                "perf_control_events": json.loads(
+                    adapters.canonical_json(inputs["perf_control_events"])
+                ),
+            }
+            mutated["perf_control_events"][0][field] = value
+            with self.subTest(field=field), self.assertRaises(
+                adapters.ProfileEvidenceError
+            ):
+                adapters.profile_fields(
+                    "cpu_profiles",
+                    rich,
+                    raw_point={"track": "cpu_profiles", "variant": "A"},
+                    control_events=events,
+                    authority=rich["authority"],
+                    profile_inputs=mutated,
+                )
+        mutated = {
+            **inputs,
+            "perf_control_events": json.loads(
+                adapters.canonical_json(inputs["perf_control_events"])
+            ),
+        }
+        mutated["perf_control_events"][1]["sent_monotonic_ns"] = 89
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters.profile_fields(
+                "cpu_profiles",
+                rich,
+                raw_point={"track": "cpu_profiles", "variant": "A"},
+                control_events=events,
+                authority=rich["authority"],
+                profile_inputs=mutated,
+            )
+        late_inputs = {
+            **inputs,
+            "perf_control_events": json.loads(
+                adapters.canonical_json(inputs["perf_control_events"])
+            ),
+        }
+        late_events = json.loads(adapters.canonical_json(events))
+        late_inputs["perf_control_events"][1].update(
+            {"sent_monotonic_ns": 89, "ack_received_monotonic_ns": 90}
+        )
+        late_events[8]["perf_disable"] = late_inputs["perf_control_events"][1]
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters.profile_fields(
+                "cpu_profiles",
+                rich,
+                raw_point={"track": "cpu_profiles", "variant": "A"},
+                control_events=late_events,
+                authority=rich["authority"],
+                profile_inputs=late_inputs,
+            )
+        bad_binding = {
+            **inputs,
+            "perf_raw_artifacts": json.loads(
+                adapters.canonical_json(inputs["perf_raw_artifacts"])
+            ),
+        }
+        bad_binding["perf_raw_artifacts"]["stat"]["sha256"] = "0" * 64
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters.profile_fields(
+                "cpu_profiles",
+                rich,
+                raw_point={"track": "cpu_profiles", "variant": "A"},
+                control_events=events,
+                authority=rich["authority"],
+                profile_inputs=bad_binding,
+            )
+
+        unavailable_inputs = {
+            "schedstat_resolution_ns": 50,
+            "perf_permission": (
+                "not_available;perf_event_paranoid=4;scope=user-only;exit_status=255"
+            ),
+            "perf_control_events": [],
+            "perf_raw_artifacts": {},
+        }
+        unavailable_rich = json.loads(adapters.canonical_json(rich))
+        unavailable_authority = unavailable_rich["authority"]
+        unavailable_authority["perf_permission_result"] = unavailable_inputs[
+            "perf_permission"
+        ]
+        unavailable_events = control_events(
+            unavailable_authority, perf_available=False
+        )
+        unavailable = adapters.profile_fields(
+            "cpu_profiles",
+            unavailable_rich,
+            raw_point={"track": "cpu_profiles", "variant": "A"},
+            control_events=unavailable_events,
+            authority=unavailable_authority,
+            profile_inputs=unavailable_inputs,
+        )
+        self.assertEqual(unavailable["cycles"], "not_available")
+
+    def test_trace_field_profiles_are_exact(self) -> None:
+        syscall_rich = self.rich("syscall_profiles")
+        syscall_authority = syscall_rich["authority"]
+        syscall_events = control_events(syscall_authority)
+        syscall_boundary = trace_boundary(syscall_authority, syscall_events)
+        syscall_payload = f"""{marker_line(syscall_authority, syscall_boundary["begin_event"])}
+10 write(4</store/log/active>, "x", 1) = 1
+10 write(4</store/log/active>, "y", 1) = 1
+10 pwritev(4</store/log/active>, [], 0, 0) = 0
+10 fdatasync(4</store/log/active>) = 0
+10 mkdir("/store/new", 0700) = 0
+10 rename("/store/new", "/store/renamed") = 0
+10 unlink("/store/renamed") = 0
+{marker_line(syscall_authority, syscall_boundary["end_event"])}
+""".encode()
+        syscall = adapters.profile_fields(
+            "syscall_profiles",
+            syscall_rich,
+            raw_point={"track": "syscall_profiles", "variant": "A"},
+            control_events=syscall_events,
+            authority=syscall_authority,
+            profile_inputs={
+                "trace_raw_artifact": self.raw_artifact("syscall.strace", syscall_payload),
+                "log_path_markers": [
+                    trace_marker("directory_prefix", "/store/log/")
+                ],
+                "metadata_path_markers": [trace_marker("exact", "/store/meta")],
+            },
+        )
+        self.assertEqual(syscall["pwritev"], 1)
+        self.assertEqual(syscall["file_unlink"], 1)
+        bad_markers = {
+            "trace_raw_artifact": self.raw_artifact(
+                "syscall-copy.strace", syscall_payload
+            ),
+            "log_path_markers": [
+                trace_marker("directory_prefix", "/tmp/evil/store/log/")
+            ],
+            "metadata_path_markers": [trace_marker("exact", "/store/meta")],
+        }
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters.profile_fields(
+                "syscall_profiles",
+                syscall_rich,
+                raw_point={"track": "syscall_profiles", "variant": "A"},
+                control_events=syscall_events,
+                authority=syscall_authority,
+                profile_inputs=bad_markers,
+            )
+        bad_mode = {
+            **bad_markers,
+            "log_path_markers": [trace_marker("directory_prefix", "/store/log/")],
+            "trace_raw_artifact": {
+                **bad_markers["trace_raw_artifact"],
+                "mode": 0o644,
+            },
+        }
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters.profile_fields(
+                "syscall_profiles",
+                syscall_rich,
+                raw_point={"track": "syscall_profiles", "variant": "A"},
+                control_events=syscall_events,
+                authority=syscall_authority,
+                profile_inputs=bad_mode,
+            )
+        aliased_path = {
+            **bad_markers,
+            "log_path_markers": [trace_marker("directory_prefix", "/store/log/")],
+            "trace_raw_artifact": {
+                **bad_markers["trace_raw_artifact"],
+                "path": str(bad_markers["trace_raw_artifact"]["path"]).replace(
+                    "/", "//", 1
+                ),
+            },
+        }
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters.profile_fields(
+                "syscall_profiles",
+                syscall_rich,
+                raw_point={"track": "syscall_profiles", "variant": "A"},
+                control_events=syscall_events,
+                authority=syscall_authority,
+                profile_inputs=aliased_path,
+            )
+
+        structural_rich = self.rich(
+            "structural_traces",
+            context={"trace_kind": "reopen"},
+        )
+        structural_authority = structural_rich["authority"]
+        structural_events = control_events(structural_authority, reopen=True)
+        structural_boundary = trace_boundary(structural_authority, structural_events)
+        structural_payload = f"""{marker_line(structural_authority, structural_boundary["begin_event"])}
+10 openat(AT_FDCWD, "/store/log/active", O_RDONLY) = 4</store/log/active>
+10 read(4</store/log/active>, "x", 1) = 1
+10 fdatasync(4</store/log/active>) = 0
+{marker_line(structural_authority, structural_boundary["end_event"])}
+""".encode()
+        structural = adapters.profile_fields(
+            "structural_traces",
+            structural_rich,
+            raw_point={
+                "track": "structural_traces",
+                "variant": "A",
+                "trace_kind": "reopen",
+            },
+            control_events=structural_events,
+            authority=structural_authority,
+            profile_inputs={
+                "trace_raw_artifact": self.raw_artifact(
+                    "structural.strace", structural_payload
+                ),
+                "log_path_markers": [
+                    trace_marker("directory_prefix", "/store/log/")
+                ],
+                "metadata_path_markers": [trace_marker("exact", "/store/meta")],
+            },
+        )
+        self.assertEqual(structural["sync_family_calls"], 1)
+        self.assertEqual(structural["files_opened"], 1)
+
+    def test_profile_fields_reject_nonfinite_and_partial_inputs(self) -> None:
+        rich = self.rich("primary", roles=[self.owner_role()])
+        events = control_events(rich["authority"])
+        events[8]["process_user_cpu_end_ns"] = math.inf
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters.profile_fields(
+                "primary",
+                rich,
+                raw_point={"track": "primary", "variant": "A"},
+                control_events=events,
+                authority=rich["authority"],
+                profile_inputs={"schedstat_resolution_ns": 1},
+            )
+
+    def test_profile_fields_reject_control_role_and_authority_mutations(self) -> None:
+        rich = self.rich("primary", roles=[self.owner_role()])
+        authority = rich["authority"]
+        inputs = {"schedstat_resolution_ns": 10}
+        mutations: list[tuple[dict[str, object], list[dict[str, object]], dict[str, object]]] = []
+        bad_nonce = control_events(authority)
+        bad_nonce[2]["nonce"] = "0" * 64
+        mutations.append((rich, bad_nonce, authority))
+        extra_event = control_events(authority)
+        extra_event.append({"command": "release", "nonce": "4" * 64})
+        mutations.append((rich, extra_event, authority))
+        bad_role = json.loads(adapters.canonical_json(rich))
+        bad_role["roles"][0]["label"] = "committer"
+        mutations.append((bad_role, control_events(authority), authority))
+        bad_phase = json.loads(adapters.canonical_json(rich))
+        bad_phase["phase_snapshots"][0]["pid"] = 999
+        mutations.append((bad_phase, control_events(authority), authority))
+        bad_authority = dict(authority)
+        bad_authority["source_tree"] = "0" * 40
+        bad_rich_authority = json.loads(adapters.canonical_json(rich))
+        bad_rich_authority["authority"] = bad_authority
+        mutations.append((bad_rich_authority, control_events(bad_authority), bad_authority))
+        for mutated_rich, events, mutated_authority in mutations:
+            with self.assertRaises(adapters.ProfileEvidenceError):
+                adapters.profile_fields(
+                    "primary",
+                    mutated_rich,
+                    raw_point={"track": "primary", "variant": "A"},
+                    control_events=events,
+                    authority=mutated_authority,
+                    profile_inputs=inputs,
+                )
+
+    def test_profile_fields_reject_lifecycle_counter_and_reopen_mutations(self) -> None:
+        rich = self.rich("primary", roles=[self.owner_role()])
+        authority = rich["authority"]
+        inputs = {"schedstat_resolution_ns": 10}
+        lifecycle_mutations: list[list[dict[str, object]]] = []
+        bad_t1 = control_events(authority)
+        bad_t1[8]["t0_monotonic_ns"] = 86
+        lifecycle_mutations.append(bad_t1)
+        cpu_rollback = control_events(authority)
+        cpu_rollback[8]["process_user_cpu_end_ns"] = 9
+        lifecycle_mutations.append(cpu_rollback)
+        future_ready = control_events(authority)
+        future_ready[6]["counter_start_monotonic_ns"] = 71
+        lifecycle_mutations.append(future_ready)
+        for index, events in enumerate(lifecycle_mutations):
+            with self.subTest(index=index), self.assertRaises(
+                adapters.ProfileEvidenceError
+            ):
+                adapters.profile_fields(
+                    "primary",
+                    rich,
+                    raw_point={"track": "primary", "variant": "A"},
+                    control_events=events,
+                    authority=authority,
+                    profile_inputs=inputs,
+                )
+
+        reopen = self.rich("reopen")
+        reopen_events = control_events(reopen["authority"], reopen=True)
+        reopen_events[6]["open_start_monotonic_ns"] = 63
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters.profile_fields(
+                "reopen",
+                reopen,
+                raw_point={"track": "reopen", "variant": "A"},
+                control_events=reopen_events,
+                authority=reopen["authority"],
+            )
+
+    def test_live_schedstat_preflight_is_canonical(self) -> None:
+        artifact = adapters.preflight_profile_contract(sample_count=8)
+        self.assertEqual(artifact["schema"], adapters.PREFLIGHT_SCHEMA)
+        self.assertGreater(artifact["minimum_nonzero_increment_ns"], 0)
+        self.assertEqual(
+            artifact["decision_floor_ns"],
+            artifact["minimum_nonzero_increment_ns"]
+            * adapters.SCHEDSTAT_DECISION_MULTIPLIER,
+        )
+        adapters.canonical_json(artifact)
+
+
+if __name__ == "__main__":
+    unittest.main()
