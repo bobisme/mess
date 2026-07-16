@@ -18,6 +18,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import socket
 import stat
@@ -111,6 +112,29 @@ SOURCE_VARIANT_FIELDS = set(schema.SOURCE_APPROVAL_VARIANT_FIELDS)
 PREPARED_FIELDS = set(schema.PREPARED_FIELDS)
 PREPARED_VARIANT_FIELDS = set(schema.PREPARED_VARIANT_FIELDS)
 PREPARED_ATTESTATION_FIELDS = set(schema.PREPARED_ATTESTATION_FIELDS)
+SOURCE_REVIEW_FIELDS = set(schema.SOURCE_REVIEW_FIELDS)
+SOURCE_REVIEW_INPUT_FIELDS = set(schema.SOURCE_REVIEW_INPUT_FIELDS)
+SOURCE_REVIEW_ASSERTION_FIELDS = set(schema.SOURCE_REVIEW_ASSERTION_FIELDS)
+SOURCE_REVIEW_BUNDLE_FIELDS = set(schema.SOURCE_REVIEW_BUNDLE_FIELDS)
+RELEASE_COMPILE_OUT_REQUIREMENT_FIELDS = set(
+    schema.RELEASE_COMPILE_OUT_REQUIREMENT_FIELDS
+)
+RELEASE_COMPILE_OUT_FIELDS = set(schema.RELEASE_COMPILE_OUT_FIELDS)
+GUEST_ROOT = "/asterism"
+GUEST_SOURCE = f"{GUEST_ROOT}/source"
+GUEST_TARGET = f"{GUEST_ROOT}/target"
+GUEST_TOOLCHAIN_ROOT = f"{GUEST_ROOT}/toolchain"
+GUEST_CARGO = f"{GUEST_TOOLCHAIN_ROOT}/bin/cargo"
+GUEST_RUSTC = f"{GUEST_TOOLCHAIN_ROOT}/bin/rustc"
+GUEST_CARGO_HOME = f"{GUEST_ROOT}/cargo-home"
+GUEST_RUSTUP_HOME = f"{GUEST_ROOT}/rustup-home"
+GUEST_BOUND_CONFIG_PATHS = (
+    f"{GUEST_SOURCE}/.cargo/config.toml",
+    f"{GUEST_SOURCE}/.cargo/config",
+    f"{GUEST_CARGO_HOME}/config.toml",
+    f"{GUEST_CARGO_HOME}/config",
+)
+EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 CHILD_FIELDS = set(schema.CHILD_FIELDS)
 GUARD_BINDING_FIELDS = set(schema.GUARD_BINDING_FIELDS)
 GUARD_SNAPSHOT_FIELDS = set(schema.GUARD_SNAPSHOT_FIELDS)
@@ -360,6 +384,180 @@ def require_exact_keys(value: Any, expected: set[str], context: str, problems: P
         )
         return False
     return True
+
+
+def sandboxed_build_environment(
+    toolchain: Mapping[str, Any], extra: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Project the exact fixed-guest environment used by retained build tools."""
+
+    environment = {**schema.sanitized_cargo_environment(toolchain), **extra}
+    environment.update(
+        {
+            "CARGO_HOME": GUEST_CARGO_HOME,
+            "PATH": f"{GUEST_TOOLCHAIN_ROOT}/bin:/usr/bin:/bin",
+            "RUSTC": GUEST_RUSTC,
+            "RUSTUP_HOME": GUEST_RUSTUP_HOME,
+        }
+    )
+    return environment
+
+
+def validate_sandboxed_build_argv(
+    value: Any,
+    *,
+    bwrap_path: Any,
+    cargo_config_search_sha256: Any,
+    package: str,
+    example: str,
+    context: str,
+    problems: Problems,
+) -> str | None:
+    """Validate and normalize the eleven exact descriptor guest bindings."""
+
+    if not isinstance(value, list) or any(
+        not isinstance(argument, str) for argument in value
+    ):
+        problems.add(f"{context} is not an exact string list")
+        return None
+    core_bindings = (
+        ("--ro-bind-fd", GUEST_SOURCE),
+        ("--bind-fd", GUEST_TARGET),
+        ("--ro-bind-fd", GUEST_TOOLCHAIN_ROOT),
+        ("--ro-bind-fd", GUEST_CARGO),
+        ("--ro-bind-fd", GUEST_RUSTC),
+        ("--ro-bind-fd", GUEST_CARGO_HOME),
+        ("--ro-bind-fd", GUEST_RUSTUP_HOME),
+    )
+    config_bindings = tuple(
+        ("--ro-bind-fd", guest_path) for guest_path in GUEST_BOUND_CONFIG_PATHS
+    )
+    prefix = [
+        bwrap_path,
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-net",
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev-bind",
+        "/dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--tmpfs",
+        "/tmp",
+        "--tmpfs",
+        GUEST_ROOT,
+        "--dir",
+        f"{GUEST_ROOT}/.cargo",
+        "--tmpfs",
+        f"{GUEST_ROOT}/.cargo",
+        "--remount-ro",
+        f"{GUEST_ROOT}/.cargo",
+        "--dir",
+        "/.cargo",
+        "--tmpfs",
+        "/.cargo",
+        "--remount-ro",
+        "/.cargo",
+    ]
+    suffix = [
+        "--chdir",
+        GUEST_SOURCE,
+        GUEST_CARGO,
+        "build",
+        "--locked",
+        "--offline",
+        "--release",
+        "-p",
+        package,
+        "--example",
+        example,
+        "--target-dir",
+        GUEST_TARGET,
+    ]
+    source_config_prefix = [
+        "--dir",
+        f"{GUEST_SOURCE}/.cargo",
+        "--tmpfs",
+        f"{GUEST_SOURCE}/.cargo",
+    ]
+    source_config_suffix = ["--remount-ro", f"{GUEST_SOURCE}/.cargo"]
+    cargo_home_suffix = ["--remount-ro", GUEST_CARGO_HOME]
+    expected_length = (
+        len(prefix)
+        + 3 * len(core_bindings)
+        + len(source_config_prefix)
+        + 3 * len(config_bindings)
+        + len(source_config_suffix)
+        + len(cargo_home_suffix)
+        + len(suffix)
+    )
+    if len(value) != expected_length or value[: len(prefix)] != prefix:
+        problems.add(f"{context} fixed sandbox prefix/cardinality differs")
+        return None
+    descriptors: list[str] = []
+    normalized = list(value)
+    offset = len(prefix)
+
+    def consume_binding(operation: str, destination: str) -> bool:
+        nonlocal offset
+        segment = value[offset : offset + 3]
+        descriptor = segment[1] if len(segment) == 3 else ""
+        if (
+            len(segment) != 3
+            or segment[0] != operation
+            or segment[2] != destination
+            or not descriptor.isascii()
+            or not descriptor.isdecimal()
+            or len(descriptor) > 10
+            or str(int(descriptor)) != descriptor
+            or int(descriptor) < 3
+        ):
+            problems.add(f"{context} descriptor binding for {destination} differs")
+            return False
+        descriptors.append(descriptor)
+        normalized[offset + 1] = f"$FD:{destination}"
+        offset += 3
+        return True
+
+    for operation, destination in core_bindings:
+        if not consume_binding(operation, destination):
+            return None
+    if value[offset : offset + len(source_config_prefix)] != source_config_prefix:
+        problems.add(f"{context} source Cargo-config private view differs")
+        return None
+    offset += len(source_config_prefix)
+    for operation, destination in config_bindings[:2]:
+        if not consume_binding(operation, destination):
+            return None
+    if value[offset : offset + len(source_config_suffix)] != source_config_suffix:
+        problems.add(f"{context} source Cargo-config read-only remount differs")
+        return None
+    offset += len(source_config_suffix)
+    for operation, destination in config_bindings[2:]:
+        if not consume_binding(operation, destination):
+            return None
+    if value[offset : offset + len(cargo_home_suffix)] != cargo_home_suffix:
+        problems.add(f"{context} Cargo-home read-only remount differs")
+        return None
+    offset += len(cargo_home_suffix)
+    if len(set(descriptors)) != len(descriptors):
+        problems.add(f"{context} descriptor operands are not distinct")
+    if value[offset:] != suffix:
+        problems.add(f"{context} fixed guest build command differs")
+    if not is_sha256(cargo_config_search_sha256):
+        problems.add(f"{context} Cargo config-search hash is invalid")
+        return None
+    return hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "argv": normalized,
+                "cargo_config_search_sha256": cargo_config_search_sha256,
+            }
+        )
+    ).hexdigest()
 
 
 def parse_timestamp(value: Any, context: str, problems: Problems) -> datetime | None:
@@ -1938,6 +2136,375 @@ def validate_tools_manifest(
     return value
 
 
+def validate_release_compile_out_requirement(
+    value: Any, context: str, problems: Problems
+) -> dict[str, Any] | None:
+    if not require_exact_keys(
+        value, RELEASE_COMPILE_OUT_REQUIREMENT_FIELDS, context, problems
+    ):
+        return None
+    expected = {
+        "schema": schema.RELEASE_COMPILE_OUT_REQUIREMENT_SCHEMA,
+        "status": "required",
+        "variant": "A",
+        "proof_must_bind_enclosing_approval_sha256": True,
+        "repeat_under_real_source_approval": True,
+        "same_contract_nonce_lock_toolchain_sandbox": True,
+        "cfg_test": False,
+        "rustc_workspace_wrapper": "absent",
+        "ordinary_a_role": "published",
+        "overlay_a_role": "proof_only",
+        "binary_byte_identical": True,
+        "symbol_inventory_byte_identical": True,
+        "forbidden_hook_strings": list(
+            schema.RELEASE_COMPILE_OUT_FORBIDDEN_HOOK_STRINGS
+        ),
+        "forbidden_hook_strings_absent": True,
+    }
+    for field, expected_value in expected.items():
+        if value.get(field) != expected_value:
+            problems.add(f"{context} {field} differs from exact authority")
+    for field in ("product_overlay_sha256", "preapproval_compile_out_sha256"):
+        if not is_sha256(value.get(field)):
+            problems.add(f"{context} {field} is not SHA-256")
+    return value
+
+
+def validate_source_review_claim(
+    approval: Mapping[str, Any], problems: Problems
+) -> dict[str, Any] | None:
+    source_review = approval.get("source_review")
+    if not require_exact_keys(
+        source_review, SOURCE_REVIEW_FIELDS, "source review", problems
+    ):
+        return None
+    if not is_sha256(source_review.get("assertion_sha256")):
+        problems.add("source review assertion hash is invalid")
+    for name, expected_schema in schema.SOURCE_REVIEW_CONTENT_SCHEMAS.items():
+        binding = source_review.get(name)
+        context = f"source review {name}"
+        if not require_exact_keys(
+            binding,
+            set(schema.SOURCE_REVIEW_CONTENT_BINDING_FIELDS),
+            context,
+            problems,
+        ):
+            continue
+        if (
+            binding.get("schema") != expected_schema
+            or binding.get("mode") != 0o444
+            or not is_sha256(binding.get("sha256"))
+        ):
+            problems.add(f"{context} content binding differs")
+    validate_release_compile_out_requirement(
+        source_review.get("release_compile_out_requirement"),
+        "source review release compile-out requirement",
+        problems,
+    )
+    return source_review
+
+
+def validate_source_review_input(
+    value: Any, name: str, problems: Problems
+) -> dict[str, Any] | None:
+    context = f"source review assertion input {name}"
+    if not require_exact_keys(value, SOURCE_REVIEW_INPUT_FIELDS, context, problems):
+        return None
+    if (
+        value.get("schema") != schema.SOURCE_REVIEW_INPUT_SCHEMA
+        or value.get("mode") != 0o444
+        or not isinstance(value.get("path"), str)
+        or not Path(value["path"]).is_absolute()
+        or not is_sha256(value.get("sha256"))
+        or isinstance(value.get("size"), bool)
+        or not isinstance(value.get("size"), int)
+        or value["size"] <= 0
+    ):
+        problems.add(f"{context} immutable binding differs")
+    identity = value.get("identity")
+    if require_exact_keys(
+        identity,
+        set(schema.SOURCE_REVIEW_IDENTITY_FIELDS),
+        f"{context} identity",
+        problems,
+    ):
+        if any(
+            isinstance(identity.get(field), bool)
+            or not isinstance(identity.get(field), int)
+            or identity[field] <= 0
+            for field in schema.SOURCE_REVIEW_IDENTITY_FIELDS
+        ):
+            problems.add(f"{context} identity values are invalid")
+        if identity.get("link_count") != 1:
+            problems.add(f"{context} link count is not exact one")
+    return value
+
+
+def validate_source_review_bundle_authority(
+    bundle: Mapping[str, Any],
+    source_review: Mapping[str, Any],
+    approval: Mapping[str, Any],
+    current_children: Mapping[str, Any],
+    lock_authority: Mapping[str, Any],
+    lock_review_bundle: Mapping[str, Any],
+    problems: Problems,
+) -> None:
+    if not require_exact_keys(
+        bundle, SOURCE_REVIEW_BUNDLE_FIELDS, "source review bundle", problems
+    ):
+        return
+    assertion = bundle.get("assertion")
+    if not require_exact_keys(
+        assertion,
+        SOURCE_REVIEW_ASSERTION_FIELDS,
+        "source review assertion",
+        problems,
+    ):
+        return
+    assertion_sha256 = hashlib.sha256(canonical_json_bytes(assertion)).hexdigest()
+    if (
+        bundle.get("schema") != schema.SOURCE_REVIEW_BUNDLE_SCHEMA
+        or bundle.get("assertion_sha256") != assertion_sha256
+        or source_review.get("assertion_sha256") != assertion_sha256
+    ):
+        problems.add("source review assertion digest binding differs")
+    for field, expected in {
+        "schema": schema.SOURCE_REVIEW_ASSERTION_SCHEMA,
+        "protocol": schema.PROTOCOL,
+        "protocol_sha256": schema.PROTOCOL_SHA256,
+        "status": "approved",
+        "open_findings": 0,
+        "tooling_commit": approval.get("tooling_commit"),
+        "tooling_tree": approval.get("tooling_tree"),
+        "release_compile_out_requirement": source_review.get(
+            "release_compile_out_requirement"
+        ),
+    }.items():
+        if assertion.get(field) != expected:
+            problems.add(f"source review assertion {field} differs")
+    inputs = assertion.get("inputs")
+    if not isinstance(inputs, dict) or set(inputs) != set(
+        schema.SOURCE_REVIEW_INPUT_NAMES
+    ):
+        problems.add("source review assertion input names differ")
+        return
+    validated_inputs = {
+        name: validate_source_review_input(inputs[name], name, problems)
+        for name in schema.SOURCE_REVIEW_INPUT_NAMES
+    }
+    if all(record is not None for record in validated_inputs.values()):
+        paths = [
+            str(record.get("path"))
+            for record in validated_inputs.values()
+            if record is not None
+        ]
+        identities = [
+            (
+                record["identity"].get("device"),
+                record["identity"].get("inode"),
+            )
+            for record in validated_inputs.values()
+            if record is not None and isinstance(record.get("identity"), Mapping)
+        ]
+        if (
+            len(identities) != len(validated_inputs)
+            or len(set(paths)) != len(paths)
+            or len(set(identities)) != len(identities)
+        ):
+            problems.add("source review assertion inputs are not physically disjoint")
+    for name in (
+        "current_children_attestation",
+        "lock_authority",
+        "lock_review_bundle",
+        "tools_manifest",
+    ):
+        expected_hash = (
+            approval.get("tools_manifest_sha256")
+            if name == "tools_manifest"
+            else source_review.get(name, {}).get("sha256")
+        )
+        record = validated_inputs.get(name)
+        if record is not None and record.get("sha256") != expected_hash:
+            problems.add(f"source review assertion {name} hash differs")
+
+    created = bundle.get("review_created")
+    verdict = bundle.get("verdict")
+    if require_exact_keys(
+        created,
+        set(schema.SOURCE_REVIEW_SEAL_EVENT_FIELDS),
+        "source review ReviewCreated",
+        problems,
+    ):
+        created_data = created.get("data")
+        if require_exact_keys(
+            created_data,
+            set(schema.SOURCE_REVIEW_CREATED_DATA_FIELDS),
+            "source review ReviewCreated data",
+            problems,
+        ):
+            review_id = created_data.get("review_id")
+            detached = f"detached:{approval.get('tooling_commit')}"
+            if (
+                created.get("event") != "ReviewCreated"
+                or not isinstance(created.get("author"), str)
+                or not created["author"]
+                or created_data.get("initial_commit")
+                != approval.get("tooling_commit")
+                or created_data.get("jj_change_id") != detached
+                or created_data.get("scm_anchor") != detached
+                or created_data.get("scm_kind") != "git"
+                or not isinstance(review_id, str)
+                or not review_id
+                or not isinstance(created_data.get("title"), str)
+                or not created_data["title"]
+                or not isinstance(created_data.get("description"), str)
+                or not created_data["description"]
+                or approval.get("review_id") != review_id
+            ):
+                problems.add("source review ReviewCreated anchor/content differs")
+        created_at = parse_timestamp(
+            created.get("ts"), "source review ReviewCreated timestamp", problems
+        )
+    else:
+        created_data = {}
+        created_at = None
+    if require_exact_keys(
+        verdict,
+        set(schema.SOURCE_REVIEW_SEAL_EVENT_FIELDS),
+        "source review ReviewerVoted",
+        problems,
+    ):
+        verdict_data = verdict.get("data")
+        if require_exact_keys(
+            verdict_data,
+            set(schema.SOURCE_REVIEW_VERDICT_DATA_FIELDS),
+            "source review ReviewerVoted data",
+            problems,
+        ):
+            expected_reason = (
+                f"APPROVED assertion_sha256={assertion_sha256}; open_findings=0"
+            )
+            if (
+                verdict.get("event") != "ReviewerVoted"
+                or not isinstance(verdict.get("author"), str)
+                or not verdict["author"]
+                or verdict_data
+                != {
+                    "reason": expected_reason,
+                    "review_id": created_data.get("review_id"),
+                    "vote": "lgtm",
+                }
+            ):
+                problems.add("source review ReviewerVoted verdict differs")
+        reviewed_at = parse_timestamp(
+            verdict.get("ts"), "source review ReviewerVoted timestamp", problems
+        )
+        if approval.get("reviewed_at") != verdict.get("ts"):
+            problems.add("source approval review time is not Seal-derived")
+        if created_at is not None and reviewed_at is not None and reviewed_at < created_at:
+            problems.add("source review verdict predates ReviewCreated")
+
+    expected_lock_inputs = {
+        "authority": inputs.get("lock_authority"),
+        "lock_manifest": inputs.get("lock_manifest"),
+        "review_bundle": inputs.get("lock_review_bundle"),
+    }
+    attested_inputs = current_children.get("lock_authority_inputs")
+    if not isinstance(attested_inputs, dict) or set(attested_inputs) != set(
+        expected_lock_inputs
+    ):
+        problems.add("current-child lock authority inputs differ")
+    else:
+        for name, reviewed in expected_lock_inputs.items():
+            expected = dict(reviewed) if isinstance(reviewed, dict) else {}
+            expected.pop("schema", None)
+            if attested_inputs.get(name) != expected:
+                problems.add(f"current-child lock input {name} differs")
+    if (
+        current_children.get("schema")
+        != schema.SOURCE_REVIEW_CONTENT_SCHEMAS["current_children_attestation"]
+        or current_children.get("status") != "ok"
+        or current_children.get("protocol") != schema.PROTOCOL
+        or current_children.get("protocol_sha256") != schema.PROTOCOL_SHA256
+        or current_children.get("tools_manifest_sha256")
+        != inputs["tools_manifest"].get("sha256")
+        or current_children.get("lock_manifest_sha256")
+        != inputs["lock_manifest"].get("sha256")
+        or current_children.get("review_bundle_sha256")
+        != inputs["lock_review_bundle"].get("sha256")
+        or current_children.get("lock_authority") != lock_authority
+    ):
+        problems.add("current-child reviewed input crosslinks differ")
+    bound_lock_manifest = lock_authority.get("lock_manifest")
+    bound_lock_review = lock_authority.get("review_bundle")
+    if (
+        lock_authority.get("schema")
+        != schema.SOURCE_REVIEW_CONTENT_SCHEMAS["lock_authority"]
+        or lock_authority.get("status") != "approved"
+        or lock_authority.get("protocol") != schema.PROTOCOL
+        or lock_authority.get("protocol_sha256") != schema.PROTOCOL_SHA256
+        or lock_authority.get("review_sha256")
+        != inputs["lock_review_bundle"].get("sha256")
+        or not isinstance(bound_lock_manifest, Mapping)
+        or bound_lock_manifest.get("sha256")
+        != inputs["lock_manifest"].get("sha256")
+        or bound_lock_manifest.get("schema")
+        != "asterism-rebaseline-lock-candidates-v3"
+        or not isinstance(bound_lock_manifest.get("payload"), Mapping)
+        or bound_lock_manifest["payload"].get("schema")
+        != "asterism-rebaseline-lock-candidates-v3"
+        or not isinstance(bound_lock_review, Mapping)
+        or bound_lock_review.get("sha256")
+        != inputs["lock_review_bundle"].get("sha256")
+        or bound_lock_review.get("schema")
+        != schema.SOURCE_REVIEW_CONTENT_SCHEMAS["lock_review_bundle"]
+        or bound_lock_review.get("payload") != lock_review_bundle
+        or lock_review_bundle.get("schema")
+        != schema.SOURCE_REVIEW_CONTENT_SCHEMAS["lock_review_bundle"]
+    ):
+        problems.add("current lock review authority crosslinks differ")
+    release_approval = current_children.get("release_compile_out_approval")
+    preapproval_sentinel = (
+        "fa2acb626f303f8a65a16a6c8a1fd86b7e80cf48e092ae21a7308984ae790c94"
+    )
+    if release_approval != {
+        "final_integration_action": (
+            "repeat-release-equality-proof-under-real-source-approval"
+        ),
+        "source_approval_sha256": preapproval_sentinel,
+        "source_approval_status": "preapproval-sentinel-not-source-approved",
+    }:
+        problems.add("current-child preapproval sentinel/action differs")
+    preapproval = current_children.get("release_compile_out")
+    requirement = source_review.get("release_compile_out_requirement", {})
+    if (
+        not isinstance(preapproval, dict)
+        or preapproval.get("preapproval_source_sentinel") != preapproval_sentinel
+        or preapproval.get("binary_byte_identical") is not True
+        or preapproval.get("symbol_inventory_byte_identical") is not True
+        or preapproval.get("forbidden_hook_strings")
+        != list(schema.RELEASE_COMPILE_OUT_FORBIDDEN_HOOK_STRINGS)
+        or hashlib.sha256(canonical_json_bytes(preapproval)).hexdigest()
+        != requirement.get("preapproval_compile_out_sha256")
+        or current_children.get("product_overlay_authority", {})
+        .get("patch", {})
+        .get("sha256")
+        != requirement.get("product_overlay_sha256")
+    ):
+        problems.add("current-child preapproval compile-out authority differs")
+    artifacts = current_children.get("artifacts")
+    approved_tools = approval.get("tools_manifest", {}).get("tools", {})
+    if not isinstance(artifacts, dict) or any(
+        artifacts.get(name) != approved_tools.get(name)
+        for name in ("correctness", "fault")
+    ):
+        problems.add("current-child tool artifacts differ from source approval")
+    if b"/asterism/preapproval-placeholder/" in canonical_json_bytes(
+        approval.get("tools_manifest", {})
+    ):
+        problems.add("source-approved tools retain a preapproval placeholder")
+
+
 def validate_source_approval(
     approval: dict[str, Any] | None,
     config: dict[str, Any] | None,
@@ -1949,6 +2516,10 @@ def validate_source_approval(
 ) -> None:
     if approval is None or not require_exact_keys(approval, SOURCE_APPROVAL_FIELDS, "source approval", problems):
         return
+    problems.capture(
+        "shared source approval authority replay",
+        lambda: schema.validate_source_approval(approval),
+    )
     for field, expected in {
         "schema": schema.SOURCE_APPROVAL_SCHEMA,
         "protocol": schema.PROTOCOL,
@@ -1990,6 +2561,7 @@ def validate_source_approval(
         and tools_manifest.get("comm_allowlist") != approval.get("comm_allowlist")
     ):
         problems.add("source approval tools manifest comm allowlist differs")
+    validate_source_review_claim(approval, problems)
 
     variants = approval.get("variants")
     if not isinstance(variants, dict) or set(variants) != set(schema.VARIANTS):
@@ -2245,6 +2817,102 @@ def validate_cargo_config_search(
             problems.add(f"{entry_context} absence binding invalid")
 
 
+def validate_sandboxed_cargo_config_search(
+    binding: Any,
+    source_root: Path,
+    toolchain: Mapping[str, Any],
+    context: str,
+    problems: Problems,
+) -> None:
+    """Replay the exact eight Cargo config candidates visible inside bwrap."""
+
+    if not require_exact_keys(
+        binding, set(schema.FILE_BINDING_FIELDS), f"{context} binding", problems
+    ):
+        return
+    path = resolve_bound_file(
+        binding.get("path"), binding.get("sha256"), context, problems
+    )
+    if path is None:
+        return
+    empty_path = path.path.with_name(f"{path.path.name}.empty")
+    resolve_bound_file(
+        str(empty_path),
+        EMPTY_SHA256,
+        f"{context} retained empty authority",
+        problems,
+        expected_mode=0o444,
+    )
+    manifest = read_canonical_object(path, context, problems)
+    if manifest is None or not require_exact_keys(
+        manifest, set(schema.CARGO_CONFIG_SEARCH_FIELDS), context, problems
+    ):
+        return
+    try:
+        exact_source = source_root.resolve(strict=True)
+        cargo_home = Path(str(toolchain.get("cargo_home_path"))).resolve(
+            strict=True
+        )
+    except OSError as error:
+        problems.add(f"{context} root resolution failed: {error}")
+        return
+    candidates: tuple[tuple[str, Path | None], ...] = (
+        (f"{GUEST_SOURCE}/.cargo/config.toml", exact_source / ".cargo/config.toml"),
+        (f"{GUEST_SOURCE}/.cargo/config", exact_source / ".cargo/config"),
+        (f"{GUEST_ROOT}/.cargo/config.toml", None),
+        (f"{GUEST_ROOT}/.cargo/config", None),
+        ("/.cargo/config.toml", None),
+        ("/.cargo/config", None),
+        (f"{GUEST_CARGO_HOME}/config.toml", cargo_home / "config.toml"),
+        (f"{GUEST_CARGO_HOME}/config", cargo_home / "config"),
+    )
+    if (
+        manifest.get("schema") != schema.CARGO_CONFIG_SEARCH_SCHEMA
+        or manifest.get("cwd") != GUEST_SOURCE
+        or manifest.get("cargo_home_path") != GUEST_CARGO_HOME
+    ):
+        problems.add(f"{context} fixed guest identity differs")
+    entries = manifest.get("entries")
+    if not isinstance(entries, list) or len(entries) != len(candidates):
+        problems.add(f"{context} candidate cardinality differs")
+        return
+    for ordinal, (entry, (guest_path, host_path)) in enumerate(
+        zip(entries, candidates, strict=True), start=1
+    ):
+        entry_context = f"{context} entry {ordinal}"
+        if not require_exact_keys(
+            entry,
+            set(schema.CARGO_CONFIG_SEARCH_ENTRY_FIELDS),
+            entry_context,
+            problems,
+        ):
+            continue
+        if entry.get("path") != guest_path:
+            problems.add(f"{entry_context} guest path/order differs")
+        if host_path is None:
+            if entry.get("status") != "absent" or entry.get("sha256") is not None:
+                problems.add(f"{entry_context} empty guest config is not absent")
+            continue
+        if host_path.is_symlink():
+            problems.add(f"{entry_context} host source is a symlink")
+            continue
+        if host_path.exists():
+            if entry.get("status") != "present" or not is_sha256(
+                entry.get("sha256")
+            ):
+                problems.add(f"{entry_context} present binding is invalid")
+                continue
+            resolve_bound_file(
+                str(host_path), entry.get("sha256"), entry_context, problems
+            )
+        elif (
+            guest_path not in GUEST_BOUND_CONFIG_PATHS
+            or entry.get("status") != "present"
+            or entry.get("sha256") != EMPTY_SHA256
+        ):
+            problems.add(f"{entry_context} retained empty binding is invalid")
+
+
 def validate_completed_child(
     child: Any,
     context: str,
@@ -2296,6 +2964,613 @@ def validate_completed_child(
     ):
         problems.add(f"{context} reaping identity/status mismatch")
     resolve_bound_file(child.get("output_path"), child.get("output_sha256"), f"{context} output", problems)
+
+
+def validate_release_file_binding(
+    value: Any,
+    context: str,
+    problems: Problems,
+    *,
+    expected_mode: int,
+) -> schema.FileSnapshot | None:
+    if not require_exact_keys(
+        value, set(schema.RELEASE_COMPILE_OUT_FILE_FIELDS), context, problems
+    ):
+        return None
+    snapshot = resolve_bound_file(
+        value.get("path"), value.get("sha256"), context, problems,
+        expected_mode=expected_mode,
+    )
+    if snapshot is None:
+        return None
+    if value.get("mode") != expected_mode or value.get("size") != snapshot.size:
+        problems.add(f"{context} size/mode differs from live immutable file")
+    expected_identity = {
+        "changed_ns": snapshot._stat.st_ctime_ns,
+        "device": snapshot.device,
+        "inode": snapshot.inode,
+        "link_count": snapshot._stat.st_nlink,
+        "modified_ns": snapshot._stat.st_mtime_ns,
+    }
+    if value.get("identity") != expected_identity or snapshot._stat.st_nlink != 1:
+        problems.add(f"{context} identity differs from live immutable file")
+    return snapshot
+
+
+def validate_release_compile_out_proof(
+    proof: Mapping[str, Any],
+    *,
+    approval_sha256: str,
+    source_review: Mapping[str, Any],
+    current_children: Mapping[str, Any],
+    current_children_sha256: str,
+    prepared: Mapping[str, Any],
+    config: Mapping[str, Any] | None,
+    problems: Problems,
+) -> None:
+    if not require_exact_keys(
+        proof, RELEASE_COMPILE_OUT_FIELDS, "release compile-out proof", problems
+    ):
+        return
+    requirement = source_review.get("release_compile_out_requirement")
+    requirement_sha256 = (
+        hashlib.sha256(canonical_json_bytes(requirement)).hexdigest()
+        if isinstance(requirement, dict)
+        else None
+    )
+    expected_top = {
+        "schema": schema.RELEASE_COMPILE_OUT_SCHEMA,
+        "protocol": schema.PROTOCOL,
+        "protocol_sha256": schema.PROTOCOL_SHA256,
+        "status": "ok",
+        "source_approval_sha256": approval_sha256,
+        "requirement_sha256": requirement_sha256,
+        "current_children_attestation_sha256": current_children_sha256,
+        "product_overlay_sha256": (
+            requirement.get("product_overlay_sha256")
+            if isinstance(requirement, dict)
+            else None
+        ),
+        "forbidden_hook_strings": list(
+            schema.RELEASE_COMPILE_OUT_FORBIDDEN_HOOK_STRINGS
+        ),
+        "binary_byte_identical": True,
+        "symbol_inventory_byte_identical": True,
+        "forbidden_hook_strings_absent": True,
+    }
+    for field, expected in expected_top.items():
+        if proof.get(field) != expected:
+            problems.add(f"release compile-out {field} differs")
+
+    equivalence = proof.get("equivalence_contract")
+    if require_exact_keys(
+        equivalence,
+        set(schema.RELEASE_COMPILE_OUT_EQUIVALENCE_CONTRACT_FIELDS),
+        "release compile-out equivalence contract",
+        problems,
+    ):
+        for field, expected in {
+            "source_approval_sha256": approval_sha256,
+            "cfg_test": False,
+            "rustc_workspace_wrapper": "absent",
+            "ordinary_a_role": "published",
+            "overlay_a_role": "proof_only",
+        }.items():
+            if equivalence.get(field) != expected:
+                problems.add(f"release compile-out equivalence {field} differs")
+        for field in (
+            "contract_sha256", "build_nonce", "cargo_lock_sha256",
+            "toolchain_sha256", "build_environment_sha256", "sandbox_sha256",
+        ):
+            if not is_sha256(equivalence.get(field)):
+                problems.add(f"release compile-out equivalence {field} is not SHA-256")
+
+    builds = proof.get("builds")
+    if not isinstance(builds, dict) or set(builds) != set(
+        schema.RELEASE_COMPILE_OUT_BUILD_NAMES
+    ):
+        problems.add("release compile-out build names differ")
+        builds = {}
+    for name in schema.RELEASE_COMPILE_OUT_BUILD_NAMES:
+        build = builds.get(name)
+        context = f"release compile-out build {name}"
+        if not require_exact_keys(
+            build, set(schema.RELEASE_COMPILE_OUT_BUILD_FIELDS), context, problems
+        ):
+            continue
+        expected_role = "published" if name == "ordinary_a" else "proof_only"
+        if build.get("role") != name or build.get("artifact_role") != expected_role:
+            problems.add(f"{context} role differs")
+        for field in (
+            "source_approval_sha256", "contract_sha256", "build_nonce",
+            "cargo_lock_sha256", "toolchain_sha256",
+            "build_environment_sha256", "sandbox_sha256",
+        ):
+            expected = equivalence.get(field) if isinstance(equivalence, dict) else None
+            if build.get(field) != expected:
+                problems.add(f"{context} {field} differs from equivalence contract")
+        if build.get("cfg_test") is not False or build.get(
+            "rustc_workspace_wrapper"
+        ) != "absent":
+            problems.add(f"{context} is not a wrapper-free release build")
+        attestation = build.get("attestation")
+        attestation_fields = set(
+            schema.RELEASE_COMPILE_OUT_ORDINARY_ATTESTATION_FIELDS
+            if name == "ordinary_a"
+            else schema.RELEASE_COMPILE_OUT_OVERLAY_ATTESTATION_FIELDS
+        )
+        if not require_exact_keys(
+            attestation, attestation_fields, f"{context} attestation", problems
+        ):
+            continue
+        if hashlib.sha256(canonical_json_bytes(attestation)).hexdigest() != build.get(
+            "attestation_sha256"
+        ):
+            problems.add(f"{context} attestation digest differs")
+            continue
+        prepared_a_attestation = prepared.get("variants", {}).get("A", {}).get(
+            "attestation"
+        )
+        if name == "ordinary_a" and attestation != prepared_a_attestation:
+            problems.add(
+                "release compile-out ordinary A attestation differs from prepared A"
+            )
+        if isinstance(prepared_a_attestation, Mapping) and (
+            attestation.get("build_env") != prepared_a_attestation.get("build_env")
+            or attestation.get("toolchain")
+            != prepared_a_attestation.get("toolchain")
+        ):
+            problems.add(f"{context} environment/toolchain differs from prepared A")
+        embedded_toolchain = attestation.get("toolchain")
+        if not isinstance(embedded_toolchain, Mapping):
+            embedded_toolchain = {}
+        for field, embedded in (
+            ("build_environment_sha256", attestation.get("build_env")),
+            ("toolchain_sha256", embedded_toolchain),
+        ):
+            if (
+                not isinstance(embedded, Mapping)
+                or hashlib.sha256(canonical_json_bytes(embedded)).hexdigest()
+                != build.get(field)
+            ):
+                problems.add(f"{context} embedded {field} differs")
+        build_environment = attestation.get("build_env")
+        if not isinstance(build_environment, Mapping):
+            problems.add(f"{context} embedded build environment is not an object")
+            build_environment = {}
+        if (
+            attestation.get("build_nonce") != build.get("build_nonce")
+            or attestation.get("cargo_lock_sha256")
+            != build.get("cargo_lock_sha256")
+            or build_environment.get("ASTERISM_BUILD_SOURCE_APPROVAL_SHA256")
+            != approval_sha256
+            or build_environment.get("CARGO_HOME") != GUEST_CARGO_HOME
+            or build_environment.get("RUSTC") != GUEST_RUSTC
+            or build_environment.get("RUSTUP_HOME") != GUEST_RUSTUP_HOME
+            or build_environment.get("PATH")
+            != f"{GUEST_TOOLCHAIN_ROOT}/bin:/usr/bin:/bin"
+            or any(
+                field in build_environment
+                for field in (
+                    "RUSTC_WORKSPACE_WRAPPER",
+                    "RUSTC_WRAPPER",
+                    "RUSTFLAGS",
+                    "CARGO_ENCODED_RUSTFLAGS",
+                )
+            )
+        ):
+            problems.add(f"{context} embedded nonce/lock/environment differs")
+        try:
+            build_source_root = Path(
+                str(attestation.get("materialized_root"))
+            ).resolve(strict=True)
+        except OSError as error:
+            problems.add(f"{context} materialized root is invalid: {error}")
+        else:
+            validate_sandboxed_cargo_config_search(
+                attestation.get("cargo_config_search"),
+                build_source_root,
+                embedded_toolchain,
+                f"{context} Cargo config search",
+                problems,
+            )
+        normalized_sandbox_sha256 = validate_sandboxed_build_argv(
+            attestation.get("build_argv"),
+            bwrap_path=embedded_toolchain.get("bwrap_path"),
+            cargo_config_search_sha256=(
+                attestation["cargo_config_search"].get("sha256")
+                if isinstance(attestation.get("cargo_config_search"), Mapping)
+                else None
+            ),
+            package="mess-store",
+            example="asterism_rebaseline_public",
+            context=f"{context} sandbox argv",
+            problems=problems,
+        )
+        if normalized_sandbox_sha256 != build.get("sandbox_sha256"):
+            problems.add(f"{context} normalized sandbox hash differs")
+        build_child = attestation.get("build_child")
+        if not isinstance(build_child, Mapping) or build_child.get(
+            "argv"
+        ) != attestation.get("build_argv"):
+            problems.add(f"{context} child argv differs from sandbox authority")
+        build_argv = attestation.get("build_argv")
+        if isinstance(build_argv, list) and any(
+            attestation.get(field) in build_argv
+            for field in ("materialized_root", "target_dir")
+        ):
+            problems.add(f"{context} sandbox exposes a mutable host path")
+        contract_snapshot = resolve_bound_file(
+            attestation.get("contract_output_path"),
+            attestation.get("contract_output_sha256"),
+            f"{context} contract output",
+            problems,
+            expected_mode=0o444,
+        )
+        if contract_snapshot is not None:
+            contract = read_canonical_object(
+                contract_snapshot, f"{context} contract output", problems
+            )
+            prepared_contract = prepared.get("variants", {}).get("A", {}).get(
+                "contract"
+            )
+            if (
+                contract is None
+                or hashlib.sha256(canonical_json_bytes(contract)).hexdigest()
+                != build.get("contract_sha256")
+                or contract != prepared_contract
+            ):
+                problems.add(f"{context} contract replay differs")
+        requirement_overlay_sha256 = (
+            requirement.get("product_overlay_sha256")
+            if isinstance(requirement, Mapping)
+            else None
+        )
+        if name == "ordinary_a" and "product_overlay_sha256" in attestation:
+            problems.add("release compile-out ordinary A has overlay authority")
+        if name == "overlay_a" and attestation.get(
+            "product_overlay_sha256"
+        ) != requirement_overlay_sha256:
+            problems.add("release compile-out proof-only overlay authority differs")
+
+    binaries = proof.get("binaries")
+    if not isinstance(binaries, dict) or set(binaries) != set(
+        schema.RELEASE_COMPILE_OUT_BUILD_NAMES
+    ):
+        problems.add("release compile-out binary names differ")
+        binaries = {}
+    binary_snapshots = {
+        name: validate_release_file_binding(
+            binaries.get(name), f"release compile-out binary {name}", problems,
+            expected_mode=0o555,
+        )
+        for name in schema.RELEASE_COMPILE_OUT_BUILD_NAMES
+    }
+    ordinary = binary_snapshots.get("ordinary_a")
+    overlay = binary_snapshots.get("overlay_a")
+    if ordinary is not None and overlay is not None:
+        if (
+            ordinary.data != overlay.data
+            or ordinary.sha256 != overlay.sha256
+            or (ordinary.device, ordinary.inode) == (overlay.device, overlay.inode)
+        ):
+            problems.add("release compile-out binaries are not equal disjoint files")
+        if proof.get("published_a_sha256") != ordinary.sha256:
+            problems.add("release compile-out published A hash differs")
+        for forbidden in schema.RELEASE_COMPILE_OUT_FORBIDDEN_HOOK_STRINGS:
+            if forbidden.encode() in ordinary.data or forbidden.encode() in overlay.data:
+                problems.add(f"release binary contains forbidden hook string {forbidden}")
+
+    inventories = proof.get("symbol_inventories")
+    if not isinstance(inventories, dict) or set(inventories) != set(
+        schema.RELEASE_COMPILE_OUT_BUILD_NAMES
+    ):
+        problems.add("release compile-out symbol inventory names differ")
+        inventories = {}
+    inventory_snapshots = {
+        name: validate_release_file_binding(
+            inventories.get(name),
+            f"release compile-out symbol inventory {name}", problems,
+            expected_mode=0o444,
+        )
+        for name in schema.RELEASE_COMPILE_OUT_BUILD_NAMES
+    }
+    ordinary_inventory = inventory_snapshots.get("ordinary_a")
+    overlay_inventory = inventory_snapshots.get("overlay_a")
+    if ordinary_inventory is not None and overlay_inventory is not None:
+        if (
+            ordinary_inventory.data != overlay_inventory.data
+            or ordinary_inventory.sha256 != overlay_inventory.sha256
+            or ordinary_inventory.size != overlay_inventory.size
+            or ordinary_inventory.path == overlay_inventory.path
+            or (ordinary_inventory.device, ordinary_inventory.inode)
+            == (overlay_inventory.device, overlay_inventory.inode)
+        ):
+            problems.add(
+                "release compile-out symbol inventories are not equal disjoint files"
+            )
+        for forbidden in schema.RELEASE_COMPILE_OUT_FORBIDDEN_HOOK_STRINGS:
+            if (
+                forbidden.encode() in ordinary_inventory.data
+                or forbidden.encode() in overlay_inventory.data
+            ):
+                problems.add(f"release symbols contain forbidden hook string {forbidden}")
+
+    nm = proof.get("nm")
+    if require_exact_keys(
+        nm, set(schema.RELEASE_COMPILE_OUT_NM_FIELDS),
+        "release compile-out nm", problems,
+    ):
+        preapproval_nm = current_children.get("release_compile_out", {}).get("nm")
+        expected_nm_mode = (
+            preapproval_nm.get("mode")
+            if isinstance(preapproval_nm, Mapping)
+            and isinstance(preapproval_nm.get("mode"), int)
+            and not isinstance(preapproval_nm.get("mode"), bool)
+            else -1
+        )
+        tool = validate_release_file_binding(
+            nm.get("tool"), "release compile-out nm tool", problems,
+            expected_mode=expected_nm_mode,
+        )
+        if isinstance(preapproval_nm, Mapping) and isinstance(nm.get("tool"), Mapping):
+            expected_nm = {
+                "identity": {
+                    "changed_ns": preapproval_nm.get("ctime_ns"),
+                    "device": preapproval_nm.get("device"),
+                    "inode": preapproval_nm.get("inode"),
+                    "link_count": preapproval_nm.get("link_count"),
+                    "modified_ns": preapproval_nm.get("mtime_ns"),
+                },
+                "mode": preapproval_nm.get("mode"),
+                "path": preapproval_nm.get("path"),
+                "sha256": preapproval_nm.get("sha256"),
+                "size": preapproval_nm.get("size"),
+            }
+            if nm.get("tool") != expected_nm:
+                problems.add("release compile-out nm tool differs from preapproval")
+        else:
+            problems.add("release compile-out preapproval nm authority is absent")
+        for name in schema.RELEASE_COMPILE_OUT_BUILD_NAMES:
+            child = nm.get(name)
+            if require_exact_keys(
+                child, set(schema.RELEASE_COMPILE_OUT_NM_CHILD_FIELDS),
+                f"release compile-out nm child {name}", problems,
+            ):
+                argv = child.get("argv")
+                expected_prefix = [
+                    str(tool.path) if tool is not None else None,
+                    "--defined-only",
+                    "--demangle=rust",
+                    "--format=posix",
+                ]
+                if (
+                    tool is None
+                    or not isinstance(argv, list)
+                    or len(argv) != 5
+                    or argv[:4] != expected_prefix
+                    or not isinstance(argv[4], str)
+                    or re.fullmatch(r"/proc/self/fd/[0-9]+", argv[4]) is None
+                ):
+                    problems.add(f"release compile-out nm child {name} argv differs")
+                validate_completed_child(
+                    child, f"release compile-out nm child {name}", problems,
+                    expected_argv=argv if isinstance(argv, list) else None,
+                )
+                output_snapshot = resolve_bound_file(
+                    child.get("output_path"),
+                    child.get("output_sha256"),
+                    f"release compile-out nm child {name} output",
+                    problems,
+                    expected_mode=0o444,
+                )
+                output = (
+                    read_canonical_object(
+                        output_snapshot,
+                        f"release compile-out nm child {name} output",
+                        problems,
+                    )
+                    if output_snapshot is not None
+                    else None
+                )
+                output_fields = {
+                    "exit_status",
+                    "stderr",
+                    "stderr_sha256",
+                    "stdout",
+                    "stdout_sha256",
+                }
+                if not require_exact_keys(
+                    output,
+                    output_fields,
+                    f"release compile-out nm child {name} output",
+                    problems,
+                ):
+                    continue
+                stdout = output.get("stdout")
+                stderr = output.get("stderr")
+                if (
+                    output.get("exit_status") != 0
+                    or not isinstance(stdout, str)
+                    or not isinstance(stderr, str)
+                    or stderr != ""
+                    or output.get("stderr_sha256") != EMPTY_SHA256
+                    or output.get("stdout_sha256")
+                    != (
+                        hashlib.sha256(stdout.encode()).hexdigest()
+                        if isinstance(stdout, str)
+                        else None
+                    )
+                ):
+                    problems.add(
+                        f"release compile-out nm child {name} output binding differs"
+                    )
+                inventory = inventory_snapshots.get(name)
+                if (
+                    inventory is not None
+                    and isinstance(stdout, str)
+                    and inventory.data != stdout.encode()
+                ):
+                    problems.add(
+                        f"release compile-out nm child {name} inventory bytes differ"
+                    )
+
+    prepared_a = prepared.get("variants", {}).get("A", {})
+    prepared_a_binary = prepared_a.get("binary", {})
+    if (
+        prepared_a_binary.get("sha256") != proof.get("published_a_sha256")
+        or (ordinary is not None and prepared_a_binary.get("path") != str(ordinary.path))
+    ):
+        problems.add("prepared variant A is not the published ordinary A")
+    overlay_path = str(overlay.path) if overlay is not None else str(
+        binaries.get("overlay_a", {}).get("path", "")
+    )
+    reachable_values: list[Any] = [prepared.get("tools"), prepared.get("variants")]
+    if config is not None:
+        reachable_values.extend((
+            config.get("smoke_transitions"), config.get("correctness_execution"),
+            config.get("argv_templates"),
+        ))
+    if overlay_path and any(
+        overlay_path in canonical_json_bytes(value).decode(errors="replace")
+        for value in reachable_values
+    ):
+        problems.add("release compile-out proof-only overlay A is child-reachable")
+
+
+def validate_prepared_source_review_and_release(
+    prepared: Mapping[str, Any],
+    prepared_root: Path,
+    approval: Mapping[str, Any],
+    source_approval_sha256: str,
+    config: Mapping[str, Any] | None,
+    problems: Problems,
+) -> None:
+    source_review = validate_source_review_claim(approval, problems)
+    if source_review is None:
+        return
+    prepared_review = prepared.get("source_review")
+    if not require_exact_keys(
+        prepared_review, set(schema.PREPARED_SOURCE_REVIEW_FIELDS),
+        "prepared source review", problems,
+    ):
+        return
+    snapshots: dict[str, schema.FileSnapshot] = {}
+    values: dict[str, dict[str, Any]] = {}
+    for name in schema.PREPARED_SOURCE_REVIEW_FIELDS:
+        binding = prepared_review.get(name)
+        context = f"prepared source review {name}"
+        if not require_exact_keys(
+            binding, set(schema.PREPARED_SOURCE_REVIEW_BINDING_FIELDS),
+            context, problems,
+        ):
+            continue
+        expected_path = (
+            prepared_root / schema.PREPARED_SOURCE_REVIEW_RELATIVE_PATHS[name]
+        ).resolve()
+        if binding.get("path") != str(expected_path) or binding.get("mode") != 0o444:
+            problems.add(f"{context} layout/mode differs")
+        claimed = source_review.get(name, {})
+        if binding.get("sha256") != claimed.get("sha256"):
+            problems.add(f"{context} differs from source approval")
+        snapshot = resolve_bound_file(
+            binding.get("path"), binding.get("sha256"), context, problems,
+            within=prepared_root, expected_mode=0o444,
+        )
+        if snapshot is None:
+            continue
+        snapshots[name] = snapshot
+        observed = read_canonical_object(snapshot, context, problems)
+        if isinstance(observed, dict):
+            values[name] = observed
+            if observed.get("schema") != claimed.get("schema"):
+                problems.add(f"{context} payload schema differs")
+
+    if set(values) == set(schema.PREPARED_SOURCE_REVIEW_FIELDS):
+        validate_source_review_bundle_authority(
+            values["bundle"], source_review, approval,
+            values["current_children_attestation"], values["lock_authority"],
+            values["lock_review_bundle"], problems,
+        )
+
+    proof_binding = prepared.get("release_compile_out")
+    if not require_exact_keys(
+        proof_binding, set(schema.RELEASE_COMPILE_OUT_BINDING_FIELDS),
+        "prepared release compile-out binding", problems,
+    ):
+        return
+    expected_proof_path = (
+        prepared_root / schema.RELEASE_COMPILE_OUT_RELATIVE_PATH
+    ).resolve()
+    if proof_binding.get("path") != str(expected_proof_path) or proof_binding.get(
+        "mode"
+    ) != 0o444:
+        problems.add("prepared release compile-out layout/mode differs")
+    proof_snapshot = resolve_bound_file(
+        proof_binding.get("path"), proof_binding.get("sha256"),
+        "prepared release compile-out proof", problems, within=prepared_root,
+        expected_mode=0o444,
+    )
+    if proof_snapshot is None:
+        return
+    proof = read_canonical_object(
+        proof_snapshot, "prepared release compile-out proof", problems
+    )
+    current = snapshots.get("current_children_attestation")
+    if isinstance(proof, dict) and current is not None:
+        validate_release_compile_out_proof(
+            proof, approval_sha256=source_approval_sha256,
+            source_review=source_review, current_children=values[
+                "current_children_attestation"
+            ], current_children_sha256=current.sha256,
+            prepared=prepared, config=config, problems=problems,
+        )
+
+
+def validate_proof_only_path_after_children(
+    prepared: Mapping[str, Any] | None,
+    children: Sequence[Mapping[str, Any]],
+    problems: Problems,
+) -> None:
+    """Prove the proof-only twin stayed unreachable through the final child ledger."""
+
+    if not isinstance(prepared, Mapping):
+        return
+    binding = prepared.get("release_compile_out")
+    if not isinstance(binding, Mapping):
+        return
+    snapshot = resolve_bound_file(
+        binding.get("path"),
+        binding.get("sha256"),
+        "post-child release compile-out proof",
+        problems,
+        expected_mode=0o444,
+    )
+    if snapshot is None:
+        return
+    proof = read_canonical_object(
+        snapshot, "post-child release compile-out proof", problems
+    )
+    overlay_path = (
+        proof.get("binaries", {}).get("overlay_a", {}).get("path")
+        if isinstance(proof, Mapping)
+        else None
+    )
+    if not isinstance(overlay_path, str) or not overlay_path:
+        problems.add("post-child proof-only overlay A path is absent")
+        return
+
+    def reaches_overlay(value: Any) -> bool:
+        if isinstance(value, Mapping):
+            return any(reaches_overlay(item) for item in value.values())
+        if isinstance(value, (list, tuple)):
+            return any(reaches_overlay(item) for item in value)
+        return value == overlay_path
+
+    if any(reaches_overlay(child) for child in children):
+        problems.add(
+            "proof-only overlay A is reachable from the completed child manifest"
+        )
 
 
 def validate_prepared_artifacts(
@@ -2706,6 +3981,22 @@ def validate_prepared_artifacts(
         prepared.get("filesystem_admission"),
         "prepared filesystem admission", problems, synthetic=synthetic,
     )
+    if approval is not None and original_prepared_snapshot is not None:
+        problems.capture(
+            "shared prepared source-review/release authority replay",
+            lambda: schema.validate_prepared_artifacts(
+                prepared, approval, original_prepared_snapshot.path
+            ),
+        )
+    if prepared_root is not None and approval is not None:
+        validate_prepared_source_review_and_release(
+            prepared,
+            prepared_root,
+            approval,
+            source_approval_sha256,
+            config,
+            problems,
+        )
 
     variants = prepared.get("variants")
     if not isinstance(variants, dict) or set(variants) != set(schema.VARIANTS):
@@ -2804,20 +4095,30 @@ def validate_prepared_artifacts(
         if attestation.get("target_dir_was_absent") is not True:
             problems.add(f"{context} target directory was reused")
         build_argv = attestation.get("build_argv")
-        if not isinstance(build_argv, list) or "--locked" not in build_argv or "--offline" not in build_argv:
-            problems.add(f"{context} build is not --locked --offline")
-        if not isinstance(build_argv, list) or "--unshare-net" not in build_argv or "--ro-bind" not in build_argv:
-            problems.add(f"{context} sandbox lacks network/read-only controls")
-        if not isinstance(build_argv, list) or not build_argv or build_argv[0] != toolchain.get("bwrap_path"):
-            problems.add(f"{context} build did not use bound bwrap executable")
-        if not isinstance(build_argv, list) or toolchain.get("cargo_path") not in build_argv:
-            problems.add(f"{context} build argv omits approved cargo path")
+        validate_sandboxed_build_argv(
+            build_argv,
+            bwrap_path=toolchain.get("bwrap_path"),
+            cargo_config_search_sha256=(
+                attestation["cargo_config_search"].get("sha256")
+                if isinstance(attestation.get("cargo_config_search"), Mapping)
+                else None
+            ),
+            package="mess-log" if variant == "B" else "mess-store",
+            example=(
+                "asterism_rebaseline_bare"
+                if variant == "B"
+                else "asterism_rebaseline_public"
+            ),
+            context=f"{context} sandbox argv",
+            problems=problems,
+        )
         build_env = attestation.get("build_env")
         if not require_exact_keys(build_env, set(schema.BUILD_ENV_FIELDS), f"{context} build environment", problems):
             build_env = {}
         approved_variant = approval.get("variants", {}).get(variant, {}) if approval else {}
-        expected_build_env = {
-            **schema.sanitized_cargo_environment(toolchain),
+        expected_build_env = sandboxed_build_environment(
+            toolchain,
+            {
             "ASTERISM_BUILD_PROTOCOL": schema.PROTOCOL,
             "ASTERISM_BUILD_PROTOCOL_SHA256": protocol_sha256,
             "ASTERISM_BUILD_TOOLING_COMMIT": prepared.get("tooling_commit"),
@@ -2832,11 +4133,12 @@ def validate_prepared_artifacts(
             "ASTERISM_BUILD_SOURCE_APPROVAL_SHA256": source_approval_sha256,
             "ASTERISM_BUILD_TIMED_SURFACE": approved_variant.get("timed_surface"),
             "ASTERISM_BUILD_NONCE": attestation.get("build_nonce"),
-        }
+            },
+        )
         if build_env != expected_build_env:
             problems.add(f"{context} build environment differs from exact contract identity")
         if materialized_root is not None:
-            validate_cargo_config_search(
+            validate_sandboxed_cargo_config_search(
                 attestation.get("cargo_config_search"), materialized_root,
                 toolchain, f"{context} Cargo config search", problems,
             )
@@ -6154,6 +7456,7 @@ def evaluate_directory(
             problems,
         )
     child_records = read_jsonl(output_dir / "child-manifest.jsonl", "child manifest", problems)
+    validate_proof_only_path_after_children(prepared, child_records, problems)
     raw_records = read_jsonl(output_dir / "raw-manifest.json", "raw manifest", problems)
     guard_records = read_jsonl(output_dir / "guard-manifest.jsonl", "guard manifest", problems)
     if provenance is not None:
@@ -6990,6 +8293,57 @@ def profile_fields(track, finish_result, *, raw_point, control_events, authority
         )
         return {"path": str(path), "sha256": sha256_file(path)}
 
+    def fixture_sandboxed_cargo_config_search(
+        source_root: Path, name: str
+    ) -> dict[str, str]:
+        path = tooling / "cargo-config-search" / f"{name}.json"
+        fixture_write_file(path.with_name(f"{path.name}.empty"), b"")
+        candidates: tuple[tuple[str, Path | None], ...] = (
+            (
+                f"{GUEST_SOURCE}/.cargo/config.toml",
+                source_root / ".cargo/config.toml",
+            ),
+            (f"{GUEST_SOURCE}/.cargo/config", source_root / ".cargo/config"),
+            (f"{GUEST_ROOT}/.cargo/config.toml", None),
+            (f"{GUEST_ROOT}/.cargo/config", None),
+            ("/.cargo/config.toml", None),
+            ("/.cargo/config", None),
+            (f"{GUEST_CARGO_HOME}/config.toml", cargo_home / "config.toml"),
+            (f"{GUEST_CARGO_HOME}/config", cargo_home / "config"),
+        )
+        entries = []
+        for guest_path, host_path in candidates:
+            if host_path is not None and host_path.exists():
+                entries.append(
+                    {
+                        "path": guest_path,
+                        "sha256": sha256_file(host_path),
+                        "status": "present",
+                    }
+                )
+            elif guest_path in GUEST_BOUND_CONFIG_PATHS:
+                entries.append(
+                    {
+                        "path": guest_path,
+                        "sha256": EMPTY_SHA256,
+                        "status": "present",
+                    }
+                )
+            else:
+                entries.append(
+                    {"path": guest_path, "sha256": None, "status": "absent"}
+                )
+        fixture_write_json(
+            path,
+            {
+                "cargo_home_path": GUEST_CARGO_HOME,
+                "cwd": GUEST_SOURCE,
+                "entries": entries,
+                "schema": schema.CARGO_CONFIG_SEARCH_SCHEMA,
+            },
+        )
+        return {"path": str(path), "sha256": sha256_file(path)}
+
     adapters: dict[str, Path] = {}
     binaries: dict[str, Path] = {}
     source_data: dict[str, dict[str, Any]] = {}
@@ -7422,14 +8776,253 @@ def profile_fields(track, finish_result, *, raw_point, control_events, authority
     tools_manifest_sha256 = hashlib.sha256(
         canonical_json_bytes(tools_manifest)
     ).hexdigest()
+    reviewed_root = root / "source-review-inputs"
+    reviewed_tools_path = reviewed_root / "tools-manifest.json"
+    fixture_write_json(reviewed_tools_path, tools_manifest)
+    lock_manifest_path = reviewed_root / "lock-manifest.json"
+    fixture_write_json(
+        lock_manifest_path,
+        {"schema": "asterism-rebaseline-lock-candidates-v3"},
+    )
+    lock_review_path = reviewed_root / "lock-review-bundle.json"
+    fixture_write_json(
+        lock_review_path,
+        {"schema": schema.SOURCE_REVIEW_CONTENT_SCHEMAS["lock_review_bundle"]},
+    )
+
+    def source_review_input(path: Path) -> dict[str, Any]:
+        metadata = path.stat()
+        return {
+            "identity": {
+                "changed_ns": metadata.st_ctime_ns,
+                "device": metadata.st_dev,
+                "inode": metadata.st_ino,
+                "link_count": metadata.st_nlink,
+                "modified_ns": metadata.st_mtime_ns,
+            },
+            "mode": stat.S_IMODE(metadata.st_mode),
+            "path": str(path.resolve()),
+            "schema": schema.SOURCE_REVIEW_INPUT_SCHEMA,
+            "sha256": sha256_file(path),
+            "size": metadata.st_size,
+        }
+
+    lock_manifest_input = source_review_input(lock_manifest_path)
+    lock_review_input = source_review_input(lock_review_path)
+    lock_authority_path = reviewed_root / "lock-authority.json"
+    lock_authority = {
+        "lock_manifest": {
+            "payload": {
+                "schema": "asterism-rebaseline-lock-candidates-v3"
+            },
+            "schema": "asterism-rebaseline-lock-candidates-v3",
+            "sha256": lock_manifest_input["sha256"],
+        },
+        "protocol": schema.PROTOCOL,
+        "protocol_sha256": schema.PROTOCOL_SHA256,
+        "review_sha256": lock_review_input["sha256"],
+        "review_bundle": {
+            "payload": {
+                "schema": schema.SOURCE_REVIEW_CONTENT_SCHEMAS[
+                    "lock_review_bundle"
+                ]
+            },
+            "schema": schema.SOURCE_REVIEW_CONTENT_SCHEMAS[
+                "lock_review_bundle"
+            ],
+            "sha256": lock_review_input["sha256"],
+        },
+        "schema": schema.SOURCE_REVIEW_CONTENT_SCHEMAS["lock_authority"],
+        "status": "approved",
+        "tooling_commit": fake_commit,
+        "tooling_tree": fake_tree,
+    }
+    fixture_write_json(lock_authority_path, lock_authority)
+    lock_authority_input = source_review_input(lock_authority_path)
+    product_overlay_sha256 = hashlib.sha256(b"fixture product overlay").hexdigest()
+    nm_path = reviewed_root / "nm"
+    fixture_write_file(nm_path, b"fixture reviewed nm\n", 0o555)
+    nm_metadata = nm_path.stat()
+    preapproval = {
+        "binary_byte_identical": True,
+        "forbidden_hook_strings": list(
+            schema.RELEASE_COMPILE_OUT_FORBIDDEN_HOOK_STRINGS
+        ),
+        "nm": {
+            "ctime_ns": nm_metadata.st_ctime_ns,
+            "device": nm_metadata.st_dev,
+            "inode": nm_metadata.st_ino,
+            "link_count": nm_metadata.st_nlink,
+            "mode": stat.S_IMODE(nm_metadata.st_mode),
+            "mtime_ns": nm_metadata.st_mtime_ns,
+            "path": str(nm_path.resolve()),
+            "sha256": sha256_file(nm_path),
+            "size": nm_metadata.st_size,
+        },
+        "preapproval_source_sentinel": (
+            "fa2acb626f303f8a65a16a6c8a1fd86b7e80cf48e092ae21a7308984ae790c94"
+        ),
+        "symbol_inventory_byte_identical": True,
+    }
+    current_children_path = reviewed_root / "current-children-attestation.json"
+    current_children = {
+        "artifacts": {
+            name: tools_manifest["tools"][name]
+            for name in ("correctness", "fault")
+        },
+        "lock_authority": lock_authority,
+        "lock_authority_inputs": {
+            "authority": {
+                key: value
+                for key, value in lock_authority_input.items()
+                if key != "schema"
+            },
+            "lock_manifest": {
+                key: value
+                for key, value in lock_manifest_input.items()
+                if key != "schema"
+            },
+            "review_bundle": {
+                key: value
+                for key, value in lock_review_input.items()
+                if key != "schema"
+            },
+        },
+        "lock_manifest_sha256": lock_manifest_input["sha256"],
+        "product_overlay_authority": {
+            "patch": {"sha256": product_overlay_sha256}
+        },
+        "protocol": schema.PROTOCOL,
+        "protocol_sha256": schema.PROTOCOL_SHA256,
+        "release_compile_out": preapproval,
+        "release_compile_out_approval": {
+            "final_integration_action": (
+                "repeat-release-equality-proof-under-real-source-approval"
+            ),
+            "source_approval_sha256": (
+                "fa2acb626f303f8a65a16a6c8a1fd86b7e80cf48e092ae21a7308984ae790c94"
+            ),
+            "source_approval_status": "preapproval-sentinel-not-source-approved",
+        },
+        "review_bundle_sha256": lock_review_input["sha256"],
+        "schema": schema.SOURCE_REVIEW_CONTENT_SCHEMAS[
+            "current_children_attestation"
+        ],
+        "status": "ok",
+        "tools_manifest_sha256": tools_manifest_sha256,
+    }
+    fixture_write_json(current_children_path, current_children)
+    reviewed_root.chmod(0o555)
+    source_inputs = {
+        "current_children_attestation": source_review_input(current_children_path),
+        "tools_manifest": source_review_input(reviewed_tools_path),
+        "lock_manifest": lock_manifest_input,
+        "lock_authority": lock_authority_input,
+        "lock_review_bundle": lock_review_input,
+    }
+    requirement = {
+        "binary_byte_identical": True,
+        "cfg_test": False,
+        "forbidden_hook_strings": list(
+            schema.RELEASE_COMPILE_OUT_FORBIDDEN_HOOK_STRINGS
+        ),
+        "forbidden_hook_strings_absent": True,
+        "ordinary_a_role": "published",
+        "overlay_a_role": "proof_only",
+        "preapproval_compile_out_sha256": hashlib.sha256(
+            canonical_json_bytes(preapproval)
+        ).hexdigest(),
+        "product_overlay_sha256": product_overlay_sha256,
+        "proof_must_bind_enclosing_approval_sha256": True,
+        "repeat_under_real_source_approval": True,
+        "rustc_workspace_wrapper": "absent",
+        "same_contract_nonce_lock_toolchain_sandbox": True,
+        "schema": schema.RELEASE_COMPILE_OUT_REQUIREMENT_SCHEMA,
+        "status": "required",
+        "symbol_inventory_byte_identical": True,
+        "variant": "A",
+    }
+    assertion = {
+        "inputs": source_inputs,
+        "open_findings": 0,
+        "protocol": schema.PROTOCOL,
+        "protocol_sha256": schema.PROTOCOL_SHA256,
+        "release_compile_out_requirement": requirement,
+        "schema": schema.SOURCE_REVIEW_ASSERTION_SCHEMA,
+        "status": "approved",
+        "tooling_commit": fake_commit,
+        "tooling_tree": fake_tree,
+    }
+    assertion_sha256 = hashlib.sha256(canonical_json_bytes(assertion)).hexdigest()
+    review_id = "cr-synthetic"
+    review_time = "2026-07-15T00:00:00+00:00"
+    bundle = {
+        "assertion": assertion,
+        "assertion_sha256": assertion_sha256,
+        "review_created": {
+            "author": "synthetic-reviewer",
+            "data": {
+                "description": "Synthetic exact source authority",
+                "initial_commit": fake_commit,
+                "jj_change_id": f"detached:{fake_commit}",
+                "review_id": review_id,
+                "scm_anchor": f"detached:{fake_commit}",
+                "scm_kind": "git",
+                "title": "Synthetic source authority",
+            },
+            "event": "ReviewCreated",
+            "ts": review_time,
+        },
+        "schema": schema.SOURCE_REVIEW_BUNDLE_SCHEMA,
+        "verdict": {
+            "author": "synthetic-reviewer",
+            "data": {
+                "reason": (
+                    f"APPROVED assertion_sha256={assertion_sha256}; open_findings=0"
+                ),
+                "review_id": review_id,
+                "vote": "lgtm",
+            },
+            "event": "ReviewerVoted",
+            "ts": review_time,
+        },
+    }
+    reviewed_bundle_path = root / "source-review-bundle.json"
+    fixture_write_json(reviewed_bundle_path, bundle)
+    source_review = {
+        "assertion_sha256": assertion_sha256,
+        "bundle": {
+            "mode": 0o444,
+            "schema": schema.SOURCE_REVIEW_BUNDLE_SCHEMA,
+            "sha256": sha256_file(reviewed_bundle_path),
+        },
+        "current_children_attestation": {
+            "mode": 0o444,
+            "schema": schema.SOURCE_REVIEW_CONTENT_SCHEMAS[
+                "current_children_attestation"
+            ],
+            "sha256": source_inputs["current_children_attestation"]["sha256"],
+        },
+        "lock_authority": {
+            "mode": 0o444,
+            "schema": schema.SOURCE_REVIEW_CONTENT_SCHEMAS["lock_authority"],
+            "sha256": source_inputs["lock_authority"]["sha256"],
+        },
+        "lock_review_bundle": {
+            "mode": 0o444,
+            "schema": schema.SOURCE_REVIEW_CONTENT_SCHEMAS["lock_review_bundle"],
+            "sha256": source_inputs["lock_review_bundle"]["sha256"],
+        },
+        "release_compile_out_requirement": requirement,
+    }
 
     approval = {
         "schema": schema.SOURCE_APPROVAL_SCHEMA,
         "protocol": schema.PROTOCOL,
         "protocol_sha256": protocol_sha256,
         "status": "approved",
-        "review_id": "cr-synthetic",
-        "reviewed_at": "2026-07-15T00:00:00+00:00",
+        "review_id": review_id,
+        "reviewed_at": review_time,
         "tooling_commit": fake_commit,
         "tooling_tree": fake_tree,
         "toolchain": toolchain,
@@ -7446,6 +9039,7 @@ def profile_fields(track, finish_result, *, raw_point, control_events, authority
             "minimum_available_inodes": schema.MIN_FREE_INODES,
         },
         "comm_allowlist": schema.expected_comm_allowlist(),
+        "source_review": source_review,
         "variants": {},
     }
     resolution_config_search = fixture_cargo_config_search(root, "resolution")
@@ -7545,6 +9139,79 @@ def profile_fields(track, finish_result, *, raw_point, control_events, authority
 
     prepared_variants: dict[str, Any] = {}
     previous_end = 100
+
+    def synthetic_sandbox_argv(
+        ordinal: int, package: str, example: str
+    ) -> list[str]:
+        descriptors = [str(300 + ordinal * 20 + offset) for offset in range(11)]
+        core_bindings = (
+            ("--ro-bind-fd", descriptors[0], GUEST_SOURCE),
+            ("--bind-fd", descriptors[1], GUEST_TARGET),
+            ("--ro-bind-fd", descriptors[2], GUEST_TOOLCHAIN_ROOT),
+            ("--ro-bind-fd", descriptors[3], GUEST_CARGO),
+            ("--ro-bind-fd", descriptors[4], GUEST_RUSTC),
+            ("--ro-bind-fd", descriptors[5], GUEST_CARGO_HOME),
+            ("--ro-bind-fd", descriptors[6], GUEST_RUSTUP_HOME),
+        )
+        config_bindings = tuple(
+            ("--ro-bind-fd", descriptors[7 + offset], guest_path)
+            for offset, guest_path in enumerate(GUEST_BOUND_CONFIG_PATHS)
+        )
+        return [
+            str(bwrap_path),
+            "--die-with-parent",
+            "--new-session",
+            "--unshare-net",
+            "--ro-bind",
+            "/",
+            "/",
+            "--dev-bind",
+            "/dev",
+            "/dev",
+            "--proc",
+            "/proc",
+            "--tmpfs",
+            "/tmp",
+            "--tmpfs",
+            GUEST_ROOT,
+            "--dir",
+            f"{GUEST_ROOT}/.cargo",
+            "--tmpfs",
+            f"{GUEST_ROOT}/.cargo",
+            "--remount-ro",
+            f"{GUEST_ROOT}/.cargo",
+            "--dir",
+            "/.cargo",
+            "--tmpfs",
+            "/.cargo",
+            "--remount-ro",
+            "/.cargo",
+            *(argument for binding in core_bindings for argument in binding),
+            "--dir",
+            f"{GUEST_SOURCE}/.cargo",
+            "--tmpfs",
+            f"{GUEST_SOURCE}/.cargo",
+            *(argument for binding in config_bindings[:2] for argument in binding),
+            "--remount-ro",
+            f"{GUEST_SOURCE}/.cargo",
+            *(argument for binding in config_bindings[2:] for argument in binding),
+            "--remount-ro",
+            GUEST_CARGO_HOME,
+            "--chdir",
+            GUEST_SOURCE,
+            GUEST_CARGO,
+            "build",
+            "--locked",
+            "--offline",
+            "--release",
+            "-p",
+            package,
+            "--example",
+            example,
+            "--target-dir",
+            GUEST_TARGET,
+        ]
+
     for index, variant in enumerate(schema.VARIANTS, start=1):
         item = source_data[variant]
         build_log = root / "logs" / f"{variant}-build.json"
@@ -7578,7 +9245,15 @@ def profile_fields(track, finish_result, *, raw_point, control_events, authority
         contract_path = root / "contracts" / f"{variant}.json"
         fixture_write_json(contract_path, contract)
         target_dir = root / "targets" / variant
-        sandbox_argv = [str(bwrap_path), "--unshare-net", "--ro-bind", "/", "/", "--", str(cargo_path), "build", "--locked", "--offline"]
+        sandbox_argv = synthetic_sandbox_argv(
+            index,
+            "mess-log" if variant == "B" else "mess-store",
+            (
+                "asterism_rebaseline_bare"
+                if variant == "B"
+                else "asterism_rebaseline_public"
+            ),
+        )
         build_argv = ["cargo", "build", "--locked", "--offline"]
         contract_argv = [str(binaries[variant]), "--contract"]
         started = previous_end + 1
@@ -7646,8 +9321,9 @@ def profile_fields(track, finish_result, *, raw_point, control_events, authority
                 "build_nonce": build_nonce,
                 "toolchain": toolchain,
                 "build_argv": sandbox_argv,
-                "build_env": {
-                    **schema.sanitized_cargo_environment(toolchain),
+                "build_env": sandboxed_build_environment(
+                    toolchain,
+                    {
                     "ASTERISM_BUILD_PROTOCOL": schema.PROTOCOL,
                     "ASTERISM_BUILD_PROTOCOL_SHA256": protocol_sha256,
                     "ASTERISM_BUILD_TOOLING_COMMIT": fake_commit,
@@ -7662,8 +9338,9 @@ def profile_fields(track, finish_result, *, raw_point, control_events, authority
                     "ASTERISM_BUILD_SOURCE_APPROVAL_SHA256": approval_sha256,
                     "ASTERISM_BUILD_TIMED_SURFACE": "raw-numeric" if variant == "B" else "public-event-store",
                     "ASTERISM_BUILD_NONCE": build_nonce,
-                },
-                "cargo_config_search": fixture_cargo_config_search(
+                    },
+                ),
+                "cargo_config_search": fixture_sandboxed_cargo_config_search(
                     item["source_root"], f"build-{variant}"
                 ),
                 "build_started_at": "2026-07-15T00:00:00+00:00",
@@ -7682,7 +9359,249 @@ def profile_fields(track, finish_result, *, raw_point, control_events, authority
     bindings_directory = prepared_bindings
     prepared_tools_manifest_path = bindings_directory / "tools-manifest.json"
     fixture_write_json(prepared_tools_manifest_path, tools_manifest)
+    prepared_source_review: dict[str, Any] = {}
+    source_review_copies = {
+        "bundle": (
+            reviewed_bundle_path,
+            bindings_directory / "source-review-bundle.json",
+        ),
+        "current_children_attestation": (
+            current_children_path,
+            bindings_directory / "current-children-attestation.json",
+        ),
+        "lock_authority": (
+            lock_authority_path,
+            bindings_directory / "lock-review-authority.json",
+        ),
+        "lock_review_bundle": (
+            lock_review_path,
+            bindings_directory / "lock-review-bundle.json",
+        ),
+    }
+    for name, (source, destination) in source_review_copies.items():
+        fixture_write_file(destination, source.read_bytes(), 0o444)
+        prepared_source_review[name] = {
+            "mode": 0o444,
+            "path": str(destination.resolve()),
+            "sha256": sha256_file(destination),
+        }
     bindings_directory.chmod(0o555)
+
+    def release_file_record(path: Path) -> dict[str, Any]:
+        metadata = path.stat()
+        return {
+            "identity": {
+                "changed_ns": metadata.st_ctime_ns,
+                "device": metadata.st_dev,
+                "inode": metadata.st_ino,
+                "link_count": metadata.st_nlink,
+                "modified_ns": metadata.st_mtime_ns,
+            },
+            "mode": stat.S_IMODE(metadata.st_mode),
+            "path": str(path.resolve()),
+            "sha256": sha256_file(path),
+            "size": metadata.st_size,
+        }
+
+    ordinary_binary = binaries["A"]
+    overlay_binary = root / "artifacts" / "proof-only" / "ast-rb-a-overlay"
+    fixture_write_file(overlay_binary, ordinary_binary.read_bytes(), 0o555)
+    symbol_bytes = b"fixture_release_symbol T 0\n"
+    ordinary_symbols = root / "manifests" / "symbols-ordinary-a.txt"
+    overlay_symbols = root / "manifests" / "symbols-overlay-a.txt"
+    fixture_write_file(ordinary_symbols, symbol_bytes, 0o444)
+    fixture_write_file(overlay_symbols, symbol_bytes, 0o444)
+
+    nm_tool_record = {
+        "identity": {
+            "changed_ns": preapproval["nm"]["ctime_ns"],
+            "device": preapproval["nm"]["device"],
+            "inode": preapproval["nm"]["inode"],
+            "link_count": preapproval["nm"]["link_count"],
+            "modified_ns": preapproval["nm"]["mtime_ns"],
+        },
+        "mode": preapproval["nm"]["mode"],
+        "path": preapproval["nm"]["path"],
+        "sha256": preapproval["nm"]["sha256"],
+        "size": preapproval["nm"]["size"],
+    }
+
+    def synthetic_nm_child(name: str, ordinal: int) -> dict[str, Any]:
+        output_path = root / "logs" / f"nm-{name}.json"
+        stdout = symbol_bytes.decode()
+        fixture_write_json(
+            output_path,
+            {
+                "exit_status": 0,
+                "stderr": "",
+                "stderr_sha256": hashlib.sha256(b"").hexdigest(),
+                "stdout": stdout,
+                "stdout_sha256": hashlib.sha256(symbol_bytes).hexdigest(),
+            },
+        )
+        pid = 40_000 + ordinal
+        start_ticks = 80_000 + ordinal
+        return {
+            "argv": [
+                str(nm_path.resolve()),
+                "--defined-only",
+                "--demangle=rust",
+                "--format=posix",
+                f"/proc/self/fd/{600 + ordinal}",
+            ],
+            "completed_at": "2026-07-15T00:00:01+00:00",
+            "completed_monotonic_ns": 20_000 + ordinal,
+            "cwd": str(root.resolve()),
+            "exit_status": 0,
+            "output_path": str(output_path.resolve()),
+            "output_sha256": sha256_file(output_path),
+            "pid": pid,
+            "process_group_absent": True,
+            "reaping": {
+                "pid": pid,
+                "start_ticks": start_ticks,
+                "status": "absent",
+            },
+            "start_ticks": start_ticks,
+            "started_at": "2026-07-15T00:00:00+00:00",
+            "started_monotonic_ns": 10_000 + ordinal,
+            "timed_out": False,
+            "waited_pid": pid,
+        }
+
+    ordinary_attestation = copy.deepcopy(prepared_variants["A"]["attestation"])
+    overlay_attestation = copy.deepcopy(ordinary_attestation)
+    ordinary_config_path = Path(
+        ordinary_attestation["cargo_config_search"]["path"]
+    )
+    overlay_config_path = (
+        root / "manifests" / "cargo-config-build-A-product-overlay.json"
+    )
+    fixture_write_file(
+        overlay_config_path.with_name(f"{overlay_config_path.name}.empty"),
+        b"",
+        0o444,
+    )
+    fixture_write_file(
+        overlay_config_path, ordinary_config_path.read_bytes(), 0o444
+    )
+    overlay_attestation["cargo_config_search"] = {
+        "path": str(overlay_config_path.resolve()),
+        "sha256": sha256_file(overlay_config_path),
+    }
+    overlay_attestation["product_overlay_sha256"] = product_overlay_sha256
+    normalized_sandbox = list(ordinary_attestation["build_argv"])
+    for normalized_index, argument in enumerate(
+        ordinary_attestation["build_argv"]
+    ):
+        if argument in {"--ro-bind-fd", "--bind-fd"}:
+            normalized_sandbox[normalized_index + 1] = (
+                f"$FD:{ordinary_attestation['build_argv'][normalized_index + 2]}"
+            )
+    equivalence_contract = {
+        "build_environment_sha256": hashlib.sha256(
+            canonical_json_bytes(ordinary_attestation["build_env"])
+        ).hexdigest(),
+        "build_nonce": ordinary_attestation["build_nonce"],
+        "cargo_lock_sha256": ordinary_attestation["cargo_lock_sha256"],
+        "cfg_test": False,
+        "contract_sha256": hashlib.sha256(
+            canonical_json_bytes(prepared_variants["A"]["contract"])
+        ).hexdigest(),
+        "ordinary_a_role": "published",
+        "overlay_a_role": "proof_only",
+        "rustc_workspace_wrapper": "absent",
+        "sandbox_sha256": hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "argv": normalized_sandbox,
+                    "cargo_config_search_sha256": ordinary_attestation[
+                        "cargo_config_search"
+                    ]["sha256"],
+                }
+            )
+        ).hexdigest(),
+        "source_approval_sha256": approval_sha256,
+        "toolchain_sha256": hashlib.sha256(
+            canonical_json_bytes(ordinary_attestation["toolchain"])
+        ).hexdigest(),
+    }
+
+    def release_build(
+        name: str, role: str, attestation: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return {
+            "artifact_role": role,
+            "attestation": attestation,
+            "attestation_sha256": hashlib.sha256(
+                canonical_json_bytes(attestation)
+            ).hexdigest(),
+            "build_environment_sha256": equivalence_contract[
+                "build_environment_sha256"
+            ],
+            "build_nonce": equivalence_contract["build_nonce"],
+            "cargo_lock_sha256": equivalence_contract["cargo_lock_sha256"],
+            "cfg_test": False,
+            "contract_sha256": equivalence_contract["contract_sha256"],
+            "role": name,
+            "rustc_workspace_wrapper": "absent",
+            "sandbox_sha256": equivalence_contract["sandbox_sha256"],
+            "source_approval_sha256": approval_sha256,
+            "toolchain_sha256": equivalence_contract["toolchain_sha256"],
+        }
+
+    release_compile_out = {
+        "binaries": {
+            "ordinary_a": release_file_record(ordinary_binary),
+            "overlay_a": release_file_record(overlay_binary),
+        },
+        "binary_byte_identical": True,
+        "builds": {
+            "ordinary_a": release_build(
+                "ordinary_a", "published", ordinary_attestation
+            ),
+            "overlay_a": release_build(
+                "overlay_a", "proof_only", overlay_attestation
+            ),
+        },
+        "current_children_attestation_sha256": source_inputs[
+            "current_children_attestation"
+        ]["sha256"],
+        "equivalence_contract": equivalence_contract,
+        "forbidden_hook_strings": list(
+            schema.RELEASE_COMPILE_OUT_FORBIDDEN_HOOK_STRINGS
+        ),
+        "forbidden_hook_strings_absent": True,
+        "nm": {
+            "ordinary_a": synthetic_nm_child("ordinary-a", 1),
+            "overlay_a": synthetic_nm_child("overlay-a", 2),
+            "tool": nm_tool_record,
+        },
+        "product_overlay_sha256": product_overlay_sha256,
+        "protocol": schema.PROTOCOL,
+        "protocol_sha256": schema.PROTOCOL_SHA256,
+        "published_a_sha256": sha256_file(ordinary_binary),
+        "requirement_sha256": hashlib.sha256(
+            canonical_json_bytes(requirement)
+        ).hexdigest(),
+        "schema": schema.RELEASE_COMPILE_OUT_SCHEMA,
+        "source_approval_sha256": approval_sha256,
+        "status": "ok",
+        "symbol_inventories": {
+            "ordinary_a": release_file_record(ordinary_symbols),
+            "overlay_a": release_file_record(overlay_symbols),
+        },
+        "symbol_inventory_byte_identical": True,
+    }
+    release_compile_out_path = (
+        prepared_bundle_root / schema.RELEASE_COMPILE_OUT_RELATIVE_PATH
+    )
+    fixture_write_json(release_compile_out_path, release_compile_out, 0o444)
+    release_compile_out_binding = {
+        "mode": 0o444,
+        "path": str(release_compile_out_path.resolve()),
+        "sha256": sha256_file(release_compile_out_path),
+    }
     claims_directory.mkdir(parents=True)
     claims_directory.chmod(0o700)
     claim_path = claims_directory / "single-use-claim.json"
@@ -7704,6 +9623,8 @@ def profile_fields(track, finish_result, *, raw_point, control_events, authority
             "mode": 0o444,
         },
         "single_use_claim": {"path": str(claim_path)},
+        "source_review": prepared_source_review,
+        "release_compile_out": release_compile_out_binding,
         "comm_allowlist": approval["comm_allowlist"],
         "tools": {
             name: {
@@ -9563,6 +11484,396 @@ def self_test() -> dict[str, Any]:
                 path.write_bytes(original)
                 path.chmod(mode)
 
+        approval_fixture = json.loads(
+            (output / "source-approval.json").read_bytes()
+        )
+        source_review_fixture = approval_fixture["source_review"]
+        current_children_fixture = json.loads(
+            Path(
+                prepared_fixture["source_review"][
+                    "current_children_attestation"
+                ]["path"]
+            ).read_bytes()
+        )
+        proof_fixture = json.loads(
+            Path(prepared_fixture["release_compile_out"]["path"]).read_bytes()
+        )
+
+        def sandbox_argv_mutation(
+            mutator: Callable[[list[str]], None], expected_error: str
+        ) -> bool:
+            argv = copy.deepcopy(
+                prepared_fixture["variants"]["A"]["attestation"]["build_argv"]
+            )
+            mutator(argv)
+            validation = Problems()
+            validate_sandboxed_build_argv(
+                argv,
+                bwrap_path=prepared_fixture["toolchain"]["bwrap_path"],
+                cargo_config_search_sha256=prepared_fixture["variants"]["A"][
+                    "attestation"
+                ]["cargo_config_search"]["sha256"],
+                package="mess-store",
+                example="asterism_rebaseline_public",
+                context="hostile release sandbox argv",
+                problems=validation,
+            )
+            return any(expected_error in error for error in validation.errors)
+
+        check(
+            "mutation-release-sandbox-fd-leading-zero",
+            lambda: sandbox_argv_mutation(
+                lambda argv: argv.__setitem__(
+                    argv.index("--ro-bind-fd") + 1, "03"
+                ),
+                "descriptor binding",
+            ),
+        )
+        check(
+            "mutation-release-sandbox-fd-duplicate",
+            lambda: sandbox_argv_mutation(
+                lambda argv: argv.__setitem__(
+                    argv.index("--bind-fd") + 1,
+                    argv[argv.index("--ro-bind-fd") + 1],
+                ),
+                "descriptor operands are not distinct",
+            ),
+        )
+        check(
+            "mutation-release-sandbox-config-fd-alias",
+            lambda: sandbox_argv_mutation(
+                lambda argv: argv.__setitem__(
+                    argv.index(GUEST_BOUND_CONFIG_PATHS[0]) - 1,
+                    argv[argv.index("--ro-bind-fd") + 1],
+                ),
+                "descriptor operands are not distinct",
+            ),
+        )
+        check(
+            "mutation-release-sandbox-config-order",
+            lambda: sandbox_argv_mutation(
+                lambda argv: argv.__setitem__(
+                    argv.index(GUEST_BOUND_CONFIG_PATHS[0]),
+                    GUEST_BOUND_CONFIG_PATHS[1],
+                ),
+                "descriptor binding",
+            ),
+        )
+        check(
+            "mutation-release-sandbox-extra-bind-fd",
+            lambda: sandbox_argv_mutation(
+                lambda argv: argv.extend(("--bind-fd", "999", "/forged")),
+                "prefix/cardinality differs",
+            ),
+        )
+
+        def sandbox_config_hash_rejected() -> bool:
+            validation = Problems()
+            validate_sandboxed_build_argv(
+                prepared_fixture["variants"]["A"]["attestation"]["build_argv"],
+                bwrap_path=prepared_fixture["toolchain"]["bwrap_path"],
+                cargo_config_search_sha256="not-a-sha256",
+                package="mess-store",
+                example="asterism_rebaseline_public",
+                context="hostile release sandbox config",
+                problems=validation,
+            )
+            return any(
+                "config-search hash is invalid" in error
+                for error in validation.errors
+            )
+
+        check(
+            "mutation-release-sandbox-config-hash-malformed",
+            sandbox_config_hash_rejected,
+        )
+
+        def sandbox_empty_config_authority_rejected() -> bool:
+            attestation = prepared_fixture["variants"]["A"]["attestation"]
+            binding = attestation["cargo_config_search"]
+            empty_path = Path(f"{binding['path']}.empty")
+            original = empty_path.read_bytes()
+            mode = stat.S_IMODE(empty_path.stat().st_mode)
+            try:
+                empty_path.chmod(0o644)
+                empty_path.write_bytes(b"forged\n")
+                empty_path.chmod(mode)
+                validation = Problems()
+                validate_sandboxed_cargo_config_search(
+                    binding,
+                    Path(attestation["materialized_root"]),
+                    prepared_fixture["toolchain"],
+                    "hostile release sandbox config",
+                    validation,
+                )
+                return any(
+                    "retained empty authority hash mismatch" in error
+                    for error in validation.errors
+                )
+            finally:
+                empty_path.chmod(0o644)
+                empty_path.write_bytes(original)
+                empty_path.chmod(mode)
+
+        check(
+            "mutation-release-sandbox-empty-config-authority",
+            sandbox_empty_config_authority_rejected,
+        )
+
+        def semantic_proof_mutation(
+            mutator: Callable[[dict[str, Any], dict[str, Any]], None],
+            expected_error: str,
+        ) -> bool:
+            proof = copy.deepcopy(proof_fixture)
+            hostile_prepared = copy.deepcopy(prepared_fixture)
+            mutator(proof, hostile_prepared)
+            validation = Problems()
+            validate_release_compile_out_proof(
+                proof,
+                approval_sha256=sha256_file(output / "source-approval.json"),
+                source_review=source_review_fixture,
+                current_children=current_children_fixture,
+                current_children_sha256=hashlib.sha256(
+                    canonical_json_bytes(current_children_fixture)
+                ).hexdigest(),
+                prepared=hostile_prepared,
+                config=config_fixture,
+                problems=validation,
+            )
+            return any(expected_error in error for error in validation.errors)
+
+        check(
+            "mutation-release-proof-published-a-rebound",
+            lambda: semantic_proof_mutation(
+                lambda proof, _prepared: proof.__setitem__(
+                    "published_a_sha256", "0" * 64
+                ),
+                "published A hash differs",
+            ),
+        )
+        check(
+            "mutation-release-proof-forbidden-absence-rebound",
+            lambda: semantic_proof_mutation(
+                lambda proof, _prepared: proof.__setitem__(
+                    "forbidden_hook_strings_absent", False
+                ),
+                "forbidden_hook_strings_absent differs",
+            ),
+        )
+
+        def rebind_overlay_nonce(
+            proof: dict[str, Any], _prepared: dict[str, Any]
+        ) -> None:
+            build = proof["builds"]["overlay_a"]
+            build["attestation"]["build_nonce"] = "0" * 64
+            build["attestation_sha256"] = hashlib.sha256(
+                canonical_json_bytes(build["attestation"])
+            ).hexdigest()
+
+        check(
+            "mutation-release-proof-overlay-nonce-rebound",
+            lambda: semantic_proof_mutation(
+                rebind_overlay_nonce,
+                "embedded nonce/lock/environment differs",
+            ),
+        )
+        check(
+            "mutation-release-proof-inventory-alias",
+            lambda: semantic_proof_mutation(
+                lambda proof, _prepared: proof["symbol_inventories"].__setitem__(
+                    "overlay_a",
+                    copy.deepcopy(proof["symbol_inventories"]["ordinary_a"]),
+                ),
+                "symbol inventories are not equal disjoint files",
+            ),
+        )
+        check(
+            "mutation-release-proof-nm-argv",
+            lambda: semantic_proof_mutation(
+                lambda proof, _prepared: proof["nm"]["overlay_a"]["argv"].__setitem__(
+                    1, "--external-only"
+                ),
+                "nm child overlay_a argv differs",
+            ),
+        )
+
+        def rebind_nm_stdout(
+            proof: dict[str, Any], _prepared: dict[str, Any]
+        ) -> None:
+            output_path = output.parent / "logs" / "nm-overlay-a-hostile.json"
+            stdout = "forged_release_symbol T 0\n"
+            fixture_write_json(
+                output_path,
+                {
+                    "exit_status": 0,
+                    "stderr": "",
+                    "stderr_sha256": EMPTY_SHA256,
+                    "stdout": stdout,
+                    "stdout_sha256": hashlib.sha256(stdout.encode()).hexdigest(),
+                },
+            )
+            child = proof["nm"]["overlay_a"]
+            child["output_path"] = str(output_path.resolve())
+            child["output_sha256"] = sha256_file(output_path)
+
+        check(
+            "mutation-release-proof-nm-stdout-inventory-divergence",
+            lambda: semantic_proof_mutation(
+                rebind_nm_stdout,
+                "nm child overlay_a inventory bytes differ",
+            ),
+        )
+
+        def make_twin_reachable(
+            proof: dict[str, Any], hostile_prepared: dict[str, Any]
+        ) -> None:
+            hostile_prepared["variants"]["A"]["evidence_argv"].append(
+                proof["binaries"]["overlay_a"]["path"]
+            )
+
+        check(
+            "mutation-release-proof-twin-child-reachable",
+            lambda: semantic_proof_mutation(
+                make_twin_reachable,
+                "proof-only overlay A is child-reachable",
+            ),
+        )
+
+        def completed_child_twin_rejected() -> bool:
+            hostile_children = copy.deepcopy(positive_children)
+            hostile_children[-1]["argv"].append(
+                proof_fixture["binaries"]["overlay_a"]["path"]
+            )
+            validation = Problems()
+            validate_proof_only_path_after_children(
+                prepared_fixture, hostile_children, validation
+            )
+            return any(
+                "completed child manifest" in error
+                for error in validation.errors
+            )
+
+        check(
+            "mutation-release-proof-twin-final-child-reachable",
+            completed_child_twin_rejected,
+        )
+
+        def hostile_seal_verdict_rejected() -> bool:
+            bundle = json.loads(
+                Path(prepared_fixture["source_review"]["bundle"]["path"])
+                .read_bytes()
+            )
+            bundle["verdict"]["data"]["vote"] = "reject"
+            validation = Problems()
+            validate_source_review_bundle_authority(
+                bundle,
+                source_review_fixture,
+                approval_fixture,
+                current_children_fixture,
+                json.loads(
+                    Path(
+                        prepared_fixture["source_review"]["lock_authority"][
+                            "path"
+                        ]
+                    ).read_bytes()
+                ),
+                json.loads(
+                    Path(
+                        prepared_fixture["source_review"][
+                            "lock_review_bundle"
+                        ]["path"]
+                    ).read_bytes()
+                ),
+                validation,
+            )
+            return any(
+                "ReviewerVoted verdict differs" in error
+                for error in validation.errors
+            )
+
+        check("mutation-source-review-seal-verdict", hostile_seal_verdict_rejected)
+
+        def hostile_source_input_alias_rejected() -> bool:
+            bundle = json.loads(
+                Path(prepared_fixture["source_review"]["bundle"]["path"])
+                .read_bytes()
+            )
+            hostile_review = copy.deepcopy(source_review_fixture)
+            first, second = schema.SOURCE_REVIEW_INPUT_NAMES[:2]
+            first_input = bundle["assertion"]["inputs"][first]
+            second_input = bundle["assertion"]["inputs"][second]
+            second_input["path"] = first_input["path"]
+            second_input["identity"] = copy.deepcopy(first_input["identity"])
+            assertion_sha256 = hashlib.sha256(
+                canonical_json_bytes(bundle["assertion"])
+            ).hexdigest()
+            bundle["assertion_sha256"] = assertion_sha256
+            hostile_review["assertion_sha256"] = assertion_sha256
+            validation = Problems()
+            validate_source_review_bundle_authority(
+                bundle,
+                hostile_review,
+                approval_fixture,
+                current_children_fixture,
+                json.loads(
+                    Path(
+                        prepared_fixture["source_review"]["lock_authority"]["path"]
+                    ).read_bytes()
+                ),
+                json.loads(
+                    Path(
+                        prepared_fixture["source_review"]["lock_review_bundle"][
+                            "path"
+                        ]
+                    ).read_bytes()
+                ),
+                validation,
+            )
+            return any(
+                "inputs are not physically disjoint" in error
+                for error in validation.errors
+            )
+
+        check(
+            "mutation-source-review-input-alias",
+            hostile_source_input_alias_rejected,
+        )
+
+        def hostile_embedded_lock_review_rejected() -> bool:
+            lock_authority = json.loads(
+                Path(
+                    prepared_fixture["source_review"]["lock_authority"]["path"]
+                ).read_bytes()
+            )
+            lock_review = json.loads(
+                Path(
+                    prepared_fixture["source_review"]["lock_review_bundle"]["path"]
+                ).read_bytes()
+            )
+            lock_authority["review_bundle"]["payload"] = {"forged": True}
+            validation = Problems()
+            validate_source_review_bundle_authority(
+                json.loads(
+                    Path(prepared_fixture["source_review"]["bundle"]["path"])
+                    .read_bytes()
+                ),
+                source_review_fixture,
+                approval_fixture,
+                current_children_fixture,
+                lock_authority,
+                lock_review,
+                validation,
+            )
+            return any(
+                "current lock review authority crosslinks differ" in error
+                for error in validation.errors
+            )
+
+        check(
+            "mutation-source-review-embedded-lock-review",
+            hostile_embedded_lock_review_rejected,
+        )
+
         def hardlink_alias_expect(
             original_path: Path,
             attempt_path: Path,
@@ -9869,7 +12180,6 @@ def self_test() -> dict[str, Any]:
 
         check("mutation-prepared-support-unexpected-entry", unexpected_support_entry)
         binary_path = Path(prepared["variants"]["A"]["binary"]["path"])
-        check("mutation-binary-hash-replay", lambda: mutate_bytes(binary_path, b"mutated fixture binary\n"))
         lock_path = Path(prepared["variants"]["C"]["attestation"]["cargo_lock_path"])
         check("mutation-lock-hash-replay", lambda: mutate_bytes(lock_path, b"mutated fixture lock\n"))
         check(
@@ -11667,6 +13977,10 @@ def self_test() -> dict[str, Any]:
             )
 
         check("publication-result-and-report-canonical", publication_is_canonical)
+        check(
+            "mutation-binary-hash-replay",
+            lambda: mutate_bytes(binary_path, b"mutated fixture binary\n"),
+        )
 
     first_case, second_case, third_case = schema.CORRECTNESS_CASE_IDS[:3]
     early_scenarios = (

@@ -12,6 +12,7 @@ import hashlib
 import fcntl
 import json
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -62,6 +63,21 @@ PRE_RELEASE_FIELDS = set(schema.TERMINAL_PRE_RELEASE_FIELDS)
 EVALUATOR_CHILD_FIELDS = set(schema.CHILD_FIELDS)
 RELEASE_FIELDS = set(schema.LEASE_RELEASE_FIELDS)
 TERMINAL_FIELDS = set(schema.TERMINAL_FIELDS)
+GUEST_ROOT = "/asterism"
+GUEST_SOURCE = f"{GUEST_ROOT}/source"
+GUEST_TARGET = f"{GUEST_ROOT}/target"
+GUEST_TOOLCHAIN_ROOT = f"{GUEST_ROOT}/toolchain"
+GUEST_CARGO = f"{GUEST_TOOLCHAIN_ROOT}/bin/cargo"
+GUEST_RUSTC = f"{GUEST_TOOLCHAIN_ROOT}/bin/rustc"
+GUEST_CARGO_HOME = f"{GUEST_ROOT}/cargo-home"
+GUEST_RUSTUP_HOME = f"{GUEST_ROOT}/rustup-home"
+GUEST_BOUND_CONFIG_PATHS = (
+    f"{GUEST_SOURCE}/.cargo/config.toml",
+    f"{GUEST_SOURCE}/.cargo/config",
+    f"{GUEST_CARGO_HOME}/config.toml",
+    f"{GUEST_CARGO_HOME}/config",
+)
+EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 _BOUND_SNAPSHOTS: dict[Path, schema.FileSnapshot] = {}
 
 
@@ -181,6 +197,405 @@ def read_jsonl(
         except ValueError as error:
             errors.append(str(error))
     return records
+
+
+_TERMINAL_REVIEW_IDENTIFIER = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._:/@+\-]{0,255}\Z"
+)
+_TERMINAL_ZONED_TIME = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+    r"(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})\Z"
+)
+
+
+def terminal_is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def terminal_is_integer(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def terminal_authority_object(
+    value: Any,
+    fields: Any,
+    context: str,
+    errors: list[str],
+) -> Mapping[str, Any] | None:
+    if not isinstance(value, Mapping) or set(value) != set(fields):
+        errors.append(f"{context} fields are not exact")
+        return None
+    return value
+
+
+def terminal_authority_timestamp(
+    value: Any, context: str, errors: list[str]
+) -> datetime | None:
+    if not isinstance(value, str) or _TERMINAL_ZONED_TIME.fullmatch(value) is None:
+        errors.append(f"{context} is not an exact zoned timestamp")
+        return None
+    return parse_timestamp(value, context, errors)
+
+
+def validate_terminal_release_requirement(
+    value: Any, errors: list[str]
+) -> Mapping[str, Any] | None:
+    requirement = terminal_authority_object(
+        value,
+        schema.RELEASE_COMPILE_OUT_REQUIREMENT_FIELDS,
+        "terminal release compile-out requirement",
+        errors,
+    )
+    if requirement is None:
+        return None
+    exact = {
+        "schema": schema.RELEASE_COMPILE_OUT_REQUIREMENT_SCHEMA,
+        "status": "required",
+        "variant": "A",
+        "proof_must_bind_enclosing_approval_sha256": True,
+        "repeat_under_real_source_approval": True,
+        "same_contract_nonce_lock_toolchain_sandbox": True,
+        "cfg_test": False,
+        "rustc_workspace_wrapper": "absent",
+        "ordinary_a_role": "published",
+        "overlay_a_role": "proof_only",
+        "binary_byte_identical": True,
+        "symbol_inventory_byte_identical": True,
+        "forbidden_hook_strings": list(
+            schema.RELEASE_COMPILE_OUT_FORBIDDEN_HOOK_STRINGS
+        ),
+        "forbidden_hook_strings_absent": True,
+    }
+    if any(requirement.get(field) != expected for field, expected in exact.items()):
+        errors.append("terminal release compile-out requirement policy differs")
+    for field in ("product_overlay_sha256", "preapproval_compile_out_sha256"):
+        if not terminal_is_sha256(requirement.get(field)):
+            errors.append(f"terminal release compile-out requirement {field} is invalid")
+    return requirement
+
+
+def validate_terminal_source_input(
+    value: Any, name: str, errors: list[str]
+) -> Mapping[str, Any] | None:
+    context = f"terminal source-review input {name}"
+    binding = terminal_authority_object(
+        value, schema.SOURCE_REVIEW_INPUT_FIELDS, context, errors
+    )
+    if binding is None:
+        return None
+    path = binding.get("path")
+    if (
+        binding.get("schema") != schema.SOURCE_REVIEW_INPUT_SCHEMA
+        or not isinstance(path, str)
+        or not Path(path).is_absolute()
+        or not terminal_is_sha256(binding.get("sha256"))
+        or not terminal_is_integer(binding.get("size"))
+        or binding.get("size", 0) <= 0
+        or binding.get("mode") != schema.ARTIFACT_FILE_MODE
+    ):
+        errors.append(f"{context} immutable binding differs")
+    identity = terminal_authority_object(
+        binding.get("identity"),
+        schema.SOURCE_REVIEW_IDENTITY_FIELDS,
+        f"{context} identity",
+        errors,
+    )
+    if identity is not None:
+        if any(
+            not terminal_is_integer(identity.get(field)) or identity.get(field, -1) < 0
+            for field in schema.SOURCE_REVIEW_IDENTITY_FIELDS
+        ) or identity.get("device", 0) <= 0 or identity.get("inode", 0) <= 0:
+            errors.append(f"{context} identity values are invalid")
+        if identity.get("link_count") != 1:
+            errors.append(f"{context} identity link count differs")
+    return binding
+
+
+def validate_terminal_source_review_semantics(
+    approval: Mapping[str, Any],
+    bundle: Mapping[str, Any],
+    current_children: Mapping[str, Any],
+    lock_authority: Mapping[str, Any],
+    lock_review_bundle: Mapping[str, Any],
+    errors: list[str],
+) -> Mapping[str, Any] | None:
+    """Replay reviewed source authority without calling shared semantic validators."""
+
+    source_review = terminal_authority_object(
+        approval.get("source_review"),
+        schema.SOURCE_REVIEW_FIELDS,
+        "terminal source review",
+        errors,
+    )
+    if source_review is None:
+        return None
+    requirement = validate_terminal_release_requirement(
+        source_review.get("release_compile_out_requirement"), errors
+    )
+    if not terminal_is_sha256(source_review.get("assertion_sha256")):
+        errors.append("terminal source-review assertion hash is invalid")
+    for name, expected_schema in schema.SOURCE_REVIEW_CONTENT_SCHEMAS.items():
+        binding = terminal_authority_object(
+            source_review.get(name),
+            schema.SOURCE_REVIEW_CONTENT_BINDING_FIELDS,
+            f"terminal source review {name}",
+            errors,
+        )
+        if binding is not None and (
+            binding.get("schema") != expected_schema
+            or binding.get("mode") != schema.ARTIFACT_FILE_MODE
+            or not terminal_is_sha256(binding.get("sha256"))
+        ):
+            errors.append(f"terminal source review {name} binding differs")
+
+    bundle_value = terminal_authority_object(
+        bundle,
+        schema.SOURCE_REVIEW_BUNDLE_FIELDS,
+        "terminal source-review bundle",
+        errors,
+    )
+    if bundle_value is None:
+        return None
+    assertion = terminal_authority_object(
+        bundle_value.get("assertion"),
+        schema.SOURCE_REVIEW_ASSERTION_FIELDS,
+        "terminal source-review assertion",
+        errors,
+    )
+    if assertion is None:
+        return None
+    assertion_sha256 = hashlib.sha256(canonical_json_bytes(assertion)).hexdigest()
+    if (
+        bundle_value.get("schema") != schema.SOURCE_REVIEW_BUNDLE_SCHEMA
+        or bundle_value.get("assertion_sha256") != assertion_sha256
+        or source_review.get("assertion_sha256") != assertion_sha256
+    ):
+        errors.append("terminal source-review assertion digest binding differs")
+    exact_assertion = {
+        "schema": schema.SOURCE_REVIEW_ASSERTION_SCHEMA,
+        "protocol": schema.PROTOCOL,
+        "protocol_sha256": schema.PROTOCOL_SHA256,
+        "status": "approved",
+        "open_findings": 0,
+        "tooling_commit": approval.get("tooling_commit"),
+        "tooling_tree": approval.get("tooling_tree"),
+        "release_compile_out_requirement": requirement,
+    }
+    if any(assertion.get(field) != expected for field, expected in exact_assertion.items()):
+        errors.append("terminal source-review assertion authority differs")
+    inputs = assertion.get("inputs")
+    if not isinstance(inputs, Mapping) or set(inputs) != set(
+        schema.SOURCE_REVIEW_INPUT_NAMES
+    ):
+        errors.append("terminal source-review assertion input names differ")
+        return None
+    validated_inputs = {
+        name: validate_terminal_source_input(inputs[name], name, errors)
+        for name in schema.SOURCE_REVIEW_INPUT_NAMES
+    }
+    if any(binding is None for binding in validated_inputs.values()):
+        return None
+    paths = [
+        binding.get("path")
+        for binding in validated_inputs.values()
+        if isinstance(binding, Mapping)
+    ]
+    identities = [
+        (binding.get("identity", {}).get("device"), binding.get("identity", {}).get("inode"))
+        for binding in validated_inputs.values()
+        if isinstance(binding, Mapping)
+    ]
+    if (
+        len(paths) != len(schema.SOURCE_REVIEW_INPUT_NAMES)
+        or len(set(paths)) != len(paths)
+        or len(set(identities)) != len(identities)
+    ):
+        errors.append("terminal source-review inputs are not physically disjoint")
+
+    created = terminal_authority_object(
+        bundle_value.get("review_created"),
+        schema.SOURCE_REVIEW_SEAL_EVENT_FIELDS,
+        "terminal source-review ReviewCreated",
+        errors,
+    )
+    verdict = terminal_authority_object(
+        bundle_value.get("verdict"),
+        schema.SOURCE_REVIEW_SEAL_EVENT_FIELDS,
+        "terminal source-review ReviewerVoted",
+        errors,
+    )
+    created_at = reviewed_at = None
+    review_id = approval.get("review_id")
+    if created is not None:
+        created_data = terminal_authority_object(
+            created.get("data"),
+            schema.SOURCE_REVIEW_CREATED_DATA_FIELDS,
+            "terminal source-review ReviewCreated data",
+            errors,
+        )
+        author = created.get("author")
+        detached = f"detached:{approval.get('tooling_commit')}"
+        if (
+            created.get("event") != "ReviewCreated"
+            or not isinstance(author, str)
+            or _TERMINAL_REVIEW_IDENTIFIER.fullmatch(author) is None
+            or created_data is None
+            or created_data.get("review_id") != review_id
+            or created_data.get("initial_commit") != approval.get("tooling_commit")
+            or created_data.get("jj_change_id") != detached
+            or created_data.get("scm_anchor") != detached
+            or created_data.get("scm_kind") != "git"
+            or not isinstance(created_data.get("title"), str)
+            or not created_data.get("title")
+            or not isinstance(created_data.get("description"), str)
+            or not created_data.get("description")
+        ):
+            errors.append("terminal source-review ReviewCreated authority differs")
+        created_at = terminal_authority_timestamp(
+            created.get("ts"), "terminal source-review created time", errors
+        )
+    if verdict is not None:
+        verdict_data = terminal_authority_object(
+            verdict.get("data"),
+            schema.SOURCE_REVIEW_VERDICT_DATA_FIELDS,
+            "terminal source-review ReviewerVoted data",
+            errors,
+        )
+        author = verdict.get("author")
+        expected_reason = (
+            f"APPROVED assertion_sha256={assertion_sha256}; open_findings=0"
+        )
+        if (
+            verdict.get("event") != "ReviewerVoted"
+            or not isinstance(author, str)
+            or _TERMINAL_REVIEW_IDENTIFIER.fullmatch(author) is None
+            or verdict_data
+            != {"reason": expected_reason, "review_id": review_id, "vote": "lgtm"}
+        ):
+            errors.append("terminal source-review ReviewerVoted authority differs")
+        reviewed_at = terminal_authority_timestamp(
+            verdict.get("ts"), "terminal source-review verdict time", errors
+        )
+        if approval.get("reviewed_at") != verdict.get("ts"):
+            errors.append("terminal source approval time is not Seal-derived")
+    if created_at is not None and reviewed_at is not None and reviewed_at < created_at:
+        errors.append("terminal source-review verdict predates ReviewCreated")
+
+    expected_hashes = {
+        "current_children_attestation": source_review.get(
+            "current_children_attestation", {}
+        ).get("sha256"),
+        "lock_authority": source_review.get("lock_authority", {}).get("sha256"),
+        "lock_review_bundle": source_review.get("lock_review_bundle", {}).get(
+            "sha256"
+        ),
+        "tools_manifest": approval.get("tools_manifest_sha256"),
+    }
+    for name, expected in expected_hashes.items():
+        if inputs[name].get("sha256") != expected:
+            errors.append(f"terminal source-review input {name} hash differs")
+
+    stripped_inputs = {
+        "authority": {
+            field: inputs["lock_authority"][field]
+            for field in schema.SOURCE_REVIEW_INPUT_FIELDS
+            if field != "schema"
+        },
+        "lock_manifest": {
+            field: inputs["lock_manifest"][field]
+            for field in schema.SOURCE_REVIEW_INPUT_FIELDS
+            if field != "schema"
+        },
+        "review_bundle": {
+            field: inputs["lock_review_bundle"][field]
+            for field in schema.SOURCE_REVIEW_INPUT_FIELDS
+            if field != "schema"
+        },
+    }
+    if (
+        current_children.get("schema")
+        != schema.SOURCE_REVIEW_CONTENT_SCHEMAS["current_children_attestation"]
+        or current_children.get("protocol") != schema.PROTOCOL
+        or current_children.get("protocol_sha256") != schema.PROTOCOL_SHA256
+        or current_children.get("status") != "ok"
+        or current_children.get("tools_manifest_sha256")
+        != inputs["tools_manifest"].get("sha256")
+        or current_children.get("lock_manifest_sha256")
+        != inputs["lock_manifest"].get("sha256")
+        or current_children.get("review_bundle_sha256")
+        != inputs["lock_review_bundle"].get("sha256")
+        or current_children.get("lock_authority_inputs") != stripped_inputs
+        or current_children.get("lock_authority") != lock_authority
+    ):
+        errors.append("terminal current-child reviewed input crosslinks differ")
+    lock_manifest = lock_authority.get("lock_manifest")
+    bound_lock_review = lock_authority.get("review_bundle")
+    if (
+        lock_authority.get("schema")
+        != schema.SOURCE_REVIEW_CONTENT_SCHEMAS["lock_authority"]
+        or lock_authority.get("status") != "approved"
+        or lock_authority.get("protocol") != schema.PROTOCOL
+        or lock_authority.get("protocol_sha256") != schema.PROTOCOL_SHA256
+        or lock_authority.get("review_sha256")
+        != inputs["lock_review_bundle"].get("sha256")
+        or not isinstance(lock_manifest, Mapping)
+        or lock_manifest.get("sha256") != inputs["lock_manifest"].get("sha256")
+        or lock_manifest.get("schema") != "asterism-rebaseline-lock-candidates-v3"
+        or not isinstance(lock_manifest.get("payload"), Mapping)
+        or lock_manifest.get("payload", {}).get("schema")
+        != "asterism-rebaseline-lock-candidates-v3"
+        or not isinstance(bound_lock_review, Mapping)
+        or bound_lock_review.get("sha256")
+        != inputs["lock_review_bundle"].get("sha256")
+        or bound_lock_review.get("schema")
+        != schema.SOURCE_REVIEW_CONTENT_SCHEMAS["lock_review_bundle"]
+        or bound_lock_review.get("payload") != lock_review_bundle
+        or lock_review_bundle.get("schema")
+        != schema.SOURCE_REVIEW_CONTENT_SCHEMAS["lock_review_bundle"]
+    ):
+        errors.append("terminal prepared lock authority differs from source review")
+
+    sentinel = "fa2acb626f303f8a65a16a6c8a1fd86b7e80cf48e092ae21a7308984ae790c94"
+    expected_approval = {
+        "final_integration_action": (
+            "repeat-release-equality-proof-under-real-source-approval"
+        ),
+        "source_approval_sha256": sentinel,
+        "source_approval_status": "preapproval-sentinel-not-source-approved",
+    }
+    preapproval = current_children.get("release_compile_out")
+    overlay_authority = current_children.get("product_overlay_authority")
+    patch = (
+        overlay_authority.get("patch")
+        if isinstance(overlay_authority, Mapping)
+        else None
+    )
+    if (
+        current_children.get("release_compile_out_approval") != expected_approval
+        or not isinstance(preapproval, Mapping)
+        or requirement is None
+        or hashlib.sha256(canonical_json_bytes(preapproval)).hexdigest()
+        != requirement.get("preapproval_compile_out_sha256")
+        or not isinstance(patch, Mapping)
+        or patch.get("sha256") != requirement.get("product_overlay_sha256")
+    ):
+        errors.append("terminal current-child preapproval authority differs")
+    approved_tools = approval.get("tools_manifest", {}).get("tools", {})
+    artifacts = current_children.get("artifacts")
+    if not isinstance(artifacts, Mapping) or any(
+        artifacts.get(name) != approved_tools.get(name)
+        for name in ("correctness", "fault")
+    ):
+        errors.append("terminal current-child tool artifacts differ")
+    if b"/asterism/preapproval-placeholder/" in canonical_json_bytes(
+        approval.get("tools_manifest", {})
+    ):
+        errors.append("terminal approved tools retain a preapproval placeholder")
+    return assertion
 
 
 def proc_identity(pid: int) -> dict[str, Any]:
@@ -342,11 +757,911 @@ def current_inventory(output_dir: Path, errors: list[str]) -> list[dict[str, Any
     return entries
 
 
+def validate_terminal_release_cargo_config(
+    attestation: Mapping[str, Any], context: str, errors: list[str]
+) -> str | None:
+    binding = terminal_authority_object(
+        attestation.get("cargo_config_search"),
+        schema.FILE_BINDING_FIELDS,
+        f"{context} Cargo config binding",
+        errors,
+    )
+    if binding is None or not terminal_is_sha256(binding.get("sha256")):
+        errors.append(f"{context} Cargo config manifest hash is invalid")
+        return None
+    manifest_path = Path(str(binding.get("path", "")))
+    snapshot = bound_file(
+        binding.get("path"),
+        binding.get("sha256"),
+        manifest_path,
+        f"{context} Cargo config manifest",
+        errors,
+    )
+    manifest = (
+        read_object(snapshot, f"{context} Cargo config manifest", errors)
+        if snapshot is not None
+        else None
+    )
+    if not isinstance(manifest, Mapping) or not require_keys(
+        manifest,
+        set(schema.CARGO_CONFIG_SEARCH_FIELDS),
+        f"{context} Cargo config manifest",
+        errors,
+    ):
+        return None
+    if (
+        manifest.get("schema") != schema.CARGO_CONFIG_SEARCH_SCHEMA
+        or manifest.get("cwd") != GUEST_SOURCE
+        or manifest.get("cargo_home_path") != GUEST_CARGO_HOME
+    ):
+        errors.append(f"{context} Cargo config guest identity differs")
+    try:
+        source_root = Path(str(attestation.get("materialized_root"))).resolve(
+            strict=True
+        )
+        toolchain = attestation.get("toolchain")
+        if not isinstance(toolchain, Mapping) or not isinstance(
+            toolchain.get("cargo_home_path"), str
+        ):
+            raise ValueError("Cargo home authority is absent")
+        cargo_home = Path(toolchain["cargo_home_path"]).resolve(strict=True)
+    except (OSError, TypeError, ValueError) as error:
+        errors.append(f"{context} Cargo config host roots differ: {error}")
+        return None
+    candidates: tuple[tuple[str, Path | None], ...] = (
+        (f"{GUEST_SOURCE}/.cargo/config.toml", source_root / ".cargo/config.toml"),
+        (f"{GUEST_SOURCE}/.cargo/config", source_root / ".cargo/config"),
+        (f"{GUEST_ROOT}/.cargo/config.toml", None),
+        (f"{GUEST_ROOT}/.cargo/config", None),
+        ("/.cargo/config.toml", None),
+        ("/.cargo/config", None),
+        (f"{GUEST_CARGO_HOME}/config.toml", cargo_home / "config.toml"),
+        (f"{GUEST_CARGO_HOME}/config", cargo_home / "config"),
+    )
+    entries = manifest.get("entries")
+    if not isinstance(entries, list) or len(entries) != len(candidates):
+        errors.append(f"{context} Cargo config candidate cardinality differs")
+        return None
+    for ordinal, (entry_value, (guest_path, host_path)) in enumerate(
+        zip(entries, candidates, strict=True), start=1
+    ):
+        entry = terminal_authority_object(
+            entry_value,
+            schema.CARGO_CONFIG_SEARCH_ENTRY_FIELDS,
+            f"{context} Cargo config entry {ordinal}",
+            errors,
+        )
+        if entry is None:
+            continue
+        if entry.get("path") != guest_path:
+            errors.append(f"{context} Cargo config guest path/order differs")
+        if host_path is None:
+            if entry.get("status") != "absent" or entry.get("sha256") is not None:
+                errors.append(f"{context} private Cargo config path is not absent")
+            continue
+        if host_path.is_symlink():
+            errors.append(f"{context} Cargo config host input is a symlink")
+            continue
+        expected_sha256 = EMPTY_SHA256
+        if host_path.exists():
+            try:
+                host_snapshot = schema.snapshot_regular_file(
+                    host_path, expected_mode=None
+                )
+                _BOUND_SNAPSHOTS[host_path] = host_snapshot
+                expected_sha256 = host_snapshot.sha256
+            except (OSError, ValueError) as error:
+                errors.append(f"{context} cannot snapshot Cargo config: {error}")
+                continue
+        if (
+            entry.get("status") != "present"
+            or entry.get("sha256") != expected_sha256
+        ):
+            errors.append(f"{context} effective Cargo config bytes differ")
+    empty_path = manifest_path.with_name(f"{manifest_path.name}.empty")
+    empty_snapshot = bound_file(
+        str(empty_path),
+        EMPTY_SHA256,
+        empty_path,
+        f"{context} empty Cargo config authority",
+        errors,
+    )
+    if empty_snapshot is not None and empty_snapshot.size != 0:
+        errors.append(f"{context} empty Cargo config authority is nonempty")
+    return str(binding.get("sha256"))
+
+
+def validate_terminal_release_sandbox(
+    attestation: Mapping[str, Any], context: str, errors: list[str]
+) -> str | None:
+    argv = attestation.get("build_argv")
+    toolchain = attestation.get("toolchain")
+    if (
+        not isinstance(argv, list)
+        or any(not isinstance(argument, str) for argument in argv)
+        or not isinstance(toolchain, Mapping)
+        or not isinstance(toolchain.get("bwrap_path"), str)
+    ):
+        errors.append(f"{context} sandbox authority is invalid")
+        return None
+    prefix = [
+        toolchain["bwrap_path"],
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-net",
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev-bind",
+        "/dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--tmpfs",
+        "/tmp",
+        "--tmpfs",
+        GUEST_ROOT,
+        "--dir",
+        f"{GUEST_ROOT}/.cargo",
+        "--tmpfs",
+        f"{GUEST_ROOT}/.cargo",
+        "--remount-ro",
+        f"{GUEST_ROOT}/.cargo",
+        "--dir",
+        "/.cargo",
+        "--tmpfs",
+        "/.cargo",
+        "--remount-ro",
+        "/.cargo",
+    ]
+    core_bindings = (
+        ("--ro-bind-fd", GUEST_SOURCE),
+        ("--bind-fd", GUEST_TARGET),
+        ("--ro-bind-fd", GUEST_TOOLCHAIN_ROOT),
+        ("--ro-bind-fd", GUEST_CARGO),
+        ("--ro-bind-fd", GUEST_RUSTC),
+        ("--ro-bind-fd", GUEST_CARGO_HOME),
+        ("--ro-bind-fd", GUEST_RUSTUP_HOME),
+    )
+    source_config = tuple(
+        ("--ro-bind-fd", path) for path in GUEST_BOUND_CONFIG_PATHS[:2]
+    )
+    cargo_home_config = tuple(
+        ("--ro-bind-fd", path) for path in GUEST_BOUND_CONFIG_PATHS[2:]
+    )
+    middle = ["--dir", f"{GUEST_SOURCE}/.cargo", "--tmpfs", f"{GUEST_SOURCE}/.cargo"]
+    source_remount = ["--remount-ro", f"{GUEST_SOURCE}/.cargo"]
+    cargo_home_remount = ["--remount-ro", GUEST_CARGO_HOME]
+    suffix = [
+        "--chdir",
+        GUEST_SOURCE,
+        GUEST_CARGO,
+        "build",
+        "--locked",
+        "--offline",
+        "--release",
+        "-p",
+        "mess-store",
+        "--example",
+        "asterism_rebaseline_public",
+        "--target-dir",
+        GUEST_TARGET,
+    ]
+    expected_length = (
+        len(prefix)
+        + 3 * len(core_bindings)
+        + len(middle)
+        + 3 * len(source_config)
+        + len(source_remount)
+        + 3 * len(cargo_home_config)
+        + len(cargo_home_remount)
+        + len(suffix)
+    )
+    if len(argv) != expected_length or argv[: len(prefix)] != prefix:
+        errors.append(f"{context} sandbox prefix/cardinality differs")
+        return None
+    descriptors: list[str] = []
+    normalized = list(argv)
+    offset = len(prefix)
+
+    def consume(bindings: Any, current: int) -> int | None:
+        for operation, destination in bindings:
+            segment = argv[current : current + 3]
+            descriptor = segment[1] if len(segment) == 3 else ""
+            if (
+                len(segment) != 3
+                or segment[0] != operation
+                or segment[2] != destination
+                or not descriptor.isascii()
+                or not descriptor.isdecimal()
+                or len(descriptor) > 10
+                or str(int(descriptor)) != descriptor
+                or int(descriptor) < 3
+            ):
+                errors.append(f"{context} sandbox binding differs: {destination}")
+                return None
+            descriptors.append(descriptor)
+            normalized[current + 1] = f"$FD:{destination}"
+            current += 3
+        return current
+
+    offset = consume(core_bindings, offset)
+    if offset is None:
+        return None
+    if argv[offset : offset + len(middle)] != middle:
+        errors.append(f"{context} private source Cargo config mount differs")
+        return None
+    offset += len(middle)
+    offset = consume(source_config, offset)
+    if offset is None:
+        return None
+    if argv[offset : offset + len(source_remount)] != source_remount:
+        errors.append(f"{context} source Cargo config remount differs")
+        return None
+    offset += len(source_remount)
+    offset = consume(cargo_home_config, offset)
+    if offset is None:
+        return None
+    if argv[offset : offset + len(cargo_home_remount)] != cargo_home_remount:
+        errors.append(f"{context} Cargo-home config remount differs")
+        return None
+    offset += len(cargo_home_remount)
+    if len(set(descriptors)) != len(descriptors) or argv[offset:] != suffix:
+        errors.append(f"{context} sandbox descriptors/command differ")
+    if any(
+        not isinstance(attestation.get(field), str) or attestation.get(field) in argv
+        for field in ("materialized_root", "target_dir")
+    ):
+        errors.append(f"{context} sandbox exposes a mutable host path")
+    build_child = attestation.get("build_child")
+    if not isinstance(build_child, Mapping) or build_child.get("argv") != argv:
+        errors.append(f"{context} child argv differs from sandbox authority")
+    cargo_config_sha256 = validate_terminal_release_cargo_config(
+        attestation, context, errors
+    )
+    if cargo_config_sha256 is None:
+        return None
+    return hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "argv": normalized,
+                "cargo_config_search_sha256": cargo_config_sha256,
+            }
+        )
+    ).hexdigest()
+
+
+def validate_terminal_release_file(
+    value: Any,
+    context: str,
+    errors: list[str],
+    *,
+    expected_mode: int,
+) -> tuple[Mapping[str, Any], schema.FileSnapshot] | None:
+    record = terminal_authority_object(
+        value, schema.RELEASE_COMPILE_OUT_FILE_FIELDS, context, errors
+    )
+    if record is None:
+        return None
+    path_value = record.get("path")
+    if (
+        not isinstance(path_value, str)
+        or not Path(path_value).is_absolute()
+        or not terminal_is_sha256(record.get("sha256"))
+        or not terminal_is_integer(record.get("size"))
+        or record.get("size", 0) <= 0
+        or record.get("mode") != expected_mode
+    ):
+        errors.append(f"{context} file binding differs")
+        return None
+    path = Path(path_value)
+    snapshot = bound_file(
+        path_value,
+        record.get("sha256"),
+        path,
+        context,
+        errors,
+        expected_mode=expected_mode,
+    )
+    if snapshot is None:
+        return None
+    expected_identity = {
+        "changed_ns": snapshot._stat.st_ctime_ns,
+        "device": snapshot.device,
+        "inode": snapshot.inode,
+        "link_count": snapshot._stat.st_nlink,
+        "modified_ns": snapshot._stat.st_mtime_ns,
+    }
+    if (
+        record.get("size") != snapshot.size
+        or record.get("identity") != expected_identity
+        or snapshot._stat.st_nlink != 1
+    ):
+        errors.append(f"{context} live size/identity differs")
+    return record, snapshot
+
+
+def validate_terminal_nm_child(
+    value: Any,
+    name: str,
+    nm_tool: Mapping[str, Any],
+    inventory: schema.FileSnapshot,
+    errors: list[str],
+) -> None:
+    context = f"terminal release nm child {name}"
+    child = terminal_authority_object(
+        value, schema.RELEASE_COMPILE_OUT_NM_CHILD_FIELDS, context, errors
+    )
+    if child is None:
+        return
+    argv = child.get("argv")
+    reaping = child.get("reaping")
+    expected_prefix = [
+        nm_tool.get("path"),
+        "--defined-only",
+        "--demangle=rust",
+        "--format=posix",
+    ]
+    integer_fields = (
+        "pid",
+        "start_ticks",
+        "waited_pid",
+        "started_monotonic_ns",
+        "completed_monotonic_ns",
+    )
+    if (
+        child.get("exit_status") != 0
+        or child.get("timed_out") is not False
+        or child.get("process_group_absent") is not True
+        or child.get("waited_pid") != child.get("pid")
+        or not isinstance(argv, list)
+        or len(argv) != 5
+        or argv[:4] != expected_prefix
+        or not isinstance(argv[4], str)
+        or re.fullmatch(r"/proc/self/fd/[0-9]+", argv[4]) is None
+        or reaping
+        != {
+            "pid": child.get("pid"),
+            "start_ticks": child.get("start_ticks"),
+            "status": "absent",
+        }
+        or any(
+            not terminal_is_integer(child.get(field)) or child.get(field, 0) <= 0
+            for field in integer_fields
+        )
+        or child.get("completed_monotonic_ns", 0)
+        < child.get("started_monotonic_ns", 0)
+    ):
+        errors.append(f"{context} did not complete exactly")
+    started_at = terminal_authority_timestamp(
+        child.get("started_at"), f"{context} start", errors
+    )
+    completed_at = terminal_authority_timestamp(
+        child.get("completed_at"), f"{context} completion", errors
+    )
+    if started_at is not None and completed_at is not None and completed_at < started_at:
+        errors.append(f"{context} wall chronology differs")
+    output_path = Path(str(child.get("output_path", "")))
+    output_snapshot = bound_file(
+        child.get("output_path"),
+        child.get("output_sha256"),
+        output_path,
+        f"{context} output",
+        errors,
+    )
+    output = (
+        read_object(output_snapshot, f"{context} output", errors)
+        if output_snapshot is not None
+        else None
+    )
+    stdout = output.get("stdout") if isinstance(output, Mapping) else None
+    stderr = output.get("stderr") if isinstance(output, Mapping) else None
+    if (
+        not isinstance(output, Mapping)
+        or set(output)
+        != {"exit_status", "stderr", "stderr_sha256", "stdout", "stdout_sha256"}
+        or output.get("exit_status") != 0
+        or not isinstance(stdout, str)
+        or not isinstance(stderr, str)
+        or stderr != ""
+        or output.get("stderr_sha256") != hashlib.sha256(b"").hexdigest()
+        or output.get("stdout_sha256")
+        != hashlib.sha256(stdout.encode() if isinstance(stdout, str) else b"").hexdigest()
+    ):
+        errors.append(f"{context} output authority differs")
+    if isinstance(stdout, str) and inventory.data != stdout.encode():
+        errors.append(f"{context} stdout does not derive symbol inventory")
+
+
+def validate_terminal_release_proof_semantics(
+    proof: Mapping[str, Any],
+    prepared: Mapping[str, Any],
+    approval: Mapping[str, Any],
+    current_children: Mapping[str, Any],
+    config: Mapping[str, Any] | None,
+    errors: list[str],
+) -> str | None:
+    """Independently replay the real-approval compile-out proof."""
+
+    value = terminal_authority_object(
+        proof,
+        schema.RELEASE_COMPILE_OUT_FIELDS,
+        "terminal release compile-out proof",
+        errors,
+    )
+    if value is None:
+        return None
+    approval_sha256 = hashlib.sha256(canonical_json_bytes(approval)).hexdigest()
+    requirement = approval.get("source_review", {}).get(
+        "release_compile_out_requirement"
+    )
+    requirement_sha256 = (
+        hashlib.sha256(canonical_json_bytes(requirement)).hexdigest()
+        if isinstance(requirement, Mapping)
+        else None
+    )
+    current_sha256 = hashlib.sha256(canonical_json_bytes(current_children)).hexdigest()
+    exact = {
+        "schema": schema.RELEASE_COMPILE_OUT_SCHEMA,
+        "protocol": schema.PROTOCOL,
+        "protocol_sha256": schema.PROTOCOL_SHA256,
+        "status": "ok",
+        "source_approval_sha256": approval_sha256,
+        "requirement_sha256": requirement_sha256,
+        "current_children_attestation_sha256": current_sha256,
+        "product_overlay_sha256": (
+            requirement.get("product_overlay_sha256")
+            if isinstance(requirement, Mapping)
+            else None
+        ),
+        "forbidden_hook_strings": list(
+            schema.RELEASE_COMPILE_OUT_FORBIDDEN_HOOK_STRINGS
+        ),
+        "binary_byte_identical": True,
+        "symbol_inventory_byte_identical": True,
+        "forbidden_hook_strings_absent": True,
+    }
+    if any(value.get(field) != expected for field, expected in exact.items()):
+        errors.append("terminal release compile-out top-level authority differs")
+
+    equivalence = terminal_authority_object(
+        value.get("equivalence_contract"),
+        schema.RELEASE_COMPILE_OUT_EQUIVALENCE_CONTRACT_FIELDS,
+        "terminal release equivalence contract",
+        errors,
+    )
+    if equivalence is None:
+        return None
+    if (
+        equivalence.get("source_approval_sha256") != approval_sha256
+        or equivalence.get("cfg_test") is not False
+        or equivalence.get("rustc_workspace_wrapper") != "absent"
+        or equivalence.get("ordinary_a_role") != "published"
+        or equivalence.get("overlay_a_role") != "proof_only"
+    ):
+        errors.append("terminal release equivalence policy differs")
+    for field in (
+        "contract_sha256",
+        "build_nonce",
+        "cargo_lock_sha256",
+        "toolchain_sha256",
+        "build_environment_sha256",
+        "sandbox_sha256",
+    ):
+        if not terminal_is_sha256(equivalence.get(field)):
+            errors.append(f"terminal release equivalence {field} is invalid")
+
+    builds = value.get("builds")
+    if not isinstance(builds, Mapping) or set(builds) != set(
+        schema.RELEASE_COMPILE_OUT_BUILD_NAMES
+    ):
+        errors.append("terminal release build names differ")
+        return None
+    prepared_a = prepared.get("variants", {}).get("A", {})
+    prepared_attestation = prepared_a.get("attestation")
+    common_fields = (
+        "source_approval_sha256",
+        "contract_sha256",
+        "build_nonce",
+        "cargo_lock_sha256",
+        "toolchain_sha256",
+        "build_environment_sha256",
+        "sandbox_sha256",
+        "cfg_test",
+        "rustc_workspace_wrapper",
+    )
+    for name in schema.RELEASE_COMPILE_OUT_BUILD_NAMES:
+        context = f"terminal release build {name}"
+        build = terminal_authority_object(
+            builds[name], schema.RELEASE_COMPILE_OUT_BUILD_FIELDS, context, errors
+        )
+        if build is None:
+            continue
+        attestation_fields = (
+            schema.RELEASE_COMPILE_OUT_ORDINARY_ATTESTATION_FIELDS
+            if name == "ordinary_a"
+            else schema.RELEASE_COMPILE_OUT_OVERLAY_ATTESTATION_FIELDS
+        )
+        attestation = terminal_authority_object(
+            build.get("attestation"),
+            attestation_fields,
+            f"{context} attestation",
+            errors,
+        )
+        if attestation is None:
+            continue
+        expected_role = "published" if name == "ordinary_a" else "proof_only"
+        if (
+            build.get("role") != name
+            or build.get("artifact_role") != expected_role
+            or any(build.get(field) != equivalence.get(field) for field in common_fields)
+            or build.get("attestation_sha256")
+            != hashlib.sha256(canonical_json_bytes(attestation)).hexdigest()
+        ):
+            errors.append(f"{context} equivalence binding differs")
+        build_env = attestation.get("build_env")
+        toolchain = attestation.get("toolchain")
+        sandbox_sha256 = validate_terminal_release_sandbox(
+            attestation, context, errors
+        )
+        if (
+            not isinstance(build_env, Mapping)
+            or not isinstance(toolchain, Mapping)
+            or attestation.get("build_nonce") != build.get("build_nonce")
+            or attestation.get("cargo_lock_sha256") != build.get("cargo_lock_sha256")
+            or hashlib.sha256(canonical_json_bytes(toolchain)).hexdigest()
+            != build.get("toolchain_sha256")
+            or hashlib.sha256(canonical_json_bytes(build_env)).hexdigest()
+            != build.get("build_environment_sha256")
+            or sandbox_sha256 != build.get("sandbox_sha256")
+            or build_env.get("ASTERISM_BUILD_SOURCE_APPROVAL_SHA256")
+            != approval_sha256
+            or build_env.get("CARGO_HOME") != GUEST_CARGO_HOME
+            or build_env.get("RUSTC") != GUEST_RUSTC
+            or build_env.get("RUSTUP_HOME") != GUEST_RUSTUP_HOME
+            or build_env.get("PATH")
+            != f"{GUEST_TOOLCHAIN_ROOT}/bin:/usr/bin:/bin"
+            or any(
+                field in build_env
+                for field in (
+                    "RUSTC_WORKSPACE_WRAPPER",
+                    "RUSTC_WRAPPER",
+                    "RUSTFLAGS",
+                    "CARGO_ENCODED_RUSTFLAGS",
+                )
+            )
+        ):
+            errors.append(f"{context} embedded authority differs")
+        if name == "ordinary_a" and attestation != prepared_attestation:
+            errors.append("terminal ordinary A attestation differs from prepared A")
+        if isinstance(prepared_attestation, Mapping) and (
+            attestation.get("build_env") != prepared_attestation.get("build_env")
+            or attestation.get("toolchain") != prepared_attestation.get("toolchain")
+        ):
+            errors.append(f"{context} environment/toolchain differs from prepared A")
+        contract_path = Path(str(attestation.get("contract_output_path", "")))
+        contract_snapshot = bound_file(
+            attestation.get("contract_output_path"),
+            attestation.get("contract_output_sha256"),
+            contract_path,
+            f"{context} contract output",
+            errors,
+        )
+        contract = (
+            read_object(contract_snapshot, f"{context} contract output", errors)
+            if contract_snapshot is not None
+            else None
+        )
+        if (
+            contract != prepared_a.get("contract")
+            or not isinstance(contract, Mapping)
+            or hashlib.sha256(canonical_json_bytes(contract)).hexdigest()
+            != build.get("contract_sha256")
+        ):
+            errors.append(f"{context} contract replay differs")
+        if name == "ordinary_a" and "product_overlay_sha256" in attestation:
+            errors.append("terminal ordinary A contains product-overlay authority")
+        if name == "overlay_a" and (
+            not isinstance(requirement, Mapping)
+            or attestation.get("product_overlay_sha256")
+            != requirement.get("product_overlay_sha256")
+        ):
+            errors.append("terminal proof-only overlay A authority differs")
+
+    binaries = value.get("binaries")
+    inventories = value.get("symbol_inventories")
+    if not isinstance(binaries, Mapping) or set(binaries) != set(
+        schema.RELEASE_COMPILE_OUT_BUILD_NAMES
+    ):
+        errors.append("terminal release binary names differ")
+        return None
+    if not isinstance(inventories, Mapping) or set(inventories) != set(
+        schema.RELEASE_COMPILE_OUT_BUILD_NAMES
+    ):
+        errors.append("terminal release inventory names differ")
+        return None
+    binary_records: dict[str, tuple[Mapping[str, Any], schema.FileSnapshot]] = {}
+    inventory_records: dict[str, tuple[Mapping[str, Any], schema.FileSnapshot]] = {}
+    for name in schema.RELEASE_COMPILE_OUT_BUILD_NAMES:
+        binary = validate_terminal_release_file(
+            binaries[name], f"terminal release binary {name}", errors,
+            expected_mode=0o555,
+        )
+        inventory = validate_terminal_release_file(
+            inventories[name], f"terminal release inventory {name}", errors,
+            expected_mode=0o444,
+        )
+        if binary is not None:
+            binary_records[name] = binary
+        if inventory is not None:
+            inventory_records[name] = inventory
+    for records, context in (
+        (binary_records, "terminal release binaries"),
+        (inventory_records, "terminal release inventories"),
+    ):
+        if set(records) != set(schema.RELEASE_COMPILE_OUT_BUILD_NAMES):
+            continue
+        first_record, first_snapshot = records["ordinary_a"]
+        second_record, second_snapshot = records["overlay_a"]
+        if (
+            first_snapshot.data != second_snapshot.data
+            or first_record.get("sha256") != second_record.get("sha256")
+            or first_record.get("size") != second_record.get("size")
+            or first_record.get("path") == second_record.get("path")
+            or (first_snapshot.device, first_snapshot.inode)
+            == (second_snapshot.device, second_snapshot.inode)
+        ):
+            errors.append(f"{context} are not equal physically-disjoint files")
+    ordinary_binary = binary_records.get("ordinary_a")
+    overlay_binary = binary_records.get("overlay_a")
+    if ordinary_binary is not None and (
+        value.get("published_a_sha256") != ordinary_binary[0].get("sha256")
+        or value.get("published_a_sha256")
+        != prepared_a.get("binary", {}).get("sha256")
+        or ordinary_binary[0].get("path") != prepared_a.get("binary", {}).get("path")
+    ):
+        errors.append("terminal published ordinary A binding differs")
+    for records in (binary_records, inventory_records):
+        for _name, (_record, snapshot) in records.items():
+            for forbidden in schema.RELEASE_COMPILE_OUT_FORBIDDEN_HOOK_STRINGS:
+                if forbidden.encode() in snapshot.data:
+                    errors.append(f"terminal release artifact contains {forbidden}")
+
+    nm = terminal_authority_object(
+        value.get("nm"), schema.RELEASE_COMPILE_OUT_NM_FIELDS,
+        "terminal release nm proof", errors,
+    )
+    if nm is not None:
+        preapproval = current_children.get("release_compile_out")
+        preapproval_nm = (
+            preapproval.get("nm") if isinstance(preapproval, Mapping) else None
+        )
+        expected_mode = (
+            preapproval_nm.get("mode")
+            if isinstance(preapproval_nm, Mapping)
+            and terminal_is_integer(preapproval_nm.get("mode"))
+            else -1
+        )
+        nm_tool_result = validate_terminal_release_file(
+            nm.get("tool"), "terminal release nm tool", errors,
+            expected_mode=expected_mode,
+        )
+        if isinstance(preapproval_nm, Mapping) and nm_tool_result is not None:
+            expected_tool = {
+                "identity": {
+                    "changed_ns": preapproval_nm.get("ctime_ns"),
+                    "device": preapproval_nm.get("device"),
+                    "inode": preapproval_nm.get("inode"),
+                    "link_count": preapproval_nm.get("link_count"),
+                    "modified_ns": preapproval_nm.get("mtime_ns"),
+                },
+                "mode": preapproval_nm.get("mode"),
+                "path": preapproval_nm.get("path"),
+                "sha256": preapproval_nm.get("sha256"),
+                "size": preapproval_nm.get("size"),
+            }
+            if nm_tool_result[0] != expected_tool:
+                errors.append("terminal release nm tool differs from preapproval")
+            for name in schema.RELEASE_COMPILE_OUT_BUILD_NAMES:
+                inventory_result = inventory_records.get(name)
+                if inventory_result is not None:
+                    validate_terminal_nm_child(
+                        nm.get(name), name, nm_tool_result[0], inventory_result[1], errors
+                    )
+        else:
+            errors.append("terminal release preapproval nm authority is absent")
+
+    overlay_path = (
+        overlay_binary[0].get("path") if overlay_binary is not None else None
+    )
+    if not isinstance(overlay_path, str) or not overlay_path:
+        errors.append("terminal proof-only overlay A path is absent")
+        return None
+
+    def reaches_overlay(item: Any) -> bool:
+        if isinstance(item, Mapping):
+            return any(reaches_overlay(child) for child in item.values())
+        if isinstance(item, (list, tuple)):
+            return any(reaches_overlay(child) for child in item)
+        return item == overlay_path
+
+    if any(
+        reaches_overlay(prepared.get(field))
+        for field in ("variants", "tools", "support_files")
+    ):
+        errors.append("terminal proof-only overlay A is published/reachable")
+    if isinstance(config, Mapping) and any(
+        reaches_overlay(config.get(field))
+        for field in ("smoke_transitions", "correctness_execution", "argv_templates")
+    ):
+        errors.append("terminal proof-only overlay A is config-reachable")
+    return overlay_path
+
+
+def validate_terminal_local_source_release(
+    prepared: Mapping[str, Any],
+    approval: Mapping[str, Any],
+    prepared_path: Path,
+    config: Mapping[str, Any] | None,
+    errors: list[str],
+) -> str | None:
+    """Independently replay prepared source review and release authority."""
+
+    try:
+        root = prepared_path.parent.resolve(strict=True)
+    except OSError as error:
+        errors.append(f"terminal local prepared root is invalid: {error}")
+        return None
+    if (
+        prepared.get("schema") != schema.PREPARED_ARTIFACTS_SCHEMA
+        or prepared.get("protocol") != schema.PROTOCOL
+        or prepared.get("protocol_sha256") != schema.PROTOCOL_SHA256
+        or prepared.get("tooling_commit") != approval.get("tooling_commit")
+        or prepared.get("tooling_tree") != approval.get("tooling_tree")
+        or prepared.get("build_order") != list(schema.VARIANTS)
+    ):
+        errors.append("terminal local prepared identity/order differs")
+    approval_binding = terminal_authority_object(
+        prepared.get("source_approval"),
+        schema.FILE_BINDING_FIELDS,
+        "terminal local prepared source approval",
+        errors,
+    )
+    expected_approval = root.joinpath(*schema.PREPARED_SOURCE_APPROVAL_RELATIVE_PATH)
+    if approval_binding is not None:
+        approval_snapshot = bound_file(
+            approval_binding.get("path"),
+            approval_binding.get("sha256"),
+            expected_approval,
+            "terminal local source approval copy",
+            errors,
+        )
+        copied_approval = (
+            read_object(
+                approval_snapshot, "terminal local source approval copy", errors
+            )
+            if approval_snapshot is not None
+            else None
+        )
+        if copied_approval != approval:
+            errors.append("terminal local source approval copy differs")
+
+    review_bindings = terminal_authority_object(
+        prepared.get("source_review"),
+        schema.PREPARED_SOURCE_REVIEW_FIELDS,
+        "terminal local prepared source review",
+        errors,
+    )
+    if review_bindings is None:
+        return None
+    snapshots: dict[str, schema.FileSnapshot] = {}
+    payloads: dict[str, Mapping[str, Any]] = {}
+    source_review = approval.get("source_review")
+    if not isinstance(source_review, Mapping):
+        errors.append("terminal local source-review approval is absent")
+        return None
+    for name, relative in schema.PREPARED_SOURCE_REVIEW_RELATIVE_PATHS.items():
+        context = f"terminal local prepared source review {name}"
+        binding = terminal_authority_object(
+            review_bindings.get(name),
+            schema.PREPARED_SOURCE_REVIEW_BINDING_FIELDS,
+            context,
+            errors,
+        )
+        if binding is None:
+            continue
+        expected_path = root / relative
+        if binding.get("mode") != schema.ARTIFACT_FILE_MODE:
+            errors.append(f"{context} mode differs")
+        snapshot = bound_file(
+            binding.get("path"),
+            binding.get("sha256"),
+            expected_path,
+            context,
+            errors,
+        )
+        payload = (
+            read_object(snapshot, context, errors) if snapshot is not None else None
+        )
+        approved_binding = source_review.get(name)
+        if (
+            not isinstance(approved_binding, Mapping)
+            or snapshot is None
+            or snapshot.sha256 != approved_binding.get("sha256")
+            or not isinstance(payload, Mapping)
+            or payload.get("schema") != approved_binding.get("schema")
+        ):
+            errors.append(f"{context} differs from source approval")
+            continue
+        snapshots[name] = snapshot
+        payloads[name] = payload
+    if set(payloads) != set(schema.PREPARED_SOURCE_REVIEW_FIELDS):
+        errors.append("terminal local prepared source-review copies are incomplete")
+        return None
+    assertion = validate_terminal_source_review_semantics(
+        approval,
+        payloads["bundle"],
+        payloads["current_children_attestation"],
+        payloads["lock_authority"],
+        payloads["lock_review_bundle"],
+        errors,
+    )
+    if assertion is None:
+        return None
+    inputs = assertion.get("inputs")
+    if isinstance(inputs, Mapping):
+        for name in (
+            "current_children_attestation",
+            "lock_authority",
+            "lock_review_bundle",
+        ):
+            if snapshots[name].sha256 != inputs.get(name, {}).get("sha256"):
+                errors.append(f"terminal local prepared source review {name} differs")
+        if inputs.get("tools_manifest", {}).get("sha256") != approval.get(
+            "tools_manifest_sha256"
+        ):
+            errors.append("terminal local reviewed tools manifest differs")
+
+    proof_binding = terminal_authority_object(
+        prepared.get("release_compile_out"),
+        schema.RELEASE_COMPILE_OUT_BINDING_FIELDS,
+        "terminal local release compile-out binding",
+        errors,
+    )
+    if proof_binding is None:
+        return None
+    if proof_binding.get("mode") != schema.ARTIFACT_FILE_MODE:
+        errors.append("terminal local release compile-out mode differs")
+    proof_path = root / schema.RELEASE_COMPILE_OUT_RELATIVE_PATH
+    proof_snapshot = bound_file(
+        proof_binding.get("path"),
+        proof_binding.get("sha256"),
+        proof_path,
+        "terminal local release compile-out proof",
+        errors,
+    )
+    proof = (
+        read_object(proof_snapshot, "terminal local release compile-out proof", errors)
+        if proof_snapshot is not None
+        else None
+    )
+    if not isinstance(proof, Mapping):
+        return None
+    return validate_terminal_release_proof_semantics(
+        proof,
+        prepared,
+        approval,
+        payloads["current_children_attestation"],
+        config,
+        errors,
+    )
+
+
 def validate_terminal_tools_authority(
     output_dir: Path,
     prepared: Mapping[str, Any] | None,
     errors: list[str],
-) -> None:
+) -> str | None:
     prepared_path = output_dir / "prepared-artifacts.json"
     approval_path = output_dir / "source-approval.json"
     approval = read_object(
@@ -380,8 +1695,13 @@ def validate_terminal_tools_authority(
         or prepared.get("protocol_sha256") != schema.PROTOCOL_SHA256
     ):
         errors.append("terminal source/prepared identity differs")
+    try:
+        schema.validate_source_approval(dict(approval))
+    except (OSError, ValueError) as error:
+        errors.append(f"terminal shared source approval authority replay: {error}")
 
     prepared_root: Path | None = None
+    original_prepared_snapshot: schema.FileSnapshot | None = None
     attempt_prepared_snapshot = _BOUND_SNAPSHOTS.get(prepared_path)
     attempt_approval_snapshot = _BOUND_SNAPSHOTS.get(approval_path)
     claim_binding = prepared.get("single_use_claim")
@@ -521,6 +1841,28 @@ def validate_terminal_tools_authority(
             or not chronology[0] < chronology[1] < chronology[2]
         ):
             errors.append("terminal claim chronology differs")
+
+    local_overlay_path: str | None = None
+    if original_prepared_snapshot is not None:
+        try:
+            schema.validate_prepared_artifacts(
+                dict(prepared), dict(approval), original_prepared_snapshot.path
+            )
+        except (OSError, ValueError) as error:
+            errors.append(
+                "terminal shared source-review/release authority replay: "
+                f"{error}"
+            )
+        config = read_object(
+            output_dir / "config.json", "terminal local authority config", errors
+        )
+        local_overlay_path = validate_terminal_local_source_release(
+            prepared,
+            approval,
+            original_prepared_snapshot.path,
+            config,
+            errors,
+        )
 
     approval_binding = prepared.get("source_approval")
     if not require_keys(
@@ -713,6 +2055,55 @@ def validate_terminal_tools_authority(
                     else schema.ARTIFACT_FILE_MODE
                 ),
             )
+
+    proof_binding = prepared.get("release_compile_out")
+    if not isinstance(proof_binding, Mapping) or prepared_root is None:
+        return None
+    proof_path = prepared_root / schema.RELEASE_COMPILE_OUT_RELATIVE_PATH
+    proof_snapshot = bound_file(
+        proof_binding.get("path"),
+        proof_binding.get("sha256"),
+        proof_path,
+        "terminal release compile-out proof",
+        errors,
+    )
+    proof = (
+        read_object(proof_snapshot, "terminal release compile-out proof", errors)
+        if proof_snapshot is not None
+        else None
+    )
+    overlay_path = (
+        proof.get("binaries", {}).get("overlay_a", {}).get("path")
+        if isinstance(proof, Mapping)
+        else None
+    )
+    if not isinstance(overlay_path, str) or not overlay_path:
+        errors.append("terminal proof-only overlay A path is absent")
+        return None
+    if local_overlay_path is not None and local_overlay_path != overlay_path:
+        errors.append("terminal local/shared proof-only overlay paths differ")
+    return local_overlay_path or overlay_path
+
+
+def validate_terminal_proof_only_child_reachability(
+    children: list[dict[str, Any]],
+    overlay_path: str | None,
+    errors: list[str],
+) -> None:
+    if overlay_path is None:
+        return
+
+    def reaches_overlay(value: Any) -> bool:
+        if isinstance(value, Mapping):
+            return any(reaches_overlay(item) for item in value.values())
+        if isinstance(value, (list, tuple)):
+            return any(reaches_overlay(item) for item in value)
+        return value == overlay_path
+
+    if any(reaches_overlay(child) for child in children):
+        errors.append(
+            "terminal proof-only overlay A is reachable from the completed child manifest"
+        )
 
 
 def validate_terminal_profile_contract(
@@ -1883,7 +3274,9 @@ def verify(output_dir: Path, *, publish: bool) -> tuple[dict[str, Any], int]:
     provenance = read_object(provenance_path, "provenance", errors)
     prepared = read_object(output_dir / "prepared-artifacts.json", "prepared artifacts", errors)
     correctness = read_object(output_dir / "correctness.json", "correctness", errors)
-    validate_terminal_tools_authority(output_dir, prepared, errors)
+    proof_only_overlay_path = validate_terminal_tools_authority(
+        output_dir, prepared, errors
+    )
     validate_terminal_profile_contract(output_dir, errors)
     if publish:
         validate_live_terminal_invocation(output_dir, prepared, terminal, errors)
@@ -1953,6 +3346,9 @@ def verify(output_dir: Path, *, publish: bool) -> tuple[dict[str, Any], int]:
         else:
             errors.append("terminal final guard completion is invalid")
     children = read_jsonl(output_dir / "child-manifest.jsonl", "terminal child manifest", errors)
+    validate_terminal_proof_only_child_reachability(
+        children, proof_only_overlay_path, errors
+    )
     correctness_only = result is not None and result.get("evidence_mode") == "correctness-only"
     validate_terminal_child_projection(
         children,
@@ -2258,7 +3654,7 @@ def build_terminal_fixture_v3(
         }
     tools_manifest = {
         "schema": schema.TOOLS_MANIFEST_SCHEMA,
-        "comm_allowlist": sorted(comms.values()),
+        "comm_allowlist": schema.expected_comm_allowlist(),
         "tools": tools,
         "support_files": support,
     }
@@ -2269,6 +3665,273 @@ def build_terminal_fixture_v3(
     write_fixture_json(tools_manifest_path, tools_manifest)
     fake_commit = "1" * 40
     fake_tree = "2" * 40
+    terminal_cargo_home = tooling_root / "cargo-home"
+    terminal_cargo_home.mkdir()
+    write_fixture(terminal_cargo_home / "config.toml", b"")
+    terminal_toolchain = {
+        "bwrap_path": "/fixture/bwrap",
+        "cargo_home_path": str(terminal_cargo_home.resolve()),
+    }
+    review_id = "cr-terminal-fixture"
+    review_time = "2026-07-15T00:00:00+00:00"
+    reviewed_root = tooling_root / "reviewed-source"
+    lock_manifest_path = reviewed_root / "lock-manifest.json"
+    lock_review_path = reviewed_root / "lock-review-bundle.json"
+    write_fixture_json(
+        lock_manifest_path,
+        {"schema": "asterism-rebaseline-lock-candidates-v3"},
+    )
+    write_fixture_json(
+        lock_review_path,
+        {"schema": schema.SOURCE_REVIEW_CONTENT_SCHEMAS["lock_review_bundle"]},
+    )
+
+    def source_review_input(path: Path) -> dict[str, Any]:
+        metadata = path.stat()
+        return {
+            "identity": {
+                "changed_ns": metadata.st_ctime_ns,
+                "device": metadata.st_dev,
+                "inode": metadata.st_ino,
+                "link_count": metadata.st_nlink,
+                "modified_ns": metadata.st_mtime_ns,
+            },
+            "mode": stat.S_IMODE(metadata.st_mode),
+            "path": str(path.resolve()),
+            "schema": schema.SOURCE_REVIEW_INPUT_SCHEMA,
+            "sha256": sha256_file(path),
+            "size": metadata.st_size,
+        }
+
+    lock_manifest_input = source_review_input(lock_manifest_path)
+    lock_review_input = source_review_input(lock_review_path)
+    lock_authority = {
+        "lock_manifest": {
+            "payload": {
+                "schema": "asterism-rebaseline-lock-candidates-v3"
+            },
+            "schema": "asterism-rebaseline-lock-candidates-v3",
+            "sha256": lock_manifest_input["sha256"],
+        },
+        "protocol": schema.PROTOCOL,
+        "protocol_sha256": schema.PROTOCOL_SHA256,
+        "review_bundle": {
+            "payload": {
+                "schema": schema.SOURCE_REVIEW_CONTENT_SCHEMAS[
+                    "lock_review_bundle"
+                ]
+            },
+            "schema": schema.SOURCE_REVIEW_CONTENT_SCHEMAS[
+                "lock_review_bundle"
+            ],
+            "sha256": lock_review_input["sha256"],
+        },
+        "review_sha256": lock_review_input["sha256"],
+        "schema": schema.SOURCE_REVIEW_CONTENT_SCHEMAS["lock_authority"],
+        "status": "approved",
+        "tooling_commit": fake_commit,
+        "tooling_tree": fake_tree,
+    }
+    lock_authority_path = reviewed_root / "lock-authority.json"
+    write_fixture_json(lock_authority_path, lock_authority)
+    lock_authority_input = source_review_input(lock_authority_path)
+    nm_path = reviewed_root / "nm"
+    write_fixture(nm_path, b"fixture reviewed nm\n", 0o555)
+    nm_metadata = nm_path.stat()
+    preapproval = {
+        "binary_byte_identical": True,
+        "forbidden_hook_strings": list(
+            schema.RELEASE_COMPILE_OUT_FORBIDDEN_HOOK_STRINGS
+        ),
+        "nm": {
+            "ctime_ns": nm_metadata.st_ctime_ns,
+            "device": nm_metadata.st_dev,
+            "inode": nm_metadata.st_ino,
+            "link_count": nm_metadata.st_nlink,
+            "mode": stat.S_IMODE(nm_metadata.st_mode),
+            "mtime_ns": nm_metadata.st_mtime_ns,
+            "path": str(nm_path.resolve()),
+            "sha256": sha256_file(nm_path),
+            "size": nm_metadata.st_size,
+        },
+        "preapproval_source_sentinel": (
+            "fa2acb626f303f8a65a16a6c8a1fd86b7e80cf48e092ae21a7308984ae790c94"
+        ),
+        "symbol_inventory_byte_identical": True,
+    }
+    product_overlay_sha256 = hashlib.sha256(
+        b"terminal fixture product overlay"
+    ).hexdigest()
+    current_children = {
+        "artifacts": {
+            name: tools_manifest["tools"][name]
+            for name in ("correctness", "fault")
+        },
+        "lock_authority": lock_authority,
+        "lock_authority_inputs": {
+            "authority": {
+                key: value
+                for key, value in lock_authority_input.items()
+                if key != "schema"
+            },
+            "lock_manifest": {
+                key: value
+                for key, value in lock_manifest_input.items()
+                if key != "schema"
+            },
+            "review_bundle": {
+                key: value
+                for key, value in lock_review_input.items()
+                if key != "schema"
+            },
+        },
+        "lock_manifest_sha256": lock_manifest_input["sha256"],
+        "product_overlay_authority": {
+            "patch": {"sha256": product_overlay_sha256}
+        },
+        "protocol": schema.PROTOCOL,
+        "protocol_sha256": schema.PROTOCOL_SHA256,
+        "release_compile_out": preapproval,
+        "release_compile_out_approval": {
+            "final_integration_action": (
+                "repeat-release-equality-proof-under-real-source-approval"
+            ),
+            "source_approval_sha256": (
+                "fa2acb626f303f8a65a16a6c8a1fd86b7e80cf48e092ae21a7308984ae790c94"
+            ),
+            "source_approval_status": "preapproval-sentinel-not-source-approved",
+        },
+        "review_bundle_sha256": lock_review_input["sha256"],
+        "schema": schema.SOURCE_REVIEW_CONTENT_SCHEMAS[
+            "current_children_attestation"
+        ],
+        "status": "ok",
+        "tools_manifest_sha256": tools_manifest_sha256,
+    }
+    current_children_path = reviewed_root / "current-children-attestation.json"
+    write_fixture_json(current_children_path, current_children)
+    source_inputs = {
+        "current_children_attestation": source_review_input(current_children_path),
+        "lock_authority": lock_authority_input,
+        "lock_manifest": lock_manifest_input,
+        "lock_review_bundle": lock_review_input,
+        "tools_manifest": source_review_input(tools_manifest_path),
+    }
+    requirement = {
+        "binary_byte_identical": True,
+        "cfg_test": False,
+        "forbidden_hook_strings": list(
+            schema.RELEASE_COMPILE_OUT_FORBIDDEN_HOOK_STRINGS
+        ),
+        "forbidden_hook_strings_absent": True,
+        "ordinary_a_role": "published",
+        "overlay_a_role": "proof_only",
+        "preapproval_compile_out_sha256": hashlib.sha256(
+            canonical_json_bytes(preapproval)
+        ).hexdigest(),
+        "product_overlay_sha256": product_overlay_sha256,
+        "proof_must_bind_enclosing_approval_sha256": True,
+        "repeat_under_real_source_approval": True,
+        "rustc_workspace_wrapper": "absent",
+        "same_contract_nonce_lock_toolchain_sandbox": True,
+        "schema": schema.RELEASE_COMPILE_OUT_REQUIREMENT_SCHEMA,
+        "status": "required",
+        "symbol_inventory_byte_identical": True,
+        "variant": "A",
+    }
+    assertion = {
+        "inputs": source_inputs,
+        "open_findings": 0,
+        "protocol": schema.PROTOCOL,
+        "protocol_sha256": schema.PROTOCOL_SHA256,
+        "release_compile_out_requirement": requirement,
+        "schema": schema.SOURCE_REVIEW_ASSERTION_SCHEMA,
+        "status": "approved",
+        "tooling_commit": fake_commit,
+        "tooling_tree": fake_tree,
+    }
+    assertion_sha256 = hashlib.sha256(
+        canonical_json_bytes(assertion)
+    ).hexdigest()
+    bundle = {
+        "assertion": assertion,
+        "assertion_sha256": assertion_sha256,
+        "review_created": {
+            "author": "terminal-reviewer",
+            "data": {
+                "description": "Synthetic terminal source authority",
+                "initial_commit": fake_commit,
+                "jj_change_id": f"detached:{fake_commit}",
+                "review_id": review_id,
+                "scm_anchor": f"detached:{fake_commit}",
+                "scm_kind": "git",
+                "title": "Synthetic terminal source authority",
+            },
+            "event": "ReviewCreated",
+            "ts": review_time,
+        },
+        "schema": schema.SOURCE_REVIEW_BUNDLE_SCHEMA,
+        "verdict": {
+            "author": "terminal-reviewer",
+            "data": {
+                "reason": (
+                    f"APPROVED assertion_sha256={assertion_sha256}; open_findings=0"
+                ),
+                "review_id": review_id,
+                "vote": "lgtm",
+            },
+            "event": "ReviewerVoted",
+            "ts": review_time,
+        },
+    }
+    source_bundle_path = reviewed_root / "source-review-bundle.json"
+    write_fixture_json(source_bundle_path, bundle)
+    prepared_source_review: dict[str, Any] = {}
+    for name, source, filename in (
+        ("bundle", source_bundle_path, "source-review-bundle.json"),
+        (
+            "current_children_attestation",
+            current_children_path,
+            "current-children-attestation.json",
+        ),
+        ("lock_authority", lock_authority_path, "lock-review-authority.json"),
+        ("lock_review_bundle", lock_review_path, "lock-review-bundle.json"),
+    ):
+        destination = tooling_root / "bindings" / filename
+        write_fixture(destination, source.read_bytes(), 0o444)
+        prepared_source_review[name] = {
+            "mode": 0o444,
+            "path": str(destination.resolve()),
+            "sha256": sha256_file(destination),
+        }
+    source_review = {
+        "assertion_sha256": assertion_sha256,
+        "bundle": {
+            "mode": 0o444,
+            "schema": schema.SOURCE_REVIEW_BUNDLE_SCHEMA,
+            "sha256": sha256_file(source_bundle_path),
+        },
+        "current_children_attestation": {
+            "mode": 0o444,
+            "schema": schema.SOURCE_REVIEW_CONTENT_SCHEMAS[
+                "current_children_attestation"
+            ],
+            "sha256": source_inputs["current_children_attestation"]["sha256"],
+        },
+        "lock_authority": {
+            "mode": 0o444,
+            "schema": schema.SOURCE_REVIEW_CONTENT_SCHEMAS["lock_authority"],
+            "sha256": lock_authority_input["sha256"],
+        },
+        "lock_review_bundle": {
+            "mode": 0o444,
+            "schema": schema.SOURCE_REVIEW_CONTENT_SCHEMAS[
+                "lock_review_bundle"
+            ],
+            "sha256": lock_review_input["sha256"],
+        },
+        "release_compile_out_requirement": requirement,
+    }
     source_variants: dict[str, dict[str, Any]] = {}
     for variant in schema.VARIANTS:
         binding = schema.VARIANT_SOURCE_BINDINGS[variant]
@@ -2304,16 +3967,17 @@ def build_terminal_fixture_v3(
         "protocol": schema.PROTOCOL,
         "protocol_sha256": schema.PROTOCOL_SHA256,
         "status": "approved",
-        "review_id": "cr-terminal-fixture",
-        "reviewed_at": "2026-07-15T00:00:00+00:00",
+        "review_id": review_id,
+        "reviewed_at": review_time,
         "tooling_commit": fake_commit,
         "tooling_tree": fake_tree,
-        "toolchain": {},
+        "toolchain": terminal_toolchain,
         "shared_manifest_sha256": hashlib.sha256(b"terminal-shared").hexdigest(),
         "tools_manifest": tools_manifest,
         "tools_manifest_sha256": tools_manifest_sha256,
         "filesystem_admission": {},
-        "comm_allowlist": sorted(comms.values()),
+        "comm_allowlist": schema.expected_comm_allowlist(),
+        "source_review": source_review,
         "variants": source_variants,
     }
     original_approval_path = tooling_root.joinpath(
@@ -2368,6 +4032,384 @@ def build_terminal_fixture_v3(
             "correctness_oracle_mode": variant != "B",
             "attestation": {},
         }
+
+    def release_file_record(path: Path) -> dict[str, Any]:
+        metadata = path.stat()
+        return {
+            "identity": {
+                "changed_ns": metadata.st_ctime_ns,
+                "device": metadata.st_dev,
+                "inode": metadata.st_ino,
+                "link_count": metadata.st_nlink,
+                "modified_ns": metadata.st_mtime_ns,
+            },
+            "mode": stat.S_IMODE(metadata.st_mode),
+            "path": str(path.resolve()),
+            "sha256": sha256_file(path),
+            "size": metadata.st_size,
+        }
+
+    ordinary_binary = Path(prepared_variants["A"]["binary"]["path"])
+    overlay_binary = tooling_root / "proof-only" / "rebaseline-bench-overlay"
+    write_fixture(overlay_binary, ordinary_binary.read_bytes(), 0o555)
+    symbols = b"terminal_fixture_symbol T 0\n"
+    ordinary_inventory = tooling_root / "manifests" / "symbols-ordinary-a.txt"
+    overlay_inventory = tooling_root / "manifests" / "symbols-overlay-a.txt"
+    write_fixture(ordinary_inventory, symbols)
+    write_fixture(overlay_inventory, symbols)
+    contract_path = tooling_root / "manifests" / "release-contract-a.json"
+    write_fixture_json(contract_path, prepared_variants["A"]["contract"])
+    fixture_hash = hashlib.sha256(b"terminal fixture field").hexdigest()
+    materialized_path = tooling_root / "materialized" / "A"
+    materialized_path.mkdir(parents=True)
+    materialized_root = str(materialized_path.resolve())
+    target_dir = str((tooling_root / "targets" / "A").resolve())
+    descriptor_bindings = (
+        ("--ro-bind-fd", "401", GUEST_SOURCE),
+        ("--bind-fd", "402", GUEST_TARGET),
+        ("--ro-bind-fd", "403", GUEST_TOOLCHAIN_ROOT),
+        ("--ro-bind-fd", "404", GUEST_CARGO),
+        ("--ro-bind-fd", "405", GUEST_RUSTC),
+        ("--ro-bind-fd", "406", GUEST_CARGO_HOME),
+        ("--ro-bind-fd", "407", GUEST_RUSTUP_HOME),
+    )
+    config_descriptor_bindings = tuple(
+        ("--ro-bind-fd", str(408 + offset), guest_path)
+        for offset, guest_path in enumerate(GUEST_BOUND_CONFIG_PATHS)
+    )
+    release_build_argv = [
+        "/fixture/bwrap",
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-net",
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev-bind",
+        "/dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--tmpfs",
+        "/tmp",
+        "--tmpfs",
+        GUEST_ROOT,
+        "--dir",
+        f"{GUEST_ROOT}/.cargo",
+        "--tmpfs",
+        f"{GUEST_ROOT}/.cargo",
+        "--remount-ro",
+        f"{GUEST_ROOT}/.cargo",
+        "--dir",
+        "/.cargo",
+        "--tmpfs",
+        "/.cargo",
+        "--remount-ro",
+        "/.cargo",
+        *(argument for binding in descriptor_bindings for argument in binding),
+        "--dir",
+        f"{GUEST_SOURCE}/.cargo",
+        "--tmpfs",
+        f"{GUEST_SOURCE}/.cargo",
+        *(
+            argument
+            for binding in config_descriptor_bindings[:2]
+            for argument in binding
+        ),
+        "--remount-ro",
+        f"{GUEST_SOURCE}/.cargo",
+        *(
+            argument
+            for binding in config_descriptor_bindings[2:]
+            for argument in binding
+        ),
+        "--remount-ro",
+        GUEST_CARGO_HOME,
+        "--chdir",
+        GUEST_SOURCE,
+        GUEST_CARGO,
+        "build",
+        "--locked",
+        "--offline",
+        "--release",
+        "-p",
+        "mess-store",
+        "--example",
+        "asterism_rebaseline_public",
+        "--target-dir",
+        GUEST_TARGET,
+    ]
+    cargo_config_manifest = {
+        "cargo_home_path": GUEST_CARGO_HOME,
+        "cwd": GUEST_SOURCE,
+        "entries": [
+            {
+                "path": f"{GUEST_SOURCE}/.cargo/config.toml",
+                "sha256": EMPTY_SHA256,
+                "status": "present",
+            },
+            {
+                "path": f"{GUEST_SOURCE}/.cargo/config",
+                "sha256": EMPTY_SHA256,
+                "status": "present",
+            },
+            {
+                "path": f"{GUEST_ROOT}/.cargo/config.toml",
+                "sha256": None,
+                "status": "absent",
+            },
+            {
+                "path": f"{GUEST_ROOT}/.cargo/config",
+                "sha256": None,
+                "status": "absent",
+            },
+            {"path": "/.cargo/config.toml", "sha256": None, "status": "absent"},
+            {"path": "/.cargo/config", "sha256": None, "status": "absent"},
+            {
+                "path": f"{GUEST_CARGO_HOME}/config.toml",
+                "sha256": sha256_file(terminal_cargo_home / "config.toml"),
+                "status": "present",
+            },
+            {
+                "path": f"{GUEST_CARGO_HOME}/config",
+                "sha256": EMPTY_SHA256,
+                "status": "present",
+            },
+        ],
+        "schema": schema.CARGO_CONFIG_SEARCH_SCHEMA,
+    }
+    ordinary_config_path = tooling_root / "manifests" / "cargo-config-A.json"
+    write_fixture(
+        ordinary_config_path.with_name(f"{ordinary_config_path.name}.empty"),
+        b"",
+    )
+    write_fixture_json(ordinary_config_path, cargo_config_manifest)
+    ordinary_config_binding = {
+        "path": str(ordinary_config_path.resolve()),
+        "sha256": sha256_file(ordinary_config_path),
+    }
+    ordinary_attestation: dict[str, Any] = {
+        field: fixture_hash for field in schema.PREPARED_ATTESTATION_FIELDS
+    }
+    ordinary_attestation.update(
+        {
+            "archive_manifest_path": str(tooling_root / "archive-manifest.json"),
+            "build_argv": release_build_argv,
+            "build_child": {"argv": release_build_argv},
+            "build_env": {
+                "ASTERISM_BUILD_SOURCE_APPROVAL_SHA256": approval_sha256,
+                "CARGO_HOME": GUEST_CARGO_HOME,
+                "PATH": f"{GUEST_TOOLCHAIN_ROOT}/bin:/usr/bin:/bin",
+                "RUSTC": GUEST_RUSTC,
+                "RUSTUP_HOME": GUEST_RUSTUP_HOME,
+            },
+            "build_completed_at": "2026-07-15T00:00:01+00:00",
+            "build_completed_monotonic_ns": 20,
+            "build_nonce": prepared_variants["A"]["contract"]["build_nonce"],
+            "build_started_at": "2026-07-15T00:00:00+00:00",
+            "build_started_monotonic_ns": 10,
+            "cargo_config_search": ordinary_config_binding,
+            "cargo_lock_path": str(tooling_root / "Cargo.lock"),
+            "cargo_lock_post_sha256": source_variants["A"]["cargo_lock_sha256"],
+            "cargo_lock_pre_sha256": source_variants["A"]["cargo_lock_sha256"],
+            "cargo_lock_sha256": source_variants["A"]["cargo_lock_sha256"],
+            "contract_child": {},
+            "contract_output_path": str(contract_path.resolve()),
+            "contract_output_sha256": sha256_file(contract_path),
+            "materialized_manifest_path": str(
+                tooling_root / "materialized-manifest.json"
+            ),
+            "materialized_root": materialized_root,
+            "overlay_manifest_path": str(tooling_root / "overlay-manifest.json"),
+            "source_archive_bytes": 1,
+            "source_archive_path": str(tooling_root / "source.tar"),
+            "source_commit": source_variants["A"]["product_commit"],
+            "source_read_only": True,
+            "source_tree": source_variants["A"]["product_tree"],
+            "target_dir": target_dir,
+            "target_dir_was_absent": True,
+            "toolchain": approval["toolchain"],
+        }
+    )
+    overlay_attestation = dict(ordinary_attestation)
+    overlay_config_path = (
+        tooling_root / "manifests" / "cargo-config-A-product-overlay.json"
+    )
+    write_fixture(
+        overlay_config_path.with_name(f"{overlay_config_path.name}.empty"),
+        b"",
+    )
+    write_fixture(overlay_config_path, ordinary_config_path.read_bytes())
+    overlay_attestation["cargo_config_search"] = {
+        "path": str(overlay_config_path.resolve()),
+        "sha256": sha256_file(overlay_config_path),
+    }
+    overlay_attestation["product_overlay_sha256"] = product_overlay_sha256
+    prepared_variants["A"]["attestation"] = ordinary_attestation
+    normalized_sandbox = list(release_build_argv)
+    for index, argument in enumerate(release_build_argv):
+        if argument in {"--ro-bind-fd", "--bind-fd"}:
+            normalized_sandbox[index + 1] = (
+                f"$FD:{release_build_argv[index + 2]}"
+            )
+    equivalence = {
+        "build_environment_sha256": hashlib.sha256(
+            canonical_json_bytes(ordinary_attestation["build_env"])
+        ).hexdigest(),
+        "build_nonce": ordinary_attestation["build_nonce"],
+        "cargo_lock_sha256": ordinary_attestation["cargo_lock_sha256"],
+        "cfg_test": False,
+        "contract_sha256": hashlib.sha256(
+            canonical_json_bytes(prepared_variants["A"]["contract"])
+        ).hexdigest(),
+        "ordinary_a_role": "published",
+        "overlay_a_role": "proof_only",
+        "rustc_workspace_wrapper": "absent",
+        "sandbox_sha256": hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "argv": normalized_sandbox,
+                    "cargo_config_search_sha256": ordinary_config_binding[
+                        "sha256"
+                    ],
+                }
+            )
+        ).hexdigest(),
+        "source_approval_sha256": approval_sha256,
+        "toolchain_sha256": hashlib.sha256(
+            canonical_json_bytes(ordinary_attestation["toolchain"])
+        ).hexdigest(),
+    }
+
+    def release_build(
+        name: str, artifact_role: str, attestation: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return {
+            "artifact_role": artifact_role,
+            "attestation": attestation,
+            "attestation_sha256": hashlib.sha256(
+                canonical_json_bytes(attestation)
+            ).hexdigest(),
+            "build_environment_sha256": equivalence["build_environment_sha256"],
+            "build_nonce": equivalence["build_nonce"],
+            "cargo_lock_sha256": equivalence["cargo_lock_sha256"],
+            "cfg_test": False,
+            "contract_sha256": equivalence["contract_sha256"],
+            "role": name,
+            "rustc_workspace_wrapper": "absent",
+            "sandbox_sha256": equivalence["sandbox_sha256"],
+            "source_approval_sha256": approval_sha256,
+            "toolchain_sha256": equivalence["toolchain_sha256"],
+        }
+
+    nm_tool = {
+        "identity": {
+            "changed_ns": preapproval["nm"]["ctime_ns"],
+            "device": preapproval["nm"]["device"],
+            "inode": preapproval["nm"]["inode"],
+            "link_count": preapproval["nm"]["link_count"],
+            "modified_ns": preapproval["nm"]["mtime_ns"],
+        },
+        "mode": preapproval["nm"]["mode"],
+        "path": preapproval["nm"]["path"],
+        "sha256": preapproval["nm"]["sha256"],
+        "size": preapproval["nm"]["size"],
+    }
+
+    def nm_child(name: str, ordinal: int) -> dict[str, Any]:
+        output_path = tooling_root / "logs" / f"nm-{name}.json"
+        write_fixture_json(
+            output_path,
+            {
+                "exit_status": 0,
+                "stderr": "",
+                "stderr_sha256": hashlib.sha256(b"").hexdigest(),
+                "stdout": symbols.decode(),
+                "stdout_sha256": hashlib.sha256(symbols).hexdigest(),
+            },
+        )
+        pid = 50_000 + ordinal
+        start_ticks = 60_000 + ordinal
+        return {
+            "argv": [
+                str(nm_path.resolve()),
+                "--defined-only",
+                "--demangle=rust",
+                "--format=posix",
+                f"/proc/self/fd/{700 + ordinal}",
+            ],
+            "completed_at": "2026-07-15T00:00:01+00:00",
+            "completed_monotonic_ns": 20_000 + ordinal,
+            "cwd": str(root.resolve()),
+            "exit_status": 0,
+            "output_path": str(output_path.resolve()),
+            "output_sha256": sha256_file(output_path),
+            "pid": pid,
+            "process_group_absent": True,
+            "reaping": {
+                "pid": pid,
+                "start_ticks": start_ticks,
+                "status": "absent",
+            },
+            "start_ticks": start_ticks,
+            "started_at": "2026-07-15T00:00:00+00:00",
+            "started_monotonic_ns": 10_000 + ordinal,
+            "timed_out": False,
+            "waited_pid": pid,
+        }
+
+    release_compile_out = {
+        "binaries": {
+            "ordinary_a": release_file_record(ordinary_binary),
+            "overlay_a": release_file_record(overlay_binary),
+        },
+        "binary_byte_identical": True,
+        "builds": {
+            "ordinary_a": release_build(
+                "ordinary_a", "published", ordinary_attestation
+            ),
+            "overlay_a": release_build(
+                "overlay_a", "proof_only", overlay_attestation
+            ),
+        },
+        "current_children_attestation_sha256": source_inputs[
+            "current_children_attestation"
+        ]["sha256"],
+        "equivalence_contract": equivalence,
+        "forbidden_hook_strings": list(
+            schema.RELEASE_COMPILE_OUT_FORBIDDEN_HOOK_STRINGS
+        ),
+        "forbidden_hook_strings_absent": True,
+        "nm": {
+            "ordinary_a": nm_child("ordinary-a", 1),
+            "overlay_a": nm_child("overlay-a", 2),
+            "tool": nm_tool,
+        },
+        "product_overlay_sha256": product_overlay_sha256,
+        "protocol": schema.PROTOCOL,
+        "protocol_sha256": schema.PROTOCOL_SHA256,
+        "published_a_sha256": sha256_file(ordinary_binary),
+        "requirement_sha256": hashlib.sha256(
+            canonical_json_bytes(requirement)
+        ).hexdigest(),
+        "schema": schema.RELEASE_COMPILE_OUT_SCHEMA,
+        "source_approval_sha256": approval_sha256,
+        "status": "ok",
+        "symbol_inventories": {
+            "ordinary_a": release_file_record(ordinary_inventory),
+            "overlay_a": release_file_record(overlay_inventory),
+        },
+        "symbol_inventory_byte_identical": True,
+    }
+    release_compile_out_path = (
+        tooling_root / schema.RELEASE_COMPILE_OUT_RELATIVE_PATH
+    )
+    write_fixture_json(release_compile_out_path, release_compile_out)
+    release_compile_out_binding = {
+        "mode": 0o444,
+        "path": str(release_compile_out_path.resolve()),
+        "sha256": sha256_file(release_compile_out_path),
+    }
     prepared = {
         "schema": schema.PREPARED_ARTIFACTS_SCHEMA,
         "protocol": schema.PROTOCOL,
@@ -2383,7 +4425,9 @@ def build_terminal_fixture_v3(
         "single_use_claim": {
             "path": str(tooling_root / "claims" / "single-use-claim.json")
         },
-        "comm_allowlist": sorted(comms.values()),
+        "source_review": prepared_source_review,
+        "release_compile_out": release_compile_out_binding,
+        "comm_allowlist": schema.expected_comm_allowlist(),
         "tools": tools,
         "support_files": support,
         "tools_manifest": {
@@ -2394,7 +4438,7 @@ def build_terminal_fixture_v3(
         "inputs": {},
         "filesystem_admission": {},
         "build_order": list(schema.VARIANTS),
-        "toolchain": {},
+        "toolchain": terminal_toolchain,
         "variants": prepared_variants,
     }
     original_prepared_path = tooling_root / "prepared-artifacts.json"
@@ -3163,10 +5207,286 @@ def self_test() -> dict[str, Any]:
             ),
         )
 
+        def terminal_authority_file_mutation(
+            path: Path,
+            mutator: Any,
+            expected_error: str,
+        ) -> bool:
+            original = path.read_bytes()
+            mode = stat.S_IMODE(path.stat().st_mode)
+            try:
+                value = json.loads(original)
+                mutator(value)
+                write_fixture_json(path, value, mode)
+                _BOUND_SNAPSHOTS.clear()
+                result, mutation_rc = verify(output, publish=False)
+                return mutation_rc == EXIT_INVALID and any(
+                    expected_error in error for error in result["errors"]
+                )
+            finally:
+                write_fixture(path, original, mode)
+                _BOUND_SNAPSHOTS.clear()
+
+        check(
+            "terminal-mutation-source-review-seal-binding",
+            lambda: terminal_authority_file_mutation(
+                Path(
+                    attempt_prepared_fixture["source_review"]["bundle"]["path"]
+                ),
+                lambda value: value["verdict"]["data"].__setitem__(
+                    "vote", "reject"
+                ),
+                "prepared source review bundle bytes differ from binding",
+            ),
+        )
+        check(
+            "terminal-mutation-release-proof-binding",
+            lambda: terminal_authority_file_mutation(
+                Path(attempt_prepared_fixture["release_compile_out"]["path"]),
+                lambda value: value.__setitem__("status", "forged"),
+                "prepared release compile-out proof bytes differ from binding",
+            ),
+        )
+
+        approval_fixture = json.loads(original_approval_fixture_path.read_bytes())
+        bundle_fixture = json.loads(
+            Path(attempt_prepared_fixture["source_review"]["bundle"]["path"])
+            .read_bytes()
+        )
+        current_children_fixture = json.loads(
+            Path(
+                attempt_prepared_fixture["source_review"][
+                    "current_children_attestation"
+                ]["path"]
+            ).read_bytes()
+        )
+        lock_authority_fixture = json.loads(
+            Path(
+                attempt_prepared_fixture["source_review"]["lock_authority"]["path"]
+            ).read_bytes()
+        )
+        lock_review_fixture = json.loads(
+            Path(
+                attempt_prepared_fixture["source_review"]["lock_review_bundle"][
+                    "path"
+                ]
+            ).read_bytes()
+        )
+        proof_fixture = json.loads(
+            Path(attempt_prepared_fixture["release_compile_out"]["path"])
+            .read_bytes()
+        )
+        config_fixture = json.loads((output / "config.json").read_bytes())
+
+        def reseal_source_bundle(
+            approval_value: dict[str, Any], bundle_value: dict[str, Any]
+        ) -> None:
+            assertion_sha256 = hashlib.sha256(
+                canonical_json_bytes(bundle_value["assertion"])
+            ).hexdigest()
+            bundle_value["assertion_sha256"] = assertion_sha256
+            approval_value["source_review"]["assertion_sha256"] = assertion_sha256
+            bundle_value["verdict"]["data"]["reason"] = (
+                f"APPROVED assertion_sha256={assertion_sha256}; open_findings=0"
+            )
+
+        def terminal_local_source_mutation(
+            mutator: Any, expected_error: str
+        ) -> bool:
+            approval_value = json.loads(json.dumps(approval_fixture))
+            bundle_value = json.loads(json.dumps(bundle_fixture))
+            current_value = json.loads(json.dumps(current_children_fixture))
+            lock_value = json.loads(json.dumps(lock_authority_fixture))
+            lock_review_value = json.loads(json.dumps(lock_review_fixture))
+            mutator(
+                approval_value,
+                bundle_value,
+                current_value,
+                lock_value,
+                lock_review_value,
+            )
+            semantic_errors: list[str] = []
+            validate_terminal_source_review_semantics(
+                approval_value,
+                bundle_value,
+                current_value,
+                lock_value,
+                lock_review_value,
+                semantic_errors,
+            )
+            return any(expected_error in error for error in semantic_errors)
+
+        def alias_reviewed_inputs(
+            approval_value: dict[str, Any],
+            bundle_value: dict[str, Any],
+            _current: dict[str, Any],
+            _lock: dict[str, Any],
+            _lock_review: dict[str, Any],
+        ) -> None:
+            inputs = bundle_value["assertion"]["inputs"]
+            inputs["lock_manifest"]["path"] = inputs["lock_authority"]["path"]
+            inputs["lock_manifest"]["identity"] = json.loads(
+                json.dumps(inputs["lock_authority"]["identity"])
+            )
+            reseal_source_bundle(approval_value, bundle_value)
+
+        check(
+            "terminal-local-rejects-reviewed-input-alias",
+            lambda: terminal_local_source_mutation(
+                alias_reviewed_inputs, "inputs are not physically disjoint"
+            ),
+        )
+
+        def scalar_reviewed_input(
+            approval_value: dict[str, Any],
+            bundle_value: dict[str, Any],
+            _current: dict[str, Any],
+            _lock: dict[str, Any],
+            _lock_review: dict[str, Any],
+        ) -> None:
+            bundle_value["assertion"]["inputs"]["lock_authority"] = "malformed"
+            reseal_source_bundle(approval_value, bundle_value)
+
+        check(
+            "terminal-local-rejects-scalar-reviewed-input",
+            lambda: terminal_local_source_mutation(
+                scalar_reviewed_input,
+                "source-review input lock_authority fields are not exact",
+            ),
+        )
+        check(
+            "terminal-local-rejects-seal-semantic-vote",
+            lambda: terminal_local_source_mutation(
+                lambda _approval, bundle, _current, _lock, _review: bundle[
+                    "verdict"
+                ]["data"].__setitem__("vote", "reject"),
+                "ReviewerVoted authority differs",
+            ),
+        )
+        check(
+            "terminal-local-rejects-embedded-lock-review-payload",
+            lambda: terminal_local_source_mutation(
+                lambda _approval, _bundle, _current, lock, _review: lock[
+                    "review_bundle"
+                ].__setitem__("payload", {"schema": "forged"}),
+                "prepared lock authority differs",
+            ),
+        )
+        check(
+            "terminal-local-rejects-preapproval-semantic-crosslink",
+            lambda: terminal_local_source_mutation(
+                lambda _approval, _bundle, current, _lock, _review: current[
+                    "release_compile_out_approval"
+                ].__setitem__("source_approval_status", "source-approved"),
+                "preapproval authority differs",
+            ),
+        )
+
+        def terminal_local_proof_mutation(
+            mutator: Any, expected_error: str
+        ) -> bool:
+            proof_value = json.loads(json.dumps(proof_fixture))
+            prepared_value = json.loads(json.dumps(attempt_prepared_fixture))
+            config_value = json.loads(json.dumps(config_fixture))
+            mutator(proof_value, prepared_value, config_value)
+            semantic_errors: list[str] = []
+            _BOUND_SNAPSHOTS.clear()
+            validate_terminal_release_proof_semantics(
+                proof_value,
+                prepared_value,
+                approval_fixture,
+                current_children_fixture,
+                config_value,
+                semantic_errors,
+            )
+            _BOUND_SNAPSHOTS.clear()
+            return any(expected_error in error for error in semantic_errors)
+
+        def mutate_overlay_attestation_nonce(
+            proof_value: dict[str, Any],
+            _prepared: dict[str, Any],
+            _config: dict[str, Any],
+        ) -> None:
+            build = proof_value["builds"]["overlay_a"]
+            build["attestation"]["build_nonce"] = "0" * 64
+            build["attestation_sha256"] = hashlib.sha256(
+                canonical_json_bytes(build["attestation"])
+            ).hexdigest()
+
+        check(
+            "terminal-local-rejects-rehashed-overlay-attestation-nonce",
+            lambda: terminal_local_proof_mutation(
+                mutate_overlay_attestation_nonce, "embedded authority differs"
+            ),
+        )
+        check(
+            "terminal-local-rejects-inventory-identity-alias",
+            lambda: terminal_local_proof_mutation(
+                lambda proof, _prepared, _config: proof["symbol_inventories"].__setitem__(
+                    "overlay_a",
+                    json.loads(json.dumps(proof["symbol_inventories"]["ordinary_a"])),
+                ),
+                "inventories are not equal physically-disjoint files",
+            ),
+        )
+        check(
+            "terminal-local-rejects-nm-argv-semantic-mutation",
+            lambda: terminal_local_proof_mutation(
+                lambda proof, _prepared, _config: proof["nm"]["ordinary_a"][
+                    "argv"
+                ].__setitem__(1, "--undefined-only"),
+                "nm child ordinary_a did not complete exactly",
+            ),
+        )
+        check(
+            "terminal-local-rejects-published-a-rebound",
+            lambda: terminal_local_proof_mutation(
+                lambda proof, _prepared, _config: proof.__setitem__(
+                    "published_a_sha256", "0" * 64
+                ),
+                "published ordinary A binding differs",
+            ),
+        )
+        check(
+            "terminal-local-rejects-config-reachable-proof-twin",
+            lambda: terminal_local_proof_mutation(
+                lambda proof, _prepared, config: config.__setitem__(
+                    "argv_templates", [proof["binaries"]["overlay_a"]["path"]]
+                ),
+                "proof-only overlay A is config-reachable",
+            ),
+        )
+
         projection_children = read_jsonl(
             output / "child-manifest.jsonl",
             "terminal projection fixture children",
             [],
+        )
+
+        def terminal_completed_child_twin_rejected() -> bool:
+            proof = json.loads(
+                Path(
+                    attempt_prepared_fixture["release_compile_out"]["path"]
+                ).read_bytes()
+            )
+            hostile_children = json.loads(json.dumps(projection_children))
+            hostile_children[-1]["argv"].append(
+                proof["binaries"]["overlay_a"]["path"]
+            )
+            reachability_errors: list[str] = []
+            validate_terminal_proof_only_child_reachability(
+                hostile_children,
+                proof["binaries"]["overlay_a"]["path"],
+                reachability_errors,
+            )
+            return any(
+                "completed child manifest" in error
+                for error in reachability_errors
+            )
+
+        check(
+            "terminal-mutation-release-twin-final-child-reachable",
+            terminal_completed_child_twin_rejected,
         )
         check(
             "terminal-full-fixture-covers-null-non-row-results",
