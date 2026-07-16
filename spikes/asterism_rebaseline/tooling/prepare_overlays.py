@@ -178,6 +178,20 @@ PLAN_PATH = HERE / "source-plan.json"
 SHARED_SOURCE = HERE / "overlay" / "shared"
 PUBLIC_SOURCE = HERE / "overlay" / "public"
 BARE_SOURCE = HERE / "overlay" / "bare"
+CURRENT_SOURCE = HERE / "current"
+CURRENT_PREPARE_CHILDREN = CURRENT_SOURCE / "prepare_children.py"
+CURRENT_CORRECTNESS = CURRENT_SOURCE / "correctness.rs"
+CURRENT_PRODUCT_OVERLAY = CURRENT_SOURCE / (
+    "product" + "-test-overlay.patch"
+)
+CURRENT_PRODUCT_OVERLAY_VALIDATOR = (
+    CURRENT_SOURCE / "validate_product_test_overlay.py"
+)
+CURRENT_PRODUCT_COMMIT = "d644dc583dfe6a3d2cd07e71ce0212a323875ab4"
+CURRENT_PRODUCT_TREE = "205d853905bdb648ee997900c6aef24a323aa380"
+CURRENT_PRODUCT_OVERLAY_SHA256 = (
+    "3e2cd85c17be87f48fce1ed5909c5b173d16b9572ed34987225a463f5592db9b"
+)
 PROTOCOL_DOCUMENT = HERE.parent / "BN-2L3N-PROTOCOL.md"
 HISTORICAL_BASELINE = HERE.parents[1] / "baseline_matrix" / "BN-2SU-FINAL.csv"
 
@@ -1663,6 +1677,205 @@ def validate_correctness_oracle_control_source(public: str) -> None:
         raise PreparationError("correctness oracle mode routing is reordered")
 
 
+def validate_semantic_oracle_integration_sources(
+    public: str, semantic: str
+) -> None:
+    """Keep C/D's frozen oracle exact while A reuses the same semantic core."""
+
+    shared = rust_item(
+        semantic,
+        "pub async fn run_generation_neutral_semantic_oracle(",
+        "shared generation-neutral semantic oracle",
+    )
+    for marker in (
+        'const EVENT_NAME: &str = "asterism.rebaseline.event";',
+        'fn name(&self) -> &\'static str { "asterism.rebaseline.rejected" }',
+        'b"common-oracle/alpha/0"',
+        'b"common-oracle/alpha/1"',
+        'b"common-oracle/beta/0"',
+        'b"common-oracle/alpha/2"',
+        "Err(AppendError::Conflict {",
+        "Err(AppendError::Backend(_))",
+        "domain_events:  4",
+        "fresh_streams:  2",
+        "public_appends: 3",
+    ):
+        if semantic.count(marker) != 1:
+            raise PreparationError(
+                f"shared semantic oracle marker differs: {marker}"
+            )
+    if shared.count(".append(") != 5:
+        raise PreparationError("shared semantic oracle append calls differ")
+    if shared.count(".load::<OracleAggregate>(") != 3:
+        raise PreparationError("shared semantic oracle load calls differ")
+    if shared.count(".subscribe(None)") != 1:
+        raise PreparationError("shared semantic oracle subscription differs")
+    for forbidden in (
+        ".append_batch(",
+        ".append_batch_owned(",
+        ".command::<",
+        ".command_cached::<",
+        ".load_cached::<",
+        ".load_hot::<",
+        ".with_cache_capacity(",
+    ):
+        if forbidden in shared:
+            raise PreparationError(
+                f"shared semantic oracle contains generation-specific path: {forbidden}"
+            )
+
+    oracle = rust_item(
+        public,
+        "fn run_common_public_oracle(",
+        "public correctness oracle",
+    )
+    for marker in (
+        '#[path = "asterism_rebaseline_shared/semantic_oracle.rs"]',
+        "mod semantic_oracle;",
+    ):
+        if public.count(marker) != 1:
+            raise PreparationError(
+                f"public shared-oracle module marker differs: {marker}"
+            )
+    routing = (
+        "let store = EventStore::new(backend).with_page_size(16);",
+        "let observations = runtime.block_on(",
+        "semantic_oracle::run_generation_neutral_semantic_oracle(&store)",
+        """adapter::assert_oracle_accounting(
+        &engine,
+        observations.domain_events,
+        observations.public_appends,
+        observations.fresh_streams,
+        false,
+    );""",
+    )
+    for marker in routing:
+        if oracle.count(marker) != 1:
+            raise PreparationError(
+                f"public shared-oracle integration marker differs: {marker}"
+            )
+    if [oracle.index(marker) for marker in routing] != sorted(
+        oracle.index(marker) for marker in routing
+    ):
+        raise PreparationError("public shared-oracle integration is reordered")
+    if ".with_cache_capacity(" in oracle:
+        raise PreparationError("historical public oracle enabled A-only cache")
+    if "common-oracle/alpha/0" in oracle:
+        raise PreparationError("public oracle retained an inline semantic copy")
+
+
+def run_current_static_tool(*arguments: str) -> dict[str, Any]:
+    completed = subprocess.run(
+        [sys.executable, "-B", *arguments],
+        cwd=HERE.parents[2],
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    if completed.returncode != 0 or completed.stderr:
+        raise PreparationError(
+            "current correctness static authority failed: "
+            f"rc={completed.returncode} stderr={completed.stderr!r}"
+        )
+    try:
+        value = json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        raise PreparationError(
+            "current correctness static authority output is not JSON"
+        ) from error
+    if not isinstance(value, dict):
+        raise PreparationError(
+            "current correctness static authority output is not an object"
+        )
+    return value
+
+
+def validate_current_correctness_construction() -> None:
+    child_self_test = run_current_static_tool(
+        str(CURRENT_PREPARE_CHILDREN), "self-test"
+    )
+    if child_self_test != {
+        "hostile_mutations_rejected": 36,
+        "schema": "bn-2k0f-prepare-children-self-test-v1",
+        "status": "ok",
+    }:
+        raise PreparationError("current child source self-test differs")
+
+    hook_self_test = run_current_static_tool(
+        str(CURRENT_PRODUCT_OVERLAY_VALIDATOR), "--self-test"
+    )
+    if (
+        hook_self_test.get("schema")
+        != "bn-xfw3-product-test-overlay-validator-v1"
+        or hook_self_test.get("outcome") != "SELF_TEST_PASS"
+        or hook_self_test.get("patch_sha256")
+        != CURRENT_PRODUCT_OVERLAY_SHA256
+        or not isinstance(hook_self_test.get("checks"), list)
+        or len(hook_self_test["checks"]) != 9
+    ):
+        raise PreparationError("current product hook self-test differs")
+
+    hook_validation = run_current_static_tool(
+        str(CURRENT_PRODUCT_OVERLAY_VALIDATOR)
+    )
+    if (
+        hook_validation.get("outcome") != "PASS"
+        or hook_validation.get("patch_sha256")
+        != CURRENT_PRODUCT_OVERLAY_SHA256
+        or not isinstance(hook_validation.get("checks"), list)
+        or len(hook_validation["checks"]) != 8
+    ):
+        raise PreparationError("current product hook validation differs")
+
+    with tempfile.TemporaryDirectory(
+        prefix="asterism-current-correctness-construction-"
+    ) as temporary:
+        output = Path(temporary) / "construction"
+        manifest = run_current_static_tool(
+            str(CURRENT_PREPARE_CHILDREN),
+            "prepare",
+            "--product-commit",
+            CURRENT_PRODUCT_COMMIT,
+            "--product-tree",
+            CURRENT_PRODUCT_TREE,
+            "--product-overlay",
+            str(CURRENT_PRODUCT_OVERLAY),
+            "--output",
+            str(output),
+        )
+        authority = manifest.get("product_test_overlay_authority")
+        if (
+            manifest.get("product_commit") != CURRENT_PRODUCT_COMMIT
+            or manifest.get("product_tree") != CURRENT_PRODUCT_TREE
+            or not isinstance(authority, dict)
+            or authority.get("sha256") != CURRENT_PRODUCT_OVERLAY_SHA256
+            or authority.get("reviewed_commit")
+            != "478e1c61968f6a02722e6881e4c765f47b921770"
+            or authority.get("checks") != hook_validation.get("checks")
+            or manifest.get("build_contract")
+            != {
+                "cargo_locked": True,
+                "cargo_offline": True,
+                "correctness_only": True,
+                "rustc_cfg": ["test"],
+                "target_comm": "ast-rb-check",
+            }
+        ):
+            raise PreparationError(
+                "current correctness construction manifest differs"
+            )
+        if (output / "construction.json").read_bytes() != canonical_json(
+            manifest
+        ):
+            raise PreparationError(
+                "current correctness construction was not canonical"
+            )
+
+
 def validate_reopen_digest_sources(public: str, digest: str) -> None:
     """Bind reopen evidence to one 64-lowercase-hex logical spelling."""
 
@@ -3082,8 +3295,8 @@ def static_self_test() -> None:
             "205d853905bdb648ee997900c6aef24a323aa380"
         )
         assert claim["lock"]["commit"] == claim["product_commit"]
-    assert len(shared_manifest()["entries"]) == 7
-    assert len({entry["sha256"] for entry in shared_manifest()["entries"]}) == 7
+    assert len(shared_manifest()["entries"]) == 8
+    assert len({entry["sha256"] for entry in shared_manifest()["entries"]}) == 8
     assert hash_file(PLAN_PATH) == hash_bytes(PLAN_PATH.read_bytes())
     assert hash_file(PROTOCOL_DOCUMENT) == PROTOCOL_DOCUMENT_SHA256
     assert hash_file(HISTORICAL_BASELINE) == HISTORICAL_BASELINE_SHA256
@@ -3097,7 +3310,10 @@ def static_self_test() -> None:
     }.issubset(set(COMM_ALLOWLIST))
     public = (PUBLIC_SOURCE / "main.rs").read_text()
     digest_source = (SHARED_SOURCE / "digest.rs").read_text()
+    semantic_source = (SHARED_SOURCE / "semantic_oracle.rs").read_text()
     validate_correctness_oracle_control_source(public)
+    validate_semantic_oracle_integration_sources(public, semantic_source)
+    validate_current_correctness_construction()
     validate_reopen_digest_sources(public, digest_source)
 
     def mirror_logical_digest(payload: bytes) -> int:
@@ -3215,6 +3431,68 @@ def static_self_test() -> None:
             raise AssertionError(
                 "hostile correctness oracle control source was accepted"
             )
+    hostile_semantic_integrations = (
+        (
+            public,
+            replace_exact_once(
+                semantic_source,
+                "domain_events:  4",
+                "domain_events:  6",
+                "shared semantic domain count mutation",
+            ),
+        ),
+        (
+            public,
+            replace_exact_once(
+                semantic_source,
+                'const EVENT_NAME: &str = "asterism.rebaseline.event";',
+                'const EVENT_NAME: &str = "asterism.rebaseline.oracle-event";',
+                "shared semantic event identity mutation",
+            ),
+        ),
+        (
+            replace_exact_once(
+                public,
+                "EventStore::new(backend).with_page_size(16);",
+                "EventStore::new(backend).with_page_size(16).with_cache_capacity(16);",
+                "historical oracle cache mutation",
+            ),
+            semantic_source,
+        ),
+        (
+            replace_exact_once(
+                public,
+                "semantic_oracle::run_generation_neutral_semantic_oracle(&store)",
+                "semantic_oracle::run_generation_neutral_semantic_oracle(&group_store)",
+                "historical oracle shared-call mutation",
+            ),
+            semantic_source,
+        ),
+        (
+            replace_exact_once(
+                public,
+                """        observations.domain_events,
+        observations.public_appends,
+        observations.fresh_streams,""",
+                """        observations.public_appends,
+        observations.domain_events,
+        observations.fresh_streams,""",
+                "historical oracle accounting swap",
+            ),
+            semantic_source,
+        ),
+    )
+    for hostile_public, hostile_semantic in hostile_semantic_integrations:
+        try:
+            validate_semantic_oracle_integration_sources(
+                hostile_public, hostile_semantic
+            )
+        except PreparationError:
+            pass
+        else:
+            raise AssertionError(
+                "hostile shared semantic-oracle integration was accepted"
+            )
     hostile_digest_sources = (
         (
             public,
@@ -3270,15 +3548,26 @@ def static_self_test() -> None:
     assert '"correctness_oracle" => {' in public
     assert 'json_string("bn-2l3n-correctness-child-v3")' in public
     for marker in (
-        "Err(AppendError::Conflict {",
-        "Err(AppendError::Backend(_))",
-        "adapter::assert_oracle_accounting(&engine, 4, 3, 2, false);",
+        "semantic_oracle::run_generation_neutral_semantic_oracle(&store)",
+        "observations.domain_events",
+        "observations.public_appends",
+        "observations.fresh_streams",
         "adapter::assert_oracle_accounting(&group_engine, 1, 1, 1, true);",
         'assert_eq!(arguments[0], "--run-row");',
         'required("ASTERISM_REBASELINE_ROW_ORDINAL")',
         'required("ASTERISM_REBASELINE_CONFIG")',
     ):
         assert marker in public, f"public integration marker absent: {marker}"
+    for marker in (
+        "Err(AppendError::Conflict {",
+        "Err(AppendError::Backend(_))",
+        "domain_events:  4",
+        "fresh_streams:  2",
+        "public_appends: 3",
+    ):
+        assert marker in semantic_source, (
+            f"shared semantic oracle marker absent: {marker}"
+        )
     bare = (BARE_SOURCE / "main.rs").read_text()
     assert 'assert_eq!(arguments[0], "--run-row");' in bare
     assert 'required("ASTERISM_REBASELINE_CONFIG")' in bare

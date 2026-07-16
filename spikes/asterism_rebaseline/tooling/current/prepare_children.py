@@ -13,9 +13,16 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
+
+from validate_product_test_overlay import (
+    ValidationError as ProductOverlayValidationError,
+    validate_patch as validate_product_overlay_patch,
+)
 
 
 PROTOCOL = "bn-2l3n-asterism-rebaseline-v3"
@@ -25,7 +32,15 @@ CORRECTNESS_DESTINATION = (
 )
 SHARED_DESTINATION = "crates/mess-store/examples/asterism_rebaseline_shared"
 PRODUCT_OVERLAY_DESTINATION = "product-test-overlay.patch"
-LOWER_HEX = frozenset("0123456789abcdef")
+PRODUCT_OVERLAY = Path(__file__).resolve().parent / PRODUCT_OVERLAY_DESTINATION
+EXACT_PRODUCT_COMMIT = "d644dc583dfe6a3d2cd07e71ce0212a323875ab4"
+EXACT_PRODUCT_TREE = "205d853905bdb648ee997900c6aef24a323aa380"
+EXACT_PRODUCT_OVERLAY_REVIEWED_COMMIT = (
+    "478e1c61968f6a02722e6881e4c765f47b921770"
+)
+EXACT_PRODUCT_OVERLAY_SHA256 = (
+    "3e2cd85c17be87f48fce1ed5909c5b173d16b9572ed34987225a463f5592db9b"
+)
 EXACT_CASES = (
     ("public-ordinary-append-command-cache-read-subscribe", "correctness"),
     ("same-stream-exact-race", "correctness"),
@@ -48,6 +63,48 @@ class PreparationError(RuntimeError):
     """The source authority or deterministic construction differs."""
 
 
+@dataclass(frozen=True)
+class FileIdentity:
+    """Fields that must remain stable around and after a descriptor read."""
+
+    device: int
+    inode: int
+    file_type: int
+    permissions: int
+    link_count: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+
+    @classmethod
+    def from_stat(cls, value: os.stat_result) -> FileIdentity:
+        return cls(
+            device=value.st_dev,
+            inode=value.st_ino,
+            file_type=stat.S_IFMT(value.st_mode),
+            permissions=stat.S_IMODE(value.st_mode),
+            link_count=value.st_nlink,
+            size=value.st_size,
+            mtime_ns=value.st_mtime_ns,
+            ctime_ns=value.st_ctime_ns,
+        )
+
+
+@dataclass(frozen=True)
+class SourceSnapshot:
+    """One immutable read used for validation, hashing, and copying."""
+
+    name: str
+    path: Path
+    destination: str | None
+    payload: bytes
+    identity: FileIdentity
+
+    @property
+    def sha256(self) -> str:
+        return sha256_bytes(self.payload)
+
+
 HERE = Path(__file__).resolve().parent
 TOOLING = HERE.parent
 SHARED = TOOLING / "overlay" / "shared"
@@ -66,8 +123,189 @@ def canonical_bytes(value: Any) -> bytes:
     ).encode()
 
 
-def exact_hex(value: str, length: int) -> bool:
-    return len(value) == length and set(value) <= LOWER_HEX
+def validate_identity(identity: FileIdentity, context: str) -> None:
+    if identity.file_type != stat.S_IFREG:
+        raise PreparationError(f"{context} must be a regular file")
+    if identity.link_count != 1:
+        raise PreparationError(f"{context} must have exactly one hard link")
+    if identity.size < 0:
+        raise PreparationError(f"{context} has an invalid size")
+
+
+def read_descriptor_exact(descriptor: int, size: int, context: str) -> bytes:
+    chunks: list[bytes] = []
+    offset = 0
+    while offset < size:
+        chunk = os.pread(descriptor, min(1024 * 1024, size - offset), offset)
+        if not chunk:
+            raise PreparationError(f"{context} shortened during snapshot")
+        chunks.append(chunk)
+        offset += len(chunk)
+    if os.pread(descriptor, 1, size):
+        raise PreparationError(f"{context} grew during snapshot")
+    return b"".join(chunks)
+
+
+def snapshot_source(
+    name: str,
+    source: Path,
+    destination: str | None,
+    *,
+    expected_path: Path | None = None,
+) -> SourceSnapshot:
+    if not source.is_absolute():
+        raise PreparationError(f"source path must be absolute: {source}")
+    try:
+        resolved_path = source.resolve(strict=True)
+    except OSError as error:
+        raise PreparationError(f"source is unavailable: {source}") from error
+    if source != resolved_path:
+        raise PreparationError(f"source path contains a symlink or alias: {source}")
+    if expected_path is not None and resolved_path != expected_path:
+        raise PreparationError(f"source path differs from reviewed input: {source}")
+
+    descriptor = os.open(
+        resolved_path,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    )
+    try:
+        before = FileIdentity.from_stat(os.fstat(descriptor))
+        validate_identity(before, name)
+        payload = read_descriptor_exact(descriptor, before.size, name)
+        after = FileIdentity.from_stat(os.fstat(descriptor))
+    finally:
+        os.close(descriptor)
+    if before != after:
+        raise PreparationError(f"{name} changed during descriptor snapshot")
+    if len(payload) != before.size:
+        raise PreparationError(f"{name} snapshot size differs")
+    path_identity = FileIdentity.from_stat(os.stat(resolved_path, follow_symlinks=False))
+    if path_identity != before:
+        raise PreparationError(f"{name} path changed during descriptor snapshot")
+    if source.resolve(strict=True) != resolved_path:
+        raise PreparationError(f"{name} resolved path changed during snapshot")
+    return SourceSnapshot(name, resolved_path, destination, payload, before)
+
+
+def capture_sources(product_overlay: Path) -> tuple[SourceSnapshot, ...]:
+    if product_overlay.name != PRODUCT_OVERLAY_DESTINATION:
+        raise PreparationError(
+            "product test overlay basename must be product-test-overlay.patch"
+        )
+    snapshots = [
+        snapshot_source(
+            "correctness.rs",
+            CORRECTNESS,
+            CORRECTNESS_DESTINATION,
+        )
+    ]
+    snapshots.extend(
+        snapshot_source(
+            name,
+            SHARED / name,
+            f"{SHARED_DESTINATION}/{name}",
+        )
+        for name in SHARED_NAMES
+    )
+    snapshots.extend(
+        (
+            snapshot_source(
+                "public/main.rs",
+                PUBLIC_MAIN,
+                None,
+            ),
+            snapshot_source(
+                PRODUCT_OVERLAY_DESTINATION,
+                product_overlay,
+                PRODUCT_OVERLAY_DESTINATION,
+                expected_path=PRODUCT_OVERLAY,
+            ),
+        )
+    )
+    result = tuple(snapshots)
+    validate_snapshot_set(result)
+    return result
+
+
+def validate_snapshot_set(snapshots: tuple[SourceSnapshot, ...]) -> None:
+    if len(snapshots) != len(SHARED_NAMES) + 3:
+        raise PreparationError("source snapshot cardinality differs")
+    names: set[str] = set()
+    paths: set[Path] = set()
+    file_identities: set[tuple[int, int]] = set()
+    destinations: set[str] = set()
+    for snapshot in snapshots:
+        validate_identity(snapshot.identity, snapshot.name)
+        if len(snapshot.payload) != snapshot.identity.size:
+            raise PreparationError(f"{snapshot.name} frozen size differs")
+        if snapshot.name in names:
+            raise PreparationError(f"duplicate source name: {snapshot.name}")
+        names.add(snapshot.name)
+        if snapshot.path in paths:
+            raise PreparationError(f"duplicate source path: {snapshot.path}")
+        paths.add(snapshot.path)
+        file_identity = (snapshot.identity.device, snapshot.identity.inode)
+        if file_identity in file_identities:
+            raise PreparationError(f"duplicate source file identity: {snapshot.name}")
+        file_identities.add(file_identity)
+        if snapshot.destination is None:
+            continue
+        destination = Path(snapshot.destination)
+        if destination.is_absolute() or ".." in destination.parts:
+            raise PreparationError(
+                f"source destination escapes construction: {snapshot.destination}"
+            )
+        if snapshot.destination in destinations:
+            raise PreparationError(
+                f"duplicate source destination: {snapshot.destination}"
+            )
+        destinations.add(snapshot.destination)
+
+
+def snapshot_named(
+    snapshots: tuple[SourceSnapshot, ...], name: str
+) -> SourceSnapshot:
+    matches = tuple(snapshot for snapshot in snapshots if snapshot.name == name)
+    if len(matches) != 1:
+        raise PreparationError(f"source snapshot identity differs: {name}")
+    return matches[0]
+
+
+def decode_snapshot(snapshot: SourceSnapshot) -> str:
+    try:
+        return snapshot.payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise PreparationError(f"source is not UTF-8: {snapshot.name}") from error
+
+
+def require_identity_matches(
+    snapshot: SourceSnapshot, current: FileIdentity
+) -> None:
+    if current != snapshot.identity:
+        raise PreparationError(
+            f"source identity changed before publication: {snapshot.name}"
+        )
+
+
+def revalidate_source(snapshot: SourceSnapshot) -> None:
+    try:
+        if snapshot.path.resolve(strict=True) != snapshot.path:
+            raise PreparationError(
+                f"source resolved path changed before publication: {snapshot.name}"
+            )
+        current = FileIdentity.from_stat(
+            os.stat(snapshot.path, follow_symlinks=False)
+        )
+    except OSError as error:
+        raise PreparationError(
+            f"source disappeared before publication: {snapshot.name}"
+        ) from error
+    require_identity_matches(snapshot, current)
+
+
+def revalidate_sources(snapshots: tuple[SourceSnapshot, ...]) -> None:
+    for snapshot in snapshots:
+        revalidate_source(snapshot)
 
 
 def require_order(source: str, tokens: tuple[str, ...], context: str) -> None:
@@ -396,19 +634,72 @@ def validate_correctness(source: str, *, allow_pending_hook: bool = True) -> Non
     )
 
 
-def validate_sources(*, allow_pending_hook: bool = True) -> None:
-    validate_semantic_oracle((SHARED / "semantic_oracle.rs").read_text())
-    validate_public_main(PUBLIC_MAIN.read_text())
-    validate_correctness(CORRECTNESS.read_text(), allow_pending_hook=allow_pending_hook)
+def validate_sources(
+    snapshots: tuple[SourceSnapshot, ...],
+    *,
+    allow_pending_hook: bool = True,
+) -> None:
+    validate_snapshot_set(snapshots)
+    validate_semantic_oracle(
+        decode_snapshot(snapshot_named(snapshots, "semantic_oracle.rs"))
+    )
+    validate_public_main(decode_snapshot(snapshot_named(snapshots, "public/main.rs")))
+    validate_correctness(
+        decode_snapshot(snapshot_named(snapshots, "correctness.rs")),
+        allow_pending_hook=allow_pending_hook,
+    )
 
 
-def input_record(source: Path, destination: str) -> dict[str, Any]:
-    payload = source.read_bytes()
+def validate_product_authority_values(
+    product_commit: str,
+    product_tree: str,
+    overlay_payload: bytes,
+) -> list[str]:
+    if product_commit != EXACT_PRODUCT_COMMIT:
+        raise PreparationError("current A product commit differs")
+    if product_tree != EXACT_PRODUCT_TREE:
+        raise PreparationError("current A product tree differs")
+    if sha256_bytes(overlay_payload) != EXACT_PRODUCT_OVERLAY_SHA256:
+        raise PreparationError("current product test overlay hash differs")
+    try:
+        overlay_text = overlay_payload.decode()
+        checks = validate_product_overlay_patch(overlay_text)
+    except (UnicodeDecodeError, ProductOverlayValidationError) as error:
+        raise PreparationError("current product test overlay authority failed") from error
+    if len(checks) != 8 or len(set(checks)) != 8:
+        raise PreparationError("current product test overlay check set differs")
+    return checks
+
+
+def validate_product_authority_snapshot(
+    product_commit: str,
+    product_tree: str,
+    product_overlay: SourceSnapshot,
+) -> list[str]:
+    if (
+        product_overlay.name != PRODUCT_OVERLAY_DESTINATION
+        or product_overlay.destination != PRODUCT_OVERLAY_DESTINATION
+    ):
+        raise PreparationError(
+            "product test overlay snapshot identity differs"
+        )
+    if product_overlay.path != PRODUCT_OVERLAY:
+        raise PreparationError("product test overlay path differs from reviewed input")
+    return validate_product_authority_values(
+        product_commit,
+        product_tree,
+        product_overlay.payload,
+    )
+
+
+def input_record(source: SourceSnapshot) -> dict[str, Any]:
+    if source.destination is None:
+        raise PreparationError(f"validation-only source cannot be copied: {source.name}")
     return {
-        "destination": destination,
+        "destination": source.destination,
         "mode": 0o444,
-        "sha256": sha256_bytes(payload),
-        "size": len(payload),
+        "sha256": source.sha256,
+        "size": len(source.payload),
         "source": source.name,
     }
 
@@ -416,23 +707,22 @@ def input_record(source: Path, destination: str) -> dict[str, Any]:
 def construction_manifest(
     product_commit: str,
     product_tree: str,
-    product_overlay: Path,
+    snapshots: tuple[SourceSnapshot, ...],
+    *,
+    allow_pending_hook: bool = False,
 ) -> dict[str, Any]:
-    if not exact_hex(product_commit, 40) or not exact_hex(product_tree, 40):
-        raise PreparationError("product commit/tree must be 40 lowercase hex")
-    if product_overlay.name != PRODUCT_OVERLAY_DESTINATION:
-        raise PreparationError(
-            "product test overlay basename must be product-test-overlay.patch"
-        )
-    if not product_overlay.is_file() or product_overlay.is_symlink():
-        raise PreparationError("product test overlay must be one regular file")
-    inputs = [input_record(CORRECTNESS, CORRECTNESS_DESTINATION)]
-    inputs.extend(
-        input_record(SHARED / name, f"{SHARED_DESTINATION}/{name}")
-        for name in SHARED_NAMES
+    validate_sources(snapshots, allow_pending_hook=allow_pending_hook)
+    product_overlay = snapshot_named(snapshots, PRODUCT_OVERLAY_DESTINATION)
+    overlay_checks = validate_product_authority_snapshot(
+        product_commit, product_tree, product_overlay
     )
-    inputs.append(input_record(product_overlay, PRODUCT_OVERLAY_DESTINATION))
+    inputs = [input_record(snapshot) for snapshot in snapshots if snapshot.destination]
     inputs.sort(key=lambda item: item["destination"])
+    overlay_input = next(
+        item for item in inputs if item["destination"] == PRODUCT_OVERLAY_DESTINATION
+    )
+    if overlay_input["sha256"] != EXACT_PRODUCT_OVERLAY_SHA256:
+        raise PreparationError("overlay authority does not match copied input")
     return {
         "build_contract": {
             "cargo_locked": True,
@@ -443,6 +733,11 @@ def construction_manifest(
         },
         "inputs": inputs,
         "product_commit": product_commit,
+        "product_test_overlay_authority": {
+            "checks": overlay_checks,
+            "reviewed_commit": EXACT_PRODUCT_OVERLAY_REVIEWED_COMMIT,
+            "sha256": EXACT_PRODUCT_OVERLAY_SHA256,
+        },
         "product_tree": product_tree,
         "protocol": PROTOCOL,
         "schema": SCHEMA,
@@ -462,27 +757,69 @@ def write_new(path: Path, payload: bytes, mode: int) -> None:
     os.chmod(path, mode)
 
 
+def validate_destination(
+    path: Path,
+    expected_payload: bytes,
+    seen_identities: set[tuple[int, int]],
+    source_identities: set[tuple[int, int]],
+) -> SourceSnapshot:
+    destination = snapshot_source(
+        f"construction/{path.name}",
+        path,
+        None,
+        expected_path=path,
+    )
+    if destination.identity.permissions != 0o444:
+        raise PreparationError(f"construction destination mode differs: {path}")
+    if destination.payload != expected_payload:
+        raise PreparationError(f"copied input differs: {path}")
+    if destination.identity.size != len(expected_payload):
+        raise PreparationError(f"construction destination size differs: {path}")
+    file_identity = (destination.identity.device, destination.identity.inode)
+    if file_identity in source_identities:
+        raise PreparationError(f"construction destination aliases a source: {path}")
+    if file_identity in seen_identities:
+        raise PreparationError(f"construction destination identity is reused: {path}")
+    seen_identities.add(file_identity)
+    return destination
+
+
 def prepare(args: argparse.Namespace) -> None:
-    validate_sources(allow_pending_hook=False)
     output = args.output.resolve()
     if output.exists() or output.is_symlink():
         raise PreparationError("construction output must be absent")
+    snapshots = capture_sources(args.product_overlay)
     manifest = construction_manifest(
-        args.product_commit, args.product_tree, args.product_overlay.resolve()
+        args.product_commit,
+        args.product_tree,
+        snapshots,
     )
-    sources = {CORRECTNESS.name: CORRECTNESS}
-    sources.update({name: SHARED / name for name in SHARED_NAMES})
-    sources[args.product_overlay.name] = args.product_overlay.resolve()
+    sources = {
+        snapshot.name: snapshot
+        for snapshot in snapshots
+        if snapshot.destination is not None
+    }
     output.mkdir(parents=True, mode=0o755)
+    source_identities = {
+        (snapshot.identity.device, snapshot.identity.inode)
+        for snapshot in snapshots
+    }
+    destination_identities: set[tuple[int, int]] = set()
+    destination_snapshots: list[SourceSnapshot] = []
     for item in manifest["inputs"]:
         source = sources[item["source"]]
-        payload = source.read_bytes()
-        if sha256_bytes(payload) != item["sha256"]:
-            raise PreparationError(f"input changed during copy: {source}")
         destination = output / item["destination"]
-        write_new(destination, payload, 0o444)
-        if sha256_bytes(destination.read_bytes()) != item["sha256"]:
-            raise PreparationError(f"copied input differs: {destination}")
+        write_new(destination, source.payload, 0o444)
+        destination_snapshots.append(
+            validate_destination(
+                destination,
+                source.payload,
+                destination_identities,
+                source_identities,
+            )
+        )
+    revalidate_sources(snapshots)
+    revalidate_sources(tuple(destination_snapshots))
     manifest_bytes = canonical_bytes(manifest)
     write_new(output / "construction.json", manifest_bytes, 0o444)
     print(manifest_bytes.decode(), end="")
@@ -503,11 +840,34 @@ def expect_rejected(validator: Any, source: str, old: str, new: str) -> None:
     raise AssertionError(f"hostile mutation was accepted: {old} -> {new}")
 
 
+def expect_preparation_error(action: Any, context: str) -> None:
+    try:
+        action()
+    except PreparationError:
+        return
+    raise AssertionError(f"hostile construction was accepted: {context}")
+
+
 def self_test() -> None:
-    validate_sources(allow_pending_hook=True)
-    semantic = (SHARED / "semantic_oracle.rs").read_text()
-    public = PUBLIC_MAIN.read_text()
-    correctness = CORRECTNESS.read_text()
+    snapshots = capture_sources(PRODUCT_OVERLAY)
+    manifest = construction_manifest(
+        EXACT_PRODUCT_COMMIT,
+        EXACT_PRODUCT_TREE,
+        snapshots,
+        allow_pending_hook=True,
+    )
+    overlay_snapshot = snapshot_named(snapshots, PRODUCT_OVERLAY_DESTINATION)
+    overlay_payload = overlay_snapshot.payload
+    overlay_input = next(
+        item
+        for item in manifest["inputs"]
+        if item["destination"] == PRODUCT_OVERLAY_DESTINATION
+    )
+    if overlay_input["sha256"] != EXACT_PRODUCT_OVERLAY_SHA256:
+        raise AssertionError("reviewed overlay authority and copied input differ")
+    semantic = decode_snapshot(snapshot_named(snapshots, "semantic_oracle.rs"))
+    public = decode_snapshot(snapshot_named(snapshots, "public/main.rs"))
+    correctness = decode_snapshot(snapshot_named(snapshots, "correctness.rs"))
 
     expect_rejected(
         validate_semantic_oracle,
@@ -653,10 +1013,140 @@ def self_test() -> None:
         '("boundedness", "null".to_owned()),',
         '("boundedness", cases_json()),',
     )
+    for product_commit, product_tree, payload in (
+        ("0" * 40, EXACT_PRODUCT_TREE, overlay_payload),
+        (EXACT_PRODUCT_COMMIT, "0" * 40, overlay_payload),
+        (
+            EXACT_PRODUCT_COMMIT,
+            EXACT_PRODUCT_TREE,
+            overlay_payload.replace(b"PwriteEio", b"PwriteGone", 1),
+        ),
+    ):
+        try:
+            validate_product_authority_values(
+                product_commit, product_tree, payload
+            )
+        except PreparationError:
+            continue
+        raise AssertionError("hostile product/overlay authority was accepted")
+
+    mutated_overlay = replace(
+        overlay_snapshot,
+        payload=overlay_payload.replace(b"PwriteEio", b"PwriteBad", 1),
+    )
+    mutated_snapshots = tuple(
+        mutated_overlay if snapshot is overlay_snapshot else snapshot
+        for snapshot in snapshots
+    )
+    expect_preparation_error(
+        lambda: construction_manifest(
+            EXACT_PRODUCT_COMMIT,
+            EXACT_PRODUCT_TREE,
+            mutated_snapshots,
+            allow_pending_hook=True,
+        ),
+        "overlay changed between validation and manifest construction",
+    )
+    expect_preparation_error(
+        lambda: require_identity_matches(
+            overlay_snapshot,
+            replace(
+                overlay_snapshot.identity,
+                ctime_ns=overlay_snapshot.identity.ctime_ns + 1,
+            ),
+        ),
+        "source identity changed before publication",
+    )
+    destination_snapshot = replace(
+        overlay_snapshot,
+        name="construction/product-test-overlay.patch",
+    )
+    expect_preparation_error(
+        lambda: require_identity_matches(
+            destination_snapshot,
+            replace(
+                destination_snapshot.identity,
+                inode=destination_snapshot.identity.inode + 1,
+            ),
+        ),
+        "destination identity changed before publication",
+    )
+    linked_overlay = replace(
+        overlay_snapshot,
+        identity=replace(overlay_snapshot.identity, link_count=2),
+    )
+    expect_preparation_error(
+        lambda: validate_snapshot_set(
+            tuple(
+                linked_overlay if snapshot is overlay_snapshot else snapshot
+                for snapshot in snapshots
+            )
+        ),
+        "hard-linked source",
+    )
+    public_snapshot = snapshot_named(snapshots, "public/main.rs")
+    duplicate_inode_public = replace(
+        public_snapshot,
+        identity=replace(
+            public_snapshot.identity,
+            device=overlay_snapshot.identity.device,
+            inode=overlay_snapshot.identity.inode,
+        ),
+    )
+    expect_preparation_error(
+        lambda: validate_snapshot_set(
+            tuple(
+                duplicate_inode_public if snapshot is public_snapshot else snapshot
+                for snapshot in snapshots
+            )
+        ),
+        "duplicate source file identity",
+    )
+    semantic_snapshot = snapshot_named(snapshots, "semantic_oracle.rs")
+    duplicate_destination_semantic = replace(
+        semantic_snapshot,
+        destination=CORRECTNESS_DESTINATION,
+    )
+    expect_preparation_error(
+        lambda: validate_snapshot_set(
+            tuple(
+                duplicate_destination_semantic
+                if snapshot is semantic_snapshot
+                else snapshot
+                for snapshot in snapshots
+            )
+        ),
+        "duplicate construction destination",
+    )
+    duplicate_path_public = replace(public_snapshot, path=overlay_snapshot.path)
+    expect_preparation_error(
+        lambda: validate_snapshot_set(
+            tuple(
+                duplicate_path_public if snapshot is public_snapshot else snapshot
+                for snapshot in snapshots
+            )
+        ),
+        "duplicate source path alias",
+    )
+    expect_preparation_error(
+        lambda: capture_sources(
+            Path(os.path.relpath(PRODUCT_OVERLAY, Path.cwd()))
+        ),
+        "relative reviewed overlay path",
+    )
+    expect_preparation_error(
+        lambda: capture_sources(
+            PRODUCT_OVERLAY.parent
+            / ".."
+            / PRODUCT_OVERLAY.parent.name
+            / PRODUCT_OVERLAY.name
+        ),
+        "lexical parent-directory overlay alias",
+    )
     print(
         canonical_bytes(
             {
-                "hostile_mutations_rejected": 24,
+                "hostile_mutations_rejected": 36,
                 "schema": "bn-2k0f-prepare-children-self-test-v1",
                 "status": "ok",
             }
