@@ -899,6 +899,9 @@ async fn cancellation_after_owned_transfer_still_publishes() {
         assert!(Instant::now() < deadline, "owned append never published");
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
+    let metrics = engine.metrics();
+    assert_eq!(metrics.owner_intent_slots_in_use, 0);
+    assert_eq!(metrics.owner_intent_bytes_in_use, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -954,6 +957,15 @@ async fn barriered_fallback_survives_cancellation_after_submission() {
         assert_eq!(
             input.borrowed_records, 3,
             "{label}: exact fallback records"
+        );
+        let metrics = engine.metrics();
+        assert_eq!(
+            metrics.owner_intent_slots_in_use, 0,
+            "{label}: cancelled append retained an owner intent slot"
+        );
+        assert_eq!(
+            metrics.owner_intent_bytes_in_use, 0,
+            "{label}: cancelled append retained owner byte permits"
         );
     }
 }

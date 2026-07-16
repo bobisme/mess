@@ -54,6 +54,8 @@ async fn metrics_move_under_durable_workload() {
     assert_eq!(m0.commit.events, 0);
     assert!(!m0.commit.fsync_degraded, "a fresh store is not degraded");
     assert_eq!(m0.durable_watermark, 0);
+    assert_eq!(m0.owner_intent_slots_in_use, 0);
+    assert_eq!(m0.owner_intent_bytes_in_use, 0);
 
     // Commit three batches across two streams.
     engine
@@ -119,6 +121,14 @@ async fn metrics_move_under_durable_workload() {
             && m.owner_outcome_scratch_retained_slots <= 256
     );
     assert!(m.owner_outcome_scratch_retained_bytes <= 1024 * 1024);
+    assert_eq!(
+        m.owner_intent_slots_in_use, 0,
+        "completed appends retain no owner intent slots"
+    );
+    assert_eq!(
+        m.owner_intent_bytes_in_use, 0,
+        "completed appends retain no owner byte permits"
+    );
     assert_eq!(
         m.durable_watermark,
         4 + REGISTRY_EVENTS,

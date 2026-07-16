@@ -2334,6 +2334,18 @@ pub struct EngineMetrics {
     pub owner_outcome_scratch_retained_bytes: usize,
     /// Oversize owner result groups whose transient capacity was shed.
     pub owner_outcome_scratch_trims: usize,
+    /// Intent slots currently occupied in the bounded append-owner channel.
+    ///
+    /// A quiescent engine reports zero. This is an instantaneous occupancy,
+    /// not a cumulative admission counter; callers must sample only after
+    /// their append cohort has completed when using it as a leak check.
+    pub owner_intent_slots_in_use: usize,
+    /// Byte-budget permits currently held by admitted append-owner intents.
+    ///
+    /// A quiescent engine reports zero. Like
+    /// [`owner_intent_slots_in_use`](Self::owner_intent_slots_in_use), this is
+    /// an instantaneous occupancy intended for boundedness diagnostics.
+    pub owner_intent_bytes_in_use: usize,
     /// Cumulative sealed block-cache hits.
     pub cache_hits: u64,
     /// Cumulative sealed block-cache misses.
@@ -3469,6 +3481,15 @@ impl LogEngine {
         let commit = self.inner.owner.status.metrics.snapshot();
         let cache = &self.inner.block_cache;
         let seal = self.inner.seal_metrics.snapshot();
+        let owner_intent_slots_in_use =
+            self.inner.owner.tx.as_ref().map_or(0, |tx| {
+                OWNER_RING_CAPACITY
+                    .checked_sub(tx.capacity())
+                    .expect("owner channel capacity exceeds its fixed bound")
+            });
+        let owner_intent_bytes_in_use = OWNER_RING_BYTES
+            .checked_sub(self.inner.owner.bytes.available_permits())
+            .expect("owner byte permits exceed their fixed bound");
         EngineMetrics {
             commit,
             durable_watermark: self.inner.owner.durable_watermark.get(),
@@ -3496,6 +3517,8 @@ impl LogEngine {
                 .status
                 .outcome_scratch_trims
                 .load(Ordering::Relaxed),
+            owner_intent_slots_in_use,
+            owner_intent_bytes_in_use,
             cache_hits: cache.hits(),
             cache_misses: cache.misses(),
             cache_hit_rate: cache.hit_rate(),

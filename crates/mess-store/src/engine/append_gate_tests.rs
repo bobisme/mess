@@ -125,6 +125,64 @@ async fn abandoned_owner_cohort_guard_unblocks_append_and_shutdown() {
     .expect("shutdown task panicked");
 }
 
+/// The production occupancy metrics must move while intents own bounded
+/// channel/byte resources and return exactly to zero after the complete
+/// cohort retires. A zero-only implementation would not satisfy this test.
+#[tokio::test]
+async fn owner_reservation_occupancy_moves_and_returns_to_zero() {
+    let dir = mess_testkit::sweeping_temp_dir("engine-owner-occupancy");
+    let engine = LogEngine::open(dir.path()).expect("open");
+    for stream in ["occupancy-a", "occupancy-b"] {
+        engine
+            .append_batch(stream, Version::NoStream, &[rec("Opened", b"seed")])
+            .await
+            .expect("prime stream");
+    }
+
+    // Keep the owner parked after consuming one intent. The second admitted
+    // intent remains channel-resident, so both occupancy surfaces must move.
+    let gate = Arc::clone(&engine.inner.owner.cohort_gate);
+    let cohort = gate.arm(3);
+    let mut producers = Vec::new();
+    for stream in ["occupancy-a", "occupancy-b"] {
+        let engine = engine.clone();
+        producers.push(tokio::spawn(async move {
+            engine
+                .append_batch(
+                    stream,
+                    Version::At(0),
+                    &[rec("Opened", b"payload")],
+                )
+                .await
+        }));
+    }
+    let admitted_gate = Arc::clone(&engine.inner.owner.cohort_gate);
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || {
+            admitted_gate.wait_until_admitted(2)
+        }),
+    )
+    .await
+    .expect("producer admission timed out")
+    .expect("admission waiter panicked");
+
+    let occupied = engine.metrics();
+    assert!(occupied.owner_intent_slots_in_use > 0);
+    assert!(occupied.owner_intent_bytes_in_use > 0);
+
+    drop(cohort);
+    for producer in producers {
+        producer
+            .await
+            .expect("producer panicked")
+            .expect("admitted append failed");
+    }
+    let quiescent = engine.metrics();
+    assert_eq!(quiescent.owner_intent_slots_in_use, 0);
+    assert_eq!(quiescent.owner_intent_bytes_in_use, 0);
+}
+
 /// N hot appends admitted to different streams are one owner-visible cohort:
 /// the owner gathers all N intents into one direct-committer call, and Group
 /// durability covers every batch with exactly one successful `fdatasync`.
