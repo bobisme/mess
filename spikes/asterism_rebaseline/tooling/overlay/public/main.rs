@@ -15,6 +15,8 @@ mod control;
 mod digest;
 #[path = "asterism_rebaseline_shared/schema.rs"]
 mod schema;
+#[path = "asterism_rebaseline_shared/semantic_oracle.rs"]
+mod semantic_oracle;
 #[path = "asterism_rebaseline_shared/timing.rs"]
 mod timing;
 #[path = "asterism_rebaseline_shared/workload.rs"]
@@ -29,8 +31,8 @@ use control::{Control, MeasuredMarkers, cpu_snapshot, monotonic_ns};
 use digest::LogicalDigest;
 use mess_core::{Aggregate, CodecError, Event};
 use mess_store::{
-    AppendError, Durability, EngineOptions, EventStore, FjallSnapshotBackend,
-    LogEngine, Version,
+    Durability, EngineOptions, EventStore, FjallSnapshotBackend, LogEngine,
+    Version,
 };
 use schema::{
     canonical_object, json_available, json_bool, json_string, json_u64,
@@ -38,7 +40,9 @@ use schema::{
 use timing::{
     FairnessInput, StartGate, fairness_ppb, nearest_rank, post_warmup,
 };
-use workload::{DurabilityKind, Workload, assert_payload_contract, payload_bytes};
+use workload::{
+    DurabilityKind, Workload, assert_payload_contract, payload_bytes,
+};
 
 #[global_allocator]
 static GLOBAL: CountingAllocator = CountingAllocator;
@@ -51,9 +55,6 @@ struct BenchEvent {
     payload: Vec<u8>,
 }
 
-#[derive(Clone, Debug)]
-struct RejectedEvent;
-
 impl Event for BenchEvent {
     fn name(&self) -> &'static str { "asterism.rebaseline.event" }
 
@@ -64,18 +65,6 @@ impl Event for BenchEvent {
             return Err(CodecError::UnknownEventName(name.to_owned()));
         }
         Ok(Self { payload: bytes.to_vec() })
-    }
-}
-
-impl Event for RejectedEvent {
-    fn name(&self) -> &'static str { "asterism.rebaseline.rejected" }
-
-    fn encode(&self) -> Result<Vec<u8>, CodecError> {
-        Err(CodecError::Encode("common oracle rejection".to_owned()))
-    }
-
-    fn decode(_name: &str, _bytes: &[u8]) -> Result<Self, CodecError> {
-        unreachable!("the rejected oracle event is never durable")
     }
 }
 
@@ -1048,10 +1037,7 @@ fn emit_point(track: &str, workload: Workload, row: PointResult) {
             .collect();
         let (jain, min_rate, max_p99) = fairness_ppb(&fairness);
         fields.extend([
-            (
-                "adaptive_group_width_target",
-                json_string("not_available"),
-            ),
+            ("adaptive_group_width_target", json_string("not_available")),
             (
                 "byte_reservations_after",
                 json_available(row.byte_reservations_after),
@@ -1118,136 +1104,16 @@ fn run_common_public_oracle(root: PathBuf) {
     );
     let t0_monotonic_ns = monotonic_ns();
     let release_monotonic_ns = monotonic_ns();
-    runtime.block_on(async {
-        let payloads = [
-            b"common-oracle/alpha/0".to_vec(),
-            b"common-oracle/alpha/1".to_vec(),
-            b"common-oracle/beta/0".to_vec(),
-            b"common-oracle/alpha/2".to_vec(),
-        ];
-        let first = store
-            .append(
-                "oracle-alpha",
-                Version::NoStream,
-                &[
-                    BenchEvent { payload: payloads[0].clone() },
-                    BenchEvent { payload: payloads[1].clone() },
-                ],
-            )
-            .await
-            .expect("oracle alpha initial append");
-        assert_eq!((first.events_appended, first.version), (2, Version::At(1)));
-        let second = store
-            .append(
-                "oracle-beta",
-                Version::NoStream,
-                &[BenchEvent { payload: payloads[2].clone() }],
-            )
-            .await
-            .expect("oracle beta append");
-        assert_eq!(
-            (second.events_appended, second.version),
-            (1, Version::At(0))
-        );
-        let third = store
-            .append(
-                "oracle-alpha",
-                Version::At(1),
-                &[BenchEvent { payload: payloads[3].clone() }],
-            )
-            .await
-            .expect("oracle alpha continuation append");
-        assert_eq!((third.events_appended, third.version), (1, Version::At(2)));
-        let conflict = store
-            .append(
-                "oracle-alpha",
-                Version::At(0),
-                &[BenchEvent { payload: b"must-not-land".to_vec() }],
-            )
-            .await;
-        assert!(matches!(
-            conflict,
-            Err(AppendError::Conflict {
-                expected: Version::At(0),
-                actual:   Version::At(2),
-            })
-        ));
-        let common_error = store
-            .append("oracle-error", Version::NoStream, &[RejectedEvent])
-            .await;
-        assert!(matches!(common_error, Err(AppendError::Backend(_))));
-        let cursors = [
-            first.last_global_position.expect("first oracle cursor"),
-            second.last_global_position.expect("second oracle cursor"),
-            third.last_global_position.expect("third oracle cursor"),
-        ];
-        assert!(cursors.windows(2).all(|pair| pair[0] < pair[1]));
-
-        let alpha = store
-            .load::<CorpusAggregate>("oracle-alpha")
-            .await
-            .expect("load oracle alpha");
-        let beta = store
-            .load::<CorpusAggregate>("oracle-beta")
-            .await
-            .expect("load oracle beta");
-        let rejected = store
-            .load::<CorpusAggregate>("oracle-error")
-            .await
-            .expect("load rejected oracle stream");
-        let mut expected_alpha = LogicalDigest::default();
-        for payload in [&payloads[0], &payloads[1], &payloads[3]] {
-            expected_alpha.update_bytes(payload);
-        }
-        let mut expected_beta = LogicalDigest::default();
-        expected_beta.update_bytes(&payloads[2]);
-        assert_eq!((alpha.events_replayed, alpha.version), (3, Version::At(2)));
-        assert_eq!((beta.events_replayed, beta.version), (1, Version::At(0)));
-        assert_eq!(alpha.state.events, 3);
-        assert_eq!(alpha.state.digest, expected_alpha);
-        assert_eq!(beta.state.events, 1);
-        assert_eq!(beta.state.digest, expected_beta);
-        assert_eq!(
-            (rejected.events_replayed, rejected.version),
-            (0, Version::NoStream)
-        );
-
-        let mut subscription = store.subscribe(None);
-        let records = subscription
-            .next_batch()
-            .await
-            .expect("read oracle subscription history");
-        assert_eq!(records.len(), 4);
-        let expected = [
-            ("oracle-alpha", 0, &payloads[0]),
-            ("oracle-alpha", 1, &payloads[1]),
-            ("oracle-beta", 0, &payloads[2]),
-            ("oracle-alpha", 2, &payloads[3]),
-        ];
-        for (record, (stream, position, payload)) in
-            records.iter().zip(expected)
-        {
-            assert_eq!(record.stream_id, stream);
-            assert_eq!(record.stream_position, position);
-            assert_eq!(record.message_type, "asterism.rebaseline.event");
-            assert_eq!(&record.data, payload);
-        }
-        assert!(
-            records.windows(2).all(|pair| {
-                pair[0].global_position < pair[1].global_position
-            })
-        );
-        let mut observed = LogicalDigest::default();
-        let mut expected_digest = LogicalDigest::default();
-        for record in &records {
-            observed.update_bytes(&record.data);
-        }
-        for payload in &payloads {
-            expected_digest.update_bytes(payload);
-        }
-        assert_eq!(observed, expected_digest);
-    });
-    adapter::assert_oracle_accounting(&engine, 4, 3, 2, false);
+    let observations = runtime.block_on(
+        semantic_oracle::run_generation_neutral_semantic_oracle(&store),
+    );
+    adapter::assert_oracle_accounting(
+        &engine,
+        observations.domain_events,
+        observations.public_appends,
+        observations.fresh_streams,
+        false,
+    );
     drop(store);
     drop(engine);
 

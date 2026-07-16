@@ -1,0 +1,592 @@
+diff --git a/crates/mess-store/src/engine.rs b/crates/mess-store/src/engine.rs
+index 5e03390..5eb5541 100644
+--- a/crates/mess-store/src/engine.rs
++++ b/crates/mess-store/src/engine.rs
+@@ -402,3 +402,428 @@
+ type EngineFile = <EngineFs as LogFs>::File;
+-
++/// Exact one-shot append-engine phases exposed only to product tests.
++#[cfg(test)]
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum TestEngineHookPoint {
++    Admission,
++    PrePwrite,
++    PreFdatasync,
++    PostFdatasyncPrePublication,
++    PostPublicationPreCompletion,
++}
++
++/// A one-shot, real-I/O test hook. Countdown fields count only successfully
++/// completed matching real operations; zero means the next matching operation.
++#[cfg(test)]
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum TestEngineHook {
++    Pause {
++        point:         TestEngineHookPoint,
++        after_reaches: usize,
++    },
++    PartialRealWrite {
++        after_successful_pwrites: usize,
++        after_bytes:              usize,
++    },
++    PwriteZero {
++        after_successful_pwrites: usize,
++    },
++    PwriteEio {
++        after_successful_pwrites: usize,
++    },
++    FdatasyncEio {
++        after_successful_fdatasyncs: usize,
++    },
++}
++
++#[cfg(test)]
++#[derive(Default)]
++struct TestEngineHooks {
++    state: std::sync::Mutex<TestEngineHookState>,
++    ready: std::sync::Condvar,
++}
++
++#[cfg(test)]
++#[derive(Default)]
++struct TestEngineHookState {
++    generation:              u64,
++    armed:                   Option<TestEngineHook>,
++    last_reached_generation: u64,
++    claimed_generation:      Option<u64>,
++    paused_generation:       Option<u64>,
++}
++
++#[cfg(test)]
++enum TestPwriteAction {
++    Pass,
++    CountDown(u64),
++    Partial { generation: u64, after_bytes: usize },
++    Zero(u64),
++    Eio(u64),
++}
++
++#[cfg(test)]
++enum TestFdatasyncAction {
++    Pass,
++    CountDown(u64),
++    Eio(u64),
++}
++
++#[cfg(test)]
++impl TestEngineHooks {
++    fn lock(&self) -> std::sync::MutexGuard<'_, TestEngineHookState> {
++        self.state.lock().unwrap_or_else(|poison| poison.into_inner())
++    }
++
++    fn arm(self: &Arc<Self>, hook: TestEngineHook) -> TestEngineHookGuard {
++        if let TestEngineHook::PartialRealWrite { after_bytes, .. } = hook {
++            assert!(after_bytes > 0, "partial write must write a real prefix");
++        }
++        let mut state = self.lock();
++        assert!(state.armed.is_none(), "test engine hook already armed");
++        assert!(
++            state.claimed_generation.is_none(),
++            "test engine hook is still executing"
++        );
++        assert!(
++            state.paused_generation.is_none(),
++            "test engine hook is still paused"
++        );
++        state.generation = state.generation.wrapping_add(1).max(1);
++        let generation = state.generation;
++        state.armed = Some(hook);
++        TestEngineHookGuard { hooks: Arc::clone(self), generation }
++    }
++
++    fn rendezvous(&self, point: TestEngineHookPoint) {
++        let generation = {
++            let mut state = self.lock();
++            let Some(TestEngineHook::Pause {
++                point: armed_point,
++                after_reaches,
++            }) = state.armed.as_mut()
++            else {
++                return;
++            };
++            if *armed_point != point {
++                return;
++            }
++            if *after_reaches > 0 {
++                *after_reaches -= 1;
++                return;
++            }
++            let generation = state.generation;
++            state.armed = None;
++            state.claimed_generation = Some(generation);
++            generation
++        };
++        self.reach_and_pause(generation);
++    }
++
++    fn pwrite_action(&self, buf_len: usize) -> TestPwriteAction {
++        let mut state = self.lock();
++        let generation = state.generation;
++        match state.armed.as_mut() {
++            Some(TestEngineHook::PartialRealWrite {
++                after_successful_pwrites,
++                after_bytes,
++            }) => {
++                if *after_successful_pwrites > 0 {
++                    TestPwriteAction::CountDown(generation)
++                } else {
++                    assert!(
++                        *after_bytes < buf_len,
++                        "partial prefix must be shorter than the real write"
++                    );
++                    let after_bytes = *after_bytes;
++                    state.armed = None;
++                    state.claimed_generation = Some(generation);
++                    TestPwriteAction::Partial { generation, after_bytes }
++                }
++            }
++            Some(TestEngineHook::PwriteZero {
++                after_successful_pwrites,
++            }) => {
++                if *after_successful_pwrites > 0 {
++                    TestPwriteAction::CountDown(generation)
++                } else {
++                    state.armed = None;
++                    state.claimed_generation = Some(generation);
++                    TestPwriteAction::Zero(generation)
++                }
++            }
++            Some(TestEngineHook::PwriteEio {
++                after_successful_pwrites,
++            }) => {
++                if *after_successful_pwrites > 0 {
++                    TestPwriteAction::CountDown(generation)
++                } else {
++                    state.armed = None;
++                    state.claimed_generation = Some(generation);
++                    TestPwriteAction::Eio(generation)
++                }
++            }
++            _ => TestPwriteAction::Pass,
++        }
++    }
++
++    fn fdatasync_action(&self) -> TestFdatasyncAction {
++        let mut state = self.lock();
++        let generation = state.generation;
++        match state.armed.as_mut() {
++            Some(TestEngineHook::FdatasyncEio {
++                after_successful_fdatasyncs,
++            }) => {
++                if *after_successful_fdatasyncs > 0 {
++                    TestFdatasyncAction::CountDown(generation)
++                } else {
++                    state.armed = None;
++                    state.claimed_generation = Some(generation);
++                    TestFdatasyncAction::Eio(generation)
++                }
++            }
++            _ => TestFdatasyncAction::Pass,
++        }
++    }
++
++    fn completed_real_pwrite(&self, generation: u64, succeeded: bool) {
++        if !succeeded {
++            return;
++        }
++        let mut state = self.lock();
++        if state.generation != generation {
++            return;
++        }
++        match state.armed.as_mut() {
++            Some(TestEngineHook::PartialRealWrite {
++                after_successful_pwrites,
++                ..
++            })
++            | Some(TestEngineHook::PwriteZero {
++                after_successful_pwrites,
++            })
++            | Some(TestEngineHook::PwriteEio {
++                after_successful_pwrites,
++            }) => {
++                *after_successful_pwrites =
++                    after_successful_pwrites.saturating_sub(1);
++            }
++            _ => {}
++        }
++    }
++
++    fn completed_real_fdatasync(&self, generation: u64, succeeded: bool) {
++        if !succeeded {
++            return;
++        }
++        let mut state = self.lock();
++        if state.generation != generation {
++            return;
++        }
++        if let Some(TestEngineHook::FdatasyncEio {
++            after_successful_fdatasyncs,
++        }) = state.armed.as_mut()
++        {
++            *after_successful_fdatasyncs =
++                after_successful_fdatasyncs.saturating_sub(1);
++        }
++    }
++
++    fn mark_reached(&self, generation: u64) {
++        let mut state = self.lock();
++        if state.generation == generation
++            && state.claimed_generation == Some(generation)
++        {
++            state.last_reached_generation = generation;
++            state.claimed_generation = None;
++            self.ready.notify_all();
++        }
++    }
++
++    fn reach_and_pause(&self, generation: u64) {
++        let mut state = self.lock();
++        if state.generation != generation
++            || state.claimed_generation != Some(generation)
++        {
++            return;
++        }
++        state.last_reached_generation = generation;
++        state.claimed_generation = None;
++        state.paused_generation = Some(generation);
++        self.ready.notify_all();
++        while state.paused_generation == Some(generation) {
++            state = self
++                .ready
++                .wait(state)
++                .unwrap_or_else(|poison| poison.into_inner());
++        }
++    }
++
++    fn wait_until_reached(&self, generation: u64) {
++        let mut state = self.lock();
++        while state.last_reached_generation < generation
++            && state.generation == generation
++            && (state.armed.is_some()
++                || state.claimed_generation == Some(generation))
++        {
++            state = self
++                .ready
++                .wait(state)
++                .unwrap_or_else(|poison| poison.into_inner());
++        }
++    }
++
++    fn release(&self, generation: u64) {
++        let mut state = self.lock();
++        if state.paused_generation == Some(generation) {
++            state.paused_generation = None;
++            self.ready.notify_all();
++        }
++    }
++
++    fn disarm(&self, generation: u64) {
++        let mut state = self.lock();
++        if state.generation == generation {
++            state.armed = None;
++            state.claimed_generation = None;
++            if state.paused_generation == Some(generation) {
++                state.paused_generation = None;
++            }
++            self.ready.notify_all();
++        }
++    }
++
++    fn disarm_all(&self) {
++        let mut state = self.lock();
++        state.armed = None;
++        state.claimed_generation = None;
++        state.paused_generation = None;
++        self.ready.notify_all();
++    }
++}
++
++/// Generation-bound safety guard for one armed test engine hook.
++#[cfg(test)]
++pub struct TestEngineHookGuard {
++    hooks:      Arc<TestEngineHooks>,
++    generation: u64,
++}
++
++#[cfg(test)]
++impl TestEngineHookGuard {
++    pub fn wait_until_reached(&self) {
++        self.hooks.wait_until_reached(self.generation);
++    }
++
++    pub fn release(&self) { self.hooks.release(self.generation); }
++}
++
++#[cfg(test)]
++impl Drop for TestEngineHookGuard {
++    fn drop(&mut self) { self.hooks.disarm(self.generation); }
++}
++
++#[cfg(test)]
++#[derive(Clone)]
++struct TestEngineFs {
++    inner: EngineFs,
++    hooks: Arc<TestEngineHooks>,
++}
++
++#[cfg(test)]
++impl LogFs for TestEngineFs {
++    type File = TestEngineFile;
++
++    fn open(&self, path: &Path, opts: OpenOpts) -> std::io::Result<Self::File> {
++        self.inner.open(path, opts).map(|inner| TestEngineFile {
++            inner,
++            hooks: Arc::clone(&self.hooks),
++        })
++    }
++
++    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
++        self.inner.rename(from, to)
++    }
++
++    fn remove(&self, path: &Path) -> std::io::Result<()> {
++        self.inner.remove(path)
++    }
++}
++
++#[cfg(test)]
++#[derive(Clone)]
++struct TestEngineFile {
++    inner: EngineFile,
++    hooks: Arc<TestEngineHooks>,
++}
++
++#[cfg(test)]
++impl FileHandle for TestEngineFile {
++    fn pwrite(&self, off: u64, buf: &[u8]) -> std::io::Result<usize> {
++        self.hooks.rendezvous(TestEngineHookPoint::PrePwrite);
++        match self.hooks.pwrite_action(buf.len()) {
++            TestPwriteAction::Pass => self.inner.pwrite(off, buf),
++            TestPwriteAction::CountDown(generation) => {
++                let result = self.inner.pwrite(off, buf);
++                self.hooks
++                    .completed_real_pwrite(generation, result.is_ok());
++                result
++            }
++            TestPwriteAction::Partial { generation, after_bytes } => {
++                let prefix = self.inner.pwrite(off, &buf[..after_bytes]);
++                let written = match prefix {
++                    Ok(written) if written == after_bytes => written,
++                    other => {
++                        self.hooks.mark_reached(generation);
++                        return other;
++                    }
++                };
++                self.hooks.reach_and_pause(generation);
++                self.inner
++                    .pwrite(off + written as u64, &buf[written..])
++                    .map(|rest| written + rest)
++            }
++            TestPwriteAction::Zero(generation) => {
++                self.hooks.mark_reached(generation);
++                Ok(0)
++            }
++            TestPwriteAction::Eio(generation) => {
++                self.hooks.mark_reached(generation);
++                Err(std::io::Error::from_raw_os_error(5))
++            }
++        }
++    }
++
++    fn pread(&self, off: u64, buf: &mut [u8]) -> std::io::Result<usize> {
++        self.inner.pread(off, buf)
++    }
++
++    fn fdatasync(&self) -> std::io::Result<()> {
++        self.hooks.rendezvous(TestEngineHookPoint::PreFdatasync);
++        let result = match self.hooks.fdatasync_action() {
++            TestFdatasyncAction::Pass => self.inner.fdatasync(),
++            TestFdatasyncAction::CountDown(generation) => {
++                let result = self.inner.fdatasync();
++                self.hooks
++                    .completed_real_fdatasync(generation, result.is_ok());
++                result
++            }
++            TestFdatasyncAction::Eio(generation) => {
++                self.hooks.mark_reached(generation);
++                Err(std::io::Error::from_raw_os_error(5))
++            }
++        };
++        if result.is_ok() {
++            self.hooks.rendezvous(
++                TestEngineHookPoint::PostFdatasyncPrePublication,
++            );
++        }
++        result
++    }
++
++    fn len(&self) -> std::io::Result<u64> { self.inner.len() }
++
++    fn allocate(&self, len: u64) -> std::io::Result<()> {
++        self.inner.allocate(len)
++    }
++}
+ /// One decoded, CRC-validated committed batch — the immutable block-backed
+@@ -1347,3 +1772,3 @@
+ #[cfg(test)]
+-struct TestOwnerCohortGuard {
++pub struct TestOwnerCohortGuard {
+     gate:       Arc<TestOwnerCohortGate>,
+@@ -1353,2 +1778,9 @@
+ #[cfg(test)]
++impl TestOwnerCohortGuard {
++    pub fn wait_until_admitted(&self, at_least: usize) {
++        self.gate.wait_until_admitted(at_least);
++    }
++}
++
++#[cfg(test)]
+ impl Drop for TestOwnerCohortGuard {
+@@ -1500,3 +1932,6 @@
+ struct FlatOwner {
++    #[cfg(not(test))]
+     direct:                          DirectCommitter<RealRuntime, EngineFs>,
++    #[cfg(test)]
++    direct: DirectCommitter<RealRuntime, TestEngineFs>,
+     publish:                         Arc<PublishState>,
+@@ -1511,2 +1946,4 @@
+     cohort_gate:                     Arc<TestOwnerCohortGate>,
++    #[cfg(test)]
++    test_hooks:                      Arc<TestEngineHooks>,
+ }
+@@ -1798,2 +2235,4 @@
+         let mut first_error: Option<EngineError> = None;
++        #[cfg(test)]
++        let mut published = false;
+         if let Some((first_version, count)) = reg_span {
+@@ -1821,2 +2260,6 @@
+                         );
++                        #[cfg(test)]
++                        {
++                            published = true;
++                        }
+                     }
+@@ -1894,2 +2337,6 @@
+             );
++            #[cfg(test)]
++            {
++                published = true;
++            }
+             appended = Some(Appended {
+@@ -1903,2 +2350,8 @@
+         };
++        #[cfg(test)]
++        if published {
++            self.test_hooks.rendezvous(
++                TestEngineHookPoint::PostPublicationPreCompletion,
++            );
++        }
+         completion.finish(result);
+@@ -1992,2 +2445,6 @@
+         );
++        #[cfg(test)]
++        self.test_hooks.rendezvous(
++            TestEngineHookPoint::PostPublicationPreCompletion,
++        );
+         completion.finish(Ok(Appended {
+@@ -2009,2 +2466,4 @@
+             #[cfg(test)]
++            self.test_hooks.rendezvous(TestEngineHookPoint::Admission);
++            #[cfg(test)]
+             self.cohort_gate.wait_until_cohort_admitted();
+@@ -2116,2 +2575,4 @@
+     rt:                   RealRuntime,
++    #[cfg(test)]
++    test_hooks:           Arc<TestEngineHooks>,
+     /// The one flat-combined owner. Its thread owns the segment writer and
+@@ -2193,2 +2654,6 @@
+     fn drop(&mut self) {
++        // Test-only unwind safety: release every engine rendezvous before the
++        // owner join below, so a dropped guard/engine cannot strand shutdown.
++        #[cfg(test)]
++        self.test_hooks.disarm_all();
+         // Order is load-bearing (`bn-1vu`). 1) Close and join the owner: it
+@@ -2496,2 +2961,18 @@
+ impl LogEngine {
++    /// Arm one generation-bound engine hook. This API exists only in unit-test
++    /// builds, so no release or benchmark binary can enable the overlay.
++    #[cfg(test)]
++    pub fn arm_test_hook(&self, hook: TestEngineHook) -> TestEngineHookGuard {
++        self.inner.test_hooks.arm(hook)
++    }
++
++    /// Cohort a known number of already-open-engine append intents.
++    #[cfg(test)]
++    pub fn arm_test_owner_cohort(
++        &self,
++        expected: usize,
++    ) -> TestOwnerCohortGuard {
++        self.inner.owner.cohort_gate.arm(expected)
++    }
++
+     /// Open (creating if absent) a composed engine rooted at `dir`, default
+@@ -2550,2 +3031,5 @@
+         let seg_path = segment_path(dir, active_seg_id);
++        #[cfg(test)]
++        let test_hooks = Arc::new(TestEngineHooks::default());
++        #[cfg(not(test))]
+         let writer = match plan {
+@@ -2584,3 +3068,42 @@
+         };
+-
++        #[cfg(test)]
++        let writer = {
++            // The hook state exists during open but cannot be armed until a
++            // fully constructed LogEngine has been returned to the test.
++            let fs = TestEngineFs {
++                inner: rt.fs(),
++                hooks: Arc::clone(&test_hooks),
++            };
++            match plan {
++                ResumePlan::Fresh => {
++                    let params = SegmentParams {
++                        segment_id:         ACTIVE_SEGMENT_ID,
++                        base_pos:           0,
++                        epoch:              1,
++                        prev_segment_epoch: 0,
++                        created_unix_nanos: 0,
++                        segment_size:       opts.segment_size,
++                    };
++                    SegmentWriter::create(&fs, &seg_path, params).map_err(
++                        |e| EngineError::Open(format!("segment create: {e}")),
++                    )?
++                }
++                ResumePlan::Resume(info) => {
++                    let params = ResumeParams {
++                        segment_id:    info.segment_id,
++                        base_pos:      info.base_pos,
++                        epoch:         info.epoch,
++                        segment_size:  opts.segment_size,
++                        write_off:     info.write_off,
++                        next_batch_id: info.next_batch_id,
++                        next_pos:      info.next_pos,
++                        batch_count:   info.batch_count,
++                        event_count:   info.event_count,
++                    };
++                    SegmentWriter::resume(&fs, &seg_path, params).map_err(
++                        |e| EngineError::Open(format!("segment resume: {e}")),
++                    )?
++                }
++            }
++        };
+         // Wire live auto-roll (bn-1vu): the committer rolls to a fresh segment
+@@ -2700,2 +3223,4 @@
+             cohort_gate: Arc::clone(&owner_cohort_gate),
++            #[cfg(test)]
++            test_hooks: Arc::clone(&test_hooks),
+         };
+@@ -2711,2 +3236,4 @@
+                 rt,
++                #[cfg(test)]
++                test_hooks,
+                 owner: AppendOwner {
