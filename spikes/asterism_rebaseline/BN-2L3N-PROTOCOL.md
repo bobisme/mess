@@ -70,34 +70,49 @@ generator, clocks, allocator counter, latency collector, logical digest, CSV
 schema, and runner protocol. Source-version adapters may contain only the
 minimum API spelling and generation-specific expected-position normalization.
 Their complete diffs and hashes require independent review. In particular,
-adapters may not bypass `EventStore`, pre-intern names on one public variant
-only, change durability, or patch product code.
+performance/comparator adapters may not bypass `EventStore`, pre-intern names
+on one public variant only, change durability, or patch product code. The sole
+product-source overlay is the separately built, `cfg(test)`-only current fault
+hook defined in the correctness section; it is never linked into these four
+performance binaries.
 
-Only `A`/`B` track a `Cargo.lock`; `C` and `D` do not. Before any source build,
-the tooling stage must copy the exact current lockfile into each comparator
-materialization and run an untimed, offline locked metadata-resolution check.
-If both resolve, all four builds use that byte-identical lock and its recorded
-SHA-256. If either does not resolve, no dependency may be silently selected:
-the stage creates an explicit measurement-only lock for that comparator before
-build, records the resolver command and complete current/comparator dependency
-diff, and obtains independent approval of its canonical lock SHA-256. Timing
-cannot begin with an untracked, mutable, or Cargo-generated-at-build lockfile.
-Every actual build is `--locked --offline` and rechecks the approved lock hash
-before and after compilation.
+Only `A`/`B` track a root `Cargo.lock`; they use its exact SHA-256
+`9c24189940d9b43d7798c6680c8aeab6ddc270ef9b450390334d9327405cbea0`.
+`C` and `D` use separately frozen comparator root locks: their historical
+spike-lock inputs have SHA-256
+`ab405326315f1be1782feaf97b6e1c031f24480f32dc5532bfccdeb425ed3c97`
+and `c419b2f347aa384f695611003ff764d63da77fd3fb87615ced2e6aa099e3aea7`
+respectively, but are not assumed to resolve the new root overlay unchanged.
+Before any build, the tooling stage must retain the expected failure or success
+of the current-lock offline check, generate each required comparator root lock
+offline with the frozen toolchain, record the exact resolver command and
+complete current/historical/final dependency diff, and obtain independent
+approval of both canonical lock SHA-256 values. No common-lock requirement may
+force a historical manifest change. Timing cannot begin with an untracked,
+mutable, or Cargo-generated-at-build lockfile. Every actual build is
+`--locked --offline` and rechecks its approved lock hash before and after
+compilation.
 
 The benchmark implementation and adapters do not yet exist in this protocol
 commit. Before any build, a separately reviewed tooling checkpoint must bind
 their exact commit/tree, every file hash, adapter allowlist and binary patch,
 runner/evaluator hashes, and this document's SHA-256. That checkpoint may only
 realize the frozen contract above. This is an implementation task, not an open
-measurement decision.
+measurement decision. The default architecture is one overlaid `mess-store`
+example shared byte-for-byte by public `A`/`C`/`D` and one overlaid `mess-log`
+example for bare `B`, without manifest or production-source changes. Shared
+workload, payload, clock, allocator, latency, digest, and schema modules must be
+byte-identical. Reviewed compile-time adapters may expose `A` input counters
+and `C` Fjall metadata barriers, but may not alter the timed call graph.
 
 ### Harness derivation, not evidence reuse
 
 The tooling implementation reuses reviewed mechanisms, never old timing rows:
 
 - `baseline_matrix` supplies the 32-cell shapes, work counts, payload generator,
-  latency warm-up rule, segment-size rule, and BN-2SU historical floor;
+  latency warm-up rule, and segment-size rule; its direct-`LogEngine` rows are
+  historical orientation only, never an absolute gate for the fresh public
+  topology;
 - `owned_append` supplies the public composition, exact input/copy counters,
   read-only source materialization, sequential attested builds, single-use
   prepared artifacts, global lease, exact `/proc` guard, child reaping,
@@ -163,12 +178,41 @@ Each observation creates and opens a fresh store on real ext4. Segment size is
 `next_power_of_two(max(256 MiB, 2 * events * (payload + 96) + 1 MiB))`, matching
 the locked no-roll append matrix. Store creation, runtime creation, and open
 are outside the timed interval. Initial stable stream/type registration is
-inside the measured work, as it was for the locked matrix. Latency drops the
-first 10% of samples independently for each writer; throughput includes all
-work. Payload buffers and record vectors are constructed through the normal
-public surface inside the timed interval for public variants. `B` uses the
-equivalent raw `EventInput` construction and native `mess-log::Runtime`; it is
-an API/topology lower bound, not a claim that all of its gap is owner CPU.
+inside the measured work. Latency drops the first 10% of samples independently
+for each writer; throughput includes all work.
+
+The measurement phases are exact and common across variants:
+
+1. Before any wall, allocator, or CPU sample, create the store/runtime, open the
+   engine, allocate the workload descriptors, deterministic reusable payload
+   source bytes, task handles, result slots, and latency-vector capacity. Do
+   not materialize an append's record/input vector or intern its first-use
+   names here. Spawn all writers and hold them at a ready barrier.
+2. After every writer proves ready, snapshot allocator, engine/path/barrier,
+   process CPU, serialized-role CPU, and context-switch counters. Take wall
+   `t0` immediately before releasing the common start barrier; no work or
+   cooldown lies between `t0` and release.
+3. For public `A`/`C`/`D`, each writer starts its append-latency clock immediately
+   before materializing that append's public typed input and stops it after
+   `EventStore::append` completes. Thus record-vector construction, payload
+   ownership/copying, public validation/encoding, registry work, queueing, I/O,
+   durability, and publication are inside both wall and allocation accounting.
+   `B` materializes the equivalent raw `EventInput` inside the wall and
+   allocator interval, but starts its per-append latency clock immediately
+   before the raw `Appender` call. That declared latency-boundary difference is
+   part of why `B` is only a lower bound; its construction cost still affects
+   throughput and allocation ratios.
+4. The coordinator awaits every writer, validates its exact completion count,
+   and takes wall `t1` immediately after the final join. It then snapshots the
+   same counters. Counter subtraction and all quantile/statistical work occur
+   after `t1`; no sample collection is performed by a background consumer.
+
+Payload bytes are generated once before the interval, but every append's owned
+or borrowed record/vector objects are created inside it. A worker's elapsed
+time is the common `t0` release through that writer's last append completion;
+row wall time is `t1 - t0` and therefore also includes task wake and join
+overhead. The exact phase markers and counter snapshots are emitted in every
+row so an adapter cannot silently move work across a boundary.
 
 The primary path uses no test-only sleeps, forced group widths, internal owner
 calls, seal work, readers, snapshots, or pre-existing data.
@@ -202,18 +246,28 @@ Fjall metadata barrier; their wall/latency values are discarded.
 
 Run all four variants with 64 writers, 250-byte payloads, one stable stream per
 writer, and cells `{Process,Group} x {batch 1,batch 100}`. Process work is
-5,000/100 batches per writer for batch 1/100. Group work is 50/25. Before the
+5,000/500 batches per writer for batch 1/100. Group work is 200/200. Before the
 measured counter snapshot, execute four matched concurrent warm rounds solely
 to establish each implementation's production grouping target; warm rows do
-not enter latency or throughput. Use the four Williams blocks, producing 64
-rows.
+not enter latency or throughput. Stable names are established by those warm
+rounds for this fairness topology only. Use the four Williams blocks,
+producing 64 rows.
 
 Record per-writer completed appends, elapsed time, p50/p99/max, the Jain index
 of per-writer rates, minimum/median writer rate, maximum/median writer p99,
-queue/group width, oldest queued age where exported, and barrier count. A
-missing queue metric on a historical implementation is `not_available`, never
-zero. Every writer must complete exact work; no aggregate total can hide a
-starved writer.
+aggregate batches/events per committed group, and barrier count. Queue
+intents/bytes, exact group-width distribution, adaptive target, and oldest
+queued age are not exported neutrally by current or historical production
+engines; all variants report those fields as `not_available`, never zero, and
+they are not gates. No wrapper-side estimate may impersonate admission-boundary
+state. Every writer must complete exact work; no aggregate total can hide a
+starved writer. Writer elapsed is the common start release through that
+writer's final append completion, and writer rate is completed domain events
+divided by that elapsed time. Jain fairness is
+`(sum(rate))^2 / (64 * sum(rate^2))`. Per-writer p50 and p99 use nearest-rank
+indexes `ceil(q * n) - 1` on sorted samples; “median writer p99” is the median
+of the 64 resulting p99 values and “maximum writer p99” is their maximum. No
+pooled latency distribution may substitute for these fairness fields.
 
 ### CPU and syscall sentinel profiles
 
@@ -223,14 +277,33 @@ Profile all variants at 250 bytes, four writers, and
 repetition, and the two profilers may not be stacked on one child.
 
 The CPU profile records measured-interval process user/system CPU and the
-append-critical serialized role: current/flat owner, Fjall-era committer plus
-its separately reported producer CPU, and bare committer. Thread identities
+append-critical roles: current/flat owner; Fjall-era committer,
+producer-runtime, and post-start `spawn_blocking` publication pool as three
+separate labels; and bare committer. Thread identities
 are bound by TID, `/proc` start ticks, and declared role before counters are
 read. If a generation has no owner, the report says so and does not relabel a
 different thread “owner.” At minimum retain thread/process CPU nanoseconds,
-cycles, instructions, context switches, and task-clock. Hardware counters may
-be `not_available` only if a pre-row permission probe proves that condition;
-thread and process CPU time remain mandatory.
+context switches, and, when available, cycles, instructions, and task-clock.
+Process user/system time comes from `getrusage(RUSAGE_SELF)`. Serialized-role
+CPU comes from the first nanosecond field in
+`/proc/<pid>/task/<tid>/schedstat`; voluntary/nonvoluntary context-switch
+deltas come from that TID's `status`. `A`/`D` bind the `mess-flat-owner` TID;
+`C`/`B` bind the reviewed committer identity. `C` identifies the committer as
+the sole new unnamed open-phase TID after named sealer/Fjall workers are
+excluded; initial runtime TIDs are producers and later TID births are the
+publication pool, with the blocking-thread keepalive frozen so they survive
+sampling. A preflight CPU-bound helper must prove that `schedstat` is monotone
+and record its smallest observed nonzero
+increment. Every decision-driving serialized-role delta must be at least 20
+times that measured increment; otherwise the CPU gate is invalid and the
+attempt is `INCONCLUSIVE`. Hardware-counter availability is probed once before
+row zero and may be `not_available` only with the retained permission result;
+it never weakens mandatory `getrusage` or `schedstat` evidence.
+The hardware profile uses `perf stat` inherited into child threads with its
+control descriptor disabled at process start, enabled at the common start
+release, and disabled at `t1`. Exact `perf` path/version/hash, events, argv, and
+control acknowledgements are source-approved; profiler wall/latency never
+enters the primary performance rows.
 
 The syscall pass runs under one frozen tracing tool and records exact counts
 for `write`, `pwrite64`, `writev`, `pwritev`, `pwritev2`, `fsync`,
@@ -243,14 +316,26 @@ before row zero is `INCONCLUSIVE`, not permission to omit syscall evidence.
 
 For each public variant, seed the locked post-Book corpus through the public
 composition: 2,000,000 domain events, 1,000 stable streams, batch 10, 64-byte
-payloads, 8 MiB segments, Process durability. Verify the corpus and close it.
-Then run three quiet-guarded opens in separate processes against that same
-variant's immutable corpus, with no append or read warm-up. Report each open's
-wall time, `VmHWM`, bytes/syscalls read, segments/directories opened, payload
-frames decoded during recovery, registry/head digest, and total visible/log
-events. This focused profile is excluded from the append row count. `B` has no
-equivalent public recovery/index surface and is marked `not_applicable`, not
-simulated.
+payloads, 8 MiB segments, Process durability. Verify the corpus, close it,
+record its byte manifest/digest, and preserve it as a read-only archive source.
+Each measured open receives a newly materialized, byte-identical private copy;
+the runner rechecks the manifest, calls `syncfs`, and completes the declared
+quiet/settle guard before spawning exactly one opener against that copy. The
+declared cache state is warm page cache from materialization and verification,
+identical by construction rather than falsely labeled cold.
+
+Run three quiet-guarded opens in separate processes and fixed Latin orders:
+`A C D`, `C D A`, and `D A C`, so every variant occupies every ordinal once.
+There is no append or read warm-up after the pre-open manifest check. The
+untraced row reports wall time, `VmHWM`, `/proc/<pid>/io` bytes and syscall
+deltas sampled while the child is `SIGSTOP`-parked immediately before and
+after the single open, exported payload frames decoded during recovery,
+registry/head digest, and total visible/log events.
+Segment/directory/file-open counts come from one separate non-timing
+structural trace per variant against another fresh verified copy; traced wall
+time is discarded and cannot fill a reopen row. This focused profile is
+excluded from the append row count. `B` has no equivalent public
+recovery/index surface and is marked `not_applicable`, not simulated.
 
 ## Metrics and row invariants
 
@@ -263,8 +348,9 @@ Every primary row reports raw integers before normalized values:
   both normalized per domain event and per append;
 - Process-owned versus borrowed batches/records/payload bytes, defensive-copy
   records/bytes, and the selected path label;
-- process user/system CPU and serialized-role CPU where available;
-- group count/width, barrier count and fsync p50/p95/p99/max/degraded status;
+- mandatory process user/system CPU and the declared role CPU fields;
+- group count and aggregate batches/events per group, barrier count, and fsync
+  p50/p95/p99/max/degraded status;
 - write-like syscall and host-write byte counters where the untraced product
   exposes them; and
 - per-writer/fairness fields for the focused topology.
@@ -314,10 +400,12 @@ The report must show three distinct comparisons:
 
 The `A/B` ratio is budget evidence, not a universal 85%-of-bare gate. Report it
 for every batch size and do not collapse it into one headline. Also compare
-`A` to the matching absolute `BN-2SU-FINAL.csv` cell, but treat the paired `A/D`
-ratio as the causal control. If both `A` and `D` move together relative to the
-historical CSV, label host/device drift rather than attributing it to current
-code.
+fresh public `A` and `D` descriptively to the matching direct-`LogEngine`
+`BN-2SU-FINAL.csv` cells, in a separately labeled historical-orientation table.
+Those cross-topology values cannot enter a threshold, outcome, drift proof, or
+causal attribution. If both fresh variants differ from that CSV, describe the
+difference only as “cross-topology and/or host/device difference.” The paired
+fresh public `A/D` ratio is the sole causal preservation control.
 
 No row is retried, replaced, winsorized, or silently dropped. No historical row
 is pooled with fresh data. An incomplete or invalid matrix is not a negative
@@ -327,6 +415,23 @@ performance result.
 
 Correctness and evidence validity are prerequisites. The following thresholds
 are fixed before build.
+
+Group performance outcomes use one exhaustive device-variance rule. First,
+correctness/durability failures follow the correctness outcomes below. Second,
+any current Group barrier, allocation, syscall-shape, fairness/boundedness, or
+resource gate failure is `NARROW`; device latency cannot excuse it. Third, if
+all such structural/resource gates pass but a Group throughput or append-p99
+gate fails, compare the same four paired blocks' engine-exported fsync mean and
+p99. If the median within-block `A/reference` ratios for both are at most
+`1.02`, the performance miss is `NARROW`. If either exceeds `1.02`, the
+decision cannot separate current code from device variance and is
+`INCONCLUSIVE`. A literal Group pass remains a pass. This mapping is applied to
+primary and new-name Group performance gates. Fairness warm rounds cannot be
+subtracted from the engine's cumulative fsync histogram, so fairness Group
+throughput or append-p99 misses map deterministically to `NARROW`; cumulative
+warm-plus-measured fsync mean/p99 remain labeled descriptive evidence and
+cannot invoke the device-variance exception. No targeted rerun or best-row
+substitution is allowed.
 
 ### Preserve the flat-owner baseline (`A/D`)
 
@@ -339,13 +444,6 @@ Every primary Process cell must satisfy:
   the exact role; and
 - zero barriers and no durability degradation in every row.
 
-In addition, `A` must retain at least `0.95` of the matching absolute
-BN-2SU-FINAL Process throughput. A miss is not excused merely because a later
-average passes. If paired `A/D` passes while both fresh variants miss the
-historical floor in the same direction, the report may classify the absolute
-miss as host drift, but it must keep the miss visible and may not raise the
-floor.
-
 Every primary Group cell must satisfy:
 
 - throughput at least `0.90` of `D`;
@@ -354,9 +452,8 @@ Every primary Group cell must satisfy:
 - `A` aggregate barriers no more than `100.25%` of `D`; and
 - the median block-level `A-D` barrier delta no greater than zero.
 
-Group must also retain at least `0.90` of matching BN-2SU-FINAL throughput and
-its declared one-covering-barrier structure. There is no post-hoc targeted
-variance run in this protocol.
+Group must also retain its declared one-covering-barrier structure. There is no
+post-hoc targeted variance run in this protocol.
 
 ### Beat the Fjall-era production path (`A/C`)
 
@@ -385,7 +482,9 @@ In every current fairness row:
 - the slowest writer rate is at least `0.50` of the median;
 - maximum writer p99 is no more than `2.0` times median writer p99;
 - every writer completes exact work with no waiter/byte reservation leak; and
-- exported queue bytes/intents and oldest age remain within configured bounds.
+- focused boundedness tests prove the current 1,024-intent owner-ring bound,
+  configured Group byte/time bounds, and exact zero retained reservations
+  after completion or cancellation.
 
 Current fairness throughput must retain `0.95` of `D` in Process and `0.90` in
 Group; Group barrier gates are identical to the primary matrix. The syscall
@@ -426,8 +525,8 @@ The mandatory gates are:
 - at least two live rolls preserve chain state, first read/cache behavior,
   pointer coverage, published watermarks, and reopen results;
 - clean reopen, repeated reopen, active-tail recovery, and sealed-directory
-  recovery reproduce heads, registry state, user-visible events, opaque cursor
-  order, and the logical digest;
+  recovery reproduce heads, user-visible event types/payload/order, opaque
+  cursor order, and the semantic logical digest;
 - real-process kill points cover pre-write, partial write, post-write/pre-
   barrier, post-barrier/pre-publication, and post-publication/pre-completion;
 - injected short write, write error, `fdatasync` error, torn/truncated tail,
@@ -438,10 +537,22 @@ The mandatory gates are:
 
 Cross-generation comparison normalizes out the documented v3 `$registry`
 position gaps. It compares user event sequence, stream versions, payload/type,
-success/conflict/error outcomes, and opaque cursor ordering. It separately
-checks each generation's exact internal high-water and registry accounting;
+success/conflict/error outcomes, known stream-name heads, and opaque cursor
+ordering. `C` has no public internal registry digest/ID-lookup surface, so no
+byte-identical internal-registry claim is made. The oracle separately checks
+each generation's exported high-water and registry/barrier accounting;
 renumbering current user positions to resemble Fjall-era positions is
 forbidden.
+
+Syscall injection and corpus mutation cover short/write/sync errors and
+on-disk corruption. Exact cancellation-before-admission and kill phases that
+are not publicly observable use a separately reviewed `cfg(test)`-only current
+instrumentation overlay. Those hooks may pause only the named phase, run only
+in prebuilt correctness/fault children, and are prohibited from every timing,
+profile, and comparator binary. Source approval must prove the hooks compile
+out and that the release product/performance binary is byte-identical to the
+unhooked build. A hook observation can validate current semantics but cannot
+add a performance result.
 
 Any current correctness, cancellation, durability, poison, roll, or recovery
 failure is a `REVERT` result once the harness itself is independently shown
@@ -475,22 +586,34 @@ The runner holds the host-wide nonblocking exclusive lease
 through evaluator exit. Record lock path/device/inode, PID/start ticks, UID,
 host, boot ID, nonce, acquisition/release, and `/proc/locks` proof. A second
 exclusive lock must fail while evidence is live. Builds, tests, formatters,
-reviews, and other benchmarks may not overlap the lease.
+reviews, and other benchmarks may not overlap the lease. The prebuilt,
+source-approved correctness/fault executables are declared evidence children,
+not Cargo test/build activity, and run under that same lease before and after
+timing as required; their commands and hashes are guarded like timed children.
 
-Before and after every child, atomically retain one `/proc` snapshot for exact
-`comm` matches of compiler/linker tools and all four benchmark executable
-names. Classify runner, current child, declared helper, unexplained foreign
-process, or vanished/unresolved identity using PID plus start ticks. Any
-unexplained or unresolved match fail-stops the whole attempt. Do not use
-`pgrep -f`, which can match its own shell. Explicitly wait/reap the child and
-prove its process group absent before continuing.
+Before and after every child, atomically retain one `/proc` snapshot for the
+source-approved exact `comm` allowlist (including Linux's declared truncation):
+compiler/linker tools, all four benchmark binaries, correctness/fault/reopen
+children, runner, evaluator, terminal verifier, tracer/profiler wrappers, and
+every helper executable. Classify runner, current child, declared helper,
+unexplained foreign process, or vanished/unresolved identity using PID plus
+start ticks. Any unexplained or unresolved match fail-stops the whole attempt.
+Do not use `pgrep -f`, which can match its own shell. Explicitly wait/reap the
+child and prove its process group absent before continuing.
 
-Load1 at or above `6.0` before a row causes a bounded pre-row wait, not a row.
-The final guard immediately precedes spawn; no unobserved cooldown window is
-allowed. A post-row load spike or fixed fsync alarm is retained in the row and
-never triggers replacement. If quiet is not reached within the frozen bound,
-the attempt is `INCONCLUSIVE` with all partial rows retained as non-decision
-evidence.
+Scratch and result materializations live under
+`$HOME/.cache/mess-bench/asterism-rebaseline`; the runner requires at least
+`137438953472` free bytes (128 GiB) and `1000000` free inodes before every row.
+Falling below either floor fail-stops the attempt as `INCONCLUSIVE` before
+spawn. Load1 at or above `6.0` causes a pre-row wait of at most 120 seconds,
+polled once per second. After each Process child the runner observes a 400 ms
+settle, and after each Group child a 4 s settle, retaining load and free-space
+samples throughout; these are fixed scheduling phases, never discarded trial
+results. The final quiet/resource/process guard immediately precedes spawn, so
+no unobserved cooldown lies between the final guard and the child. A post-row
+load spike or fixed fsync alarm is retained in the row and never triggers
+replacement. If quiet is not reached within 120 seconds, the attempt is
+`INCONCLUSIVE` with all partial rows retained as non-decision evidence.
 
 Provenance records toolchain and flags, kernel/boot ID, CPU model/topology,
 governor/turbo/affinity, page size, memory, filesystem/mount/device/scheduler,
@@ -546,13 +669,10 @@ matrix.
   the rest from further integration until a new predeclared candidate wins.
 - `REVERT`: the current public composition has a reproducible correctness,
   durability, cancellation, roll/recovery, poison, or paired unapproved
-  Process regression against `D`. If fresh `D` retains the historical
-  BN-2SU floor while `A` does not, that is likewise a current regression. If
-  both fresh variants move together below the absolute historical floor while
-  paired `A/D` passes, the result is `NARROW` for host drift, not a causal
-  reversion. The report identifies the first causal integrated checkpoint;
-  reversion is a separately reviewed product action, never an automatic
-  benchmark-script mutation.
+  Process regression against fresh public `D`. Historical direct-`LogEngine`
+  rows cannot cause or prevent reversion. The report identifies the first
+  causal integrated checkpoint; reversion is a separately reviewed product
+  action, never an automatic benchmark-script mutation.
 - `INCONCLUSIVE`: the matrix is incomplete or invalid, a source/build/adapter,
   lease/quiet/guard, tracer, child/evaluator, provenance, or historical-oracle
   failure prevents a valid decision, or the evidence cannot distinguish host
