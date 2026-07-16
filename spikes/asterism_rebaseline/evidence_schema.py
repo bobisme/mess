@@ -22,6 +22,7 @@ import re
 import stat
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Final
 
@@ -325,6 +326,13 @@ CONFIG_SCHEMA: Final = "bn-2l3n-config-v3"
 SOURCE_APPROVAL_SCHEMA: Final = "bn-2l3n-source-approval-v3"
 PREPARED_ARTIFACTS_SCHEMA: Final = "bn-2l3n-prepared-artifacts-v3"
 PREPARED_CLAIM_SCHEMA: Final = "bn-2l3n-prepared-claim-v3"
+SOURCE_REVIEW_INPUT_SCHEMA: Final = "bn-3hch-source-review-input-v1"
+SOURCE_REVIEW_ASSERTION_SCHEMA: Final = "bn-3hch-source-review-assertion-v1"
+SOURCE_REVIEW_BUNDLE_SCHEMA: Final = "bn-3hch-source-review-bundle-v1"
+RELEASE_COMPILE_OUT_REQUIREMENT_SCHEMA: Final = (
+    "bn-3hch-release-compile-out-requirement-v1"
+)
+RELEASE_COMPILE_OUT_SCHEMA: Final = "bn-3hch-release-compile-out-v1"
 FILE_MANIFEST_SCHEMA: Final = "bn-2l3n-file-manifest-v3"
 SMOKE_SCHEMA: Final = "bn-2l3n-smoke-v3"
 PROVENANCE_SCHEMA: Final = "bn-2l3n-provenance-v3"
@@ -590,7 +598,176 @@ SOURCE_APPROVAL_FIELDS: Final = (
     "tools_manifest_sha256",
     "filesystem_admission",
     "comm_allowlist",
+    "source_review",
     "variants",
+)
+SOURCE_REVIEW_IDENTITY_FIELDS: Final = (
+    "changed_ns",
+    "device",
+    "inode",
+    "link_count",
+    "modified_ns",
+)
+SOURCE_REVIEW_INPUT_FIELDS: Final = (
+    "schema",
+    "path",
+    "sha256",
+    "size",
+    "mode",
+    "identity",
+)
+SOURCE_REVIEW_INPUT_NAMES: Final = (
+    "current_children_attestation",
+    "tools_manifest",
+    "lock_manifest",
+    "lock_authority",
+    "lock_review_bundle",
+)
+SOURCE_REVIEW_ASSERTION_FIELDS: Final = (
+    "schema",
+    "protocol",
+    "protocol_sha256",
+    "status",
+    "open_findings",
+    "tooling_commit",
+    "tooling_tree",
+    "inputs",
+    "release_compile_out_requirement",
+)
+SOURCE_REVIEW_BUNDLE_FIELDS: Final = (
+    "assertion",
+    "assertion_sha256",
+    "review_created",
+    "schema",
+    "verdict",
+)
+SOURCE_REVIEW_SEAL_EVENT_FIELDS: Final = ("author", "data", "event", "ts")
+SOURCE_REVIEW_CREATED_DATA_FIELDS: Final = (
+    "description",
+    "initial_commit",
+    "jj_change_id",
+    "review_id",
+    "scm_anchor",
+    "scm_kind",
+    "title",
+)
+SOURCE_REVIEW_VERDICT_DATA_FIELDS: Final = ("reason", "review_id", "vote")
+SOURCE_REVIEW_FIELDS: Final = (
+    "assertion_sha256",
+    "bundle",
+    "current_children_attestation",
+    "lock_authority",
+    "lock_review_bundle",
+    "release_compile_out_requirement",
+)
+SOURCE_REVIEW_CONTENT_BINDING_FIELDS: Final = ("schema", "sha256", "mode")
+SOURCE_REVIEW_CONTENT_SCHEMAS: Final = {
+    "bundle": SOURCE_REVIEW_BUNDLE_SCHEMA,
+    "current_children_attestation": "bn-30fs-current-children-build-v1",
+    "lock_authority": "bn-31gp-current-lock-authority-v1",
+    "lock_review_bundle": "bn-31gp-current-lock-review-bundle-v1",
+}
+RELEASE_COMPILE_OUT_REQUIREMENT_FIELDS: Final = (
+    "schema",
+    "status",
+    "variant",
+    "product_overlay_sha256",
+    "preapproval_compile_out_sha256",
+    "proof_must_bind_enclosing_approval_sha256",
+    "repeat_under_real_source_approval",
+    "same_contract_nonce_lock_toolchain_sandbox",
+    "cfg_test",
+    "rustc_workspace_wrapper",
+    "ordinary_a_role",
+    "overlay_a_role",
+    "binary_byte_identical",
+    "symbol_inventory_byte_identical",
+    "forbidden_hook_strings",
+    "forbidden_hook_strings_absent",
+)
+RELEASE_COMPILE_OUT_FORBIDDEN_HOOK_STRINGS: Final = (
+    "TestEngineHook",
+    "TestEngineHooks",
+    "TestEngineFs",
+    "arm_test_hook",
+    "arm_test_owner_cohort",
+    "asterism_rebaseline_correctness",
+)
+RELEASE_COMPILE_OUT_EQUIVALENCE_CONTRACT_FIELDS: Final = (
+    "source_approval_sha256",
+    "contract_sha256",
+    "build_nonce",
+    "cargo_lock_sha256",
+    "toolchain_sha256",
+    "build_environment_sha256",
+    "sandbox_sha256",
+    "cfg_test",
+    "rustc_workspace_wrapper",
+    "ordinary_a_role",
+    "overlay_a_role",
+)
+RELEASE_COMPILE_OUT_BUILD_FIELDS: Final = (
+    "role",
+    "artifact_role",
+    "source_approval_sha256",
+    "contract_sha256",
+    "build_nonce",
+    "cargo_lock_sha256",
+    "toolchain_sha256",
+    "build_environment_sha256",
+    "sandbox_sha256",
+    "cfg_test",
+    "rustc_workspace_wrapper",
+    "attestation",
+    "attestation_sha256",
+)
+RELEASE_COMPILE_OUT_BUILD_NAMES: Final = ("ordinary_a", "overlay_a")
+RELEASE_COMPILE_OUT_FILE_FIELDS: Final = (
+    "path",
+    "sha256",
+    "size",
+    "mode",
+    "identity",
+)
+RELEASE_COMPILE_OUT_BINARY_FIELDS: Final = RELEASE_COMPILE_OUT_FILE_FIELDS
+RELEASE_COMPILE_OUT_SYMBOL_INVENTORY_FIELDS: Final = RELEASE_COMPILE_OUT_FILE_FIELDS
+RELEASE_COMPILE_OUT_NM_FIELDS: Final = ("tool", "ordinary_a", "overlay_a")
+RELEASE_COMPILE_OUT_NM_CHILD_FIELDS: Final = (
+    "argv",
+    "completed_at",
+    "completed_monotonic_ns",
+    "cwd",
+    "exit_status",
+    "output_path",
+    "output_sha256",
+    "pid",
+    "process_group_absent",
+    "reaping",
+    "start_ticks",
+    "started_at",
+    "started_monotonic_ns",
+    "timed_out",
+    "waited_pid",
+)
+RELEASE_COMPILE_OUT_FIELDS: Final = (
+    "schema",
+    "protocol",
+    "protocol_sha256",
+    "status",
+    "source_approval_sha256",
+    "requirement_sha256",
+    "current_children_attestation_sha256",
+    "product_overlay_sha256",
+    "equivalence_contract",
+    "builds",
+    "binaries",
+    "nm",
+    "symbol_inventories",
+    "forbidden_hook_strings",
+    "binary_byte_identical",
+    "symbol_inventory_byte_identical",
+    "forbidden_hook_strings_absent",
+    "published_a_sha256",
 )
 SOURCE_APPROVAL_VARIANT_FIELDS: Final = (
     "product_commit",
@@ -616,6 +793,8 @@ PREPARED_FIELDS: Final = (
     "created_at",
     "created_monotonic_ns",
     "source_approval",
+    "source_review",
+    "release_compile_out",
     "tools_manifest",
     "single_use_claim",
     "comm_allowlist",
@@ -631,6 +810,21 @@ PREPARED_SOURCE_APPROVAL_RELATIVE_PATH: Final = (
     "bindings",
     "source-approval.json",
 )
+PREPARED_SOURCE_REVIEW_FIELDS: Final = (
+    "bundle",
+    "current_children_attestation",
+    "lock_authority",
+    "lock_review_bundle",
+)
+PREPARED_SOURCE_REVIEW_BINDING_FIELDS: Final = ("path", "sha256", "mode")
+PREPARED_SOURCE_REVIEW_RELATIVE_PATHS: Final = {
+    "bundle": "bindings/source-review-bundle.json",
+    "current_children_attestation": "bindings/current-children-attestation.json",
+    "lock_authority": "bindings/lock-review-authority.json",
+    "lock_review_bundle": "bindings/lock-review-bundle.json",
+}
+RELEASE_COMPILE_OUT_BINDING_FIELDS: Final = ("path", "sha256", "mode")
+RELEASE_COMPILE_OUT_RELATIVE_PATH: Final = "manifests/release-compile-out.json"
 PREPARED_CLAIM_FIELDS: Final = (
     "schema",
     "protocol",
@@ -698,6 +892,13 @@ PREPARED_ATTESTATION_FIELDS: Final = (
     "contract_output_path",
     "contract_output_sha256",
     "contract_child",
+)
+RELEASE_COMPILE_OUT_ORDINARY_ATTESTATION_FIELDS: Final = (
+    *PREPARED_ATTESTATION_FIELDS,
+)
+RELEASE_COMPILE_OUT_OVERLAY_ATTESTATION_FIELDS: Final = (
+    *PREPARED_ATTESTATION_FIELDS,
+    "product_overlay_sha256",
 )
 FILE_BINDING_FIELDS: Final = ("path", "sha256")
 CARGO_CONFIG_SEARCH_SCHEMA: Final = "asterism-rebaseline-cargo-config-search-v3"
@@ -2535,6 +2736,1083 @@ def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+_SOURCE_REVIEW_IDENTIFIER: Final = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._:/@+\-]{0,255}\Z"
+)
+_SOURCE_REVIEW_ZONED_TIME: Final = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+    r"(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})\Z"
+)
+
+
+def _authority_object(
+    value: Any, fields: Sequence[str], context: str
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != set(fields):
+        raise ValueError(f"{context} fields are not exact")
+    return value
+
+
+def _authority_sha256(value: Any, context: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{context} is not lower-case SHA-256")
+    return value
+
+
+def _authority_git_id(value: Any, context: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 40
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{context} is not a Git object id")
+    return value
+
+
+def _authority_timestamp(value: Any, context: str) -> tuple[datetime, int]:
+    if not isinstance(value, str) or not _SOURCE_REVIEW_ZONED_TIME.fullmatch(value):
+        raise ValueError(f"{context} is not a zoned timestamp")
+    match = re.fullmatch(
+        r"(?P<head>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})"
+        r"(?:\.(?P<fraction>\d{1,9}))?(?P<zone>Z|[+-]\d{2}:\d{2})",
+        value,
+    )
+    if match is None:
+        raise ValueError(f"{context} is not a zoned timestamp")
+    fraction = match.group("fraction")
+    nanoseconds = (fraction or "").ljust(9, "0")
+    microseconds = f".{nanoseconds[:6]}" if fraction else ""
+    zone = "+00:00" if match.group("zone") == "Z" else match.group("zone")
+    try:
+        timestamp = datetime.fromisoformat(
+            f"{match.group('head')}{microseconds}{zone}"
+        )
+    except ValueError as error:
+        raise ValueError(f"{context} is not a valid zoned timestamp") from error
+    return timestamp, int(nanoseconds[6:] or "0")
+
+
+def _validate_source_review_identity(value: Any, context: str) -> None:
+    identity = _authority_object(
+        value, SOURCE_REVIEW_IDENTITY_FIELDS, f"{context} identity"
+    )
+    for field in SOURCE_REVIEW_IDENTITY_FIELDS:
+        item = identity[field]
+        if not _is_integer(item) or item < 0:
+            raise ValueError(f"{context} identity {field} is invalid")
+    if identity["device"] <= 0 or identity["inode"] <= 0:
+        raise ValueError(f"{context} identity device/inode is invalid")
+    if identity["link_count"] != 1:
+        raise ValueError(f"{context} identity link count is not exact one")
+
+
+def _validate_source_review_input(value: Any, context: str) -> Mapping[str, Any]:
+    binding = _authority_object(value, SOURCE_REVIEW_INPUT_FIELDS, context)
+    if binding["schema"] != SOURCE_REVIEW_INPUT_SCHEMA:
+        raise ValueError(f"{context} schema differs")
+    path = binding["path"]
+    if not isinstance(path, str) or not Path(path).is_absolute():
+        raise ValueError(f"{context} path is not absolute")
+    _authority_sha256(binding["sha256"], f"{context} sha256")
+    if not _is_integer(binding["size"]) or binding["size"] <= 0:
+        raise ValueError(f"{context} size is invalid")
+    if binding["mode"] != ARTIFACT_FILE_MODE:
+        raise ValueError(f"{context} mode differs from exact 0444")
+    _validate_source_review_identity(binding["identity"], context)
+    return binding
+
+
+def validate_release_compile_out_requirement(value: Any) -> None:
+    """Validate the cycle-breaking proof obligation embedded in approval."""
+
+    requirement = _authority_object(
+        value,
+        RELEASE_COMPILE_OUT_REQUIREMENT_FIELDS,
+        "release compile-out requirement",
+    )
+    exact = {
+        "schema": RELEASE_COMPILE_OUT_REQUIREMENT_SCHEMA,
+        "status": "required",
+        "variant": "A",
+        "proof_must_bind_enclosing_approval_sha256": True,
+        "repeat_under_real_source_approval": True,
+        "same_contract_nonce_lock_toolchain_sandbox": True,
+        "cfg_test": False,
+        "rustc_workspace_wrapper": "absent",
+        "ordinary_a_role": "published",
+        "overlay_a_role": "proof_only",
+        "binary_byte_identical": True,
+        "symbol_inventory_byte_identical": True,
+        "forbidden_hook_strings": list(RELEASE_COMPILE_OUT_FORBIDDEN_HOOK_STRINGS),
+        "forbidden_hook_strings_absent": True,
+    }
+    for field, expected in exact.items():
+        if requirement[field] != expected:
+            raise ValueError(f"release compile-out requirement {field} differs")
+    _authority_sha256(
+        requirement["product_overlay_sha256"],
+        "release compile-out product overlay hash",
+    )
+    _authority_sha256(
+        requirement["preapproval_compile_out_sha256"],
+        "release compile-out preapproval proof hash",
+    )
+
+
+def _validate_source_review_content_binding(
+    value: Any, name: str
+) -> Mapping[str, Any]:
+    binding = _authority_object(
+        value, SOURCE_REVIEW_CONTENT_BINDING_FIELDS, f"source review {name}"
+    )
+    if binding["schema"] != SOURCE_REVIEW_CONTENT_SCHEMAS[name]:
+        raise ValueError(f"source review {name} payload schema differs")
+    _authority_sha256(binding["sha256"], f"source review {name} hash")
+    if binding["mode"] != ARTIFACT_FILE_MODE:
+        raise ValueError(f"source review {name} mode differs from exact 0444")
+    return binding
+
+
+def _validate_source_review_approval(
+    source_review: Any,
+) -> Mapping[str, Any]:
+    value = _authority_object(source_review, SOURCE_REVIEW_FIELDS, "source review")
+    _authority_sha256(value["assertion_sha256"], "source review assertion hash")
+    for name in SOURCE_REVIEW_CONTENT_SCHEMAS:
+        _validate_source_review_content_binding(value[name], name)
+    validate_release_compile_out_requirement(
+        value["release_compile_out_requirement"]
+    )
+    return value
+
+
+def validate_source_approval(approval: dict[str, Any]) -> None:
+    """Apply the shared, fail-closed v3 source-approval authority.
+
+    The filesystem-bearing source-review bundle is replayed by
+    :func:`validate_prepared_artifacts`; this first stage validates the exact
+    approval structure and its cycle-free compile-out obligation.
+    """
+
+    value = _authority_object(approval, SOURCE_APPROVAL_FIELDS, "source approval")
+    exact = {
+        "schema": SOURCE_APPROVAL_SCHEMA,
+        "protocol": PROTOCOL,
+        "protocol_sha256": PROTOCOL_SHA256,
+        "status": "approved",
+    }
+    for field, expected in exact.items():
+        if value[field] != expected:
+            raise ValueError(f"source approval {field} differs")
+    review_id = value["review_id"]
+    if not isinstance(review_id, str) or not _SOURCE_REVIEW_IDENTIFIER.fullmatch(
+        review_id
+    ):
+        raise ValueError("source approval review id is invalid")
+    _authority_timestamp(value["reviewed_at"], "source approval reviewed_at")
+    _authority_git_id(value["tooling_commit"], "source approval tooling commit")
+    _authority_git_id(value["tooling_tree"], "source approval tooling tree")
+    _authority_sha256(
+        value["shared_manifest_sha256"], "source approval shared manifest hash"
+    )
+    tools_manifest = _authority_object(
+        value["tools_manifest"], TOOLS_MANIFEST_FIELDS, "source approval tools manifest"
+    )
+    if (
+        tools_manifest["schema"] != TOOLS_MANIFEST_SCHEMA
+        or tools_manifest["comm_allowlist"] != expected_comm_allowlist()
+    ):
+        raise ValueError("source approval tools manifest authority differs")
+    tools_sha256 = _authority_sha256(
+        value["tools_manifest_sha256"], "source approval tools manifest hash"
+    )
+    if sha256_bytes(canonical_json_bytes(tools_manifest)) != tools_sha256:
+        raise ValueError("source approval embedded tools manifest hash differs")
+    if value["comm_allowlist"] != expected_comm_allowlist():
+        raise ValueError("source approval comm allowlist differs")
+    if not isinstance(value["toolchain"], Mapping):
+        raise ValueError("source approval toolchain is not an object")
+    if not isinstance(value["filesystem_admission"], Mapping):
+        raise ValueError("source approval filesystem admission is not an object")
+    variants = value["variants"]
+    if not isinstance(variants, Mapping) or set(variants) != set(VARIANTS):
+        raise ValueError("source approval variants are not exact A/B/C/D")
+    for variant in VARIANTS:
+        _authority_object(
+            variants[variant],
+            SOURCE_APPROVAL_VARIANT_FIELDS,
+            f"source approval variant {variant}",
+        )
+    _validate_source_review_approval(value["source_review"])
+
+
+def _validate_source_review_bundle(
+    bundle: Mapping[str, Any], approval: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    value = _authority_object(bundle, SOURCE_REVIEW_BUNDLE_FIELDS, "source review bundle")
+    if value["schema"] != SOURCE_REVIEW_BUNDLE_SCHEMA:
+        raise ValueError("source review bundle schema differs")
+    assertion = _authority_object(
+        value["assertion"], SOURCE_REVIEW_ASSERTION_FIELDS, "source review assertion"
+    )
+    if (
+        assertion["schema"] != SOURCE_REVIEW_ASSERTION_SCHEMA
+        or assertion["protocol"] != PROTOCOL
+        or assertion["protocol_sha256"] != PROTOCOL_SHA256
+        or assertion["status"] != "approved"
+        or assertion["open_findings"] != 0
+        or assertion["tooling_commit"] != approval["tooling_commit"]
+        or assertion["tooling_tree"] != approval["tooling_tree"]
+    ):
+        raise ValueError("source review assertion authority differs")
+    inputs = assertion["inputs"]
+    if not isinstance(inputs, Mapping) or set(inputs) != set(SOURCE_REVIEW_INPUT_NAMES):
+        raise ValueError("source review assertion input names differ")
+    validated_inputs = {
+        name: _validate_source_review_input(inputs[name], f"source review input {name}")
+        for name in SOURCE_REVIEW_INPUT_NAMES
+    }
+    paths = [binding["path"] for binding in validated_inputs.values()]
+    identities = [
+        (binding["identity"]["device"], binding["identity"]["inode"])
+        for binding in validated_inputs.values()
+    ]
+    if len(set(paths)) != len(paths) or len(set(identities)) != len(identities):
+        raise ValueError("source review inputs are not disjoint")
+    requirement = assertion["release_compile_out_requirement"]
+    validate_release_compile_out_requirement(requirement)
+    if requirement != approval["source_review"]["release_compile_out_requirement"]:
+        raise ValueError("source review assertion requirement differs from approval")
+    assertion_sha256 = sha256_bytes(canonical_json_bytes(assertion))
+    if (
+        value["assertion_sha256"] != assertion_sha256
+        or approval["source_review"]["assertion_sha256"] != assertion_sha256
+    ):
+        raise ValueError("source review assertion hash binding differs")
+
+    created = _authority_object(
+        value["review_created"],
+        SOURCE_REVIEW_SEAL_EVENT_FIELDS,
+        "source review ReviewCreated event",
+    )
+    verdict = _authority_object(
+        value["verdict"],
+        SOURCE_REVIEW_SEAL_EVENT_FIELDS,
+        "source review ReviewerVoted event",
+    )
+    for event, event_name in (
+        (created, "ReviewCreated"),
+        (verdict, "ReviewerVoted"),
+    ):
+        author = event["author"]
+        if not isinstance(author, str) or not _SOURCE_REVIEW_IDENTIFIER.fullmatch(author):
+            raise ValueError(f"source review {event_name} author is invalid")
+        if event["event"] != event_name:
+            raise ValueError(f"source review {event_name} event kind differs")
+    created_data = _authority_object(
+        created["data"],
+        SOURCE_REVIEW_CREATED_DATA_FIELDS,
+        "source review ReviewCreated data",
+    )
+    review_id = approval["review_id"]
+    detached_anchor = f"detached:{approval['tooling_commit']}"
+    if (
+        created_data["review_id"] != review_id
+        or created_data["initial_commit"] != approval["tooling_commit"]
+        or created_data["jj_change_id"] != detached_anchor
+        or created_data["scm_anchor"] != detached_anchor
+        or created_data["scm_kind"] != "git"
+        or not isinstance(created_data["title"], str)
+        or not created_data["title"]
+        or not isinstance(created_data["description"], str)
+        or not created_data["description"]
+    ):
+        raise ValueError("source review ReviewCreated anchor/content differs")
+    verdict_data = _authority_object(
+        verdict["data"],
+        SOURCE_REVIEW_VERDICT_DATA_FIELDS,
+        "source review ReviewerVoted data",
+    )
+    expected_reason = (
+        f"APPROVED assertion_sha256={assertion_sha256}; open_findings=0"
+    )
+    if (
+        verdict_data["review_id"] != review_id
+        or verdict_data["vote"] != "lgtm"
+        or verdict_data["reason"] != expected_reason
+    ):
+        raise ValueError("source review verdict differs")
+    created_at = _authority_timestamp(created["ts"], "source review created time")
+    reviewed_at = _authority_timestamp(verdict["ts"], "source review verdict time")
+    if reviewed_at < created_at or verdict["ts"] != approval["reviewed_at"]:
+        raise ValueError("source review chronology/approval time differs")
+    return assertion
+
+
+def _snapshot_prepared_binding(
+    value: Any,
+    fields: Sequence[str],
+    expected_path: Path,
+    context: str,
+    *,
+    expected_mode: int,
+) -> tuple[FileSnapshot, dict[str, Any]]:
+    binding = _authority_object(value, fields, f"{context} binding")
+    if (
+        binding["path"] != str(expected_path)
+        or binding["mode"] != expected_mode
+    ):
+        raise ValueError(f"{context} path/mode binding differs")
+    expected_sha256 = _authority_sha256(binding["sha256"], f"{context} hash")
+    snapshot = snapshot_regular_file(expected_path, expected_mode=expected_mode)
+    if snapshot.sha256 != expected_sha256:
+        raise ValueError(f"{context} bytes differ from binding")
+    parsed = parse_canonical_json_object(snapshot.data, context)
+    return snapshot, parsed
+
+
+def _strip_source_input_schema(value: Mapping[str, Any]) -> dict[str, Any]:
+    return {field: value[field] for field in SOURCE_REVIEW_INPUT_FIELDS if field != "schema"}
+
+
+def _validate_preapproval_attestation(
+    attestation: Mapping[str, Any],
+    assertion: Mapping[str, Any],
+    approval: Mapping[str, Any],
+) -> None:
+    inputs = assertion["inputs"]
+    if (
+        attestation.get("schema") != SOURCE_REVIEW_CONTENT_SCHEMAS[
+            "current_children_attestation"
+        ]
+        or attestation.get("protocol") != PROTOCOL
+        or attestation.get("protocol_sha256") != PROTOCOL_SHA256
+        or attestation.get("status") != "ok"
+        or attestation.get("tools_manifest_sha256")
+        != inputs["tools_manifest"]["sha256"]
+        or attestation.get("tools_manifest_sha256")
+        != approval["tools_manifest_sha256"]
+        or attestation.get("lock_manifest_sha256")
+        != inputs["lock_manifest"]["sha256"]
+        or attestation.get("review_bundle_sha256")
+        != inputs["lock_review_bundle"]["sha256"]
+    ):
+        raise ValueError("current children attestation reviewed inputs differ")
+    authority_inputs = attestation.get("lock_authority_inputs")
+    if not isinstance(authority_inputs, Mapping) or set(authority_inputs) != {
+        "authority",
+        "lock_manifest",
+        "review_bundle",
+    }:
+        raise ValueError("current children lock-authority inputs differ")
+    names = {
+        "authority": "lock_authority",
+        "lock_manifest": "lock_manifest",
+        "review_bundle": "lock_review_bundle",
+    }
+    for attestation_name, assertion_name in names.items():
+        if authority_inputs[attestation_name] != _strip_source_input_schema(
+            inputs[assertion_name]
+        ):
+            raise ValueError(
+                f"current children {attestation_name} input binding differs"
+            )
+    approval_state = attestation.get("release_compile_out_approval")
+    if approval_state != {
+        "final_integration_action": (
+            "repeat-release-equality-proof-under-real-source-approval"
+        ),
+        "source_approval_sha256": (
+            "fa2acb626f303f8a65a16a6c8a1fd86b7e80cf48e092ae21a7308984ae790c94"
+        ),
+        "source_approval_status": "preapproval-sentinel-not-source-approved",
+    }:
+        raise ValueError("current children preapproval sentinel/action differs")
+    requirement = assertion["release_compile_out_requirement"]
+    preapproval = attestation.get("release_compile_out")
+    if (
+        not isinstance(preapproval, Mapping)
+        or sha256_bytes(canonical_json_bytes(preapproval))
+        != requirement["preapproval_compile_out_sha256"]
+    ):
+        raise ValueError("current children preapproval compile-out proof differs")
+    overlay_authority = attestation.get("product_overlay_authority")
+    patch = overlay_authority.get("patch") if isinstance(overlay_authority, Mapping) else None
+    if (
+        not isinstance(patch, Mapping)
+        or patch.get("sha256") != requirement["product_overlay_sha256"]
+    ):
+        raise ValueError("current children product overlay binding differs")
+
+
+def _validate_release_file_record(
+    value: Any, context: str, *, expected_mode: int
+) -> Mapping[str, Any]:
+    record = _authority_object(value, RELEASE_COMPILE_OUT_FILE_FIELDS, context)
+    path = record["path"]
+    if not isinstance(path, str) or not Path(path).is_absolute():
+        raise ValueError(f"{context} path is not absolute")
+    _authority_sha256(record["sha256"], f"{context} hash")
+    if not _is_integer(record["size"]) or record["size"] <= 0:
+        raise ValueError(f"{context} size is invalid")
+    if record["mode"] != expected_mode:
+        raise ValueError(f"{context} mode differs")
+    _validate_source_review_identity(record["identity"], context)
+    snapshot = snapshot_regular_file(Path(path), expected_mode=expected_mode)
+    if snapshot.sha256 != record["sha256"] or snapshot.size != record["size"]:
+        raise ValueError(f"{context} live bytes differ")
+    if record["identity"] != {
+        "changed_ns": snapshot._stat.st_ctime_ns,
+        "device": snapshot.device,
+        "inode": snapshot.inode,
+        "link_count": snapshot._stat.st_nlink,
+        "modified_ns": snapshot._stat.st_mtime_ns,
+    }:
+        raise ValueError(f"{context} live identity differs")
+    return record
+
+
+def _validate_release_compile_out(
+    proof: Mapping[str, Any],
+    prepared: Mapping[str, Any],
+    approval: Mapping[str, Any],
+    current_attestation: Mapping[str, Any],
+) -> None:
+    value = _authority_object(proof, RELEASE_COMPILE_OUT_FIELDS, "release compile-out proof")
+    approval_sha256 = sha256_bytes(canonical_json_bytes(approval))
+    requirement = approval["source_review"]["release_compile_out_requirement"]
+    requirement_sha256 = sha256_bytes(canonical_json_bytes(requirement))
+    exact = {
+        "schema": RELEASE_COMPILE_OUT_SCHEMA,
+        "protocol": PROTOCOL,
+        "protocol_sha256": PROTOCOL_SHA256,
+        "status": "ok",
+        "source_approval_sha256": approval_sha256,
+        "requirement_sha256": requirement_sha256,
+        "current_children_attestation_sha256": sha256_bytes(
+            canonical_json_bytes(current_attestation)
+        ),
+        "product_overlay_sha256": requirement["product_overlay_sha256"],
+        "forbidden_hook_strings": list(RELEASE_COMPILE_OUT_FORBIDDEN_HOOK_STRINGS),
+        "binary_byte_identical": True,
+        "symbol_inventory_byte_identical": True,
+        "forbidden_hook_strings_absent": True,
+    }
+    for field, expected in exact.items():
+        if value[field] != expected:
+            raise ValueError(f"release compile-out proof {field} differs")
+
+    equivalence = _authority_object(
+        value["equivalence_contract"],
+        RELEASE_COMPILE_OUT_EQUIVALENCE_CONTRACT_FIELDS,
+        "release compile-out equivalence contract",
+    )
+    if (
+        equivalence["source_approval_sha256"] != approval_sha256
+        or equivalence["cfg_test"] is not False
+        or equivalence["rustc_workspace_wrapper"] != "absent"
+        or equivalence["ordinary_a_role"] != "published"
+        or equivalence["overlay_a_role"] != "proof_only"
+    ):
+        raise ValueError("release compile-out equivalence policy differs")
+    for field in (
+        "contract_sha256",
+        "build_nonce",
+        "cargo_lock_sha256",
+        "toolchain_sha256",
+        "build_environment_sha256",
+        "sandbox_sha256",
+    ):
+        _authority_sha256(equivalence[field], f"release equivalence {field}")
+
+    builds = value["builds"]
+    if not isinstance(builds, Mapping) or set(builds) != set(
+        RELEASE_COMPILE_OUT_BUILD_NAMES
+    ):
+        raise ValueError("release compile-out build names differ")
+    common_fields = (
+        "source_approval_sha256",
+        "contract_sha256",
+        "build_nonce",
+        "cargo_lock_sha256",
+        "toolchain_sha256",
+        "build_environment_sha256",
+        "sandbox_sha256",
+        "cfg_test",
+        "rustc_workspace_wrapper",
+    )
+    for name in RELEASE_COMPILE_OUT_BUILD_NAMES:
+        build = _authority_object(
+            builds[name], RELEASE_COMPILE_OUT_BUILD_FIELDS, f"release build {name}"
+        )
+        attestation_fields = (
+            RELEASE_COMPILE_OUT_ORDINARY_ATTESTATION_FIELDS
+            if name == "ordinary_a"
+            else RELEASE_COMPILE_OUT_OVERLAY_ATTESTATION_FIELDS
+        )
+        attestation = _authority_object(
+            build["attestation"],
+            attestation_fields,
+            f"release build {name} attestation",
+        )
+        if (
+            build["role"] != name
+            or build["artifact_role"] != equivalence[f"{name}_role"]
+            or any(build[field] != equivalence[field] for field in common_fields)
+            or build["attestation_sha256"]
+            != sha256_bytes(canonical_json_bytes(attestation))
+        ):
+            raise ValueError(f"release build {name} equivalence binding differs")
+        build_environment = attestation["build_env"]
+        if not isinstance(build_environment, Mapping):
+            raise ValueError(f"release build {name} environment is not an object")
+        normalized_argv = [
+            "$SOURCE_ROOT"
+            if argument == attestation["materialized_root"]
+            else "$TARGET_DIR"
+            if argument == attestation["target_dir"]
+            else argument
+            for argument in attestation["build_argv"]
+        ]
+        if (
+            attestation["build_nonce"] != build["build_nonce"]
+            or attestation["cargo_lock_sha256"] != build["cargo_lock_sha256"]
+            or sha256_bytes(canonical_json_bytes(attestation["toolchain"]))
+            != build["toolchain_sha256"]
+            or sha256_bytes(canonical_json_bytes(build_environment))
+            != build["build_environment_sha256"]
+            or sha256_bytes(canonical_json_bytes(normalized_argv))
+            != build["sandbox_sha256"]
+            or build_environment.get("ASTERISM_BUILD_SOURCE_APPROVAL_SHA256")
+            != approval_sha256
+            or any(
+                field in build_environment
+                for field in (
+                    "RUSTC_WORKSPACE_WRAPPER",
+                    "RUSTC_WRAPPER",
+                    "RUSTFLAGS",
+                    "CARGO_ENCODED_RUSTFLAGS",
+                )
+            )
+        ):
+            raise ValueError(f"release build {name} embedded authority differs")
+        contract_path = Path(str(attestation["contract_output_path"]))
+        contract_snapshot = snapshot_regular_file(
+            contract_path, expected_mode=ARTIFACT_FILE_MODE
+        )
+        contract = parse_canonical_json_object(
+            contract_snapshot.data, f"release build {name} contract"
+        )
+        if (
+            contract_snapshot.sha256 != attestation["contract_output_sha256"]
+            or sha256_bytes(canonical_json_bytes(contract))
+            != build["contract_sha256"]
+            or contract != prepared["variants"]["A"]["contract"]
+        ):
+            raise ValueError(f"release build {name} contract replay differs")
+        if name == "ordinary_a" and "product_overlay_sha256" in attestation:
+            raise ValueError("ordinary A attestation contains product overlay authority")
+        if (
+            name == "overlay_a"
+            and attestation["product_overlay_sha256"]
+            != requirement["product_overlay_sha256"]
+        ):
+            raise ValueError("proof-only overlay A authority differs")
+
+    binaries = value["binaries"]
+    inventories = value["symbol_inventories"]
+    if not isinstance(binaries, Mapping) or set(binaries) != set(
+        RELEASE_COMPILE_OUT_BUILD_NAMES
+    ):
+        raise ValueError("release binary names differ")
+    if not isinstance(inventories, Mapping) or set(inventories) != set(
+        RELEASE_COMPILE_OUT_BUILD_NAMES
+    ):
+        raise ValueError("release symbol inventory names differ")
+    binary_records = {
+        name: _validate_release_file_record(
+            binaries[name], f"release binary {name}", expected_mode=0o555
+        )
+        for name in RELEASE_COMPILE_OUT_BUILD_NAMES
+    }
+    inventory_records = {
+        name: _validate_release_file_record(
+            inventories[name], f"release symbol inventory {name}", expected_mode=0o444
+        )
+        for name in RELEASE_COMPILE_OUT_BUILD_NAMES
+    }
+    for records, context in (
+        (binary_records, "release binaries"),
+        (inventory_records, "release symbol inventories"),
+    ):
+        first, second = (records[name] for name in RELEASE_COMPILE_OUT_BUILD_NAMES)
+        if (
+            first["sha256"] != second["sha256"]
+            or first["size"] != second["size"]
+            or first["path"] == second["path"]
+            or (first["identity"]["device"], first["identity"]["inode"])
+            == (second["identity"]["device"], second["identity"]["inode"])
+        ):
+            raise ValueError(f"{context} are not equal and physically disjoint")
+    if (
+        value["published_a_sha256"] != binary_records["ordinary_a"]["sha256"]
+        or value["published_a_sha256"] != prepared["variants"]["A"]["binary"]["sha256"]
+        or binary_records["ordinary_a"]["path"]
+        != prepared["variants"]["A"]["binary"]["path"]
+    ):
+        raise ValueError("release published A binding differs")
+    overlay_path = binary_records["overlay_a"]["path"]
+
+    def contains_proof_only_path(item: Any) -> bool:
+        if isinstance(item, Mapping):
+            return any(contains_proof_only_path(child) for child in item.values())
+        if isinstance(item, (list, tuple)):
+            return any(contains_proof_only_path(child) for child in item)
+        return item == overlay_path
+
+    if any(
+        contains_proof_only_path(prepared[field])
+        for field in ("variants", "tools", "support_files")
+    ):
+        raise ValueError("proof-only overlay A is reachable as a published artifact")
+
+    nm = _authority_object(value["nm"], RELEASE_COMPILE_OUT_NM_FIELDS, "release nm proof")
+    preapproval_compile_out = current_attestation.get("release_compile_out")
+    preapproval_nm = (
+        preapproval_compile_out.get("nm")
+        if isinstance(preapproval_compile_out, Mapping)
+        else None
+    )
+    if not isinstance(preapproval_nm, Mapping) or not _is_integer(
+        preapproval_nm.get("mode")
+    ):
+        raise ValueError("preapproval nm authority is absent")
+    nm_tool = _validate_release_file_record(
+        nm["tool"], "release nm tool", expected_mode=preapproval_nm["mode"]
+    )
+    expected_nm_tool = {
+        "identity": {
+            "changed_ns": preapproval_nm.get("ctime_ns"),
+            "device": preapproval_nm.get("device"),
+            "inode": preapproval_nm.get("inode"),
+            "link_count": preapproval_nm.get("link_count"),
+            "modified_ns": preapproval_nm.get("mtime_ns"),
+        },
+        "mode": preapproval_nm.get("mode"),
+        "path": preapproval_nm.get("path"),
+        "sha256": preapproval_nm.get("sha256"),
+        "size": preapproval_nm.get("size"),
+    }
+    if nm_tool != expected_nm_tool:
+        raise ValueError("release nm tool differs from preapproval authority")
+    for name in RELEASE_COMPILE_OUT_BUILD_NAMES:
+        child = _authority_object(
+            nm[name], RELEASE_COMPILE_OUT_NM_CHILD_FIELDS, f"release nm child {name}"
+        )
+        argv = child["argv"]
+        expected_prefix = [
+            nm_tool["path"],
+            "--defined-only",
+            "--demangle=rust",
+            "--format=posix",
+        ]
+        reaping = child["reaping"]
+        if (
+            child["exit_status"] != 0
+            or child["timed_out"] is not False
+            or child["process_group_absent"] is not True
+            or child["waited_pid"] != child["pid"]
+            or not isinstance(argv, list)
+            or len(argv) != 5
+            or argv[:4] != expected_prefix
+            or not isinstance(argv[4], str)
+            or re.fullmatch(r"/proc/self/fd/[0-9]+", argv[4]) is None
+            or reaping
+            != {
+                "pid": child["pid"],
+                "start_ticks": child["start_ticks"],
+                "status": "absent",
+            }
+            or any(
+                not _is_integer(child[field]) or child[field] <= 0
+                for field in (
+                    "pid",
+                    "start_ticks",
+                    "waited_pid",
+                    "started_monotonic_ns",
+                    "completed_monotonic_ns",
+                )
+            )
+            or child["completed_monotonic_ns"] < child["started_monotonic_ns"]
+        ):
+            raise ValueError(f"release nm child {name} did not complete exactly")
+        started_at = _authority_timestamp(
+            child["started_at"], f"release nm child {name} start"
+        )
+        completed_at = _authority_timestamp(
+            child["completed_at"], f"release nm child {name} completion"
+        )
+        if completed_at < started_at:
+            raise ValueError(f"release nm child {name} chronology differs")
+        output_path = Path(str(child["output_path"]))
+        output_snapshot = snapshot_regular_file(
+            output_path, expected_mode=ARTIFACT_FILE_MODE
+        )
+        output = parse_canonical_json_object(
+            output_snapshot.data, f"release nm child {name} output"
+        )
+        stdout = output.get("stdout")
+        stderr = output.get("stderr")
+        if (
+            set(output)
+            != {
+                "exit_status",
+                "stderr",
+                "stderr_sha256",
+                "stdout",
+                "stdout_sha256",
+            }
+            or output_snapshot.sha256 != child["output_sha256"]
+            or output.get("exit_status") != 0
+            or not isinstance(stdout, str)
+            or not isinstance(stderr, str)
+            or stderr != ""
+            or output.get("stderr_sha256") != sha256_bytes(b"")
+            or output.get("stdout_sha256") != sha256_bytes(stdout.encode())
+        ):
+            raise ValueError(f"release nm child {name} output binding differs")
+        inventory_snapshot = snapshot_regular_file(
+            Path(inventory_records[name]["path"]), expected_mode=ARTIFACT_FILE_MODE
+        )
+        if inventory_snapshot.data != stdout.encode():
+            raise ValueError(f"release nm child {name} inventory bytes differ")
+
+
+def validate_prepared_artifacts(
+    prepared: dict[str, Any],
+    approval: dict[str, Any],
+    prepared_path: Path,
+) -> None:
+    """Replay local source-review copies and the real-approval release proof."""
+
+    validate_source_approval(approval)
+    value = _authority_object(prepared, PREPARED_FIELDS, "prepared artifacts")
+    if (
+        value["schema"] != PREPARED_ARTIFACTS_SCHEMA
+        or value["protocol"] != PROTOCOL
+        or value["protocol_sha256"] != PROTOCOL_SHA256
+        or value["tooling_commit"] != approval["tooling_commit"]
+        or value["tooling_tree"] != approval["tooling_tree"]
+        or value["build_order"] != list(VARIANTS)
+    ):
+        raise ValueError("prepared artifact identity/order differs")
+    root = Path(prepared_path).parent.resolve(strict=True)
+    approval_binding = _authority_object(
+        value["source_approval"], FILE_BINDING_FIELDS, "prepared source approval binding"
+    )
+    copied_approval_path = root.joinpath(*PREPARED_SOURCE_APPROVAL_RELATIVE_PATH)
+    if approval_binding["path"] != str(copied_approval_path):
+        raise ValueError("prepared source approval path differs")
+    copied_approval = snapshot_regular_file(
+        copied_approval_path, expected_mode=ARTIFACT_FILE_MODE
+    )
+    if (
+        copied_approval.sha256
+        != _authority_sha256(
+            approval_binding["sha256"], "prepared source approval hash"
+        )
+        or parse_canonical_json_object(
+            copied_approval.data, "prepared source approval copy"
+        )
+        != approval
+    ):
+        raise ValueError("prepared source approval copy differs")
+    source_review = _authority_object(
+        value["source_review"], PREPARED_SOURCE_REVIEW_FIELDS, "prepared source review"
+    )
+    snapshots: dict[str, FileSnapshot] = {}
+    payloads: dict[str, dict[str, Any]] = {}
+    for name, relative in PREPARED_SOURCE_REVIEW_RELATIVE_PATHS.items():
+        snapshot, payload = _snapshot_prepared_binding(
+            source_review[name],
+            PREPARED_SOURCE_REVIEW_BINDING_FIELDS,
+            root / relative,
+            f"prepared source review {name}",
+            expected_mode=0o444,
+        )
+        approval_binding = approval["source_review"][name]
+        if (
+            snapshot.sha256 != approval_binding["sha256"]
+            or payload.get("schema") != approval_binding["schema"]
+        ):
+            raise ValueError(f"prepared source review {name} differs from approval")
+        snapshots[name] = snapshot
+        payloads[name] = payload
+    assertion = _validate_source_review_bundle(payloads["bundle"], approval)
+    inputs = assertion["inputs"]
+    for name in (
+        "current_children_attestation",
+        "lock_authority",
+        "lock_review_bundle",
+    ):
+        if snapshots[name].sha256 != inputs[name]["sha256"]:
+            raise ValueError(f"prepared source review {name} differs from assertion")
+    if snapshots["bundle"].sha256 != approval["source_review"]["bundle"]["sha256"]:
+        raise ValueError("prepared source review bundle differs from approval")
+    if inputs["tools_manifest"]["sha256"] != approval["tools_manifest_sha256"]:
+        raise ValueError("source review tools manifest differs from approval")
+    _validate_preapproval_attestation(
+        payloads["current_children_attestation"], assertion, approval
+    )
+    lock_authority = payloads["lock_authority"]
+    bound_lock_manifest = lock_authority.get("lock_manifest")
+    bound_lock_review = lock_authority.get("review_bundle")
+    if (
+        lock_authority.get("schema")
+        != SOURCE_REVIEW_CONTENT_SCHEMAS["lock_authority"]
+        or lock_authority.get("status") != "approved"
+        or lock_authority.get("protocol") != PROTOCOL
+        or lock_authority.get("protocol_sha256") != PROTOCOL_SHA256
+        or lock_authority.get("tooling_commit") != approval["tooling_commit"]
+        or lock_authority.get("tooling_tree") != approval["tooling_tree"]
+        or lock_authority.get("review_sha256")
+        != inputs["lock_review_bundle"]["sha256"]
+        or not isinstance(bound_lock_manifest, Mapping)
+        or bound_lock_manifest.get("sha256") != inputs["lock_manifest"]["sha256"]
+        or bound_lock_manifest.get("schema") != "asterism-rebaseline-lock-candidates-v3"
+        or not isinstance(bound_lock_manifest.get("payload"), Mapping)
+        or bound_lock_manifest["payload"].get("schema")
+        != "asterism-rebaseline-lock-candidates-v3"
+        or not isinstance(bound_lock_review, Mapping)
+        or bound_lock_review.get("sha256")
+        != inputs["lock_review_bundle"]["sha256"]
+        or bound_lock_review.get("schema")
+        != SOURCE_REVIEW_CONTENT_SCHEMAS["lock_review_bundle"]
+        or bound_lock_review.get("payload") != payloads["lock_review_bundle"]
+    ):
+        raise ValueError("prepared lock authority differs from source review")
+    lock_review = payloads["lock_review_bundle"]
+    if lock_review.get("schema") != SOURCE_REVIEW_CONTENT_SCHEMAS["lock_review_bundle"]:
+        raise ValueError("prepared lock review bundle schema differs")
+
+    _proof_snapshot, proof = _snapshot_prepared_binding(
+        value["release_compile_out"],
+        RELEASE_COMPILE_OUT_BINDING_FIELDS,
+        root / RELEASE_COMPILE_OUT_RELATIVE_PATH,
+        "prepared release compile-out proof",
+        expected_mode=0o444,
+    )
+    _validate_release_compile_out(
+        proof,
+        value,
+        approval,
+        payloads["current_children_attestation"],
+    )
+
+
+def source_authority_self_test() -> dict[str, Any]:
+    """Exercise the canonical contract and representative hostile mutations."""
+
+    requirement = {
+        "binary_byte_identical": True,
+        "cfg_test": False,
+        "forbidden_hook_strings": list(RELEASE_COMPILE_OUT_FORBIDDEN_HOOK_STRINGS),
+        "forbidden_hook_strings_absent": True,
+        "ordinary_a_role": "published",
+        "overlay_a_role": "proof_only",
+        "preapproval_compile_out_sha256": "a" * 64,
+        "product_overlay_sha256": "b" * 64,
+        "proof_must_bind_enclosing_approval_sha256": True,
+        "repeat_under_real_source_approval": True,
+        "rustc_workspace_wrapper": "absent",
+        "same_contract_nonce_lock_toolchain_sandbox": True,
+        "schema": RELEASE_COMPILE_OUT_REQUIREMENT_SCHEMA,
+        "status": "required",
+        "symbol_inventory_byte_identical": True,
+        "variant": "A",
+    }
+    tools_manifest: dict[str, Any] = {
+        "comm_allowlist": expected_comm_allowlist(),
+        "schema": TOOLS_MANIFEST_SCHEMA,
+        "support_files": {},
+        "tools": {},
+    }
+    inputs = {
+        name: {
+            "identity": {
+                "changed_ns": ordinal,
+                "device": 1,
+                "inode": ordinal,
+                "link_count": 1,
+                "modified_ns": ordinal,
+            },
+            "mode": 0o444,
+            "path": f"/authority/{name}.json",
+            "schema": SOURCE_REVIEW_INPUT_SCHEMA,
+            "sha256": f"{ordinal:x}" * 64,
+            "size": ordinal,
+        }
+        for ordinal, name in enumerate(SOURCE_REVIEW_INPUT_NAMES, start=1)
+    }
+    assertion = {
+        "inputs": inputs,
+        "open_findings": 0,
+        "protocol": PROTOCOL,
+        "protocol_sha256": PROTOCOL_SHA256,
+        "release_compile_out_requirement": requirement,
+        "schema": SOURCE_REVIEW_ASSERTION_SCHEMA,
+        "status": "approved",
+        "tooling_commit": "c" * 40,
+        "tooling_tree": "d" * 40,
+    }
+    assertion_sha256 = sha256_bytes(canonical_json_bytes(assertion))
+    review_id = "cr-bn-3hch-self-test"
+    reviewed_at = "2026-07-16T20:00:01.000000000Z"
+    bundle = {
+        "assertion": assertion,
+        "assertion_sha256": assertion_sha256,
+        "review_created": {
+            "author": "mess-reviewer",
+            "data": {
+                "description": "Canonical source authority fixture",
+                "initial_commit": "c" * 40,
+                "jj_change_id": f"detached:{'c' * 40}",
+                "review_id": review_id,
+                "scm_anchor": f"detached:{'c' * 40}",
+                "scm_kind": "git",
+                "title": "Source authority fixture",
+            },
+            "event": "ReviewCreated",
+            "ts": "2026-07-16T20:00:00.000000000Z",
+        },
+        "schema": SOURCE_REVIEW_BUNDLE_SCHEMA,
+        "verdict": {
+            "author": "mess-reviewer",
+            "data": {
+                "reason": (
+                    f"APPROVED assertion_sha256={assertion_sha256}; open_findings=0"
+                ),
+                "review_id": review_id,
+                "vote": "lgtm",
+            },
+            "event": "ReviewerVoted",
+            "ts": reviewed_at,
+        },
+    }
+    source_review = {
+        "assertion_sha256": assertion_sha256,
+        "bundle": {
+            "mode": 0o444,
+            "schema": SOURCE_REVIEW_BUNDLE_SCHEMA,
+            "sha256": sha256_bytes(canonical_json_bytes(bundle)),
+        },
+        "current_children_attestation": {
+            "mode": 0o444,
+            "schema": SOURCE_REVIEW_CONTENT_SCHEMAS[
+                "current_children_attestation"
+            ],
+            "sha256": inputs["current_children_attestation"]["sha256"],
+        },
+        "lock_authority": {
+            "mode": 0o444,
+            "schema": SOURCE_REVIEW_CONTENT_SCHEMAS["lock_authority"],
+            "sha256": inputs["lock_authority"]["sha256"],
+        },
+        "lock_review_bundle": {
+            "mode": 0o444,
+            "schema": SOURCE_REVIEW_CONTENT_SCHEMAS["lock_review_bundle"],
+            "sha256": inputs["lock_review_bundle"]["sha256"],
+        },
+        "release_compile_out_requirement": requirement,
+    }
+    approval = {
+        "comm_allowlist": expected_comm_allowlist(),
+        "filesystem_admission": {},
+        "protocol": PROTOCOL,
+        "protocol_sha256": PROTOCOL_SHA256,
+        "review_id": review_id,
+        "reviewed_at": reviewed_at,
+        "schema": SOURCE_APPROVAL_SCHEMA,
+        "shared_manifest_sha256": "e" * 64,
+        "source_review": source_review,
+        "status": "approved",
+        "toolchain": {},
+        "tooling_commit": "c" * 40,
+        "tooling_tree": "d" * 40,
+        "tools_manifest": tools_manifest,
+        "tools_manifest_sha256": sha256_bytes(canonical_json_bytes(tools_manifest)),
+        "variants": {
+            variant: {field: None for field in SOURCE_APPROVAL_VARIANT_FIELDS}
+            for variant in VARIANTS
+        },
+    }
+    validate_source_approval(approval)
+    _validate_source_review_bundle(bundle, approval)
+
+    rejected: list[str] = []
+
+    def reject(name: str, callback: Any) -> None:
+        try:
+            callback()
+        except (OSError, ValueError):
+            rejected.append(name)
+        else:
+            raise AssertionError(f"hostile source-authority mutation passed: {name}")
+
+    for field in RELEASE_COMPILE_OUT_REQUIREMENT_FIELDS:
+        hostile = json.loads(json.dumps(requirement))
+        hostile[field] = None
+        reject(
+            f"requirement_{field}",
+            lambda hostile=hostile: validate_release_compile_out_requirement(hostile),
+        )
+    extra_requirement = json.loads(json.dumps(requirement))
+    extra_requirement["unreviewed"] = True
+    reject(
+        "requirement_extra_field",
+        lambda: validate_release_compile_out_requirement(extra_requirement),
+    )
+    hostile_bundles = {
+        "bundle_schema": (("schema",), "other"),
+        "assertion_hash": (("assertion_sha256",), "f" * 64),
+        "input_mode": (
+            ("assertion", "inputs", "tools_manifest", "mode"),
+            0o644,
+        ),
+        "review_anchor": (
+            ("review_created", "data", "initial_commit"),
+            "f" * 40,
+        ),
+        "verdict_reason": (("verdict", "data", "reason"), "approved"),
+        "verdict_vote": (("verdict", "data", "vote"), "block"),
+        "verdict_time": (("verdict", "ts"), "2026-07-16T19:59:59Z"),
+    }
+    for name, (path, replacement) in hostile_bundles.items():
+        hostile = json.loads(json.dumps(bundle))
+        cursor: dict[str, Any] = hostile
+        for component in path[:-1]:
+            cursor = cursor[component]
+        cursor[path[-1]] = replacement
+        reject(
+            name,
+            lambda hostile=hostile: _validate_source_review_bundle(hostile, approval),
+        )
+    reject(
+        "prepared_fields",
+        lambda: validate_prepared_artifacts({}, approval, Path("/nonexistent")),
+    )
+    return {
+        "canonical_checks": 2,
+        "hostile_mutations_rejected": len(rejected),
+        "schema": "bn-28w0-evidence-schema-self-test-v1",
+        "status": "ok",
+    }
+
+
 def _is_integer(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -3237,3 +4515,7 @@ def ensure_exact_sequence(actual: Iterable[Mapping[str, Any]], expected: Sequenc
                 raise ValueError(
                     f"row {ordinal} identity {field}={row.get(field)!r}, expected {value!r}"
                 )
+
+
+if __name__ == "__main__":
+    print(canonical_json_bytes(source_authority_self_test()).decode("ascii"), end="")
