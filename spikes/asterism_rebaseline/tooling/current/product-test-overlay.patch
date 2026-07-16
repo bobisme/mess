@@ -590,3 +590,11 @@ index 5e03390..5eb5541 100644
 +                #[cfg(test)]
 +                test_hooks,
                  owner: AppendOwner {
+@@ -4674,2 +5201,2 @@
+-#[cfg(all(test, not(miri)))]
++#[cfg(all(test, not(miri), not(asterism_rebaseline_correctness)))]
+ mod append_gate_tests;
+@@ -4677,2 +5204,2 @@
+-#[cfg(test)]
++#[cfg(all(test, not(asterism_rebaseline_correctness)))]
+ mod seal_skip_tests {

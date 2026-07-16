@@ -56,6 +56,11 @@ struct CorrectnessArgs {
     phase:         String,
 }
 
+enum Invocation {
+    Correctness(CorrectnessArgs),
+    Smoke,
+}
+
 const CURRENT_EVENT_NAME: &str = "asterism.rebaseline.current-event";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -150,6 +155,21 @@ fn lower_hex(value: &str, length: usize) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn invocation() -> Invocation {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if arguments == ["--smoke"] {
+        assert_eq!(required("ASTERISM_REBASELINE_MODE"), "smoke");
+        assert_eq!(required("ASTERISM_REBASELINE_SMOKE_TARGET"), "correctness",);
+        assert_eq!(
+            required("ASTERISM_REBASELINE_PROTOCOL"),
+            contract::PROTOCOL
+        );
+        Invocation::Smoke
+    } else {
+        Invocation::Correctness(correctness_args())
+    }
 }
 
 fn correctness_args() -> CorrectnessArgs {
@@ -725,9 +745,28 @@ fn emit_result(args: &CorrectnessArgs) {
     );
 }
 
+fn emit_smoke_result() {
+    println!(
+        "{}",
+        canonical_object(&[
+            ("cases", cases_json()),
+            ("harness_sound", json_bool(true)),
+            ("protocol", json_string(contract::PROTOCOL)),
+            ("schema", json_string("bn-2l3n-smoke-v3"),),
+            ("smoke_target", json_string("correctness")),
+            ("status", json_string("PASS")),
+            ("variant", json_string(contract::VARIANT)),
+        ])
+    );
+}
+
 fn main() {
-    let args = correctness_args();
-    control::validate_perf_environment_mode("correctness");
+    let invocation = invocation();
+    let mode = match &invocation {
+        Invocation::Correctness(_) => "correctness",
+        Invocation::Smoke => "smoke",
+    };
+    control::validate_perf_environment_mode(mode);
     control::authorize_ptracer_from_env();
     let root = PathBuf::from(required("ASTERISM_REBASELINE_STORE"));
     assert!(!root.exists(), "correctness store root must be absent");
@@ -808,5 +847,8 @@ fn main() {
     drop(public_store);
     drop(public_engine);
     runtime.shutdown_timeout(std::time::Duration::from_secs(30));
-    emit_result(&args);
+    match invocation {
+        Invocation::Correctness(args) => emit_result(&args),
+        Invocation::Smoke => emit_smoke_result(),
+    }
 }

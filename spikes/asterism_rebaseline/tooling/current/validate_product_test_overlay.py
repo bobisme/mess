@@ -21,6 +21,7 @@ from typing import Mapping
 SCHEMA = "bn-xfw3-product-test-overlay-validator-v1"
 ENGINE_PATH = Path("crates/mess-store/src/engine.rs")
 ENGINE_SHA256 = "c995c27d8fff3e1ddfffdb700dfc94160a99ea0c7fe731017d3f1db99d7b59e7"
+CORRECTNESS_CFG = "asterism_rebaseline_correctness"
 HERE = Path(__file__).resolve().parent
 REPOSITORY = HERE.parents[3]
 PATCH_PATH = HERE / "product-test-overlay.patch"
@@ -204,6 +205,23 @@ def validate_cfg_dominance(source: str, patch_text: str) -> None:
     )
     for marker in local_markers:
         require_once(source, marker, "cfg_test_dominance")
+    require_once(
+        source,
+        "#[cfg(all(test, not(miri), not(asterism_rebaseline_correctness)))]\n"
+        "mod append_gate_tests;",
+        "cfg_test_dominance",
+    )
+    require_once(
+        source,
+        "#[cfg(all(test, not(asterism_rebaseline_correctness)))]\n"
+        "mod seal_skip_tests {",
+        "cfg_test_dominance",
+    )
+    if source.count(CORRECTNESS_CFG) != 2 or patch_text.count(CORRECTNESS_CFG) != 2:
+        fail(
+            "cfg_test_dominance",
+            "correctness cfg may only suppress the two dev-only test modules",
+        )
     if "cfg(feature" in patch_text or "Cargo.toml" in patch_text:
         fail("cfg_test_dominance", "overlay introduces a normal feature surface")
 
@@ -421,6 +439,7 @@ def validate_patch(
     return [
         "exact_source_and_patch_applicability",
         "cfg_test_dominance",
+        "dev_only_test_modules_excluded_from_child_dependency_unit",
         "named_call_sites_and_order",
         "generation_bound_one_shot_countdowns",
         "after_open_arming_only",
@@ -458,6 +477,28 @@ def self_test(patch_text: str) -> list[str]:
                 patch_text,
                 "+#[cfg(test)]\n+#[derive(Debug, Clone, Copy, PartialEq, Eq)]\n+pub enum TestEngineHookPoint",
                 "+// hostile missing cfg(test)\n+#[derive(Debug, Clone, Copy, PartialEq, Eq)]\n+pub enum TestEngineHookPoint",
+            ),
+            "cfg_test_dominance",
+        )
+    )
+    passed.append(
+        expect_rejection(
+            "missing_append_gate_negative_guard",
+            replace_once(
+                patch_text,
+                "+#[cfg(all(test, not(miri), not(asterism_rebaseline_correctness)))]",
+                "+#[cfg(all(test, not(miri)))]",
+            ),
+            "cfg_test_dominance",
+        )
+    )
+    passed.append(
+        expect_rejection(
+            "missing_seal_skip_negative_guard",
+            replace_once(
+                patch_text,
+                "+#[cfg(all(test, not(asterism_rebaseline_correctness)))]",
+                "+#[cfg(test)]",
             ),
             "cfg_test_dominance",
         )
