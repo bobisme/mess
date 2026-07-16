@@ -2,7 +2,7 @@
 
 ## Status and decision boundary
 
-The canonical protocol identity is `bn-2l3n-asterism-rebaseline-v2`.
+The canonical protocol identity is `bn-2l3n-asterism-rebaseline-v3`.
 
 This is the frozen pre-build contract for `bn-2l3n`. No benchmark binary,
 correctness build, timing row, or profile row may be produced until this
@@ -12,18 +12,38 @@ change a source checkpoint, workload, order, statistic, gate, or outcome after
 the first build starts. Any such change creates a new protocol version and
 invalidates every prepared artifact and row from this version.
 
-Version 2 supersedes the independently approved version-1 document at
-SHA-256 `19567dd2582de9717be4e7d401a2ddf2c63a076ae58ff0aee01ac49653db5762`
-before any correctness build, benchmark build, timing row, or profile row was
-produced. Its only measurement-contract changes are the `A`/`B` source binding
-below and the corresponding evidence availability: the current source now
-exports read-only owner intent-slot and byte-permit occupancy, so `A` must
-report exact quiescent integers for the already-required zero-reservation
-fairness and cancellation gates instead of `not_available`. All workloads,
-orders, statistics, thresholds, correctness gates, and terminal outcomes are
-unchanged. Every version-1 tooling constant, provisional source plan,
-resolution-only lock candidate, or prepared artifact is invalid and must be
-regenerated from this document after its independent risk-high approval.
+Version 3 supersedes the independently approved version-2 document at
+SHA-256 `1d56a91c26b6d06c045850d13474a563811c1a07e87146818849b3753c3409f6`
+before any rebaseline correctness build, benchmark build, timing row, or
+profile row was produced. Its only measurement-contract changes are the
+`A`/`B` source binding below, the source-path completion boundary that binding
+contains, the exact names of already-nongating fairness diagnostics, and the
+historical `C` structural metadata classification. All workloads, orders,
+statistics, thresholds, correctness gates, and terminal outcomes are
+unchanged.
+
+The newly bound current source releases an accepted intent's byte permit
+before sending its terminal one-shot notification. Append completion is the
+ownership boundary: once success, conflict, empty-append, backend failure, or
+a later sentinel after an abandoned receiver is observable, the completed
+intent's slot and byte permits are already reusable. Permit release is
+therefore inside `EventStore::append` completion and inside the measured
+current public source path; it is not post-completion cleanup that the runner
+may exclude. After the final append completion is observable, the exported
+quiescent owner intent-slot and byte-permit occupancies are deterministically
+zero rather than merely expected to drain eventually. This clarifies the
+already-required exact-release gate; it adds no workload or threshold.
+
+Every version-2 rebaseline tooling constant and protocol-versioned tooling or
+evidence schema is invalid, including any version-2 source plan, source
+approval, resolution-only `r5` lock candidate, binary contract, prepared
+artifact, or runner/evaluator checkpoint. All
+`bn-2l3n-*-v2` and `asterism-rebaseline-*-v2` schemas owned by this rebaseline
+must become their corresponding version-3 identities, be regenerated from
+this document, and receive fresh independent risk-high review before any
+build. No rebaseline benchmark, correctness, profile, or timing evidence
+exists from version 1 or version 2; contaminated compiler output from an
+aborted version-2 tooling review is non-evidence and cannot be adopted.
 
 The question is deliberately end to end: does the current public storage
 composition preserve the completed flat-owner win, improve materially on the
@@ -54,8 +74,8 @@ Variant letters and order are fixed:
 
 | id | variant | product commit | product tree | timed surface |
 | --- | --- | --- | --- | --- |
-| `A` | `current-public` | `1d8a6e0d5382c387e9c327c7382db516f40a63a4` | `48aa4e3b3400549e0e9a939e5ef0bfb2d6492b29` | `EventStore<FjallSnapshotBackend<LogEngine>>`, snapshot policy off, using the public batch append surface |
-| `B` | `current-bare` | `1d8a6e0d5382c387e9c327c7382db516f40a63a4` | `48aa4e3b3400549e0e9a939e5ef0bfb2d6492b29` | raw `mess-log` `Committer`/`Appender`, numeric IDs, no registry or `mess-store` validation |
+| `A` | `current-public` | `d644dc583dfe6a3d2cd07e71ce0212a323875ab4` | `205d853905bdb648ee997900c6aef24a323aa380` | `EventStore<FjallSnapshotBackend<LogEngine>>`, snapshot policy off, using the public batch append surface |
+| `B` | `current-bare` | `d644dc583dfe6a3d2cd07e71ce0212a323875ab4` | `205d853905bdb648ee997900c6aef24a323aa380` | raw `mess-log` `Committer`/`Appender`, numeric IDs, no registry or `mess-store` validation |
 | `C` | `fjall-public` | `f0ab89e92e44253f8fe48cf19d7a93e39263585b` | `7ca2228fcd1c65ef942da35144fcf507d8a72e12` | the same public composition, with the baseline-gen2 Fjall-era `LogEngine` |
 | `D` | `flat-public` | `69b95604b9e7c924314cf7d82b86a2edb7dccde6` | `f738cde2b5414d1a2926ac86573163d505754ba9` | the same public composition at the integrated optimized BN-2SU checkpoint |
 
@@ -68,11 +88,14 @@ tree contains the optimized source measured at
 report correction; `git diff 095460b7..69b95604` must remain limited to that
 report. The earlier `b583fd01` source is the report's explicitly superseded
 pre-optimization checkpoint and is forbidden as `D`. `A` includes direct
-outcomes, owner-ring fairness/publication fixes, and the admitted Process-only
-owned-input path, plus the read-only reservation-occupancy metrics required by
-the frozen fairness gate. The occupancy seam adds no work to append admission,
+outcomes, owner-ring fairness/publication fixes, the admitted Process-only
+owned-input path, read-only reservation-occupancy metrics, and the
+release-before-terminal-notification completion ordering required by the
+frozen fairness gate. The occupancy seam adds no work to append admission,
 ownership, publication, or durability; it is sampled only after the measured
-window at quiescence. `B` must be compiled anew from the named current source;
+window at quiescence. The permit release itself remains in the append
+completion path and measured source boundary. `B` must be compiled anew from
+the named current source;
 historical bare rows may be shown in the report but may not enter a ratio or
 outcome.
 
@@ -214,7 +237,9 @@ The measurement phases are exact and common across variants:
    before materializing that append's public typed input and stops it after
    `EventStore::append` completes. Thus record-vector construction, payload
    ownership/copying, public validation/encoding, registry work, queueing, I/O,
-   durability, and publication are inside both wall and allocation accounting.
+   durability, publication, release of the accepted intent's byte permit, and
+   terminal notification are inside both wall and allocation accounting. The
+   completion cannot become observable before that permit release.
    `B` materializes the equivalent raw `EventInput` inside the wall and
    allocator interval, but starts its per-append latency clock immediately
    before the raw `Appender` call. That declared latency-boundary difference is
@@ -222,8 +247,10 @@ The measurement phases are exact and common across variants:
    throughput and allocation ratios.
 4. The coordinator awaits every writer, validates its exact completion count,
    and takes wall `t1` immediately after the final join. It then snapshots the
-   same counters. Counter subtraction and all quantile/statistical work occur
-   after `t1`; no sample collection is performed by a background consumer.
+   same counters. At this boundary `A`'s completed intents must already expose
+   exact zero slot and byte occupancy; a post-join drain wait is forbidden.
+   Counter subtraction and all quantile/statistical work occur after `t1`; no
+   sample collection is performed by a background consumer.
 
 Payload bytes are generated once before the interval, but every append's owned
 or borrowed record/vector objects are created inside it. A worker's elapsed
@@ -259,6 +286,10 @@ fresh store with eight new-name appends per writer. Child-emitted durable
 begin/end markers delimit the append interval so open/close syscalls cannot be
 misclassified as new-name work. These traces are the authority for the removed
 Fjall metadata barrier; their wall/latency values are discarded.
+For historical `C`, the source-approved metadata markers include `log/meta/`
+while log data remains classified by the nonoverlapping `log/seg-` marker.
+This records the historical layout faithfully; it changes no structural or
+performance gate.
 
 ### Queue fairness and owner saturation
 
@@ -273,12 +304,14 @@ producing 64 rows.
 
 Record per-writer completed appends, elapsed time, p50/p99/max, the Jain index
 of per-writer rates, minimum/median writer rate, maximum/median writer p99,
-aggregate batches/events per committed group, and barrier count. Queue
-depth/bytes, exact group-width distribution, adaptive target, and oldest queued
-age are not exported neutrally by current or historical production engines;
-all variants report those detailed diagnostic fields as `not_available`, never
-zero, and they are not gates. Separately, `A` reports the production engine's
-exact quiescent `waiter_reservations_after` and
+aggregate batches/events per committed group, and barrier count. The exact
+additional field names are `queue_depth`, `queue_bytes`,
+`group_width_distribution`, `adaptive_group_width_target`, and
+`oldest_queued_age_ns`. They are not exported neutrally by current or
+historical production engines; every variant reports all five as the literal
+string `not_available`, never zero, and they are not gates. Separately, `A`
+reports the production engine's exact quiescent
+`waiter_reservations_after` and
 `byte_reservations_after` occupancy as integers in every fairness row; both
 must be zero. `B`, `C`, and `D` report those two fields as `not_available`
 because they do not expose the same admission-boundary state. No wrapper-side
@@ -542,6 +575,10 @@ The mandatory gates are:
 - cancellation before queue admission reserves nothing; cancellation after
   ownership transfer cannot prevent an accepted/committed append, including a
   fresh-name append, from reaching publication and releasing exact bytes;
+  success, conflict, empty append, and backend-error paths release the exact
+  byte permit before terminal notification, while an abandoned receiver
+  releases by the same owner path and a later completed sentinel proves the
+  owner has retired both reservations;
 - borrowed and owned paths preserve mixed-record order, type authority, and
   byte-equivalent domain results;
 - at least two live rolls preserve chain state, first read/cache behavior,
