@@ -20,37 +20,17 @@ use mess_store::{
 use tokio::sync::Barrier;
 
 const PROTOCOL: &str = "bn-22it-process-owned-v1";
-
-// Ordinary workspace test discovery compiles examples without the sealed
-// preparer's build identity. Keep that compile path available, but embed an
-// invalid empty sentinel: every executable path calls validate_build_identity
-// before emitting a contract, running work, or writing CSV, so an unattested
-// binary still fails closed at runtime.
-macro_rules! build_identity {
-    ($name:literal) => {
-        match option_env!($name) {
-            Some(value) => value,
-            None => "",
-        }
-    };
-}
-
-const BUILD_PROTOCOL: &str = build_identity!("OWNED_APPEND_BUILD_PROTOCOL");
-const BUILD_BASELINE_SOURCE: &str =
-    build_identity!("OWNED_APPEND_BUILD_BASELINE_SOURCE");
-const BUILD_BASELINE_TREE: &str =
-    build_identity!("OWNED_APPEND_BUILD_BASELINE_TREE");
-const BUILD_SOURCE_COMMIT: &str =
-    build_identity!("OWNED_APPEND_BUILD_SOURCE_COMMIT");
-const BUILD_SOURCE_TREE: &str =
-    build_identity!("OWNED_APPEND_BUILD_SOURCE_TREE");
-const BUILD_HARNESS_SHA256: &str =
-    build_identity!("OWNED_APPEND_BUILD_HARNESS_SHA256");
+const BUILD_PROTOCOL: &str = env!("OWNED_APPEND_BUILD_PROTOCOL");
+const BUILD_BASELINE_SOURCE: &str = env!("OWNED_APPEND_BUILD_BASELINE_SOURCE");
+const BUILD_BASELINE_TREE: &str = env!("OWNED_APPEND_BUILD_BASELINE_TREE");
+const BUILD_SOURCE_COMMIT: &str = env!("OWNED_APPEND_BUILD_SOURCE_COMMIT");
+const BUILD_SOURCE_TREE: &str = env!("OWNED_APPEND_BUILD_SOURCE_TREE");
+const BUILD_HARNESS_SHA256: &str = env!("OWNED_APPEND_BUILD_HARNESS_SHA256");
 const BUILD_CARGO_LOCK_SHA256: &str =
-    build_identity!("OWNED_APPEND_BUILD_CARGO_LOCK_SHA256");
+    env!("OWNED_APPEND_BUILD_CARGO_LOCK_SHA256");
 const BUILD_SOURCE_APPROVAL_SHA256: &str =
-    build_identity!("OWNED_APPEND_BUILD_SOURCE_APPROVAL_SHA256");
-const BUILD_NONCE: &str = build_identity!("OWNED_APPEND_BUILD_BUILD_NONCE");
+    env!("OWNED_APPEND_BUILD_SOURCE_APPROVAL_SHA256");
+const BUILD_NONCE: &str = env!("OWNED_APPEND_BUILD_BUILD_NONCE");
 
 struct CountingAlloc;
 

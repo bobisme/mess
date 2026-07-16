@@ -43,6 +43,8 @@ not on a timing claim.
 The retained evidence snapshot is under `adopt-20260715/`. Its decisive
 bindings are:
 
+- exact measured harness snapshot SHA-256
+  `e7b33bcf3022a51c3f9e9f74fa3cf2de47bf8217905fb4be05920c677e7ae10e`;
 - prepared pair SHA-256
   `fd5603a9a6c1a70c55a61ecbf296405464dd812ffd5c3117de7b641834256fff`;
 - final CSV SHA-256
@@ -67,6 +69,17 @@ Any commit after the measured candidate must contain documentation and retained
 evidence only until the candidate is merged. Product integration is authorized
 only because the exact measured candidate remains its ancestor and the public
 correctness matrix is rerun after merge.
+
+After integration, that public matrix found that ordinary workspace test
+discovery also compiles examples without the sealed preparer's nine build
+identity variables. The measured harness used unconditional `env!` expansion,
+so normal `cargo test --workspace` failed during compilation even though every
+focused product test passed. The exact measured source is retained as
+`adopt-20260715/owned_append_bench.rs` with the hash above. The live example now
+uses empty `option_env!` sentinels solely to permit ordinary compilation;
+`validate_build_identity` still runs before contract output, timed work, or CSV
+writes and rejects every unattested binary. Sealed preparation continues to
+embed and verify all nine values exactly.
 
 ## Historical bn-2yye decision status
 
