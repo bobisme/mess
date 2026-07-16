@@ -183,6 +183,91 @@ async fn owner_reservation_occupancy_moves_and_returns_to_zero() {
     assert_eq!(quiescent.owner_intent_bytes_in_use, 0);
 }
 
+/// Conflict, no-op, and abandoned-receiver completion paths obey the same
+/// ownership boundary as a successful commit: no reservation may remain once
+/// a caller can observe a terminal result (or a later sentinel completion).
+#[tokio::test]
+async fn owner_completion_releases_reservations_on_every_terminal_path() {
+    let dir = mess_testkit::sweeping_temp_dir("engine-owner-completion");
+    let engine = LogEngine::open(dir.path()).expect("open");
+    for stream in ["completion-a", "completion-b"] {
+        engine
+            .append_batch(stream, Version::NoStream, &[rec("Opened", b"seed")])
+            .await
+            .expect("prime stream");
+    }
+
+    let conflict = engine
+        .append_batch(
+            "completion-a",
+            Version::NoStream,
+            &[rec("Opened", b"conflict")],
+        )
+        .await;
+    assert!(matches!(conflict, Err(AppendError::Conflict { .. })));
+    let after_conflict = engine.metrics();
+    assert_eq!(after_conflict.owner_intent_slots_in_use, 0);
+    assert_eq!(after_conflict.owner_intent_bytes_in_use, 0);
+
+    engine
+        .append_batch("completion-a", Version::At(0), &[])
+        .await
+        .expect("empty append");
+    let after_empty = engine.metrics();
+    assert_eq!(after_empty.owner_intent_slots_in_use, 0);
+    assert_eq!(after_empty.owner_intent_bytes_in_use, 0);
+
+    // Park the owner with one admitted intent, then abandon that intent's
+    // receiver. A second admitted append releases the rendezvous and acts as a
+    // terminal sentinel: after it wakes, its reservation and the cancelled
+    // caller's earlier reservation must both be gone.
+    let gate = Arc::clone(&engine.inner.owner.cohort_gate);
+    let cohort = gate.arm(2);
+    let cancelled = {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            engine
+                .append_batch(
+                    "completion-a",
+                    Version::At(0),
+                    &[rec("Opened", b"cancelled")],
+                )
+                .await
+        })
+    };
+    let admitted_gate = Arc::clone(&engine.inner.owner.cohort_gate);
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || {
+            admitted_gate.wait_until_admitted(1)
+        }),
+    )
+    .await
+    .expect("cancelled producer admission timed out")
+    .expect("admission waiter panicked");
+    cancelled.abort();
+    assert!(
+        cancelled
+            .await
+            .expect_err("cancelled producer completed")
+            .is_cancelled()
+    );
+
+    engine
+        .append_batch(
+            "completion-b",
+            Version::At(0),
+            &[rec("Opened", b"sentinel")],
+        )
+        .await
+        .expect("sentinel append");
+    drop(cohort);
+
+    let after_cancel = engine.metrics();
+    assert_eq!(after_cancel.owner_intent_slots_in_use, 0);
+    assert_eq!(after_cancel.owner_intent_bytes_in_use, 0);
+}
+
 /// N hot appends admitted to different streams are one owner-visible cohort:
 /// the owner gathers all N intents into one direct-committer call, and Group
 /// durability covers every batch with exactly one successful `fdatasync`.

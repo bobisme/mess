@@ -1191,10 +1191,27 @@ impl DomainInput {
 }
 
 struct OwnerIntent {
-    kind:    OwnerIntentKind,
-    cost:    usize,
-    done:    oneshot::Sender<OwnerResult>,
+    kind:       OwnerIntentKind,
+    cost:       usize,
+    completion: OwnerCompletion,
+}
+
+/// An intent's bounded byte reservation and terminal notification, kept in
+/// release-before-notify field order even when a queued intent is cancelled,
+/// the owner exits, or unwinding bypasses the ordinary completion path.
+struct OwnerCompletion {
     _permit: OwnedSemaphorePermit,
+    done:    oneshot::Sender<OwnerResult>,
+}
+
+impl OwnerCompletion {
+    /// Append completion is an ownership boundary: once the receiver wakes,
+    /// both the channel slot and byte permits must be reusable.
+    fn finish(self, result: OwnerResult) {
+        let Self { _permit, done } = self;
+        drop(_permit);
+        let _ = done.send(result);
+    }
 }
 
 struct InFlightGuard(Arc<AtomicUsize>);
@@ -1367,12 +1384,15 @@ struct PublishState {
 }
 
 struct DomainPlan {
-    pre:      Pre,
-    reqs:     Vec<DirectAppendRequest>,
-    staged:   Vec<RegistryRecord>,
-    reg_span: Option<(u64, usize)>,
-    done:     oneshot::Sender<OwnerResult>,
-    _permit:  OwnedSemaphorePermit,
+    pre:        Pre,
+    reqs:       Vec<DirectAppendRequest>,
+    staged:     Vec<RegistryRecord>,
+    reg_span:   Option<(u64, usize)>,
+    completion: OwnerCompletion,
+}
+
+impl DomainPlan {
+    fn complete(self, result: OwnerResult) { self.completion.finish(result); }
 }
 
 #[derive(Default)]
@@ -1548,8 +1568,7 @@ impl FlatOwner {
         stream: String,
         expected: Version,
         input: DomainInput,
-        done: oneshot::Sender<OwnerResult>,
-        permit: OwnedSemaphorePermit,
+        completion: OwnerCompletion,
     ) -> DomainPlan {
         let book = self.publish.book.lock().expect("book lock");
         let mut staged = Vec::new();
@@ -1709,7 +1728,7 @@ impl FlatOwner {
             reqs.push(domain_req);
             Pre::Proceed { sid, first_stream_pos, tids }
         };
-        DomainPlan { pre, reqs, staged, reg_span, done, _permit: permit }
+        DomainPlan { pre, reqs, staged, reg_span, completion }
     }
 
     fn commit_plans(&mut self, mut plans: Vec<DomainPlan>) {
@@ -1733,7 +1752,7 @@ impl FlatOwner {
         match outcomes {
             Err(e) => {
                 for plan in plans {
-                    let _ = plan.done.send(Err(AppendError::Backend(
+                    plan.complete(Err(AppendError::Backend(
                         EngineError::Append(e.to_string()),
                     )));
                 }
@@ -1771,7 +1790,7 @@ impl FlatOwner {
     }
 
     fn retire_domain(&mut self, plan: DomainPlan, outcomes: PlanOutcomes) {
-        let DomainPlan { pre, staged, reg_span, done, .. } = plan;
+        let DomainPlan { pre, staged, reg_span, completion, .. } = plan;
         let PlanOutcomes { registry, domain } = outcomes;
         let Pre::Proceed { sid, first_stream_pos, tids } = pre else {
             unreachable!()
@@ -1882,31 +1901,30 @@ impl FlatOwner {
             Some(e) => Err(AppendError::Backend(e)),
             None => Ok(appended.expect("successful domain outcome")),
         };
-        let _ = done.send(result);
+        completion.finish(result);
     }
 
     fn process_registry(
         &mut self,
         expected: Version,
         records: Vec<RegistryRecord>,
-        done: oneshot::Sender<OwnerResult>,
-        _permit: OwnedSemaphorePermit,
+        completion: OwnerCompletion,
     ) {
         let (first_version, trial) = {
             let book = self.publish.book.lock().expect("book lock");
             if book.registry_lost {
-                let _ =
-                    done.send(Err(AppendError::Backend(registry_lost_error())));
+                completion
+                    .finish(Err(AppendError::Backend(registry_lost_error())));
                 return;
             }
             let actual = book.registry_head();
             if actual != expected {
-                let _ =
-                    done.send(Err(AppendError::Conflict { expected, actual }));
+                completion
+                    .finish(Err(AppendError::Conflict { expected, actual }));
                 return;
             }
             if records.is_empty() {
-                let _ = done.send(Ok(Appended {
+                completion.finish(Ok(Appended {
                     version:              expected,
                     last_global_position: self
                         .publish
@@ -1921,7 +1939,7 @@ impl FlatOwner {
                 if let Err(e) =
                     trial.apply::<std::convert::Infallible>(record.clone())
                 {
-                    let _ = done.send(Err(AppendError::Backend(
+                    completion.finish(Err(AppendError::Backend(
                         EngineError::Append(format!(
                             "{}: {e}",
                             registry::RESERVED_STREAM_NAME
@@ -1944,7 +1962,7 @@ impl FlatOwner {
         let outcome = match result {
             Ok(()) => outcome.expect("registry outcome"),
             Err(e) => {
-                let _ = done.send(Err(AppendError::Backend(
+                completion.finish(Err(AppendError::Backend(
                     EngineError::Append(e.to_string()),
                 )));
                 return;
@@ -1953,7 +1971,7 @@ impl FlatOwner {
         let placed = match outcome.outcome.and_then(expect_acked_log) {
             Ok(p) => p,
             Err(e) => {
-                let _ = done.send(Err(AppendError::Backend(
+                completion.finish(Err(AppendError::Backend(
                     EngineError::Append(e.to_string()),
                 )));
                 return;
@@ -1972,7 +1990,7 @@ impl FlatOwner {
             records.len() as u32,
             placed,
         );
-        let _ = done.send(Ok(Appended {
+        completion.finish(Ok(Appended {
             version:              Version::At(
                 first_version + records.len() as u64 - 1,
             ),
@@ -1994,16 +2012,12 @@ impl FlatOwner {
             let mut pending = Vec::new();
             let mut streams = HashSet::new();
             for intent in gathered {
-                match intent.kind {
+                let OwnerIntent { kind, completion, .. } = intent;
+                match kind {
                     OwnerIntentKind::Registry { expected, records } => {
                         self.commit_plans(std::mem::take(&mut pending));
                         streams.clear();
-                        self.process_registry(
-                            expected,
-                            records,
-                            intent.done,
-                            intent._permit,
-                        );
+                        self.process_registry(expected, records, completion);
                     }
                     OwnerIntentKind::Domain { stream, expected, input } => {
                         // Re-plan after flushing a prior append to this stream;
@@ -2026,30 +2040,23 @@ impl FlatOwner {
                             .expect("book lock")
                             .registry_lost
                         {
-                            let _ = intent.done.send(Err(
-                                AppendError::Backend(registry_lost_error()),
-                            ));
+                            completion.finish(Err(AppendError::Backend(
+                                registry_lost_error(),
+                            )));
                             continue;
                         }
-                        let plan = self.plan_domain(
-                            stream,
-                            expected,
-                            input,
-                            intent.done,
-                            intent._permit,
-                        );
-                        match plan.pre {
+                        let plan = self
+                            .plan_domain(stream, expected, input, completion);
+                        match &plan.pre {
                             Pre::Conflict(actual) => {
-                                let expected = match &plan.pre {
-                                    Pre::Conflict(_) => expected,
-                                    _ => unreachable!(),
-                                };
-                                let _ = plan.done.send(Err(
-                                    AppendError::Conflict { expected, actual },
-                                ));
+                                let actual = *actual;
+                                plan.complete(Err(AppendError::Conflict {
+                                    expected,
+                                    actual,
+                                }));
                             }
                             Pre::Empty => {
-                                let _ = plan.done.send(Ok(Appended {
+                                plan.complete(Ok(Appended {
                                     version:              expected,
                                     last_global_position: self
                                         .publish
@@ -2059,6 +2066,7 @@ impl FlatOwner {
                                 }));
                             }
                             Pre::Proceed { sid, .. } => {
+                                let sid = *sid;
                                 if !plan.staged.is_empty()
                                     || matches!(self.durability, Durability::Os)
                                 {
@@ -3940,7 +3948,11 @@ impl LogEngine {
                 ))
             })?;
         let (done, rx) = oneshot::channel();
-        let intent = OwnerIntent { kind, cost, done, _permit: permit };
+        let intent = OwnerIntent {
+            kind,
+            cost,
+            completion: OwnerCompletion { _permit: permit, done },
+        };
         self.inner
             .owner
             .tx
