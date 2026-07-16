@@ -72,3 +72,24 @@ pub fn assert_oracle_accounting(
         assert_eq!(metrics.commit.fsync.count, 0);
     }
 }
+
+pub fn assert_reopen_seed_accounting(
+    engine: &LogEngine,
+    domain_events: u64,
+    fresh_streams: u64,
+) {
+    let high_water = engine.total_events() as u64;
+    assert_eq!(engine.metrics().total_events, high_water);
+    match contract::VARIANT {
+        "C" => assert_eq!(
+            high_water, domain_events,
+            "C reopen seed unexpectedly consumed metadata positions",
+        ),
+        "D" => assert_eq!(
+            high_water,
+            domain_events + fresh_streams + 1,
+            "D reopen seed differs from domain + streams + one shared type",
+        ),
+        variant => panic!("borrowed adapter used by variant {variant}"),
+    }
+}

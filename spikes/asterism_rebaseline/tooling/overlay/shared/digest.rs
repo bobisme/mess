@@ -43,5 +43,13 @@ impl LogicalDigest {
         self
     }
 
+    /// Canonical evidence spelling for one deterministic logical digest.
+    ///
+    /// The logical digest remains the same dependency-free 64-bit fold. The
+    /// evidence protocol reserves a fixed 64-lowercase-hex field, so retain
+    /// the numeric value and left-pad it rather than changing the workload
+    /// semantics or claiming a cryptographic digest.
+    pub fn canonical_hex(self) -> String { format!("{:064x}", self.0) }
+
     pub fn value(self) -> u64 { self.0 }
 }

@@ -159,8 +159,8 @@ impl Aggregate for CorpusAggregate {
 
 struct CorpusVerification {
     domain_events:        u64,
-    logical_digest:       u64,
-    registry_head_digest: u64,
+    logical_digest:       String,
+    registry_head_digest: String,
 }
 
 struct CorrectnessOracleArgs {
@@ -609,8 +609,8 @@ fn verify_corpus(
         assert_eq!(domain_events, streams as u64 * events_per_stream);
         CorpusVerification {
             domain_events,
-            logical_digest: logical_digest.value(),
-            registry_head_digest: registry_head_digest.value(),
+            logical_digest: logical_digest.canonical_hex(),
+            registry_head_digest: registry_head_digest.canonical_hex(),
         }
     })
 }
@@ -718,23 +718,21 @@ fn run_reopen_seed(
         (batches_per_stream * batch) as u64,
     );
     let log_events = engine.total_events() as u64;
-    assert!(log_events >= verified.domain_events);
+    adapter::assert_reopen_seed_accounting(
+        &engine,
+        verified.domain_events,
+        streams as u64,
+    );
     drop(store);
     drop(engine);
     runtime.shutdown_timeout(std::time::Duration::from_secs(30));
     let fields = [
         ("domain_events", json_u64(verified.domain_events)),
         ("log_events", json_u64(log_events)),
-        (
-            "logical_digest",
-            json_string(&format!("{:016x}", verified.logical_digest)),
-        ),
+        ("logical_digest", json_string(&verified.logical_digest)),
         ("protocol", json_string(contract::PROTOCOL)),
         ("protocol_sha256", json_string(contract::PROTOCOL_SHA256)),
-        (
-            "registry_head_digest",
-            json_string(&format!("{:016x}", verified.registry_head_digest)),
-        ),
+        ("registry_head_digest", json_string(&verified.registry_head_digest)),
         ("schema", json_string(output_schema)),
         ("variant", json_string(contract::VARIANT)),
         ("visible_events", json_u64(verified.domain_events)),
@@ -842,13 +840,11 @@ fn run_reopen(
     let verified = verify_corpus(&runtime, &store, streams, events_per_stream);
     assert_eq!(verified.domain_events, domain_events);
     assert_eq!(
-        format!("{:016x}", verified.logical_digest),
-        logical_digest,
+        verified.logical_digest, logical_digest,
         "reopen logical digest mismatch"
     );
     assert_eq!(
-        format!("{:016x}", verified.registry_head_digest),
-        registry_head_digest,
+        verified.registry_head_digest, registry_head_digest,
         "reopen registry/head digest mismatch"
     );
     drop(store);
@@ -1086,10 +1082,13 @@ fn emit_point(track: &str, workload: Workload, row: PointResult) {
 fn run_common_public_oracle(root: PathBuf) {
     assert!(!root.exists(), "correctness oracle store path must be absent");
     assert!(matches!(contract::VARIANT, "A" | "C" | "D"));
+    let mut control = Control::connect();
+    let boot_nonce = control.boot();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("create correctness oracle runtime");
+    let runtime_nonce = control.runtime(&boot_nonce);
     let engine = LogEngine::open_with(
         root.join("log"),
         EngineOptions {
@@ -1103,6 +1102,22 @@ fn run_common_public_oracle(root: PathBuf) {
         FjallSnapshotBackend::open(engine.clone(), root.join("snapshots"))
             .expect("open correctness oracle production snapshot wrapper");
     let store = EventStore::new(backend).with_page_size(16);
+    let opened_nonce = control.opened(&runtime_nonce);
+    let ready_monotonic_ns = monotonic_ns();
+    let alloc_before = allocation::snapshot();
+    let cpu_before = cpu_snapshot();
+    let counter_start_monotonic_ns = monotonic_ns();
+    let start_nonce = control.ready_and_wait_start(
+        &opened_nonce,
+        alloc_before.calls,
+        alloc_before.bytes,
+        cpu_before.user_ns,
+        cpu_before.system_ns,
+        ready_monotonic_ns,
+        counter_start_monotonic_ns,
+    );
+    let t0_monotonic_ns = monotonic_ns();
+    let release_monotonic_ns = monotonic_ns();
     runtime.block_on(async {
         let payloads = [
             b"common-oracle/alpha/0".to_vec(),
@@ -1276,6 +1291,25 @@ fn run_common_public_oracle(root: PathBuf) {
         );
     });
     adapter::assert_oracle_accounting(&group_engine, 1, 1, 1, true);
+    let last_completion_monotonic_ns = monotonic_ns();
+    let t1_monotonic_ns = monotonic_ns();
+    let alloc_after = allocation::snapshot();
+    let cpu_after = cpu_snapshot();
+    let counter_end_monotonic_ns = monotonic_ns();
+    control.measured_and_wait_release(
+        &start_nonce,
+        MeasuredMarkers {
+            allocation_calls_end: alloc_after.calls,
+            allocated_bytes_end: alloc_after.bytes,
+            counter_end_monotonic_ns,
+            last_completion_monotonic_ns,
+            release_monotonic_ns,
+            process_system_cpu_end_ns: cpu_after.system_ns,
+            process_user_cpu_end_ns: cpu_after.user_ns,
+            t0_monotonic_ns,
+            t1_monotonic_ns,
+        },
+    );
     drop(group_store);
     drop(group_engine);
     runtime.shutdown_timeout(std::time::Duration::from_secs(30));

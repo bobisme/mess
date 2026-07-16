@@ -1365,6 +1365,483 @@ def rust_item(source: str, marker: str, context: str) -> str:
     raise PreparationError(f"{context} body is not balanced")
 
 
+def require_exact_fragment(source: str, fragment: str, context: str) -> None:
+    """Require one exact source expression in an attested Rust item."""
+
+    if source.count(fragment) != 1:
+        raise PreparationError(f"{context} exact expression differs")
+
+
+def require_exact_signature(item: str, signature: str, context: str) -> None:
+    """Require an extracted Rust item to start with one exact signature."""
+
+    if not item.startswith(signature):
+        raise PreparationError(f"{context} exact typed signature differs")
+
+
+def replace_exact_once(
+    source: str, old: str, new: str, context: str
+) -> str:
+    """Construct one hostile source only when its target is unambiguous."""
+
+    if source.count(old) != 1:
+        raise AssertionError(f"{context} hostile target cardinality differs")
+    return source.replace(old, new, 1)
+
+
+def validate_shared_control_child_source(control: str) -> None:
+    """Bind the shared ordinary-child wire phases to runner v3 fields."""
+
+    boot = rust_item(control, "pub fn boot(", "shared control boot")
+    require_exact_signature(
+        boot,
+        "pub fn boot(&mut self) -> Nonce {",
+        "shared control boot",
+    )
+    for marker in (
+        '("context_sha256", json_string(&self.context_sha256))',
+        '("phase", json_string("boot"))',
+        '("protocol_sha256", json_string(crate::contract::PROTOCOL_SHA256))',
+        '("variant", json_string(crate::contract::VARIANT))',
+        'continue_command(&self.receive(), "boot")',
+    ):
+        if boot.count(marker) != 1:
+            raise PreparationError(f"shared boot field differs: {marker}")
+
+    for method, phase in (("runtime", "runtime"), ("opened", "opened")):
+        item = rust_item(
+            control, f"pub fn {method}(", f"shared control {method}"
+        )
+        require_exact_signature(
+            item,
+            f"pub fn {method}(&mut self, nonce: &Nonce) -> Nonce {{",
+            f"shared control {method}",
+        )
+        for marker in (
+            '("nonce", json_string(nonce.as_str()))',
+            f'("phase", json_string("{phase}"))',
+            f'continue_command(&self.receive(), "{phase}")',
+        ):
+            if item.count(marker) != 1:
+                raise PreparationError(
+                    f"shared {phase} field differs: {marker}"
+                )
+
+    opened_after_start = rust_item(
+        control,
+        "pub fn opened_after_start(",
+        "shared control opened-after-start",
+    )
+    require_exact_signature(
+        opened_after_start,
+        """pub fn opened_after_start(
+        &mut self,
+        nonce: &Nonce,
+        open_start_monotonic_ns: u64,
+        opened_monotonic_ns: u64,
+    ) -> Nonce {""",
+        "shared control opened-after-start",
+    )
+
+    ready = rust_item(
+        control,
+        "pub fn ready_and_wait_start(",
+        "shared control ready/start",
+    )
+    require_exact_signature(
+        ready,
+        """pub fn ready_and_wait_start(
+        &mut self,
+        nonce: &Nonce,
+        allocation_calls_start: u64,
+        allocated_bytes_start: u64,
+        process_user_cpu_start_ns: u64,
+        process_system_cpu_start_ns: u64,
+        ready_monotonic_ns: u64,
+        counter_start_monotonic_ns: u64,
+    ) -> Nonce {""",
+        "shared control ready/start",
+    )
+    ready_fields = (
+        '\\"allocated_bytes_start\\":{}',
+        '\\"allocation_calls_start\\":{}',
+        '\\"context_sha256\\":\\"{}\\"',
+        '\\"counter_start_monotonic_ns\\":{}',
+        '\\"nonce\\":\\"{}\\"',
+        '\\"phase\\":\\"ready\\"',
+        '\\"process_system_cpu_start_ns\\":{}',
+        'process_user_cpu_start_ns\\":{}',
+        '\\"protocol_sha256\\":\\"{}\\"',
+        '\\"ready_monotonic_ns\\":{}',
+        '\\"variant\\":\\"{}\\"',
+    )
+    for field in ready_fields:
+        if ready.count(field) != 1:
+            raise PreparationError(f"shared ready field differs: {field}")
+    if [ready.index(field) for field in ready_fields] != sorted(
+        ready.index(field) for field in ready_fields
+    ):
+        raise PreparationError("shared ready fields are reordered")
+    ready_arguments = """            allocated_bytes_start,
+            allocation_calls_start,
+            self.context_sha256,
+            counter_start_monotonic_ns,
+            nonce.as_str(),
+            process_system_cpu_start_ns,
+            process_user_cpu_start_ns,
+            crate::contract::PROTOCOL_SHA256,
+            ready_monotonic_ns,
+            crate::contract::VARIANT,"""
+    require_exact_fragment(
+        ready,
+        ready_arguments,
+        "shared ready format argument tuple",
+    )
+    if ready.count('command(&self.receive(), "start")') != 1:
+        raise PreparationError("shared ready/start command differs")
+
+    measured = rust_item(
+        control,
+        "pub fn measured_and_wait_release(",
+        "shared control measured/release",
+    )
+    require_exact_signature(
+        measured,
+        """pub fn measured_and_wait_release(
+        &mut self,
+        nonce: &Nonce,
+        markers: MeasuredMarkers,
+    ) {""",
+        "shared control measured/release",
+    )
+    measured_fields = """        let mut fields = vec![
+            ("allocated_bytes_end", json_u64(markers.allocated_bytes_end)),
+            ("allocation_calls_end", json_u64(markers.allocation_calls_end)),
+            (
+                "counter_end_monotonic_ns",
+                json_u64(markers.counter_end_monotonic_ns),
+            ),
+            (
+                "last_completion_monotonic_ns",
+                json_u64(markers.last_completion_monotonic_ns),
+            ),
+            ("nonce", json_string(nonce.as_str())),
+            ("phase", json_string("measured")),
+            (
+                "process_system_cpu_end_ns",
+                json_u64(markers.process_system_cpu_end_ns),
+            ),
+            (
+                "process_user_cpu_end_ns",
+                json_u64(markers.process_user_cpu_end_ns),
+            ),
+            ("release_monotonic_ns", json_u64(markers.release_monotonic_ns)),
+            ("t0_monotonic_ns", json_u64(markers.t0_monotonic_ns)),
+            ("t1_monotonic_ns", json_u64(markers.t1_monotonic_ns)),
+        ];"""
+    require_exact_fragment(
+        measured,
+        measured_fields,
+        "shared measured field/expression tuple",
+    )
+    for marker in (
+        'command(&self.receive(), "release")',
+        'assert_eq!(released, *nonce, "release nonce mismatch")',
+    ):
+        if measured.count(marker) != 1:
+            raise PreparationError(f"shared measured release differs: {marker}")
+
+
+def validate_correctness_oracle_control_source(public: str) -> None:
+    """Prove the historical oracle uses the shared ordinary-child protocol."""
+
+    oracle = rust_item(
+        public,
+        "fn run_common_public_oracle(",
+        "public correctness oracle",
+    )
+    require_exact_signature(
+        oracle,
+        "fn run_common_public_oracle(root: PathBuf) {",
+        "public correctness oracle",
+    )
+    phase_markers = (
+        "let mut control = Control::connect();",
+        "let boot_nonce = control.boot();",
+        "let runtime = tokio::runtime::Builder::new_current_thread()",
+        "let runtime_nonce = control.runtime(&boot_nonce);",
+        "let engine = LogEngine::open_with(",
+        "let opened_nonce = control.opened(&runtime_nonce);",
+        "let ready_monotonic_ns = monotonic_ns();",
+        "let alloc_before = allocation::snapshot();",
+        "let cpu_before = cpu_snapshot();",
+        "let counter_start_monotonic_ns = monotonic_ns();",
+        "let start_nonce = control.ready_and_wait_start(",
+        "let t0_monotonic_ns = monotonic_ns();",
+        "let release_monotonic_ns = monotonic_ns();",
+        "let last_completion_monotonic_ns = monotonic_ns();",
+        "let t1_monotonic_ns = monotonic_ns();",
+        "let alloc_after = allocation::snapshot();",
+        "let cpu_after = cpu_snapshot();",
+        "let counter_end_monotonic_ns = monotonic_ns();",
+        "control.measured_and_wait_release(",
+    )
+    for marker in phase_markers:
+        if oracle.count(marker) != 1:
+            raise PreparationError(
+                f"correctness oracle control marker differs: {marker}"
+            )
+    offsets = [oracle.index(marker) for marker in phase_markers]
+    if offsets != sorted(offsets):
+        raise PreparationError("correctness oracle control phases are reordered")
+    ready_call = """    let start_nonce = control.ready_and_wait_start(
+        &opened_nonce,
+        alloc_before.calls,
+        alloc_before.bytes,
+        cpu_before.user_ns,
+        cpu_before.system_ns,
+        ready_monotonic_ns,
+        counter_start_monotonic_ns,
+    );"""
+    require_exact_fragment(
+        oracle,
+        ready_call,
+        "correctness oracle ready counter/CPU/timestamp tuple",
+    )
+    measured_call = """    control.measured_and_wait_release(
+        &start_nonce,
+        MeasuredMarkers {
+            allocation_calls_end: alloc_after.calls,
+            allocated_bytes_end: alloc_after.bytes,
+            counter_end_monotonic_ns,
+            last_completion_monotonic_ns,
+            release_monotonic_ns,
+            process_system_cpu_end_ns: cpu_after.system_ns,
+            process_user_cpu_end_ns: cpu_after.user_ns,
+            t0_monotonic_ns,
+            t1_monotonic_ns,
+        },
+    );"""
+    require_exact_fragment(
+        oracle,
+        measured_call,
+        "correctness oracle measured counter/CPU/timestamp tuple",
+    )
+    if ".send(" in oracle or ".receive(" in oracle:
+        raise PreparationError(
+            "correctness oracle bypasses the shared control API"
+        )
+
+    emit = rust_item(
+        public,
+        "fn emit_correctness_oracle(",
+        "public correctness oracle emitter",
+    )
+    require_exact_signature(
+        emit,
+        "fn emit_correctness_oracle(args: CorrectnessOracleArgs) {",
+        "public correctness oracle emitter",
+    )
+    if emit.count("run_common_public_oracle(") != 1:
+        raise PreparationError("correctness oracle emitter routing differs")
+    main = rust_item(public, "fn main()", "public overlay main")
+    arm_start = main.find('"correctness_oracle" => {')
+    arm_end = main.find('"self-test" => {', arm_start + 1)
+    if arm_start < 0 or arm_end < 0:
+        raise PreparationError("correctness oracle mode arm is absent")
+    arm = main[arm_start:arm_end]
+    routing = (
+        '"correctness_oracle" => {',
+        "contract::validate(BINARY_KIND, TIMED_SURFACE);",
+        "emit_correctness_oracle(correctness_oracle_args());",
+    )
+    if any(arm.count(marker) != 1 for marker in routing):
+        raise PreparationError("correctness oracle mode routing differs")
+    if [arm.index(marker) for marker in routing] != sorted(
+        arm.index(marker) for marker in routing
+    ):
+        raise PreparationError("correctness oracle mode routing is reordered")
+
+
+def validate_reopen_digest_sources(public: str, digest: str) -> None:
+    """Bind reopen evidence to one 64-lowercase-hex logical spelling."""
+
+    formatter = rust_item(
+        digest, "pub fn canonical_hex(", "shared logical digest formatter"
+    )
+    if formatter.count('format!("{:064x}", self.0)') != 1:
+        raise PreparationError("shared logical digest spelling differs")
+    verification = rust_item(
+        public, "fn verify_corpus(", "public corpus verification"
+    )
+    for marker in (
+        "logical_digest: logical_digest.canonical_hex(),",
+        "registry_head_digest: registry_head_digest.canonical_hex(),",
+    ):
+        if verification.count(marker) != 1:
+            raise PreparationError(f"corpus digest marker differs: {marker}")
+    seed = rust_item(public, "fn run_reopen_seed(", "public reopen seed")
+    reopen = rust_item(public, "fn run_reopen(", "public reopen")
+    for marker in (
+        '("logical_digest", json_string(&verified.logical_digest))',
+        '("registry_head_digest", json_string(&verified.registry_head_digest))',
+    ):
+        if seed.count(marker) != 1:
+            raise PreparationError(f"reopen seed digest marker differs: {marker}")
+    for marker in (
+        "verified.logical_digest, logical_digest,",
+        "verified.registry_head_digest, registry_head_digest,",
+    ):
+        if reopen.count(marker) != 1:
+            raise PreparationError(f"reopen digest comparison differs: {marker}")
+    if ':016x' in verification or ':016x' in seed or ':016x' in reopen:
+        raise PreparationError("legacy 16-hex reopen digest spelling remains")
+
+
+def validate_reopen_seed_accounting_sources(
+    public: str,
+    current_adapter: str,
+    borrowed_adapter: str,
+) -> None:
+    """Bind full/smoke inputs and A/C/D log-event accounting exactly."""
+
+    verification = rust_item(
+        public,
+        "fn verify_corpus(",
+        "public corpus verification",
+    )
+    require_exact_signature(
+        verification,
+        """fn verify_corpus(
+    runtime: &tokio::runtime::Runtime,
+    store: &EventStore<FjallSnapshotBackend<LogEngine>>,
+    streams: usize,
+    events_per_stream: u64,
+) -> CorpusVerification {""",
+        "public corpus verification",
+    )
+
+    seed = rust_item(public, "fn run_reopen_seed(", "public reopen seed")
+    require_exact_signature(
+        seed,
+        """fn run_reopen_seed(
+    root: PathBuf,
+    streams: usize,
+    batches_per_stream: usize,
+    batch: usize,
+    workers: usize,
+    output_schema: &str,
+) {""",
+        "public reopen seed",
+    )
+    require_exact_fragment(
+        seed,
+        """    adapter::assert_reopen_seed_accounting(
+        &engine,
+        verified.domain_events,
+        streams as u64,
+    );""",
+        "public reopen seed accounting call",
+    )
+
+    main = rust_item(public, "fn main()", "public overlay main")
+    require_exact_fragment(
+        main,
+        'run_reopen_seed(root, 1_000, 200, 10, 8, "bn-2l3n-reopen-seed-v3");',
+        "public full reopen seed route",
+    )
+    require_exact_fragment(
+        main,
+        """            run_reopen_seed(
+                root,
+                1,
+                1,
+                1,
+                1,
+                "bn-2l3n-overlay-smoke-reopen-seed-v3",
+            );""",
+        "public smoke reopen seed route",
+    )
+
+    accounting_signature = """pub fn assert_oracle_accounting(
+    engine: &LogEngine,
+    domain_events: u64,
+    public_appends: u64,
+    fresh_streams: u64,
+    group: bool,
+) {"""
+    for generation, adapter in (
+        ("current", current_adapter),
+        ("historical", borrowed_adapter),
+    ):
+        accounting = rust_item(
+            adapter,
+            "pub fn assert_oracle_accounting(",
+            f"{generation} oracle accounting",
+        )
+        require_exact_signature(
+            accounting,
+            accounting_signature,
+            f"{generation} oracle accounting",
+        )
+
+    current = rust_item(
+        current_adapter,
+        "pub fn assert_reopen_seed_accounting(",
+        "current reopen seed accounting",
+    )
+    seed_accounting_signature = """pub fn assert_reopen_seed_accounting(
+    engine: &LogEngine,
+    domain_events: u64,
+    fresh_streams: u64,
+) {"""
+    require_exact_signature(
+        current,
+        seed_accounting_signature,
+        "current reopen seed accounting",
+    )
+    require_exact_fragment(
+        current,
+        """    let high_water = engine.total_events() as u64;
+    assert_eq!(engine.metrics().total_events, high_water);
+    assert_eq!(
+        high_water,
+        domain_events + fresh_streams + 1,
+        "v3 reopen seed differs from domain + streams + one shared type",
+    );""",
+        "A reopen seed accounting formula",
+    )
+
+    borrowed = rust_item(
+        borrowed_adapter,
+        "pub fn assert_reopen_seed_accounting(",
+        "historical reopen seed accounting",
+    )
+    require_exact_signature(
+        borrowed,
+        seed_accounting_signature,
+        "historical reopen seed accounting",
+    )
+    require_exact_fragment(
+        borrowed,
+        """    let high_water = engine.total_events() as u64;
+    assert_eq!(engine.metrics().total_events, high_water);
+    match contract::VARIANT {
+        "C" => assert_eq!(
+            high_water, domain_events,
+            "C reopen seed unexpectedly consumed metadata positions",
+        ),
+        "D" => assert_eq!(
+            high_water,
+            domain_events + fresh_streams + 1,
+            "D reopen seed differs from domain + streams + one shared type",
+        ),
+        variant => panic!("borrowed adapter used by variant {variant}"),
+    }""",
+        "C/D reopen seed accounting formulas",
+    )
+
+
 def validate_c_role_lifetime_sources(public: str, engine: str) -> None:
     run_point = rust_item(public, "fn run_point(", "C overlay run_point")
     append_batch = rust_item(
@@ -2619,6 +3096,148 @@ def static_self_test() -> None:
         *REQUIRED_TOOL_COMMS.values(),
     }.issubset(set(COMM_ALLOWLIST))
     public = (PUBLIC_SOURCE / "main.rs").read_text()
+    digest_source = (SHARED_SOURCE / "digest.rs").read_text()
+    validate_correctness_oracle_control_source(public)
+    validate_reopen_digest_sources(public, digest_source)
+
+    def mirror_logical_digest(payload: bytes) -> int:
+        value = 0xCBF29CE484222325
+        for byte in payload:
+            value ^= byte
+            value = value * 0x100000001B3 & ((1 << 64) - 1)
+        return value
+
+    smoke_stream_digest = mirror_logical_digest(bytes(range(64)))
+    smoke_logical_digest = mirror_logical_digest(
+        smoke_stream_digest.to_bytes(8, "little")
+    )
+    smoke_registry_digest = mirror_logical_digest(
+        (0).to_bytes(8, "little") + (0).to_bytes(8, "little")
+    )
+    canonical_logical_digest = f"{smoke_logical_digest:064x}"
+    canonical_registry_digest = f"{smoke_registry_digest:064x}"
+    assert canonical_logical_digest == (
+        "000000000000000000000000000000000000000000000000"
+        "e2d874aa120f66af"
+    )
+    assert canonical_registry_digest == (
+        "000000000000000000000000000000000000000000000000"
+        "88201fb960ff6465"
+    )
+    assert is_lower_hex(canonical_logical_digest, SHA256)
+    assert is_lower_hex(canonical_registry_digest, SHA256)
+    assert not is_lower_hex(f"{smoke_logical_digest:016x}", SHA256)
+    assert not is_lower_hex(f"{smoke_registry_digest:016x}", SHA256)
+    oracle_source = rust_item(
+        public,
+        "fn run_common_public_oracle(",
+        "public correctness oracle",
+    )
+
+    def hostile_oracle(old: str, new: str, context: str) -> str:
+        mutated = replace_exact_once(oracle_source, old, new, context)
+        return replace_exact_once(
+            public,
+            oracle_source,
+            mutated,
+            f"{context} oracle item",
+        )
+
+    hostile_oracle_sources = (
+        public.replace(
+            "let opened_nonce = control.opened(&runtime_nonce);",
+            "let opened_nonce = control.runtime(&runtime_nonce);",
+        ),
+        public.replace(
+            "let opened_nonce = control.opened(&runtime_nonce);",
+            "let opened_nonce = runtime_nonce;",
+        ),
+        public.replace(
+            "emit_correctness_oracle(correctness_oracle_args());",
+            "self_test();",
+        ),
+        hostile_oracle(
+            """        alloc_before.calls,
+        alloc_before.bytes,""",
+            """        alloc_before.bytes,
+        alloc_before.calls,""",
+            "oracle allocation-start swap",
+        ),
+        hostile_oracle(
+            """        cpu_before.user_ns,
+        cpu_before.system_ns,""",
+            """        cpu_before.system_ns,
+        cpu_before.user_ns,""",
+            "oracle CPU-start swap",
+        ),
+        hostile_oracle(
+            """        ready_monotonic_ns,
+        counter_start_monotonic_ns,""",
+            """        counter_start_monotonic_ns,
+        ready_monotonic_ns,""",
+            "oracle ready/counter-start timestamp swap",
+        ),
+        hostile_oracle(
+            """            allocation_calls_end: alloc_after.calls,
+            allocated_bytes_end: alloc_after.bytes,""",
+            """            allocation_calls_end: alloc_after.bytes,
+            allocated_bytes_end: alloc_after.calls,""",
+            "oracle allocation-end swap",
+        ),
+        hostile_oracle(
+            """            process_system_cpu_end_ns: cpu_after.system_ns,
+            process_user_cpu_end_ns: cpu_after.user_ns,""",
+            """            process_system_cpu_end_ns: cpu_after.user_ns,
+            process_user_cpu_end_ns: cpu_after.system_ns,""",
+            "oracle CPU-end swap",
+        ),
+        hostile_oracle(
+            """            counter_end_monotonic_ns,
+            last_completion_monotonic_ns,""",
+            """            counter_end_monotonic_ns: last_completion_monotonic_ns,
+            last_completion_monotonic_ns: counter_end_monotonic_ns,""",
+            "oracle counter/completion timestamp swap",
+        ),
+        hostile_oracle(
+            """            t0_monotonic_ns,
+            t1_monotonic_ns,""",
+            """            t0_monotonic_ns: t1_monotonic_ns,
+            t1_monotonic_ns: t0_monotonic_ns,""",
+            "oracle t0/t1 timestamp swap",
+        ),
+    )
+    for hostile_public in hostile_oracle_sources:
+        try:
+            validate_correctness_oracle_control_source(hostile_public)
+        except PreparationError:
+            pass
+        else:
+            raise AssertionError(
+                "hostile correctness oracle control source was accepted"
+            )
+    hostile_digest_sources = (
+        (
+            public,
+            digest_source.replace(
+                'format!("{:064x}", self.0)',
+                'format!("{:016x}", self.0)',
+            ),
+        ),
+        (
+            public.replace(
+                "logical_digest: logical_digest.canonical_hex(),",
+                "logical_digest: format!(\"{:016x}\", logical_digest.value()),",
+            ),
+            digest_source,
+        ),
+    )
+    for hostile_public, hostile_digest in hostile_digest_sources:
+        try:
+            validate_reopen_digest_sources(hostile_public, hostile_digest)
+        except PreparationError:
+            pass
+        else:
+            raise AssertionError("hostile reopen digest source was accepted")
     reopen = public[
         public.index("fn run_reopen(") : public.index("fn emit_reopen(")
     ]
@@ -2698,11 +3317,200 @@ def static_self_test() -> None:
             ), f"{name} fairness field absent: {field}"
     current_adapter = (PUBLIC_SOURCE / "adapters" / "current.rs").read_text()
     borrowed_adapter = (PUBLIC_SOURCE / "adapters" / "borrowed.rs").read_text()
-    assert "pub fn assert_oracle_accounting(" in current_adapter
-    assert "pub fn assert_oracle_accounting(" in borrowed_adapter
-    assert '"C" =>' in borrowed_adapter and '"D" =>' in borrowed_adapter
-    assert "domain_events + fresh_streams + 1" in current_adapter
-    assert "domain_events + fresh_streams + 1" in borrowed_adapter
+    validate_reopen_seed_accounting_sources(
+        public,
+        current_adapter,
+        borrowed_adapter,
+    )
+
+    def expected_seed_log_events(
+        variant: str,
+        domain_events: int,
+        fresh_streams: int,
+    ) -> int:
+        if variant == "C":
+            return domain_events
+        if variant in ("A", "D"):
+            return domain_events + fresh_streams + 1
+        raise AssertionError(f"unexpected seed variant {variant}")
+
+    full_domain_events = 1_000 * 200 * 10
+    full_seed_log_events = {
+        variant: expected_seed_log_events(variant, full_domain_events, 1_000)
+        for variant in ("A", "C", "D")
+    }
+    assert full_seed_log_events == {
+        "A": 2_001_001,
+        "C": 2_000_000,
+        "D": 2_001_001,
+    }
+    smoke_seed_log_events = {
+        variant: expected_seed_log_events(variant, 1, 1)
+        for variant in ("A", "C", "D")
+    }
+    assert smoke_seed_log_events == {"A": 3, "C": 1, "D": 3}
+
+    hostile_seed_sources = (
+        (
+            replace_exact_once(
+                public,
+                """    streams: usize,
+    batches_per_stream: usize,""",
+                """    batches_per_stream: usize,
+    streams: usize,""",
+                "public reopen seed streams/batches signature swap",
+            ),
+            current_adapter,
+            borrowed_adapter,
+        ),
+        (
+            public,
+            replace_exact_once(
+                current_adapter,
+                """    domain_events: u64,
+    fresh_streams: u64,""",
+                """    fresh_streams: u64,
+    domain_events: u64,""",
+                "current reopen seed accounting signature swap",
+            ),
+            borrowed_adapter,
+        ),
+        (
+            public,
+            current_adapter,
+            replace_exact_once(
+                borrowed_adapter,
+                """    domain_events: u64,
+    fresh_streams: u64,""",
+                """    fresh_streams: u64,
+    domain_events: u64,""",
+                "historical reopen seed accounting signature swap",
+            ),
+        ),
+        (
+            public,
+            replace_exact_once(
+                current_adapter,
+                """    domain_events: u64,
+    public_appends: u64,
+    fresh_streams: u64,""",
+                """    public_appends: u64,
+    domain_events: u64,
+    fresh_streams: u64,""",
+                "current oracle accounting signature swap",
+            ),
+            borrowed_adapter,
+        ),
+        (
+            public,
+            current_adapter,
+            replace_exact_once(
+                borrowed_adapter,
+                """    domain_events: u64,
+    public_appends: u64,
+    fresh_streams: u64,""",
+                """    public_appends: u64,
+    domain_events: u64,
+    fresh_streams: u64,""",
+                "historical oracle accounting signature swap",
+            ),
+        ),
+        (
+            public,
+            replace_exact_once(
+                current_adapter,
+                """        domain_events + fresh_streams + 1,
+        "v3 reopen seed differs from domain + streams + one shared type",""",
+                """        domain_events + 17,
+        "v3 reopen seed differs from domain + streams + one shared type",""",
+                "A reopen seed domain-events-plus-17 formula",
+            ),
+            borrowed_adapter,
+        ),
+        (
+            public,
+            current_adapter,
+            replace_exact_once(
+                borrowed_adapter,
+                """            high_water, domain_events,
+            "C reopen seed unexpectedly consumed metadata positions",""",
+                """            high_water, domain_events + 17,
+            "C reopen seed unexpectedly consumed metadata positions",""",
+                "C reopen seed domain-events-plus-17 formula",
+            ),
+        ),
+        (
+            public,
+            current_adapter,
+            replace_exact_once(
+                borrowed_adapter,
+                """            domain_events + fresh_streams + 1,
+            "D reopen seed differs from domain + streams + one shared type",""",
+                """            domain_events + 17,
+            "D reopen seed differs from domain + streams + one shared type",""",
+                "D reopen seed domain-events-plus-17 formula",
+            ),
+        ),
+        (
+            replace_exact_once(
+                public,
+                'run_reopen_seed(root, 1_000, 200, 10, 8, "bn-2l3n-reopen-seed-v3");',
+                'run_reopen_seed(root, 1_000, 201, 10, 8, "bn-2l3n-reopen-seed-v3");',
+                "full reopen seed workload formula",
+            ),
+            current_adapter,
+            borrowed_adapter,
+        ),
+        (
+            replace_exact_once(
+                public,
+                """            run_reopen_seed(
+                root,
+                1,
+                1,
+                1,
+                1,
+                "bn-2l3n-overlay-smoke-reopen-seed-v3",
+            );""",
+                """            run_reopen_seed(
+                root,
+                1,
+                1,
+                2,
+                1,
+                "bn-2l3n-overlay-smoke-reopen-seed-v3",
+            );""",
+                "smoke reopen seed workload formula",
+            ),
+            current_adapter,
+            borrowed_adapter,
+        ),
+        (
+            replace_exact_once(
+                public,
+                """        verified.domain_events,
+        streams as u64,""",
+                """        streams as u64,
+        verified.domain_events,""",
+                "reopen seed accounting argument swap",
+            ),
+            current_adapter,
+            borrowed_adapter,
+        ),
+    )
+    for hostile_public, hostile_current, hostile_borrowed in (
+        hostile_seed_sources
+    ):
+        try:
+            validate_reopen_seed_accounting_sources(
+                hostile_public,
+                hostile_current,
+                hostile_borrowed,
+            )
+        except PreparationError:
+            pass
+        else:
+            raise AssertionError("hostile reopen seed accounting was accepted")
     assert current_adapter.count("assert_eq!(metrics.commit.groups, 1);") == 1
     assert borrowed_adapter.count("assert_eq!(metrics.commit.groups, 1);") == 1
     workload = (SHARED_SOURCE / "workload.rs").read_text()
@@ -2712,6 +3520,134 @@ def static_self_test() -> None:
     assert "assert_eq!(payload_bytes(250), PAYLOAD_250);" in workload
     contract = (SHARED_SOURCE / "contract.rs").read_text()
     control = (SHARED_SOURCE / "control.rs").read_text()
+    validate_shared_control_child_source(control)
+    hostile_control_sources = (
+        control.replace(
+            '("context_sha256", json_string(&self.context_sha256)),\n',
+            "",
+            1,
+        ),
+        control.replace(
+            '("phase", json_string("opened"))',
+            '("phase", json_string("runtime"))',
+        ),
+        control.replace(
+            '("phase", json_string("measured"))',
+            '("phase", json_string("ready"))',
+            1,
+        ),
+        replace_exact_once(
+            control,
+            """        allocation_calls_start: u64,
+        allocated_bytes_start: u64,""",
+            """        allocated_bytes_start: u64,
+        allocation_calls_start: u64,""",
+            "shared ready allocation signature swap",
+        ),
+        replace_exact_once(
+            control,
+            """        process_user_cpu_start_ns: u64,
+        process_system_cpu_start_ns: u64,""",
+            """        process_system_cpu_start_ns: u64,
+        process_user_cpu_start_ns: u64,""",
+            "shared ready CPU signature swap",
+        ),
+        replace_exact_once(
+            control,
+            """        ready_monotonic_ns: u64,
+        counter_start_monotonic_ns: u64,""",
+            """        counter_start_monotonic_ns: u64,
+        ready_monotonic_ns: u64,""",
+            "shared ready/counter timestamp signature swap",
+        ),
+        replace_exact_once(
+            control,
+            """        open_start_monotonic_ns: u64,
+        opened_monotonic_ns: u64,""",
+            """        opened_monotonic_ns: u64,
+        open_start_monotonic_ns: u64,""",
+            "shared opened timestamp signature swap",
+        ),
+        replace_exact_once(
+            control,
+            """            allocated_bytes_start,
+            allocation_calls_start,
+            self.context_sha256,
+            counter_start_monotonic_ns,
+            nonce.as_str(),
+            process_system_cpu_start_ns,
+            process_user_cpu_start_ns,
+            crate::contract::PROTOCOL_SHA256,
+            ready_monotonic_ns,
+            crate::contract::VARIANT,""",
+            """            allocation_calls_start,
+            allocated_bytes_start,
+            self.context_sha256,
+            ready_monotonic_ns,
+            nonce.as_str(),
+            process_user_cpu_start_ns,
+            process_system_cpu_start_ns,
+            crate::contract::PROTOCOL_SHA256,
+            counter_start_monotonic_ns,
+            crate::contract::VARIANT,""",
+            "shared ready same-typed tuple swaps",
+        ),
+        replace_exact_once(
+            control,
+            """            (
+                "process_system_cpu_end_ns",
+                json_u64(markers.process_system_cpu_end_ns),
+            ),
+            (
+                "process_user_cpu_end_ns",
+                json_u64(markers.process_user_cpu_end_ns),
+            ),""",
+            """            (
+                "process_system_cpu_end_ns",
+                json_u64(markers.process_user_cpu_end_ns),
+            ),
+            (
+                "process_user_cpu_end_ns",
+                json_u64(markers.process_system_cpu_end_ns),
+            ),""",
+            "shared measured CPU swap",
+        ),
+        replace_exact_once(
+            control,
+            """            (
+                "counter_end_monotonic_ns",
+                json_u64(markers.counter_end_monotonic_ns),
+            ),
+            (
+                "last_completion_monotonic_ns",
+                json_u64(markers.last_completion_monotonic_ns),
+            ),""",
+            """            (
+                "counter_end_monotonic_ns",
+                json_u64(markers.last_completion_monotonic_ns),
+            ),
+            (
+                "last_completion_monotonic_ns",
+                json_u64(markers.counter_end_monotonic_ns),
+            ),""",
+            "shared measured counter/completion timestamp swap",
+        ),
+        replace_exact_once(
+            control,
+            """            ("t0_monotonic_ns", json_u64(markers.t0_monotonic_ns)),
+            ("t1_monotonic_ns", json_u64(markers.t1_monotonic_ns)),""",
+            """            ("t0_monotonic_ns", json_u64(markers.t1_monotonic_ns)),
+            ("t1_monotonic_ns", json_u64(markers.t0_monotonic_ns)),""",
+            "shared measured t0/t1 timestamp swap",
+        ),
+    )
+    for hostile_control in hostile_control_sources:
+        try:
+            validate_shared_control_child_source(hostile_control)
+        except PreparationError:
+            pass
+        else:
+            raise AssertionError("hostile shared control source was accepted")
     assert public.count(
         ".thread_keep_alive(Duration::from_secs(3_600))"
     ) == public.count("tokio::runtime::Builder::new_multi_thread()") == 3
