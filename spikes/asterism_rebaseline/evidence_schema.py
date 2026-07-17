@@ -3637,6 +3637,257 @@ def _validate_release_build_events(
         raise ValueError("release build wall chronology overlaps")
 
 
+def _release_cargo_config_sha256(
+    attestation: Mapping[str, Any], context: str
+) -> str:
+    binding = _authority_object(
+        attestation["cargo_config_search"],
+        FILE_BINDING_FIELDS,
+        f"{context} Cargo config binding",
+    )
+    manifest_sha256 = _authority_sha256(
+        binding["sha256"], f"{context} Cargo config manifest hash"
+    )
+    manifest_path = Path(str(binding["path"]))
+    manifest_snapshot = snapshot_regular_file(
+        manifest_path, expected_mode=ARTIFACT_FILE_MODE
+    )
+    if manifest_snapshot.sha256 != manifest_sha256:
+        raise ValueError(f"{context} Cargo config manifest bytes differ")
+    manifest = _authority_object(
+        parse_canonical_json_object(
+            manifest_snapshot.data, f"{context} Cargo config manifest"
+        ),
+        CARGO_CONFIG_SEARCH_FIELDS,
+        f"{context} Cargo config manifest",
+    )
+    if (
+        manifest["schema"] != CARGO_CONFIG_SEARCH_SCHEMA
+        or manifest["cwd"] != _RELEASE_GUEST_SOURCE
+        or manifest["cargo_home_path"] != _RELEASE_GUEST_CARGO_HOME
+    ):
+        raise ValueError(f"{context} Cargo config guest identity differs")
+    try:
+        source_root = Path(str(attestation["materialized_root"])).resolve(
+            strict=True
+        )
+        toolchain = attestation["toolchain"]
+        if not isinstance(toolchain, Mapping) or not isinstance(
+            toolchain.get("cargo_home_path"), str
+        ):
+            raise ValueError("Cargo home authority is absent")
+        cargo_home = Path(
+            toolchain["cargo_home_path"]
+        ).resolve(strict=True)
+    except (KeyError, OSError, TypeError, ValueError) as error:
+        raise ValueError(f"{context} Cargo config host roots differ") from error
+    candidates: tuple[tuple[str, Path | None], ...] = (
+        (
+            f"{_RELEASE_GUEST_SOURCE}/.cargo/config.toml",
+            source_root / ".cargo/config.toml",
+        ),
+        (
+            f"{_RELEASE_GUEST_SOURCE}/.cargo/config",
+            source_root / ".cargo/config",
+        ),
+        (f"{_RELEASE_GUEST_ROOT}/.cargo/config.toml", None),
+        (f"{_RELEASE_GUEST_ROOT}/.cargo/config", None),
+        ("/.cargo/config.toml", None),
+        ("/.cargo/config", None),
+        (
+            f"{_RELEASE_GUEST_CARGO_HOME}/config.toml",
+            cargo_home / "config.toml",
+        ),
+        (f"{_RELEASE_GUEST_CARGO_HOME}/config", cargo_home / "config"),
+    )
+    entries = manifest["entries"]
+    if not isinstance(entries, list) or len(entries) != len(candidates):
+        raise ValueError(f"{context} Cargo config candidate cardinality differs")
+    for ordinal, (entry_value, (guest_path, host_path)) in enumerate(
+        zip(entries, candidates, strict=True), start=1
+    ):
+        entry = _authority_object(
+            entry_value,
+            CARGO_CONFIG_SEARCH_ENTRY_FIELDS,
+            f"{context} Cargo config entry {ordinal}",
+        )
+        if entry["path"] != guest_path:
+            raise ValueError(f"{context} Cargo config guest path/order differs")
+        if host_path is None:
+            if entry["status"] != "absent" or entry["sha256"] is not None:
+                raise ValueError(f"{context} private Cargo config path is not absent")
+            continue
+        if host_path.is_symlink():
+            raise ValueError(f"{context} Cargo config host input is a symlink")
+        expected_sha256 = _EMPTY_SHA256
+        if host_path.exists():
+            expected_sha256 = snapshot_regular_file(
+                host_path, expected_mode=None
+            ).sha256
+        if (
+            entry["status"] != "present"
+            or entry["sha256"] != expected_sha256
+        ):
+            raise ValueError(f"{context} effective Cargo config bytes differ")
+    empty_snapshot = snapshot_regular_file(
+        manifest_path.with_name(f"{manifest_path.name}.empty"),
+        expected_mode=ARTIFACT_FILE_MODE,
+    )
+    if empty_snapshot.sha256 != _EMPTY_SHA256 or empty_snapshot.size != 0:
+        raise ValueError(f"{context} empty Cargo config authority differs")
+    return manifest_sha256
+
+
+def _release_sandbox_sha256(
+    attestation: Mapping[str, Any], context: str
+) -> str:
+    argv = attestation["build_argv"]
+    toolchain = attestation["toolchain"]
+    if (
+        not isinstance(argv, list)
+        or any(not isinstance(argument, str) for argument in argv)
+        or not isinstance(toolchain, Mapping)
+        or not isinstance(toolchain.get("bwrap_path"), str)
+    ):
+        raise ValueError(f"{context} sandbox authority is invalid")
+    prefix = [
+        toolchain["bwrap_path"],
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-net",
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev-bind",
+        "/dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--tmpfs",
+        "/tmp",
+        "--tmpfs",
+        _RELEASE_GUEST_ROOT,
+        "--dir",
+        f"{_RELEASE_GUEST_ROOT}/.cargo",
+        "--tmpfs",
+        f"{_RELEASE_GUEST_ROOT}/.cargo",
+        "--remount-ro",
+        f"{_RELEASE_GUEST_ROOT}/.cargo",
+        "--dir",
+        "/.cargo",
+        "--tmpfs",
+        "/.cargo",
+        "--remount-ro",
+        "/.cargo",
+    ]
+    middle = [
+        "--dir",
+        f"{_RELEASE_GUEST_SOURCE}/.cargo",
+        "--tmpfs",
+        f"{_RELEASE_GUEST_SOURCE}/.cargo",
+    ]
+    source_config_remount = [
+        "--remount-ro",
+        f"{_RELEASE_GUEST_SOURCE}/.cargo",
+    ]
+    cargo_home_config_remount = [
+        "--remount-ro",
+        _RELEASE_GUEST_CARGO_HOME,
+    ]
+    suffix = [
+        "--chdir",
+        _RELEASE_GUEST_SOURCE,
+        _RELEASE_GUEST_CARGO,
+        "build",
+        "--locked",
+        "--offline",
+        "--release",
+        "-p",
+        "mess-store",
+        "--example",
+        "asterism_rebaseline_public",
+        "--target-dir",
+        _RELEASE_GUEST_TARGET,
+    ]
+    expected_length = (
+        len(prefix)
+        + 3 * len(_RELEASE_SANDBOX_CORE_BINDINGS)
+        + len(middle)
+        + 3 * len(_RELEASE_SANDBOX_SOURCE_CONFIG_BINDINGS)
+        + len(source_config_remount)
+        + 3 * len(_RELEASE_SANDBOX_CARGO_HOME_CONFIG_BINDINGS)
+        + len(cargo_home_config_remount)
+        + len(suffix)
+    )
+    if len(argv) != expected_length or argv[: len(prefix)] != prefix:
+        raise ValueError(f"{context} sandbox prefix/cardinality differs")
+    descriptors: list[str] = []
+    normalized = list(argv)
+    offset = len(prefix)
+
+    def consume_bindings(
+        bindings: Sequence[tuple[str, str]], start: int
+    ) -> int:
+        current = start
+        for operation, destination in bindings:
+            segment = argv[current : current + 3]
+            descriptor = segment[1] if len(segment) == 3 else ""
+            if (
+                len(segment) != 3
+                or segment[0] != operation
+                or segment[2] != destination
+                or not descriptor.isascii()
+                or not descriptor.isdecimal()
+                or len(descriptor) > 10
+                or str(int(descriptor)) != descriptor
+                or int(descriptor) < 3
+            ):
+                raise ValueError(
+                    f"{context} descriptor binding differs: {destination}"
+                )
+            descriptors.append(descriptor)
+            normalized[current + 1] = f"$FD:{destination}"
+            current += 3
+        return current
+
+    offset = consume_bindings(_RELEASE_SANDBOX_CORE_BINDINGS, offset)
+    if argv[offset : offset + len(middle)] != middle:
+        raise ValueError(f"{context} private source Cargo config mount differs")
+    offset += len(middle)
+    offset = consume_bindings(_RELEASE_SANDBOX_SOURCE_CONFIG_BINDINGS, offset)
+    if argv[offset : offset + len(source_config_remount)] != source_config_remount:
+        raise ValueError(f"{context} source Cargo config remount differs")
+    offset += len(source_config_remount)
+    offset = consume_bindings(
+        _RELEASE_SANDBOX_CARGO_HOME_CONFIG_BINDINGS, offset
+    )
+    if (
+        argv[offset : offset + len(cargo_home_config_remount)]
+        != cargo_home_config_remount
+    ):
+        raise ValueError(f"{context} Cargo-home config remount differs")
+    offset += len(cargo_home_config_remount)
+    if len(set(descriptors)) != len(descriptors) or argv[offset:] != suffix:
+        raise ValueError(f"{context} sandbox descriptors/command differ")
+    if any(
+        not isinstance(attestation[field], str) or attestation[field] in argv
+        for field in ("materialized_root", "target_dir")
+    ):
+        raise ValueError(f"{context} sandbox exposes a mutable host path")
+    build_child = attestation["build_child"]
+    if not isinstance(build_child, Mapping) or build_child.get("argv") != argv:
+        raise ValueError(f"{context} child argv differs from sandbox authority")
+    cargo_config_sha256 = _release_cargo_config_sha256(attestation, context)
+    return sha256_bytes(
+        canonical_json_bytes(
+            {
+                "argv": normalized,
+                "cargo_config_search_sha256": cargo_config_sha256,
+            }
+        )
+    )
+
+
 def _validate_release_compile_out(
     proof: Mapping[str, Any],
     prepared: Mapping[str, Any],

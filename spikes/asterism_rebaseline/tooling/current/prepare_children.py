@@ -36,10 +36,10 @@ PRODUCT_OVERLAY = Path(__file__).resolve().parent / PRODUCT_OVERLAY_DESTINATION
 EXACT_PRODUCT_COMMIT = "d644dc583dfe6a3d2cd07e71ce0212a323875ab4"
 EXACT_PRODUCT_TREE = "205d853905bdb648ee997900c6aef24a323aa380"
 EXACT_PRODUCT_OVERLAY_REVIEWED_COMMIT = (
-    "478e1c61968f6a02722e6881e4c765f47b921770"
+    "ded1d69e6ba30dceec5ead61239d47a405234512"
 )
 EXACT_PRODUCT_OVERLAY_SHA256 = (
-    "3e2cd85c17be87f48fce1ed5909c5b173d16b9572ed34987225a463f5592db9b"
+    "0e38a70c9917de5892c7f049ed2103e4431103fbaebb3073d6398574a9453574"
 )
 EXACT_CASES = (
     ("public-ordinary-append-command-cache-read-subscribe", "correctness"),
@@ -482,13 +482,17 @@ def validate_correctness(source: str, *, allow_pending_hook: bool = True) -> Non
             "case_two_live_rolls(",
             "case_clean_repeated_active_tail_sealed_recovery(",
             "control.measured_and_wait_release(",
-            "emit_result(&args);",
+            "drop(public_store);",
+            "drop(public_engine);",
+            "runtime.shutdown_timeout(",
+            "Invocation::Correctness(args) => emit_result(&args),",
+            "Invocation::Smoke => emit_smoke_result(),",
         ),
         "current correctness control/case/output sequence",
     )
     if source.count("control.measured_and_wait_release(") != 1:
         raise PreparationError("current correctness measured transition differs")
-    if source.count("emit_result(&args);") != 1:
+    if source.count("Invocation::Correctness(args) => emit_result(&args),") != 1:
         raise PreparationError("current correctness output cardinality differs")
     require_order(
         source,
@@ -503,15 +507,16 @@ def validate_correctness(source: str, *, allow_pending_hook: bool = True) -> Non
         ),
         "current correctness argv",
     )
-    for binding in (
-        "ASTERISM_REBASELINE_MODE",
-        "ASTERISM_REBASELINE_ATTEMPT_NONCE",
-        "ASTERISM_REBASELINE_PHASE",
-        "ASTERISM_REBASELINE_PROTOCOL",
-        "ASTERISM_REBASELINE_SUITE",
-        "ASTERISM_REBASELINE_VARIANT",
-    ):
-        if source.count(f'required("{binding}")') != 1:
+    expected_binding_counts = {
+        "ASTERISM_REBASELINE_MODE": 2,
+        "ASTERISM_REBASELINE_ATTEMPT_NONCE": 1,
+        "ASTERISM_REBASELINE_PHASE": 1,
+        "ASTERISM_REBASELINE_PROTOCOL": 2,
+        "ASTERISM_REBASELINE_SUITE": 1,
+        "ASTERISM_REBASELINE_VARIANT": 1,
+    }
+    for binding, expected_count in expected_binding_counts.items():
+        if source.count(f'required("{binding}")') != expected_count:
             raise PreparationError(f"current correctness env binding differs: {binding}")
     public_case = extract_between(
         source,
@@ -666,7 +671,7 @@ def validate_product_authority_values(
         checks = validate_product_overlay_patch(overlay_text)
     except (UnicodeDecodeError, ProductOverlayValidationError) as error:
         raise PreparationError("current product test overlay authority failed") from error
-    if len(checks) != 8 or len(set(checks)) != 8:
+    if len(checks) != 9 or len(set(checks)) != 9:
         raise PreparationError("current product test overlay check set differs")
     return checks
 
@@ -969,7 +974,10 @@ def self_test() -> None:
         validate_correctness,
         correctness,
         "control.measured_and_wait_release(",
-        "emit_result(&args);\n    control.measured_and_wait_release(",
+        (
+            "Invocation::Correctness(args) => emit_result(&args),\n"
+            "    control.measured_and_wait_release("
+        ),
     )
     expect_rejected(
         validate_correctness,

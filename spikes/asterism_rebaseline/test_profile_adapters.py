@@ -74,6 +74,69 @@ def write_canonical(path: Path, value: object, mode: int) -> str:
     return sha256(payload)
 
 
+def release_file_binding(path: Path) -> dict[str, object]:
+    metadata = path.stat()
+    return {
+        "path": str(path.resolve()),
+        "sha256": sha256(path.read_bytes()),
+        "size": metadata.st_size,
+        "mode": stat.S_IMODE(metadata.st_mode),
+        "identity": {
+            "changed_ns": metadata.st_ctime_ns,
+            "device": metadata.st_dev,
+            "inode": metadata.st_ino,
+            "link_count": metadata.st_nlink,
+            "modified_ns": metadata.st_mtime_ns,
+        },
+    }
+
+
+def nm_child(
+    *,
+    name: str,
+    pid: int,
+    nm_path: Path,
+    inventory: Path,
+    prepared_root: Path,
+) -> dict[str, object]:
+    log_path = prepared_root / "logs" / f"nm-{name.replace('_', '-')}.json"
+    inventory_payload = inventory.read_bytes()
+    write_canonical(
+        log_path,
+        {
+            "exit_status": 0,
+            "stderr": "",
+            "stderr_sha256": sha256(b""),
+            "stdout": inventory_payload.decode(),
+            "stdout_sha256": sha256(inventory_payload),
+        },
+        0o444,
+    )
+    return {
+        "argv": [
+            str(nm_path.resolve()),
+            "--defined-only",
+            "--demangle=rust",
+            "--format=posix",
+            f"/proc/self/fd/{pid + 20}",
+        ],
+        "completed_at": "2026-07-16T00:00:01+00:00",
+        "completed_monotonic_ns": 2,
+        "cwd": str(prepared_root),
+        "exit_status": 0,
+        "output_path": str(log_path.resolve()),
+        "output_sha256": sha256(log_path.read_bytes()),
+        "pid": pid,
+        "process_group_absent": True,
+        "reaping": {"pid": pid, "start_ticks": pid + 1, "status": "absent"},
+        "start_ticks": pid + 1,
+        "started_at": "2026-07-16T00:00:00+00:00",
+        "started_monotonic_ns": 1,
+        "timed_out": False,
+        "waited_pid": pid,
+    }
+
+
 def profile_tools_for(track: str, root: Path | None = None) -> dict[str, object]:
     names = (
         ("perf",)
@@ -308,6 +371,101 @@ def live_authority(
     adapter.chmod(0o444)
     adapter_sha = sha256(adapter.read_bytes())
     tools = profile_tools_for(track, artifacts)
+    ordinary_a_binary = binary
+    if variant != "A":
+        ordinary_a_binary = artifacts / "ast-rb-a"
+        ordinary_a_binary.write_bytes(b"synthetic ordinary A executable\n")
+        ordinary_a_binary.chmod(0o555)
+    overlay_binary = artifacts / "ast-rb-a-product-overlay"
+    overlay_binary.write_bytes(ordinary_a_binary.read_bytes())
+    overlay_binary.chmod(0o555)
+    ordinary_inventory = artifacts / "symbols-ordinary-a.txt"
+    overlay_inventory = artifacts / "symbols-overlay-a.txt"
+    for inventory in (ordinary_inventory, overlay_inventory):
+        inventory.write_bytes(b"main T 0 1\n")
+        inventory.chmod(0o444)
+    nm_path = artifacts / "nm"
+    nm_path.write_bytes(b"synthetic nm executable\n")
+    nm_path.chmod(0o555)
+
+    preapproval_compile_out = {
+        "binary_byte_identical": True,
+        "forbidden_hook_strings": list(adapters._FORBIDDEN_RELEASE_HOOK_STRINGS),
+        "symbol_inventory_byte_identical": True,
+    }
+    current_children = {
+        "release_compile_out": preapproval_compile_out,
+        "schema": "bn-30fs-current-children-build-v1",
+    }
+    requirement = {
+        "binary_byte_identical": True,
+        "cfg_test": False,
+        "forbidden_hook_strings": list(adapters._FORBIDDEN_RELEASE_HOOK_STRINGS),
+        "forbidden_hook_strings_absent": True,
+        "ordinary_a_role": "published",
+        "overlay_a_role": "proof_only",
+        "preapproval_compile_out_sha256": sha256(
+            adapters.canonical_json(preapproval_compile_out)
+        ),
+        "product_overlay_sha256": adapters._CURRENT_PRODUCT_OVERLAY_SHA256,
+        "proof_must_bind_enclosing_approval_sha256": True,
+        "repeat_under_real_source_approval": True,
+        "rustc_workspace_wrapper": "absent",
+        "same_contract_nonce_lock_toolchain_sandbox": True,
+        "schema": "bn-3hch-release-compile-out-requirement-v1",
+        "status": "required",
+        "symbol_inventory_byte_identical": True,
+        "variant": "A",
+    }
+    assertion = {
+        "inputs": {},
+        "open_findings": 0,
+        "protocol": adapters.PROTOCOL,
+        "protocol_sha256": adapters.PROTOCOL_SHA256,
+        "release_compile_out_requirement": requirement,
+        "schema": "bn-3hch-source-review-assertion-v1",
+        "status": "approved",
+        "tooling_commit": "1" * 40,
+        "tooling_tree": "2" * 40,
+    }
+    assertion_sha = sha256(adapters.canonical_json(assertion))
+    source_review_values = {
+        "bundle": {
+            "assertion": assertion,
+            "assertion_sha256": assertion_sha,
+            "review_created": {},
+            "schema": "bn-3hch-source-review-bundle-v1",
+            "verdict": {},
+        },
+        "current_children_attestation": current_children,
+        "lock_authority": {"schema": "bn-31gp-current-lock-authority-v1"},
+        "lock_review_bundle": {
+            "schema": "bn-31gp-current-lock-review-bundle-v1"
+        },
+    }
+    source_review_paths = {
+        "bundle": bindings / "source-review-bundle.json",
+        "current_children_attestation": (
+            bindings / "current-children-attestation.json"
+        ),
+        "lock_authority": bindings / "lock-review-authority.json",
+        "lock_review_bundle": bindings / "lock-review-bundle.json",
+    }
+    source_review_schemas = adapters._SOURCE_REVIEW_CONTENT_SCHEMAS
+    for name, source_review_path in source_review_paths.items():
+        write_canonical(source_review_path, source_review_values[name], 0o444)
+    approved_source_review = {
+        "assertion_sha256": assertion_sha,
+        **{
+            name: {
+                "mode": 0o444,
+                "schema": source_review_schemas[name],
+                "sha256": sha256(source_review_paths[name].read_bytes()),
+            }
+            for name in source_review_paths
+        },
+        "release_compile_out_requirement": requirement,
+    }
     source = adapters.VARIANT_SOURCE_BINDINGS[variant]
     role_lifetime: object = (
         adapters.C_ROLE_LIFETIME_CONTRACT if variant == "C" else "not_applicable"
@@ -317,6 +475,7 @@ def live_authority(
         "status": "approved",
         "protocol": adapters.PROTOCOL,
         "protocol_sha256": adapters.PROTOCOL_SHA256,
+        "source_review": approved_source_review,
         "variants": {
             variant: {
                 "product_commit": source["commit"],
@@ -337,6 +496,93 @@ def live_authority(
     }
     original_approval_path = bindings / "source-approval.json"
     approval_sha = write_canonical(original_approval_path, approval, 0o444)
+    ordinary_nm_child = nm_child(
+        name="ordinary_a",
+        pid=301,
+        nm_path=nm_path,
+        inventory=ordinary_inventory,
+        prepared_root=prepared_root,
+    )
+    overlay_nm_child = nm_child(
+        name="overlay_a",
+        pid=302,
+        nm_path=nm_path,
+        inventory=overlay_inventory,
+        prepared_root=prepared_root,
+    )
+    equivalence = {
+        "source_approval_sha256": approval_sha,
+        "contract_sha256": "3" * 64,
+        "build_nonce": "4" * 64,
+        "cargo_lock_sha256": "5" * 64,
+        "toolchain_sha256": "6" * 64,
+        "build_environment_sha256": "7" * 64,
+        "sandbox_sha256": "8" * 64,
+        "cfg_test": False,
+        "rustc_workspace_wrapper": "absent",
+        "ordinary_a_role": "published",
+        "overlay_a_role": "proof_only",
+    }
+
+    def release_build(name: str, artifact_role: str) -> dict[str, object]:
+        attestation = {"artifact_role": artifact_role, "role": name}
+        return {
+            "role": name,
+            "artifact_role": artifact_role,
+            "source_approval_sha256": approval_sha,
+            "contract_sha256": equivalence["contract_sha256"],
+            "build_nonce": equivalence["build_nonce"],
+            "cargo_lock_sha256": equivalence["cargo_lock_sha256"],
+            "toolchain_sha256": equivalence["toolchain_sha256"],
+            "build_environment_sha256": equivalence[
+                "build_environment_sha256"
+            ],
+            "sandbox_sha256": equivalence["sandbox_sha256"],
+            "cfg_test": False,
+            "rustc_workspace_wrapper": "absent",
+            "attestation": attestation,
+            "attestation_sha256": sha256(adapters.canonical_json(attestation)),
+        }
+
+    release_compile_out = {
+        "schema": "bn-3hch-release-compile-out-v1",
+        "protocol": adapters.PROTOCOL,
+        "protocol_sha256": adapters.PROTOCOL_SHA256,
+        "status": "ok",
+        "source_approval_sha256": approval_sha,
+        "requirement_sha256": sha256(adapters.canonical_json(requirement)),
+        "current_children_attestation_sha256": sha256(
+            source_review_paths["current_children_attestation"].read_bytes()
+        ),
+        "product_overlay_sha256": adapters._CURRENT_PRODUCT_OVERLAY_SHA256,
+        "equivalence_contract": equivalence,
+        "builds": {
+            "ordinary_a": release_build("ordinary_a", "published"),
+            "overlay_a": release_build("overlay_a", "proof_only"),
+        },
+        "binaries": {
+            "ordinary_a": release_file_binding(ordinary_a_binary),
+            "overlay_a": release_file_binding(overlay_binary),
+        },
+        "nm": {
+            "tool": release_file_binding(nm_path),
+            "ordinary_a": ordinary_nm_child,
+            "overlay_a": overlay_nm_child,
+        },
+        "symbol_inventories": {
+            "ordinary_a": release_file_binding(ordinary_inventory),
+            "overlay_a": release_file_binding(overlay_inventory),
+        },
+        "forbidden_hook_strings": list(adapters._FORBIDDEN_RELEASE_HOOK_STRINGS),
+        "binary_byte_identical": True,
+        "symbol_inventory_byte_identical": True,
+        "forbidden_hook_strings_absent": True,
+        "published_a_sha256": sha256(ordinary_a_binary.read_bytes()),
+    }
+    release_compile_out_path = prepared_root / "manifests" / "release-compile-out.json"
+    release_compile_out_sha = write_canonical(
+        release_compile_out_path, release_compile_out, 0o444
+    )
     claim_path = prepared_root / "claims" / "single-use-claim.json"
     prepared = {
         "schema": "bn-2l3n-prepared-artifacts-v3",
@@ -345,6 +591,19 @@ def live_authority(
         "source_approval": {
             "path": str(original_approval_path),
             "sha256": approval_sha,
+        },
+        "source_review": {
+            name: {
+                "path": str(source_review_paths[name].resolve()),
+                "sha256": sha256(source_review_paths[name].read_bytes()),
+                "mode": 0o444,
+            }
+            for name in source_review_paths
+        },
+        "release_compile_out": {
+            "path": str(release_compile_out_path.resolve()),
+            "sha256": release_compile_out_sha,
+            "mode": 0o444,
         },
         "single_use_claim": {"path": str(claim_path)},
         "support_files": {
@@ -369,6 +628,22 @@ def live_authority(
             }
         },
     }
+    if variant != "A":
+        source_a = adapters.VARIANT_SOURCE_BINDINGS["A"]
+        prepared["variants"]["A"] = {
+            "binary": {
+                "path": str(ordinary_a_binary.resolve()),
+                "sha256": sha256(ordinary_a_binary.read_bytes()),
+            },
+            "executable_mode": 0o555,
+            "comm": ordinary_a_binary.name,
+            "contract": {
+                "protocol_sha256": adapters.PROTOCOL_SHA256,
+                "product_commit": source_a["commit"],
+                "product_tree": source_a["tree"],
+                "profile_role_lifetime": "not_applicable",
+            },
+        }
     original_prepared_path = prepared_root / "prepared-artifacts.json"
     prepared_sha = write_canonical(original_prepared_path, prepared, 0o444)
     claim = {
@@ -386,6 +661,9 @@ def live_authority(
     claim_path.parent.chmod(0o700)
     bindings.chmod(0o555)
     artifacts.chmod(0o555)
+    release_compile_out_path.parent.chmod(0o555)
+    ordinary_nm_child_log = Path(str(ordinary_nm_child["output_path"]))
+    ordinary_nm_child_log.parent.chmod(0o555)
     prepared_root.chmod(0o555)
     attempt_approval_path = attempt_root / "source-approval.json"
     attempt_prepared_path = attempt_root / "prepared-artifacts.json"
@@ -821,12 +1099,20 @@ class AuthorityMutationTests(unittest.TestCase):
         original_prepared = Path(str(claim_value["prepared_artifacts_path"]))
         original = json.loads(original_prepared.read_bytes())
         original_approval = Path(str(original["source_approval"]["path"]))
+        source_review = original["source_review"]
         return {
             "attempt_prepared": attempt_prepared,
             "attempt_approval": attempt_approval,
             "claim": claim,
             "original_prepared": original_prepared,
             "original_approval": original_approval,
+            "release_compile_out": Path(
+                str(original["release_compile_out"]["path"])
+            ),
+            **{
+                f"source_review_{name}": Path(str(binding["path"]))
+                for name, binding in source_review.items()
+            },
         }
 
     def rewrite_complete_chain(
@@ -872,6 +1158,20 @@ class AuthorityMutationTests(unittest.TestCase):
             "source_approval_sha256": approval_sha,
             "prepared_artifacts_sha256": prepared_sha,
         }
+
+    def rewrite_release_proof(self, mutate: object) -> dict[str, object]:
+        paths = self.authority_paths()
+        proof_path = paths["release_compile_out"]
+        proof = json.loads(proof_path.read_bytes())
+        if callable(mutate):
+            mutate(proof)
+        proof_path.chmod(0o644)
+        proof_sha = write_canonical(proof_path, proof, 0o444)
+        return self.rewrite_complete_chain(
+            mutate_prepared=lambda value: value["release_compile_out"].__setitem__(
+                "sha256", proof_sha
+            )
+        )
 
     def test_distinct_attempt_copies_replay_original_authority(self) -> None:
         paths = self.authority_paths()
@@ -939,6 +1239,11 @@ class AuthorityMutationTests(unittest.TestCase):
             "original_prepared",
             "original_approval",
             "claim",
+            "release_compile_out",
+            "source_review_bundle",
+            "source_review_current_children_attestation",
+            "source_review_lock_authority",
+            "source_review_lock_review_bundle",
         ):
             path = paths[name]
             path.chmod(0o644)
@@ -957,6 +1262,26 @@ class AuthorityMutationTests(unittest.TestCase):
         attempt_prepared.symlink_to(target)
         with self.assertRaises(adapters.ProfileEvidenceError):
             self.construct()
+
+    def test_release_proof_must_bind_real_source_approval(self) -> None:
+        mutated = self.rewrite_release_proof(
+            lambda value: value.__setitem__("source_approval_sha256", "0" * 64)
+        )
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            self.construct(mutated)
+
+    def test_proof_only_twin_cannot_become_prepared_reachable(self) -> None:
+        proof = json.loads(
+            self.authority_paths()["release_compile_out"].read_bytes()
+        )
+        twin = proof["binaries"]["overlay_a"]["path"]
+        mutated = self.rewrite_complete_chain(
+            mutate_prepared=lambda value: value.__setitem__(
+                "proof_only_twin", twin
+            )
+        )
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            self.construct(mutated)
 
     def test_role_lifetime_contract_is_source_and_binary_bound(self) -> None:
         mutated = self.rewrite_complete_chain(

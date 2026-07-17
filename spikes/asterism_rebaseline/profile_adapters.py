@@ -532,6 +532,126 @@ def parse_proc_io(payload: str) -> ProcessIo:
 
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_SOURCE_REVIEW_CONTENT_SCHEMAS = {
+    "bundle": "bn-3hch-source-review-bundle-v1",
+    "current_children_attestation": "bn-30fs-current-children-build-v1",
+    "lock_authority": "bn-31gp-current-lock-authority-v1",
+    "lock_review_bundle": "bn-31gp-current-lock-review-bundle-v1",
+}
+_SOURCE_REVIEW_PATHS = {
+    "bundle": "bindings/source-review-bundle.json",
+    "current_children_attestation": "bindings/current-children-attestation.json",
+    "lock_authority": "bindings/lock-review-authority.json",
+    "lock_review_bundle": "bindings/lock-review-bundle.json",
+}
+_RELEASE_COMPILE_OUT_REQUIREMENT_FIELDS = (
+    "schema",
+    "status",
+    "variant",
+    "product_overlay_sha256",
+    "preapproval_compile_out_sha256",
+    "proof_must_bind_enclosing_approval_sha256",
+    "repeat_under_real_source_approval",
+    "same_contract_nonce_lock_toolchain_sandbox",
+    "cfg_test",
+    "rustc_workspace_wrapper",
+    "ordinary_a_role",
+    "overlay_a_role",
+    "binary_byte_identical",
+    "symbol_inventory_byte_identical",
+    "forbidden_hook_strings",
+    "forbidden_hook_strings_absent",
+)
+_RELEASE_COMPILE_OUT_FIELDS = (
+    "schema",
+    "protocol",
+    "protocol_sha256",
+    "status",
+    "source_approval_sha256",
+    "requirement_sha256",
+    "current_children_attestation_sha256",
+    "product_overlay_sha256",
+    "equivalence_contract",
+    "builds",
+    "binaries",
+    "nm",
+    "symbol_inventories",
+    "forbidden_hook_strings",
+    "binary_byte_identical",
+    "symbol_inventory_byte_identical",
+    "forbidden_hook_strings_absent",
+    "published_a_sha256",
+)
+_RELEASE_COMPILE_OUT_EQUIVALENCE_FIELDS = (
+    "source_approval_sha256",
+    "contract_sha256",
+    "build_nonce",
+    "cargo_lock_sha256",
+    "toolchain_sha256",
+    "build_environment_sha256",
+    "sandbox_sha256",
+    "cfg_test",
+    "rustc_workspace_wrapper",
+    "ordinary_a_role",
+    "overlay_a_role",
+)
+_RELEASE_COMPILE_OUT_BUILD_FIELDS = (
+    "role",
+    "artifact_role",
+    "source_approval_sha256",
+    "contract_sha256",
+    "build_nonce",
+    "cargo_lock_sha256",
+    "toolchain_sha256",
+    "build_environment_sha256",
+    "sandbox_sha256",
+    "cfg_test",
+    "rustc_workspace_wrapper",
+    "attestation",
+    "attestation_sha256",
+)
+_RELEASE_COMPILE_OUT_FILE_FIELDS = (
+    "path",
+    "sha256",
+    "size",
+    "mode",
+    "identity",
+)
+_RELEASE_COMPILE_OUT_IDENTITY_FIELDS = (
+    "changed_ns",
+    "device",
+    "inode",
+    "link_count",
+    "modified_ns",
+)
+_RELEASE_COMPILE_OUT_NM_CHILD_FIELDS = (
+    "argv",
+    "completed_at",
+    "completed_monotonic_ns",
+    "cwd",
+    "exit_status",
+    "output_path",
+    "output_sha256",
+    "pid",
+    "process_group_absent",
+    "reaping",
+    "start_ticks",
+    "started_at",
+    "started_monotonic_ns",
+    "timed_out",
+    "waited_pid",
+)
+_FORBIDDEN_RELEASE_HOOK_STRINGS = (
+    "TestEngineHook",
+    "TestEngineHooks",
+    "TestEngineFs",
+    "arm_test_hook",
+    "arm_test_owner_cohort",
+    "asterism_rebaseline_correctness",
+)
+_CURRENT_PRODUCT_OVERLAY_SHA256 = (
+    "0e38a70c9917de5892c7f049ed2103e4431103fbaebb3073d6398574a9453574"
+)
 _AUTHORITY_FIELDS = frozenset(
     {
         "schema",
@@ -585,7 +705,7 @@ def _immutable_file_payload(
     path_value: object,
     expected_mode: int | None,
     context: str,
-) -> tuple[Path, bytes, tuple[int, int]]:
+) -> tuple[Path, bytes, tuple[int, int, int, int, int, int, int]]:
     if not isinstance(path_value, str):
         raise ProfileEvidenceError(f"{context} path is not text")
     path = Path(path_value)
@@ -633,7 +753,15 @@ def _immutable_file_payload(
             raise ProfileEvidenceError(f"{context} changed during its one-fd snapshot")
     finally:
         os.close(descriptor)
-    return path, payload, (before.st_dev, before.st_ino)
+    return path, payload, (
+        after.st_dev,
+        after.st_ino,
+        after.st_nlink,
+        after.st_size,
+        stat.S_IMODE(after.st_mode),
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
 
 
 def _immutable_file_snapshot(
@@ -641,7 +769,7 @@ def _immutable_file_snapshot(
     claimed_sha256: object,
     expected_mode: int | None,
     context: str,
-) -> tuple[Path, bytes, tuple[int, int]]:
+) -> tuple[Path, bytes, tuple[int, int, int, int, int, int, int]]:
     if not isinstance(claimed_sha256, str) or not _SHA256_RE.fullmatch(claimed_sha256):
         raise ProfileEvidenceError(f"{context} SHA-256 is malformed")
     path, payload, identity = _immutable_file_payload(
@@ -2116,6 +2244,390 @@ def _json_nonnegative_integer(value: object, context: str) -> int:
     return value
 
 
+def _sha256_authority(value: object, context: str) -> str:
+    if not isinstance(value, str) or not _SHA256_RE.fullmatch(value):
+        raise ProfileEvidenceError(f"{context} SHA-256 is malformed")
+    return value
+
+
+def _release_file_snapshot(
+    value: object,
+    *,
+    expected_mode: int,
+    context: str,
+) -> tuple[Path, bytes, tuple[int, int, int, int, int, int, int]]:
+    binding = _exact_mapping(value, _RELEASE_COMPILE_OUT_FILE_FIELDS, context)
+    if binding["mode"] != expected_mode:
+        raise ProfileEvidenceError(f"{context} mode authority differs")
+    identity = _exact_mapping(
+        binding["identity"], _RELEASE_COMPILE_OUT_IDENTITY_FIELDS, f"{context} identity"
+    )
+    for name in _RELEASE_COMPILE_OUT_IDENTITY_FIELDS:
+        item = identity[name]
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            raise ProfileEvidenceError(f"{context} identity {name} is invalid")
+    path, payload, observed = _immutable_file_snapshot(
+        binding["path"], binding["sha256"], expected_mode, context
+    )
+    observed_identity = {
+        "changed_ns": observed[6],
+        "device": observed[0],
+        "inode": observed[1],
+        "link_count": observed[2],
+        "modified_ns": observed[5],
+    }
+    if (
+        _json_nonnegative_integer(binding["size"], f"{context} size")
+        != len(payload)
+        or identity != observed_identity
+        or observed[2] != 1
+    ):
+        raise ProfileEvidenceError(f"{context} file identity differs")
+    return path, payload, observed
+
+
+def _validate_release_compile_out_authority(
+    approval: Mapping[str, object],
+    prepared: Mapping[str, object],
+    prepared_root: Path,
+    source_approval_sha256: str,
+    executable_path: str,
+    executable_sha256: str,
+    variant: str,
+) -> None:
+    source_review = _exact_mapping(
+        approval.get("source_review"),
+        (
+            "assertion_sha256",
+            "bundle",
+            "current_children_attestation",
+            "lock_authority",
+            "lock_review_bundle",
+            "release_compile_out_requirement",
+        ),
+        "source-approved source review",
+    )
+    assertion_sha256 = _sha256_authority(
+        source_review["assertion_sha256"], "source-review assertion"
+    )
+    requirement = _exact_mapping(
+        source_review["release_compile_out_requirement"],
+        _RELEASE_COMPILE_OUT_REQUIREMENT_FIELDS,
+        "release compile-out requirement",
+    )
+    if (
+        requirement["schema"] != "bn-3hch-release-compile-out-requirement-v1"
+        or requirement["status"] != "required"
+        or requirement["variant"] != "A"
+        or requirement["product_overlay_sha256"]
+        != _CURRENT_PRODUCT_OVERLAY_SHA256
+        or requirement["proof_must_bind_enclosing_approval_sha256"] is not True
+        or requirement["repeat_under_real_source_approval"] is not True
+        or requirement["same_contract_nonce_lock_toolchain_sandbox"] is not True
+        or requirement["cfg_test"] is not False
+        or requirement["rustc_workspace_wrapper"] != "absent"
+        or requirement["ordinary_a_role"] != "published"
+        or requirement["overlay_a_role"] != "proof_only"
+        or requirement["binary_byte_identical"] is not True
+        or requirement["symbol_inventory_byte_identical"] is not True
+        or requirement["forbidden_hook_strings"]
+        != list(_FORBIDDEN_RELEASE_HOOK_STRINGS)
+        or requirement["forbidden_hook_strings_absent"] is not True
+    ):
+        raise ProfileEvidenceError("release compile-out requirement differs")
+    preapproval_sha256 = _sha256_authority(
+        requirement["preapproval_compile_out_sha256"],
+        "preapproval release compile-out",
+    )
+    requirement_sha256 = _sha256_bytes(canonical_json(dict(requirement)))
+
+    prepared_source_review = _exact_mapping(
+        prepared.get("source_review"),
+        _SOURCE_REVIEW_CONTENT_SCHEMAS,
+        "prepared source-review bindings",
+    )
+    source_review_values: dict[str, dict[str, object]] = {}
+    source_review_payloads: dict[str, bytes] = {}
+    for name, schema in _SOURCE_REVIEW_CONTENT_SCHEMAS.items():
+        approved_binding = _exact_mapping(
+            source_review[name],
+            ("schema", "sha256", "mode"),
+            f"source-approved source-review {name}",
+        )
+        local_binding = _exact_mapping(
+            prepared_source_review[name],
+            ("path", "sha256", "mode"),
+            f"prepared source-review {name}",
+        )
+        expected_path = prepared_root / _SOURCE_REVIEW_PATHS[name]
+        if (
+            approved_binding["schema"] != schema
+            or approved_binding["mode"] != 0o444
+            or local_binding["mode"] != 0o444
+            or local_binding["path"] != str(expected_path)
+            or local_binding["sha256"] != approved_binding["sha256"]
+        ):
+            raise ProfileEvidenceError(f"source-review {name} binding differs")
+        path, payload, _identity = _immutable_file_snapshot(
+            local_binding["path"],
+            local_binding["sha256"],
+            0o444,
+            f"prepared source-review {name}",
+        )
+        if path != expected_path:
+            raise ProfileEvidenceError(f"source-review {name} path differs")
+        source_review_payloads[name] = payload
+        source_review_values[name] = _canonical_json_payload(
+            payload, f"prepared source-review {name}"
+        )
+        if source_review_values[name].get("schema") != schema:
+            raise ProfileEvidenceError(f"source-review {name} schema differs")
+
+    bundle = _exact_mapping(
+        source_review_values["bundle"],
+        ("assertion", "assertion_sha256", "review_created", "schema", "verdict"),
+        "source-review bundle",
+    )
+    assertion = _as_mapping(bundle["assertion"], "source-review assertion")
+    if (
+        bundle["assertion_sha256"] != assertion_sha256
+        or _sha256_bytes(canonical_json(dict(assertion))) != assertion_sha256
+        or assertion.get("release_compile_out_requirement") != requirement
+    ):
+        raise ProfileEvidenceError("source-review assertion/requirement binding differs")
+    current_children = source_review_values["current_children_attestation"]
+    preapproval = current_children.get("release_compile_out")
+    if (
+        not isinstance(preapproval, dict)
+        or _sha256_bytes(canonical_json(preapproval)) != preapproval_sha256
+    ):
+        raise ProfileEvidenceError("current-child preapproval proof binding differs")
+
+    release_binding = _exact_mapping(
+        prepared.get("release_compile_out"),
+        ("path", "sha256", "mode"),
+        "prepared release compile-out binding",
+    )
+    expected_release_path = prepared_root / "manifests" / "release-compile-out.json"
+    if (
+        release_binding["path"] != str(expected_release_path)
+        or release_binding["mode"] != 0o444
+    ):
+        raise ProfileEvidenceError("prepared release compile-out path/mode differs")
+    release_path, release_payload, _release_identity = _immutable_file_snapshot(
+        release_binding["path"],
+        release_binding["sha256"],
+        0o444,
+        "release compile-out proof",
+    )
+    if release_path != expected_release_path:
+        raise ProfileEvidenceError("release compile-out proof path differs")
+    proof = _exact_mapping(
+        _canonical_json_payload(release_payload, "release compile-out proof"),
+        _RELEASE_COMPILE_OUT_FIELDS,
+        "release compile-out proof",
+    )
+    if (
+        proof["schema"] != "bn-3hch-release-compile-out-v1"
+        or proof["protocol"] != PROTOCOL
+        or proof["protocol_sha256"] != PROTOCOL_SHA256
+        or proof["status"] != "ok"
+        or proof["source_approval_sha256"] != source_approval_sha256
+        or proof["requirement_sha256"] != requirement_sha256
+        or proof["current_children_attestation_sha256"]
+        != _sha256_bytes(source_review_payloads["current_children_attestation"])
+        or proof["product_overlay_sha256"] != _CURRENT_PRODUCT_OVERLAY_SHA256
+        or proof["forbidden_hook_strings"]
+        != list(_FORBIDDEN_RELEASE_HOOK_STRINGS)
+        or proof["binary_byte_identical"] is not True
+        or proof["symbol_inventory_byte_identical"] is not True
+        or proof["forbidden_hook_strings_absent"] is not True
+    ):
+        raise ProfileEvidenceError("release compile-out proof authority differs")
+
+    equivalence = _exact_mapping(
+        proof["equivalence_contract"],
+        _RELEASE_COMPILE_OUT_EQUIVALENCE_FIELDS,
+        "release compile-out equivalence contract",
+    )
+    if (
+        equivalence["source_approval_sha256"] != source_approval_sha256
+        or equivalence["cfg_test"] is not False
+        or equivalence["rustc_workspace_wrapper"] != "absent"
+        or equivalence["ordinary_a_role"] != "published"
+        or equivalence["overlay_a_role"] != "proof_only"
+    ):
+        raise ProfileEvidenceError("release compile-out equivalence differs")
+    for name in (
+        "contract_sha256",
+        "build_nonce",
+        "cargo_lock_sha256",
+        "toolchain_sha256",
+        "build_environment_sha256",
+        "sandbox_sha256",
+    ):
+        _sha256_authority(equivalence[name], f"release equivalence {name}")
+
+    builds = _exact_mapping(
+        proof["builds"], ("ordinary_a", "overlay_a"), "release proof builds"
+    )
+    for name, artifact_role in (
+        ("ordinary_a", "published"),
+        ("overlay_a", "proof_only"),
+    ):
+        build = _exact_mapping(
+            builds[name], _RELEASE_COMPILE_OUT_BUILD_FIELDS, f"release build {name}"
+        )
+        if (
+            build["role"] != name
+            or build["artifact_role"] != artifact_role
+            or build["source_approval_sha256"] != source_approval_sha256
+            or build["cfg_test"] is not False
+            or build["rustc_workspace_wrapper"] != "absent"
+        ):
+            raise ProfileEvidenceError(f"release build {name} role differs")
+        for field in (
+            "contract_sha256",
+            "build_nonce",
+            "cargo_lock_sha256",
+            "toolchain_sha256",
+            "build_environment_sha256",
+            "sandbox_sha256",
+        ):
+            if build[field] != equivalence[field]:
+                raise ProfileEvidenceError(
+                    f"release build {name} equivalence {field} differs"
+                )
+        attestation = _as_mapping(
+            build["attestation"], f"release build {name} attestation"
+        )
+        if _sha256_bytes(canonical_json(dict(attestation))) != build["attestation_sha256"]:
+            raise ProfileEvidenceError(f"release build {name} attestation differs")
+
+    binaries = _exact_mapping(
+        proof["binaries"], ("ordinary_a", "overlay_a"), "release proof binaries"
+    )
+    inventories = _exact_mapping(
+        proof["symbol_inventories"],
+        ("ordinary_a", "overlay_a"),
+        "release proof symbol inventories",
+    )
+    ordinary_binary = _release_file_snapshot(
+        binaries["ordinary_a"], expected_mode=0o555, context="ordinary A binary"
+    )
+    overlay_binary = _release_file_snapshot(
+        binaries["overlay_a"], expected_mode=0o555, context="overlay A proof binary"
+    )
+    ordinary_inventory = _release_file_snapshot(
+        inventories["ordinary_a"],
+        expected_mode=0o444,
+        context="ordinary A symbol inventory",
+    )
+    overlay_inventory = _release_file_snapshot(
+        inventories["overlay_a"],
+        expected_mode=0o444,
+        context="overlay A symbol inventory",
+    )
+    ordinary_binding = _as_mapping(binaries["ordinary_a"], "ordinary A binary")
+    overlay_binding = _as_mapping(binaries["overlay_a"], "overlay A proof binary")
+    prepared_variants = _as_mapping(prepared.get("variants"), "prepared variants")
+    prepared_a = _as_mapping(prepared_variants.get("A"), "prepared variant A")
+    prepared_a_binary = _as_mapping(prepared_a.get("binary"), "prepared A binary")
+    if (
+        ordinary_binary[1] != overlay_binary[1]
+        or ordinary_inventory[1] != overlay_inventory[1]
+        or ordinary_binary[2][:2] == overlay_binary[2][:2]
+        or ordinary_inventory[2][:2] == overlay_inventory[2][:2]
+        or proof["published_a_sha256"] != ordinary_binding["sha256"]
+        or (prepared_a_binary.get("path"), prepared_a_binary.get("sha256"))
+        != (ordinary_binding["path"], ordinary_binding["sha256"])
+        or overlay_binding["path"] == ordinary_binding["path"]
+        or overlay_binding["path"] == executable_path
+        or str(overlay_binding["path"]).encode() in canonical_json(dict(prepared))
+    ):
+        raise ProfileEvidenceError("release proof publication/twin isolation differs")
+    if variant == "A" and (executable_path, executable_sha256) != (
+        ordinary_binding["path"],
+        ordinary_binding["sha256"],
+    ):
+        raise ProfileEvidenceError("profiled A is not the published ordinary A")
+    inspected_payloads = (
+        ordinary_binary[1],
+        overlay_binary[1],
+        ordinary_inventory[1],
+        overlay_inventory[1],
+    )
+    if any(
+        marker.encode() in payload
+        for marker in _FORBIDDEN_RELEASE_HOOK_STRINGS
+        for payload in inspected_payloads
+    ):
+        raise ProfileEvidenceError("release proof contains a forbidden hook string")
+
+    nm = _exact_mapping(
+        proof["nm"], ("tool", "ordinary_a", "overlay_a"), "release proof nm"
+    )
+    nm_tool = _release_file_snapshot(
+        nm["tool"], expected_mode=0o555, context="release proof nm tool"
+    )
+    for name, inventory_payload in (
+        ("ordinary_a", ordinary_inventory[1]),
+        ("overlay_a", overlay_inventory[1]),
+    ):
+        child = _exact_mapping(
+            nm[name], _RELEASE_COMPILE_OUT_NM_CHILD_FIELDS, f"release nm child {name}"
+        )
+        argv = child["argv"]
+        expected_log = prepared_root / "logs" / f"nm-{name.replace('_', '-')}.json"
+        if (
+            not isinstance(argv, list)
+            or argv[:4]
+            != [
+                str(nm_tool[0]),
+                "--defined-only",
+                "--demangle=rust",
+                "--format=posix",
+            ]
+            or len(argv) != 5
+            or re.fullmatch(r"/proc/self/fd/[1-9][0-9]*", str(argv[4])) is None
+            or child["output_path"] != str(expected_log)
+            or child["exit_status"] != 0
+            or child["timed_out"] is not False
+            or child["process_group_absent"] is not True
+            or child["pid"] != child["waited_pid"]
+        ):
+            raise ProfileEvidenceError(f"release nm child {name} differs")
+        reaping = _exact_mapping(
+            child["reaping"], ("pid", "start_ticks", "status"), f"release nm {name} reaping"
+        )
+        if (
+            reaping["pid"] != child["pid"]
+            or reaping["start_ticks"] != child["start_ticks"]
+            or reaping["status"] != "absent"
+        ):
+            raise ProfileEvidenceError(f"release nm child {name} reaping differs")
+        _log_path, log_payload, _log_identity = _immutable_file_snapshot(
+            child["output_path"],
+            child["output_sha256"],
+            0o444,
+            f"release nm child {name} log",
+        )
+        log = _exact_mapping(
+            _canonical_json_payload(log_payload, f"release nm child {name} log"),
+            ("exit_status", "stderr", "stderr_sha256", "stdout", "stdout_sha256"),
+            f"release nm child {name} log",
+        )
+        if (
+            log["exit_status"] != 0
+            or log["stderr"] != ""
+            or log["stderr_sha256"] != _sha256_bytes(b"")
+            or not isinstance(log["stdout"], str)
+            or log["stdout"].encode() != inventory_payload
+            or log["stdout_sha256"] != _sha256_bytes(inventory_payload)
+        ):
+            raise ProfileEvidenceError(f"release nm child {name} output differs")
+
+
 def validate_profile_authority(
     value: object,
     *,
@@ -2358,6 +2870,15 @@ def validate_profile_authority(
         raise ProfileEvidenceError("original/attempt source-approval file identities alias")
     if original_approval_payload != attempt_approval_payload:
         raise ProfileEvidenceError("original/attempt source-approval bytes differ")
+    _validate_release_compile_out_authority(
+        approval,
+        prepared,
+        prepared_root,
+        str(authority["source_approval_sha256"]),
+        str(authority["executable_path"]),
+        str(authority["executable_sha256"]),
+        variant,
+    )
     support_files = prepared.get("support_files")
     adapter_binding = (
         support_files.get("profile_adapter") if isinstance(support_files, dict) else None

@@ -798,6 +798,9 @@ class Prepared:
     source_approval: Path
     source_approval_sha256: str
     source_approval_value: dict[str, Any]
+    source_review_files: dict[str, SupportFile]
+    release_compile_out: SupportFile
+    release_compile_out_value: dict[str, Any]
     tools_manifest: SupportFile
     tools_manifest_value: dict[str, Any]
     claim_path: Path
@@ -1129,6 +1132,86 @@ def load_prepared(path: Path, schema: Any | None = None) -> Prepared:
             raise RunnerFailure(
                 f"prepared input {name} binding differs", exit_code=2
             )
+    source_review_value = value.get("source_review")
+    expected_source_review_names = {
+        "bundle",
+        "current_children_attestation",
+        "lock_authority",
+        "lock_review_bundle",
+    }
+    shared_source_review_names = set(
+        getattr(schema, "PREPARED_SOURCE_REVIEW_FIELDS", ())
+    )
+    shared_source_review_binding_fields = tuple(
+        getattr(schema, "PREPARED_SOURCE_REVIEW_BINDING_FIELDS", ())
+    )
+    source_review_relative_paths = getattr(
+        schema, "PREPARED_SOURCE_REVIEW_RELATIVE_PATHS", None
+    )
+    if (
+        shared_source_review_names != expected_source_review_names
+        or shared_source_review_binding_fields != ("path", "sha256", "mode")
+        or not isinstance(source_review_relative_paths, dict)
+        or set(source_review_relative_paths) != expected_source_review_names
+    ):
+        raise RunnerFailure(
+            "shared prepared source-review authority differs", exit_code=2
+        )
+    if (
+        not isinstance(source_review_value, dict)
+        or set(source_review_value) != expected_source_review_names
+    ):
+        raise RunnerFailure("prepared source-review bindings differ", exit_code=2)
+    source_review_files = {
+        name: resolve_support_file(
+            root, source_review_value[name], f"prepared-source-review-{name}"
+        )
+        for name in sorted(expected_source_review_names)
+    }
+    for name, binding in source_review_files.items():
+        expected_path = (root / str(source_review_relative_paths[name])).resolve(
+            strict=True
+        )
+        if binding.path != expected_path or binding.mode != 0o444:
+            raise RunnerFailure(
+                f"prepared source-review {name} binding differs", exit_code=2
+            )
+
+    release_compile_out_value = value.get("release_compile_out")
+    if tuple(getattr(schema, "RELEASE_COMPILE_OUT_BINDING_FIELDS", ())) != (
+        "path",
+        "sha256",
+        "mode",
+    ):
+        raise RunnerFailure(
+            "shared release compile-out binding authority differs", exit_code=2
+        )
+    if not isinstance(release_compile_out_value, dict):
+        raise RunnerFailure("prepared release compile-out binding is absent", exit_code=2)
+    release_compile_out = resolve_support_file(
+        root, release_compile_out_value, "prepared-release-compile-out"
+    )
+    expected_release_compile_out_path = (
+        root / str(getattr(schema, "RELEASE_COMPILE_OUT_RELATIVE_PATH", ""))
+    ).resolve(strict=True)
+    if (
+        release_compile_out.path != expected_release_compile_out_path
+        or release_compile_out.mode != 0o444
+    ):
+        raise RunnerFailure(
+            "prepared release compile-out path/mode differs", exit_code=2
+        )
+    release_compile_out_payload = load_canonical_json(release_compile_out.path)
+    if (
+        release_compile_out_payload.get("schema")
+        != getattr(schema, "RELEASE_COMPILE_OUT_SCHEMA", None)
+        or release_compile_out_payload.get("protocol") != PROTOCOL
+        or release_compile_out_payload.get("protocol_sha256") != PROTOCOL_SHA256
+        or release_compile_out_payload.get("status") != "ok"
+    ):
+        raise RunnerFailure(
+            "prepared release compile-out identity differs", exit_code=2
+        )
     approval_binding = value["source_approval"]
     require_exact_keys(approval_binding, {"path", "sha256"}, "source approval binding")
     source_approval = resolve_immutable_json_file(
@@ -1494,6 +1577,9 @@ def load_prepared(path: Path, schema: Any | None = None) -> Prepared:
         source_approval=source_approval,
         source_approval_sha256=str(approval_binding["sha256"]),
         source_approval_value=source_approval_value,
+        source_review_files=source_review_files,
+        release_compile_out=release_compile_out,
+        release_compile_out_value=release_compile_out_payload,
         tools_manifest=tools_manifest,
         tools_manifest_value=tools_manifest_value,
         claim_path=claim_path,
@@ -3347,6 +3433,9 @@ class RebaselineRunner:
         values = {
             str(self.prepared.path): self.prepared.digest,
             str(self.prepared.source_approval): self.prepared.source_approval_sha256,
+            str(self.prepared.release_compile_out.path): (
+                self.prepared.release_compile_out.sha256
+            ),
             str(self.prepared.tools_manifest.path): self.prepared.tools_manifest.sha256,
             str(Path(__file__).resolve()): sha256(Path(__file__).resolve()),
             str(self.schema_path): sha256(self.schema_path),
@@ -3359,7 +3448,143 @@ class RebaselineRunner:
             values[str(support.path)] = support.sha256
         for input_file in self.prepared.inputs.values():
             values[str(input_file.path)] = input_file.sha256
+        for source_review_file in self.prepared.source_review_files.values():
+            values[str(source_review_file.path)] = source_review_file.sha256
+        for path, digest, _mode, _identity, _label in (
+            self._release_compile_out_file_bindings()
+        ):
+            prior = values.get(str(path))
+            if prior is not None and prior != digest:
+                raise RunnerFailure(
+                    f"release compile-out path has conflicting hashes: {path}"
+                )
+            values[str(path)] = digest
         return values
+
+    def _release_compile_out_file_bindings(
+        self,
+    ) -> list[tuple[Path, str, int, dict[str, Any] | None, str]]:
+        """Project every proof-referenced file into the runner's frozen set."""
+
+        proof = self.prepared.release_compile_out_value
+        binaries = proof.get("binaries")
+        inventories = proof.get("symbol_inventories")
+        nm = proof.get("nm")
+        builds = proof.get("builds")
+        if not all(
+            isinstance(value, dict)
+            for value in (binaries, inventories, nm, builds)
+        ):
+            # Synthetic runner fixtures predate the final proof shape. Real
+            # prepared inputs already passed the shared exact schema validator.
+            return []
+        records: list[tuple[Path, str, int, dict[str, Any] | None, str]] = []
+        for group_name, group, expected_mode in (
+            ("binary", binaries, 0o555),
+            ("symbol inventory", inventories, 0o444),
+        ):
+            for role in ("ordinary_a", "overlay_a"):
+                binding = group.get(role)
+                if not isinstance(binding, dict):
+                    raise RunnerFailure(
+                        f"release compile-out {group_name} {role} is absent"
+                    )
+                records.append(
+                    (
+                        Path(str(binding.get("path"))),
+                        str(binding.get("sha256")),
+                        expected_mode,
+                        binding.get("identity")
+                        if isinstance(binding.get("identity"), dict)
+                        else None,
+                        f"release compile-out {group_name} {role}",
+                    )
+                )
+        nm_tool = nm.get("tool")
+        if not isinstance(nm_tool, dict) or not isinstance(nm_tool.get("mode"), int):
+            raise RunnerFailure("release compile-out nm tool is absent")
+        records.append(
+            (
+                Path(str(nm_tool.get("path"))),
+                str(nm_tool.get("sha256")),
+                int(nm_tool["mode"]),
+                nm_tool.get("identity")
+                if isinstance(nm_tool.get("identity"), dict)
+                else None,
+                "release compile-out nm tool",
+            )
+        )
+        for role in ("ordinary_a", "overlay_a"):
+            child = nm.get(role)
+            if not isinstance(child, dict):
+                raise RunnerFailure(f"release compile-out nm child {role} is absent")
+            records.append(
+                (
+                    Path(str(child.get("output_path"))),
+                    str(child.get("output_sha256")),
+                    0o444,
+                    None,
+                    f"release compile-out nm log {role}",
+                )
+            )
+        attestation_file_fields = (
+            ("source_archive_path", "source_archive_sha256"),
+            ("archive_manifest_path", "archive_manifest_sha256"),
+            ("overlay_manifest_path", "overlay_manifest_sha256"),
+            ("materialized_manifest_path", "materialized_manifest_sha256"),
+            ("cargo_lock_path", "cargo_lock_sha256"),
+            ("build_log_path", "build_log_sha256"),
+            ("contract_output_path", "contract_output_sha256"),
+        )
+        for role in ("ordinary_a", "overlay_a"):
+            build = builds.get(role)
+            attestation = (
+                build.get("attestation") if isinstance(build, dict) else None
+            )
+            if not isinstance(attestation, dict):
+                raise RunnerFailure(
+                    f"release compile-out build attestation {role} is absent"
+                )
+            for path_field, digest_field in attestation_file_fields:
+                records.append(
+                    (
+                        Path(str(attestation.get(path_field))),
+                        str(attestation.get(digest_field)),
+                        0o444,
+                        None,
+                        (
+                            "release compile-out build "
+                            f"{role} {path_field.removesuffix('_path')}"
+                        ),
+                    )
+                )
+            cargo_config = attestation.get("cargo_config_search")
+            if not isinstance(cargo_config, dict):
+                raise RunnerFailure(
+                    f"release compile-out Cargo config authority {role} is absent"
+                )
+            records.append(
+                (
+                    Path(str(cargo_config.get("path"))),
+                    str(cargo_config.get("sha256")),
+                    0o444,
+                    None,
+                    f"release compile-out build {role} Cargo config search",
+                )
+            )
+            cargo_config_path = Path(str(cargo_config.get("path")))
+            records.append(
+                (
+                    cargo_config_path.with_name(
+                        f"{cargo_config_path.name}.empty"
+                    ),
+                    hashlib.sha256(b"").hexdigest(),
+                    0o444,
+                    None,
+                    f"release compile-out build {role} empty Cargo config",
+                )
+            )
+        return records
 
     @staticmethod
     def _read_load1() -> float:
@@ -3394,6 +3619,11 @@ class RebaselineRunner:
             (self.prepared.path, "prepared artifacts", 0o444),
             (self.prepared.source_approval, "source approval", 0o444),
             (
+                self.prepared.release_compile_out.path,
+                "release compile-out proof",
+                self.prepared.release_compile_out.mode,
+            ),
+            (
                 self.prepared.tools_manifest.path,
                 "prepared tools manifest",
                 self.prepared.tools_manifest.mode,
@@ -3415,6 +3645,19 @@ class RebaselineRunner:
             (input_file.path, f"input {name}", input_file.mode)
             for name, input_file in self.prepared.inputs.items()
         )
+        bindings.extend(
+            (
+                source_review_file.path,
+                f"source review {name}",
+                source_review_file.mode,
+            )
+            for name, source_review_file in self.prepared.source_review_files.items()
+        )
+        proof_bindings = self._release_compile_out_file_bindings()
+        bindings.extend(
+            (path, label, mode)
+            for path, _digest, mode, _identity, label in proof_bindings
+        )
         for path, label, expected_mode in bindings:
             try:
                 metadata = path.lstat()
@@ -3426,6 +3669,19 @@ class RebaselineRunner:
                 or stat.S_IMODE(metadata.st_mode) != expected_mode
             ):
                 raise RunnerFailure(f"{label} immutable metadata changed")
+        for path, _digest, _mode, identity, label in proof_bindings:
+            if identity is None:
+                continue
+            metadata = path.lstat()
+            observed_identity = {
+                "changed_ns": metadata.st_ctime_ns,
+                "device": metadata.st_dev,
+                "inode": metadata.st_ino,
+                "link_count": metadata.st_nlink,
+                "modified_ns": metadata.st_mtime_ns,
+            }
+            if identity != observed_identity or metadata.st_nlink != 1:
+                raise RunnerFailure(f"{label} immutable identity changed")
         if self.prepared.inputs:
             claims_directory = self.prepared.claim_path.parent
             if (
@@ -8423,11 +8679,44 @@ def _fixture_prepared(root: Path, executable: Path) -> Prepared:
     bindings = root / "bindings"
     bindings.mkdir()
     tools_manifest = bindings / "tools-manifest.json"
+    source_review_paths = {
+        "bundle": bindings / "source-review-bundle.json",
+        "current_children_attestation": (
+            bindings / "current-children-attestation.json"
+        ),
+        "lock_authority": bindings / "lock-review-authority.json",
+        "lock_review_bundle": bindings / "lock-review-bundle.json",
+    }
+    source_review_values = {
+        "bundle": {"schema": "bn-3hch-source-review-bundle-v1"},
+        "current_children_attestation": {
+            "schema": "bn-30fs-current-children-build-v1"
+        },
+        "lock_authority": {"schema": "bn-31gp-current-lock-authority-v1"},
+        "lock_review_bundle": {
+            "schema": "bn-31gp-current-lock-review-bundle-v1"
+        },
+    }
+    for name, source_review_path in source_review_paths.items():
+        atomic_json(source_review_path, source_review_values[name])
+        source_review_path.chmod(0o444)
+    manifests = root / "manifests"
+    manifests.mkdir()
+    release_compile_out_path = manifests / "release-compile-out.json"
+    release_compile_out_value = {
+        "protocol": PROTOCOL,
+        "protocol_sha256": PROTOCOL_SHA256,
+        "schema": "bn-3hch-release-compile-out-v1",
+        "status": "ok",
+    }
+    atomic_json(release_compile_out_path, release_compile_out_value)
+    release_compile_out_path.chmod(0o444)
     atomic_json(tools_manifest, tools_manifest_value)
     atomic_json(approval, {"status": "approved", "review_id": "fixture-review"})
     atomic_json(manifest, {"fixture": True})
     tools_manifest.chmod(0o444)
     bindings.chmod(0o555)
+    manifests.chmod(0o555)
     approval.chmod(0o444)
     manifest.chmod(0o444)
     return Prepared(
@@ -8438,6 +8727,22 @@ def _fixture_prepared(root: Path, executable: Path) -> Prepared:
         source_approval=approval,
         source_approval_sha256=sha256(approval),
         source_approval_value={"status": "approved", "review_id": "fixture-review"},
+        source_review_files={
+            name: SupportFile(
+                f"prepared-source-review-{name}",
+                source_review_path,
+                sha256(source_review_path),
+                0o444,
+            )
+            for name, source_review_path in source_review_paths.items()
+        },
+        release_compile_out=SupportFile(
+            "prepared-release-compile-out",
+            release_compile_out_path,
+            sha256(release_compile_out_path),
+            0o444,
+        ),
+        release_compile_out_value=release_compile_out_value,
         tools_manifest=SupportFile(
             "prepared-tools-manifest",
             tools_manifest,
@@ -9230,6 +9535,32 @@ def run_self_test(root: Path) -> int:
         prepared.tools_manifest.path.read_bytes(),
         mode=0o444,
     )
+    relocated_source_review_files = {}
+    for name, source_review_file in prepared.source_review_files.items():
+        relocated_source_review_path = (
+            relocated_bindings / source_review_file.path.name
+        )
+        atomic_write(
+            relocated_source_review_path,
+            source_review_file.path.read_bytes(),
+            mode=0o444,
+        )
+        relocated_source_review_files[name] = SupportFile(
+            f"prepared-source-review-{name}",
+            relocated_source_review_path,
+            sha256(relocated_source_review_path),
+            0o444,
+        )
+    relocated_manifests = relocated_root / "manifests"
+    relocated_manifests.mkdir()
+    relocated_release_compile_out = (
+        relocated_manifests / "release-compile-out.json"
+    )
+    atomic_write(
+        relocated_release_compile_out,
+        prepared.release_compile_out.path.read_bytes(),
+        mode=0o444,
+    )
     relocated_protocol = relocated_root / "BN-2L3N-PROTOCOL.md"
     protocol_source = Path(__file__).with_name("BN-2L3N-PROTOCOL.md")
     atomic_write(relocated_protocol, protocol_source.read_bytes(), mode=0o444)
@@ -9243,6 +9574,7 @@ def run_self_test(root: Path) -> int:
     relocated_claims = relocated_root / "claims"
     relocated_claims.mkdir(mode=0o700)
     relocated_bindings.chmod(0o555)
+    relocated_manifests.chmod(0o555)
     relocated_historical.parent.chmod(0o555)
     relocated_root.chmod(0o555)
     relocated_inputs = {
@@ -9270,6 +9602,13 @@ def run_self_test(root: Path) -> int:
             "prepared-tools-manifest",
             relocated_tools_manifest,
             sha256(relocated_tools_manifest),
+            0o444,
+        ),
+        source_review_files=relocated_source_review_files,
+        release_compile_out=SupportFile(
+            "prepared-release-compile-out",
+            relocated_release_compile_out,
+            sha256(relocated_release_compile_out),
             0o444,
         ),
         claim_path=relocated_claims / "single-use-claim.json",
@@ -9306,6 +9645,14 @@ def run_self_test(root: Path) -> int:
                 str((relocated_output / "BN-2SU-FINAL.csv").resolve())
                 in runner.frozen_files,
                 str(relocated_tools_manifest.resolve()) in runner.frozen_files,
+                str(relocated_release_compile_out.resolve())
+                in runner.frozen_files,
+                all(
+                    str(source_review_file.path.resolve()) in runner.frozen_files
+                    for source_review_file in (
+                        relocated_source_review_files.values()
+                    )
+                ),
             )
         )
     except RunnerFailure as error:

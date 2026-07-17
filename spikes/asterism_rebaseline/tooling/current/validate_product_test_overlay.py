@@ -389,15 +389,24 @@ def validate_faults(source: str) -> None:
 
 
 def normal_command_sources(overrides: Mapping[Path, str] | None = None) -> dict[Path, str]:
+    """Return only runtime launch boundaries for normal timed children.
+
+    Build/review/schema sources intentionally name the forbidden test hooks in
+    order to prove their absence and must not be confused with executable
+    launch inputs. Prepared-artifact validation separately proves that the
+    proof-only overlay twin is unreachable from published variants and tools.
+    """
+
     overrides = overrides or {}
-    root = REPOSITORY / "spikes/asterism_rebaseline"
     selected: dict[Path, str] = {}
-    for path in sorted(root.rglob("*")):
-        if not path.is_file() or path.suffix not in {".py", ".rs", ".sh", ".json"}:
-            continue
-        if HERE == path.parent or HERE in path.parents:
-            continue
-        relative = path.relative_to(REPOSITORY)
+    for relative in (
+        Path("spikes/asterism_rebaseline/run_rebaseline.py"),
+        Path("spikes/asterism_rebaseline/run_rebaseline.sh"),
+        Path("spikes/asterism_rebaseline/strace_attach.py"),
+    ):
+        path = REPOSITORY / relative
+        if not path.is_file():
+            fail("normal_perf_isolation", f"normal command source is absent: {relative}")
         selected[relative] = overrides.get(relative, path.read_text())
     for relative, text in overrides.items():
         selected[relative] = text
