@@ -72,7 +72,7 @@ At handoff time:
 
 | Workspace | Meaning | Action |
 |---|---|---|
-| `bn-znj5` | Active Phase 4 source and authority checkpoint | Continue here; do not merge merely because Maw says “ready to merge” |
+| `bn-znj5` | Active exact Phase 4 source and authority checkpoint; persistent and intentionally stale relative to trunk | Continue here; **do not advance, sync, or rebase it** before authority-bound construction |
 | `bn-2l3n` | Clean umbrella workspace | Retain until the rebaseline closes |
 | `bn-1qsq` | Done review of old commit `86027c…` | Historical only; never merge. It may be recovery-snapshotted/destroyed |
 
@@ -85,9 +85,25 @@ tree    0087e1f4de9fc3608107d2291b6b7de6d1cc5573
 status  clean, detached HEAD
 ```
 
-`maw ws list` labels `bn-znj5` “ready to merge” only because all source changes
-are committed. The bone itself is not done: prepared artifacts and the terminal
+`maw ws list` currently labels `bn-znj5` a stale persistent workspace because
+trunk gained this handoff after the authority was approved. That staleness is
+intentional. Do **not** follow Maw's generic `maw ws advance bn-znj5` hint:
+advancing or rebasing rewrites the exact commit/tree and invalidates the current
+approval lineage. The bone is not done: prepared artifacts and the terminal
 handoff remain outstanding.
+
+The first handoff merge briefly auto-rebased the then-ephemeral workspace to
+`bc65c131f9dd784388efa9484bc5c6e45f0aae8b`, changing only `handoff.md`.
+That rebased state was recovery-snapshotted at:
+
+```text
+refs/manifold/recovery/bn-znj5/2026-07-17T22-23-33.291552008Z
+```
+
+The workspace was then safely recreated from epoch `664e0f987ebb` and
+fast-forwarded to the exact approved `2bd1dcc5` checkpoint, restoring tree
+`0087e1f4`. No source work was lost. It is persistent specifically to prevent
+future documentation merges from repeating the auto-rebase.
 
 The trunk has unrelated/operational metadata changes in `.bones/` and `.seal/`.
 Preserve them. Do not reset or clean the trunk.
@@ -492,4 +508,5 @@ rite claims list --agent "$AGENT"
 
 Then continue the bounded prepared-r1 diagnosis in
 `/home/bob/src/mess/.maw/workspaces/bn-znj5`; do not start a new implementation
-from trunk and do not rerun the terminal measurement.
+from trunk, do not advance/rebase the persistent workspace, and do not rerun the
+terminal measurement.
