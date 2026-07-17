@@ -2143,19 +2143,24 @@ def _current_config_record(
         ):
             raise ValueError(f"{context} Cargo config entry differs")
         if host is not None:
-            present = host.exists()
-            if present and (
-                entry["status"] != "present"
-                or sha256_file(host) != entry["sha256"]
-            ):
-                raise ValueError(f"{context} live Cargo config entry differs")
+            try:
+                snapshot = schema.snapshot_regular_file(host, expected_mode=None)
+            except FileNotFoundError:
+                expected_sha256 = EMPTY_SHA256
+            except (OSError, ValueError) as error:
+                raise ValueError(
+                    f"{context} live Cargo config entry is not exact regular"
+                ) from error
+            else:
+                if snapshot._stat.st_nlink != 1:
+                    raise ValueError(
+                        f"{context} live Cargo config entry is not exact regular"
+                    )
+                expected_sha256 = snapshot.sha256
             if (
-                not present
-                and (
-                    path not in GUEST_BOUND_CONFIG_PATHS
-                    or entry["status"] != "present"
-                    or entry["sha256"] != EMPTY_SHA256
-                )
+                path not in GUEST_BOUND_CONFIG_PATHS
+                or entry["status"] != "present"
+                or entry["sha256"] != expected_sha256
             ):
                 raise ValueError(f"{context} live Cargo config entry differs")
     cargo_home_tree = _semantic_exact(
@@ -16815,6 +16820,47 @@ def self_test() -> dict[str, Any]:
             ),
         )
 
+        def current_config_reserved_type_rejected(kind: str) -> bool:
+            build = current_children_fixture["builds"]["children"]
+            record = copy.deepcopy(build["cargo_config_prebuild"])
+            record["preserved_top_level_entries"] = {
+                "cargo-home": [],
+                "source": [],
+            }
+            record["cargo_search"]["entries"][6]["sha256"] = EMPTY_SHA256
+            with tempfile.TemporaryDirectory(
+                prefix="bn-2l3n-config-type-", dir=Path(temp).parent
+            ) as scratch_text:
+                scratch = Path(scratch_text)
+                source_root = scratch / "source"
+                cargo_home = scratch / "cargo-home"
+                (source_root / ".cargo").mkdir(parents=True)
+                cargo_home.mkdir()
+                (cargo_home / "config.toml").write_bytes(b"")
+                hostile = cargo_home / "config"
+                if kind == "directory":
+                    hostile.mkdir()
+                elif kind == "hardlink":
+                    target = scratch / "hardlink-target"
+                    target.write_bytes(b"")
+                    os.link(target, hostile)
+                else:
+                    hostile.symlink_to("missing-config-target")
+                try:
+                    _current_config_record(
+                        record,
+                        build["semantic_input_authority"],
+                        source_root,
+                        cargo_home,
+                        f"hostile Cargo config {kind}",
+                    )
+                except ValueError as error:
+                    return (
+                        "live Cargo config entry is not exact regular"
+                        in str(error)
+                    )
+            return False
+
         def omitted_preserved_source_entry_rejected() -> bool:
             build = current_children_fixture["builds"]["children"]
             record = copy.deepcopy(build["cargo_config_prebuild"])
@@ -20649,6 +20695,19 @@ def self_test() -> dict[str, Any]:
                 ),
                 "detail": json.dumps(mutated["errors"][:20]),
             }
+        )
+
+        check(
+            "mutation-semantic-current-cargo-config-directory",
+            lambda: current_config_reserved_type_rejected("directory"),
+        )
+        check(
+            "mutation-semantic-current-cargo-config-dangling-symlink",
+            lambda: current_config_reserved_type_rejected("symlink"),
+        )
+        check(
+            "mutation-semantic-current-cargo-config-hardlink",
+            lambda: current_config_reserved_type_rejected("hardlink"),
         )
 
     passed = all(item["pass"] for item in checks)

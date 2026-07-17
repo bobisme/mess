@@ -4164,6 +4164,7 @@ def _validate_current_cargo_config(
     source_root: Path,
     cargo_home: Path,
     semantic: Mapping[str, object],
+    expected_entries: Sequence[Mapping[str, object]],
 ) -> tuple[Mapping[str, object], tuple[tuple[str, str, str], ...]]:
     record = _exact_mapping(
         value,
@@ -4181,6 +4182,7 @@ def _validate_current_cargo_config(
         or search["cwd"] != _GUEST_SOURCE
         or not isinstance(search["entries"], list)
         or len(search["entries"]) != len(_GUEST_BOUND_CONFIG_PATHS) + 4
+        or search["entries"] != list(expected_entries)
     ):
         raise ProfileEvidenceError(f"{context} Cargo search differs")
     candidates = (
@@ -4199,17 +4201,26 @@ def _validate_current_cargo_config(
             raise ProfileEvidenceError(f"{context} Cargo search order differs")
         if host is not None and host.is_symlink():
             raise ProfileEvidenceError(f"{context} Cargo config is a symlink")
-        if host is None or not host.exists():
+        if host is None:
             if entry != {"path": guest, "sha256": None, "status": "absent"}:
                 raise ProfileEvidenceError(f"{context} absent Cargo config differs")
         else:
-            _path, payload, identity = _immutable_file_payload(str(host), None, f"{context} Cargo config")
-            if identity[2] != 1 or entry != {
+            expected_sha256 = _EMPTY_SHA256
+            if host.exists():
+                _path, payload, identity = _immutable_file_payload(
+                    str(host), None, f"{context} Cargo config"
+                )
+                if identity[2] != 1:
+                    raise ProfileEvidenceError(
+                        f"{context} present Cargo config differs"
+                    )
+                expected_sha256 = _sha256_bytes(payload)
+            if entry != {
                 "path": guest,
-                "sha256": _sha256_bytes(payload),
+                "sha256": expected_sha256,
                 "status": "present",
             }:
-                raise ProfileEvidenceError(f"{context} present Cargo config differs")
+                raise ProfileEvidenceError(f"{context} bound Cargo config differs")
     cargo_tree = _exact_mapping(
         record["cargo_home_tree"],
         ("entry_count", "equal_pre_post", "path", "post_sha256", "pre_sha256", "watch_count"),
@@ -4260,13 +4271,11 @@ def _validate_current_cargo_config(
                     bindings.append((f"preserved:{origin}:{entry['name']}", "--ro-bind-fd", destination))
             else:
                 raise ProfileEvidenceError(f"{context} preserved {origin} type differs")
-    for guest, host in (candidates[0], candidates[1]):
-        if host is not None and host.exists():
-            bindings.append((f"config:{guest}", "--ro-bind-data", guest))
+    for guest, _host in (candidates[0], candidates[1]):
+        bindings.append((f"config:{guest}", "--ro-bind-data", guest))
     bindings.append(("cargo_home", "--ro-bind-fd", _GUEST_CARGO_HOME))
-    for guest, host in (candidates[6], candidates[7]):
-        if host is not None and host.exists():
-            bindings.append((f"config:{guest}", "--ro-bind-data", guest))
+    for guest, _host in (candidates[6], candidates[7]):
+        bindings.append((f"config:{guest}", "--ro-bind-data", guest))
     return record, tuple(bindings)
 
 
@@ -4528,6 +4537,7 @@ def _validate_current_build_record(
     toolchain: Mapping[str, object],
     toolchain_root: Path,
     filesystem_admission: object,
+    expected_cargo_config_entries: Sequence[Mapping[str, object]],
 ) -> Mapping[str, object]:
     child = name == "children"
     fields = (*_CURRENT_BUILD_FIELDS, *_CURRENT_CHILD_WRAPPER_FIELDS) if child else _CURRENT_BUILD_FIELDS
@@ -4546,6 +4556,7 @@ def _validate_current_build_record(
         source_root=source_root,
         cargo_home=Path(str(toolchain["cargo_home_path"])),
         semantic=semantic,
+        expected_entries=expected_cargo_config_entries,
     )
     if build["cargo_config_postbuild"] != config_pre:
         raise ProfileEvidenceError(f"{context} Cargo config changed")
@@ -5146,6 +5157,134 @@ def _validate_resolver_record(
             raise ProfileEvidenceError(f"{context} live generated lock path differs")
 
 
+def _validate_current_cargo_config_authority(
+    current: Mapping[str, object],
+) -> tuple[Mapping[str, object], ...]:
+    lock_authority = _as_mapping(
+        current.get("lock_authority"), "current-child lock authority"
+    )
+    lock_manifest = _as_mapping(
+        lock_authority.get("lock_manifest"), "current-child embedded lock manifest"
+    )
+    lock_payload = _as_mapping(
+        lock_manifest.get("payload"), "current-child embedded lock payload"
+    )
+    variants = _exact_mapping(
+        lock_payload.get("variants"), VARIANT_SOURCE_BINDINGS, "current-child lock variants"
+    )
+    reviewed_a = _as_mapping(variants["A"], "current-child reviewed A")
+    reviewed_resolver = _as_mapping(
+        reviewed_a.get("resolver"), "current-child reviewed A resolver"
+    )
+    reviewed_binding = _exact_mapping(
+        reviewed_resolver.get("cargo_config_search"),
+        ("path", "sha256"),
+        "current-child reviewed A Cargo config",
+    )
+
+    cargo = _exact_mapping(
+        current.get("cargo_config_authority"),
+        ("binding", "identity", "recorded", "translated_entries"),
+        "current-child Cargo config authority",
+    )
+    binding = _exact_mapping(
+        cargo["binding"], ("path", "sha256"), "current-child Cargo config binding"
+    )
+    path_value = binding["path"]
+    if not isinstance(path_value, str):
+        raise ProfileEvidenceError("current-child Cargo config path is not text")
+    config_path = Path(path_value)
+    identity = _current_file_identity(
+        cargo["identity"],
+        "current-child Cargo config identity",
+        expected_path=config_path,
+        executable=False,
+    )
+    selected, payload, observed = _immutable_file_payload(
+        path_value,
+        0o444,
+        "current-child Cargo config manifest",
+        limit=None,
+    )
+    observed_identity = {
+        "bytes": len(payload),
+        "ctime_ns": observed[6],
+        "device": observed[0],
+        "inode": observed[1],
+        "link_count": observed[2],
+        "mode": observed[4],
+        "mtime_ns": observed[5],
+        "path": str(selected),
+        "sha256": _sha256_bytes(payload),
+        "size": observed[3],
+    }
+    recorded = _exact_mapping(
+        cargo["recorded"],
+        ("cargo_home_path", "cwd", "entries", "schema"),
+        "current-child recorded Cargo config",
+    )
+    if (
+        binding != reviewed_binding
+        or binding
+        != {"path": str(selected), "sha256": _sha256_bytes(payload)}
+        or identity != observed_identity
+        or _canonical_json_payload(payload, "current-child Cargo config manifest")
+        != recorded
+        or recorded["schema"] != _CARGO_CONFIG_SEARCH_SCHEMA
+        or recorded["cargo_home_path"] != _GUEST_CARGO_HOME
+        or recorded["cwd"] != _GUEST_SOURCE
+    ):
+        raise ProfileEvidenceError("current-child Cargo config authority differs")
+    candidates = (
+        f"{_GUEST_SOURCE}/.cargo/config.toml",
+        f"{_GUEST_SOURCE}/.cargo/config",
+        f"{_GUEST_ROOT}/.cargo/config.toml",
+        f"{_GUEST_ROOT}/.cargo/config",
+        "/.cargo/config.toml",
+        "/.cargo/config",
+        f"{_GUEST_CARGO_HOME}/config.toml",
+        f"{_GUEST_CARGO_HOME}/config",
+    )
+    raw_entries = recorded["entries"]
+    translated = cargo["translated_entries"]
+    if (
+        not isinstance(raw_entries, list)
+        or len(raw_entries) != len(candidates)
+        or not isinstance(translated, list)
+        or translated != raw_entries
+    ):
+        raise ProfileEvidenceError("current-child Cargo config topology differs")
+    entries: list[Mapping[str, object]] = []
+    for ordinal, (raw, guest) in enumerate(
+        zip(raw_entries, candidates, strict=True), start=1
+    ):
+        entry = _exact_mapping(
+            raw,
+            ("path", "sha256", "status"),
+            f"current-child Cargo config entry {ordinal}",
+        )
+        middle = 2 <= ordinal - 1 < 6
+        if (
+            entry["path"] != guest
+            or (
+                middle
+                and entry
+                != {"path": guest, "sha256": None, "status": "absent"}
+            )
+            or (
+                not middle
+                and (
+                    entry["status"] != "present"
+                    or not isinstance(entry["sha256"], str)
+                    or _SHA256_RE.fullmatch(entry["sha256"]) is None
+                )
+            )
+        ):
+            raise ProfileEvidenceError("current-child Cargo config entry differs")
+        entries.append(entry)
+    return tuple(entries)
+
+
 def _validate_current_preapproval(
     current: Mapping[str, object],
     assertion: Mapping[str, object],
@@ -5323,6 +5462,7 @@ def _validate_phase4_semantic_authority(
         "current-child builds",
     )
     _validate_current_preapproval(current, assertion, approval)
+    current_cargo_config_entries = _validate_current_cargo_config_authority(current)
     current_toolchain, current_toolchain_root = _validate_toolchain_contract(
         current["toolchain"], "current-child toolchain"
     )
@@ -5352,6 +5492,7 @@ def _validate_phase4_semantic_authority(
             toolchain=current_toolchain,
             toolchain_root=current_toolchain_root,
             filesystem_admission=filesystem_admissions[name],
+            expected_cargo_config_entries=current_cargo_config_entries,
         )
         if name != "children":
             release_environments.append(

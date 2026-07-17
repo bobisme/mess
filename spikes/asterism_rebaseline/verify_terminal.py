@@ -1296,9 +1296,17 @@ def _terminal_current_config(
         if entry["path"] != path or entry["status"] not in {"absent", "present"} or (entry["status"] == "absent") != (entry["sha256"] is None) or (entry["status"] == "present" and not terminal_is_sha256(entry["sha256"])) or (path in paths[2:6] and entry["status"] != "absent"):
             raise ValueError(f"{context} entry differs")
         if host is not None:
-            expected_sha256 = (
-                sha256_file(host) if host.is_file() else EMPTY_SHA256
-            )
+            try:
+                snapshot = schema.snapshot_regular_file(host, expected_mode=None)
+            except FileNotFoundError:
+                expected_sha256 = EMPTY_SHA256
+            except (OSError, ValueError) as error:
+                raise ValueError(f"{context} live entry is not exact regular") from error
+            else:
+                if snapshot._stat.st_nlink != 1:
+                    raise ValueError(f"{context} live entry is not exact regular")
+                _BOUND_SNAPSHOTS[host] = snapshot
+                expected_sha256 = snapshot.sha256
             if (
                 entry["status"] != "present"
                 or entry["sha256"] != expected_sha256
@@ -9541,6 +9549,45 @@ def self_test() -> dict[str, Any]:
                 )
             ),
         )
+
+        def terminal_current_config_reserved_type_rejected(kind: str) -> bool:
+            build = current_children_fixture["builds"]["children"]
+            record = json.loads(json.dumps(build["cargo_config_prebuild"]))
+            record["preserved_top_level_entries"] = {
+                "cargo-home": [],
+                "source": [],
+            }
+            record["cargo_search"]["entries"][6]["sha256"] = EMPTY_SHA256
+            with tempfile.TemporaryDirectory(
+                prefix="bn-2l3n-terminal-config-type-", dir=Path(temp).parent
+            ) as scratch_text:
+                scratch = Path(scratch_text)
+                source_root = scratch / "source"
+                cargo_home = scratch / "cargo-home"
+                (source_root / ".cargo").mkdir(parents=True)
+                cargo_home.mkdir()
+                (cargo_home / "config.toml").write_bytes(b"")
+                hostile = cargo_home / "config"
+                if kind == "directory":
+                    hostile.mkdir()
+                elif kind == "hardlink":
+                    target = scratch / "hardlink-target"
+                    target.write_bytes(b"")
+                    os.link(target, hostile)
+                else:
+                    hostile.symlink_to("missing-config-target")
+                try:
+                    _terminal_current_config(
+                        record,
+                        build["semantic_input_authority"],
+                        source_root,
+                        cargo_home,
+                        f"terminal hostile Cargo config {kind}",
+                    )
+                except ValueError as error:
+                    return "live entry is not exact regular" in str(error)
+            return False
+
         check(
             "terminal-semantic-rejects-current-build-lock-transition",
             lambda: any(
@@ -11953,6 +12000,18 @@ def self_test() -> dict[str, Any]:
                     path.unlink()
 
         check("terminal-correctness-only-rejects-timing-csv", inject_timing_csv)
+        check(
+            "terminal-semantic-rejects-current-cargo-config-directory",
+            lambda: terminal_current_config_reserved_type_rejected("directory"),
+        )
+        check(
+            "terminal-semantic-rejects-current-cargo-config-dangling-symlink",
+            lambda: terminal_current_config_reserved_type_rejected("symlink"),
+        )
+        check(
+            "terminal-semantic-rejects-current-cargo-config-hardlink",
+            lambda: terminal_current_config_reserved_type_rejected("hardlink"),
+        )
     passed = all(item["pass"] for item in checks)
     return {
         "schema": "bn-2l3n-terminal-self-test-v3",

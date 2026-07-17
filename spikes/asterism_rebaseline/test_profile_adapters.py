@@ -1021,13 +1021,13 @@ def live_authority(
         cargo_search_entries = [
             {
                 "path": f"{adapters._GUEST_SOURCE}/.cargo/config.toml",
-                "sha256": None,
-                "status": "absent",
+                "sha256": adapters._EMPTY_SHA256,
+                "status": "present",
             },
             {
                 "path": f"{adapters._GUEST_SOURCE}/.cargo/config",
-                "sha256": None,
-                "status": "absent",
+                "sha256": adapters._EMPTY_SHA256,
+                "status": "present",
             },
             *(
                 {
@@ -1049,8 +1049,8 @@ def live_authority(
             },
             {
                 "path": f"{adapters._GUEST_CARGO_HOME}/config",
-                "sha256": None,
-                "status": "absent",
+                "sha256": adapters._EMPTY_SHA256,
+                "status": "present",
             },
         ]
         semantic_cargo_home = semantic["cargo_home"]
@@ -1082,11 +1082,26 @@ def live_authority(
             "schema": adapters._CURRENT_CARGO_CONFIG_SCHEMA,
         }
         config_bindings = (
+            (
+                f"config:{adapters._GUEST_SOURCE}/.cargo/config.toml",
+                "--ro-bind-data",
+                f"{adapters._GUEST_SOURCE}/.cargo/config.toml",
+            ),
+            (
+                f"config:{adapters._GUEST_SOURCE}/.cargo/config",
+                "--ro-bind-data",
+                f"{adapters._GUEST_SOURCE}/.cargo/config",
+            ),
             ("cargo_home", "--ro-bind-fd", adapters._GUEST_CARGO_HOME),
             (
                 f"config:{adapters._GUEST_CARGO_HOME}/config.toml",
                 "--ro-bind-data",
                 f"{adapters._GUEST_CARGO_HOME}/config.toml",
+            ),
+            (
+                f"config:{adapters._GUEST_CARGO_HOME}/config",
+                "--ro-bind-data",
+                f"{adapters._GUEST_CARGO_HOME}/config",
             ),
         )
         descriptor_names = (
@@ -1507,6 +1522,17 @@ def live_authority(
         "lock_manifest": embedded_lock_binding,
         "schema": "bn-31gp-current-lock-authority-v1",
     }
+    reviewed_cargo_binding = lock_claims["A"]["resolver"]["cargo_config_search"]
+    reviewed_cargo_path = Path(str(reviewed_cargo_binding["path"]))
+    reviewed_cargo_record = json.loads(reviewed_cargo_path.read_bytes())
+    cargo_config_authority = {
+        "binding": dict(reviewed_cargo_binding),
+        "identity": current_file_identity(reviewed_cargo_path),
+        "recorded": reviewed_cargo_record,
+        "translated_entries": json.loads(
+            json.dumps(reviewed_cargo_record["entries"])
+        ),
+    }
 
     preapproval_compile_out = current_compile_out
     requirement = {
@@ -1564,7 +1590,7 @@ def live_authority(
         "artifacts": {},
         "build_nonce": build_nonce,
         "builds": current_builds,
-        "cargo_config_authority": {},
+        "cargo_config_authority": cargo_config_authority,
         "construction_path": "/authority/construction.py",
         "construction_sha256": "0" * 64,
         "fault_authority": {},
@@ -2525,6 +2551,9 @@ class AuthorityMutationTests(unittest.TestCase):
             toolchain=toolchain,
             toolchain_root=toolchain_root,
             filesystem_admission=current["prebuild_filesystem_admissions"][name],
+            expected_cargo_config_entries=(
+                adapters._validate_current_cargo_config_authority(current)
+            ),
         )
 
     def test_current_build_records_and_wrapper_policy_are_exact(self) -> None:
@@ -2536,6 +2565,25 @@ class AuthorityMutationTests(unittest.TestCase):
             "hooked_release", current["builds"]["hooked_release"]
         )
         children = current["builds"]["children"]
+        cargo_entries = children["cargo_config_prebuild"]["cargo_search"][
+            "entries"
+        ]
+        self.assertEqual(
+            list(adapters._validate_current_cargo_config_authority(current)),
+            cargo_entries,
+        )
+        self.assertEqual(
+            [cargo_entries[index]["status"] for index in (0, 1, 6, 7)],
+            ["present"] * 4,
+        )
+        self.assertEqual(
+            [cargo_entries[index]["sha256"] for index in (0, 1, 7)],
+            [adapters._EMPTY_SHA256] * 3,
+        )
+        self.assertEqual(
+            [cargo_entries[index]["status"] for index in range(2, 6)],
+            ["absent"] * 4,
+        )
         argv_descriptor_count = sum(
             argument in {"--ro-bind-fd", "--bind-fd", "--ro-bind-data"}
             for argument in children["argv"]
@@ -2550,6 +2598,15 @@ class AuthorityMutationTests(unittest.TestCase):
             children["execution"]["passed_file_descriptors"],
             argv_descriptor_count + 2 + cargo_home_preserved_count,
         )
+        authority_drift = json.loads(json.dumps(current))
+        authority_drift["cargo_config_authority"]["translated_entries"][0][
+            "sha256"
+        ] = "0" * 64
+        for build in authority_drift["builds"].values():
+            for phase in ("cargo_config_prebuild", "cargo_config_postbuild"):
+                build[phase]["cargo_search"]["entries"][0]["sha256"] = "0" * 64
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters._validate_current_cargo_config_authority(authority_drift)
         hostiles: list[tuple[str, str, dict[str, object]]] = []
         missing = json.loads(json.dumps(current["builds"]["children"]))
         del missing["execution_tools"]
@@ -2578,6 +2635,19 @@ class AuthorityMutationTests(unittest.TestCase):
         config = json.loads(json.dumps(current["builds"]["children"]))
         del config["cargo_config_prebuild"]["cargo_home_tree"]["watch_count"]
         hostiles.append(("truncated-config", "children", config))
+        absent_edge = json.loads(json.dumps(current["builds"]["children"]))
+        edge_path = f"{adapters._GUEST_SOURCE}/.cargo/config.toml"
+        for phase in ("cargo_config_prebuild", "cargo_config_postbuild"):
+            absent_edge[phase]["cargo_search"]["entries"][0] = {
+                "path": edge_path,
+                "sha256": None,
+                "status": "absent",
+            }
+        for argv in (absent_edge["argv"], absent_edge["execution"]["argv"]):
+            destination = argv.index(edge_path)
+            del argv[destination - 2 : destination + 1]
+        absent_edge["execution"]["passed_file_descriptors"] -= 1
+        hostiles.append(("absent-bound-config-edge", "children", absent_edge))
         tool = json.loads(json.dumps(current["builds"]["children"]))
         del tool["execution_tools"]["cargo"]["identity"]["sha256"]
         hostiles.append(("truncated-tool", "children", tool))
@@ -3187,6 +3257,12 @@ class AuthorityMutationTests(unittest.TestCase):
             self.authority_paths()["original_prepared"].read_bytes()
         )
         self.assertEqual(prepared["schema"], "bn-2l3n-prepared-artifacts-v3")
+        for variant in ("A", "B", "C", "D"):
+            with self.subTest(variant=variant):
+                self.assertEqual(
+                    set(prepared["variants"][variant]),
+                    set(adapters._PREPARED_VARIANT_FIELDS),
+                )
         mutated = self.rewrite_complete_chain(
             mutate_prepared=lambda value: value.__setitem__(
                 "schema", "asterism-rebaseline-prepared-v3"
@@ -3194,6 +3270,13 @@ class AuthorityMutationTests(unittest.TestCase):
         )
         with self.assertRaises(adapters.ProfileEvidenceError):
             self.construct(mutated)
+        truncated_a = self.rewrite_complete_chain(
+            mutate_prepared=lambda value: value["variants"]["A"].pop(
+                "artifact_root"
+            )
+        )
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            self.construct(truncated_a)
 
     def test_mutable_or_symlinked_authority_files_fail(self) -> None:
         paths = self.authority_paths()
