@@ -20,6 +20,7 @@ import secrets
 import selectors
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -28,7 +29,8 @@ import time
 import tomllib
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from pathlib import Path
+from contextlib import ExitStack
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 
@@ -41,7 +43,7 @@ CONTRACT_SCHEMA = "bn-2l3n-binary-contract-v3"
 SOURCE_REVIEW_ASSERTION_SCHEMA = "bn-3hch-source-review-assertion-v1"
 SOURCE_REVIEW_BUNDLE_SCHEMA = "bn-3hch-source-review-bundle-v1"
 SOURCE_REVIEW_INPUT_SCHEMA = "bn-3hch-source-review-input-v1"
-CURRENT_CHILDREN_ATTESTATION_SCHEMA = "bn-30fs-current-children-build-v1"
+CURRENT_CHILDREN_ATTESTATION_SCHEMA = "bn-ecm1-current-children-build-v2"
 CURRENT_LOCK_AUTHORITY_SCHEMA = "bn-31gp-current-lock-authority-v1"
 CURRENT_LOCK_REVIEW_BUNDLE_SCHEMA = "bn-31gp-current-lock-review-bundle-v1"
 RELEASE_COMPILE_OUT_REQUIREMENT_SCHEMA = (
@@ -238,6 +240,29 @@ GUEST_BOUND_CONFIG_PATHS = (
     f"{GUEST_CARGO_HOME}/config.toml",
     f"{GUEST_CARGO_HOME}/config",
 )
+SEMANTIC_INPUT_AUTHORITY_SCHEMA = "bn-ecm1-semantic-input-authority-v1"
+RECURSIVE_TREE_AUTHORITY_SCHEMA = "bn-ecm1-recursive-tree-authority-v1"
+TRUSTED_SYSTEM_CLOSURE_SCHEMA = "bn-ecm1-trusted-system-closure-v1"
+TRUSTED_SYSTEM_MOUNTS = (
+    (Path("/usr/bin"), "/usr/bin"),
+    (Path("/usr/lib"), "/usr/lib"),
+    (Path("/usr/include"), "/usr/include"),
+)
+INOTIFY_EVENT_HEADER = struct.Struct("iIII")
+INOTIFY_MUTATION_MASK = (
+    0x00000002
+    | 0x00000004
+    | 0x00000008
+    | 0x00000040
+    | 0x00000080
+    | 0x00000100
+    | 0x00000200
+    | 0x00000400
+    | 0x00000800
+    | 0x00002000
+    | 0x00004000
+    | 0x00008000
+)
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 REVIEW_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+\-]{0,255}\Z")
 ZONED_TIME = re.compile(
@@ -387,6 +412,491 @@ def atomic_json(path: Path, value: Any) -> None:
 
 def hash_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
+
+
+def semantic_runtime_sha256(components: dict[str, dict[str, Any]]) -> str:
+    """Hash runtime semantics while excluding relocatable evidence pathnames."""
+
+    tree_fields = (
+        "schema",
+        "role",
+        "manifest_sha256",
+        "entry_count",
+        "watch_count",
+        "equal_pre_post",
+        "mutation_events_absent",
+    )
+    closure_fields = (
+        "schema",
+        "sha256",
+        "entry_count",
+        "mounts",
+        "watch_count",
+        "mutation_events_absent",
+    )
+    if set(components) != {
+        "cargo_home",
+        "toolchain",
+        "trusted_system_closure",
+    }:
+        raise PreparationError("semantic runtime authority components differ")
+    closure = components["trusted_system_closure"]
+    mounts = closure.get("mounts")
+    if (
+        not isinstance(mounts, list)
+        or len(mounts) != len(TRUSTED_SYSTEM_MOUNTS)
+        or any(
+            not isinstance(mount, dict)
+            or mount.get("guest_path") != guest_path
+            or mount.get("host_path") != str(host_path)
+            or mount.get("resolved_path") != str(host_path)
+            for mount, (host_path, guest_path) in zip(
+                mounts, TRUSTED_SYSTEM_MOUNTS, strict=True
+            )
+        )
+    ):
+        raise PreparationError("semantic runtime trusted-system mounts differ")
+    normalized = {
+        "cargo_home": {
+            field: components["cargo_home"].get(field) for field in tree_fields
+        },
+        "schema": SEMANTIC_INPUT_AUTHORITY_SCHEMA,
+        "toolchain": {
+            field: components["toolchain"].get(field) for field in tree_fields
+        },
+        "trusted_system_closure": {
+            field: closure.get(field)
+            for field in closure_fields
+        },
+    }
+    return hash_bytes(canonical_json(normalized))
+
+
+def system_symlink_scope(root: Path, relative: str, target: str) -> str:
+    raw_guest = (
+        PurePosixPath(target)
+        if PurePosixPath(target).is_absolute()
+        else PurePosixPath(str(root)) / PurePosixPath(relative).parent / target
+    )
+    rendered = os.path.normpath(str(raw_guest))
+    for alias, destination in (
+        ("/bin", "/usr/bin"),
+        ("/lib", "/usr/lib"),
+        ("/lib64", "/usr/lib"),
+    ):
+        if rendered == alias or rendered.startswith(alias + "/"):
+            rendered = destination + rendered.removeprefix(alias)
+            break
+    exposed = tuple(guest for _host, guest in TRUSTED_SYSTEM_MOUNTS)
+    if any(
+        rendered == authority or rendered.startswith(authority + "/")
+        for authority in exposed
+    ):
+        return "within_closure"
+    if any(
+        rendered == authority or rendered.startswith(authority + "/")
+        for authority in ("/asterism", "/dev", "/proc", "/run", "/sys", "/tmp")
+    ):
+        raise PreparationError(
+            "trusted system symlink reaches mutable guest authority"
+        )
+    return "guest_inaccessible_external"
+
+
+SEMANTIC_MANIFEST_ENTRY_FIELDS = {
+    "changed_ns",
+    "device",
+    "file_type",
+    "gid",
+    "inode",
+    "link_count",
+    "modified_ns",
+    "path",
+    "permissions",
+    "sha256",
+    "size",
+    "symlink_target",
+    "symlink_scope",
+    "uid",
+}
+
+
+def validate_recursive_manifest_value(
+    value: Any, role: str, context: str, *, trusted_system: bool
+) -> dict[str, Any]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"entries", "role", "schema"}
+        or value.get("schema") != RECURSIVE_TREE_AUTHORITY_SCHEMA
+        or value.get("role") != role
+        or not isinstance(value.get("entries"), list)
+        or not value["entries"]
+    ):
+        raise PreparationError(f"{context} recursive manifest fields differ")
+    paths: set[str] = set()
+    directory_count = 0
+    for index, entry in enumerate(value["entries"]):
+        if not isinstance(entry, dict) or set(entry) != SEMANTIC_MANIFEST_ENTRY_FIELDS:
+            raise PreparationError(f"{context} recursive manifest entry differs")
+        relative = entry.get("path")
+        if not isinstance(relative, str) or (
+            relative != "."
+            and (
+                PurePosixPath(relative).is_absolute()
+                or str(PurePosixPath(relative)) != relative
+                or ".." in PurePosixPath(relative).parts
+                or "." in PurePosixPath(relative).parts
+            )
+        ):
+            raise PreparationError(f"{context} recursive manifest path differs")
+        if relative in paths or (index == 0) != (relative == "."):
+            raise PreparationError(f"{context} recursive manifest paths alias")
+        paths.add(relative)
+        kind = entry.get("file_type")
+        if kind not in {"directory", "regular", "symlink"}:
+            raise PreparationError(f"{context} recursive manifest type differs")
+        if any(
+            not isinstance(entry.get(field), int)
+            or isinstance(entry.get(field), bool)
+            for field in (
+                "changed_ns",
+                "device",
+                "gid",
+                "inode",
+                "link_count",
+                "modified_ns",
+                "permissions",
+                "size",
+                "uid",
+            )
+        ):
+            raise PreparationError(f"{context} recursive manifest metadata differs")
+        if kind == "directory":
+            directory_count += 1
+            if (
+                entry.get("sha256") is not None
+                or entry.get("symlink_target") is not None
+                or entry.get("symlink_scope") is not None
+            ):
+                raise PreparationError(f"{context} directory digest differs")
+        elif kind == "regular":
+            if (
+                entry.get("symlink_target") is not None
+                or entry.get("symlink_scope") is not None
+                or (
+                entry.get("sha256") is not None
+                if trusted_system
+                else not is_lower_hex(entry.get("sha256"), SHA256)
+                )
+            ):
+                raise PreparationError(f"{context} regular-file digest differs")
+        elif (
+            not isinstance(entry.get("symlink_target"), str)
+            or not is_lower_hex(entry.get("sha256"), SHA256)
+            or entry.get("symlink_scope")
+            not in (
+                {"within_closure", "guest_inaccessible_external"}
+                if trusted_system
+                else {"within_root"}
+            )
+        ):
+            raise PreparationError(f"{context} symlink target differs")
+        if trusted_system and (
+            entry["uid"] != 0
+            or (kind != "symlink" and entry["permissions"] & 0o022)
+        ):
+            raise PreparationError(f"{context} trusted system policy differs")
+    if directory_count < 1:
+        raise PreparationError(f"{context} recursive directory set is empty")
+    return value
+
+
+def resample_recursive_manifest(
+    root: Path,
+    role: str,
+    context: str,
+    *,
+    allow_internal_symlinks: bool,
+    hash_regular_contents: bool,
+    trusted_system_roots: tuple[Path, ...] = (),
+    excluded_relative_paths: tuple[str, ...] = (),
+    volatile_directory_metadata_paths: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    guard = RecursiveTreeAuthorityGuard(
+        root,
+        root / ".unused-semantic-evidence",
+        role,
+        context,
+        allow_internal_symlinks=allow_internal_symlinks,
+        hash_regular_contents=hash_regular_contents,
+        trusted_system_roots=trusted_system_roots,
+        excluded_relative_paths=excluded_relative_paths,
+        volatile_directory_metadata_paths=volatile_directory_metadata_paths,
+    )
+    try:
+        guard.descriptor, guard.identity = open_retained_directory(root, context)
+        first = guard._manifest(install_watches=False)
+        second = guard._manifest(install_watches=False)
+        if first != second:
+            raise PreparationError(f"{context} changed while resampling")
+        return second
+    finally:
+        guard.close()
+
+
+def validate_semantic_input_authority(
+    value: Any,
+    context: str,
+    *,
+    replay_evidence: bool = False,
+    live_roots: dict[str, Path] | None = None,
+    source_role: str = "source",
+) -> dict[str, Any]:
+    """Validate the exact producer contract consumed by bn-17nh integrations."""
+
+    if not isinstance(value, dict) or set(value) != {
+        "cargo_home",
+        "runtime_sha256",
+        "schema",
+        "source",
+        "toolchain",
+        "trusted_system_closure",
+    } or value.get("schema") != SEMANTIC_INPUT_AUTHORITY_SCHEMA:
+        raise PreparationError(f"{context} semantic input authority fields differ")
+    tree_fields = {
+        "entry_count",
+        "equal_pre_post",
+        "manifest_path",
+        "manifest_sha256",
+        "mutation_events_absent",
+        "role",
+        "schema",
+        "watch_count",
+    }
+    for name, role in (
+        ("source", source_role),
+        ("toolchain", "toolchain"),
+        ("cargo_home", "cargo_home"),
+    ):
+        tree = value.get(name)
+        if (
+            not isinstance(tree, dict)
+            or set(tree) != tree_fields
+            or tree.get("schema") != RECURSIVE_TREE_AUTHORITY_SCHEMA
+            or tree.get("role") != role
+            or not is_lower_hex(tree.get("manifest_sha256"), SHA256)
+            or not isinstance(tree.get("manifest_path"), str)
+            or not Path(tree["manifest_path"]).is_absolute()
+            or not isinstance(tree.get("entry_count"), int)
+            or isinstance(tree.get("entry_count"), bool)
+            or tree["entry_count"] < 1
+            or not isinstance(tree.get("watch_count"), int)
+            or isinstance(tree.get("watch_count"), bool)
+            or tree["watch_count"] < 1
+            or tree.get("equal_pre_post") is not True
+            or tree.get("mutation_events_absent") is not True
+        ):
+            raise PreparationError(f"{context} semantic {name} binding differs")
+        if replay_evidence:
+            evidence = immutable_canonical_snapshot(
+                Path(tree["manifest_path"]),
+                RECURSIVE_TREE_AUTHORITY_SCHEMA,
+                f"{context} semantic {name} evidence",
+            )
+            validate_recursive_manifest_value(
+                evidence.value, role, f"{context} semantic {name} evidence",
+                trusted_system=False,
+            )
+            if (
+                evidence.sha256 != tree["manifest_sha256"]
+                or evidence.value.get("role") != role
+                or len(evidence.value.get("entries", [])) != tree["entry_count"]
+                or sum(
+                    entry.get("file_type") == "directory"
+                    for entry in evidence.value.get("entries", [])
+                )
+                != tree["watch_count"]
+            ):
+                raise PreparationError(
+                    f"{context} semantic {name} evidence differs"
+                )
+            if live_roots is not None:
+                root = live_roots[name].resolve(strict=True)
+                observed = resample_recursive_manifest(
+                    root,
+                    role,
+                    f"{context} live semantic {name}",
+                    allow_internal_symlinks=name != "source",
+                    hash_regular_contents=True,
+                    excluded_relative_paths=("Cargo.lock",)
+                    if role == "resolution_source_without_cargo_lock"
+                    else (),
+                    volatile_directory_metadata_paths=(".",)
+                    if role == "resolution_source_without_cargo_lock"
+                    else (),
+                )
+                if canonical_json(observed) != evidence.payload:
+                    raise PreparationError(
+                        f"{context} live semantic {name} differs"
+                    )
+    closure = value.get("trusted_system_closure")
+    closure_fields = {
+        "entry_count",
+        "manifest_path",
+        "mounts",
+        "mutation_events_absent",
+        "schema",
+        "sha256",
+        "watch_count",
+    }
+    mount_fields = {
+        "device",
+        "gid",
+        "guest_path",
+        "host_path",
+        "inode",
+        "permissions",
+        "resolved_path",
+        "trusted_root_owned_non_writable",
+        "uid",
+    }
+    closure_mounts = closure.get("mounts") if isinstance(closure, dict) else None
+    if (
+        not isinstance(closure_mounts, list)
+        or len(closure_mounts) != len(TRUSTED_SYSTEM_MOUNTS)
+        or any(not isinstance(mount, dict) for mount in closure_mounts)
+    ):
+        raise PreparationError(f"{context} trusted system closure mounts differ")
+    if (
+        not isinstance(closure, dict)
+        or set(closure) != closure_fields
+        or closure.get("schema") != TRUSTED_SYSTEM_CLOSURE_SCHEMA
+        or not is_lower_hex(closure.get("sha256"), SHA256)
+        or not isinstance(closure.get("manifest_path"), str)
+        or not Path(closure["manifest_path"]).is_absolute()
+        or not isinstance(closure.get("entry_count"), int)
+        or isinstance(closure.get("entry_count"), bool)
+        or closure["entry_count"] < 3
+        or not isinstance(closure.get("watch_count"), int)
+        or isinstance(closure.get("watch_count"), bool)
+        or closure["watch_count"] < 3
+        or closure.get("mutation_events_absent") is not True
+        or any(
+            set(mount) != mount_fields
+            or mount.get("guest_path") != guest_path
+            or mount.get("host_path") != str(host_path)
+            or mount.get("resolved_path") != str(host_path)
+            or mount.get("trusted_root_owned_non_writable") is not True
+            or mount.get("uid") != 0
+            or not all(
+                isinstance(mount.get(field), int)
+                and not isinstance(mount.get(field), bool)
+                for field in ("device", "gid", "inode", "permissions", "uid")
+            )
+            or mount.get("permissions", 0) & 0o022
+            for mount, (host_path, guest_path) in zip(
+                closure_mounts, TRUSTED_SYSTEM_MOUNTS, strict=True
+            )
+        )
+    ):
+        raise PreparationError(f"{context} trusted system closure differs")
+    if replay_evidence:
+        closure_evidence = immutable_canonical_snapshot(
+            Path(closure["manifest_path"]),
+            TRUSTED_SYSTEM_CLOSURE_SCHEMA,
+            f"{context} trusted system closure evidence",
+        )
+        evidence_mounts = closure_evidence.value.get("mounts")
+        if (
+            not isinstance(evidence_mounts, list)
+            or len(evidence_mounts) != len(TRUSTED_SYSTEM_MOUNTS)
+            or any(not isinstance(mount, dict) for mount in evidence_mounts)
+        ):
+            raise PreparationError(
+                f"{context} trusted system evidence mounts differ"
+            )
+        roots = tuple(
+            path.resolve(strict=True) for path, _guest in TRUSTED_SYSTEM_MOUNTS
+        )
+        for expected, evidence_mount, binding_mount in zip(
+            TRUSTED_SYSTEM_MOUNTS,
+            evidence_mounts,
+            closure_mounts,
+            strict=True,
+        ):
+            host_path, guest_path = expected
+            if (
+                set(evidence_mount)
+                != {"guest_path", "host_path", "resolved_path", "tree"}
+                or evidence_mount.get("guest_path") != guest_path
+                or evidence_mount.get("host_path") != str(host_path)
+                or evidence_mount.get("resolved_path") != str(host_path)
+            ):
+                raise PreparationError(
+                    f"{context} trusted system evidence mount differs"
+                )
+            tree = validate_recursive_manifest_value(
+                evidence_mount.get("tree"),
+                "system-" + guest_path.removeprefix("/").replace("/", "-"),
+                f"{context} trusted system {guest_path}",
+                trusted_system=True,
+            )
+            root_entry = tree["entries"][0]
+            for field, entry_field in (
+                ("device", "device"),
+                ("gid", "gid"),
+                ("inode", "inode"),
+                ("permissions", "permissions"),
+                ("uid", "uid"),
+            ):
+                if binding_mount[field] != root_entry[entry_field]:
+                    raise PreparationError(
+                        f"{context} trusted system root binding differs"
+                    )
+            if live_roots is not None:
+                observed = resample_recursive_manifest(
+                    host_path,
+                    tree["role"],
+                    f"{context} live trusted system {guest_path}",
+                    allow_internal_symlinks=True,
+                    hash_regular_contents=False,
+                    trusted_system_roots=roots,
+                )
+                if observed != tree:
+                    raise PreparationError(
+                        f"{context} live trusted system {guest_path} differs"
+                    )
+        if (
+            closure_evidence.sha256 != closure["sha256"]
+            or sum(
+                len(mount.get("tree", {}).get("entries", []))
+                for mount in evidence_mounts
+                if isinstance(mount, dict)
+            )
+            != closure["entry_count"]
+            or sum(
+                sum(
+                    entry.get("file_type") == "directory"
+                    for entry in mount.get("tree", {}).get("entries", [])
+                )
+                for mount in evidence_mounts or []
+                if isinstance(mount, dict)
+            )
+            != closure["watch_count"]
+        ):
+            raise PreparationError(
+                f"{context} trusted system closure evidence differs"
+            )
+    components = {
+        name: value[name]
+        for name in ("cargo_home", "toolchain", "trusted_system_closure")
+    }
+    if (
+        not is_lower_hex(value.get("runtime_sha256"), SHA256)
+        or value["runtime_sha256"] != semantic_runtime_sha256(components)
+    ):
+        raise PreparationError(f"{context} semantic runtime digest differs")
+    return value
 
 
 def hash_file(path: Path) -> str:
@@ -612,72 +1122,216 @@ def checked_tool(name: str) -> Path:
     if name not in {"bwrap", "git", "rustup"}:
         raise PreparationError(f"unapproved system tool: {name}")
     path = Path("/usr/bin") / name
-    if not path.is_file():
+    try:
+        metadata = path.lstat()
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        raise PreparationError(f"required tool is unavailable: {path}") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or resolved != path
+    ):
         raise PreparationError(f"required tool is not a regular file: {path}")
     return path
 
 
+def run_retained_probe(
+    path: Path,
+    descriptor: int,
+    argv: list[str],
+    environment: dict[str, str],
+    context: str,
+) -> bytes:
+    """Execute one exact retained tool descriptor and return exact stdout bytes."""
+
+    if not argv or argv[0] != str(path):
+        raise PreparationError(f"{context} logical executable differs")
+    completed = subprocess.run(
+        argv,
+        executable=f"/proc/self/fd/{descriptor}",
+        pass_fds=(descriptor,),
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+        check=False,
+    )
+    if completed.returncode != 0 or completed.stderr or not completed.stdout:
+        raise PreparationError(f"{context} retained probe failed")
+    return completed.stdout
+
+
 def toolchain_identity() -> dict[str, str]:
-    cargo_home = Path(
+    cargo_home_input = Path(
         os.environ.get("CARGO_HOME", str(Path.home() / ".cargo"))
-    ).resolve(strict=True)
-    rustup_home = Path(
+    ).absolute()
+    rustup_home_input = Path(
         os.environ.get("RUSTUP_HOME", str(Path.home() / ".rustup"))
-    ).resolve(strict=True)
-    if not cargo_home.is_dir() or not rustup_home.is_dir():
+    ).absolute()
+    cargo_home = cargo_home_input.resolve(strict=True)
+    rustup_home = rustup_home_input.resolve(strict=True)
+    if (
+        cargo_home != cargo_home_input
+        or rustup_home != rustup_home_input
+        or not cargo_home.is_dir()
+        or not rustup_home.is_dir()
+    ):
         raise PreparationError("Cargo and rustup homes must be directories")
     rustup = checked_tool("rustup")
     bwrap = checked_tool("bwrap")
     git = checked_tool("git")
     bootstrap = bootstrap_environment(cargo_home, rustup_home)
-    active = subprocess.run(
-        [str(rustup), "show", "active-toolchain"],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=30,
-        env=bootstrap,
-    ).stdout.strip()
-    toolchain = active.split(maxsplit=1)[0]
-    if not toolchain or any(character.isspace() for character in toolchain):
-        raise PreparationError("rustup active toolchain is invalid")
+    leases: dict[str, tuple[Path, int, bytes, dict[str, Any]]] = {}
 
-    def effective(component: str) -> Path:
-        value = subprocess.run(
-            [str(rustup), "which", component, "--toolchain", toolchain],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            env=bootstrap,
-        ).stdout.strip()
-        path = Path(value).resolve(strict=True)
-        if not path.is_file():
-            raise PreparationError(f"rustup {component} target is not a file")
-        return path
+    def retain(name: str, path: Path) -> None:
+        descriptor, payload, binding, _full = open_retained_artifact(
+            path, f"toolchain identity {name}"
+        )
+        key = (binding["identity"]["device"], binding["identity"]["inode"])
+        if any(
+            key
+            == (
+                other[3]["identity"]["device"],
+                other[3]["identity"]["inode"],
+            )
+            for other in leases.values()
+        ):
+            os.close(descriptor)
+            raise PreparationError(f"toolchain executable aliases: {name}")
+        leases[name] = (path, descriptor, payload, binding)
 
-    cargo = effective("cargo")
-    rustc = effective("rustc")
-    version_env = {
-        **bootstrap,
-        "RUSTUP_TOOLCHAIN": toolchain,
-    }
-    cargo_version = subprocess.run(
-        [str(cargo), "--version", "--verbose"],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=30,
-        env=version_env,
-    ).stdout.strip()
-    rustc_version = subprocess.run(
-        [str(rustc), "--version", "--verbose"],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=30,
-        env=version_env,
-    ).stdout.strip()
+    def verify_all(boundary: str) -> None:
+        for name, (path, descriptor, payload, binding) in leases.items():
+            verify_retained_artifact(
+                descriptor,
+                path,
+                payload,
+                binding,
+                f"toolchain identity {name} at {boundary}",
+            )
+
+    try:
+        retain("rustup", rustup)
+        retain("bwrap", bwrap)
+        retain("git", git)
+        active_argv = [str(rustup), "show", "active-toolchain"]
+        active_raw = run_retained_probe(
+            rustup,
+            leases["rustup"][1],
+            active_argv,
+            bootstrap,
+            "rustup active toolchain",
+        )
+        verify_all("active-toolchain sample")
+        try:
+            active = active_raw.decode("utf-8").strip()
+        except UnicodeDecodeError as error:
+            raise PreparationError("rustup active toolchain is not UTF-8") from error
+        toolchain = active.split(maxsplit=1)[0]
+        if not toolchain or any(character.isspace() for character in toolchain):
+            raise PreparationError("rustup active toolchain is invalid")
+
+        which_outputs: dict[str, bytes] = {}
+        for component in ("cargo", "rustc"):
+            argv = [
+                str(rustup),
+                "which",
+                component,
+                "--toolchain",
+                toolchain,
+            ]
+            raw = run_retained_probe(
+                rustup,
+                leases["rustup"][1],
+                argv,
+                bootstrap,
+                f"rustup which {component}",
+            )
+            verify_all(f"rustup which {component}")
+            which_outputs[component] = raw
+            try:
+                rendered = raw.decode("utf-8").strip()
+            except UnicodeDecodeError as error:
+                raise PreparationError(
+                    f"rustup {component} target is not UTF-8"
+                ) from error
+            lexical = Path(rendered).absolute()
+            resolved = lexical.resolve(strict=True)
+            metadata = lexical.lstat()
+            if (
+                lexical != resolved
+                or stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISREG(metadata.st_mode)
+            ):
+                raise PreparationError(
+                    f"rustup {component} target is aliased or unsupported"
+                )
+            retain(component, lexical)
+
+        cargo = leases["cargo"][0]
+        rustc = leases["rustc"][0]
+        if cargo.parent.parent != rustc.parent.parent:
+            raise PreparationError("Cargo and rustc toolchain roots differ")
+        version_env = {**bootstrap, "RUSTUP_TOOLCHAIN": toolchain}
+        version_outputs: dict[str, bytes] = {}
+        for component, path in (("cargo", cargo), ("rustc", rustc)):
+            raw = run_retained_probe(
+                path,
+                leases[component][1],
+                [str(path), "--version", "--verbose"],
+                version_env,
+                f"{component} verbose version",
+            )
+            verify_all(f"{component} version sample")
+            version_outputs[component] = raw
+
+        active_replay = run_retained_probe(
+            rustup,
+            leases["rustup"][1],
+            active_argv,
+            bootstrap,
+            "rustup active toolchain replay",
+        )
+        if active_replay != active_raw:
+            raise PreparationError("rustup active toolchain changed while sampled")
+        for component, path in (("cargo", cargo), ("rustc", rustc)):
+            which_replay = run_retained_probe(
+                rustup,
+                leases["rustup"][1],
+                [
+                    str(rustup),
+                    "which",
+                    component,
+                    "--toolchain",
+                    toolchain,
+                ],
+                bootstrap,
+                f"rustup which {component} replay",
+            )
+            version_replay = run_retained_probe(
+                path,
+                leases[component][1],
+                [str(path), "--version", "--verbose"],
+                version_env,
+                f"{component} verbose version replay",
+            )
+            if (
+                which_replay != which_outputs[component]
+                or version_replay != version_outputs[component]
+            ):
+                raise PreparationError(
+                    f"{component} toolchain discovery changed while sampled"
+                )
+            verify_all(f"{component} discovery replay")
+        cargo_version = version_outputs["cargo"].decode("utf-8").strip()
+        rustc_version = version_outputs["rustc"].decode("utf-8").strip()
+        verify_all("final toolchain identity")
+        bindings = {name: lease[3] for name, lease in leases.items()}
+    finally:
+        for _path, descriptor, _payload, _binding in leases.values():
+            os.close(descriptor)
     host_lines = [
         line.removeprefix("host: ")
         for line in rustc_version.splitlines()
@@ -687,20 +1341,20 @@ def toolchain_identity() -> dict[str, str]:
         raise PreparationError("rustc verbose version has no unique host triple")
     return {
         "bwrap_path": str(bwrap),
-        "bwrap_sha256": hash_file(bwrap),
+        "bwrap_sha256": bindings["bwrap"]["sha256"],
         "cargo_home_path": str(cargo_home),
         "cargo_path": str(cargo),
-        "cargo_sha256": hash_file(cargo),
+        "cargo_sha256": bindings["cargo"]["sha256"],
         "cargo_version_verbose": cargo_version,
         "git_path": str(git),
-        "git_sha256": hash_file(git),
+        "git_sha256": bindings["git"]["sha256"],
         "rustc_path": str(rustc),
-        "rustc_sha256": hash_file(rustc),
+        "rustc_sha256": bindings["rustc"]["sha256"],
         "rustc_version_verbose": rustc_version,
         "rustc_host": host_lines[0],
         "rustup_home_path": str(rustup_home),
         "rustup_path": str(rustup),
-        "rustup_sha256": hash_file(rustup),
+        "rustup_sha256": bindings["rustup"]["sha256"],
         "rustup_toolchain": toolchain,
     }
 
@@ -765,9 +1419,10 @@ def sandboxed_cargo_environment(
     environment.update(
         {
             "CARGO_HOME": GUEST_CARGO_HOME,
+            "GIT_CONFIG_GLOBAL": f"{GUEST_ROOT}/absent-gitconfig",
             "PATH": f"{GUEST_TOOLCHAIN_ROOT}/bin:/usr/bin:/bin",
             "RUSTC": GUEST_RUSTC,
-            "RUSTUP_HOME": GUEST_RUSTUP_HOME,
+            "RUSTUP_HOME": "/nonexistent",
         }
     )
     if set(environment) != FROZEN_CARGO_ENV_FIELDS | set(extra):
@@ -1118,25 +1773,6 @@ def validate_bound_source_file(
     if not is_lower_hex(claimed_sha256, SHA256) or hash_file(source) != claimed_sha256:
         raise PreparationError(f"{context} source hash differs")
     return source
-
-
-def run(
-    argv: list[str],
-    *,
-    cwd: Path,
-    env: dict[str, str],
-    timeout: int = 3600,
-) -> dict[str, Any]:
-    completed = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, timeout=timeout)
-    return {
-        "argv": argv,
-        "cwd": str(cwd.resolve()),
-        "exit_status": completed.returncode,
-        "stdout_sha256": hash_bytes(completed.stdout),
-        "stderr_sha256": hash_bytes(completed.stderr),
-        "stdout": completed.stdout.decode(errors="replace"),
-        "stderr": completed.stderr.decode(errors="replace"),
-    }
 
 
 def proc_start_ticks(pid: int) -> int:
@@ -2175,7 +2811,7 @@ def validate_current_correctness_construction() -> None:
         or hook_self_test.get("patch_sha256")
         != CURRENT_PRODUCT_OVERLAY_SHA256
         or not isinstance(hook_self_test.get("checks"), list)
-        or len(hook_self_test["checks"]) != 9
+        or len(hook_self_test["checks"]) != 11
     ):
         raise PreparationError("current product hook self-test differs")
 
@@ -2187,7 +2823,7 @@ def validate_current_correctness_construction() -> None:
         or hook_validation.get("patch_sha256")
         != CURRENT_PRODUCT_OVERLAY_SHA256
         or not isinstance(hook_validation.get("checks"), list)
-        or len(hook_validation["checks"]) != 8
+        or len(hook_validation["checks"]) != 9
     ):
         raise PreparationError("current product hook validation differs")
 
@@ -2214,7 +2850,7 @@ def validate_current_correctness_construction() -> None:
             or not isinstance(authority, dict)
             or authority.get("sha256") != CURRENT_PRODUCT_OVERLAY_SHA256
             or authority.get("reviewed_commit")
-            != "478e1c61968f6a02722e6881e4c765f47b921770"
+            != "ded1d69e6ba30dceec5ead61239d47a405234512"
             or authority.get("checks") != hook_validation.get("checks")
             or manifest.get("build_contract")
             != {
@@ -2727,31 +3363,133 @@ def stage_variant(
 
 
 def sandboxed_resolution_argv(
-    root: Path, toolchain: dict[str, str], cargo_arguments: list[str]
+    descriptors: dict[str, int],
+    system_descriptors: dict[str, int],
+    config_descriptors: dict[str, int],
+    cargo_arguments: list[str],
+    bwrap_path: str,
 ) -> list[str]:
-    return [
-        toolchain["bwrap_path"],
+    if set(descriptors) != {
+        "cargo",
+        "cargo_home",
+        "rustc",
+        "source",
+        "toolchain_root",
+    }:
+        raise PreparationError("resolution sandbox descriptors differ")
+    expected_system = tuple(
+        guest_path for _host_path, guest_path in TRUSTED_SYSTEM_MOUNTS
+    )
+    if tuple(system_descriptors) != expected_system:
+        raise PreparationError("resolution system descriptors differ")
+    if tuple(config_descriptors) != GUEST_BOUND_CONFIG_PATHS:
+        raise PreparationError("resolution config descriptors differ")
+    all_descriptors = (
+        *descriptors.values(),
+        *system_descriptors.values(),
+        *config_descriptors.values(),
+    )
+    if (
+        any(
+            not isinstance(descriptor, int)
+            or isinstance(descriptor, bool)
+            or descriptor < 3
+            for descriptor in all_descriptors
+        )
+        or len(all_descriptors) != len(set(all_descriptors))
+    ):
+        raise PreparationError("resolution sandbox descriptors alias")
+    argv = [
+        bwrap_path,
         "--die-with-parent",
         "--new-session",
         "--unshare-net",
-        "--ro-bind",
-        "/",
-        "/",
-        "--dev-bind",
+        "--dir",
+        "/usr",
+    ]
+    for guest_path, descriptor in system_descriptors.items():
+        argv.extend(["--ro-bind-fd", str(descriptor), guest_path])
+    argv.extend(
+        [
+        "--symlink",
+        "usr/bin",
+        "/bin",
+        "--symlink",
+        "usr/lib",
+        "/lib",
+        "--symlink",
+        "usr/lib",
+        "/lib64",
+        "--dir",
         "/dev",
-        "/dev",
-        "--proc",
+        "--dir",
         "/proc",
         "--tmpfs",
         "/tmp",
-        "--bind",
-        str(root),
-        str(root),
+        "--tmpfs",
+        GUEST_ROOT,
+        "--bind-fd",
+        str(descriptors["source"]),
+        GUEST_SOURCE,
+        "--ro-bind-fd",
+        str(descriptors["toolchain_root"]),
+        GUEST_TOOLCHAIN_ROOT,
+        "--ro-bind-fd",
+        str(descriptors["cargo"]),
+        GUEST_CARGO,
+        "--ro-bind-fd",
+        str(descriptors["rustc"]),
+        GUEST_RUSTC,
+        "--ro-bind-fd",
+        str(descriptors["cargo_home"]),
+        GUEST_CARGO_HOME,
+        "--dir",
+        f"{GUEST_ROOT}/.cargo",
+        "--tmpfs",
+        f"{GUEST_ROOT}/.cargo",
+        "--remount-ro",
+        f"{GUEST_ROOT}/.cargo",
+        "--dir",
+        "/.cargo",
+        "--tmpfs",
+        "/.cargo",
+        "--remount-ro",
+        "/.cargo",
+        "--dir",
+        f"{GUEST_SOURCE}/.cargo",
+        "--tmpfs",
+        f"{GUEST_SOURCE}/.cargo",
+        "--ro-bind-fd",
+        str(config_descriptors[f"{GUEST_SOURCE}/.cargo/config.toml"]),
+        f"{GUEST_SOURCE}/.cargo/config.toml",
+        "--ro-bind-fd",
+        str(config_descriptors[f"{GUEST_SOURCE}/.cargo/config"]),
+        f"{GUEST_SOURCE}/.cargo/config",
+        "--remount-ro",
+        f"{GUEST_SOURCE}/.cargo",
+        "--ro-bind-fd",
+        str(config_descriptors[f"{GUEST_CARGO_HOME}/config.toml"]),
+        f"{GUEST_CARGO_HOME}/config.toml",
+        "--ro-bind-fd",
+        str(config_descriptors[f"{GUEST_CARGO_HOME}/config"]),
+        f"{GUEST_CARGO_HOME}/config",
+        "--remount-ro",
+        GUEST_CARGO_HOME,
         "--chdir",
-        str(root),
-        toolchain["cargo_path"],
+        GUEST_SOURCE,
+        GUEST_CARGO,
         *cargo_arguments,
-    ]
+        ]
+    )
+    return argv
+
+
+def freeze_resolution_source(root: Path) -> None:
+    """Freeze every source input while leaving only Cargo.lock's parent writable."""
+
+    make_read_only(root)
+    if stat.S_IMODE(root.stat().st_mode) != 0o755:
+        root.chmod(0o755)
 
 
 def stage_locks(repository: Path, output: Path) -> None:
@@ -2761,7 +3499,7 @@ def stage_locks(repository: Path, output: Path) -> None:
     output.mkdir(parents=True)
     toolchain = toolchain_identity()
     plan = load_plan(repository, toolchain)
-    resolution_env = frozen_cargo_environment(toolchain)
+    resolution_env = sandboxed_cargo_environment(toolchain, {})
     current_lock = git_bytes(
         repository,
         ["show", f"{plan['variants']['A']['product_commit']}:Cargo.lock"],
@@ -2777,12 +3515,13 @@ def stage_locks(repository: Path, output: Path) -> None:
         if variant != "B":
             public_hashes.add(staged["overlay"]["main_sha256"])
         root = staged["root"]
-        config_binding = write_cargo_config_search(
+        freeze_resolution_source(root)
+        config_binding = write_sandboxed_cargo_config_search(
             output / "manifests" / f"cargo-config-{variant}.json",
             root,
             toolchain,
         )
-        replay_cargo_config_search(config_binding, root, toolchain)
+        replay_sandboxed_cargo_config_search(config_binding, root, toolchain)
         historical = git_bytes(
             repository,
             ["show", f"{claim['lock']['commit']}:{claim['lock']['path']}"],
@@ -2792,12 +3531,13 @@ def stage_locks(repository: Path, output: Path) -> None:
         current_attempt = None
         if variant in {"C", "D"}:
             atomic_write(lock_path, current_lock)
-            replay_cargo_config_search(config_binding, root, toolchain)
-            current_attempt = run(
-                sandboxed_resolution_argv(
-                    root,
-                    toolchain,
-                    [
+            replay_sandboxed_cargo_config_search(config_binding, root, toolchain)
+            current_attempt = execute_sandboxed_resolution(
+                root=root,
+                toolchain=toolchain,
+                environment=resolution_env,
+                cargo_config_search=config_binding,
+                cargo_arguments=[
                         "metadata",
                         "--locked",
                         "--offline",
@@ -2805,29 +3545,30 @@ def stage_locks(repository: Path, output: Path) -> None:
                         "1",
                         "--no-deps",
                     ],
-                ),
-                cwd=root,
-                env=resolution_env,
-                timeout=300,
+                evidence_root=output / "manifests",
+                label=f"current-lock-{variant}",
             )
-            replay_cargo_config_search(config_binding, root, toolchain)
-            current_attempt["cargo_config_search"] = config_binding
-            current_attempt["environment"] = resolution_env
-            current_attempt["toolchain"] = toolchain
+            replay_sandboxed_cargo_config_search(config_binding, root, toolchain)
+            if (
+                current_attempt["exit_status"] != 0
+                or current_attempt["lock_output"]["pre"]
+                != current_attempt["lock_output"]["post"]
+            ):
+                raise PreparationError(
+                    f"{variant} current-lock attempt failed or changed Cargo.lock"
+                )
             lock_path.unlink()
-            replay_cargo_config_search(config_binding, root, toolchain)
-            resolved = run(
-                sandboxed_resolution_argv(
-                    root, toolchain, ["generate-lockfile", "--offline"]
-                ),
-                cwd=root,
-                env=resolution_env,
-                timeout=300,
+            replay_sandboxed_cargo_config_search(config_binding, root, toolchain)
+            resolved = execute_sandboxed_resolution(
+                root=root,
+                toolchain=toolchain,
+                environment=resolution_env,
+                cargo_config_search=config_binding,
+                cargo_arguments=["generate-lockfile", "--offline"],
+                evidence_root=output / "manifests",
+                label=f"resolved-lock-{variant}",
             )
-            replay_cargo_config_search(config_binding, root, toolchain)
-            resolved["cargo_config_search"] = config_binding
-            resolved["environment"] = resolution_env
-            resolved["toolchain"] = toolchain
+            replay_sandboxed_cargo_config_search(config_binding, root, toolchain)
             if resolved["exit_status"] != 0 or not lock_path.is_file():
                 raise PreparationError(f"{variant} offline lock resolution failed: {resolved['stderr']}")
             final_lock = lock_path.read_bytes()
@@ -2844,14 +3585,16 @@ def stage_locks(repository: Path, output: Path) -> None:
                 toolchain,
             )
             resolved["cargo_config_search"] = config_binding
-            resolved["environment"] = resolution_env
+            resolved["environment"] = frozen_cargo_environment(toolchain)
+            resolved["host_source_root"] = str(root.resolve())
+            resolved["resolver_kind"] = "tracked_git_readback"
             resolved["toolchain"] = toolchain
             if (
                 resolved["exit_status"] != 0
                 or resolved_payload != historical
             ):
                 raise PreparationError(f"{variant} tracked lock readback failed")
-        replay_cargo_config_search(config_binding, root, toolchain)
+        replay_sandboxed_cargo_config_search(config_binding, root, toolchain)
         candidate_path = output / "locks" / f"Cargo-{variant}.lock"
         atomic_write(candidate_path, final_lock)
         records[variant] = {
@@ -2897,8 +3640,84 @@ def tooling_identity(
     return commit, tree
 
 
+def resolution_sandbox_descriptors(
+    argv: Any, context: str
+) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
+    """Extract only the descriptor layout accepted by the fixed resolver argv."""
+
+    if (
+        not isinstance(argv, list)
+        or not argv
+        or any(not isinstance(argument, str) for argument in argv)
+    ):
+        raise PreparationError(f"{context} argv is not an exact string list")
+    expected_bindings = (
+        *(
+            (f"system:{guest_path}", "--ro-bind-fd", guest_path)
+            for _host_path, guest_path in TRUSTED_SYSTEM_MOUNTS
+        ),
+        ("source", "--bind-fd", GUEST_SOURCE),
+        ("toolchain_root", "--ro-bind-fd", GUEST_TOOLCHAIN_ROOT),
+        ("cargo", "--ro-bind-fd", GUEST_CARGO),
+        ("rustc", "--ro-bind-fd", GUEST_RUSTC),
+        ("cargo_home", "--ro-bind-fd", GUEST_CARGO_HOME),
+        *(
+            (f"config:{guest_path}", "--ro-bind-fd", guest_path)
+            for guest_path in GUEST_BOUND_CONFIG_PATHS
+        ),
+    )
+    descriptors: dict[str, int] = {}
+    observed: list[tuple[str, str, str]] = []
+    for index, argument in enumerate(argv):
+        if argument not in {"--ro-bind-fd", "--bind-fd"}:
+            continue
+        if index + 2 >= len(argv):
+            raise PreparationError(f"{context} descriptor binding is truncated")
+        descriptor_text = argv[index + 1]
+        if (
+            not descriptor_text.isdecimal()
+            or str(int(descriptor_text)) != descriptor_text
+        ):
+            raise PreparationError(f"{context} descriptor is not canonical")
+        ordinal = len(observed)
+        if ordinal >= len(expected_bindings):
+            raise PreparationError(f"{context} has an extra descriptor binding")
+        name, _option, _destination = expected_bindings[ordinal]
+        observed.append((name, argument, argv[index + 2]))
+        descriptors[name] = int(descriptor_text)
+    if tuple(observed) != expected_bindings:
+        raise PreparationError(f"{context} guest descriptor bindings differ")
+    if len(descriptors) != len(set(descriptors.values())):
+        raise PreparationError(f"{context} descriptors alias")
+    core = {
+        name: descriptors[name]
+        for name in ("cargo", "cargo_home", "rustc", "source", "toolchain_root")
+    }
+    system = {
+        guest_path: descriptors[f"system:{guest_path}"]
+        for _host_path, guest_path in TRUSTED_SYSTEM_MOUNTS
+    }
+    config = {
+        guest_path: descriptors[f"config:{guest_path}"]
+        for guest_path in GUEST_BOUND_CONFIG_PATHS
+    }
+    return core, system, config
+
+
+def validate_resolver_output_hashes(record: dict[str, Any], context: str) -> None:
+    for stream in ("stderr", "stdout"):
+        payload = record.get(stream)
+        digest = record.get(f"{stream}_sha256")
+        if (
+            not isinstance(payload, str)
+            or not is_lower_hex(digest, SHA256)
+            or hash_bytes(payload.encode("utf-8")) != digest
+        ):
+            raise PreparationError(f"{context} {stream} authority differs")
+
+
 def validate_lock_manifest(
-    locks: dict[str, Any], plan: dict[str, Any]
+    repository: Path, locks: dict[str, Any], plan: dict[str, Any]
 ) -> None:
     if (
         locks.get("protocol") != PROTOCOL
@@ -2919,38 +3738,282 @@ def validate_lock_manifest(
         or admission.get("available_inodes", 0) < MIN_AVAILABLE_INODES
     ):
         raise PreparationError("lock-candidate filesystem admission differs")
-    expected_environment = frozen_cargo_environment(toolchain)
+    expected_sandbox_environment = sandboxed_cargo_environment(toolchain, {})
+    expected_git_environment = frozen_cargo_environment(toolchain)
+    current_claim = plan["variants"]["A"]
+    if (
+        current_claim.get("product_commit")
+        != current_claim.get("lock", {}).get("commit")
+        or current_claim.get("lock", {}).get("path") != "Cargo.lock"
+        or not is_lower_hex(current_claim.get("lock", {}).get("sha256"), SHA256)
+    ):
+        raise PreparationError("current Cargo.lock source-plan authority differs")
+    current_lock_sha256 = current_claim["lock"]["sha256"]
     shared_manifest_hashes: set[str] = set()
     for variant in VARIANTS:
         claim = locks["variants"][variant]
-        resolver = claim.get("resolver", {})
+        if not isinstance(claim, dict) or set(claim) != {
+            "adapter_sha256",
+            "archive_sha256",
+            "current_lock_attempt",
+            "current_to_final",
+            "final_lock_path",
+            "final_lock_sha256",
+            "historical_lock",
+            "historical_to_final",
+            "overlay_manifest_path",
+            "overlay_manifest_sha256",
+            "resolver",
+            "shared_manifest_sha256",
+        }:
+            raise PreparationError(f"{variant} lock-candidate fields differ")
         if (
-            resolver.get("toolchain") != toolchain
-            or resolver.get("environment") != expected_environment
+            claim.get("historical_lock") != plan["variants"][variant]["lock"]
+            or not is_lower_hex(claim.get("final_lock_sha256"), SHA256)
         ):
-            raise PreparationError(f"{variant} resolver identity differs")
+            raise PreparationError(f"{variant} lock-candidate authority differs")
+        resolver = claim.get("resolver", {})
         current_attempt = claim.get("current_lock_attempt")
-        records = [resolver]
+        if (variant in {"C", "D"}) != isinstance(current_attempt, dict):
+            raise PreparationError(f"{variant} current-lock topology differs")
+        if variant in {"A", "B"} and current_attempt is not None:
+            raise PreparationError(f"{variant} unexpectedly has a current-lock attempt")
+        final_lock_lexical = Path(str(claim.get("final_lock_path")))
+        if not final_lock_lexical.is_absolute():
+            raise PreparationError(f"{variant} lock path is not absolute")
+        output_root = final_lock_lexical.parent.parent
+        expected_lock_path = output_root / "locks" / f"Cargo-{variant}.lock"
+        expected_overlay_path = (
+            output_root / "manifests" / f"overlay-{variant}.json"
+        )
+        expected_config_path = (
+            output_root / "manifests" / f"cargo-config-{variant}.json"
+        )
+        expected_source_root = (
+            output_root / "materialized" / variant
+        ).resolve(strict=True)
+        if final_lock_lexical != expected_lock_path:
+            raise PreparationError(f"{variant} lock path topology differs")
+        records = [("generated", resolver)]
         if current_attempt is not None:
-            if (
-                current_attempt.get("toolchain") != toolchain
-                or current_attempt.get("environment") != expected_environment
-            ):
-                raise PreparationError(f"{variant} current-lock identity differs")
-            records.append(current_attempt)
-        for record in records:
-            binding = record.get("cargo_config_search")
-            if not isinstance(binding, dict):
-                raise PreparationError(f"{variant} Cargo config binding is absent")
-            config = load_canonical(Path(binding["path"]), CARGO_CONFIG_SCHEMA)
-            replay_cargo_config_search(
-                binding, Path(config["cwd"]), toolchain
+            records.append(("current", current_attempt))
+        for role, record in records:
+            expected_kind = (
+                "tracked_git_readback"
+                if variant in {"A", "B"}
+                else "sandboxed_cargo_resolution"
             )
+            tracked_fields = {
+                "argv",
+                "cargo_config_search",
+                "cwd",
+                "environment",
+                "exit_status",
+                "host_source_root",
+                "resolver_kind",
+                "stderr",
+                "stderr_sha256",
+                "stdout",
+                "stdout_sha256",
+                "toolchain",
+            }
+            sandboxed_fields = tracked_fields | {
+                "execution_authority",
+                "lock_output",
+                "passed_file_descriptors",
+                "semantic_input_authority",
+            }
+            expected_fields = (
+                tracked_fields
+                if expected_kind == "tracked_git_readback"
+                else sandboxed_fields
+            )
+            if (
+                not isinstance(record, dict)
+                or set(record) != expected_fields
+                or record.get("resolver_kind") != expected_kind
+                or record.get("toolchain") != toolchain
+                or record.get("environment")
+                != (
+                    expected_git_environment
+                    if expected_kind == "tracked_git_readback"
+                    else expected_sandbox_environment
+                )
+                or not isinstance(record.get("exit_status"), int)
+                or isinstance(record.get("exit_status"), bool)
+                or record.get("exit_status") != 0
+            ):
+                raise PreparationError(f"{variant} resolver record fields differ")
+            validate_resolver_output_hashes(
+                record, f"{variant} {role} resolver"
+            )
+            binding = record.get("cargo_config_search")
+            if (
+                not isinstance(binding, dict)
+                or set(binding) != {"path", "sha256"}
+                or binding.get("path") != str(expected_config_path)
+            ):
+                raise PreparationError(f"{variant} Cargo config binding is absent")
+            load_canonical(Path(binding["path"]), CARGO_CONFIG_SCHEMA)
+            host_source_root = Path(str(record.get("host_source_root")))
+            if (
+                record.get("host_source_root") != str(expected_source_root)
+                or host_source_root.resolve(strict=True) != expected_source_root
+            ):
+                raise PreparationError(
+                    f"{variant} resolver source-root authority differs"
+                )
+            replay_sandboxed_cargo_config_search(
+                binding, host_source_root, toolchain
+            )
+            if expected_kind == "sandboxed_cargo_resolution":
+                if record.get("cwd") != GUEST_SOURCE:
+                    raise PreparationError(f"{variant} resolver cwd differs")
+                execution_authority = record.get("execution_authority")
+                if (
+                    not isinstance(execution_authority, dict)
+                    or execution_authority.get("path")
+                    != toolchain["bwrap_path"]
+                    or execution_authority.get("sha256")
+                    != toolchain["bwrap_sha256"]
+                ):
+                    raise PreparationError(
+                        f"{variant} resolver execution authority differs"
+                    )
+                replay_artifact_binding(
+                    execution_authority,
+                    f"{variant} {role} resolver retained bwrap",
+                )
+                descriptors, system_descriptors, config_descriptors = (
+                    resolution_sandbox_descriptors(
+                        record.get("argv"), f"{variant} {role} resolver"
+                    )
+                )
+                cargo_arguments = (
+                    [
+                        "metadata",
+                        "--locked",
+                        "--offline",
+                        "--format-version",
+                        "1",
+                        "--no-deps",
+                    ]
+                    if role == "current"
+                    else ["generate-lockfile", "--offline"]
+                )
+                if record["argv"] != sandboxed_resolution_argv(
+                    descriptors,
+                    system_descriptors,
+                    config_descriptors,
+                    cargo_arguments,
+                    toolchain["bwrap_path"],
+                ):
+                    raise PreparationError(
+                        f"{variant} {role} resolver argv differs"
+                    )
+                if record.get("passed_file_descriptors") != 13:
+                    raise PreparationError(
+                        f"{variant} resolver descriptor count differs"
+                    )
+                authority = record["semantic_input_authority"]
+                if (
+                    not isinstance(authority, dict)
+                    or authority.get("schema") != SEMANTIC_INPUT_AUTHORITY_SCHEMA
+                    or authority.get("source", {}).get("role")
+                    != "resolution_source_without_cargo_lock"
+                ):
+                    raise PreparationError(
+                        f"{variant} resolver semantic authority differs"
+                    )
+                validate_semantic_input_authority(
+                    authority,
+                    f"{variant} resolver",
+                    replay_evidence=True,
+                    live_roots={
+                        "cargo_home": Path(toolchain["cargo_home_path"]),
+                        "source": host_source_root,
+                        "toolchain": Path(toolchain["cargo_path"]).parent.parent,
+                    },
+                    source_role="resolution_source_without_cargo_lock",
+                )
+                lock_output = record.get("lock_output")
+                if (
+                    not isinstance(lock_output, dict)
+                    or set(lock_output) != {"post", "pre"}
+                    or any(
+                        not isinstance(lock_output.get(boundary), dict)
+                        or set(lock_output[boundary])
+                        != {"path", "sha256", "status"}
+                        for boundary in ("pre", "post")
+                    )
+                ):
+                    raise PreparationError(
+                        f"{variant} resolver lock-output authority differs"
+                    )
+                lock_path_string = str(expected_source_root / "Cargo.lock")
+                if role == "current":
+                    expected_boundary = {
+                        "path": lock_path_string,
+                        "sha256": current_lock_sha256,
+                        "status": "present",
+                    }
+                    if (
+                        lock_output["pre"] != expected_boundary
+                        or lock_output["post"] != expected_boundary
+                    ):
+                        raise PreparationError(
+                            f"{variant} current-lock replay differs"
+                        )
+                elif lock_output != {
+                    "post": {
+                        "path": lock_path_string,
+                        "sha256": claim.get("final_lock_sha256"),
+                        "status": "present",
+                    },
+                    "pre": {
+                        "path": lock_path_string,
+                        "sha256": None,
+                        "status": "absent",
+                    },
+                }:
+                    raise PreparationError(
+                        f"{variant} generated lock authority differs"
+                    )
+            else:
+                historical = claim.get("historical_lock")
+                if (
+                    role != "generated"
+                    or not isinstance(historical, dict)
+                    or set(historical) != {"commit", "path", "sha256"}
+                    or record.get("argv")
+                    != [
+                        toolchain["git_path"],
+                        "-C",
+                        str(repository),
+                        "show",
+                        f"{historical['commit']}:{historical['path']}",
+                    ]
+                    or record.get("cwd") != str(repository.resolve())
+                    or record.get("stdout_sha256") != historical["sha256"]
+                    or record.get("stdout_sha256")
+                    != claim.get("final_lock_sha256")
+                    or record.get("stderr") != ""
+                    or record.get("stderr_sha256") != EMPTY_SHA256
+                ):
+                    raise PreparationError(
+                        f"{variant} tracked lock resolver authority differs"
+                    )
         lock_path = Path(claim["final_lock_path"]).resolve(strict=True)
-        if hash_file(lock_path) != claim.get("final_lock_sha256"):
+        if (
+            lock_path != expected_lock_path
+            or hash_file(lock_path) != claim.get("final_lock_sha256")
+        ):
             raise PreparationError(f"{variant} lock candidate changed")
         overlay_path = Path(claim["overlay_manifest_path"]).resolve(strict=True)
-        if hash_file(overlay_path) != claim.get("overlay_manifest_sha256"):
+        if (
+            overlay_path != expected_overlay_path
+            or hash_file(overlay_path) != claim.get("overlay_manifest_sha256")
+        ):
             raise PreparationError(f"{variant} overlay manifest changed")
         overlay = load_canonical(
             overlay_path, "asterism-rebaseline-overlay-v3"
@@ -3010,6 +4073,44 @@ def validate_current_children_authority(
     }
     if set(attestation) != expected_fields or attestation.get("status") != "ok":
         raise PreparationError("current-child attestation fields/status differ")
+    builds = attestation.get("builds")
+    if not isinstance(builds, dict) or set(builds) != {
+        "children",
+        "hooked_release",
+        "pristine_release",
+    }:
+        raise PreparationError("current-child build set differs")
+    runtime_digests = set()
+    toolchain_value = attestation.get("toolchain")
+    if not isinstance(toolchain_value, dict):
+        raise PreparationError("current-child toolchain is absent")
+    toolchain_root = Path(str(toolchain_value.get("cargo_path"))).parent.parent
+    cargo_home = Path(str(toolchain_value.get("cargo_home_path")))
+    source_roots = {
+        "children": current_children.path.parent / "materialized" / "children",
+        "hooked_release": (
+            current_children.path.parent / "materialized" / "hooked-release"
+        ),
+        "pristine_release": (
+            current_children.path.parent / "materialized" / "pristine-release"
+        ),
+    }
+    for name, build in builds.items():
+        if not isinstance(build, dict):
+            raise PreparationError(f"current-child build is not an object: {name}")
+        authority = validate_semantic_input_authority(
+            build.get("semantic_input_authority"),
+            f"current-child {name} build",
+            replay_evidence=True,
+            live_roots={
+                "cargo_home": cargo_home,
+                "source": source_roots[name],
+                "toolchain": toolchain_root,
+            },
+        )
+        runtime_digests.add(authority["runtime_sha256"])
+    if len(runtime_digests) != 1:
+        raise PreparationError("current-child runtime authorities differ")
     if (
         attestation.get("protocol") != PROTOCOL
         or attestation.get("protocol_sha256") != PROTOCOL_DOCUMENT_SHA256
@@ -3244,7 +4345,7 @@ def validate_source_review_authority(
     if tools != inputs["tools_manifest"].value:
         raise PreparationError("source-review tools snapshot changed during validation")
     plan = load_plan(repository, toolchain)
-    validate_lock_manifest(locks, plan)
+    validate_lock_manifest(repository, locks, plan)
     validate_current_children_authority(
         inputs["current_children_attestation"],
         inputs["tools_manifest"],
@@ -3653,6 +4754,7 @@ def validate_support_import_immutability(
 
 def sandboxed_build_argv(
     descriptors: dict[str, int],
+    system_descriptors: dict[str, int],
     config_descriptors: dict[str, int],
     package: str,
     example: str,
@@ -3662,7 +4764,6 @@ def sandboxed_build_argv(
         "cargo",
         "cargo_home",
         "rustc",
-        "rustup_home",
         "source",
         "target",
         "toolchain_root",
@@ -3678,6 +4779,21 @@ def sandboxed_build_argv(
         or len(set(descriptors.values())) != len(descriptors)
     ):
         raise PreparationError("release sandbox descriptors differ")
+    expected_system_paths = tuple(
+        guest_path for _host_path, guest_path in TRUSTED_SYSTEM_MOUNTS
+    )
+    if (
+        tuple(system_descriptors) != expected_system_paths
+        or any(
+            isinstance(descriptor, bool)
+            or not isinstance(descriptor, int)
+            or descriptor < 3
+            for descriptor in system_descriptors.values()
+        )
+        or len(set(system_descriptors.values())) != len(system_descriptors)
+        or set(descriptors.values()) & set(system_descriptors.values())
+    ):
+        raise PreparationError("release trusted-system descriptors differ")
     if (
         tuple(config_descriptors) != GUEST_BOUND_CONFIG_PATHS
         or any(
@@ -3688,6 +4804,7 @@ def sandboxed_build_argv(
         )
         or len(set(config_descriptors.values())) != len(config_descriptors)
         or set(descriptors.values()) & set(config_descriptors.values())
+        or set(system_descriptors.values()) & set(config_descriptors.values())
     ):
         raise PreparationError("release sandbox config descriptors differ")
     argv = [
@@ -3695,13 +4812,25 @@ def sandboxed_build_argv(
         "--die-with-parent",
         "--new-session",
         "--unshare-net",
-        "--ro-bind",
-        "/",
-        "/",
-        "--dev-bind",
+        "--dir",
+        "/usr",
+    ]
+    for guest_path, descriptor in system_descriptors.items():
+        argv.extend(["--ro-bind-fd", str(descriptor), guest_path])
+    argv.extend(
+        [
+        "--symlink",
+        "usr/bin",
+        "/bin",
+        "--symlink",
+        "usr/lib",
+        "/lib",
+        "--symlink",
+        "usr/lib",
+        "/lib64",
+        "--dir",
         "/dev",
-        "/dev",
-        "--proc",
+        "--dir",
         "/proc",
         "--tmpfs",
         "/tmp",
@@ -3737,9 +4866,6 @@ def sandboxed_build_argv(
         "--ro-bind-fd",
         str(descriptors["cargo_home"]),
         GUEST_CARGO_HOME,
-        "--ro-bind-fd",
-        str(descriptors["rustup_home"]),
-        GUEST_RUSTUP_HOME,
         "--dir",
         f"{GUEST_SOURCE}/.cargo",
         "--tmpfs",
@@ -3773,7 +4899,8 @@ def sandboxed_build_argv(
         example,
         "--target-dir",
         GUEST_TARGET,
-    ]
+        ]
+    )
     return argv
 
 
@@ -3989,6 +5116,855 @@ def verify_retained_directory(
         raise PreparationError(f"{context} retained directory identity changed")
 
 
+RECURSIVE_METADATA_FIELDS = (
+    "st_dev",
+    "st_ino",
+    "st_mode",
+    "st_nlink",
+    "st_size",
+    "st_mtime_ns",
+    "st_ctime_ns",
+)
+
+
+def same_recursive_metadata(left: os.stat_result, right: os.stat_result) -> bool:
+    return all(
+        getattr(left, field) == getattr(right, field)
+        for field in RECURSIVE_METADATA_FIELDS
+    )
+
+
+class RecursiveTreeAuthorityGuard:
+    """Descriptor-bind and recursively watch one build-semantic input tree."""
+
+    def __init__(
+        self,
+        path: Path,
+        evidence_path: Path,
+        role: str,
+        context: str,
+        *,
+        allow_internal_symlinks: bool,
+        hash_regular_contents: bool = True,
+        trusted_system_roots: tuple[Path, ...] = (),
+        excluded_relative_paths: tuple[str, ...] = (),
+        allowed_mutation_paths: tuple[str, ...] = (),
+        volatile_directory_metadata_paths: tuple[str, ...] = (),
+    ) -> None:
+        self.path = path
+        self.evidence_path = evidence_path
+        self.role = role
+        self.context = context
+        self.allow_internal_symlinks = allow_internal_symlinks
+        self.hash_regular_contents = hash_regular_contents
+        self.trusted_system_roots = trusted_system_roots
+        self.excluded_relative_paths = frozenset(excluded_relative_paths)
+        self.allowed_mutation_paths = frozenset(allowed_mutation_paths)
+        self.volatile_directory_metadata_paths = frozenset(
+            volatile_directory_metadata_paths
+        )
+        self.descriptor = -1
+        self.identity: dict[str, int] | None = None
+        self.inotify_descriptor = -1
+        self.watch_descriptors: set[int] = set()
+        self.watch_paths: dict[int, str] = {}
+        self.evidence: tuple[int, bytes, dict[str, Any]] | None = None
+        self.initial_manifest: dict[str, Any] | None = None
+        self.binding: dict[str, Any] | None = None
+        self.poisoned = False
+        self.active = False
+
+    def _initialize_inotify(self) -> None:
+        library = ctypes.CDLL(None, use_errno=True)
+        try:
+            initialize = library.inotify_init1
+            add_watch = library.inotify_add_watch
+        except AttributeError as error:
+            raise PreparationError(
+                f"{self.context} inotify API is unavailable"
+            ) from error
+        initialize.argtypes = [ctypes.c_int]
+        initialize.restype = ctypes.c_int
+        add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        add_watch.restype = ctypes.c_int
+        self.inotify_descriptor = initialize(os.O_CLOEXEC | os.O_NONBLOCK)
+        if self.inotify_descriptor < 0:
+            errno = ctypes.get_errno()
+            raise PreparationError(
+                f"{self.context} inotify initialization failed: {errno}"
+            )
+        self._inotify_add_watch = add_watch
+
+    def _add_watch(self, descriptor: int, relative: str) -> None:
+        watch = self._inotify_add_watch(
+            self.inotify_descriptor,
+            os.fsencode(f"/proc/self/fd/{descriptor}"),
+            INOTIFY_MUTATION_MASK | 0x01000000,
+        )
+        if watch < 0:
+            errno = ctypes.get_errno()
+            raise PreparationError(f"{self.context} inotify watch failed: {errno}")
+        self.watch_descriptors.add(watch)
+        if watch in self.watch_paths and self.watch_paths[watch] != relative:
+            raise PreparationError(f"{self.context} inotify watch aliases")
+        self.watch_paths[watch] = relative
+
+    def _drain(self, boundary: str) -> None:
+        if self.poisoned or self.inotify_descriptor < 0:
+            raise PreparationError(f"{self.context} mutation guard is poisoned")
+        observed: list[tuple[int, int, int, int]] = []
+        try:
+            while True:
+                try:
+                    payload = os.read(self.inotify_descriptor, 1024 * 1024)
+                except BlockingIOError:
+                    break
+                if not payload:
+                    raise PreparationError(
+                        f"{self.context} inotify queue closed at {boundary}"
+                    )
+                offset = 0
+                while offset < len(payload):
+                    if len(payload) - offset < INOTIFY_EVENT_HEADER.size:
+                        raise PreparationError(
+                            f"{self.context} malformed inotify header at {boundary}"
+                        )
+                    event = INOTIFY_EVENT_HEADER.unpack_from(payload, offset)
+                    event_size = INOTIFY_EVENT_HEADER.size + event[3]
+                    if event_size > len(payload) - offset:
+                        raise PreparationError(
+                            f"{self.context} malformed inotify event at {boundary}"
+                        )
+                    raw_name = payload[
+                        offset + INOTIFY_EVENT_HEADER.size : offset + event_size
+                    ].rstrip(b"\0")
+                    try:
+                        name = os.fsdecode(raw_name)
+                    except UnicodeDecodeError:
+                        name = "<invalid>"
+                    parent = self.watch_paths.get(event[0], "<unknown>")
+                    relative = (
+                        parent
+                        if not name
+                        else name if parent == "." else f"{parent}/{name}"
+                    )
+                    always_fatal = event[1] & (
+                        0x00002000 | 0x00004000 | 0x00008000
+                    )
+                    allowed = relative in self.allowed_mutation_paths or (
+                        parent == "." and name.startswith(".Cargo.lock")
+                    )
+                    if always_fatal or not allowed:
+                        observed.append(event)
+                    offset += event_size
+        except OSError as error:
+            self.poisoned = True
+            raise PreparationError(
+                f"{self.context} inotify read failed at {boundary}"
+            ) from error
+        if observed:
+            self.poisoned = True
+            masks = sorted({event[1] for event in observed})
+            raise PreparationError(
+                f"{self.context} mutation events at {boundary}: {masks}"
+            )
+
+    def _trusted(self, metadata: os.stat_result, relative: str, *, symlink: bool) -> None:
+        candidate = self.path if relative == "." else self.path / relative
+        if self.trusted_system_roots and (
+            metadata.st_uid != 0
+            or (not symlink and stat.S_IMODE(metadata.st_mode) & 0o022)
+            or (not symlink and os.access(candidate, os.W_OK))
+        ):
+            raise PreparationError(
+                f"{self.context} trusted system entry is writable: {relative}"
+            )
+
+    def _record(
+        self,
+        metadata: os.stat_result,
+        relative: str,
+        kind: str,
+        digest: str | None,
+        target: str | None,
+        symlink_scope: str | None = None,
+    ) -> dict[str, Any]:
+        record = {
+            "changed_ns": metadata.st_ctime_ns,
+            "device": metadata.st_dev,
+            "file_type": kind,
+            "gid": metadata.st_gid,
+            "inode": metadata.st_ino,
+            "link_count": metadata.st_nlink,
+            "modified_ns": metadata.st_mtime_ns,
+            "path": relative,
+            "permissions": stat.S_IMODE(metadata.st_mode),
+            "sha256": digest,
+            "size": metadata.st_size,
+            "symlink_target": target,
+            "symlink_scope": symlink_scope,
+            "uid": metadata.st_uid,
+        }
+        if kind == "directory" and relative in self.volatile_directory_metadata_paths:
+            for field in ("changed_ns", "modified_ns", "permissions", "size"):
+                record[field] = 0
+        return record
+
+    def _manifest(self, *, install_watches: bool) -> dict[str, Any]:
+        if self.descriptor < 0:
+            raise PreparationError(f"{self.context} root descriptor is absent")
+        directory_flags = (
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        root_descriptor = os.open(".", directory_flags, dir_fd=self.descriptor)
+        entries: list[dict[str, Any]] = []
+
+        def walk(descriptor: int, relative: str) -> None:
+            before = os.fstat(descriptor)
+            self._trusted(before, relative, symlink=False)
+            if install_watches:
+                self._add_watch(descriptor, relative)
+            entries.append(self._record(before, relative, "directory", None, None))
+            names = sorted(os.listdir(descriptor))
+            if len(names) != len(set(names)):
+                raise PreparationError(f"{self.context} names alias")
+            for name in names:
+                child_relative = name if relative == "." else f"{relative}/{name}"
+                if child_relative in self.excluded_relative_paths:
+                    continue
+                selected = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                if stat.S_ISDIR(selected.st_mode):
+                    child = os.open(name, directory_flags, dir_fd=descriptor)
+                    try:
+                        if not same_recursive_metadata(selected, os.fstat(child)):
+                            raise PreparationError(
+                                f"{self.context} directory selection changed"
+                            )
+                        walk(child, child_relative)
+                    finally:
+                        os.close(child)
+                elif stat.S_ISREG(selected.st_mode):
+                    child = os.open(
+                        name,
+                        os.O_RDONLY
+                        | os.O_CLOEXEC
+                        | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=descriptor,
+                    )
+                    try:
+                        opened_before = os.fstat(child)
+                        if not same_recursive_metadata(selected, opened_before):
+                            raise PreparationError(
+                                f"{self.context} file selection changed"
+                            )
+                        digest = None
+                        if self.hash_regular_contents:
+                            hasher = hashlib.sha256()
+                            offset = 0
+                            while offset < opened_before.st_size:
+                                chunk = os.pread(
+                                    child,
+                                    min(
+                                        1024 * 1024,
+                                        opened_before.st_size - offset,
+                                    ),
+                                    offset,
+                                )
+                                if not chunk:
+                                    raise PreparationError(
+                                        f"{self.context} file read made no progress"
+                                    )
+                                hasher.update(chunk)
+                                offset += len(chunk)
+                            digest = hasher.hexdigest()
+                        opened_after = os.fstat(child)
+                        selected_after = os.stat(
+                            name, dir_fd=descriptor, follow_symlinks=False
+                        )
+                        if (
+                            not same_recursive_metadata(
+                                opened_before, opened_after
+                            )
+                            or not same_recursive_metadata(
+                                opened_after, selected_after
+                            )
+                        ):
+                            raise PreparationError(
+                                f"{self.context} file changed while snapshotting"
+                            )
+                    finally:
+                        os.close(child)
+                    self._trusted(selected, child_relative, symlink=False)
+                    entries.append(
+                        self._record(
+                            selected, child_relative, "regular", digest, None
+                        )
+                    )
+                elif stat.S_ISLNK(selected.st_mode):
+                    if not self.allow_internal_symlinks:
+                        raise PreparationError(
+                            f"{self.context} contains a symlink: {child_relative}"
+                        )
+                    target = os.readlink(name, dir_fd=descriptor)
+                    selected_after = os.stat(
+                        name, dir_fd=descriptor, follow_symlinks=False
+                    )
+                    if not same_recursive_metadata(selected, selected_after):
+                        raise PreparationError(
+                            f"{self.context} symlink changed while snapshotting"
+                        )
+                    candidate = self.path / Path(child_relative).parent / target
+                    try:
+                        candidate.resolve(strict=True)
+                    except OSError as error:
+                        raise PreparationError(
+                            f"{self.context} symlink target is unresolved"
+                        ) from error
+                    if not self.trusted_system_roots:
+                        resolved = candidate.resolve(strict=True)
+                        if (
+                            resolved != self.path and self.path not in resolved.parents
+                        ):
+                            raise PreparationError(
+                                f"{self.context} symlink escapes the retained root"
+                            )
+                        scope = "within_root"
+                    else:
+                        scope = system_symlink_scope(
+                            self.path, child_relative, target
+                        )
+                    self._trusted(selected, child_relative, symlink=True)
+                    entries.append(
+                        self._record(
+                            selected,
+                            child_relative,
+                            "symlink",
+                            hash_bytes(os.fsencode(target)),
+                            target,
+                            scope,
+                        )
+                    )
+                else:
+                    raise PreparationError(
+                        f"{self.context} contains unsupported node: {child_relative}"
+                    )
+            after = os.fstat(descriptor)
+            if not same_recursive_metadata(before, after):
+                raise PreparationError(
+                    f"{self.context} directory changed during traversal"
+                )
+
+        try:
+            walk(root_descriptor, ".")
+        finally:
+            os.close(root_descriptor)
+        hardlinks: dict[tuple[int, int], list[dict[str, Any]]] = {}
+        for entry in entries:
+            if entry["file_type"] == "regular":
+                hardlinks.setdefault((entry["device"], entry["inode"]), []).append(
+                    entry
+                )
+        for aliases in hardlinks.values():
+            if (
+                not self.trusted_system_roots
+                and len(aliases) != aliases[0]["link_count"]
+            ):
+                raise PreparationError(
+                    f"{self.context} hard link escapes the retained tree"
+                )
+        if install_watches:
+            expected = sum(entry["file_type"] == "directory" for entry in entries)
+            if len(self.watch_descriptors) != expected:
+                raise PreparationError(
+                    f"{self.context} recursive watch coverage differs"
+                )
+        return {
+            "entries": entries,
+            "role": self.role,
+            "schema": RECURSIVE_TREE_AUTHORITY_SCHEMA,
+        }
+
+    def __enter__(self) -> RecursiveTreeAuthorityGuard:
+        try:
+            self.descriptor, self.identity = open_retained_directory(
+                self.path, f"{self.context} root"
+            )
+            self._initialize_inotify()
+            first = self._manifest(install_watches=True)
+            self._drain("initial manifest")
+            second = self._manifest(install_watches=False)
+            self._drain("matching manifest")
+            if first != second:
+                raise PreparationError(f"{self.context} initial manifests differ")
+            payload = canonical_json(second)
+            if self.evidence_path.exists() or self.evidence_path.is_symlink():
+                raise PreparationError(f"{self.context} evidence path is not fresh")
+            atomic_write(self.evidence_path, payload, mode=0o444)
+            evidence_descriptor, evidence_payload, evidence_binding, _full = (
+                open_retained_artifact(
+                    self.evidence_path, f"{self.context} manifest evidence"
+                )
+            )
+            if evidence_payload != payload:
+                os.close(evidence_descriptor)
+                raise PreparationError(f"{self.context} evidence bytes differ")
+            self.evidence = (
+                evidence_descriptor,
+                evidence_payload,
+                evidence_binding,
+            )
+            self.initial_manifest = second
+            self.binding = {
+                "entry_count": len(second["entries"]),
+                "equal_pre_post": False,
+                "manifest_path": str(self.evidence_path.resolve()),
+                "manifest_sha256": hash_bytes(payload),
+                "mutation_events_absent": True,
+                "role": self.role,
+                "schema": RECURSIVE_TREE_AUTHORITY_SCHEMA,
+                "watch_count": len(self.watch_descriptors),
+            }
+            self.active = True
+        except Exception:
+            self.close()
+            raise
+        return self
+
+    @property
+    def pass_fds(self) -> tuple[int, ...]:
+        if not self.active or self.descriptor < 0:
+            raise PreparationError(f"{self.context} recursive guard is inactive")
+        return (self.descriptor,)
+
+    def bwrap_bind(self, guest_path: str) -> tuple[str, str, str]:
+        return "--ro-bind-fd", str(self.pass_fds[0]), guest_path
+
+    def replay(self, boundary: str) -> dict[str, Any]:
+        if (
+            not self.active
+            or self.initial_manifest is None
+            or self.binding is None
+            or self.identity is None
+            or self.evidence is None
+        ):
+            raise PreparationError(f"{self.context} recursive guard is inactive")
+        self._drain(f"{boundary} before replay")
+        if self._manifest(install_watches=False) != self.initial_manifest:
+            self.poisoned = True
+            raise PreparationError(f"{self.context} recursive manifest changed")
+        self._drain(f"{boundary} after replay")
+        verify_retained_directory(
+            self.descriptor, self.path, self.identity, f"{self.context} root"
+        )
+        verify_retained_artifact(
+            self.evidence[0],
+            self.evidence_path,
+            self.evidence[1],
+            self.evidence[2],
+            f"{self.context} manifest evidence",
+        )
+        self.binding["equal_pre_post"] = True
+        return dict(self.binding)
+
+    def close(self) -> None:
+        if self.evidence is not None:
+            os.close(self.evidence[0])
+            self.evidence = None
+        if self.inotify_descriptor >= 0:
+            os.close(self.inotify_descriptor)
+            self.inotify_descriptor = -1
+        if self.descriptor >= 0:
+            os.close(self.descriptor)
+            self.descriptor = -1
+        self.active = False
+
+    def __exit__(self, child_type: Any, child_error: Any, traceback: Any) -> bool:
+        verification_error = None
+        try:
+            if self.active:
+                self.replay("guard close")
+        except PreparationError as error:
+            verification_error = error
+        finally:
+            self.close()
+        if verification_error is not None:
+            raise verification_error
+        return False
+
+
+class TrustedSystemClosureGuard:
+    """Retain the narrow, recursively immutable system build closure."""
+
+    def __init__(self, evidence_root: Path, label: str) -> None:
+        self.evidence_root = evidence_root
+        self.label = label
+        self.guards: list[tuple[str, RecursiveTreeAuthorityGuard]] = []
+        self.evidence_path = evidence_root / f"{label}-system-closure.json"
+        self.evidence: tuple[int, bytes, dict[str, Any]] | None = None
+        self.binding: dict[str, Any] | None = None
+
+    def __enter__(self) -> TrustedSystemClosureGuard:
+        roots = tuple(path.resolve(strict=True) for path, _ in TRUSTED_SYSTEM_MOUNTS)
+        if len(set(roots)) != len(roots):
+            raise PreparationError("trusted system closure roots alias")
+        manifests = []
+        try:
+            for (host_path, guest_path), root in zip(
+                TRUSTED_SYSTEM_MOUNTS, roots, strict=True
+            ):
+                if host_path != root or not root.is_dir():
+                    raise PreparationError(
+                        f"trusted system mount is aliased: {host_path}"
+                    )
+                role = "system-" + guest_path.removeprefix("/").replace("/", "-")
+                guard = RecursiveTreeAuthorityGuard(
+                    root,
+                    self.evidence_root / f"{self.label}-{role}.json",
+                    role,
+                    f"{self.label} trusted {guest_path}",
+                    allow_internal_symlinks=True,
+                    hash_regular_contents=False,
+                    trusted_system_roots=roots,
+                )
+                guard.__enter__()
+                self.guards.append((guest_path, guard))
+                assert guard.initial_manifest is not None
+                manifests.append(
+                    {
+                        "guest_path": guest_path,
+                        "host_path": str(host_path),
+                        "resolved_path": str(root),
+                        "tree": guard.initial_manifest,
+                    }
+                )
+            payload = canonical_json(
+                {"mounts": manifests, "schema": TRUSTED_SYSTEM_CLOSURE_SCHEMA}
+            )
+            if self.evidence_path.exists() or self.evidence_path.is_symlink():
+                raise PreparationError("trusted system closure evidence is not fresh")
+            atomic_write(self.evidence_path, payload, mode=0o444)
+            descriptor, observed_payload, observed_binding, _full = (
+                open_retained_artifact(
+                    self.evidence_path, "trusted system closure evidence"
+                )
+            )
+            if observed_payload != payload:
+                os.close(descriptor)
+                raise PreparationError("trusted system closure evidence differs")
+            self.evidence = (descriptor, observed_payload, observed_binding)
+            self.binding = {
+                "entry_count": sum(
+                    len(item["tree"]["entries"]) for item in manifests
+                ),
+                "manifest_path": str(self.evidence_path.resolve()),
+                "mounts": [
+                    {
+                        "device": item["tree"]["entries"][0]["device"],
+                        "gid": item["tree"]["entries"][0]["gid"],
+                        "guest_path": item["guest_path"],
+                        "host_path": item["host_path"],
+                        "inode": item["tree"]["entries"][0]["inode"],
+                        "permissions": item["tree"]["entries"][0]["permissions"],
+                        "resolved_path": item["resolved_path"],
+                        "trusted_root_owned_non_writable": True,
+                        "uid": item["tree"]["entries"][0]["uid"],
+                    }
+                    for item in manifests
+                ],
+                "mutation_events_absent": True,
+                "schema": TRUSTED_SYSTEM_CLOSURE_SCHEMA,
+                "sha256": hash_bytes(payload),
+                "watch_count": sum(
+                    len(guard.watch_descriptors) for _, guard in self.guards
+                ),
+            }
+        except Exception:
+            self.close()
+            raise
+        return self
+
+    @property
+    def pass_fds(self) -> tuple[int, ...]:
+        descriptors = tuple(
+            descriptor
+            for _, guard in self.guards
+            for descriptor in guard.pass_fds
+        )
+        if len(descriptors) != len(set(descriptors)):
+            raise PreparationError("trusted system closure descriptors alias")
+        return descriptors
+
+    def bwrap_args(self) -> list[str]:
+        arguments = ["--dir", "/usr"]
+        for guest_path, guard in self.guards:
+            arguments.extend(guard.bwrap_bind(guest_path))
+        arguments.extend(
+            [
+                "--symlink",
+                "usr/bin",
+                "/bin",
+                "--symlink",
+                "usr/lib",
+                "/lib",
+                "--symlink",
+                "usr/lib",
+                "/lib64",
+            ]
+        )
+        return arguments
+
+    def replay(self, boundary: str) -> dict[str, Any]:
+        for _, guard in self.guards:
+            guard.replay(boundary)
+        if self.binding is None or self.evidence is None:
+            raise PreparationError("trusted system closure binding is absent")
+        verify_retained_artifact(
+            self.evidence[0],
+            self.evidence_path,
+            self.evidence[1],
+            self.evidence[2],
+            "trusted system closure evidence",
+        )
+        return dict(self.binding)
+
+    def close(self) -> None:
+        if self.evidence is not None:
+            os.close(self.evidence[0])
+            self.evidence = None
+        while self.guards:
+            _guest, guard = self.guards.pop()
+            guard.__exit__(None, None, None)
+
+    def __exit__(self, child_type: Any, child_error: Any, traceback: Any) -> bool:
+        self.close()
+        return False
+
+
+def resolution_lock_binding(path: Path, context: str) -> dict[str, Any]:
+    try:
+        descriptor, payload, binding, _full = open_retained_artifact(path, context)
+    except FileNotFoundError:
+        return {"path": str(path), "sha256": None, "status": "absent"}
+    try:
+        verify_retained_artifact(descriptor, path, payload, binding, context)
+        return {"path": str(path), "sha256": binding["sha256"], "status": "present"}
+    finally:
+        os.close(descriptor)
+
+
+def execute_sandboxed_resolution(
+    *,
+    root: Path,
+    toolchain: dict[str, str],
+    environment: dict[str, str],
+    cargo_config_search: dict[str, str],
+    cargo_arguments: list[str],
+    evidence_root: Path,
+    label: str,
+) -> dict[str, Any]:
+    """Run one offline lock operation through retained, recursively guarded inputs."""
+
+    cargo_path = Path(toolchain["cargo_path"])
+    rustc_path = Path(toolchain["rustc_path"])
+    toolchain_root = cargo_path.parent.parent
+    if rustc_path.parent.parent != toolchain_root:
+        raise PreparationError(f"{label} Cargo/rustc roots differ")
+    replay_sandboxed_cargo_config_search(cargo_config_search, root, toolchain)
+    config_snapshot = immutable_canonical_snapshot(
+        Path(cargo_config_search["path"]),
+        CARGO_CONFIG_SCHEMA,
+        f"{label} Cargo config manifest",
+    )
+    config_entries = {entry["path"]: entry for entry in config_snapshot.value["entries"]}
+    host_config_paths = sandboxed_config_host_paths(root, toolchain)
+    empty_config = sandboxed_empty_cargo_config_path(config_snapshot.path)
+    artifact_specs = {
+        "bwrap": (Path(toolchain["bwrap_path"]), toolchain["bwrap_sha256"]),
+        "cargo": (cargo_path, toolchain["cargo_sha256"]),
+        "rustc": (rustc_path, toolchain["rustc_sha256"]),
+    }
+    for guest_path in GUEST_BOUND_CONFIG_PATHS:
+        entry = config_entries.get(guest_path)
+        if (
+            not isinstance(entry, dict)
+            or entry.get("status") != "present"
+            or not is_lower_hex(entry.get("sha256"), SHA256)
+        ):
+            raise PreparationError(f"{label} Cargo config binding differs")
+        host_path = host_config_paths[guest_path]
+        artifact_specs[f"config:{guest_path}"] = (
+            host_path if host_path.exists() else empty_config,
+            entry["sha256"],
+        )
+    leases: dict[str, tuple[int, bytes, dict[str, Any]]] = {}
+    authority_stack = ExitStack()
+    lock_path = root / "Cargo.lock"
+    lock_before = resolution_lock_binding(lock_path, f"{label} lock before")
+    try:
+        for name, (path, expected_sha256) in artifact_specs.items():
+            descriptor, payload, binding, _full = open_retained_artifact(
+                path, f"{label} retained {name}"
+            )
+            if binding["sha256"] != expected_sha256:
+                os.close(descriptor)
+                raise PreparationError(f"{label} retained {name} hash differs")
+            leases[name] = (descriptor, payload, binding)
+        source_guard = authority_stack.enter_context(
+            RecursiveTreeAuthorityGuard(
+                root,
+                evidence_root / f"resolution-source-{label}.json",
+                "resolution_source_without_cargo_lock",
+                f"{label} resolution source",
+                allow_internal_symlinks=False,
+                excluded_relative_paths=("Cargo.lock",),
+                allowed_mutation_paths=("Cargo.lock",),
+                volatile_directory_metadata_paths=(".",),
+            )
+        )
+        toolchain_guard = authority_stack.enter_context(
+            RecursiveTreeAuthorityGuard(
+                toolchain_root,
+                evidence_root / f"resolution-toolchain-{label}.json",
+                "toolchain",
+                f"{label} resolution toolchain",
+                allow_internal_symlinks=True,
+            )
+        )
+        cargo_home_guard = authority_stack.enter_context(
+            RecursiveTreeAuthorityGuard(
+                Path(toolchain["cargo_home_path"]),
+                evidence_root / f"resolution-cargo-home-{label}.json",
+                "cargo_home",
+                f"{label} resolution Cargo home",
+                allow_internal_symlinks=True,
+            )
+        )
+        system_guard = authority_stack.enter_context(
+            TrustedSystemClosureGuard(evidence_root, f"resolution-{label}")
+        )
+        descriptors = {
+            "cargo": leases["cargo"][0],
+            "cargo_home": cargo_home_guard.pass_fds[0],
+            "rustc": leases["rustc"][0],
+            "source": source_guard.pass_fds[0],
+            "toolchain_root": toolchain_guard.pass_fds[0],
+        }
+        system_descriptors = {
+            guest_path: guard.pass_fds[0]
+            for guest_path, guard in system_guard.guards
+        }
+        config_descriptors = {
+            guest_path: leases[f"config:{guest_path}"][0]
+            for guest_path in GUEST_BOUND_CONFIG_PATHS
+        }
+        argv = sandboxed_resolution_argv(
+            descriptors,
+            system_descriptors,
+            config_descriptors,
+            cargo_arguments,
+            str(Path(toolchain["bwrap_path"])),
+        )
+        inherited_fds = tuple(lease[0] for lease in leases.values()) + (
+            source_guard.pass_fds
+            + toolchain_guard.pass_fds
+            + cargo_home_guard.pass_fds
+            + system_guard.pass_fds
+        )
+        if len(inherited_fds) != len(set(inherited_fds)):
+            raise PreparationError(f"{label} inherited descriptors alias")
+        source_guard.replay("pre-resolution launch")
+        toolchain_guard.replay("pre-resolution launch")
+        cargo_home_guard.replay("pre-resolution launch")
+        system_guard.replay("pre-resolution launch")
+        for name, (descriptor, payload, binding) in leases.items():
+            verify_retained_artifact(
+                descriptor,
+                artifact_specs[name][0],
+                payload,
+                binding,
+                f"{label} retained {name} before launch",
+            )
+        bwrap_descriptor = leases["bwrap"][0]
+        try:
+            completed = subprocess.run(
+                argv,
+                executable=f"/proc/self/fd/{bwrap_descriptor}",
+                pass_fds=inherited_fds,
+                cwd=root,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=300,
+                check=False,
+            )
+        finally:
+            source_guard.replay("post-resolution boundary")
+            toolchain_guard.replay("post-resolution boundary")
+            cargo_home_guard.replay("post-resolution boundary")
+            system_guard.replay("post-resolution boundary")
+        replay_sandboxed_cargo_config_search(cargo_config_search, root, toolchain)
+        lock_after = resolution_lock_binding(lock_path, f"{label} lock after")
+        runtime_components = {
+            "cargo_home": cargo_home_guard.binding,
+            "toolchain": toolchain_guard.binding,
+            "trusted_system_closure": system_guard.binding,
+        }
+        if any(value is None for value in runtime_components.values()):
+            raise PreparationError(f"{label} runtime authority is absent")
+        source_binding = dict(source_guard.binding or {})
+        authority = {
+            **runtime_components,
+            "runtime_sha256": semantic_runtime_sha256(runtime_components),
+            "schema": SEMANTIC_INPUT_AUTHORITY_SCHEMA,
+            "source": source_binding,
+        }
+        return {
+            "argv": argv,
+            "cargo_config_search": cargo_config_search,
+            "cwd": GUEST_SOURCE,
+            "environment": environment,
+            "exit_status": completed.returncode,
+            "execution_authority": leases["bwrap"][2],
+            "host_source_root": str(root.resolve()),
+            "lock_output": {"post": lock_after, "pre": lock_before},
+            "passed_file_descriptors": len(inherited_fds),
+            "resolver_kind": "sandboxed_cargo_resolution",
+            "semantic_input_authority": authority,
+            "stderr": completed.stderr.decode("utf-8"),
+            "stderr_sha256": hash_bytes(completed.stderr),
+            "stdout": completed.stdout.decode("utf-8"),
+            "stdout_sha256": hash_bytes(completed.stdout),
+            "toolchain": toolchain,
+        }
+    finally:
+        verification_error: BaseException | None = None
+        for name, (descriptor, payload, binding) in leases.items():
+            try:
+                verify_retained_artifact(
+                    descriptor,
+                    artifact_specs[name][0],
+                    payload,
+                    binding,
+                    f"{label} retained {name}",
+                )
+            except BaseException as error:
+                if verification_error is None:
+                    verification_error = error
+            finally:
+                os.close(descriptor)
+        try:
+            authority_stack.close()
+        except BaseException as error:
+            if verification_error is None:
+                verification_error = error
+        if verification_error is not None:
+            raise verification_error
+
+
 def execute_sandboxed_build(
     *,
     root: Path,
@@ -4000,7 +5976,7 @@ def execute_sandboxed_build(
     cargo_config_search: dict[str, str],
     output_path: Path,
     context: str,
-) -> tuple[list[str], dict[str, Any], bytes, bytes]:
+) -> tuple[list[str], dict[str, Any], bytes, bytes, dict[str, Any]]:
     """Execute one build through retained tools and fixed guest bindings."""
 
     artifact_specs = {
@@ -4014,11 +5990,7 @@ def execute_sandboxed_build(
     if rustc.parent.parent != toolchain_root:
         raise PreparationError(f"{context} Cargo/rustc toolchain roots differ")
     directory_specs = {
-        "source": root,
         "target": target,
-        "toolchain_root": toolchain_root,
-        "cargo_home": Path(toolchain["cargo_home_path"]),
-        "rustup_home": Path(toolchain["rustup_home_path"]),
     }
     replay_sandboxed_cargo_config_search(
         cargo_config_search, root, toolchain
@@ -4063,6 +6035,7 @@ def execute_sandboxed_build(
         )
     artifact_leases: dict[str, tuple[int, bytes, dict[str, Any]]] = {}
     directory_leases: dict[str, tuple[int, dict[str, int]]] = {}
+    authority_stack = ExitStack()
     try:
         for name, (path, expected_sha256) in artifact_specs.items():
             descriptor, payload, binding, _full = open_retained_artifact(
@@ -4076,21 +6049,61 @@ def execute_sandboxed_build(
             directory_leases[name] = open_retained_directory(
                 path, f"{context} retained {name}"
             )
+        evidence_root = output_path.parent.parent / "manifests"
+        evidence_label = output_path.stem
+        source_guard = authority_stack.enter_context(
+            RecursiveTreeAuthorityGuard(
+                root,
+                evidence_root / f"semantic-source-{evidence_label}.json",
+                "source",
+                f"{context} semantic source tree",
+                allow_internal_symlinks=False,
+            )
+        )
+        toolchain_guard = authority_stack.enter_context(
+            RecursiveTreeAuthorityGuard(
+                toolchain_root,
+                evidence_root / f"semantic-toolchain-{evidence_label}.json",
+                "toolchain",
+                f"{context} semantic toolchain tree",
+                allow_internal_symlinks=True,
+            )
+        )
+        cargo_home_guard = authority_stack.enter_context(
+            RecursiveTreeAuthorityGuard(
+                Path(toolchain["cargo_home_path"]),
+                evidence_root / f"semantic-cargo-home-{evidence_label}.json",
+                "cargo_home",
+                f"{context} semantic Cargo home",
+                allow_internal_symlinks=True,
+            )
+        )
+        system_guard = authority_stack.enter_context(
+            TrustedSystemClosureGuard(evidence_root, evidence_label)
+        )
         descriptors = {
             name: lease[0] for name, lease in directory_leases.items()
         }
         descriptors.update(
             {
                 "cargo": artifact_leases["cargo"][0],
+                "cargo_home": cargo_home_guard.pass_fds[0],
                 "rustc": artifact_leases["rustc"][0],
+                "source": source_guard.pass_fds[0],
+                "toolchain_root": toolchain_guard.pass_fds[0],
             }
         )
+        system_descriptors = {
+            guest_path: guard.pass_fds[0]
+            for guest_path, guard in system_guard.guards
+        }
         config_descriptors = {
             guest_path: artifact_leases[f"config:{guest_path}"][0]
             for guest_path in GUEST_BOUND_CONFIG_PATHS
         }
         argv = sandboxed_build_argv(
             descriptors,
+            system_descriptors,
             config_descriptors,
             package,
             example,
@@ -4106,26 +6119,56 @@ def execute_sandboxed_build(
         )
         inherited_fds = tuple(
             artifact_leases[name][0] for name in inherited_artifacts
-        ) + tuple(lease[0] for lease in directory_leases.values())
+        ) + tuple(lease[0] for lease in directory_leases.values()) + (
+            source_guard.pass_fds
+            + toolchain_guard.pass_fds
+            + cargo_home_guard.pass_fds
+            + system_guard.pass_fds
+        )
         if len(set(inherited_fds)) != len(inherited_fds):
             raise PreparationError(f"{context} inherited descriptors alias")
         replay_sandboxed_cargo_config_search(
             cargo_config_search, root, toolchain
         )
+        source_guard.replay("pre-child launch")
+        toolchain_guard.replay("pre-child launch")
+        cargo_home_guard.replay("pre-child launch")
+        system_guard.replay("pre-child launch")
         execution_path = f"/proc/self/fd/{artifact_leases['bwrap'][0]}"
-        child, stdout, stderr = run_attested(
-            argv,
-            cwd=root,
-            env=environment,
-            output_path=output_path,
-            raw_stdout=False,
-            inherited_fds=inherited_fds,
-            executable=execution_path,
-        )
+        try:
+            child, stdout, stderr = run_attested(
+                argv,
+                cwd=root,
+                env=environment,
+                output_path=output_path,
+                raw_stdout=False,
+                inherited_fds=inherited_fds,
+                executable=execution_path,
+            )
+        finally:
+            source_guard.replay("post-child boundary")
+            toolchain_guard.replay("post-child boundary")
+            cargo_home_guard.replay("post-child boundary")
+            system_guard.replay("post-child boundary")
         replay_sandboxed_cargo_config_search(
             cargo_config_search, root, toolchain
         )
-        return argv, child, stdout, stderr
+        assert source_guard.binding is not None
+        assert toolchain_guard.binding is not None
+        assert cargo_home_guard.binding is not None
+        assert system_guard.binding is not None
+        runtime_components = {
+            "cargo_home": cargo_home_guard.binding,
+            "toolchain": toolchain_guard.binding,
+            "trusted_system_closure": system_guard.binding,
+        }
+        semantic_input_authority = {
+            **runtime_components,
+            "runtime_sha256": semantic_runtime_sha256(runtime_components),
+            "schema": SEMANTIC_INPUT_AUTHORITY_SCHEMA,
+            "source": source_guard.binding,
+        }
+        return argv, child, stdout, stderr, semantic_input_authority
     finally:
         verification_error: BaseException | None = None
         for name, (descriptor, payload, binding) in artifact_leases.items():
@@ -4156,6 +6199,11 @@ def execute_sandboxed_build(
                     verification_error = error
             finally:
                 os.close(descriptor)
+        try:
+            authority_stack.close()
+        except BaseException as error:
+            if verification_error is None:
+                verification_error = error
         if verification_error is not None:
             raise verification_error
 
@@ -4225,6 +6273,10 @@ def normalized_sandbox_sha256(attestation: dict[str, Any]) -> str:
         or any(not isinstance(argument, str) for argument in argv)
     ):
         raise PreparationError("release build argv is not an exact string list")
+    system_bindings = tuple(
+        (f"system:{guest_path}", "--ro-bind-fd", guest_path)
+        for _host_path, guest_path in TRUSTED_SYSTEM_MOUNTS
+    )
     core_bindings = (
         ("source", "--ro-bind-fd", GUEST_SOURCE),
         ("target", "--bind-fd", GUEST_TARGET),
@@ -4232,13 +6284,12 @@ def normalized_sandbox_sha256(attestation: dict[str, Any]) -> str:
         ("cargo", "--ro-bind-fd", GUEST_CARGO),
         ("rustc", "--ro-bind-fd", GUEST_RUSTC),
         ("cargo_home", "--ro-bind-fd", GUEST_CARGO_HOME),
-        ("rustup_home", "--ro-bind-fd", GUEST_RUSTUP_HOME),
     )
     config_bindings = tuple(
         (f"config:{guest_path}", "--ro-bind-fd", guest_path)
         for guest_path in GUEST_BOUND_CONFIG_PATHS
     )
-    expected_bindings = (*core_bindings, *config_bindings)
+    expected_bindings = (*system_bindings, *core_bindings, *config_bindings)
     observed_bindings: list[tuple[str, str, str]] = []
     descriptors: dict[str, int] = {}
     normalized = list(argv)
@@ -4270,11 +6321,16 @@ def normalized_sandbox_sha256(attestation: dict[str, Any]) -> str:
     core_descriptors = {
         name: descriptors[name] for name, _option, _path in core_bindings
     }
+    system_descriptors = {
+        path: descriptors[f"system:{path}"]
+        for _host_path, path in TRUSTED_SYSTEM_MOUNTS
+    }
     config_descriptors = {
         path: descriptors[f"config:{path}"] for path in GUEST_BOUND_CONFIG_PATHS
     }
     expected_argv = sandboxed_build_argv(
         core_descriptors,
+        system_descriptors,
         config_descriptors,
         "mess-store",
         "asterism_rebaseline_public",
@@ -4289,11 +6345,15 @@ def normalized_sandbox_sha256(attestation: dict[str, Any]) -> str:
         or not is_lower_hex(cargo_config.get("sha256"), SHA256)
     ):
         raise PreparationError("release sandbox Cargo config authority differs")
+    semantic_authority = validate_semantic_input_authority(
+        attestation.get("semantic_input_authority"), "release build"
+    )
     return hash_bytes(
         canonical_json(
             {
                 "argv": normalized,
                 "cargo_config_search_sha256": cargo_config["sha256"],
+                "semantic_runtime_sha256": semantic_authority["runtime_sha256"],
             }
         )
     )
@@ -4405,7 +6465,13 @@ def build_product_overlay_a(
     target.mkdir(parents=True)
     build_log_path = output / "logs" / "build-A-product-overlay.json"
     replay_sandboxed_cargo_config_search(config_binding, root, approved_toolchain)
-    build_argv, build_child, _stdout, _stderr = execute_sandboxed_build(
+    (
+        build_argv,
+        build_child,
+        _stdout,
+        _stderr,
+        semantic_input_authority,
+    ) = execute_sandboxed_build(
         root=root,
         target=target.resolve(),
         package="mess-store",
@@ -4480,6 +6546,7 @@ def build_product_overlay_a(
         "source_commit": claim["product_commit"],
         "source_read_only": True,
         "source_tree": claim["product_tree"],
+        "semantic_input_authority": semantic_input_authority,
         "target_dir": str(target.resolve()),
         "target_dir_was_absent": target_was_absent,
         "toolchain": approved_toolchain,
@@ -4782,6 +6849,7 @@ def build(
         }
     variants: dict[str, Any] = {}
     release_compile_out: dict[str, Any] | None = None
+    release_runtime_digests: set[str] = set()
     approved_toolchain = approval["toolchain"]
     for variant in VARIANTS:
         if toolchain_identity() != approved_toolchain:
@@ -4844,7 +6912,13 @@ def build(
         replay_sandboxed_cargo_config_search(
             config_binding, root, approved_toolchain
         )
-        build_argv, build_child, _build_stdout, build_stderr = (
+        (
+            build_argv,
+            build_child,
+            _build_stdout,
+            build_stderr,
+            semantic_input_authority,
+        ) = (
             execute_sandboxed_build(
                 root=root,
                 target=target.resolve(),
@@ -4858,6 +6932,9 @@ def build(
             )
         )
         validate_attested_child(build_child, f"{variant} build")
+        release_runtime_digests.add(
+            semantic_input_authority["runtime_sha256"]
+        )
         replay_sandboxed_cargo_config_search(
             config_binding, root, approved_toolchain
         )
@@ -4940,6 +7017,7 @@ def build(
             "source_commit": claim["product_commit"],
             "source_read_only": True,
             "source_tree": claim["product_tree"],
+            "semantic_input_authority": semantic_input_authority,
             "target_dir": str(target.resolve()),
             "target_dir_was_absent": target_was_absent,
             "toolchain": approved_toolchain,
@@ -4980,6 +7058,11 @@ def build(
             )
             if overlay_contract != contract:
                 raise PreparationError("proof-only A contract differs from ordinary A")
+            release_runtime_digests.add(
+                overlay_build["attestation"]["semantic_input_authority"][
+                    "runtime_sha256"
+                ]
+            )
             release_compile_out = produce_release_compile_out(
                 repository=repository,
                 output=output,
@@ -4991,6 +7074,10 @@ def build(
                 overlay_build=overlay_build,
                 overlay_binary=overlay_binary,
             )
+    if len(release_runtime_digests) != 1:
+        raise PreparationError(
+            "release builds used different semantic runtime authority"
+        )
     if release_compile_out is None:
         raise PreparationError("real-approval release compile-out proof was not produced")
     release_compile_out_path = output / "manifests" / "release-compile-out.json"
@@ -5393,17 +7480,163 @@ def source_review_and_compile_out_static_self_test() -> int:
         "cargo": 13,
         "rustc": 14,
         "cargo_home": 15,
-        "rustup_home": 16,
+    }
+    base_system_descriptors = {
+        guest_path: descriptor
+        for (_host_path, guest_path), descriptor in zip(
+            TRUSTED_SYSTEM_MOUNTS, range(16, 19), strict=True
+        )
     }
     base_config_descriptors = {
         guest_path: descriptor
         for guest_path, descriptor in zip(
-            GUEST_BOUND_CONFIG_PATHS, range(17, 21), strict=True
+            GUEST_BOUND_CONFIG_PATHS, range(19, 23), strict=True
         )
     }
+    def static_tree(role: str, digest: str, path: str) -> dict[str, Any]:
+        return {
+            "entry_count": 10,
+            "equal_pre_post": True,
+            "manifest_path": path,
+            "manifest_sha256": digest,
+            "mutation_events_absent": True,
+            "role": role,
+            "schema": RECURSIVE_TREE_AUTHORITY_SCHEMA,
+            "watch_count": 3,
+        }
+
+    runtime_components = {
+        "cargo_home": static_tree("cargo_home", "a" * SHA256, "/host/cargo.json"),
+        "toolchain": static_tree("toolchain", "b" * SHA256, "/host/toolchain.json"),
+        "trusted_system_closure": {
+            "entry_count": 30,
+            "manifest_path": "/host/system.json",
+            "mounts": [
+                {
+                    "device": 1,
+                    "gid": 0,
+                    "guest_path": guest_path,
+                    "host_path": guest_path,
+                    "inode": index + 1,
+                    "permissions": 0o755,
+                    "resolved_path": guest_path,
+                    "trusted_root_owned_non_writable": True,
+                    "uid": 0,
+                }
+                for index, (_host_path, guest_path) in enumerate(
+                    TRUSTED_SYSTEM_MOUNTS
+                )
+            ],
+            "mutation_events_absent": True,
+            "schema": TRUSTED_SYSTEM_CLOSURE_SCHEMA,
+            "sha256": "c" * SHA256,
+            "watch_count": 9,
+        },
+    }
+    semantic_authority = {
+        **runtime_components,
+        "runtime_sha256": semantic_runtime_sha256(runtime_components),
+        "schema": SEMANTIC_INPUT_AUTHORITY_SCHEMA,
+        "source": static_tree("source", "d" * SHA256, "/host/source.json"),
+    }
+    assert validate_semantic_input_authority(
+        semantic_authority, "static semantic authority"
+    ) == semantic_authority
+    scalar_mount = json.loads(json.dumps(semantic_authority))
+    scalar_mount["trusted_system_closure"]["mounts"][0] = "forged"
+    reject(
+        lambda: validate_semantic_input_authority(
+            scalar_mount, "static scalar closure mount"
+        ),
+        "scalar trusted-system closure mount",
+    )
+    short_mounts = json.loads(json.dumps(semantic_authority))
+    short_mounts["trusted_system_closure"]["mounts"].pop()
+    reject(
+        lambda: validate_semantic_input_authority(
+            short_mounts, "static short closure mounts"
+        ),
+        "short trusted-system closure mount list",
+    )
+    forged_mount_paths = json.loads(json.dumps(semantic_authority))
+    forged_mount_paths["trusted_system_closure"]["mounts"][0][
+        "host_path"
+    ] = "/forged"
+    forged_mount_paths["trusted_system_closure"]["mounts"][0][
+        "resolved_path"
+    ] = "/forged"
+    reject(
+        lambda: validate_semantic_input_authority(
+            forged_mount_paths, "static forged closure mount path"
+        ),
+        "forged trusted-system closure mount path",
+    )
+    forged_runtime_components = {
+        name: forged_mount_paths[name]
+        for name in ("cargo_home", "toolchain", "trusted_system_closure")
+    }
+    reject(
+        lambda: semantic_runtime_sha256(forged_runtime_components),
+        "forged trusted-system runtime mount path",
+    )
+    resolution_descriptors = {
+        name: descriptor
+        for name, descriptor in base_descriptors.items()
+        if name != "target"
+    }
+    resolution_argv = sandboxed_resolution_argv(
+        resolution_descriptors,
+        base_system_descriptors,
+        base_config_descriptors,
+        ["generate-lockfile", "--offline"],
+        "/usr/bin/bwrap",
+    )
+    assert all(
+        forbidden not in resolution_argv
+        for forbidden in ("--dev", "--dev-bind", "--proc")
+    )
+    assert ["--dir", "/dev"] == resolution_argv[
+        resolution_argv.index("/dev") - 1 : resolution_argv.index("/dev") + 1
+    ]
+    assert ["--dir", "/proc"] == resolution_argv[
+        resolution_argv.index("/proc") - 1 : resolution_argv.index("/proc") + 1
+    ]
+    observed_resolution_descriptors = resolution_sandbox_descriptors(
+        resolution_argv, "static resolution sandbox"
+    )
+    assert observed_resolution_descriptors == (
+        resolution_descriptors,
+        base_system_descriptors,
+        base_config_descriptors,
+    )
+    extra_resolution_binding = [
+        *resolution_argv,
+        "--ro-bind-fd",
+        "99",
+        "/forged",
+    ]
+    reject(
+        lambda: resolution_sandbox_descriptors(
+            extra_resolution_binding, "static extra resolution binding"
+        ),
+        "extra resolution descriptor binding",
+    )
+    aliased_resolution_binding = list(resolution_argv)
+    first_descriptor = aliased_resolution_binding.index("--ro-bind-fd") + 1
+    source_descriptor = aliased_resolution_binding.index("--bind-fd") + 1
+    aliased_resolution_binding[source_descriptor] = aliased_resolution_binding[
+        first_descriptor
+    ]
+    reject(
+        lambda: resolution_sandbox_descriptors(
+            aliased_resolution_binding, "static aliased resolution binding"
+        ),
+        "aliased resolution descriptor binding",
+    )
     base_attestation = {
         "build_argv": sandboxed_build_argv(
             base_descriptors,
+            base_system_descriptors,
             base_config_descriptors,
             "mess-store",
             "asterism_rebaseline_public",
@@ -5417,6 +7650,7 @@ def source_review_and_compile_out_static_self_test() -> int:
         },
         "cargo_lock_sha256": "6" * SHA256,
         "materialized_root": "/host/source",
+        "semantic_input_authority": semantic_authority,
         "target_dir": "/host/target",
         "toolchain": {
             "bwrap_path": "/usr/bin/bwrap",
@@ -5434,8 +7668,19 @@ def source_review_and_compile_out_static_self_test() -> int:
     relocated = json.loads(json.dumps(base_attestation))
     relocated["materialized_root"] = "/host/proof-source"
     relocated["target_dir"] = "/host/proof-target"
+    for component in ("source", "cargo_home", "toolchain"):
+        relocated["semantic_input_authority"][component]["manifest_path"] = (
+            f"/relocated/{component}.json"
+        )
+    relocated["semantic_input_authority"]["trusted_system_closure"][
+        "manifest_path"
+    ] = "/relocated/system.json"
     relocated["build_argv"] = sandboxed_build_argv(
         {name: descriptor + 20 for name, descriptor in base_descriptors.items()},
+        {
+            name: descriptor + 20
+            for name, descriptor in base_system_descriptors.items()
+        },
         {
             name: descriptor + 20
             for name, descriptor in base_config_descriptors.items()
@@ -5469,6 +7714,25 @@ def source_review_and_compile_out_static_self_test() -> int:
         role="overlay_a",
         artifact_role="proof_only",
         attestation=config_drift,
+        contract=contract,
+        approval_sha256="4" * SHA256,
+    )["sandbox_sha256"] != ordinary["sandbox_sha256"]
+    rejected += 1
+    runtime_drift = json.loads(json.dumps(relocated))
+    runtime_drift["semantic_input_authority"]["toolchain"][
+        "manifest_sha256"
+    ] = "e" * SHA256
+    runtime_drift_components = {
+        name: runtime_drift["semantic_input_authority"][name]
+        for name in ("cargo_home", "toolchain", "trusted_system_closure")
+    }
+    runtime_drift["semantic_input_authority"]["runtime_sha256"] = (
+        semantic_runtime_sha256(runtime_drift_components)
+    )
+    assert release_build_record(
+        role="overlay_a",
+        artifact_role="proof_only",
+        attestation=runtime_drift,
         contract=contract,
         approval_sha256="4" * SHA256,
     )["sandbox_sha256"] != ordinary["sandbox_sha256"]
@@ -5523,6 +7787,7 @@ def source_review_and_compile_out_static_self_test() -> int:
     reject(
         lambda: sandboxed_build_argv(
             duplicate_descriptors,
+            base_system_descriptors,
             base_config_descriptors,
             "mess-store",
             "asterism_rebaseline_public",
@@ -5535,6 +7800,7 @@ def source_review_and_compile_out_static_self_test() -> int:
     reject(
         lambda: sandboxed_build_argv(
             low_descriptors,
+            base_system_descriptors,
             base_config_descriptors,
             "mess-store",
             "asterism_rebaseline_public",
@@ -5549,6 +7815,7 @@ def source_review_and_compile_out_static_self_test() -> int:
     reject(
         lambda: sandboxed_build_argv(
             base_descriptors,
+            base_system_descriptors,
             duplicate_config_descriptors,
             "mess-store",
             "asterism_rebaseline_public",
@@ -5563,6 +7830,7 @@ def source_review_and_compile_out_static_self_test() -> int:
     reject(
         lambda: sandboxed_build_argv(
             base_descriptors,
+            base_system_descriptors,
             aliased_config_descriptors,
             "mess-store",
             "asterism_rebaseline_public",
@@ -5574,7 +7842,51 @@ def source_review_and_compile_out_static_self_test() -> int:
     return rejected
 
 
+def idempotent_freeze_static_self_test() -> None:
+    assert (
+        system_symlink_scope(Path("/usr/bin"), "tool", "/bin/sh")
+        == "within_closure"
+    )
+    assert (
+        system_symlink_scope(Path("/usr/bin"), "manual", "/usr/share/man")
+        == "guest_inaccessible_external"
+    )
+    try:
+        system_symlink_scope(Path("/usr/bin"), "hostile", "/proc/self/status")
+    except PreparationError:
+        pass
+    else:
+        raise PreparationError("trusted system symlink reached exposed /proc")
+    with tempfile.TemporaryDirectory(prefix="bn-ecm1-prepare-freeze-") as temporary:
+        temporary_root = Path(temporary).resolve(strict=True)
+        root = temporary_root / "source"
+        root.mkdir()
+        atomic_write(root / "input.rs", b"fn main() {}\n", mode=0o444)
+        root.chmod(0o555)
+        before = resample_recursive_manifest(
+            root,
+            "source",
+            "prepare freeze before",
+            allow_internal_symlinks=False,
+            hash_regular_contents=True,
+        )
+        make_read_only(root)
+        after = resample_recursive_manifest(
+            root,
+            "source",
+            "prepare freeze after",
+            allow_internal_symlinks=False,
+            hash_regular_contents=True,
+        )
+        if before != after:
+            raise PreparationError(
+                "idempotent final freeze changed recursive evidence"
+            )
+        root.chmod(0o755)
+
+
 def static_self_test() -> None:
+    idempotent_freeze_static_self_test()
     source_review_and_compile_out_static_self_test()
     plan = load_canonical(PLAN_PATH, PLAN_SCHEMA)
     assert APPROVAL_SCHEMA == "bn-2l3n-source-approval-v3"
@@ -6403,6 +8715,16 @@ async fn append_batch() {
         'locks = source_inputs["lock_manifest"].value',
         "build_env = sandboxed_cargo_environment(",
         "execute_sandboxed_build(",
+        "execute_sandboxed_resolution(",
+        'executable=f"/proc/self/fd/{bwrap_descriptor}"',
+        'source_guard.replay("post-resolution boundary")',
+        'toolchain_guard.replay("post-resolution boundary")',
+        'cargo_home_guard.replay("post-resolution boundary")',
+        'system_guard.replay("post-resolution boundary")',
+        'if (variant in {"C", "D"}) != isinstance(current_attempt, dict):',
+        'if variant in {"A", "B"} and current_attempt is not None:',
+        'or set(record) != expected_fields',
+        'authority = record["semantic_input_authority"]',
         'if argv[0] != artifact_leases["bwrap"][2]["path"]:',
         'execution_path = f"/proc/self/fd/{artifact_leases[\'bwrap\'][0]}"',
         "executable=execution_path,",
@@ -6419,11 +8741,121 @@ async fn append_batch() {
     build_source = production_source[
         production_source.index("def build(") :
     ]
+    resolution_source = production_source[
+        production_source.index("def sandboxed_resolution_argv(") :
+        production_source.index("def stage_locks(")
+    ]
+    release_sandbox_source = production_source[
+        production_source.index("def sandboxed_build_argv(") :
+        production_source.index("def expected_contract(")
+    ]
+    semantic_digest_source = production_source[
+        production_source.index("def semantic_runtime_sha256(") :
+        production_source.index("def system_symlink_scope(")
+    ]
+    semantic_validation_source = production_source[
+        production_source.index("def validate_semantic_input_authority(") :
+        production_source.index("def hash_file(")
+    ]
+    for marker in (
+        '"mounts",',
+        'mount.get("guest_path") != guest_path',
+        'mount.get("host_path") != str(host_path)',
+        'mount.get("resolved_path") != str(host_path)',
+        '"semantic runtime trusted-system mounts differ"',
+    ):
+        assert marker in semantic_digest_source
+    for marker in (
+        'mount.get("guest_path") != guest_path',
+        'mount.get("host_path") != str(host_path)',
+        'mount.get("resolved_path") != str(host_path)',
+    ):
+        assert marker in semantic_validation_source
+    assert '"--ro-bind",\n        "/",\n        "/"' not in resolution_source
+    assert '"--bind",\n        str(root)' not in resolution_source
+    for forbidden in ('"--dev-bind"', '"--dev"', '"--proc"'):
+        assert forbidden not in resolution_source
+    assert '"--dir",\n        "/dev"' in resolution_source
+    assert '"--dir",\n        "/proc"' in resolution_source
+    for forbidden in ('"--dev-bind"', '"--dev"', '"--proc"'):
+        assert forbidden not in release_sandbox_source
+    assert '"--dir",\n        "/dev"' in release_sandbox_source
+    assert '"--dir",\n        "/proc"' in release_sandbox_source
+    sandbox_environment_source = production_source[
+        production_source.index("def sandboxed_cargo_environment(") :
+        production_source.index("def frozen_runtime_environment(")
+    ]
+    assert (
+        '"GIT_CONFIG_GLOBAL": f"{GUEST_ROOT}/absent-gitconfig"'
+        in sandbox_environment_source
+    )
+    assert "toolchain[\"cargo_path\"]" not in resolution_source
+    assert '"--bind-fd"' in resolution_source
+    assert '"--ro-bind-fd"' in resolution_source
+    assert "GUEST_CARGO" in resolution_source
+    assert "def run(\n" not in production_source
+    for marker in (
+        "def system_symlink_scope(root: Path, relative: str, target: str) -> str:",
+        'for authority in ("/asterism", "/dev", "/proc", "/run", "/sys", "/tmp")',
+        '"trusted system symlink reaches mutable guest authority"',
+        '"symlink_scope": symlink_scope',
+    ):
+        assert marker in production_source
+    toolchain_source = production_source[
+        production_source.index("def checked_tool(") :
+        production_source.index("def validate_toolchain(")
+    ]
+    identity_source = toolchain_source[
+        toolchain_source.index("def toolchain_identity(") :
+    ]
+    assert "subprocess.run(" not in identity_source
+    for marker in (
+        'executable=f"/proc/self/fd/{descriptor}"',
+        "pass_fds=(descriptor,)",
+        'retain("rustup", rustup)',
+        'retain("bwrap", bwrap)',
+        'retain("git", git)',
+        'for component in ("cargo", "rustc"):',
+        "retain(component, lexical)",
+        "if active_replay != active_raw:",
+        "which_replay != which_outputs[component]",
+        "version_replay != version_outputs[component]",
+        'verify_all("final toolchain identity")',
+    ):
+        assert marker in toolchain_source
+    for forbidden in (
+        "hash_file(bwrap)",
+        "hash_file(cargo)",
+        "hash_file(git)",
+        "hash_file(rustc)",
+        "hash_file(rustup)",
+    ):
+        assert forbidden not in toolchain_source
     approval_validation_source = production_source[
         production_source.index("def validate_approval(") : production_source.index(
             "def write_approval("
         )
     ]
+    lock_validation_source = production_source[
+        production_source.index("def validate_lock_manifest(") :
+        production_source.index("def validate_current_children_authority(")
+    ]
+    assert 'if "semantic_input_authority" in record:' not in lock_validation_source
+    assert 'claim.get("current_lock_attempt")' in lock_validation_source
+    assert '"sandboxed_cargo_resolution"' in lock_validation_source
+    assert '"tracked_git_readback"' in lock_validation_source
+    for marker in (
+        "resolution_sandbox_descriptors(",
+        "validate_resolver_output_hashes(",
+        'record.get("exit_status") != 0',
+        'record.get("host_source_root") != str(expected_source_root)',
+        'record.get("passed_file_descriptors") != 13',
+        "replay_artifact_binding(",
+        '"generate-lockfile", "--offline"',
+        '"metadata",',
+        "current_lock_sha256",
+    ):
+        assert marker in lock_validation_source
     reviewed_snapshot_offset = approval_validation_source.index(
         "validate_source_review_authority("
     )

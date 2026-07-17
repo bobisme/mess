@@ -45,7 +45,7 @@ PRODUCT_TREE = "205d853905bdb648ee997900c6aef24a323aa380"
 PRODUCT_LOCK_SHA256 = "9c24189940d9b43d7798c6680c8aeab6ddc270ef9b450390334d9327405cbea0"
 PRODUCT_ENGINE_SHA256 = "c995c27d8fff3e1ddfffdb700dfc94160a99ea0c7fe731017d3f1db99d7b59e7"
 PRODUCT_OVERLAY_VALIDATOR_SCHEMA = "bn-xfw3-product-test-overlay-validator-v1"
-ATTESTATION_SCHEMA = "bn-30fs-current-children-build-v1"
+ATTESTATION_SCHEMA = "bn-ecm1-current-children-build-v2"
 CONSTRUCTION_SCHEMA = "bn-30fs-current-children-construction-v1"
 SELF_TEST_SCHEMA = "bn-30fs-build-children-self-test-v1"
 TOOLS_SCHEMA = "asterism-rebaseline-tools-v3"
@@ -225,7 +225,15 @@ GUEST_TOOLCHAIN_ROOT = "/asterism/toolchain"
 GUEST_CARGO = f"{GUEST_TOOLCHAIN_ROOT}/bin/cargo"
 GUEST_RUSTC = f"{GUEST_TOOLCHAIN_ROOT}/bin/rustc"
 CARGO_CONFIG_SEARCH_SCHEMA = "bn-30fs-build-cargo-config-search-v1"
-CARGO_HOME_TREE_SCHEMA = "bn-30fs-build-cargo-home-tree-v1"
+SEMANTIC_INPUT_AUTHORITY_SCHEMA = "bn-ecm1-semantic-input-authority-v1"
+RECURSIVE_TREE_AUTHORITY_SCHEMA = "bn-ecm1-recursive-tree-authority-v1"
+TRUSTED_SYSTEM_CLOSURE_SCHEMA = "bn-ecm1-trusted-system-closure-v1"
+CARGO_HOME_TREE_SCHEMA = RECURSIVE_TREE_AUTHORITY_SCHEMA
+TRUSTED_SYSTEM_MOUNTS = (
+    (Path("/usr/bin"), "/usr/bin"),
+    (Path("/usr/lib"), "/usr/lib"),
+    (Path("/usr/include"), "/usr/include"),
+)
 INOTIFY_EVENT_HEADER = struct.Struct("iIII")
 INOTIFY_MUTATION_MASK = (
     0x00000002  # IN_MODIFY
@@ -266,6 +274,93 @@ def canonical_bytes(value: Any) -> bytes:
 
 def sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
+
+
+def semantic_runtime_sha256(components: Mapping[str, Mapping[str, Any]]) -> str:
+    """Hash runtime semantics while excluding relocatable evidence pathnames."""
+
+    tree_fields = (
+        "schema",
+        "role",
+        "manifest_sha256",
+        "entry_count",
+        "watch_count",
+        "equal_pre_post",
+        "mutation_events_absent",
+    )
+    closure_fields = (
+        "schema",
+        "sha256",
+        "entry_count",
+        "mounts",
+        "watch_count",
+        "mutation_events_absent",
+    )
+    if set(components) != {
+        "cargo_home",
+        "toolchain",
+        "trusted_system_closure",
+    }:
+        raise BuildError("semantic runtime authority components differ")
+    closure = components["trusted_system_closure"]
+    mounts = closure.get("mounts")
+    if (
+        not isinstance(mounts, list)
+        or len(mounts) != len(TRUSTED_SYSTEM_MOUNTS)
+        or any(
+            not isinstance(mount, Mapping)
+            or mount.get("guest_path") != guest_path
+            or mount.get("host_path") != str(host_path)
+            or mount.get("resolved_path") != str(host_path)
+            for mount, (host_path, guest_path) in zip(
+                mounts, TRUSTED_SYSTEM_MOUNTS, strict=True
+            )
+        )
+    ):
+        raise BuildError("semantic runtime trusted-system mounts differ")
+    normalized = {
+        "cargo_home": {
+            field: components["cargo_home"].get(field) for field in tree_fields
+        },
+        "schema": SEMANTIC_INPUT_AUTHORITY_SCHEMA,
+        "toolchain": {
+            field: components["toolchain"].get(field) for field in tree_fields
+        },
+        "trusted_system_closure": {
+            field: closure.get(field)
+            for field in closure_fields
+        },
+    }
+    return sha256_bytes(canonical_bytes(normalized))
+
+
+def system_symlink_scope(root: Path, relative: str, target: str) -> str:
+    raw_guest = (
+        PurePosixPath(target)
+        if PurePosixPath(target).is_absolute()
+        else PurePosixPath(str(root)) / PurePosixPath(relative).parent / target
+    )
+    rendered = os.path.normpath(str(raw_guest))
+    for alias, destination in (
+        ("/bin", "/usr/bin"),
+        ("/lib", "/usr/lib"),
+        ("/lib64", "/usr/lib"),
+    ):
+        if rendered == alias or rendered.startswith(alias + "/"):
+            rendered = destination + rendered.removeprefix(alias)
+            break
+    exposed = tuple(guest for _host, guest in TRUSTED_SYSTEM_MOUNTS)
+    if any(
+        rendered == authority or rendered.startswith(authority + "/")
+        for authority in exposed
+    ):
+        return "within_closure"
+    if any(
+        rendered == authority or rendered.startswith(authority + "/")
+        for authority in ("/asterism", "/dev", "/proc", "/run", "/sys", "/tmp")
+    ):
+        raise BuildError("trusted system symlink reaches mutable guest authority")
+    return "guest_inaccessible_external"
 
 
 def sha256_file(path: Path) -> str:
@@ -1649,13 +1744,17 @@ def make_read_only(root: Path) -> None:
         if path.is_symlink():
             raise BuildError(f"cannot freeze symlink: {path}")
         if path.is_dir():
-            path.chmod(0o555)
+            if stat.S_IMODE(path.stat().st_mode) != 0o555:
+                path.chmod(0o555)
         elif path.is_file():
             executable = bool(stat.S_IMODE(path.stat().st_mode) & 0o111)
-            path.chmod(0o555 if executable else 0o444)
+            desired = 0o555 if executable else 0o444
+            if stat.S_IMODE(path.stat().st_mode) != desired:
+                path.chmod(desired)
         else:
             raise BuildError(f"cannot freeze unsupported path: {path}")
-    root.chmod(0o555)
+    if stat.S_IMODE(root.stat().st_mode) != 0o555:
+        root.chmod(0o555)
 
 
 def install_lock(root: Path, lock_payload: bytes) -> None:
@@ -1799,7 +1898,7 @@ def cargo_environment(
         "CARGO_INCREMENTAL": "0",
         "CARGO_NET_OFFLINE": "true",
         "GIT_CONFIG_COUNT": "0",
-        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_GLOBAL": f"{GUEST_ROOT}/absent-gitconfig",
         "GIT_CONFIG_NOSYSTEM": "1",
         "HOME": "/nonexistent",
         "LANG": "C.UTF-8",
@@ -1822,6 +1921,7 @@ def cargo_environment(
 def sandboxed_build_argv(
     *,
     toolchain: Mapping[str, str],
+    trusted_system_args: Sequence[str],
     source_ro_bind: Sequence[str],
     toolchain_ro_bind: Sequence[str],
     cargo_bind: Sequence[str],
@@ -1838,13 +1938,10 @@ def sandboxed_build_argv(
         "--die-with-parent",
         "--new-session",
         "--unshare-net",
-        "--ro-bind",
-        "/",
-        "/",
-        "--dev-bind",
+        *trusted_system_args,
+        "--dir",
         "/dev",
-        "/dev",
-        "--proc",
+        "--dir",
         "/proc",
         "--tmpfs",
         "/tmp",
@@ -2103,6 +2200,530 @@ class BoundBuildDirectory:
         return False
 
 
+class RecursiveTreeAuthorityGuard:
+    """Retain, recursively attest, and mutation-watch one semantic input tree."""
+
+    def __init__(
+        self,
+        path: Path,
+        evidence_path: Path,
+        role: str,
+        context: str,
+        *,
+        allow_internal_symlinks: bool,
+        hash_regular_contents: bool = True,
+        trusted_system_roots: Sequence[Path] = (),
+    ) -> None:
+        self.path = path
+        self.evidence_path = evidence_path
+        self.role = role
+        self.context = context
+        self.allow_internal_symlinks = allow_internal_symlinks
+        self.hash_regular_contents = hash_regular_contents
+        self.trusted_system_roots = tuple(trusted_system_roots)
+        self.stack = ExitStack()
+        self.root_guard: BoundBuildDirectory | None = None
+        self.evidence: RetainedFile | None = None
+        self.inotify_descriptor = -1
+        self.watch_descriptors: set[int] = set()
+        self.initial_manifest: dict[str, Any] | None = None
+        self.binding: dict[str, Any] | None = None
+        self.poisoned = False
+        self.active = False
+
+    def _initialize_inotify(self) -> None:
+        library = ctypes.CDLL(None, use_errno=True)
+        try:
+            initialize = library.inotify_init1
+            add_watch = library.inotify_add_watch
+        except AttributeError as error:
+            raise BuildError(f"{self.context} inotify API is unavailable") from error
+        initialize.argtypes = [ctypes.c_int]
+        initialize.restype = ctypes.c_int
+        add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        add_watch.restype = ctypes.c_int
+        descriptor = initialize(os.O_CLOEXEC | os.O_NONBLOCK)
+        if descriptor < 0:
+            errno = ctypes.get_errno()
+            raise BuildError(f"{self.context} inotify initialization failed: {errno}")
+        self.inotify_descriptor = descriptor
+        self._inotify_add_watch = add_watch
+        self.stack.callback(self._close_inotify)
+
+    def _close_inotify(self) -> None:
+        if self.inotify_descriptor >= 0:
+            os.close(self.inotify_descriptor)
+            self.inotify_descriptor = -1
+
+    def _add_directory_watch(self, descriptor: int) -> None:
+        watch = self._inotify_add_watch(
+            self.inotify_descriptor,
+            os.fsencode(f"/proc/self/fd/{descriptor}"),
+            INOTIFY_MUTATION_MASK | 0x01000000,  # IN_ONLYDIR
+        )
+        if watch < 0:
+            errno = ctypes.get_errno()
+            raise BuildError(f"{self.context} inotify watch failed: {errno}")
+        self.watch_descriptors.add(watch)
+
+    def _drain_mutation_events(self, boundary: str) -> None:
+        if self.poisoned or self.inotify_descriptor < 0:
+            raise BuildError(f"{self.context} mutation guard is poisoned")
+        observed: list[tuple[int, int, int, int]] = []
+        try:
+            while True:
+                try:
+                    payload = os.read(self.inotify_descriptor, 1024 * 1024)
+                except BlockingIOError:
+                    break
+                if not payload:
+                    raise BuildError(
+                        f"{self.context} inotify queue closed at {boundary}"
+                    )
+                offset = 0
+                while offset < len(payload):
+                    if len(payload) - offset < INOTIFY_EVENT_HEADER.size:
+                        raise BuildError(
+                            f"{self.context} malformed inotify header at {boundary}"
+                        )
+                    event = INOTIFY_EVENT_HEADER.unpack_from(payload, offset)
+                    event_size = INOTIFY_EVENT_HEADER.size + event[3]
+                    if event_size > len(payload) - offset:
+                        raise BuildError(
+                            f"{self.context} malformed inotify event at {boundary}"
+                        )
+                    observed.append(event)
+                    offset += event_size
+        except OSError as error:
+            self.poisoned = True
+            raise BuildError(
+                f"{self.context} inotify read failed at {boundary}"
+            ) from error
+        if observed:
+            self.poisoned = True
+            masks = sorted({event[1] for event in observed})
+            raise BuildError(
+                f"{self.context} mutation events at {boundary}: {masks}"
+            )
+
+    def _trusted_system_entry(
+        self, metadata: os.stat_result, relative: str, *, symlink: bool = False
+    ) -> None:
+        if self.trusted_system_roots and (
+            metadata.st_uid != 0
+            or (not symlink and stat.S_IMODE(metadata.st_mode) & 0o022)
+            or (
+                not symlink
+                and os.access(
+                    self.path if relative == "." else self.path / relative,
+                    os.W_OK,
+                )
+            )
+        ):
+            raise BuildError(
+                f"{self.context} trusted system entry is writable: {relative}"
+            )
+
+    def _regular_entry(
+        self,
+        parent_descriptor: int,
+        name: str,
+        relative: str,
+        selected: os.stat_result,
+    ) -> dict[str, Any]:
+        flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+        try:
+            opened_before = os.fstat(descriptor)
+            if not same_manifest_metadata(selected, opened_before):
+                raise BuildError(f"{self.context} file selection changed")
+            digest = None
+            if self.hash_regular_contents:
+                hasher = hashlib.sha256()
+                offset = 0
+                while offset < opened_before.st_size:
+                    chunk = os.pread(
+                        descriptor,
+                        min(1024 * 1024, opened_before.st_size - offset),
+                        offset,
+                    )
+                    if not chunk:
+                        raise BuildError(f"{self.context} file read made no progress")
+                    hasher.update(chunk)
+                    offset += len(chunk)
+                digest = hasher.hexdigest()
+            opened_after = os.fstat(descriptor)
+            selected_after = os.stat(
+                name, dir_fd=parent_descriptor, follow_symlinks=False
+            )
+            if (
+                not same_manifest_metadata(opened_before, opened_after)
+                or not same_manifest_metadata(opened_after, selected_after)
+            ):
+                raise BuildError(f"{self.context} file changed while snapshotting")
+        finally:
+            os.close(descriptor)
+        self._trusted_system_entry(selected, relative)
+        return self._entry_record(selected, relative, "regular", digest, None)
+
+    def _entry_record(
+        self,
+        metadata: os.stat_result,
+        relative: str,
+        file_type: str,
+        digest: str | None,
+        symlink_target: str | None,
+        symlink_scope: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "changed_ns": metadata.st_ctime_ns,
+            "device": metadata.st_dev,
+            "file_type": file_type,
+            "gid": metadata.st_gid,
+            "inode": metadata.st_ino,
+            "link_count": metadata.st_nlink,
+            "modified_ns": metadata.st_mtime_ns,
+            "path": relative,
+            "permissions": stat.S_IMODE(metadata.st_mode),
+            "sha256": digest,
+            "size": metadata.st_size,
+            "symlink_target": symlink_target,
+            "symlink_scope": symlink_scope,
+            "uid": metadata.st_uid,
+        }
+
+    def _symlink_entry(
+        self,
+        descriptor: int,
+        name: str,
+        relative: str,
+        selected: os.stat_result,
+    ) -> dict[str, Any]:
+        if not self.allow_internal_symlinks:
+            raise BuildError(f"{self.context} contains a symlink: {relative}")
+        target = os.readlink(name, dir_fd=descriptor)
+        selected_after = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        if not same_manifest_metadata(selected, selected_after):
+            raise BuildError(f"{self.context} symlink changed while snapshotting")
+        candidate = self.path / Path(relative).parent / target
+        try:
+            candidate.resolve(strict=True)
+        except OSError as error:
+            raise BuildError(f"{self.context} symlink target is unresolved") from error
+        if not self.trusted_system_roots:
+            resolved = candidate.resolve(strict=True)
+            if resolved != self.path and self.path not in resolved.parents:
+                raise BuildError(f"{self.context} symlink escapes the retained root")
+            scope = "within_root"
+        else:
+            scope = system_symlink_scope(self.path, relative, target)
+        self._trusted_system_entry(selected, relative, symlink=True)
+        return self._entry_record(
+            selected,
+            relative,
+            "symlink",
+            sha256_bytes(os.fsencode(target)),
+            target,
+            scope,
+        )
+
+    def _manifest(self, *, install_watches: bool) -> dict[str, Any]:
+        if self.root_guard is None:
+            raise BuildError(f"{self.context} root guard is absent")
+        directory_flags = (
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        root_descriptor = os.open(
+            ".", directory_flags, dir_fd=self.root_guard.descriptor
+        )
+        entries: list[dict[str, Any]] = []
+
+        def walk(descriptor: int, relative: str) -> None:
+            before = os.fstat(descriptor)
+            self._trusted_system_entry(before, relative)
+            if install_watches:
+                self._add_directory_watch(descriptor)
+            entries.append(
+                self._entry_record(before, relative, "directory", None, None)
+            )
+            names = sorted(os.listdir(descriptor))
+            if len(names) != len(set(names)):
+                raise BuildError(f"{self.context} names alias")
+            for name in names:
+                child_relative = name if relative == "." else f"{relative}/{name}"
+                selected = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                if stat.S_ISDIR(selected.st_mode):
+                    child = os.open(name, directory_flags, dir_fd=descriptor)
+                    try:
+                        if not same_manifest_metadata(selected, os.fstat(child)):
+                            raise BuildError(
+                                f"{self.context} directory selection changed"
+                            )
+                        walk(child, child_relative)
+                    finally:
+                        os.close(child)
+                elif stat.S_ISREG(selected.st_mode):
+                    entries.append(
+                        self._regular_entry(
+                            descriptor, name, child_relative, selected
+                        )
+                    )
+                elif stat.S_ISLNK(selected.st_mode):
+                    entries.append(
+                        self._symlink_entry(
+                            descriptor, name, child_relative, selected
+                        )
+                    )
+                else:
+                    raise BuildError(
+                        f"{self.context} contains an unsupported node: {child_relative}"
+                    )
+            after = os.fstat(descriptor)
+            if not same_manifest_metadata(before, after):
+                raise BuildError(f"{self.context} directory changed during traversal")
+
+        try:
+            walk(root_descriptor, ".")
+        finally:
+            os.close(root_descriptor)
+        hardlinks: dict[tuple[int, int], list[dict[str, Any]]] = {}
+        for entry in entries:
+            if entry["file_type"] == "regular":
+                hardlinks.setdefault((entry["device"], entry["inode"]), []).append(
+                    entry
+                )
+        for aliases in hardlinks.values():
+            if (
+                not self.trusted_system_roots
+                and len(aliases) != aliases[0]["link_count"]
+            ):
+                raise BuildError(f"{self.context} hard link escapes the retained tree")
+        if install_watches:
+            directory_count = sum(
+                entry["file_type"] == "directory" for entry in entries
+            )
+            if len(self.watch_descriptors) != directory_count:
+                raise BuildError(f"{self.context} recursive watch coverage differs")
+        return {
+            "entries": entries,
+            "role": self.role,
+            "schema": RECURSIVE_TREE_AUTHORITY_SCHEMA,
+        }
+
+    def __enter__(self) -> RecursiveTreeAuthorityGuard:
+        try:
+            self.root_guard = self.stack.enter_context(
+                BoundBuildDirectory(self.path, f"{self.context} root")
+            )
+            self._initialize_inotify()
+            first = self._manifest(install_watches=True)
+            self._drain_mutation_events("initial manifest")
+            second = self._manifest(install_watches=False)
+            self._drain_mutation_events("matching manifest")
+            if first != second:
+                raise BuildError(f"{self.context} initial manifests differ")
+            payload = canonical_bytes(second)
+            write_new(self.evidence_path, payload, 0o444)
+            self.evidence = self.stack.enter_context(
+                RetainedFile(
+                    self.evidence_path,
+                    f"{self.context} manifest evidence",
+                    expected_sha256=sha256_bytes(payload),
+                    require_executable=False,
+                )
+            )
+            self.initial_manifest = second
+            self.binding = {
+                "entry_count": len(second["entries"]),
+                "equal_pre_post": False,
+                "manifest_path": str(self.evidence_path.resolve()),
+                "manifest_sha256": sha256_bytes(payload),
+                "mutation_events_absent": True,
+                "role": self.role,
+                "schema": RECURSIVE_TREE_AUTHORITY_SCHEMA,
+                "watch_count": len(self.watch_descriptors),
+            }
+            self.active = True
+        except Exception:
+            self.stack.close()
+            raise
+        return self
+
+    @property
+    def pass_fds(self) -> tuple[int, ...]:
+        if not self.active or self.root_guard is None:
+            raise BuildError(f"{self.context} recursive guard is inactive")
+        return self.root_guard.pass_fds
+
+    def bwrap_bind(self, destination: str) -> tuple[str, str, str]:
+        if self.root_guard is None:
+            raise BuildError(f"{self.context} recursive guard root is absent")
+        return self.root_guard.bwrap_bind(destination, read_only=True)
+
+    def replay(self, boundary: str) -> dict[str, Any]:
+        if not self.active or self.initial_manifest is None or self.binding is None:
+            raise BuildError(f"{self.context} recursive guard is inactive")
+        self._drain_mutation_events(f"{boundary} before replay")
+        observed = self._manifest(install_watches=False)
+        if observed != self.initial_manifest:
+            self.poisoned = True
+            raise BuildError(f"{self.context} recursive manifest changed")
+        self._drain_mutation_events(f"{boundary} after replay")
+        if self.evidence is None:
+            raise BuildError(f"{self.context} manifest evidence is absent")
+        self.evidence.verify()
+        self.binding["equal_pre_post"] = True
+        return dict(self.binding)
+
+    def __exit__(self, child_type: Any, child_error: Any, traceback: Any) -> bool:
+        verification_error = None
+        try:
+            if self.active:
+                self.replay("guard close")
+        except BuildError as error:
+            verification_error = error
+        finally:
+            self.active = False
+            self.stack.close()
+        if verification_error is not None:
+            raise verification_error
+        return False
+
+
+class TrustedSystemClosureGuard:
+    """Expose only recursively verified, immutable system build dependencies."""
+
+    def __init__(self, evidence_root: Path, label: str) -> None:
+        self.evidence_root = evidence_root
+        self.label = label
+        self.stack = ExitStack()
+        self.guards: list[tuple[str, RecursiveTreeAuthorityGuard]] = []
+        self.evidence: RetainedFile | None = None
+        self.binding: dict[str, Any] | None = None
+
+    def __enter__(self) -> TrustedSystemClosureGuard:
+        roots = tuple(path.resolve(strict=True) for path, _ in TRUSTED_SYSTEM_MOUNTS)
+        if len(set(roots)) != len(roots):
+            raise BuildError("trusted system closure roots alias")
+        manifests = []
+        try:
+            for (host_path, guest_path), root in zip(
+                TRUSTED_SYSTEM_MOUNTS, roots, strict=True
+            ):
+                if host_path != root or not root.is_dir():
+                    raise BuildError(f"trusted system mount is aliased: {host_path}")
+                role = "system-" + guest_path.removeprefix("/").replace("/", "-")
+                guard = self.stack.enter_context(
+                    RecursiveTreeAuthorityGuard(
+                        root,
+                        self.evidence_root / f"{self.label}-{role}.json",
+                        role,
+                        f"{self.label} trusted {guest_path}",
+                        allow_internal_symlinks=True,
+                        hash_regular_contents=False,
+                        trusted_system_roots=roots,
+                    )
+                )
+                self.guards.append((guest_path, guard))
+                assert guard.initial_manifest is not None
+                manifests.append(
+                    {
+                        "guest_path": guest_path,
+                        "host_path": str(host_path),
+                        "resolved_path": str(root),
+                        "tree": guard.initial_manifest,
+                    }
+                )
+            payload = canonical_bytes(
+                {"mounts": manifests, "schema": TRUSTED_SYSTEM_CLOSURE_SCHEMA}
+            )
+            evidence_path = self.evidence_root / f"{self.label}-system-closure.json"
+            write_new(evidence_path, payload, 0o444)
+            self.evidence = self.stack.enter_context(
+                RetainedFile(
+                    evidence_path,
+                    f"{self.label} trusted system closure evidence",
+                    expected_sha256=sha256_bytes(payload),
+                    require_executable=False,
+                )
+            )
+            entry_count = sum(
+                len(item["tree"]["entries"]) for item in manifests
+            )
+            watch_count = sum(len(guard.watch_descriptors) for _, guard in self.guards)
+            self.binding = {
+                "entry_count": entry_count,
+                "manifest_path": str(evidence_path.resolve()),
+                "mounts": [
+                    {
+                        "device": item["tree"]["entries"][0]["device"],
+                        "gid": item["tree"]["entries"][0]["gid"],
+                        "guest_path": item["guest_path"],
+                        "host_path": item["host_path"],
+                        "inode": item["tree"]["entries"][0]["inode"],
+                        "permissions": item["tree"]["entries"][0]["permissions"],
+                        "resolved_path": item["resolved_path"],
+                        "trusted_root_owned_non_writable": True,
+                        "uid": item["tree"]["entries"][0]["uid"],
+                    }
+                    for item in manifests
+                ],
+                "mutation_events_absent": True,
+                "schema": TRUSTED_SYSTEM_CLOSURE_SCHEMA,
+                "sha256": sha256_bytes(payload),
+                "watch_count": watch_count,
+            }
+        except Exception:
+            self.stack.close()
+            raise
+        return self
+
+    @property
+    def pass_fds(self) -> tuple[int, ...]:
+        descriptors = tuple(
+            descriptor
+            for _, guard in self.guards
+            for descriptor in guard.pass_fds
+        )
+        if len(descriptors) != len(set(descriptors)):
+            raise BuildError("trusted system closure descriptors alias")
+        return descriptors
+
+    def bwrap_args(self) -> list[str]:
+        arguments = ["--dir", "/usr"]
+        for guest_path, guard in self.guards:
+            arguments.extend(guard.bwrap_bind(guest_path))
+        arguments.extend(
+            [
+                "--symlink",
+                "usr/bin",
+                "/bin",
+                "--symlink",
+                "usr/lib",
+                "/lib",
+                "--symlink",
+                "usr/lib",
+                "/lib64",
+            ]
+        )
+        return arguments
+
+    def replay(self, boundary: str) -> dict[str, Any]:
+        for _, guard in self.guards:
+            guard.replay(boundary)
+        if self.binding is None or self.evidence is None:
+            raise BuildError("trusted system closure binding is absent")
+        self.evidence.verify()
+        return dict(self.binding)
+
+    def __exit__(self, child_type: Any, child_error: Any, traceback: Any) -> bool:
+        self.stack.close()
+        return False
+
+
 class CargoConfigSearchGuard:
     """Freeze and attest the exact eight Cargo config selections in the guest."""
 
@@ -2331,6 +2952,7 @@ class CargoConfigSearchGuard:
             "sha256": digest.hexdigest(),
             "size": selected.st_size,
             "symlink_target": None,
+            "symlink_scope": None,
             "uid": selected.st_uid,
         }
 
@@ -2361,6 +2983,7 @@ class CargoConfigSearchGuard:
                 "sha256": None,
                 "size": metadata.st_size,
                 "symlink_target": None,
+                "symlink_scope": None,
                 "uid": metadata.st_uid,
             }
 
@@ -2427,6 +3050,7 @@ class CargoConfigSearchGuard:
                             "sha256": sha256_bytes(os.fsencode(target)),
                             "size": selected.st_size,
                             "symlink_target": target,
+                            "symlink_scope": "within_root",
                             "uid": selected.st_uid,
                         }
                     )
@@ -2461,7 +3085,11 @@ class CargoConfigSearchGuard:
             )
             if len(self.watch_descriptors) != directory_count:
                 raise BuildError(f"{self.context} Cargo-home watch coverage differs")
-        return {"entries": entries, "schema": CARGO_HOME_TREE_SCHEMA}
+        return {
+            "entries": entries,
+            "role": "cargo_home",
+            "schema": CARGO_HOME_TREE_SCHEMA,
+        }
 
     def _capture_cargo_home_tree_authority(self) -> None:
         self._initialize_inotify()
@@ -2881,6 +3509,7 @@ def run_build(
     config_postbuild = None
     execution_tools = None
     toolchain_manifest_binding = None
+    semantic_input_authority = None
     cargo_path = Path(toolchain["cargo_path"])
     rustc_path = Path(toolchain["rustc_path"])
     toolchain_root = cargo_path.parent.parent
@@ -2920,9 +3549,6 @@ def run_build(
                 trusted_system=True,
             )
         )
-        toolchain_guard = stack.enter_context(
-            BoundBuildDirectory(toolchain_root, f"{kind} toolchain root bind")
-        )
         target_guard = stack.enter_context(
             BoundBuildDirectory(target, f"{kind} target bind")
         )
@@ -2939,6 +3565,24 @@ def run_build(
                 f"{kind} materialized source tree",
             )
         )
+        source_tree_guard = stack.enter_context(
+            RecursiveTreeAuthorityGuard(
+                materialized["root"],
+                output / "manifests" / f"semantic-source-{kind}.json",
+                "source",
+                f"{kind} semantic source tree",
+                allow_internal_symlinks=False,
+            )
+        )
+        toolchain_guard = stack.enter_context(
+            RecursiveTreeAuthorityGuard(
+                toolchain_root,
+                output / "manifests" / f"semantic-toolchain-{kind}.json",
+                "toolchain",
+                f"{kind} semantic toolchain tree",
+                allow_internal_symlinks=True,
+            )
+        )
         config_guard = stack.enter_context(
             CargoConfigSearchGuard(
                 materialized["root"],
@@ -2947,6 +3591,9 @@ def run_build(
                 output / "manifests" / f"cargo-home-{kind}.json",
                 f"{kind} Cargo config search",
             )
+        )
+        system_guard = stack.enter_context(
+            TrustedSystemClosureGuard(output / "manifests", kind)
         )
         lock_before = immutable_snapshot_record(
             guard.pre_build,
@@ -2974,7 +3621,7 @@ def run_build(
             "/asterism/target", read_only=False
         )
         toolchain_ro_bind = toolchain_guard.bwrap_bind(
-            GUEST_TOOLCHAIN_ROOT, read_only=True
+            GUEST_TOOLCHAIN_ROOT
         )
         cargo_bind = ("--ro-bind-fd", str(cargo_lease.descriptor), GUEST_CARGO)
         rustc_bind = ("--ro-bind-fd", str(rustc_lease.descriptor), GUEST_RUSTC)
@@ -2990,6 +3637,7 @@ def run_build(
             + target_guard.pass_fds
             + toolchain_guard.pass_fds
             + config_guard.pass_fds
+            + system_guard.pass_fds
             + cargo_lease.pass_fds
             + rustc_lease.pass_fds
             + python_lease.pass_fds
@@ -3011,33 +3659,20 @@ def run_build(
             inherited_descriptors += (wrapper_descriptor, *receipt_guard.pass_fds)
         if len(set(inherited_descriptors)) != len(inherited_descriptors):
             raise BuildError(f"{kind} inherited bind descriptors alias")
-        toolchain_manifest_prebuild = file_manifest(toolchain_root)
-        toolchain_manifest_payload = canonical_bytes(toolchain_manifest_prebuild)
-        toolchain_manifest_path = (
-            output / "manifests" / f"toolchain-{kind}.json"
-        )
-        write_new(toolchain_manifest_path, toolchain_manifest_payload, 0o444)
-        toolchain_manifest_lease = stack.enter_context(
-            RetainedFile(
-                toolchain_manifest_path,
-                f"{kind} toolchain manifest evidence",
-                expected_sha256=sha256_bytes(toolchain_manifest_payload),
-                require_executable=False,
-            )
-        )
-        toolchain_manifest_binding = {
-            "entry_count": len(toolchain_manifest_prebuild["entries"]),
-            "equal_pre_post": False,
-            "path": str(toolchain_manifest_path.resolve()),
-            "post_sha256": None,
-            "pre_sha256": sha256_bytes(toolchain_manifest_payload),
-        }
-        del toolchain_manifest_payload
-        del toolchain_manifest_prebuild
+        if os.fstat(source_tree_guard.pass_fds[0]).st_ino != os.fstat(
+            guard.pass_fds[0]
+        ).st_ino or os.fstat(source_tree_guard.pass_fds[0]).st_dev != os.fstat(
+            guard.pass_fds[0]
+        ).st_dev:
+            raise BuildError(f"{kind} source authority descriptors differ")
+        source_tree_guard.replay("pre-Cargo launch")
+        toolchain_guard.replay("pre-Cargo launch")
+        system_guard.replay("pre-Cargo launch")
         config_prebuild = config_guard.replay(boundary="pre-Cargo launch")
         cargo_config_args = config_guard.prepare_bwrap_args()
         argv = sandboxed_build_argv(
             toolchain=toolchain,
+            trusted_system_args=system_guard.bwrap_args(),
             source_ro_bind=source_ro_bind,
             toolchain_ro_bind=toolchain_ro_bind,
             cargo_bind=cargo_bind,
@@ -3059,21 +3694,9 @@ def run_build(
                 raise BuildError(
                     f"{kind} Cargo config changed across Cargo execution"
                 )
-            toolchain_manifest_postbuild = file_manifest(toolchain_root)
-            post_payload = canonical_bytes(toolchain_manifest_postbuild)
-            post_sha256 = sha256_bytes(post_payload)
-            assert toolchain_manifest_binding is not None
-            if (
-                post_sha256 != toolchain_manifest_binding["pre_sha256"]
-                or len(toolchain_manifest_postbuild["entries"])
-                != toolchain_manifest_binding["entry_count"]
-            ):
-                raise BuildError(
-                    f"{kind} toolchain tree changed across Cargo execution"
-                )
-            toolchain_manifest_binding["post_sha256"] = post_sha256
-            toolchain_manifest_binding["equal_pre_post"] = True
-            toolchain_manifest_lease.verify()
+            source_tree_guard.replay("post-Cargo boundary")
+            toolchain_guard.replay("post-Cargo boundary")
+            system_guard.replay("post-Cargo boundary")
             for lease in (bwrap_lease, cargo_lease, rustc_lease, python_lease):
                 lease.verify()
 
@@ -3093,7 +3716,7 @@ def run_build(
             "cargo": cargo_lease.record(),
             "python": python_lease.record(),
             "rustc": rustc_lease.record(),
-            "toolchain_root": toolchain_guard.pre_bind,
+            "toolchain_root": toolchain_guard.root_guard.pre_bind,
         }
         after = file_manifest(materialized["root"])
         if after != materialized["manifest"]:
@@ -3131,6 +3754,38 @@ def run_build(
                 wrapper_identity,
                 f"{kind} copied workspace wrapper",
             )
+        assert source_tree_guard.binding is not None
+        assert toolchain_guard.binding is not None
+        assert system_guard.binding is not None
+        cargo_home_tree = config_postbuild["cargo_home_tree"]
+        cargo_home_authority = {
+            "entry_count": cargo_home_tree["entry_count"],
+            "equal_pre_post": cargo_home_tree["equal_pre_post"],
+            "manifest_path": cargo_home_tree["path"],
+            "manifest_sha256": cargo_home_tree["pre_sha256"],
+            "mutation_events_absent": True,
+            "role": "cargo_home",
+            "schema": RECURSIVE_TREE_AUTHORITY_SCHEMA,
+            "watch_count": cargo_home_tree["watch_count"],
+        }
+        runtime_components = {
+            "cargo_home": cargo_home_authority,
+            "toolchain": toolchain_guard.binding,
+            "trusted_system_closure": system_guard.binding,
+        }
+        semantic_input_authority = {
+            **runtime_components,
+            "runtime_sha256": semantic_runtime_sha256(runtime_components),
+            "schema": SEMANTIC_INPUT_AUTHORITY_SCHEMA,
+            "source": source_tree_guard.binding,
+        }
+        toolchain_manifest_binding = {
+            "entry_count": toolchain_guard.binding["entry_count"],
+            "equal_pre_post": toolchain_guard.binding["equal_pre_post"],
+            "path": toolchain_guard.binding["manifest_path"],
+            "post_sha256": toolchain_guard.binding["manifest_sha256"],
+            "pre_sha256": toolchain_guard.binding["manifest_sha256"],
+        }
     lock_after = immutable_snapshot_record(
         guard.post_build,
         f"{kind} postbuild Cargo.lock",
@@ -3157,6 +3812,7 @@ def run_build(
         "lock_prebuild": lock_before,
         "lock_postbuild": lock_after,
         "source_manifest_sha256": materialized["manifest_sha256"],
+        "semantic_input_authority": semantic_input_authority,
         "toolchain_manifest": toolchain_manifest_binding,
         "target": str(target.resolve()),
         "target_was_absent": True,
@@ -3667,6 +4323,12 @@ def build(args: argparse.Namespace) -> None:
     )
     if child_build["wrapper_receipt"].get("build_nonce") != build_nonce:
         raise BuildError("wrapper receipt build nonce differs")
+    semantic_runtime_digests = {
+        build["semantic_input_authority"]["runtime_sha256"]
+        for build in (pristine_build, hooked_build, child_build)
+    }
+    if len(semantic_runtime_digests) != 1:
+        raise BuildError("current builds used different semantic runtime authority")
 
     child_bindings = {
         "correctness": child_build["artifacts"][
@@ -3836,6 +4498,132 @@ def self_test_cargo_config_guard() -> dict[str, Any]:
         }
 
 
+def self_test_semantic_runtime_authority() -> dict[str, Any]:
+    """Prove path relocation is neutral while semantic drift changes the digest."""
+
+    def tree(role: str, digest: str, path: str) -> dict[str, Any]:
+        return {
+            "entry_count": 7,
+            "equal_pre_post": True,
+            "manifest_path": path,
+            "manifest_sha256": digest,
+            "mutation_events_absent": True,
+            "role": role,
+            "schema": RECURSIVE_TREE_AUTHORITY_SCHEMA,
+            "watch_count": 2,
+        }
+
+    components = {
+        "cargo_home": tree("cargo_home", "a" * 64, "/one/cargo.json"),
+        "toolchain": tree("toolchain", "b" * 64, "/one/toolchain.json"),
+        "trusted_system_closure": {
+            "entry_count": 21,
+            "manifest_path": "/one/system.json",
+            "mounts": [
+                {
+                    "device": 1,
+                    "gid": 0,
+                    "guest_path": guest_path,
+                    "host_path": str(host_path),
+                    "inode": index + 1,
+                    "permissions": 0o755,
+                    "resolved_path": str(host_path),
+                    "trusted_root_owned_non_writable": True,
+                    "uid": 0,
+                }
+                for index, (host_path, guest_path) in enumerate(
+                    TRUSTED_SYSTEM_MOUNTS
+                )
+            ],
+            "mutation_events_absent": True,
+            "schema": TRUSTED_SYSTEM_CLOSURE_SCHEMA,
+            "sha256": "c" * 64,
+            "watch_count": 6,
+        },
+    }
+    baseline = semantic_runtime_sha256(components)
+    relocated = json.loads(json.dumps(components))
+    for name in ("cargo_home", "toolchain", "trusted_system_closure"):
+        relocated[name]["manifest_path"] = f"/two/{name}.json"
+    if semantic_runtime_sha256(relocated) != baseline:
+        raise BuildError("semantic runtime digest depends on evidence paths")
+    drifted = json.loads(json.dumps(relocated))
+    drifted["toolchain"]["manifest_sha256"] = "d" * 64
+    if semantic_runtime_sha256(drifted) == baseline:
+        raise BuildError("semantic runtime digest ignores manifest drift")
+    drifted = json.loads(json.dumps(relocated))
+    drifted["trusted_system_closure"]["entry_count"] += 1
+    if semantic_runtime_sha256(drifted) == baseline:
+        raise BuildError("semantic runtime digest ignores authority counts")
+    drifted = json.loads(json.dumps(relocated))
+    drifted["trusted_system_closure"]["mounts"][0]["host_path"] = "/forged"
+    drifted["trusted_system_closure"]["mounts"][0]["resolved_path"] = "/forged"
+    try:
+        semantic_runtime_sha256(drifted)
+    except BuildError:
+        pass
+    else:
+        raise BuildError("semantic runtime accepts forged system mount paths")
+    if (
+        system_symlink_scope(Path("/usr/bin"), "tool", "/bin/sh")
+        != "within_closure"
+        or system_symlink_scope(Path("/usr/bin"), "manual", "/usr/share/man")
+        != "guest_inaccessible_external"
+    ):
+        raise BuildError("trusted system symlink namespace model differs")
+    special_root_rejected = False
+    try:
+        system_symlink_scope(Path("/usr/bin"), "hostile", "/proc/self/status")
+    except BuildError:
+        special_root_rejected = True
+    if not special_root_rejected:
+        raise BuildError("trusted system symlink reached exposed /proc")
+    return {
+        "manifest_drift_changes_digest": True,
+        "mount_path_drift_rejected": True,
+        "path_relocation_neutral": True,
+        "special_root_symlink_rejected": True,
+        "schema": SEMANTIC_INPUT_AUTHORITY_SCHEMA,
+        "status": "ok",
+    }
+
+
+def self_test_idempotent_freeze() -> dict[str, Any]:
+    """Prove final output freezing cannot invalidate pre-frozen input evidence."""
+
+    with tempfile.TemporaryDirectory(prefix="bn-ecm1-freeze-") as temporary:
+        temporary_root = Path(temporary).resolve(strict=True)
+        evidence_root = temporary_root / "evidence"
+        evidence_root.mkdir()
+        root = temporary_root / "source"
+        root.mkdir()
+        write_new(root / "input.rs", b"fn main() {}\n", 0o444)
+        root.chmod(0o555)
+        with RecursiveTreeAuthorityGuard(
+            root,
+            evidence_root / "before.json",
+            "source",
+            "idempotent freeze before",
+            allow_internal_symlinks=False,
+        ) as before_guard:
+            assert before_guard.initial_manifest is not None
+            before = before_guard.initial_manifest
+        make_read_only(root)
+        with RecursiveTreeAuthorityGuard(
+            root,
+            evidence_root / "after.json",
+            "source",
+            "idempotent freeze after",
+            allow_internal_symlinks=False,
+        ) as after_guard:
+            assert after_guard.initial_manifest is not None
+            after = after_guard.initial_manifest
+        if before != after:
+            raise BuildError("idempotent final freeze changed recursive evidence")
+        root.chmod(0o755)
+    return {"recursive_manifest_unchanged": True, "status": "ok"}
+
+
 def self_test(repository: Path) -> None:
     static = validate_static_authority(repository)
     overlay = validate_product_overlay_authority(repository)
@@ -3844,6 +4632,8 @@ def self_test(repository: Path) -> None:
     fault = validate_fault_authority(repository)
     lock_module = load_lock_authority_module()
     cargo_config_guard = self_test_cargo_config_guard()
+    semantic_runtime = self_test_semantic_runtime_authority()
+    idempotent_freeze = self_test_idempotent_freeze()
     print(
         canonical_bytes(
             {
@@ -3860,10 +4650,12 @@ def self_test(repository: Path) -> None:
                     if callable(getattr(lock_module, name, None))
                 ),
                 "overlay_checks": overlay["normal"]["checks"],
+                "idempotent_freeze": idempotent_freeze,
                 "overlay_hostile_mutations_rejected": overlay[
                     "hostile_mutations_rejected"
                 ],
                 "schema": SELF_TEST_SCHEMA,
+                "semantic_runtime_authority": semantic_runtime,
                 "static_hostile_mutations_rejected": static["self_test"][
                     "hostile_mutations_rejected"
                 ],

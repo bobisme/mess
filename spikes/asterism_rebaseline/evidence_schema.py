@@ -20,6 +20,7 @@ import json
 import os
 import re
 import stat
+import tempfile
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -749,6 +750,16 @@ RELEASE_COMPILE_OUT_NM_CHILD_FIELDS: Final = (
     "timed_out",
     "waited_pid",
 )
+RELEASE_COMPILE_OUT_BUILD_CHILD_FIELDS: Final = (
+    *RELEASE_COMPILE_OUT_NM_CHILD_FIELDS,
+)
+RELEASE_COMPILE_OUT_BUILD_LOG_FIELDS: Final = (
+    "exit_status",
+    "stderr",
+    "stderr_sha256",
+    "stdout",
+    "stdout_sha256",
+)
 RELEASE_COMPILE_OUT_FIELDS: Final = (
     "schema",
     "protocol",
@@ -900,6 +911,39 @@ RELEASE_COMPILE_OUT_OVERLAY_ATTESTATION_FIELDS: Final = (
     *PREPARED_ATTESTATION_FIELDS,
     "product_overlay_sha256",
 )
+_RELEASE_GUEST_ROOT: Final = "/asterism"
+_RELEASE_GUEST_SOURCE: Final = f"{_RELEASE_GUEST_ROOT}/source"
+_RELEASE_GUEST_TARGET: Final = f"{_RELEASE_GUEST_ROOT}/target"
+_RELEASE_GUEST_TOOLCHAIN_ROOT: Final = f"{_RELEASE_GUEST_ROOT}/toolchain"
+_RELEASE_GUEST_CARGO: Final = f"{_RELEASE_GUEST_TOOLCHAIN_ROOT}/bin/cargo"
+_RELEASE_GUEST_RUSTC: Final = f"{_RELEASE_GUEST_TOOLCHAIN_ROOT}/bin/rustc"
+_RELEASE_GUEST_CARGO_HOME: Final = f"{_RELEASE_GUEST_ROOT}/cargo-home"
+_RELEASE_GUEST_RUSTUP_HOME: Final = f"{_RELEASE_GUEST_ROOT}/rustup-home"
+_RELEASE_SANDBOX_CORE_BINDINGS: Final = (
+    ("--ro-bind-fd", _RELEASE_GUEST_SOURCE),
+    ("--bind-fd", _RELEASE_GUEST_TARGET),
+    ("--ro-bind-fd", _RELEASE_GUEST_TOOLCHAIN_ROOT),
+    ("--ro-bind-fd", _RELEASE_GUEST_CARGO),
+    ("--ro-bind-fd", _RELEASE_GUEST_RUSTC),
+    ("--ro-bind-fd", _RELEASE_GUEST_CARGO_HOME),
+    ("--ro-bind-fd", _RELEASE_GUEST_RUSTUP_HOME),
+)
+_RELEASE_SANDBOX_CONFIG_PATHS: Final = (
+    f"{_RELEASE_GUEST_SOURCE}/.cargo/config.toml",
+    f"{_RELEASE_GUEST_SOURCE}/.cargo/config",
+    f"{_RELEASE_GUEST_CARGO_HOME}/config.toml",
+    f"{_RELEASE_GUEST_CARGO_HOME}/config",
+)
+_RELEASE_SANDBOX_CONFIG_BINDINGS: Final = tuple(
+    ("--ro-bind-fd", path) for path in _RELEASE_SANDBOX_CONFIG_PATHS
+)
+_RELEASE_SANDBOX_SOURCE_CONFIG_BINDINGS: Final = (
+    _RELEASE_SANDBOX_CONFIG_BINDINGS[:2]
+)
+_RELEASE_SANDBOX_CARGO_HOME_CONFIG_BINDINGS: Final = (
+    _RELEASE_SANDBOX_CONFIG_BINDINGS[2:]
+)
+_EMPTY_SHA256: Final = hashlib.sha256(b"").hexdigest()
 FILE_BINDING_FIELDS: Final = ("path", "sha256")
 CARGO_CONFIG_SEARCH_SCHEMA: Final = "asterism-rebaseline-cargo-config-search-v3"
 CARGO_CONFIG_SEARCH_FIELDS: Final = (
@@ -3176,6 +3220,423 @@ def _validate_release_file_record(
     return record
 
 
+def _release_cargo_config_sha256(
+    attestation: Mapping[str, Any], context: str
+) -> str:
+    binding = _authority_object(
+        attestation["cargo_config_search"],
+        FILE_BINDING_FIELDS,
+        f"{context} Cargo config binding",
+    )
+    manifest_sha256 = _authority_sha256(
+        binding["sha256"], f"{context} Cargo config manifest hash"
+    )
+    manifest_path = Path(str(binding["path"]))
+    manifest_snapshot = snapshot_regular_file(
+        manifest_path, expected_mode=ARTIFACT_FILE_MODE
+    )
+    if manifest_snapshot.sha256 != manifest_sha256:
+        raise ValueError(f"{context} Cargo config manifest bytes differ")
+    manifest = _authority_object(
+        parse_canonical_json_object(
+            manifest_snapshot.data, f"{context} Cargo config manifest"
+        ),
+        CARGO_CONFIG_SEARCH_FIELDS,
+        f"{context} Cargo config manifest",
+    )
+    if (
+        manifest["schema"] != CARGO_CONFIG_SEARCH_SCHEMA
+        or manifest["cwd"] != _RELEASE_GUEST_SOURCE
+        or manifest["cargo_home_path"] != _RELEASE_GUEST_CARGO_HOME
+    ):
+        raise ValueError(f"{context} Cargo config guest identity differs")
+    try:
+        source_root = Path(str(attestation["materialized_root"])).resolve(
+            strict=True
+        )
+        toolchain = attestation["toolchain"]
+        if not isinstance(toolchain, Mapping) or not isinstance(
+            toolchain.get("cargo_home_path"), str
+        ):
+            raise ValueError("Cargo home authority is absent")
+        cargo_home = Path(
+            toolchain["cargo_home_path"]
+        ).resolve(strict=True)
+    except (KeyError, OSError, TypeError, ValueError) as error:
+        raise ValueError(f"{context} Cargo config host roots differ") from error
+    candidates: tuple[tuple[str, Path | None], ...] = (
+        (
+            f"{_RELEASE_GUEST_SOURCE}/.cargo/config.toml",
+            source_root / ".cargo/config.toml",
+        ),
+        (
+            f"{_RELEASE_GUEST_SOURCE}/.cargo/config",
+            source_root / ".cargo/config",
+        ),
+        (f"{_RELEASE_GUEST_ROOT}/.cargo/config.toml", None),
+        (f"{_RELEASE_GUEST_ROOT}/.cargo/config", None),
+        ("/.cargo/config.toml", None),
+        ("/.cargo/config", None),
+        (
+            f"{_RELEASE_GUEST_CARGO_HOME}/config.toml",
+            cargo_home / "config.toml",
+        ),
+        (f"{_RELEASE_GUEST_CARGO_HOME}/config", cargo_home / "config"),
+    )
+    entries = manifest["entries"]
+    if not isinstance(entries, list) or len(entries) != len(candidates):
+        raise ValueError(f"{context} Cargo config candidate cardinality differs")
+    for ordinal, (entry_value, (guest_path, host_path)) in enumerate(
+        zip(entries, candidates, strict=True), start=1
+    ):
+        entry = _authority_object(
+            entry_value,
+            CARGO_CONFIG_SEARCH_ENTRY_FIELDS,
+            f"{context} Cargo config entry {ordinal}",
+        )
+        if entry["path"] != guest_path:
+            raise ValueError(f"{context} Cargo config guest path/order differs")
+        if host_path is None:
+            if entry["status"] != "absent" or entry["sha256"] is not None:
+                raise ValueError(f"{context} private Cargo config path is not absent")
+            continue
+        if host_path.is_symlink():
+            raise ValueError(f"{context} Cargo config host input is a symlink")
+        expected_sha256 = _EMPTY_SHA256
+        if host_path.exists():
+            expected_sha256 = snapshot_regular_file(
+                host_path, expected_mode=None
+            ).sha256
+        if (
+            entry["status"] != "present"
+            or entry["sha256"] != expected_sha256
+        ):
+            raise ValueError(f"{context} effective Cargo config bytes differ")
+    empty_snapshot = snapshot_regular_file(
+        manifest_path.with_name(f"{manifest_path.name}.empty"),
+        expected_mode=ARTIFACT_FILE_MODE,
+    )
+    if empty_snapshot.sha256 != _EMPTY_SHA256 or empty_snapshot.size != 0:
+        raise ValueError(f"{context} empty Cargo config authority differs")
+    return manifest_sha256
+
+
+def _release_sandbox_sha256(
+    attestation: Mapping[str, Any], context: str
+) -> str:
+    argv = attestation["build_argv"]
+    toolchain = attestation["toolchain"]
+    if (
+        not isinstance(argv, list)
+        or any(not isinstance(argument, str) for argument in argv)
+        or not isinstance(toolchain, Mapping)
+        or not isinstance(toolchain.get("bwrap_path"), str)
+    ):
+        raise ValueError(f"{context} sandbox authority is invalid")
+    prefix = [
+        toolchain["bwrap_path"],
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-net",
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev-bind",
+        "/dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--tmpfs",
+        "/tmp",
+        "--tmpfs",
+        _RELEASE_GUEST_ROOT,
+        "--dir",
+        f"{_RELEASE_GUEST_ROOT}/.cargo",
+        "--tmpfs",
+        f"{_RELEASE_GUEST_ROOT}/.cargo",
+        "--remount-ro",
+        f"{_RELEASE_GUEST_ROOT}/.cargo",
+        "--dir",
+        "/.cargo",
+        "--tmpfs",
+        "/.cargo",
+        "--remount-ro",
+        "/.cargo",
+    ]
+    middle = [
+        "--dir",
+        f"{_RELEASE_GUEST_SOURCE}/.cargo",
+        "--tmpfs",
+        f"{_RELEASE_GUEST_SOURCE}/.cargo",
+    ]
+    source_config_remount = [
+        "--remount-ro",
+        f"{_RELEASE_GUEST_SOURCE}/.cargo",
+    ]
+    cargo_home_config_remount = [
+        "--remount-ro",
+        _RELEASE_GUEST_CARGO_HOME,
+    ]
+    suffix = [
+        "--chdir",
+        _RELEASE_GUEST_SOURCE,
+        _RELEASE_GUEST_CARGO,
+        "build",
+        "--locked",
+        "--offline",
+        "--release",
+        "-p",
+        "mess-store",
+        "--example",
+        "asterism_rebaseline_public",
+        "--target-dir",
+        _RELEASE_GUEST_TARGET,
+    ]
+    expected_length = (
+        len(prefix)
+        + 3 * len(_RELEASE_SANDBOX_CORE_BINDINGS)
+        + len(middle)
+        + 3 * len(_RELEASE_SANDBOX_SOURCE_CONFIG_BINDINGS)
+        + len(source_config_remount)
+        + 3 * len(_RELEASE_SANDBOX_CARGO_HOME_CONFIG_BINDINGS)
+        + len(cargo_home_config_remount)
+        + len(suffix)
+    )
+    if len(argv) != expected_length or argv[: len(prefix)] != prefix:
+        raise ValueError(f"{context} sandbox prefix/cardinality differs")
+    descriptors: list[str] = []
+    normalized = list(argv)
+    offset = len(prefix)
+
+    def consume_bindings(
+        bindings: Sequence[tuple[str, str]], start: int
+    ) -> int:
+        current = start
+        for operation, destination in bindings:
+            segment = argv[current : current + 3]
+            descriptor = segment[1] if len(segment) == 3 else ""
+            if (
+                len(segment) != 3
+                or segment[0] != operation
+                or segment[2] != destination
+                or not descriptor.isascii()
+                or not descriptor.isdecimal()
+                or len(descriptor) > 10
+                or str(int(descriptor)) != descriptor
+                or int(descriptor) < 3
+            ):
+                raise ValueError(
+                    f"{context} descriptor binding differs: {destination}"
+                )
+            descriptors.append(descriptor)
+            normalized[current + 1] = f"$FD:{destination}"
+            current += 3
+        return current
+
+    offset = consume_bindings(_RELEASE_SANDBOX_CORE_BINDINGS, offset)
+    if argv[offset : offset + len(middle)] != middle:
+        raise ValueError(f"{context} private source Cargo config mount differs")
+    offset += len(middle)
+    offset = consume_bindings(_RELEASE_SANDBOX_SOURCE_CONFIG_BINDINGS, offset)
+    if argv[offset : offset + len(source_config_remount)] != source_config_remount:
+        raise ValueError(f"{context} source Cargo config remount differs")
+    offset += len(source_config_remount)
+    offset = consume_bindings(
+        _RELEASE_SANDBOX_CARGO_HOME_CONFIG_BINDINGS, offset
+    )
+    if (
+        argv[offset : offset + len(cargo_home_config_remount)]
+        != cargo_home_config_remount
+    ):
+        raise ValueError(f"{context} Cargo-home config remount differs")
+    offset += len(cargo_home_config_remount)
+    if len(set(descriptors)) != len(descriptors) or argv[offset:] != suffix:
+        raise ValueError(f"{context} sandbox descriptors/command differ")
+    if any(
+        not isinstance(attestation[field], str) or attestation[field] in argv
+        for field in ("materialized_root", "target_dir")
+    ):
+        raise ValueError(f"{context} sandbox exposes a mutable host path")
+    build_child = attestation["build_child"]
+    if not isinstance(build_child, Mapping) or build_child.get("argv") != argv:
+        raise ValueError(f"{context} child argv differs from sandbox authority")
+    cargo_config_sha256 = _release_cargo_config_sha256(attestation, context)
+    return sha256_bytes(
+        canonical_json_bytes(
+            {
+                "argv": normalized,
+                "cargo_config_search_sha256": cargo_config_sha256,
+            }
+        )
+    )
+
+
+def _release_materialized_root_identity(
+    attestation: Mapping[str, Any], context: str
+) -> tuple[str, int, int]:
+    value = attestation["materialized_root"]
+    if not isinstance(value, str) or not Path(value).is_absolute():
+        raise ValueError(f"{context} materialized root is not absolute text")
+    try:
+        resolved = Path(value).resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ValueError(f"{context} materialized root cannot be resolved") from error
+    if value != str(resolved):
+        raise ValueError(f"{context} materialized root is not canonical")
+    descriptor = os.open(
+        resolved,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    )
+    try:
+        opened = os.fstat(descriptor)
+        current = os.stat(resolved, follow_symlinks=False)
+    finally:
+        os.close(descriptor)
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+    ):
+        raise ValueError(f"{context} materialized root identity differs")
+    return str(resolved), opened.st_dev, opened.st_ino
+
+
+def _validate_release_build_child(
+    attestation: Mapping[str, Any], context: str
+) -> tuple[Mapping[str, Any], FileSnapshot, tuple[str, int, int]]:
+    """Replay one release build completion record and its canonical log."""
+
+    child = _authority_object(
+        attestation["build_child"],
+        RELEASE_COMPILE_OUT_BUILD_CHILD_FIELDS,
+        f"{context} child",
+    )
+    integer_fields = (
+        "pid",
+        "start_ticks",
+        "started_monotonic_ns",
+        "completed_monotonic_ns",
+        "waited_pid",
+    )
+    reaping = _authority_object(
+        child["reaping"], ("pid", "start_ticks", "status"), f"{context} reaping"
+    )
+    root_identity = _release_materialized_root_identity(attestation, context)
+    if (
+        child["argv"] != attestation["build_argv"]
+        or child["cwd"] != attestation["materialized_root"]
+        or child["output_path"] != attestation["build_log_path"]
+        or child["output_sha256"] != attestation["build_log_sha256"]
+        or any(
+            child[field] != attestation[f"build_{field}"]
+            for field in (
+                "started_at",
+                "started_monotonic_ns",
+                "completed_at",
+                "completed_monotonic_ns",
+            )
+        )
+        or any(
+            not _is_integer(child[field]) or child[field] <= 0
+            for field in integer_fields
+        )
+        or child["waited_pid"] != child["pid"]
+        or not _is_integer(child["exit_status"])
+        or child["exit_status"] != 0
+        or child["timed_out"] is not False
+        or child["process_group_absent"] is not True
+        or not _is_integer(reaping["pid"])
+        or reaping["pid"] <= 0
+        or not _is_integer(reaping["start_ticks"])
+        or reaping["start_ticks"] <= 0
+        or reaping
+        != {
+            "pid": child["pid"],
+            "start_ticks": child["start_ticks"],
+            "status": "absent",
+        }
+        or child["completed_monotonic_ns"] < child["started_monotonic_ns"]
+    ):
+        raise ValueError(f"{context} child completion authority differs")
+    started_at = _authority_timestamp(
+        child["started_at"], f"{context} child start"
+    )
+    completed_at = _authority_timestamp(
+        child["completed_at"], f"{context} child completion"
+    )
+    if completed_at < started_at:
+        raise ValueError(f"{context} child wall chronology differs")
+
+    log_snapshot = snapshot_regular_file(
+        Path(str(attestation["build_log_path"])),
+        expected_mode=ARTIFACT_FILE_MODE,
+    )
+    if log_snapshot.sha256 != attestation["build_log_sha256"]:
+        raise ValueError(f"{context} build log hash differs")
+    log = _authority_object(
+        parse_canonical_json_object(log_snapshot.data, f"{context} build log"),
+        RELEASE_COMPILE_OUT_BUILD_LOG_FIELDS,
+        f"{context} build log",
+    )
+    stdout = log["stdout"]
+    stderr = log["stderr"]
+    if (
+        not _is_integer(log["exit_status"])
+        or log["exit_status"] != 0
+        or log["exit_status"] != child["exit_status"]
+        or not isinstance(stdout, str)
+        or not isinstance(stderr, str)
+        or log["stdout_sha256"]
+        != sha256_bytes(stdout.encode() if isinstance(stdout, str) else b"")
+        or log["stderr_sha256"]
+        != sha256_bytes(stderr.encode() if isinstance(stderr, str) else b"")
+    ):
+        raise ValueError(f"{context} build log output authority differs")
+    return child, log_snapshot, root_identity
+
+
+def _validate_release_build_events(
+    events: Mapping[
+        str,
+        tuple[
+            Mapping[str, Any],
+            Mapping[str, Any],
+            FileSnapshot,
+            tuple[str, int, int],
+        ],
+    ],
+) -> None:
+    """Prove the two release builds are ordered, disjoint executions."""
+
+    if set(events) != set(RELEASE_COMPILE_OUT_BUILD_NAMES):
+        raise ValueError("release build event authority is incomplete")
+    ordinary_attestation, ordinary_child, ordinary_log, ordinary_root = events[
+        "ordinary_a"
+    ]
+    overlay_attestation, overlay_child, overlay_log, overlay_root = events[
+        "overlay_a"
+    ]
+    if (
+        ordinary_root[0] == overlay_root[0]
+        or ordinary_root[1:] == overlay_root[1:]
+        or (ordinary_child["pid"], ordinary_child["start_ticks"])
+        == (overlay_child["pid"], overlay_child["start_ticks"])
+        or ordinary_child["completed_monotonic_ns"]
+        >= overlay_child["started_monotonic_ns"]
+        or ordinary_log.path == overlay_log.path
+        or (ordinary_log.device, ordinary_log.inode)
+        == (overlay_log.device, overlay_log.inode)
+    ):
+        raise ValueError("release build events are not ordered and physically disjoint")
+    ordinary_completed = _authority_timestamp(
+        ordinary_child["completed_at"], "ordinary release build completion"
+    )
+    overlay_started = _authority_timestamp(
+        overlay_child["started_at"], "proof-only release build start"
+    )
+    if ordinary_completed > overlay_started:
+        raise ValueError("release build wall chronology overlaps")
+
+
 def _validate_release_compile_out(
     proof: Mapping[str, Any],
     prepared: Mapping[str, Any],
@@ -3245,6 +3706,15 @@ def _validate_release_compile_out(
         "cfg_test",
         "rustc_workspace_wrapper",
     )
+    build_events: dict[
+        str,
+        tuple[
+            Mapping[str, Any],
+            Mapping[str, Any],
+            FileSnapshot,
+            tuple[str, int, int],
+        ],
+    ] = {}
     for name in RELEASE_COMPILE_OUT_BUILD_NAMES:
         build = _authority_object(
             builds[name], RELEASE_COMPILE_OUT_BUILD_FIELDS, f"release build {name}"
@@ -3270,14 +3740,13 @@ def _validate_release_compile_out(
         build_environment = attestation["build_env"]
         if not isinstance(build_environment, Mapping):
             raise ValueError(f"release build {name} environment is not an object")
-        normalized_argv = [
-            "$SOURCE_ROOT"
-            if argument == attestation["materialized_root"]
-            else "$TARGET_DIR"
-            if argument == attestation["target_dir"]
-            else argument
-            for argument in attestation["build_argv"]
-        ]
+        sandbox_sha256 = _release_sandbox_sha256(
+            attestation, f"release build {name}"
+        )
+        child, log_snapshot, root_identity = _validate_release_build_child(
+            attestation, f"release build {name}"
+        )
+        build_events[name] = (attestation, child, log_snapshot, root_identity)
         if (
             attestation["build_nonce"] != build["build_nonce"]
             or attestation["cargo_lock_sha256"] != build["cargo_lock_sha256"]
@@ -3285,10 +3754,14 @@ def _validate_release_compile_out(
             != build["toolchain_sha256"]
             or sha256_bytes(canonical_json_bytes(build_environment))
             != build["build_environment_sha256"]
-            or sha256_bytes(canonical_json_bytes(normalized_argv))
-            != build["sandbox_sha256"]
+            or sandbox_sha256 != build["sandbox_sha256"]
             or build_environment.get("ASTERISM_BUILD_SOURCE_APPROVAL_SHA256")
             != approval_sha256
+            or build_environment.get("CARGO_HOME") != _RELEASE_GUEST_CARGO_HOME
+            or build_environment.get("RUSTC") != _RELEASE_GUEST_RUSTC
+            or build_environment.get("RUSTUP_HOME") != _RELEASE_GUEST_RUSTUP_HOME
+            or build_environment.get("PATH")
+            != f"{_RELEASE_GUEST_TOOLCHAIN_ROOT}/bin:/usr/bin:/bin"
             or any(
                 field in build_environment
                 for field in (
@@ -3322,6 +3795,7 @@ def _validate_release_compile_out(
             != requirement["product_overlay_sha256"]
         ):
             raise ValueError("proof-only overlay A authority differs")
+    _validate_release_build_events(build_events)
 
     binaries = value["binaries"]
     inventories = value["symbol_inventories"]
@@ -3568,6 +4042,11 @@ def validate_prepared_artifacts(
     _validate_preapproval_attestation(
         payloads["current_children_attestation"], assertion, approval
     )
+    if (
+        payloads["current_children_attestation"].get("lock_authority")
+        != payloads["lock_authority"]
+    ):
+        raise ValueError("current children embedded lock authority differs")
     lock_authority = payloads["lock_authority"]
     bound_lock_manifest = lock_authority.get("lock_manifest")
     bound_lock_review = lock_authority.get("review_bundle")
@@ -3577,8 +4056,6 @@ def validate_prepared_artifacts(
         or lock_authority.get("status") != "approved"
         or lock_authority.get("protocol") != PROTOCOL
         or lock_authority.get("protocol_sha256") != PROTOCOL_SHA256
-        or lock_authority.get("tooling_commit") != approval["tooling_commit"]
-        or lock_authority.get("tooling_tree") != approval["tooling_tree"]
         or lock_authority.get("review_sha256")
         != inputs["lock_review_bundle"]["sha256"]
         or not isinstance(bound_lock_manifest, Mapping)
@@ -3763,6 +4240,419 @@ def source_authority_self_test() -> dict[str, Any]:
         else:
             raise AssertionError(f"hostile source-authority mutation passed: {name}")
 
+    with tempfile.TemporaryDirectory(prefix="evidence-schema-sandbox-") as temporary:
+        fixture_root = Path(temporary)
+        source_root = fixture_root / "source"
+        cargo_home = fixture_root / "cargo-home"
+        (source_root / ".cargo").mkdir(parents=True)
+        cargo_home.mkdir()
+        config_manifest_path = fixture_root / "cargo-config.json"
+        config_manifest = {
+            "cargo_home_path": _RELEASE_GUEST_CARGO_HOME,
+            "cwd": _RELEASE_GUEST_SOURCE,
+            "entries": [
+                {
+                    "path": path,
+                    "sha256": _EMPTY_SHA256,
+                    "status": "present",
+                }
+                for path in _RELEASE_SANDBOX_CONFIG_PATHS[:2]
+            ]
+            + [
+                {"path": path, "sha256": None, "status": "absent"}
+                for path in (
+                    f"{_RELEASE_GUEST_ROOT}/.cargo/config.toml",
+                    f"{_RELEASE_GUEST_ROOT}/.cargo/config",
+                    "/.cargo/config.toml",
+                    "/.cargo/config",
+                )
+            ]
+            + [
+                {
+                    "path": path,
+                    "sha256": _EMPTY_SHA256,
+                    "status": "present",
+                }
+                for path in _RELEASE_SANDBOX_CONFIG_PATHS[2:]
+            ],
+            "schema": CARGO_CONFIG_SEARCH_SCHEMA,
+        }
+        config_manifest_path.write_bytes(canonical_json_bytes(config_manifest))
+        config_manifest_path.chmod(0o444)
+        empty_config_path = config_manifest_path.with_name(
+            f"{config_manifest_path.name}.empty"
+        )
+        empty_config_path.write_bytes(b"")
+        empty_config_path.chmod(0o444)
+        core_descriptors = tuple(str(401 + index) for index in range(7))
+        config_descriptors = tuple(str(408 + index) for index in range(4))
+        sandbox_argv = [
+            "/usr/bin/bwrap",
+            "--die-with-parent",
+            "--new-session",
+            "--unshare-net",
+            "--ro-bind",
+            "/",
+            "/",
+            "--dev-bind",
+            "/dev",
+            "/dev",
+            "--proc",
+            "/proc",
+            "--tmpfs",
+            "/tmp",
+            "--tmpfs",
+            _RELEASE_GUEST_ROOT,
+            "--dir",
+            f"{_RELEASE_GUEST_ROOT}/.cargo",
+            "--tmpfs",
+            f"{_RELEASE_GUEST_ROOT}/.cargo",
+            "--remount-ro",
+            f"{_RELEASE_GUEST_ROOT}/.cargo",
+            "--dir",
+            "/.cargo",
+            "--tmpfs",
+            "/.cargo",
+            "--remount-ro",
+            "/.cargo",
+            *(
+                argument
+                for descriptor, (operation, destination) in zip(
+                    core_descriptors,
+                    _RELEASE_SANDBOX_CORE_BINDINGS,
+                    strict=True,
+                )
+                for argument in (operation, descriptor, destination)
+            ),
+            "--dir",
+            f"{_RELEASE_GUEST_SOURCE}/.cargo",
+            "--tmpfs",
+            f"{_RELEASE_GUEST_SOURCE}/.cargo",
+            *(
+                argument
+                for descriptor, (operation, destination) in zip(
+                    config_descriptors[:2],
+                    _RELEASE_SANDBOX_SOURCE_CONFIG_BINDINGS,
+                    strict=True,
+                )
+                for argument in (operation, descriptor, destination)
+            ),
+            "--remount-ro",
+            f"{_RELEASE_GUEST_SOURCE}/.cargo",
+            *(
+                argument
+                for descriptor, (operation, destination) in zip(
+                    config_descriptors[2:],
+                    _RELEASE_SANDBOX_CARGO_HOME_CONFIG_BINDINGS,
+                    strict=True,
+                )
+                for argument in (operation, descriptor, destination)
+            ),
+            "--remount-ro",
+            _RELEASE_GUEST_CARGO_HOME,
+            "--chdir",
+            _RELEASE_GUEST_SOURCE,
+            _RELEASE_GUEST_CARGO,
+            "build",
+            "--locked",
+            "--offline",
+            "--release",
+            "-p",
+            "mess-store",
+            "--example",
+            "asterism_rebaseline_public",
+            "--target-dir",
+            _RELEASE_GUEST_TARGET,
+        ]
+        config_sha256 = sha256_bytes(config_manifest_path.read_bytes())
+        sandbox_attestation = {
+            "build_argv": sandbox_argv,
+            "build_child": {"argv": sandbox_argv},
+            "cargo_config_search": {
+                "path": str(config_manifest_path),
+                "sha256": config_sha256,
+            },
+            "materialized_root": str(source_root),
+            "target_dir": "/host/target",
+            "toolchain": {
+                "bwrap_path": "/usr/bin/bwrap",
+                "cargo_home_path": str(cargo_home),
+            },
+        }
+        normalized_sandbox = list(sandbox_argv)
+        descriptor_indexes = []
+        for index, argument in enumerate(sandbox_argv):
+            if argument in {"--ro-bind-fd", "--bind-fd"}:
+                descriptor_indexes.append(index + 1)
+                normalized_sandbox[index + 1] = f"$FD:{sandbox_argv[index + 2]}"
+        expected_sandbox_sha256 = sha256_bytes(
+            canonical_json_bytes(
+                {
+                    "argv": normalized_sandbox,
+                    "cargo_config_search_sha256": config_sha256,
+                }
+            )
+        )
+        if (
+            _release_sandbox_sha256(sandbox_attestation, "self-test")
+            != expected_sandbox_sha256
+        ):
+            raise AssertionError("canonical release sandbox hash differs")
+        sandbox_hostiles = {
+            "sandbox_aliased_descriptor": lambda hostile: hostile[
+                "build_argv"
+            ].__setitem__(
+                descriptor_indexes[-1],
+                hostile["build_argv"][descriptor_indexes[0]],
+            ),
+            "sandbox_noncanonical_descriptor": lambda hostile: hostile[
+                "build_argv"
+            ].__setitem__(descriptor_indexes[0], "0401"),
+            "sandbox_guest_path": lambda hostile: hostile[
+                "build_argv"
+            ].__setitem__(
+                descriptor_indexes[0] + 1, "/asterism/other-source"
+            ),
+            "sandbox_extra_argument": lambda hostile: hostile[
+                "build_argv"
+            ].append("--share-net"),
+            "sandbox_host_path": lambda hostile: hostile.__setitem__(
+                "target_dir", _RELEASE_GUEST_TARGET
+            ),
+            "sandbox_child_argv": lambda hostile: hostile[
+                "build_child"
+            ].__setitem__("argv", ["/forged"]),
+            "sandbox_config_hash": lambda hostile: hostile[
+                "cargo_config_search"
+            ].__setitem__("sha256", "f" * 64),
+        }
+        for name, mutate in sandbox_hostiles.items():
+            hostile = json.loads(json.dumps(sandbox_attestation))
+            mutate(hostile)
+            if name != "sandbox_child_argv":
+                hostile["build_child"]["argv"] = list(hostile["build_argv"])
+            reject(
+                name,
+                lambda hostile=hostile: _release_sandbox_sha256(hostile, name),
+            )
+
+        build_log_path = fixture_root / "release-build.json"
+        build_log_path.write_bytes(
+            canonical_json_bytes(
+                {
+                    "exit_status": 0,
+                    "stderr": "",
+                    "stderr_sha256": _EMPTY_SHA256,
+                    "stdout": "",
+                    "stdout_sha256": _EMPTY_SHA256,
+                }
+            )
+        )
+        build_log_path.chmod(ARTIFACT_FILE_MODE)
+        build_pid = 41_001
+        build_start_ticks = 51_001
+        build_attestation = {
+            "build_argv": sandbox_argv,
+            "build_child": {
+                "argv": sandbox_argv,
+                "completed_at": "2026-07-16T20:00:01.000000000Z",
+                "completed_monotonic_ns": 20,
+                "cwd": str(source_root.resolve()),
+                "exit_status": 0,
+                "output_path": str(build_log_path.resolve()),
+                "output_sha256": sha256_bytes(build_log_path.read_bytes()),
+                "pid": build_pid,
+                "process_group_absent": True,
+                "reaping": {
+                    "pid": build_pid,
+                    "start_ticks": build_start_ticks,
+                    "status": "absent",
+                },
+                "start_ticks": build_start_ticks,
+                "started_at": "2026-07-16T20:00:00.000000000Z",
+                "started_monotonic_ns": 10,
+                "timed_out": False,
+                "waited_pid": build_pid,
+            },
+            "build_completed_at": "2026-07-16T20:00:01.000000000Z",
+            "build_completed_monotonic_ns": 20,
+            "build_log_path": str(build_log_path.resolve()),
+            "build_log_sha256": sha256_bytes(build_log_path.read_bytes()),
+            "build_started_at": "2026-07-16T20:00:00.000000000Z",
+            "build_started_monotonic_ns": 10,
+            "materialized_root": str(source_root.resolve()),
+        }
+        _validate_release_build_child(build_attestation, "self-test release build")
+
+        def hostile_build_chronology(hostile: dict[str, Any]) -> None:
+            hostile["build_child"]["completed_monotonic_ns"] = 9
+            hostile["build_completed_monotonic_ns"] = 9
+
+        def hostile_build_wall_chronology(hostile: dict[str, Any]) -> None:
+            completed = "2026-07-16T19:59:59.000000000Z"
+            hostile["build_child"]["completed_at"] = completed
+            hostile["build_completed_at"] = completed
+
+        def hostile_build_reaping_bool_identity(hostile: dict[str, Any]) -> None:
+            child = hostile["build_child"]
+            child["pid"] = 1
+            child["waited_pid"] = 1
+            child["start_ticks"] = 1
+            child["reaping"] = {
+                "pid": True,
+                "start_ticks": True,
+                "status": "absent",
+            }
+
+        build_child_hostiles = {
+            "build_child_nonzero_exit": lambda hostile: hostile[
+                "build_child"
+            ].__setitem__("exit_status", 1),
+            "build_child_timeout": lambda hostile: hostile[
+                "build_child"
+            ].__setitem__("timed_out", True),
+            "build_child_orphan_group": lambda hostile: hostile[
+                "build_child"
+            ].__setitem__("process_group_absent", False),
+            "build_child_reaping": lambda hostile: hostile["build_child"][
+                "reaping"
+            ].__setitem__("status", "present"),
+            "build_child_reaping_bool_identity": (
+                hostile_build_reaping_bool_identity
+            ),
+            "build_child_argv": lambda hostile: hostile[
+                "build_child"
+            ].__setitem__("argv", ["/forged"]),
+            "build_child_cwd": lambda hostile: hostile[
+                "build_child"
+            ].__setitem__("cwd", "/forged"),
+            "build_child_monotonic_chronology": hostile_build_chronology,
+            "build_child_wall_chronology": hostile_build_wall_chronology,
+            "build_child_attestation_crosslink": lambda hostile: hostile.__setitem__(
+                "build_started_monotonic_ns", 11
+            ),
+            "build_child_log_hash": lambda hostile: (
+                hostile.__setitem__("build_log_sha256", "0" * 64),
+                hostile["build_child"].__setitem__("output_sha256", "0" * 64),
+            ),
+        }
+        for name, mutate in build_child_hostiles.items():
+            hostile = json.loads(json.dumps(build_attestation))
+            mutate(hostile)
+            reject(
+                name,
+                lambda hostile=hostile, name=name: _validate_release_build_child(
+                    hostile, name
+                ),
+            )
+
+        for name, output in {
+            "build_child_rehashed_failed_log": {
+                "exit_status": 1,
+                "stderr": "failed",
+                "stderr_sha256": sha256_bytes(b"failed"),
+                "stdout": "",
+                "stdout_sha256": _EMPTY_SHA256,
+            },
+            "build_child_log_output_hash": {
+                "exit_status": 0,
+                "stderr": "",
+                "stderr_sha256": _EMPTY_SHA256,
+                "stdout": "forged",
+                "stdout_sha256": _EMPTY_SHA256,
+            },
+        }.items():
+            hostile_log = fixture_root / f"{name}.json"
+            hostile_log.write_bytes(canonical_json_bytes(output))
+            hostile_log.chmod(ARTIFACT_FILE_MODE)
+            hostile = json.loads(json.dumps(build_attestation))
+            hostile["build_log_path"] = str(hostile_log.resolve())
+            hostile["build_log_sha256"] = sha256_bytes(hostile_log.read_bytes())
+            hostile["build_child"]["output_path"] = str(hostile_log.resolve())
+            hostile["build_child"]["output_sha256"] = sha256_bytes(
+                hostile_log.read_bytes()
+            )
+            reject(
+                name,
+                lambda hostile=hostile, name=name: _validate_release_build_child(
+                    hostile, name
+                ),
+            )
+
+        overlay_log_path = fixture_root / "release-build-overlay.json"
+        overlay_log_path.write_bytes(build_log_path.read_bytes())
+        overlay_log_path.chmod(ARTIFACT_FILE_MODE)
+        overlay_source_root = fixture_root / "overlay-source"
+        overlay_source_root.mkdir()
+        overlay_attestation = json.loads(json.dumps(build_attestation))
+        overlay_attestation["materialized_root"] = str(
+            overlay_source_root.resolve()
+        )
+        overlay_attestation["build_log_path"] = str(overlay_log_path.resolve())
+        overlay_attestation["build_log_sha256"] = sha256_bytes(
+            overlay_log_path.read_bytes()
+        )
+        overlay_child = overlay_attestation["build_child"]
+        overlay_child["cwd"] = str(overlay_source_root.resolve())
+        overlay_child["pid"] += 1
+        overlay_child["waited_pid"] += 1
+        overlay_child["start_ticks"] += 1
+        overlay_child["reaping"] = {
+            "pid": overlay_child["pid"],
+            "start_ticks": overlay_child["start_ticks"],
+            "status": "absent",
+        }
+        overlay_child["started_at"] = "2026-07-16T20:00:02.000000000Z"
+        overlay_child["completed_at"] = "2026-07-16T20:00:03.000000000Z"
+        overlay_child["started_monotonic_ns"] = 30
+        overlay_child["completed_monotonic_ns"] = 40
+        overlay_child["output_path"] = str(overlay_log_path.resolve())
+        overlay_child["output_sha256"] = sha256_bytes(
+            overlay_log_path.read_bytes()
+        )
+        for field in (
+            "started_at",
+            "started_monotonic_ns",
+            "completed_at",
+            "completed_monotonic_ns",
+        ):
+            overlay_attestation[f"build_{field}"] = overlay_child[field]
+        ordinary_event = _validate_release_build_child(
+            build_attestation, "ordinary self-test release build"
+        )
+        overlay_event = _validate_release_build_child(
+            overlay_attestation, "overlay self-test release build"
+        )
+        release_events = {
+            "ordinary_a": (build_attestation, *ordinary_event),
+            "overlay_a": (overlay_attestation, *overlay_event),
+        }
+        _validate_release_build_events(release_events)
+        lexical_root_alias = json.loads(json.dumps(overlay_attestation))
+        lexical_root_alias["materialized_root"] = (
+            build_attestation["materialized_root"] + "/."
+        )
+        lexical_root_alias["build_child"]["cwd"] = lexical_root_alias[
+            "materialized_root"
+        ]
+        reject(
+            "build_events_lexical_materialized_root_alias",
+            lambda: _validate_release_build_child(
+                lexical_root_alias, "lexical root alias"
+            ),
+        )
+        aliased_events = dict(release_events)
+        aliased_events["overlay_a"] = (
+            overlay_attestation,
+            overlay_event[0],
+            ordinary_event[1],
+            overlay_event[2],
+        )
+        reject(
+            "build_events_log_identity_alias",
+            lambda: _validate_release_build_events(aliased_events),
+        )
+
     for field in RELEASE_COMPILE_OUT_REQUIREMENT_FIELDS:
         hostile = json.loads(json.dumps(requirement))
         hostile[field] = None
@@ -3806,7 +4696,7 @@ def source_authority_self_test() -> dict[str, Any]:
         lambda: validate_prepared_artifacts({}, approval, Path("/nonexistent")),
     )
     return {
-        "canonical_checks": 2,
+        "canonical_checks": 3,
         "hostile_mutations_rejected": len(rejected),
         "schema": "bn-28w0-evidence-schema-self-test-v1",
         "status": "ok",

@@ -203,6 +203,22 @@ def validate_builder(source: str) -> list[str]:
     ):
         if forbidden in source:
             fail("builder_scope", f"builder reaches forbidden integration surface: {forbidden}")
+    repeatable_authority_markers = {
+        "initialize = library.inotify_init1",
+        "add_watch = library.inotify_add_watch",
+        'os.fsencode(f"/proc/self/fd/{descriptor}")',
+        "self.watch_descriptors.add(watch)",
+        "self._add_directory_watch(descriptor)",
+        "def _drain_mutation_events(self, boundary: str) -> None:",
+        "if observed:\n            self.poisoned = True",
+        'f"{self.context} malformed inotify header at {boundary}"',
+        'f"{self.context} malformed inotify event at {boundary}"',
+        "if len(self.watch_descriptors) != directory_count:",
+        'self._drain_mutation_events("initial manifest")',
+        'self._drain_mutation_events("matching manifest")',
+        '"watch_count": len(self.watch_descriptors)',
+        "chunk = os.pread(",
+    }
     for marker in (
         'LOCK_AUTHORITY_SCHEMA = "bn-31gp-current-lock-authority-v1"',
         'LOCK_VALIDATION_SCHEMA = "bn-31gp-current-lock-authority-validation-v1"',
@@ -309,7 +325,7 @@ def validate_builder(source: str) -> list[str]:
         'dir_fd=guard.descriptor,\n        )\n        try:\n            names = sorted(os.listdir(enumeration_descriptor))',
         "parent_descriptor=guard.descriptor,",
         'CARGO_CONFIG_SEARCH_SCHEMA = "bn-30fs-build-cargo-config-search-v1"',
-        'CARGO_HOME_TREE_SCHEMA = "bn-30fs-build-cargo-home-tree-v1"',
+        'CARGO_HOME_TREE_SCHEMA = RECURSIVE_TREE_AUTHORITY_SCHEMA',
         "| 0x00004000  # IN_Q_OVERFLOW",
         "| 0x00008000  # IN_IGNORED",
         "initialize = library.inotify_init1",
@@ -356,15 +372,36 @@ def validate_builder(source: str) -> list[str]:
         'GUEST_CARGO = f"{GUEST_TOOLCHAIN_ROOT}/bin/cargo"',
         'cargo_bind = ("--ro-bind-fd", str(cargo_lease.descriptor), GUEST_CARGO)',
         'rustc_bind = ("--ro-bind-fd", str(rustc_lease.descriptor), GUEST_RUSTC)',
-        'toolchain_manifest_prebuild = file_manifest(toolchain_root)',
-        'toolchain_manifest_postbuild = file_manifest(toolchain_root)',
-        'post_sha256 != toolchain_manifest_binding["pre_sha256"]',
-        '"equal_pre_post": False',
-        'toolchain_manifest_binding["equal_pre_post"] = True',
+        'ATTESTATION_SCHEMA = "bn-ecm1-current-children-build-v2"',
+        'SEMANTIC_INPUT_AUTHORITY_SCHEMA = "bn-ecm1-semantic-input-authority-v1"',
+        'RECURSIVE_TREE_AUTHORITY_SCHEMA = "bn-ecm1-recursive-tree-authority-v1"',
+        'TRUSTED_SYSTEM_CLOSURE_SCHEMA = "bn-ecm1-trusted-system-closure-v1"',
+        "def system_symlink_scope(root: Path, relative: str, target: str) -> str:",
+        'for authority in ("/asterism", "/dev", "/proc", "/run", "/sys", "/tmp")',
+        'raise BuildError("trusted system symlink reaches mutable guest authority")',
+        '"symlink_scope": symlink_scope',
+        '"special_root_symlink_rejected": True',
+        'class RecursiveTreeAuthorityGuard:',
+        'class TrustedSystemClosureGuard:',
+        'hash_regular_contents=False,',
+        'trusted_system_roots=roots,',
+        '"--symlink",\n                "usr/bin",\n                "/bin"',
+        '"--symlink",\n                "usr/lib",\n                "/lib"',
+        '"--symlink",\n                "usr/lib",\n                "/lib64"',
+        'source_tree_guard.replay("post-Cargo boundary")',
+        'toolchain_guard.replay("post-Cargo boundary")',
+        'system_guard.replay("post-Cargo boundary")',
+        'if observed != self.initial_manifest:\n            self.poisoned = True',
+        '"semantic_input_authority": semantic_input_authority',
+        '"runtime_sha256": semantic_runtime_sha256(runtime_components)',
+        'if len(semantic_runtime_digests) != 1:',
         '"toolchain_manifest": toolchain_manifest_binding',
         "def self_test_cargo_config_guard() -> dict[str, Any]:",
         "cargo_config_guard = self_test_cargo_config_guard()",
         '"cargo_config_guard": cargo_config_guard',
+        'semantic_runtime = self_test_semantic_runtime_authority()',
+        '"semantic_runtime_authority": semantic_runtime',
+        '"mount_path_drift_rejected": True',
         'config_postbuild = config_guard.replay(',
         'if config_postbuild != config_prebuild:',
         '"ASTERISM_REBASELINE_PINNED_RUSTC": GUEST_RUSTC',
@@ -380,9 +417,94 @@ def validate_builder(source: str) -> list[str]:
         'compile(\n                    validator_lease.payload,',
         "make_read_only(output)",
     ):
-        require_once(source, marker, "builder_contract")
+        if marker in repeatable_authority_markers:
+            if source.count(marker) < 2:
+                fail("builder_contract", f"recursive authority marker absent: {marker}")
+        else:
+            require_once(source, marker, "builder_contract")
     if "Path(str(a.get(\"final_lock_path\")))" in source or "lock_path.read_bytes()" in source:
         fail("builder_lock_authority", "builder materializes from an unvalidated manifest path")
+    sandbox = slice_between(
+        source, "def sandboxed_build_argv(", "def directory_identity(",
+        "builder_system_closure",
+    )
+    if (
+        '"--ro-bind",\n        "/",\n        "/"' in sandbox
+        or '"--ro-bind", "/", "/"' in sandbox
+    ):
+        fail("builder_system_closure", "builder exposes the whole host root")
+    if (
+        '"--dev-bind"' in sandbox
+        or '"--dev"' in sandbox
+        or '"--proc"' in sandbox
+        or '"--dir",\n        "/dev"' not in sandbox
+        or '"--dir",\n        "/proc"' not in sandbox
+    ):
+        fail(
+            "builder_system_closure",
+            "builder exposes a device or proc interface instead of empty directories",
+        )
+    if '"/etc"' in sandbox or 'Path("/etc")' in source:
+        fail("builder_system_closure", "builder exposes unreviewed /etc authority")
+    cargo_environment_source = slice_between(
+        source, "def cargo_environment(", "def sandboxed_build_argv(",
+        "builder_system_closure",
+    )
+    if (
+        '"GIT_CONFIG_GLOBAL": f"{GUEST_ROOT}/absent-gitconfig"'
+        not in cargo_environment_source
+        or '"GIT_CONFIG_GLOBAL": "/dev/null"' in cargo_environment_source
+    ):
+        fail(
+            "builder_system_closure",
+            "sandboxed Git config reaches a guest device path",
+        )
+    runtime_digest = slice_between(
+        source, "def semantic_runtime_sha256(", "def sha256_file(",
+        "builder_semantic_runtime",
+    )
+    if "manifest_path" in runtime_digest or '"source"' in runtime_digest:
+        fail(
+            "builder_semantic_runtime",
+            "runtime equality includes relocatable/source-only authority",
+        )
+    for marker in (
+        '"mounts",',
+        'mount.get("guest_path") != guest_path',
+        'mount.get("host_path") != str(host_path)',
+        'mount.get("resolved_path") != str(host_path)',
+        'raise BuildError("semantic runtime trusted-system mounts differ")',
+    ):
+        require_once(runtime_digest, marker, "builder_semantic_runtime")
+    freeze_source = slice_between(
+        source, "def make_read_only(", "def install_lock(",
+        "builder_idempotent_freeze",
+    )
+    for marker in (
+        "if stat.S_IMODE(path.stat().st_mode) != 0o555:",
+        "if stat.S_IMODE(path.stat().st_mode) != desired:",
+        "if stat.S_IMODE(root.stat().st_mode) != 0o555:",
+    ):
+        require_once(freeze_source, marker, "builder_idempotent_freeze")
+    for marker in (
+        '(Path("/usr/bin"), "/usr/bin")',
+        '(Path("/usr/lib"), "/usr/lib")',
+        '(Path("/usr/include"), "/usr/include")',
+        "metadata.st_uid != 0",
+        "stat.S_IMODE(metadata.st_mode) & 0o022",
+        "os.access(",
+        'self.evidence_root / f"{self.label}-system-closure.json"',
+        '"entry_count": entry_count',
+        '"mutation_events_absent": True',
+        '"watch_count": watch_count',
+        "def self_test_idempotent_freeze() -> dict[str, Any]:",
+        'evidence_root = temporary_root / "evidence"',
+        'evidence_root / "before.json"',
+        'evidence_root / "after.json"',
+        'raise BuildError("idempotent final freeze changed recursive evidence")',
+    ):
+        if marker not in source:
+            fail("builder_system_closure", f"system/freeze marker absent: {marker}")
     if source.count("run_build(") != 4:
         fail("builder_build_count", "run_build definition/call cardinality differs")
     if source.count("materialize(") != 2:
@@ -590,12 +712,17 @@ def validate_builder(source: str) -> list[str]:
             "with ExitStack() as stack:",
             "BoundBuildDirectory(target",
             "\n        guard = stack.enter_context(\n            guard_factory(",
+            "source_tree_guard = stack.enter_context(",
+            "toolchain_guard = stack.enter_context(",
+            "system_guard = stack.enter_context(",
             'source_ro_bind = guard.bwrap_ro_bind("/asterism/source")',
             "target_bind = target_guard.bwrap_bind(",
             '"--ro-bind-fd",\n                str(wrapper_descriptor),',
             "def replay_cargo_boundary() -> None:",
             "config_postbuild = config_guard.replay(",
-            "toolchain_manifest_postbuild = file_manifest(toolchain_root)",
+            'source_tree_guard.replay("post-Cargo boundary")',
+            'toolchain_guard.replay("post-Cargo boundary")',
+            'system_guard.replay("post-Cargo boundary")',
             "record = run_logged(",
             "boundary_replay=replay_cargo_boundary,",
             "after = file_manifest(materialized[\"root\"])",
@@ -665,6 +792,10 @@ def validate_builder(source: str) -> list[str]:
         "builder_normalized_authority_failures",
         "builder_descriptor_cargo_config_guard_probe",
         "builder_recursive_cargo_home_freeze_authority",
+        "builder_recursive_semantic_input_authority",
+        "builder_narrow_trusted_system_closure",
+        "builder_path_free_runtime_equality",
+        "builder_idempotent_final_freeze",
     ]
 
 
@@ -806,7 +937,13 @@ def self_test(
     passed = ["canonical_sources"]
 
     def reject_builder(name: str, old: str, new: str, code: str) -> None:
-        mutated = replace_once(builder, old, new)
+        if builder.count(old) != 1 and name.startswith("builder_cargo_home_"):
+            start = builder.index("class CargoConfigSearchGuard:")
+            end = builder.index("def read_bound_regular_file(", start)
+            scoped = replace_once(builder[start:end], old, new)
+            mutated = builder[:start] + scoped + builder[end:]
+        else:
+            mutated = replace_once(builder, old, new)
         passed.append(expect_rejection(name, code, lambda: validate_builder(mutated)))
 
     def reject_wrapper(name: str, old: str, new: str, code: str) -> None:
@@ -1119,15 +1256,69 @@ def self_test(
     )
     reject_builder(
         "builder_toolchain_no_post_manifest",
-        "toolchain_manifest_postbuild = file_manifest(toolchain_root)",
-        "toolchain_manifest_postbuild = toolchain_manifest_prebuild",
+        'toolchain_guard.replay("post-Cargo boundary")',
+        'toolchain_guard.replay("pre-Cargo launch")  # hostile cached replay',
         "builder_contract",
     )
     reject_builder(
         "builder_toolchain_accepts_change",
-        'post_sha256 != toolchain_manifest_binding["pre_sha256"]',
-        "post_sha256 != post_sha256",
+        "if observed != self.initial_manifest:\n            self.poisoned = True",
+        "if False:\n            self.poisoned = True",
         "builder_contract",
+    )
+    reject_builder(
+        "builder_whole_host_root_reintroduced",
+        "        *trusted_system_args,\n        \"--dir\",\n        \"/dev\",",
+        "        *trusted_system_args,\n        \"--ro-bind\", \"/\", \"/\",\n        \"--dir\",\n        \"/dev\",",
+        "builder_system_closure",
+    )
+    reject_builder(
+        "builder_devtmpfs_reintroduced",
+        '"--dir",\n        "/dev",',
+        '"--dev",\n        "/dev",',
+        "builder_system_closure",
+    )
+    reject_builder(
+        "builder_procfs_reintroduced",
+        '"--dir",\n        "/proc",',
+        '"--proc",\n        "/proc",',
+        "builder_system_closure",
+    )
+    reject_builder(
+        "builder_system_closure_broadened_to_etc",
+        '(Path("/usr/include"), "/usr/include")',
+        '(Path("/etc"), "/etc")',
+        "builder_system_closure",
+    )
+    reject_builder(
+        "builder_system_post_replay_removed",
+        'system_guard.replay("post-Cargo boundary")',
+        'system_guard.replay("pre-Cargo launch")  # hostile cached replay',
+        "builder_contract",
+    )
+    reject_builder(
+        "builder_runtime_digest_binds_paths",
+        '"mutation_events_absent",\n    )\n    if set(components)',
+        '"mutation_events_absent",\n        "manifest_path",\n    )\n    if set(components)',
+        "builder_semantic_runtime",
+    )
+    reject_builder(
+        "builder_runtime_accepts_forged_system_mount",
+        'mount.get("host_path") != str(host_path)',
+        'mount.get("host_path") == mount.get("host_path")',
+        "builder_semantic_runtime",
+    )
+    reject_builder(
+        "builder_idempotent_freeze_removed",
+        "if stat.S_IMODE(path.stat().st_mode) != desired:\n                path.chmod(desired)",
+        "path.chmod(desired)  # hostile unconditional final freeze",
+        "builder_idempotent_freeze",
+    )
+    reject_builder(
+        "builder_idempotent_evidence_mutates_selected_parent",
+        'evidence_root / "before.json"',
+        'temporary_root / "before.json"',
+        "builder_system_closure",
     )
     reject_builder(
         "builder_wrapper_guest_rustc_unbound",

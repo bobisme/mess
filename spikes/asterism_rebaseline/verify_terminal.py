@@ -94,19 +94,39 @@ def sha256_file(path: Path) -> str:
     return snapshot.sha256
 
 
-def parse_timestamp(value: Any, context: str, errors: list[str]) -> datetime | None:
+_EXACT_ZONED_TIME = re.compile(
+    r"(?P<head>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})"
+    r"(?:\.(?P<fraction>\d{1,9}))?(?P<zone>Z|[+-]\d{2}:\d{2})\Z"
+)
+
+
+def parse_timestamp_key(
+    value: Any, context: str, errors: list[str]
+) -> tuple[datetime, int] | None:
     if not isinstance(value, str):
         errors.append(f"{context} is not text")
         return None
+    match = _EXACT_ZONED_TIME.fullmatch(value)
+    if match is None:
+        errors.append(f"{context} is not an exact zoned timestamp")
+        return None
+    fraction = match.group("fraction")
+    nanoseconds = (fraction or "").ljust(9, "0")
+    microseconds = f".{nanoseconds[:6]}" if fraction else ""
+    zone = "+00:00" if match.group("zone") == "Z" else match.group("zone")
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(
+            f"{match.group('head')}{microseconds}{zone}"
+        )
     except ValueError as error:
         errors.append(f"{context} invalid: {error}")
         return None
-    if parsed.tzinfo is None:
-        errors.append(f"{context} has no timezone")
-        return None
-    return parsed
+    return parsed, int(nanoseconds[6:] or "0")
+
+
+def parse_timestamp(value: Any, context: str, errors: list[str]) -> datetime | None:
+    parsed = parse_timestamp_key(value, context, errors)
+    return parsed[0] if parsed is not None else None
 
 
 def require_keys(value: Any, expected: set[str], context: str, errors: list[str]) -> bool:
@@ -202,12 +222,6 @@ def read_jsonl(
 _TERMINAL_REVIEW_IDENTIFIER = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._:/@+\-]{0,255}\Z"
 )
-_TERMINAL_ZONED_TIME = re.compile(
-    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
-    r"(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})\Z"
-)
-
-
 def terminal_is_sha256(value: Any) -> bool:
     return (
         isinstance(value, str)
@@ -235,10 +249,13 @@ def terminal_authority_object(
 def terminal_authority_timestamp(
     value: Any, context: str, errors: list[str]
 ) -> datetime | None:
-    if not isinstance(value, str) or _TERMINAL_ZONED_TIME.fullmatch(value) is None:
-        errors.append(f"{context} is not an exact zoned timestamp")
-        return None
     return parse_timestamp(value, context, errors)
+
+
+def terminal_authority_timestamp_key(
+    value: Any, context: str, errors: list[str]
+) -> tuple[datetime, int] | None:
+    return parse_timestamp_key(value, context, errors)
 
 
 def validate_terminal_release_requirement(
@@ -1109,6 +1126,10 @@ def validate_terminal_nm_child(
         "started_monotonic_ns",
         "completed_monotonic_ns",
     )
+    valid_integers = all(
+        terminal_is_integer(child.get(field)) and child.get(field, 0) > 0
+        for field in integer_fields
+    )
     if (
         child.get("exit_status") != 0
         or child.get("timed_out") is not False
@@ -1125,18 +1146,17 @@ def validate_terminal_nm_child(
             "start_ticks": child.get("start_ticks"),
             "status": "absent",
         }
-        or any(
-            not terminal_is_integer(child.get(field)) or child.get(field, 0) <= 0
-            for field in integer_fields
+        or not valid_integers
+        or (
+            valid_integers
+            and child["completed_monotonic_ns"] < child["started_monotonic_ns"]
         )
-        or child.get("completed_monotonic_ns", 0)
-        < child.get("started_monotonic_ns", 0)
     ):
         errors.append(f"{context} did not complete exactly")
-    started_at = terminal_authority_timestamp(
+    started_at = terminal_authority_timestamp_key(
         child.get("started_at"), f"{context} start", errors
     )
-    completed_at = terminal_authority_timestamp(
+    completed_at = terminal_authority_timestamp_key(
         child.get("completed_at"), f"{context} completion", errors
     )
     if started_at is not None and completed_at is not None and completed_at < started_at:
@@ -1171,6 +1191,235 @@ def validate_terminal_nm_child(
         errors.append(f"{context} output authority differs")
     if isinstance(stdout, str) and inventory.data != stdout.encode():
         errors.append(f"{context} stdout does not derive symbol inventory")
+
+
+def validate_terminal_release_materialized_root(
+    attestation: Mapping[str, Any], context: str, errors: list[str]
+) -> tuple[str, int, int] | None:
+    value = attestation.get("materialized_root")
+    if not isinstance(value, str) or not Path(value).is_absolute():
+        errors.append(f"{context} materialized root is not absolute text")
+        return None
+    try:
+        resolved = Path(value).resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        errors.append(f"{context} materialized root cannot be resolved: {error}")
+        return None
+    if value != str(resolved):
+        errors.append(f"{context} materialized root is not canonical")
+        return None
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            resolved,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+        opened = os.fstat(descriptor)
+        current = os.stat(resolved, follow_symlinks=False)
+    except OSError as error:
+        errors.append(f"{context} materialized root cannot be opened: {error}")
+        return None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+    ):
+        errors.append(f"{context} materialized root identity differs")
+        return None
+    return str(resolved), opened.st_dev, opened.st_ino
+
+
+def validate_terminal_release_build_child(
+    attestation: Mapping[str, Any], context: str, errors: list[str]
+) -> tuple[
+    Mapping[str, Any], schema.FileSnapshot, tuple[str, int, int]
+] | None:
+    """Independently replay one release build child and canonical log."""
+
+    child = terminal_authority_object(
+        attestation.get("build_child"),
+        schema.RELEASE_COMPILE_OUT_BUILD_CHILD_FIELDS,
+        f"{context} child",
+        errors,
+    )
+    if child is None:
+        return None
+    integer_fields = (
+        "pid",
+        "start_ticks",
+        "waited_pid",
+        "started_monotonic_ns",
+        "completed_monotonic_ns",
+    )
+    valid_integers = all(
+        terminal_is_integer(child.get(field)) and child.get(field, 0) > 0
+        for field in integer_fields
+    )
+    reaping = terminal_authority_object(
+        child.get("reaping"),
+        ("pid", "start_ticks", "status"),
+        f"{context} child reaping",
+        errors,
+    )
+    reaping_identity_valid = reaping is not None and all(
+        terminal_is_integer(reaping.get(field)) and reaping.get(field, 0) > 0
+        for field in ("pid", "start_ticks")
+    )
+    if reaping is not None and not reaping_identity_valid:
+        errors.append(f"{context} child reaping identity is invalid")
+    root_identity = validate_terminal_release_materialized_root(
+        attestation, context, errors
+    )
+    if (
+        child.get("argv") != attestation.get("build_argv")
+        or child.get("cwd") != attestation.get("materialized_root")
+        or child.get("output_path") != attestation.get("build_log_path")
+        or child.get("output_sha256") != attestation.get("build_log_sha256")
+        or any(
+            child.get(field) != attestation.get(f"build_{field}")
+            for field in (
+                "started_at",
+                "started_monotonic_ns",
+                "completed_at",
+                "completed_monotonic_ns",
+            )
+        )
+        or not valid_integers
+        or child.get("waited_pid") != child.get("pid")
+        or not terminal_is_integer(child.get("exit_status"))
+        or child.get("exit_status") != 0
+        or child.get("timed_out") is not False
+        or child.get("process_group_absent") is not True
+        or not reaping_identity_valid
+        or reaping
+        != {
+            "pid": child.get("pid"),
+            "start_ticks": child.get("start_ticks"),
+            "status": "absent",
+        }
+        or (
+            valid_integers
+            and child["completed_monotonic_ns"] < child["started_monotonic_ns"]
+        )
+    ):
+        errors.append(f"{context} child completion authority differs")
+    started_at = terminal_authority_timestamp_key(
+        child.get("started_at"), f"{context} child start", errors
+    )
+    completed_at = terminal_authority_timestamp_key(
+        child.get("completed_at"), f"{context} child completion", errors
+    )
+    if started_at is not None and completed_at is not None and completed_at < started_at:
+        errors.append(f"{context} child wall chronology differs")
+
+    log_path = Path(str(attestation.get("build_log_path", "")))
+    log_snapshot = bound_file(
+        attestation.get("build_log_path"),
+        attestation.get("build_log_sha256"),
+        log_path,
+        f"{context} build log",
+        errors,
+        expected_mode=0o444,
+    )
+    log = (
+        read_object(log_snapshot, f"{context} build log", errors)
+        if log_snapshot is not None
+        else None
+    )
+    log = terminal_authority_object(
+        log,
+        schema.RELEASE_COMPILE_OUT_BUILD_LOG_FIELDS,
+        f"{context} build log",
+        errors,
+    )
+    if log is None:
+        return None
+    stdout = log.get("stdout")
+    stderr = log.get("stderr")
+    if (
+        not terminal_is_integer(log.get("exit_status"))
+        or log.get("exit_status") != 0
+        or log.get("exit_status") != child.get("exit_status")
+        or not isinstance(stdout, str)
+        or not isinstance(stderr, str)
+        or log.get("stdout_sha256")
+        != hashlib.sha256(
+            stdout.encode() if isinstance(stdout, str) else b""
+        ).hexdigest()
+        or log.get("stderr_sha256")
+        != hashlib.sha256(
+            stderr.encode() if isinstance(stderr, str) else b""
+        ).hexdigest()
+    ):
+        errors.append(f"{context} build log output authority differs")
+    if root_identity is None:
+        return None
+    return child, log_snapshot, root_identity
+
+
+def validate_terminal_release_build_events(
+    events: Mapping[
+        str,
+        tuple[
+            Mapping[str, Any],
+            Mapping[str, Any],
+            schema.FileSnapshot,
+            tuple[str, int, int],
+        ],
+    ],
+    errors: list[str],
+) -> None:
+    """Prove the terminal proof contains two ordered, disjoint build events."""
+
+    if set(events) != set(schema.RELEASE_COMPILE_OUT_BUILD_NAMES):
+        errors.append("terminal release build event authority is incomplete")
+        return
+    ordinary_attestation, ordinary_child, ordinary_log, ordinary_root = events[
+        "ordinary_a"
+    ]
+    overlay_attestation, overlay_child, overlay_log, overlay_root = events[
+        "overlay_a"
+    ]
+    if ordinary_root[0] == overlay_root[0] or ordinary_root[1:] == overlay_root[1:]:
+        errors.append("terminal release build materializations are not distinct")
+    if (ordinary_child.get("pid"), ordinary_child.get("start_ticks")) == (
+        overlay_child.get("pid"),
+        overlay_child.get("start_ticks"),
+    ):
+        errors.append("terminal release build event identities are not distinct")
+    ordinary_completed_monotonic = ordinary_child.get("completed_monotonic_ns")
+    overlay_started_monotonic = overlay_child.get("started_monotonic_ns")
+    cross_monotonic_valid = all(
+        terminal_is_integer(value) and value > 0
+        for value in (ordinary_completed_monotonic, overlay_started_monotonic)
+    )
+    if not cross_monotonic_valid:
+        errors.append("terminal release build cross-event chronology is invalid")
+    elif ordinary_completed_monotonic >= overlay_started_monotonic:
+        errors.append("terminal release build monotonic chronology overlaps")
+    ordinary_completed = terminal_authority_timestamp_key(
+        ordinary_child.get("completed_at"),
+        "terminal ordinary release build completion",
+        errors,
+    )
+    overlay_started = terminal_authority_timestamp_key(
+        overlay_child.get("started_at"),
+        "terminal proof-only release build start",
+        errors,
+    )
+    if (
+        ordinary_completed is not None
+        and overlay_started is not None
+        and ordinary_completed > overlay_started
+    ):
+        errors.append("terminal release build wall chronology overlaps")
+    if ordinary_log.path == overlay_log.path or (
+        ordinary_log.device,
+        ordinary_log.inode,
+    ) == (overlay_log.device, overlay_log.inode):
+        errors.append("terminal release build logs are not physically disjoint")
 
 
 def validate_terminal_release_proof_semantics(
@@ -1270,6 +1519,15 @@ def validate_terminal_release_proof_semantics(
         "cfg_test",
         "rustc_workspace_wrapper",
     )
+    build_events: dict[
+        str,
+        tuple[
+            Mapping[str, Any],
+            Mapping[str, Any],
+            schema.FileSnapshot,
+            tuple[str, int, int],
+        ],
+    ] = {}
     for name in schema.RELEASE_COMPILE_OUT_BUILD_NAMES:
         context = f"terminal release build {name}"
         build = terminal_authority_object(
@@ -1304,6 +1562,11 @@ def validate_terminal_release_proof_semantics(
         sandbox_sha256 = validate_terminal_release_sandbox(
             attestation, context, errors
         )
+        build_event = validate_terminal_release_build_child(
+            attestation, context, errors
+        )
+        if build_event is not None:
+            build_events[name] = (attestation, *build_event)
         if (
             not isinstance(build_env, Mapping)
             or not isinstance(toolchain, Mapping)
@@ -1367,6 +1630,7 @@ def validate_terminal_release_proof_semantics(
             != requirement.get("product_overlay_sha256")
         ):
             errors.append("terminal proof-only overlay A authority differs")
+    validate_terminal_release_build_events(build_events, errors)
 
     binaries = value.get("binaries")
     inventories = value.get("symbol_inventories")
@@ -4188,6 +4452,58 @@ def build_terminal_fixture_v3(
         "path": str(ordinary_config_path.resolve()),
         "sha256": sha256_file(ordinary_config_path),
     }
+
+    def release_build_child(name: str, ordinal: int) -> tuple[Path, dict[str, Any]]:
+        log_path = tooling_root / "logs" / f"build-{name}.json"
+        write_fixture_json(
+            log_path,
+            {
+                "exit_status": 0,
+                "stderr": "",
+                "stderr_sha256": EMPTY_SHA256,
+                "stdout": "",
+                "stdout_sha256": EMPTY_SHA256,
+            },
+        )
+        pid = 30_000 + ordinal
+        start_ticks = 40_000 + ordinal
+        started_at = (
+            "2026-07-15T00:00:00+00:00"
+            if ordinal == 1
+            else "2026-07-15T00:00:02+00:00"
+        )
+        completed_at = (
+            "2026-07-15T00:00:01+00:00"
+            if ordinal == 1
+            else "2026-07-15T00:00:03+00:00"
+        )
+        started_monotonic_ns = 10 if ordinal == 1 else 30
+        completed_monotonic_ns = 20 if ordinal == 1 else 40
+        return log_path, {
+            "argv": release_build_argv,
+            "completed_at": completed_at,
+            "completed_monotonic_ns": completed_monotonic_ns,
+            "cwd": materialized_root,
+            "exit_status": 0,
+            "output_path": str(log_path.resolve()),
+            "output_sha256": sha256_file(log_path),
+            "pid": pid,
+            "process_group_absent": True,
+            "reaping": {
+                "pid": pid,
+                "start_ticks": start_ticks,
+                "status": "absent",
+            },
+            "start_ticks": start_ticks,
+            "started_at": started_at,
+            "started_monotonic_ns": started_monotonic_ns,
+            "timed_out": False,
+            "waited_pid": pid,
+        }
+
+    ordinary_build_log, ordinary_build_child = release_build_child(
+        "ordinary-a", 1
+    )
     ordinary_attestation: dict[str, Any] = {
         field: fixture_hash for field in schema.PREPARED_ATTESTATION_FIELDS
     }
@@ -4195,7 +4511,7 @@ def build_terminal_fixture_v3(
         {
             "archive_manifest_path": str(tooling_root / "archive-manifest.json"),
             "build_argv": release_build_argv,
-            "build_child": {"argv": release_build_argv},
+            "build_child": ordinary_build_child,
             "build_env": {
                 "ASTERISM_BUILD_SOURCE_APPROVAL_SHA256": approval_sha256,
                 "CARGO_HOME": GUEST_CARGO_HOME,
@@ -4205,6 +4521,8 @@ def build_terminal_fixture_v3(
             },
             "build_completed_at": "2026-07-15T00:00:01+00:00",
             "build_completed_monotonic_ns": 20,
+            "build_log_path": str(ordinary_build_log.resolve()),
+            "build_log_sha256": sha256_file(ordinary_build_log),
             "build_nonce": prepared_variants["A"]["contract"]["build_nonce"],
             "build_started_at": "2026-07-15T00:00:00+00:00",
             "build_started_monotonic_ns": 10,
@@ -4244,6 +4562,25 @@ def build_terminal_fixture_v3(
         "path": str(overlay_config_path.resolve()),
         "sha256": sha256_file(overlay_config_path),
     }
+    overlay_build_log, overlay_build_child = release_build_child(
+        "product-overlay-a", 2
+    )
+    overlay_attestation["build_log_path"] = str(overlay_build_log.resolve())
+    overlay_attestation["build_log_sha256"] = sha256_file(overlay_build_log)
+    overlay_attestation["build_child"] = overlay_build_child
+    overlay_materialized_path = tooling_root / "materialized" / "A-product-overlay"
+    overlay_materialized_path.mkdir(parents=True)
+    overlay_attestation["materialized_root"] = str(
+        overlay_materialized_path.resolve()
+    )
+    overlay_build_child["cwd"] = overlay_attestation["materialized_root"]
+    for field in (
+        "started_at",
+        "started_monotonic_ns",
+        "completed_at",
+        "completed_monotonic_ns",
+    ):
+        overlay_attestation[f"build_{field}"] = overlay_build_child[field]
     overlay_attestation["product_overlay_sha256"] = product_overlay_sha256
     prepared_variants["A"]["attestation"] = ordinary_attestation
     normalized_sandbox = list(release_build_argv)
@@ -5417,6 +5754,397 @@ def self_test() -> dict[str, Any]:
             "terminal-local-rejects-rehashed-overlay-attestation-nonce",
             lambda: terminal_local_proof_mutation(
                 mutate_overlay_attestation_nonce, "embedded authority differs"
+            ),
+        )
+
+        def rehash_terminal_release_build(
+            proof: dict[str, Any], name: str
+        ) -> dict[str, Any]:
+            build = proof["builds"][name]
+            build["attestation_sha256"] = hashlib.sha256(
+                canonical_json_bytes(build["attestation"])
+            ).hexdigest()
+            return build["attestation"]
+
+        def mutate_terminal_build_child_field(
+            proof: dict[str, Any],
+            _prepared: dict[str, Any],
+            _config: dict[str, Any],
+            name: str,
+            field: str,
+            value: Any,
+        ) -> None:
+            attestation = proof["builds"][name]["attestation"]
+            attestation["build_child"][field] = value
+            rehash_terminal_release_build(proof, name)
+
+        check(
+            "terminal-local-rejects-ordinary-build-nonzero-exit",
+            lambda: terminal_local_proof_mutation(
+                lambda proof, prepared, config: mutate_terminal_build_child_field(
+                    proof, prepared, config, "ordinary_a", "exit_status", 1
+                ),
+                "child completion authority differs",
+            ),
+        )
+        check(
+            "terminal-local-rejects-overlay-build-timeout",
+            lambda: terminal_local_proof_mutation(
+                lambda proof, prepared, config: mutate_terminal_build_child_field(
+                    proof, prepared, config, "overlay_a", "timed_out", True
+                ),
+                "child completion authority differs",
+            ),
+        )
+        check(
+            "terminal-local-rejects-overlay-build-orphan-process-group",
+            lambda: terminal_local_proof_mutation(
+                lambda proof, prepared, config: mutate_terminal_build_child_field(
+                    proof,
+                    prepared,
+                    config,
+                    "overlay_a",
+                    "process_group_absent",
+                    False,
+                ),
+                "child completion authority differs",
+            ),
+        )
+
+        def mutate_terminal_build_reaping(
+            proof: dict[str, Any],
+            _prepared: dict[str, Any],
+            _config: dict[str, Any],
+        ) -> None:
+            attestation = proof["builds"]["overlay_a"]["attestation"]
+            attestation["build_child"]["reaping"]["status"] = "present"
+            rehash_terminal_release_build(proof, "overlay_a")
+
+        check(
+            "terminal-local-rejects-overlay-build-reaping",
+            lambda: terminal_local_proof_mutation(
+                mutate_terminal_build_reaping,
+                "child completion authority differs",
+            ),
+        )
+
+        def mutate_terminal_build_reaping_bool_identity(
+            proof: dict[str, Any],
+            _prepared: dict[str, Any],
+            _config: dict[str, Any],
+        ) -> None:
+            attestation = proof["builds"]["overlay_a"]["attestation"]
+            child = attestation["build_child"]
+            child["pid"] = 1
+            child["waited_pid"] = 1
+            child["start_ticks"] = 1
+            child["reaping"] = {
+                "pid": True,
+                "start_ticks": True,
+                "status": "absent",
+            }
+            rehash_terminal_release_build(proof, "overlay_a")
+
+        check(
+            "terminal-local-rejects-overlay-build-reaping-bool-identity",
+            lambda: terminal_local_proof_mutation(
+                mutate_terminal_build_reaping_bool_identity,
+                "child reaping identity is invalid",
+            ),
+        )
+        check(
+            "terminal-local-rejects-overlay-build-argv",
+            lambda: terminal_local_proof_mutation(
+                lambda proof, prepared, config: mutate_terminal_build_child_field(
+                    proof, prepared, config, "overlay_a", "argv", ["/forged"]
+                ),
+                "child completion authority differs",
+            ),
+        )
+        check(
+            "terminal-local-rejects-overlay-build-cwd",
+            lambda: terminal_local_proof_mutation(
+                lambda proof, prepared, config: mutate_terminal_build_child_field(
+                    proof, prepared, config, "overlay_a", "cwd", "/forged"
+                ),
+                "child completion authority differs",
+            ),
+        )
+
+        def mutate_terminal_build_chronology(
+            proof: dict[str, Any],
+            _prepared: dict[str, Any],
+            _config: dict[str, Any],
+        ) -> None:
+            attestation = proof["builds"]["overlay_a"]["attestation"]
+            child = attestation["build_child"]
+            completed = child["started_monotonic_ns"] - 1
+            child["completed_monotonic_ns"] = completed
+            attestation["build_completed_monotonic_ns"] = completed
+            rehash_terminal_release_build(proof, "overlay_a")
+
+        check(
+            "terminal-local-rejects-overlay-build-chronology",
+            lambda: terminal_local_proof_mutation(
+                mutate_terminal_build_chronology,
+                "child completion authority differs",
+            ),
+        )
+
+        def mutate_terminal_build_time_scalar(
+            proof: dict[str, Any],
+            _prepared: dict[str, Any],
+            _config: dict[str, Any],
+            field: str,
+            value: Any,
+        ) -> None:
+            attestation = proof["builds"]["overlay_a"]["attestation"]
+            attestation["build_child"][field] = value
+            attestation[f"build_{field}"] = value
+            rehash_terminal_release_build(proof, "overlay_a")
+
+        check(
+            "terminal-local-rejects-overlay-build-string-monotonic-scalar",
+            lambda: terminal_local_proof_mutation(
+                lambda proof, prepared, config: mutate_terminal_build_time_scalar(
+                    proof,
+                    prepared,
+                    config,
+                    "started_monotonic_ns",
+                    "forged",
+                ),
+                "child completion authority differs",
+            ),
+        )
+        check(
+            "terminal-local-rejects-overlay-build-bool-monotonic-scalar",
+            lambda: terminal_local_proof_mutation(
+                lambda proof, prepared, config: mutate_terminal_build_time_scalar(
+                    proof,
+                    prepared,
+                    config,
+                    "completed_monotonic_ns",
+                    False,
+                ),
+                "child completion authority differs",
+            ),
+        )
+        check(
+            "terminal-local-rejects-overlay-build-bool-wall-start",
+            lambda: terminal_local_proof_mutation(
+                lambda proof, prepared, config: mutate_terminal_build_time_scalar(
+                    proof, prepared, config, "started_at", False
+                ),
+                "child start is not text",
+            ),
+        )
+        check(
+            "terminal-local-rejects-overlay-build-scalar-wall-completion",
+            lambda: terminal_local_proof_mutation(
+                lambda proof, prepared, config: mutate_terminal_build_time_scalar(
+                    proof, prepared, config, "completed_at", 7
+                ),
+                "child completion is not text",
+            ),
+        )
+        check(
+            "terminal-local-rejects-overlay-build-noncanonical-wall-time",
+            lambda: terminal_local_proof_mutation(
+                lambda proof, prepared, config: mutate_terminal_build_time_scalar(
+                    proof,
+                    prepared,
+                    config,
+                    "started_at",
+                    "2026-07-15 00:00:02+00:00",
+                ),
+                "child start is not an exact zoned timestamp",
+            ),
+        )
+
+        def mutate_terminal_cross_wall_nanosecond_reversal(
+            proof: dict[str, Any],
+            _prepared: dict[str, Any],
+            _config: dict[str, Any],
+        ) -> None:
+            ordinary_attestation = proof["builds"]["ordinary_a"]["attestation"]
+            overlay_attestation = proof["builds"]["overlay_a"]["attestation"]
+            ordinary_attestation["build_child"]["completed_at"] = (
+                "2026-07-15T00:00:02.000000001+00:00"
+            )
+            ordinary_attestation["build_completed_at"] = ordinary_attestation[
+                "build_child"
+            ]["completed_at"]
+            overlay_attestation["build_child"]["started_at"] = (
+                "2026-07-15T00:00:02.000000000+00:00"
+            )
+            overlay_attestation["build_started_at"] = overlay_attestation[
+                "build_child"
+            ]["started_at"]
+            rehash_terminal_release_build(proof, "ordinary_a")
+            rehash_terminal_release_build(proof, "overlay_a")
+
+        check(
+            "terminal-local-rejects-cross-wall-nanosecond-reversal",
+            lambda: terminal_local_proof_mutation(
+                mutate_terminal_cross_wall_nanosecond_reversal,
+                "build wall chronology overlaps",
+            ),
+        )
+
+        def mutate_terminal_build_crosslink(
+            proof: dict[str, Any],
+            _prepared: dict[str, Any],
+            _config: dict[str, Any],
+        ) -> None:
+            attestation = proof["builds"]["overlay_a"]["attestation"]
+            attestation["build_completed_at"] = "2026-07-15T00:00:02+00:00"
+            rehash_terminal_release_build(proof, "overlay_a")
+
+        check(
+            "terminal-local-rejects-overlay-build-attestation-crosslink",
+            lambda: terminal_local_proof_mutation(
+                mutate_terminal_build_crosslink,
+                "child completion authority differs",
+            ),
+        )
+
+        def rebind_terminal_build_log(
+            proof: dict[str, Any],
+            name: str,
+            filename: str,
+            payload: dict[str, Any],
+        ) -> None:
+            path = Path(
+                attempt_prepared_fixture["release_compile_out"]["path"]
+            ).parent / filename
+            write_fixture_json(path, payload)
+            attestation = proof["builds"][name]["attestation"]
+            attestation["build_log_path"] = str(path.resolve())
+            attestation["build_log_sha256"] = sha256_file(path)
+            attestation["build_child"]["output_path"] = str(path.resolve())
+            attestation["build_child"]["output_sha256"] = sha256_file(path)
+            rehash_terminal_release_build(proof, name)
+
+        check(
+            "terminal-local-rejects-overlay-build-rehashed-failed-log",
+            lambda: terminal_local_proof_mutation(
+                lambda proof, _prepared, _config: rebind_terminal_build_log(
+                    proof,
+                    "overlay_a",
+                    "build-overlay-failed.json",
+                    {
+                        "exit_status": 1,
+                        "stderr": "failed",
+                        "stderr_sha256": hashlib.sha256(b"failed").hexdigest(),
+                        "stdout": "",
+                        "stdout_sha256": EMPTY_SHA256,
+                    },
+                ),
+                "build log output authority differs",
+            ),
+        )
+        check(
+            "terminal-local-rejects-overlay-build-log-output-hash",
+            lambda: terminal_local_proof_mutation(
+                lambda proof, _prepared, _config: rebind_terminal_build_log(
+                    proof,
+                    "overlay_a",
+                    "build-overlay-bad-stdout-hash.json",
+                    {
+                        "exit_status": 0,
+                        "stderr": "",
+                        "stderr_sha256": EMPTY_SHA256,
+                        "stdout": "forged",
+                        "stdout_sha256": EMPTY_SHA256,
+                    },
+                ),
+                "build log output authority differs",
+            ),
+        )
+
+        def mutate_terminal_build_log_hash(
+            proof: dict[str, Any],
+            _prepared: dict[str, Any],
+            _config: dict[str, Any],
+        ) -> None:
+            attestation = proof["builds"]["overlay_a"]["attestation"]
+            attestation["build_log_sha256"] = "0" * 64
+            attestation["build_child"]["output_sha256"] = "0" * 64
+            rehash_terminal_release_build(proof, "overlay_a")
+
+        check(
+            "terminal-local-rejects-overlay-build-log-hash",
+            lambda: terminal_local_proof_mutation(
+                mutate_terminal_build_log_hash,
+                "build log hash mismatch",
+            ),
+        )
+
+        def alias_terminal_build_log(
+            proof: dict[str, Any],
+            _prepared: dict[str, Any],
+            _config: dict[str, Any],
+        ) -> None:
+            ordinary = proof["builds"]["ordinary_a"]["attestation"]
+            overlay = proof["builds"]["overlay_a"]["attestation"]
+            overlay["build_log_path"] = ordinary["build_log_path"]
+            overlay["build_log_sha256"] = ordinary["build_log_sha256"]
+            overlay["build_child"]["output_path"] = ordinary["build_log_path"]
+            overlay["build_child"]["output_sha256"] = ordinary[
+                "build_log_sha256"
+            ]
+            rehash_terminal_release_build(proof, "overlay_a")
+
+        check(
+            "terminal-local-rejects-release-build-log-physical-alias",
+            lambda: terminal_local_proof_mutation(
+                alias_terminal_build_log,
+                "build logs are not physically disjoint",
+            ),
+        )
+
+        def alias_terminal_materialized_root(
+            proof: dict[str, Any],
+            _prepared: dict[str, Any],
+            _config: dict[str, Any],
+        ) -> None:
+            ordinary = proof["builds"]["ordinary_a"]["attestation"]
+            overlay = proof["builds"]["overlay_a"]["attestation"]
+            overlay["materialized_root"] = ordinary["materialized_root"] + "/."
+            overlay["build_child"]["cwd"] = overlay["materialized_root"]
+            rehash_terminal_release_build(proof, "overlay_a")
+
+        check(
+            "terminal-local-rejects-materialized-root-lexical-alias",
+            lambda: terminal_local_proof_mutation(
+                alias_terminal_materialized_root,
+                "materialized root is not canonical",
+            ),
+        )
+
+        def overlap_terminal_build_events(
+            proof: dict[str, Any],
+            _prepared: dict[str, Any],
+            _config: dict[str, Any],
+        ) -> None:
+            ordinary = proof["builds"]["ordinary_a"]["attestation"][
+                "build_child"
+            ]
+            overlay_attestation = proof["builds"]["overlay_a"]["attestation"]
+            overlay = overlay_attestation["build_child"]
+            overlay["started_monotonic_ns"] = ordinary[
+                "completed_monotonic_ns"
+            ]
+            overlay_attestation["build_started_monotonic_ns"] = overlay[
+                "started_monotonic_ns"
+            ]
+            rehash_terminal_release_build(proof, "overlay_a")
+
+        check(
+            "terminal-local-rejects-release-build-event-overlap",
+            lambda: terminal_local_proof_mutation(
+                overlap_terminal_build_events,
+                "build monotonic chronology overlaps",
             ),
         )
         check(

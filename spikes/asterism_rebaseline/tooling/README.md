@@ -22,7 +22,32 @@ hash-checked descriptor. Every Cargo invocation
 uses a complete allowlisted environment, disabled global/system Git config,
 an offline read-only Cargo home, and a canonical replayed manifest of every
 Cargo config search path. The exact same identity is required for every later
-sequential build. Resolution itself runs in a no-network bubblewrap sandbox.
+sequential build. Resolution itself runs in a no-network bubblewrap sandbox
+whose only system mounts are `/usr/bin`, `/usr/lib`, and `/usr/include`.
+It creates empty `/dev` and `/proc` directories and exposes no device or proc
+interface, host root, `/etc`, or rustup home. The sandboxed Git global-config
+path is a deliberately absent path under `/asterism`, not `/dev/null`.
+Merged-`/usr` aliases are explicit guest symlinks.
+Every system-tree symlink must either remain in that closure or resolve to a
+guest-inaccessible path; links into `/asterism`, `/dev`, `/proc`, `/run`,
+`/sys`, or `/tmp` fail closed. All closure entries are root-owned and neither
+group/world nor process-writable, are recursively watched, and are replayed at
+the child boundary.
+
+Lock resolution is replayable authority, not a best-effort log. `A` and `B`
+record the exact retained-Git `show <commit:path>` readback. `C` and `D` first
+run the exact offline locked-metadata command with the current lock and require
+both success and an unchanged lock, then run the exact offline
+`generate-lockfile` command from an absent lock and require the reviewed final
+hash. Validation reconstructs the complete argv and descriptor order, fixed
+guest cwd, canonical materialized source root, retained bubblewrap lease,
+environment, successful exit, UTF-8 stdout/stderr hashes, and both lock
+boundaries. Its fixed descriptor order is three system roots, five core
+bindings (source, toolchain root, Cargo, rustc, and Cargo home), and four Cargo
+config files, plus the separately retained bubblewrap executable: thirteen
+passed descriptors in total. The resolution source is recursively frozen
+except for the root needed to create `Cargo.lock`; inotify and a second
+manifest allow only that lock and its atomic temporary names to mutate.
 This command
 performs dependency resolution but does not compile Rust or emit a measurement
 row.
@@ -96,11 +121,14 @@ approval embeds the complete canonical tools object and its file hash;
    contract, nonce, lock, toolchain, Cargo environment, normalized sandbox,
    package/example and fixed guest paths, with no workspace wrapper or
    `cfg(test)`. Bubblewrap, Cargo, rustc, Git, both source roots, both target
-   roots, and the Cargo/rustup homes are retained by descriptor across their
-   use. The seven core descriptors are followed by four exact config-file
-   descriptors; all eleven ephemeral numbers are normalized, never a guest
-   destination. Cargo-config evidence names the guest cwd/home and all eight
-   searched guest paths. Source and Cargo-home config files are private
+   roots, the exact toolchain root, and the Cargo home are retained by
+   descriptor across their use. The sandbox binds the three ordered system
+   roots first, then six core bindings (source, target, toolchain root, Cargo,
+   rustc, and Cargo home), then four exact config-file bindings. Bubblewrap is
+   a separate retained executable lease. All thirteen bind-descriptor numbers
+   are normalized, never a guest destination. Cargo-config evidence names the
+   guest cwd/home and all eight searched guest paths. Source and Cargo-home
+   config files are private
    descriptor mounts containing either the retained reviewed bytes or an
    immutable empty substitute; ancestor `.cargo` directories are empty
    read-only mounts. The config-manifest hash is part of the sandbox hash;
@@ -126,6 +154,22 @@ copies and `manifests/release-compile-out.json`. The proof-only overlay binary
 is reachable only through that proof: it is absent from variants, prepared
 tools, executable argument plans, and measurement child plans. The ordinary A
 hash in the proof must equal the A hash published by the prepared manifest.
+
+The preapproval current-child attestation is
+`bn-ecm1-current-children-build-v2`. Each current and release build carries one
+`bn-ecm1-semantic-input-authority-v1` object: recursively immutable filesystem
+authority for source, toolchain, and Cargo-home tree bindings plus the narrow
+trusted-system closure.
+Every referenced manifest is canonical immutable `0444` evidence with exact
+entry/watch counts and is deeply replayed against the live tree. Regular files
+in source/toolchain/Cargo-home are content-hashed; the trusted system closure
+uses exact metadata under its explicit root-owned non-writable trust boundary.
+The path-free runtime digest intentionally excludes relocatable evidence paths
+and the source component, while binding the exact ordered
+host/resolved/guest system-mount tuples, so independently materialized builds
+must still prove one identical Cargo/toolchain/system runtime. Downstream
+source approval must consume and replay this object; merely preserving its
+hash is not a valid integration.
 
 The prepared manifest also binds immutable copies of the exact approved
 protocol document and the historical `BN-2SU-FINAL.csv` input. Downstream

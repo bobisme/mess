@@ -560,19 +560,39 @@ def validate_sandboxed_build_argv(
     ).hexdigest()
 
 
-def parse_timestamp(value: Any, context: str, problems: Problems) -> datetime | None:
+_EXACT_ZONED_TIME = re.compile(
+    r"(?P<head>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})"
+    r"(?:\.(?P<fraction>\d{1,9}))?(?P<zone>Z|[+-]\d{2}:\d{2})\Z"
+)
+
+
+def parse_timestamp_key(
+    value: Any, context: str, problems: Problems
+) -> tuple[datetime, int] | None:
     if not isinstance(value, str):
         problems.add(f"{context} is not a timestamp")
         return None
+    match = _EXACT_ZONED_TIME.fullmatch(value)
+    if match is None:
+        problems.add(f"{context} is not an exact zoned timestamp")
+        return None
+    fraction = match.group("fraction")
+    nanoseconds = (fraction or "").ljust(9, "0")
+    microseconds = f".{nanoseconds[:6]}" if fraction else ""
+    zone = "+00:00" if match.group("zone") == "Z" else match.group("zone")
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(
+            f"{match.group('head')}{microseconds}{zone}"
+        )
     except ValueError as error:
         problems.add(f"{context} is invalid: {error}")
         return None
-    if parsed.tzinfo is None:
-        problems.add(f"{context} is not timezone-aware")
-        return None
-    return parsed
+    return parsed, int(nanoseconds[6:] or "0")
+
+
+def parse_timestamp(value: Any, context: str, problems: Problems) -> datetime | None:
+    parsed = parse_timestamp_key(value, context, problems)
+    return parsed[0] if parsed is not None else None
 
 
 def read_canonical_object(
@@ -2941,29 +2961,248 @@ def validate_completed_child(
         return
     if expected_argv is not None and child.get("argv") != list(expected_argv):
         problems.add(f"{context} argv mismatch")
-    for field in ("pid", "start_ticks", "started_monotonic_ns", "completed_monotonic_ns", "waited_pid"):
-        if not isinstance(child.get(field), int) or isinstance(child.get(field), bool) or child[field] <= 0:
+    integer_fields = (
+        "pid",
+        "start_ticks",
+        "started_monotonic_ns",
+        "completed_monotonic_ns",
+        "waited_pid",
+    )
+    valid_integers = all(
+        isinstance(child.get(field), int)
+        and not isinstance(child.get(field), bool)
+        and child[field] > 0
+        for field in integer_fields
+    )
+    for field in integer_fields:
+        if (
+            not isinstance(child.get(field), int)
+            or isinstance(child.get(field), bool)
+            or child[field] <= 0
+        ):
             problems.add(f"{context} {field} invalid")
     if child.get("waited_pid") != child.get("pid"):
         problems.add(f"{context} waited_pid mismatch")
-    if child.get("exit_status") != 0 or child.get("timed_out") is not False or child.get("process_group_absent") is not True:
+    if (
+        not isinstance(child.get("exit_status"), int)
+        or isinstance(child.get("exit_status"), bool)
+        or child.get("exit_status") != 0
+        or child.get("timed_out") is not False
+        or child.get("process_group_absent") is not True
+    ):
         problems.add(f"{context} completion/reaping status invalid")
-    if child.get("completed_monotonic_ns", 0) < child.get("started_monotonic_ns", 0):
+    if valid_integers and (
+        child["completed_monotonic_ns"] < child["started_monotonic_ns"]
+    ):
         problems.add(f"{context} monotonic chronology invalid")
-    start = parse_timestamp(child.get("started_at"), f"{context} started_at", problems)
-    end = parse_timestamp(child.get("completed_at"), f"{context} completed_at", problems)
+    start = parse_timestamp_key(
+        child.get("started_at"), f"{context} started_at", problems
+    )
+    end = parse_timestamp_key(
+        child.get("completed_at"), f"{context} completed_at", problems
+    )
     if start is not None and end is not None and end < start:
         problems.add(f"{context} wall chronology invalid")
     reaping = child.get("reaping")
     if not require_exact_keys(reaping, {"pid", "start_ticks", "status"}, f"{context} reaping", problems):
         reaping = None
-    if reaping is not None and (
-        reaping.get("pid") != child.get("pid")
-        or reaping.get("start_ticks") != child.get("start_ticks")
-        or reaping.get("status") != "absent"
-    ):
-        problems.add(f"{context} reaping identity/status mismatch")
+    if reaping is not None:
+        reaping_identity_valid = all(
+            isinstance(reaping.get(field), int)
+            and not isinstance(reaping.get(field), bool)
+            and reaping[field] > 0
+            for field in ("pid", "start_ticks")
+        )
+        if not reaping_identity_valid:
+            problems.add(f"{context} reaping identity invalid")
+        if (
+            not reaping_identity_valid
+            or reaping.get("pid") != child.get("pid")
+            or reaping.get("start_ticks") != child.get("start_ticks")
+            or reaping.get("status") != "absent"
+        ):
+            problems.add(f"{context} reaping identity/status mismatch")
     resolve_bound_file(child.get("output_path"), child.get("output_sha256"), f"{context} output", problems)
+
+
+def validate_release_materialized_root(
+    attestation: Mapping[str, Any], context: str, problems: Problems
+) -> tuple[str, int, int] | None:
+    value = attestation.get("materialized_root")
+    if not isinstance(value, str) or not Path(value).is_absolute():
+        problems.add(f"{context} materialized root is not absolute text")
+        return None
+    try:
+        resolved = Path(value).resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        problems.add(f"{context} materialized root cannot be resolved: {error}")
+        return None
+    if value != str(resolved):
+        problems.add(f"{context} materialized root is not canonical")
+        return None
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            resolved,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+        opened = os.fstat(descriptor)
+        current = os.stat(resolved, follow_symlinks=False)
+    except OSError as error:
+        problems.add(f"{context} materialized root cannot be opened: {error}")
+        return None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+    ):
+        problems.add(f"{context} materialized root identity differs")
+        return None
+    return str(resolved), opened.st_dev, opened.st_ino
+
+
+def validate_release_build_child(
+    attestation: Mapping[str, Any], context: str, problems: Problems
+) -> tuple[
+    Mapping[str, Any], schema.FileSnapshot, tuple[str, int, int]
+] | None:
+    """Independently replay a release build child and its canonical log."""
+
+    child = attestation.get("build_child")
+    build_argv = attestation.get("build_argv")
+    validate_completed_child(
+        child,
+        f"{context} child",
+        problems,
+        expected_argv=build_argv if isinstance(build_argv, list) else None,
+    )
+    root_identity = validate_release_materialized_root(
+        attestation, context, problems
+    )
+    if not isinstance(child, Mapping):
+        return None
+    if child.get("cwd") != attestation.get("materialized_root"):
+        problems.add(f"{context} child cwd differs")
+    if (
+        child.get("output_path") != attestation.get("build_log_path")
+        or child.get("output_sha256") != attestation.get("build_log_sha256")
+    ):
+        problems.add(f"{context} child/log binding differs")
+    for field in (
+        "started_at",
+        "started_monotonic_ns",
+        "completed_at",
+        "completed_monotonic_ns",
+    ):
+        if child.get(field) != attestation.get(f"build_{field}"):
+            problems.add(f"{context} child {field} attestation crosslink differs")
+
+    log_snapshot = resolve_bound_file(
+        attestation.get("build_log_path"),
+        attestation.get("build_log_sha256"),
+        f"{context} build log",
+        problems,
+        expected_mode=0o444,
+    )
+    log = (
+        read_canonical_object(log_snapshot, f"{context} build log", problems)
+        if log_snapshot is not None
+        else None
+    )
+    if not require_exact_keys(
+        log,
+        set(schema.RELEASE_COMPILE_OUT_BUILD_LOG_FIELDS),
+        f"{context} build log",
+        problems,
+    ):
+        return None
+    stdout = log.get("stdout")
+    stderr = log.get("stderr")
+    if (
+        not isinstance(log.get("exit_status"), int)
+        or isinstance(log.get("exit_status"), bool)
+        or log.get("exit_status") != 0
+        or log.get("exit_status") != child.get("exit_status")
+        or not isinstance(stdout, str)
+        or not isinstance(stderr, str)
+        or log.get("stdout_sha256")
+        != hashlib.sha256(
+            stdout.encode() if isinstance(stdout, str) else b""
+        ).hexdigest()
+        or log.get("stderr_sha256")
+        != hashlib.sha256(
+            stderr.encode() if isinstance(stderr, str) else b""
+        ).hexdigest()
+    ):
+        problems.add(f"{context} build log output authority differs")
+    if root_identity is None:
+        return None
+    return child, log_snapshot, root_identity
+
+
+def validate_release_build_events(
+    events: Mapping[
+        str,
+        tuple[
+            Mapping[str, Any],
+            Mapping[str, Any],
+            schema.FileSnapshot,
+            tuple[str, int, int],
+        ],
+    ],
+    problems: Problems,
+) -> None:
+    """Prove the release proof contains two ordered, disjoint build events."""
+
+    if set(events) != set(schema.RELEASE_COMPILE_OUT_BUILD_NAMES):
+        problems.add("release compile-out build event authority is incomplete")
+        return
+    ordinary_attestation, ordinary_child, ordinary_log, ordinary_root = events[
+        "ordinary_a"
+    ]
+    overlay_attestation, overlay_child, overlay_log, overlay_root = events[
+        "overlay_a"
+    ]
+    if ordinary_root[0] == overlay_root[0] or ordinary_root[1:] == overlay_root[1:]:
+        problems.add("release compile-out build materializations are not distinct")
+    if (ordinary_child.get("pid"), ordinary_child.get("start_ticks")) == (
+        overlay_child.get("pid"),
+        overlay_child.get("start_ticks"),
+    ):
+        problems.add("release compile-out build event identities are not distinct")
+    ordinary_completed_monotonic = ordinary_child.get("completed_monotonic_ns")
+    overlay_started_monotonic = overlay_child.get("started_monotonic_ns")
+    cross_monotonic_valid = all(
+        isinstance(value, int) and not isinstance(value, bool) and value > 0
+        for value in (ordinary_completed_monotonic, overlay_started_monotonic)
+    )
+    if not cross_monotonic_valid:
+        problems.add("release compile-out build cross-event chronology is invalid")
+    elif ordinary_completed_monotonic >= overlay_started_monotonic:
+        problems.add("release compile-out build monotonic chronology overlaps")
+    ordinary_completed = parse_timestamp_key(
+        ordinary_child.get("completed_at"),
+        "release compile-out ordinary build completion",
+        problems,
+    )
+    overlay_started = parse_timestamp_key(
+        overlay_child.get("started_at"),
+        "release compile-out proof-only build start",
+        problems,
+    )
+    if (
+        ordinary_completed is not None
+        and overlay_started is not None
+        and ordinary_completed > overlay_started
+    ):
+        problems.add("release compile-out build wall chronology overlaps")
+    if ordinary_log.path == overlay_log.path or (
+        ordinary_log.device,
+        ordinary_log.inode,
+    ) == (overlay_log.device, overlay_log.inode):
+        problems.add("release compile-out build logs are not physically disjoint")
 
 
 def validate_release_file_binding(
@@ -3071,6 +3310,15 @@ def validate_release_compile_out_proof(
     ):
         problems.add("release compile-out build names differ")
         builds = {}
+    build_events: dict[
+        str,
+        tuple[
+            Mapping[str, Any],
+            Mapping[str, Any],
+            schema.FileSnapshot,
+            tuple[str, int, int],
+        ],
+    ] = {}
     for name in schema.RELEASE_COMPILE_OUT_BUILD_NAMES:
         build = builds.get(name)
         context = f"release compile-out build {name}"
@@ -3189,11 +3437,9 @@ def validate_release_compile_out_proof(
         )
         if normalized_sandbox_sha256 != build.get("sandbox_sha256"):
             problems.add(f"{context} normalized sandbox hash differs")
-        build_child = attestation.get("build_child")
-        if not isinstance(build_child, Mapping) or build_child.get(
-            "argv"
-        ) != attestation.get("build_argv"):
-            problems.add(f"{context} child argv differs from sandbox authority")
+        build_event = validate_release_build_child(attestation, context, problems)
+        if build_event is not None:
+            build_events[name] = (attestation, *build_event)
         build_argv = attestation.get("build_argv")
         if isinstance(build_argv, list) and any(
             attestation.get(field) in build_argv
@@ -3232,6 +3478,7 @@ def validate_release_compile_out_proof(
             "product_overlay_sha256"
         ) != requirement_overlay_sha256:
             problems.add("release compile-out proof-only overlay authority differs")
+    validate_release_build_events(build_events, problems)
 
     binaries = proof.get("binaries")
     if not isinstance(binaries, dict) or set(binaries) != set(
@@ -9215,7 +9462,16 @@ def profile_fields(track, finish_result, *, raw_point, control_events, authority
     for index, variant in enumerate(schema.VARIANTS, start=1):
         item = source_data[variant]
         build_log = root / "logs" / f"{variant}-build.json"
-        fixture_write_json(build_log, {"status": "PASS", "variant": variant})
+        fixture_write_json(
+            build_log,
+            {
+                "exit_status": 0,
+                "stderr": "",
+                "stderr_sha256": EMPTY_SHA256,
+                "stdout": "",
+                "stdout_sha256": EMPTY_SHA256,
+            },
+        )
         build_nonce = hashlib.sha256(f"fixture-build-{variant}".encode()).hexdigest()
         contract = {
             "schema": schema.BINARY_CONTRACT_SCHEMA,
@@ -9257,7 +9513,7 @@ def profile_fields(track, finish_result, *, raw_point, control_events, authority
         build_argv = ["cargo", "build", "--locked", "--offline"]
         contract_argv = [str(binaries[variant]), "--contract"]
         started = previous_end + 1
-        completed = started + 10
+        completed = started + 1
         previous_end = completed
 
         def completed_child(argv: list[str], output_path: Path, start_ns: int) -> dict[str, Any]:
@@ -9489,6 +9745,55 @@ def profile_fields(track, finish_result, *, raw_point, control_events, authority
         "path": str(overlay_config_path.resolve()),
         "sha256": sha256_file(overlay_config_path),
     }
+    overlay_build_log = root / "logs" / "A-product-overlay-build.json"
+    fixture_write_json(
+        overlay_build_log,
+        {
+            "exit_status": 0,
+            "stderr": "",
+            "stderr_sha256": EMPTY_SHA256,
+            "stdout": "",
+            "stdout_sha256": EMPTY_SHA256,
+        },
+    )
+    overlay_attestation["build_log_path"] = str(overlay_build_log.resolve())
+    overlay_attestation["build_log_sha256"] = sha256_file(overlay_build_log)
+    overlay_attestation["build_child"]["output_path"] = str(
+        overlay_build_log.resolve()
+    )
+    overlay_attestation["build_child"]["output_sha256"] = sha256_file(
+        overlay_build_log
+    )
+    overlay_materialized_root = root / "materialized" / "A-product-overlay"
+    overlay_materialized_root.mkdir(parents=True)
+    overlay_attestation["materialized_root"] = str(
+        overlay_materialized_root.resolve()
+    )
+    overlay_child = overlay_attestation["build_child"]
+    overlay_child["cwd"] = str(overlay_materialized_root.resolve())
+    overlay_child["pid"] += 10_000
+    overlay_child["waited_pid"] = overlay_child["pid"]
+    overlay_child["start_ticks"] += 10_000
+    overlay_child["reaping"] = {
+        "pid": overlay_child["pid"],
+        "start_ticks": overlay_child["start_ticks"],
+        "status": "absent",
+    }
+    overlay_child["started_at"] = "2026-07-15T00:00:02+00:00"
+    overlay_child["completed_at"] = "2026-07-15T00:00:03+00:00"
+    overlay_child["started_monotonic_ns"] = (
+        ordinary_attestation["build_child"]["completed_monotonic_ns"] + 1
+    )
+    overlay_child["completed_monotonic_ns"] = (
+        overlay_child["started_monotonic_ns"] + 1
+    )
+    for field in (
+        "started_at",
+        "started_monotonic_ns",
+        "completed_at",
+        "completed_monotonic_ns",
+    ):
+        overlay_attestation[f"build_{field}"] = overlay_child[field]
     overlay_attestation["product_overlay_sha256"] = product_overlay_sha256
     normalized_sandbox = list(ordinary_attestation["build_argv"])
     for normalized_index, argument in enumerate(
@@ -11675,6 +11980,410 @@ def self_test() -> dict[str, Any]:
             lambda: semantic_proof_mutation(
                 rebind_overlay_nonce,
                 "embedded nonce/lock/environment differs",
+            ),
+        )
+
+        def rehash_release_build(
+            proof: dict[str, Any], name: str
+        ) -> dict[str, Any]:
+            build = proof["builds"][name]
+            build["attestation_sha256"] = hashlib.sha256(
+                canonical_json_bytes(build["attestation"])
+            ).hexdigest()
+            return build["attestation"]
+
+        def mutate_build_child_field(
+            proof: dict[str, Any],
+            _prepared: dict[str, Any],
+            name: str,
+            field: str,
+            value: Any,
+        ) -> None:
+            attestation = proof["builds"][name]["attestation"]
+            attestation["build_child"][field] = value
+            rehash_release_build(proof, name)
+
+        check(
+            "mutation-release-build-ordinary-nonzero-exit",
+            lambda: semantic_proof_mutation(
+                lambda proof, prepared: mutate_build_child_field(
+                    proof, prepared, "ordinary_a", "exit_status", 1
+                ),
+                "child completion/reaping status invalid",
+            ),
+        )
+        check(
+            "mutation-release-build-overlay-timeout",
+            lambda: semantic_proof_mutation(
+                lambda proof, prepared: mutate_build_child_field(
+                    proof, prepared, "overlay_a", "timed_out", True
+                ),
+                "child completion/reaping status invalid",
+            ),
+        )
+        check(
+            "mutation-release-build-overlay-orphan-process-group",
+            lambda: semantic_proof_mutation(
+                lambda proof, prepared: mutate_build_child_field(
+                    proof, prepared, "overlay_a", "process_group_absent", False
+                ),
+                "child completion/reaping status invalid",
+            ),
+        )
+
+        def mutate_build_reaping(
+            proof: dict[str, Any], _prepared: dict[str, Any]
+        ) -> None:
+            attestation = proof["builds"]["overlay_a"]["attestation"]
+            attestation["build_child"]["reaping"]["status"] = "present"
+            rehash_release_build(proof, "overlay_a")
+
+        check(
+            "mutation-release-build-overlay-reaping",
+            lambda: semantic_proof_mutation(
+                mutate_build_reaping, "reaping identity/status mismatch"
+            ),
+        )
+
+        def mutate_build_reaping_bool_identity(
+            proof: dict[str, Any], _prepared: dict[str, Any]
+        ) -> None:
+            attestation = proof["builds"]["overlay_a"]["attestation"]
+            child = attestation["build_child"]
+            child["pid"] = 1
+            child["waited_pid"] = 1
+            child["start_ticks"] = 1
+            child["reaping"] = {
+                "pid": True,
+                "start_ticks": True,
+                "status": "absent",
+            }
+            rehash_release_build(proof, "overlay_a")
+
+        check(
+            "mutation-release-build-overlay-reaping-bool-identity",
+            lambda: semantic_proof_mutation(
+                mutate_build_reaping_bool_identity,
+                "reaping identity invalid",
+            ),
+        )
+        check(
+            "mutation-release-build-overlay-argv",
+            lambda: semantic_proof_mutation(
+                lambda proof, prepared: mutate_build_child_field(
+                    proof, prepared, "overlay_a", "argv", ["/forged"]
+                ),
+                "child argv mismatch",
+            ),
+        )
+        check(
+            "mutation-release-build-overlay-cwd",
+            lambda: semantic_proof_mutation(
+                lambda proof, prepared: mutate_build_child_field(
+                    proof, prepared, "overlay_a", "cwd", "/forged"
+                ),
+                "child cwd differs",
+            ),
+        )
+
+        def mutate_build_monotonic_chronology(
+            proof: dict[str, Any], _prepared: dict[str, Any]
+        ) -> None:
+            attestation = proof["builds"]["overlay_a"]["attestation"]
+            child = attestation["build_child"]
+            completed = child["started_monotonic_ns"] - 1
+            child["completed_monotonic_ns"] = completed
+            attestation["build_completed_monotonic_ns"] = completed
+            rehash_release_build(proof, "overlay_a")
+
+        check(
+            "mutation-release-build-overlay-monotonic-chronology",
+            lambda: semantic_proof_mutation(
+                mutate_build_monotonic_chronology,
+                "child monotonic chronology invalid",
+            ),
+        )
+
+        def mutate_build_time_scalar(
+            proof: dict[str, Any],
+            _prepared: dict[str, Any],
+            field: str,
+            value: Any,
+        ) -> None:
+            attestation = proof["builds"]["overlay_a"]["attestation"]
+            attestation["build_child"][field] = value
+            attestation[f"build_{field}"] = value
+            rehash_release_build(proof, "overlay_a")
+
+        check(
+            "mutation-release-build-overlay-string-monotonic-scalar",
+            lambda: semantic_proof_mutation(
+                lambda proof, prepared: mutate_build_time_scalar(
+                    proof,
+                    prepared,
+                    "started_monotonic_ns",
+                    "forged",
+                ),
+                "child started_monotonic_ns invalid",
+            ),
+        )
+        check(
+            "mutation-release-build-overlay-bool-monotonic-scalar",
+            lambda: semantic_proof_mutation(
+                lambda proof, prepared: mutate_build_time_scalar(
+                    proof,
+                    prepared,
+                    "completed_monotonic_ns",
+                    False,
+                ),
+                "child completed_monotonic_ns invalid",
+            ),
+        )
+        check(
+            "mutation-release-build-overlay-bool-wall-start",
+            lambda: semantic_proof_mutation(
+                lambda proof, prepared: mutate_build_time_scalar(
+                    proof, prepared, "started_at", False
+                ),
+                "child started_at is not a timestamp",
+            ),
+        )
+        check(
+            "mutation-release-build-overlay-scalar-wall-completion",
+            lambda: semantic_proof_mutation(
+                lambda proof, prepared: mutate_build_time_scalar(
+                    proof, prepared, "completed_at", 7
+                ),
+                "child completed_at is not a timestamp",
+            ),
+        )
+        check(
+            "mutation-release-build-overlay-noncanonical-wall-time",
+            lambda: semantic_proof_mutation(
+                lambda proof, prepared: mutate_build_time_scalar(
+                    proof,
+                    prepared,
+                    "started_at",
+                    "2026-07-15 00:00:02+00:00",
+                ),
+                "child started_at is not an exact zoned timestamp",
+            ),
+        )
+
+        def mutate_build_cross_wall_nanosecond_reversal(
+            proof: dict[str, Any], _prepared: dict[str, Any]
+        ) -> None:
+            ordinary_attestation = proof["builds"]["ordinary_a"]["attestation"]
+            overlay_attestation = proof["builds"]["overlay_a"]["attestation"]
+            ordinary_attestation["build_child"]["completed_at"] = (
+                "2026-07-15T00:00:02.000000001+00:00"
+            )
+            ordinary_attestation["build_completed_at"] = ordinary_attestation[
+                "build_child"
+            ]["completed_at"]
+            overlay_attestation["build_child"]["started_at"] = (
+                "2026-07-15T00:00:02.000000000+00:00"
+            )
+            overlay_attestation["build_started_at"] = overlay_attestation[
+                "build_child"
+            ]["started_at"]
+            rehash_release_build(proof, "ordinary_a")
+            rehash_release_build(proof, "overlay_a")
+
+        check(
+            "mutation-release-build-cross-wall-nanosecond-reversal",
+            lambda: semantic_proof_mutation(
+                mutate_build_cross_wall_nanosecond_reversal,
+                "build wall chronology overlaps",
+            ),
+        )
+
+        def mutate_build_wall_chronology(
+            proof: dict[str, Any], _prepared: dict[str, Any]
+        ) -> None:
+            attestation = proof["builds"]["overlay_a"]["attestation"]
+            completed = "2026-07-14T23:59:59+00:00"
+            attestation["build_child"]["completed_at"] = completed
+            attestation["build_completed_at"] = completed
+            rehash_release_build(proof, "overlay_a")
+
+        check(
+            "mutation-release-build-overlay-wall-chronology",
+            lambda: semantic_proof_mutation(
+                mutate_build_wall_chronology,
+                "child wall chronology invalid",
+            ),
+        )
+
+        def mutate_build_crosslink(
+            proof: dict[str, Any], _prepared: dict[str, Any]
+        ) -> None:
+            attestation = proof["builds"]["overlay_a"]["attestation"]
+            attestation["build_started_monotonic_ns"] += 1
+            rehash_release_build(proof, "overlay_a")
+
+        check(
+            "mutation-release-build-overlay-attestation-crosslink",
+            lambda: semantic_proof_mutation(
+                mutate_build_crosslink,
+                "child started_monotonic_ns attestation crosslink differs",
+            ),
+        )
+
+        def rebind_release_build_log(
+            proof: dict[str, Any],
+            name: str,
+            filename: str,
+            payload: dict[str, Any],
+        ) -> None:
+            path = Path(
+                prepared_fixture["release_compile_out"]["path"]
+            ).parent / filename
+            fixture_write_json(path, payload)
+            attestation = proof["builds"][name]["attestation"]
+            attestation["build_log_path"] = str(path.resolve())
+            attestation["build_log_sha256"] = sha256_file(path)
+            attestation["build_child"]["output_path"] = str(path.resolve())
+            attestation["build_child"]["output_sha256"] = sha256_file(path)
+            rehash_release_build(proof, name)
+
+        check(
+            "mutation-release-build-overlay-rehashed-failed-log",
+            lambda: semantic_proof_mutation(
+                lambda proof, _prepared: rebind_release_build_log(
+                    proof,
+                    "overlay_a",
+                    "A-product-overlay-failed.json",
+                    {
+                        "exit_status": 1,
+                        "stderr": "failed",
+                        "stderr_sha256": hashlib.sha256(b"failed").hexdigest(),
+                        "stdout": "",
+                        "stdout_sha256": EMPTY_SHA256,
+                    },
+                ),
+                "build log output authority differs",
+            ),
+        )
+        check(
+            "mutation-release-build-overlay-log-output-hash",
+            lambda: semantic_proof_mutation(
+                lambda proof, _prepared: rebind_release_build_log(
+                    proof,
+                    "overlay_a",
+                    "A-product-overlay-bad-stdout-hash.json",
+                    {
+                        "exit_status": 0,
+                        "stderr": "",
+                        "stderr_sha256": EMPTY_SHA256,
+                        "stdout": "forged",
+                        "stdout_sha256": EMPTY_SHA256,
+                    },
+                ),
+                "build log output authority differs",
+            ),
+        )
+
+        def mutate_build_log_hash(
+            proof: dict[str, Any], _prepared: dict[str, Any]
+        ) -> None:
+            attestation = proof["builds"]["overlay_a"]["attestation"]
+            attestation["build_log_sha256"] = "0" * 64
+            attestation["build_child"]["output_sha256"] = "0" * 64
+            rehash_release_build(proof, "overlay_a")
+
+        check(
+            "mutation-release-build-overlay-log-hash",
+            lambda: semantic_proof_mutation(
+                mutate_build_log_hash, "build log hash mismatch"
+            ),
+        )
+
+        def alias_release_build_log(
+            proof: dict[str, Any], _prepared: dict[str, Any]
+        ) -> None:
+            ordinary = proof["builds"]["ordinary_a"]["attestation"]
+            overlay = proof["builds"]["overlay_a"]["attestation"]
+            overlay["build_log_path"] = ordinary["build_log_path"]
+            overlay["build_log_sha256"] = ordinary["build_log_sha256"]
+            overlay["build_child"]["output_path"] = ordinary["build_log_path"]
+            overlay["build_child"]["output_sha256"] = ordinary[
+                "build_log_sha256"
+            ]
+            rehash_release_build(proof, "overlay_a")
+
+        check(
+            "mutation-release-build-log-physical-alias",
+            lambda: semantic_proof_mutation(
+                alias_release_build_log, "build logs are not physically disjoint"
+            ),
+        )
+
+        def alias_release_materialized_root(
+            proof: dict[str, Any], _prepared: dict[str, Any]
+        ) -> None:
+            ordinary = proof["builds"]["ordinary_a"]["attestation"]
+            overlay = proof["builds"]["overlay_a"]["attestation"]
+            overlay["materialized_root"] = ordinary["materialized_root"] + "/."
+            overlay["build_child"]["cwd"] = overlay["materialized_root"]
+            rehash_release_build(proof, "overlay_a")
+
+        check(
+            "mutation-release-build-materialized-root-lexical-alias",
+            lambda: semantic_proof_mutation(
+                alias_release_materialized_root,
+                "materialized root is not canonical",
+            ),
+        )
+
+        def duplicate_release_build_identity(
+            proof: dict[str, Any], _prepared: dict[str, Any]
+        ) -> None:
+            ordinary = proof["builds"]["ordinary_a"]["attestation"][
+                "build_child"
+            ]
+            overlay = proof["builds"]["overlay_a"]["attestation"][
+                "build_child"
+            ]
+            overlay["pid"] = ordinary["pid"]
+            overlay["waited_pid"] = ordinary["pid"]
+            overlay["start_ticks"] = ordinary["start_ticks"]
+            overlay["reaping"] = {
+                "pid": ordinary["pid"],
+                "start_ticks": ordinary["start_ticks"],
+                "status": "absent",
+            }
+            rehash_release_build(proof, "overlay_a")
+
+        check(
+            "mutation-release-build-duplicate-event-identity",
+            lambda: semantic_proof_mutation(
+                duplicate_release_build_identity,
+                "build event identities are not distinct",
+            ),
+        )
+
+        def overlap_release_build_events(
+            proof: dict[str, Any], _prepared: dict[str, Any]
+        ) -> None:
+            ordinary = proof["builds"]["ordinary_a"]["attestation"][
+                "build_child"
+            ]
+            overlay_attestation = proof["builds"]["overlay_a"]["attestation"]
+            overlay = overlay_attestation["build_child"]
+            overlay["started_monotonic_ns"] = ordinary[
+                "completed_monotonic_ns"
+            ]
+            overlay_attestation["build_started_monotonic_ns"] = overlay[
+                "started_monotonic_ns"
+            ]
+            rehash_release_build(proof, "overlay_a")
+
+        check(
+            "mutation-release-build-overlapping-events",
+            lambda: semantic_proof_mutation(
+                overlap_release_build_events,
+                "build monotonic chronology overlaps",
             ),
         )
         check(
