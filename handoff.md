@@ -1,180 +1,495 @@
-# Handoff — Asterism implementation program
+# Handoff — Asterism Phase 4 integration and terminal rebaseline
 
-**Written:** 2026-07-13 by the outgoing lead agent.
-**For:** the next lead agent.
-**Read this first, then `bn show bn-agy` (the goal bone — its comments are the running decision log).**
+**Written:** 2026-07-17
+**Outgoing lead:** `mess-dev`
+**Repository:** `/home/bob/src/mess`
 
----
+This document supersedes the July 13 handoff that described the beginning of the
+Asterism implementation program. Much more has landed since then. The immediate
+job is no longer “implement the flat owner”; it is to finish the sealed,
+independently reviewed Phase 4 rebaseline pipeline, run its single-use terminal
+measurement, and publish the current-vs-Fjall-era performance budget.
 
-## 1. Where we are in one paragraph
+## 1. Executive summary
 
-The **Asterism spike program is complete** — 12 of 12 spikes done, zero kill criteria tripped, all merged (goal `bn-3fn`, closed). It proved a log-derived state kernel can replace Fjall, and produced a final go/no-go (Spike J): **PROCEED, NARROWED**. The **implementation program** (goal `bn-agy`) is now underway. **Step 1 is merged** (`05af6861`): stream/type names now live in the log, and **Fjall no longer holds anything authoritative** — every remaining Fjall keyspace is a derived cache with a spike-proven replacement. **Step 2 (the flat-combined append owner, `bn-2su`) is the next task and has not been started** — its worker died on a usage limit before writing a line. Everything else is follow-up.
+The flat-owner/owned-append kernel and its supporting Phase 4 work are integrated
+in the active Maw workspace and pass the full repository suite. The current
+source checkpoint has independent code, lock-authority, and source-authority
+approvals. A fresh current-child build also proved that the production-test
+overlay compiles completely out of the release binary.
 
----
+The final prepared A/B/C/D artifact build is the only immediate blocker. Its
+first attempt, `bn-znj5-prepared-v3-r1`, failed closed before emitting any
+benchmark rows:
 
-## 2. Immediate next action
+```text
+prepare-overlays: [Errno 2] No such file or directory:
+'/home/bob/src/mess/.maw/workspaces/bn-znj5/None'
+```
 
-**Dispatch Step 2: the flat-combined owner (`bn-2su`).**
+That root is diagnostic and must never be reused or promoted. The next lead
+should locate which serialized optional value is being converted into the
+repository-relative path `None`, fix it through a new bone/Maw workspace if it
+is a product-code defect, independently review the fix, regenerate all
+source-bound authority, finish the prepared build, and only then start the
+single-use terminal runner.
 
-State: bone is `doing`, claim staked by `mess-dev`, workspace `.maw/workspaces/bn-2su` exists and is **empty/clean**. Either reuse it or destroy and recreate. Nothing is lost.
+There is no manual action required from Bob. Do not ask him to stop unrelated
+processes. Authority and builds now use a physically separate offline
+`CARGO_HOME`, so unrelated local Cargo work cannot perturb the lineage.
 
-The brief I would give (it is the same one whose worker died — reuse it):
+## 2. Live objective and bone chain
 
-> Replace the composed engine's append orchestration with ONE owner that validates, assigns positions, encodes, writes, barriers, applies, and publishes. Prototyped and proven in Spike B (`spikes/flat_combined_append/REPORT.md`) — beats the current engine in **all 32 measured cells**.
+The immediate dependency chain is:
 
-**Three hard constraints (measured; violating any of them throws away the win):**
+```text
+bn-3ef   Phase 4 goal
+  └─ bn-2l3n  Rebaseline flat-owner kernel vs Fjall-era and bare engines
+       ├─ bn-znj5  Integrate/review rebaseline state machine        DOING
+       └─ bn-3nl7  Terminal rebaseline and published budget        OPEN
+                    depends on bn-znj5
+```
 
-1. **The owner MUST BE the committer** — it performs the write and the `fdatasync` itself. An owner that *fronts* the existing committer thread measured **−35%**.
-2. **Rebuild the committer's D7 early-close inside the owner** (target width + in-flight-producer gate + ~200 µs grace). Without it the commit convoy splits into ~2× fsyncs — which is exactly the pre-existing defect **`bn-3pz`**, so doing this correctly **fixes `bn-3pz` for free**. Verify it does and report fsync counts.
-3. **Do NOT implement B1 pipelining** (validate/encode group N+1 during group N's barrier). Measured: no win in Process, **5–18% LOSS** in durable mode at 64 writers. Reconfirmed the `perf_group_commit` H2a result twice. Keeping it out also keeps a nondeterministic barrier cut out of the fault model.
+- `bn-znj5` is the current implementation/authority task.
+- `bn-3nl7` is the next execution task. It alone may emit the final correctness
+  and performance rows from the approved, frozen artifact set.
+- `bn-2l3n` is the umbrella rebaseline task and completes after `bn-3nl7`.
+- `bn-3ef` is the Phase 4 goal.
+- `bn-1gn1` (“Bound prepared construction memory without priority scheduling”)
+  is another ready Phase 4 bone, but it is not part of this immediate authority
+  chain. Do not silently switch to it before the rebaseline is finished.
 
-**It replaces** (all in `crates/mess-store/src/engine.rs`): the 256-shard `AppendGate`, both per-append `spawn_blocking` tasks, the `PublishSequencer` (mutex+condvar), and the post-commit Fjall `CommitGroup` head write.
+The broader roadmap is intentional, not active clutter. After this handoff bone
+is closed, the Asterism-labelled inventory should be approximately 118 bones:
+63 done, 2 doing, and 53 open. Most open bones are dependency-gated Phase 5–10
+work under `bn-o5b`, “Complete the post-flat-owner Asterism storage-engine
+roadmap.” They preserve the rest of the Asterism integration plan; do not treat
+all 53 as concurrently active.
 
-**It MUST preserve** — these are load-bearing and were earned the hard way:
-- **The registry unit** (just landed — read `git show 05af6861` first): a `$registry` batch and the domain batch that first uses its ids are ONE ordered unit that fails atomically (`UnitTag`/`failed_units` in `committer.rs`) and must **publish everything that landed before surfacing any error** (a committed-but-never-published position stalls every higher position forever — the `bn-3nz` hazard). Ids are **staged**: only committed to the `Book` after the record is irrevocably queued.
-- **Cancellation**: dropping the caller's future must never prevent a committed batch from publishing (today guaranteed by the non-cancellable `spawn_blocking`; the owner must give the same guarantee).
-- Dense global positions *within the log*, exactly-one-winner on same-stream `Exact(v)` races, conflict/empty-append API semantics, EIO/poison (D8) stickiness.
+## 3. Maw workspaces
 
-**Bar:** full `just test`; `cargo check --workspace --all-targets`; differential oracle vs the pre-change engine; matched benchmark using `spikes/baseline_matrix/` (baseline-gen2: batch 1/10/100/1000 × 24 B/250 B × 1/4 writers × Process/Group, interleaved ABBA, median-of-3, quiet-guarded). **Adversarial review is mandatory before merge.**
+At handoff time:
 
----
-
-## 3. The one process rule that matters most
-
-**Every production change gets an adversarial review before merge, from a separate agent, told to REFUTE merge-readiness — not to "review".**
-
-This is not ceremony. In this program it caught, in production code that passed its author's full test suite:
-
-| What review caught | Severity |
-|---|---|
-| A reader panic that poisoned the engine-wide mutex, killing the store (Spike C) | blocking |
-| A recovery path that trusted an index covering data that never reached disk (Spike C) | blocking |
-| A corruption test that "passed" only because it recomputed the checksum after corrupting the byte (Spike I) | bogus gate |
-| **Permanent store corruption from the public API, no crash, no fault injection** (Step 1) | **REJECT** |
-
-That last one: an oversized (>64 MiB) batch to a new stream minted ids into memory, failed, and never rolled back — the *next* append saw them as registered, emitted no registry record, and committed events referencing ids that existed nowhere. Store unopenable forever, with a successfully-acked event inside it. **Reproduced from the public API.** The fix was structural (stage ids; commit them only after the record is irrevocably queued), and the same reviewer then re-verified against its own repros.
-
-Practical notes: reuse **the same reviewer agent** for re-checks after fixes (it holds its own reproductions). Give reviewers a concrete attack list, not "please review". Expect FIX-FIRST or REJECT on first pass for anything touching durability or recovery — that has been the norm, not the exception.
-
----
-
-## 4. What is done (and where the evidence lives)
-
-All spike code and REPORTs are merged under `spikes/`. Each REPORT has method, machine info, Measured/Derived labels, gates, and a verdict.
-
-| Spike | Verdict | Evidence |
+| Workspace | Meaning | Action |
 |---|---|---|
-| 0 baseline | baseline-gen2 locked; **gate per batch size, never one headline** | `spikes/baseline_matrix/` |
-| A dense heads | Direct pages win: 46× fjall, 2.6× HashMap, 16.02 B/stream | `spikes/state_kernel_dense_heads/` |
-| B flat owner | NARROW: beats engine everywhere; **owner must BE committer**; B1 dead | `spikes/flat_combined_append/` |
-| C no-Book | **MERGED INTO ENGINE.** RSS 16–25% of baseline, zero open decodes, hot loads 2× faster | `spikes/open_without_book/` |
-| D effects+checkpoint | PROCEED: 100k/100k digests identical, open 4.9% of full scan, 24.3M transitions/s | `spikes/segment_effect/` |
-| E v4 capsules | **MERGED, flag-OFF.** 96k crash states + 24k torn + 30M fuzz, zero violations | `spikes/capsule_v4_prelude/` |
-| F microblocks | ADOPT-F3 stream side; **stride-8 global REFUTED** (use stride-1) | `spikes/active_microblocks/` |
-| G epoch dedupe | ADOPT G2: exact under forced collisions, 12.6× on window misses, zero deletes | `spikes/epoch_dedupe/` |
-| H directory | ADMIT bitvector+rank (real segments are all dense); PtrHash disqualified | `spikes/directory_tournament/` |
-| I SealPack | **MERGED, flag-OFF** (`EngineOptions::seal_pack`) | `spikes/seal_pack/` |
-| J composed | **PROCEED NARROWED** — the decision | `spikes/composed_decision/` |
-| Step 1 registry | **MERGED** (`05af6861`) — Fjall now holds nothing authoritative | — |
+| `bn-znj5` | Active Phase 4 source and authority checkpoint | Continue here; do not merge merely because Maw says “ready to merge” |
+| `bn-2l3n` | Clean umbrella workspace | Retain until the rebaseline closes |
+| `bn-1qsq` | Done review of old commit `86027c…` | Historical only; never merge. It may be recovery-snapshotted/destroyed |
 
----
+The current source workspace is:
 
-## 5. Spike J's decision (this is the plan; don't re-litigate it)
+```text
+/home/bob/src/mess/.maw/workspaces/bn-znj5
+commit  2bd1dcc5bb2ff2ae7c291fe7a83ab3bc32b47381
+tree    0087e1f4de9fc3608107d2291b6b7de6d1cc5573
+status  clean, detached HEAD
+```
 
-- **(a) Integrate the flat owner: YES**, highest priority. → Step 2, `bn-2su`.
-- **(b) Retire Fjall: NOT YET** → *this is now unblocked.* Step 1 removed the sole blocker (names). All remaining keyspaces (`stream_heads`, `snapshot_heads`, `checkpoints`, `dedupe`, `dedupe_order`, `hw`) are **derived caches**. Deleting Fjall is now mechanical, not dangerous.
-- **(c) v4 / migration: STOP for now.** The v3-compatible subset is the right stopping point. v4 is merged, proven, and flag-off — available the day there's a reason. **See §7: the reason may now exist.**
+`maw ws list` labels `bn-znj5` “ready to merge” only because all source changes
+are committed. The bone itself is not done: prepared artifacts and the terminal
+handoff remain outstanding.
 
-**Implementation order (from Spike J, with Step 1 done):**
-1. ~~log-derived `$registry`~~ ✅ **DONE** (`bn-2di`)
-2. **flat owner** ← **YOU ARE HERE** (`bn-2su`)
-3. dense heads (A) + epoch dedupe (G) — replaces `stream_heads`, `dedupe`
-4. microblocks (F) **stream side only, stride-1 global**
-5. segment effects + checkpoints (D)
-6. bitrank sealed directory (H)
-7. SealPack RSS fix (`bn-dbz`) + footer identity binding (`bn-11g`) **before** `seal_pack` may default ON
-8. v4: not now (but see §7)
+The trunk has unrelated/operational metadata changes in `.bones/` and `.seal/`.
+Preserve them. Do not reset or clean the trunk.
 
-**The known ceiling — do not be surprised by it:** the literal "≥85% of bare log" gate **fails below batch 1000 for BOTH engines**. It prices *the async API*, not the orchestration. ~69% of cycles are producer-side (tokio wakeups + record allocation; two thread wakes per append). Spike J bounded the prize precisely: **dropping the tokio hop + record copy takes the flat owner from 53.8% → 83.4% of bare.** That is the single largest lever remaining after the current work — an owned-record / interned-type append API. Note `mess-log` itself is runtime-agnostic (its own `Runtime` trait, `RealRuntime`/`SimRuntime`); tokio lives only above it, in `mess-store` and up.
+All three previously spawned reviewers are finished; no subagent is currently
+running:
 
----
+- canonical handoff/code review: approved
+- lock r23 review: approved
+- source r2 review: approved
 
-## 6. Design-pack amendments the spikes produced
+## 4. What is integrated and verified
 
-The `notes/mess-asterism/` pack is **not** fully updated with these. They live in `bn-3fn`'s comments. If you revise the pack, these are the corrections:
+The last integrated repair is commit `2bd1dcc5`:
 
-- **Frontier semilattice needs an explicit bottom** (or entry *creation* must count as dirtying). A `ProjectionCheckpoint` at position 0 creates a digest-visible entry with no value change — invisible to latest-value dirty tracking, so an incremental checkpoint reuses a stale blob. Found by the corpus at ~4/100k. General rule: **in any latest-value component, "key now exists" is invisible to value-comparison dirty tracking.**
-- **Parallelize the effect BUILD, apply sequentially.** Full ordered tree composition materializes intermediate maps (7.0 s vs 0.3 s at 1 thread). Build parallelizes 6.8× at 8 threads; apply runs at 24.3M transitions/s sequentially.
-- **Allocator components need first/last boundaries** so monotonicity survives composition (design §9.7).
-- **The owner must be the committer** (design §6.3 as literally written). Fronting the existing committer: −35%.
-- **B1 pipelining is dead.** Measured twice.
-- **The v4 spec must mandate the no-alloc validate/materialize split.** A naive materialize-everything `decode_capsule` costs **+24.5%/byte** over v3; splitting it into an allocation-free `validate_capsule` for the scanner hot path brings it to **+0.47%**. Without this the <2% scan gate is unreachable.
-- **A5 framing (design §1.1 is wrong as written):** v4 does not "preserve all A1–A12". Say: *"preserves A1–A4 and A6–A12; replaces A5 with a safety-preserving nonempty-capsule rule (`control_count + event_count >= 1`) and promotes contiguous `batch_id` to recovery-significant."*
-- **Gate per batch size, never on one headline ratio** (the composed/bare ratio is fixed-overhead-bound and rises monotonically with batch size).
-- **research/06 (migration plan) is MOOT** — see §7. Bone `bn-3m3` tracks annotating it.
+- separates builder-local ASCII-canonical JSON replay from the strict UTF-8
+  canonical parser used by reviewed/prepared authorities;
+- fixes the real non-ASCII system-closure case
+  `/usr/lib/go/test/fixedbugs/issue27836.dir/Þfoo.go`;
+- keeps generic reviewed/prepared authority parsing strict UTF-8;
+- rejects all 10 cross-encoding hostile cases;
+- refreshes every live release-line-neutral overlay binding:
+  - overlay SHA-256
+    `db060c902d7d1a2664dcaea44525adac727b1bef1de32bb01b33be2561143a39`
+  - reviewed overlay commit
+    `86027c98605d9ea01c3e385b0702741723d5a538`
+  - validator counts: 11 production, 17 self-test;
+  - profile adapter binding updated and directly tested.
 
----
+The repair originated as commit
+`8e8b4f9936d47c62d16691872d7d90246fe4b9ca`. Seal review `cr-244cxl`
+approved it with zero findings and zero threads. Review event-log SHA-256:
 
-## 7. IMPORTANT — a mid-flight scope change you must know about
+```text
+908e41bc59aae38a77bf1132ba513bbed5800ef2330f0d3535cbfd1f2af8eb76
+```
 
-**Bob confirmed (2026-07-13): mess has NO users and NO existing stores. Early development.**
+After integration, the exact current tree passed:
 
-Consequences, already actioned:
-- The **entire migration program is moot** — research/06's M0–M9 phased cutover, shadow compares, dedupe/snapshot import, rollback matrix, `mess migrate` CLI. None of it will be built. Risk R3 ("authoritative name mappings lost during migration") drops out entirely. Bone `bn-3m3` tracks annotating the doc (keep it — its analysis of *why* names were the sole non-rebuildable authority is what produced Step 1).
-- **Fjall retirement is a straight deletion, not a migration.**
-- **This weakens the main argument for holding v4.** Spike J's caution was substantially about migration danger. With no stores to migrate, v4 can be judged on its own merits — and there is now a *positive* reason to want it (below). I did not re-open that decision; the v3 registry path works and I did not want to churn it. **But it is a live question for you.**
+- `just fmt-check`
+- focused Python, overlay, and build static tests
+- all 58 profile-adapter tests
+- `MESS_SNAPSHOT_LAW_ITERS=25 CARGO_NET_OFFLINE=true CARGO_HOME=<private> just test`
+- result: 981 passed, 27 skipped, 2 slow; 151.509 seconds of test runtime
+  after the clean build
 
-**The positive reason for v4 — a real semantic cost of the v3 registry path (bone `bn-25c`):**
-`$registry` batches are real v3 event batches, so **they consume global positions**. The engine filters stream 0 out of `read_global` (both tiers), so users never *see* registry events — but the `global_position` values on the user events they *do* see now have **gaps**. **Global positions are no longer dense over user events.** This already broke four test suites whose oracles assumed "position N == the Nth user event" (fixed in `bn-2di`). Any external cursor or projection assuming density will break the same way.
+No benchmark rows were emitted by these checks.
 
-This was an explicit, anticipated trade (research/06 M4 option 1; design §21.7: *"accept the extra global positions rather than weakening recovery"*). **But v4's control-only capsules do not consume domain positions — by design (§5.2). That is precisely the problem they were invented to solve.** So: v3 registry works and is merged; v4 would restore dense user positions. Worth deciding deliberately once the state kernel lands.
+## 5. Private Cargo authority
 
----
+Every authority or build producer must use:
 
-## 8. Open bones, triaged
+```bash
+export PYTHONDONTWRITEBYTECODE=1
+export CARGO_NET_OFFLINE=true
+export CARGO_HOME=/home/bob/.cache/mess-bench/asterism-rebaseline/bn-znj5-cargo-home-v3-r1
+```
 
-**Blocks flag-default-ON (do before turning `seal_pack` on):**
-- `bn-dbz` — SealPack costs **+18%/+36% reopen peak RSS** (2M/10M). Erodes the exact bounded-RSS win Spike C bought. Likely: the pack is materialized whole into RAM at open; leave `PAYLOAD_COLUMNS` on the pread/bounded-cache path.
-- `bn-11g` — footer does not name the pack hash (deviates from research/04 §6.2 trust chain). Accepted for the flag-off period only.
+The private Cargo home is 7.2 GiB with 225,566 entries. It is physically
+distinct from `~/.cargo` and has zero inode overlap. It contains the offline
+registry/git/cache material required by the pipeline, not user credentials or
+installed bins. Tool identities are pinned separately.
 
-**Real bugs / gaps:**
-- `bn-3pz` — Group-mode convoy split. **CONFIRMED but MISATTRIBUTED** (bisect showed it pre-dates the recent merges; present at Spike B's own base commit). **Step 2's early-close fixes it for free** — do not fix separately; close it out as part of `bn-2su`.
-- `bn-30u` — refuted sidecar candidates are re-evaluated every reopen; rolled-but-refuted segments are never re-queued for re-seal.
-- `bn-2r8` — v4 follow-ups (SIGKILL scenario when a v4 committer exists; v3-binary open-time refusal; `marker_flags == 0` read check; validate-vs-decode differential fuzz).
+This isolation was added after unrelated local Cargo work mutated
+`~/.cargo/.global-cache` during earlier lineages. It solves the interference
+without weakening any guard. Do not revert to shared `~/.cargo`, stop unrelated
+user processes, or loosen the authority checks.
 
-**Free wins:**
-- `bn-dcr` — swap the sealed directory HashMap to **foldhash**: +53% median real-segment batch lookup, one line. Independent of whether bitrank ships.
+The parent claims may have expired by the time this is read. Check first:
 
-**Docs:**
-- `bn-25c` — document that global positions are no longer dense over user events (§7 above). **Do this one; it is API-visible.**
-- `bn-3m3` — annotate research/06 as moot.
+```bash
+rite claims list --agent "$AGENT"
+```
 
-**Flaky tests — these actively erode signal; three separate reviewers have burned time proving they aren't regressions:**
-- `bn-2nd` — `fold_chain_overhead::chain_append_overhead_is_in_envelope` (fails under parallel load; passes 3/3 in isolation at 0.26 s). **Ignore it in suite runs; do not chase it.**
-- `bn-31n` — `engine_publish_cancel` (same class).
-- `bn-2rk` — `engine_append_gate` (same class). *Note: this one may be deleted outright by Step 2, which removes the AppendGate.*
+When continuing `bn-znj5`, stake only these scoped claims:
 
-**Process:**
-- `bn-1qa` — **worker verification must run `cargo check --workspace --all-targets`**, not just `-p <touched crates>`. A merge broke the build because `SealInput` gained a field and two call sites (`mess-bench`, `mess-cli`) sat outside the verified scope. I hotfixed it (`16243284`). **Enforce this on every worker brief.**
-- `bn-tkd` — tracking a bones projection glitch filed upstream (`bn-2nxw` in `~/src/bones`): created items went briefly unfindable mid-batch; workaround is to re-create (same IDs come back).
+```bash
+rite claims stake --agent "$AGENT" \
+  "resource://mess/cargo-home-authority" \
+  "bone://mess/bn-znj5" \
+  "workspace://mess/bn-znj5" \
+  -m "bn-znj5 isolated Cargo-home authority and Phase 4 integration" \
+  --ttl 3600
+```
 
----
+Never use `rite claims release --all`; release only claims owned by your task.
 
-## 9. Operational notes that will save you time
+## 6. Fresh approved authority lineage for `2bd1dcc5`
 
-- **Models:** Bob asked for **Opus workers** (Fable got expensive). Lead stays on the session model. Reviewers on Opus have been excellent.
-- **Workers die on usage limits mid-task.** It has happened four times. Their work is usually *committed or at least written* in the workspace — **always inspect `.maw/workspaces/<bone>/` (`git log`, `git status`, `git diff`) before re-spawning.** Twice I finished the job myself from what was already on disk rather than burning a new worker.
-- **Bench hygiene is real on this host.** Ambient load is ~4–5 from unrelated processes, so a fixed "load < 6" quiet-guard is unusable. Have workers **record the load1 each measured run executed under** rather than trusting a floor. Concurrent spikes must stagger measured phases — and beware `pgrep -f <name>` **self-matching** the guard's own shell (it deadlocked one spike for an hour).
-- **Merging:** `.bones/events/*.events` conflicts on nearly every merge (append-only). Resolve with `maw ws resolve <ws> --keep union`. If merge says the epoch is stale, `maw epoch sync` then `maw ws sync <ws>`.
-- **`just test` is long** (crash harnesses). `snapshot_law` alone is ~3000 fsync-bound iterations; the documented override is `MESS_SNAPSHOT_LAW_ITERS=25`.
-- **Do not chase the three flaky tests.** See §8.
+These artifacts are immutable evidence. Preserve all diagnostic and successful
+roots. Never overwrite an existing output root.
 
----
+### 6.1 Base tools r22
 
-## 10. What "the promised land" looks like from here
+```text
+root:
+/home/bob/.cache/mess-bench/asterism-rebaseline/bn-znj5-base-tools-v3-r22
 
-Fjall holds nothing authoritative *today*. After **Step 2** (flat owner) the append path is one owner, one barrier, no `spawn_blocking`, no publish sequencer, no second database on the write path. After **steps 3–6** the remaining Fjall keyspaces are replaced by the structures the spikes already proved (dense head pages, epoch dedupe, microblocks, segment effects, bitrank directories) and **Fjall is deleted**. What remains after that is the tokio/API overhead (§5) — a known, bounded, measured 54% → 83%-of-bare opportunity.
+manifest:
+asterism-rebaseline-tools.json
 
-Nothing in the plan is speculative. Every component has a merged spike with measured gates behind it.
+SHA-256:
+68b9a132d7d554afbb462f827317adf54442315671182a9cff3297123fe47bdc
+```
 
-Good luck.
+`base-tools-v3-r21` is diagnostic/non-reusable. Its output argument accidentally
+created a nested
+`asterism-rebaseline-tools.json/asterism-rebaseline-tools.json`.
+
+### 6.2 Resolution-only locks r22
+
+```text
+root:
+/home/bob/.cache/mess-bench/asterism-rebaseline/bn-znj5-locks-v3-r22
+
+manifest SHA-256:
+5768c74f1aab0c07de7703601ba3319d1697bc5eb8bac26561eb4ccf3308df75
+
+final lock SHA-256:
+A/B  9c24189940d9b43d7798c6680c8aeab6ddc270ef9b450390334d9327405cbea0
+C    36c49c89776c15aafdbdee969c25a5289e4860548c4c4005bb4535786d5b93fd
+D    a51304c875ed957aa0dbb21c65cd1fbf6ba5df166786d69c5b6819e493d072d1
+```
+
+### 6.3 Lock review/authority r23
+
+```text
+root:
+/home/bob/.cache/mess-bench/asterism-rebaseline/bn-znj5-lock-review-v3-r23
+
+assertion SHA-256:
+9d7560c87d9ab66e767bdc42ff63d5c4f7bba27dca38ab4801be7994da96d495
+
+Seal:
+cr-2x9pjy
+
+Seal events SHA-256:
+ea846bc9aa8db9468e433220161c5ef5e0dca7b2306bc84521161aee1c3bf314
+
+source-review bundle SHA-256:
+d969547dab415b1cb7a0185f8d279d5c1fb6ce57312e8df37005fed4f0bcdf11
+
+authority SHA-256:
+25412caafcfd59028f42c678766b7e2c73b015ec49dab429b20c87b69e66f978
+```
+
+Independent authority validation returned `status=ok` and the same authority
+and manifest hashes. The Seal review was bound to exact commit/tree
+`2bd1dcc5…` / `0087e1f4…` with zero findings and zero threads.
+
+### 6.4 Current children r9
+
+```text
+root:
+/home/bob/.cache/mess-bench/asterism-rebaseline/bn-znj5-current-children-v3-r9
+
+attestation SHA-256:
+e22fbbf5ade6649287954abc452b014ba1c2d1e384a5ed5ebf72d6e2aa7b5f9e
+
+final tools SHA-256:
+7a409b4772ec000962d7b4aeb9468cc41d53da6f070acc49d21268d5b0cffa01
+```
+
+Release compile-out proof:
+
+```text
+pristine == overlay-without-test
+size:    5,688,448 bytes
+SHA-256: 30c8c7eb2de304ff18967eca315c8e36d0d869c11dccab5b08736de044c04550
+
+exact nm inventory SHA-256:
+f2d6dda0328722cfd7a1f1116bc6f0dea9c6a1c68a14463beafa8c70b922c997
+
+forbidden hook strings:
+absent
+
+correctness tool SHA-256:
+2449c4ac3e4861ecd7401f2718bd02f7dfe6b071c0c70f33e1768e28091f7eaa
+
+fault tool SHA-256:
+e5a4cdd1ee20b882fed404f709834064fb729023df29c4e3e32cf6f193d866ef
+```
+
+r9 release/fault hashes differ from the older r8 lineage. That is expected;
+within-r9 equality and fresh authority passed. r9 is the source-bound evidence
+for the current commit. No benchmark rows were emitted.
+
+### 6.5 Source review r2
+
+```text
+root:
+/home/bob/.cache/mess-bench/asterism-rebaseline/bn-znj5-source-review-v3-r2
+
+source assertion SHA-256:
+314f628d7adaed56c5758513b955267629a330e63e3fda9cf76a270e56c7807a
+
+Seal:
+cr-gr7zun
+
+Seal events SHA-256:
+2d8807f324c07c3388d870838b0f4e76d563a62b440c6fceda661908c2df52d0
+
+source bundle SHA-256:
+e4d8691bc8cfb62a8190eb3a975c488f1004fd5208f65d1e0a7292ddad5ab237
+
+source approval:
+/home/bob/.cache/mess-bench/asterism-rebaseline/bn-znj5-source-review-v3-r2/source-approval.json
+
+source approval SHA-256:
+3d2f86d6b2a9f13447bca6629348ecca13bbd92ad583f387622d9427daeb09e5
+```
+
+The approval is mode `0444`, size 383,056 bytes, schema
+`bn-2l3n-source-approval-v3`, status `approved`, and binds exact commit/tree
+`2bd1dcc5…` / `0087e1f4…` and review `cr-gr7zun`.
+
+The independent reviewer reproduced the assertion byte-for-byte in 299.636
+seconds and replayed all r9 semantic live roots. This successful source
+assertion conclusively proves the earlier `Þfoo.go` handoff failure is fixed.
+
+## 7. Current failure: prepared build r1
+
+The failed root is:
+
+```text
+/home/bob/.cache/mess-bench/asterism-rebaseline/bn-znj5-prepared-v3-r1
+```
+
+It ran for roughly 8.5 minutes and failed closed before any benchmark rows. It
+materialized part of variant A and its product overlay, so the exact stopping
+point can be narrowed from the files already present:
+
+- `materialized/A`
+- `materialized/A-product-overlay`
+- A and A-product-overlay source archives/manifests
+- semantic source/toolchain/Cargo-home manifests
+- build/contract logs
+- frozen binding copies for tools, locks, children, and source approval
+
+The terminal error was:
+
+```text
+[Errno 2] No such file or directory:
+'/home/bob/src/mess/.maw/workspaces/bn-znj5/None'
+```
+
+Treat the entire root as diagnostic/non-reusable. Do not delete it, edit it,
+resume it, or use its partial artifacts as authority.
+
+Likely class of defect: a serialized optional field is being passed through
+`str(value)` and then resolved relative to the repository, yielding
+`repository / "None"`. This is only a hypothesis; prove the exact consumer
+before editing.
+
+Primary code:
+
+```text
+spikes/asterism_rebaseline/tooling/prepare_overlays.py
+spikes/asterism_rebaseline/tooling/authority_inputs.py
+spikes/asterism_rebaseline/tooling/current/prepare_children.py
+spikes/asterism_rebaseline/tooling/current/build_children.py
+```
+
+Recommended bounded diagnosis:
+
+1. Inspect the diagnostic root filenames and timestamps to identify the exact
+   build phase. Do not rerun the full build blindly.
+2. Enumerate `null`/`None` values in:
+   - source r2 `source-approval.json`, assertion, and bundle;
+   - current-child r9 attestation and tools manifest;
+   - lock r22/r23 manifest, bundle, and authority;
+   - the frozen copies under prepared r1 `bindings/`.
+3. Search `prepare_overlays.py` and helpers for:
+   - `resolve_repository_input`
+   - `Path(str(...))`
+   - `repository / str(...)`
+   - path-bearing fields read from source approval, overlay descriptors,
+     adapter descriptors, support files, or tool identities.
+4. Reproduce only the validation/materialization substep that consumes the
+   suspected field. The top-level tool catches the exception and suppresses a
+   useful traceback, so importing the module and calling bounded substeps may be
+   faster than another full producer run.
+5. Distinguish legitimate optional `null` fields from fields whose schema
+   requires a path. Do not globally reject or stringify all nulls.
+
+If the cause is product code:
+
+1. Create a new bug bone.
+2. Create a fresh Maw workspace from exact `bn-znj5` commit `2bd1dcc5`.
+3. Implement a narrow repair plus positive and hostile tests.
+4. Run focused gates and an independent Seal review in another fresh Maw
+   workspace.
+5. Integrate only the reviewed tree into `bn-znj5`.
+6. Run `just fmt-check` and the proportional/full test gate.
+7. Regenerate the entire source-bound r22/r23/r9/r2 lineage under the private
+   Cargo home. Old authority remains immutable regression evidence but becomes
+   stale immediately after any source change.
+
+If the cause is only an incorrect producer argument or non-source artifact
+binding, document the proof on `bn-znj5` and retry into a fresh, absent prepared
+root. Never “fix” an immutable artifact in place.
+
+## 8. What happens after prepared construction succeeds
+
+The successful prepared root must:
+
+- bind the exact approved source, locks, toolchain, and child tools;
+- freeze all A/B/C/D artifacts;
+- pass its own independent validation;
+- contain no diagnostic residue or benchmark rows;
+- be made immutable according to the protocol.
+
+Then finish/merge `bn-znj5` according to the Edict protocol and start
+`bn-3nl7`. Read:
+
+```text
+spikes/asterism_rebaseline/BN-2L3N-PROTOCOL.md
+spikes/asterism_rebaseline/run_rebaseline.py
+spikes/asterism_rebaseline/evaluate.py
+spikes/asterism_rebaseline/verify_terminal.py
+spikes/asterism_rebaseline/evidence_schema.py
+```
+
+`bn-3nl7` is a single-use terminal run:
+
+- start from row zero;
+- acquire the global lease;
+- run correctness/fault/reopen gates first;
+- run all frozen balanced matrices and focused profiles exactly as specified;
+- retain raw evidence;
+- evaluate once and terminal-verify;
+- publish a plain-English comparison against both the Fjall-era engine and the
+  fresh bare engine;
+- update later Asterism budgets and admitted paths from the terminal result.
+
+Do not emit exploratory “almost final” rows with the terminal runner. Failed,
+partial, or diagnostic attempts must remain clearly non-authoritative.
+
+## 9. Current performance interpretation
+
+There is not yet a fresh terminal Phase 4 number that can honestly be published.
+Do not promote older spike results or partial authority runs as the final
+current-vs-Fjall comparison.
+
+What is already established:
+
+- the flat-owner design beat the old composed engine across the original 32
+  measured spike cells;
+- the owner must itself be the committer—fronting the old committer lost about
+  35%;
+- speculative B1 pipelining was rejected because it lost 5–18% at high durable
+  concurrency;
+- the owned/interned append path and release integration are now real engine
+  paths, not spike-only code;
+- full correctness remains green after integration.
+
+The terminal rebaseline exists because the implementation has evolved
+substantially since those measurements. The honest plain-English summary today
+is: the architecture has already removed the expensive Fjall-era orchestration
+from the critical append path and prior controlled evidence says it should win,
+but the exact size of the current win—and whether every batch-size/tail-latency
+budget passes—remains pending `bn-3nl7`.
+
+## 10. Safety and workflow rules
+
+- Read `AGENTS.md` and use the Edict workflow.
+- Make every source change in a bone-named Maw workspace, never directly in the
+  trunk.
+- Use `maw exec <workspace> -- <command>` for child workspaces.
+- Run `maw ws merge <name> --into default --check` before any destructive merge.
+- Never merge or destroy `default`.
+- Never manually create Git branches.
+- Preserve unrelated dirty trunk/workspace changes.
+- Before assuming a destroyed workspace lost work, run `maw ws recover`.
+- Post progress comments to the active bone for crash/session recovery.
+- For risk-high source or authority changes, use a separate adversarial reviewer
+  bound to the exact commit/tree.
+- Keep builds local/offline. Do not use Cyber/security scans or external
+  security tooling for this work unless explicitly authorized.
+- Do not weaken namespace, mount, descriptor, toolchain, canonicalization,
+  compile-out, or immutable-authority guards to get a run through.
+- Use fresh absent output directories for every retry.
+- Do not delete diagnostic evidence roots.
+- Run `just fmt-check`; for the final source checkpoint run
+  `MESS_SNAPSHOT_LAW_ITERS=25 just test` under the private offline Cargo home.
+- Workers do not push. The lead owns integration.
+
+## 11. First commands for the next lead
+
+```bash
+cd /home/bob/src/mess
+cat handoff.md
+edict protocol resume --agent "$AGENT"
+bn show bn-znj5
+bn show bn-2l3n
+bn show bn-3nl7
+maw ws list
+maw exec bn-znj5 -- git status --short --branch
+maw exec bn-znj5 -- git log --oneline -5
+rite claims list --agent "$AGENT"
+```
+
+Then continue the bounded prepared-r1 diagnosis in
+`/home/bob/src/mess/.maw/workspaces/bn-znj5`; do not start a new implementation
+from trunk and do not rerun the terminal measurement.
