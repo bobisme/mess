@@ -36,7 +36,7 @@ import sys
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, NoReturn, Protocol
 
 
@@ -175,6 +175,144 @@ TRACE_SYSCALLS = (
     "read",
     "pread64",
 )
+CURRENT_CHILDREN_ATTESTATION_SCHEMA = "bn-ecm1-current-children-build-v2"
+CURRENT_BUILD_CARGO_CONFIG_SCHEMA = "bn-30fs-build-cargo-config-search-v1"
+SEMANTIC_INPUT_AUTHORITY_SCHEMA = "bn-ecm1-semantic-input-authority-v1"
+RECURSIVE_TREE_AUTHORITY_SCHEMA = "bn-ecm1-recursive-tree-authority-v1"
+TRUSTED_SYSTEM_CLOSURE_SCHEMA = "bn-ecm1-trusted-system-closure-v1"
+SEMANTIC_MANIFEST_TOTAL = 48
+SEMANTIC_MANIFEST_COUNTS = {"current": 12, "release": 20, "resolver": 16}
+SEMANTIC_TREE_BINDING_FIELDS = {
+    "entry_count",
+    "equal_pre_post",
+    "manifest_path",
+    "manifest_sha256",
+    "mutation_events_absent",
+    "role",
+    "schema",
+    "watch_count",
+}
+SEMANTIC_CLOSURE_BINDING_FIELDS = {
+    "entry_count",
+    "manifest_path",
+    "mounts",
+    "mutation_events_absent",
+    "schema",
+    "sha256",
+    "watch_count",
+}
+SEMANTIC_MANIFEST_ENTRY_FIELDS = {
+    "changed_ns",
+    "device",
+    "file_type",
+    "gid",
+    "inode",
+    "link_count",
+    "modified_ns",
+    "path",
+    "permissions",
+    "sha256",
+    "size",
+    "symlink_target",
+    "symlink_scope",
+    "uid",
+}
+CURRENT_BUILD_CARGO_CONFIG_FIELDS = {
+    "cargo_search",
+    "cargo_home_tree",
+    "preserved_top_level_entries",
+    "schema",
+}
+CURRENT_BUILD_CARGO_SEARCH_FIELDS = {
+    "cargo_home_path",
+    "cwd",
+    "entries",
+    "schema",
+}
+CURRENT_BUILD_CARGO_HOME_TREE_FIELDS = {
+    "entry_count",
+    "equal_pre_post",
+    "path",
+    "post_sha256",
+    "pre_sha256",
+    "watch_count",
+}
+CURRENT_BUILD_PRESERVED_ENTRY_FIELDS = {"identity", "name", "type"}
+CURRENT_BUILD_PRESERVED_REGULAR_IDENTITY_FIELDS = {
+    "bytes",
+    "ctime_ns",
+    "device",
+    "inode",
+    "link_count",
+    "mode",
+    "mtime_ns",
+    "path",
+    "sha256",
+    "size",
+}
+CURRENT_BUILD_PRESERVED_DIRECTORY_IDENTITY_FIELDS = {
+    "changed_ns",
+    "device",
+    "file_type",
+    "inode",
+    "link_count",
+    "modified_ns",
+    "path",
+    "permissions",
+    "size",
+}
+SEMANTIC_DESCRIPTOR_OPTIONS = frozenset(
+    {"--ro-bind-fd", "--bind-fd", "--ro-bind-data", "--bind-data"}
+)
+TRUSTED_SYSTEM_MOUNTS = (
+    ("/usr/bin", "/usr/bin"),
+    ("/usr/lib", "/usr/lib"),
+    ("/usr/include", "/usr/include"),
+)
+SEMANTIC_CONFIG_DESTINATIONS = (
+    "/asterism/source/.cargo/config.toml",
+    "/asterism/source/.cargo/config",
+    "/asterism/cargo-home/config.toml",
+    "/asterism/cargo-home/config",
+)
+RELEASE_BUILD_DESTINATIONS = {
+    "/usr/bin",
+    "/usr/lib",
+    "/usr/include",
+    "/asterism/source",
+    "/asterism/target",
+    "/asterism/toolchain",
+    "/asterism/toolchain/bin/cargo",
+    "/asterism/toolchain/bin/rustc",
+    "/asterism/cargo-home",
+    *SEMANTIC_CONFIG_DESTINATIONS,
+}
+CURRENT_BUILD_FD_DESTINATIONS = {
+    *(RELEASE_BUILD_DESTINATIONS - set(SEMANTIC_CONFIG_DESTINATIONS)),
+    "/asterism/python3",
+}
+RESOLVER_DESTINATIONS = RELEASE_BUILD_DESTINATIONS - {"/asterism/target"}
+RELEASE_BUILD_DESCRIPTOR_BINDINGS = (
+    *(("--ro-bind-fd", guest) for _host, guest in TRUSTED_SYSTEM_MOUNTS),
+    ("--ro-bind-fd", "/asterism/source"),
+    ("--bind-fd", "/asterism/target"),
+    ("--ro-bind-fd", "/asterism/toolchain"),
+    ("--ro-bind-fd", "/asterism/toolchain/bin/cargo"),
+    ("--ro-bind-fd", "/asterism/toolchain/bin/rustc"),
+    ("--ro-bind-fd", "/asterism/cargo-home"),
+    *(("--ro-bind-fd", path) for path in SEMANTIC_CONFIG_DESTINATIONS),
+)
+RESOLVER_DESCRIPTOR_BINDINGS = (
+    *(("--ro-bind-fd", guest) for _host, guest in TRUSTED_SYSTEM_MOUNTS),
+    ("--bind-fd", "/asterism/source"),
+    ("--ro-bind-fd", "/asterism/toolchain"),
+    ("--ro-bind-fd", "/asterism/toolchain/bin/cargo"),
+    ("--ro-bind-fd", "/asterism/toolchain/bin/rustc"),
+    ("--ro-bind-fd", "/asterism/cargo-home"),
+    *(("--ro-bind-fd", path) for path in SEMANTIC_CONFIG_DESTINATIONS),
+)
+
+
 class RunnerFailure(Exception):
     """A classified failure which must terminate the whole attempt."""
 
@@ -809,6 +947,1230 @@ class Prepared:
     support_files: dict[str, SupportFile]
     inputs: dict[str, SupportFile]
     tracked_comm: frozenset[str]
+
+
+def _semantic_runtime_sha256(authority: dict[str, Any]) -> str:
+    tree_fields = (
+        "schema",
+        "role",
+        "manifest_sha256",
+        "entry_count",
+        "watch_count",
+        "equal_pre_post",
+        "mutation_events_absent",
+    )
+    closure_fields = (
+        "schema",
+        "sha256",
+        "entry_count",
+        "mounts",
+        "watch_count",
+        "mutation_events_absent",
+    )
+    closure = authority["trusted_system_closure"]
+    normalized = {
+        "cargo_home": {
+            field: authority["cargo_home"].get(field) for field in tree_fields
+        },
+        "schema": SEMANTIC_INPUT_AUTHORITY_SCHEMA,
+        "toolchain": {
+            field: authority["toolchain"].get(field) for field in tree_fields
+        },
+        "trusted_system_closure": {
+            field: closure.get(field) for field in closure_fields
+        },
+    }
+    return sha256_bytes(canonical_json_bytes(normalized))
+
+
+def _semantic_file_identity(metadata: os.stat_result) -> dict[str, int]:
+    return {
+        "changed_ns": metadata.st_ctime_ns,
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "link_count": metadata.st_nlink,
+        "mode": stat.S_IMODE(metadata.st_mode),
+        "modified_ns": metadata.st_mtime_ns,
+        "size": metadata.st_size,
+    }
+
+
+def _read_retained_file(descriptor: int) -> bytes:
+    chunks = []
+    offset = 0
+    while True:
+        chunk = os.pread(descriptor, 1024 * 1024, offset)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+        offset += len(chunk)
+
+
+def _sha256_retained_file(descriptor: int) -> str:
+    digest = hashlib.sha256()
+    offset = 0
+    while True:
+        chunk = os.pread(descriptor, 1024 * 1024, offset)
+        if not chunk:
+            return digest.hexdigest()
+        digest.update(chunk)
+        offset += len(chunk)
+
+
+def _semantic_directory_identity(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int, int, int]:
+    """Return fail-closed metadata for one retained path ancestor."""
+
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _open_semantic_manifest_no_follow(
+    path: Path,
+) -> tuple[
+    list[int],
+    list[tuple[int, int, int, int, int, int, int, int, int]],
+    int,
+]:
+    """Open one absolute manifest through a descriptor-relative no-follow chain."""
+
+    directory_flags = (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_CLOEXEC
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    directories: list[int] = []
+    identities: list[
+        tuple[int, int, int, int, int, int, int, int, int]
+    ] = []
+    file_descriptor = -1
+    try:
+        current = os.open("/", directory_flags)
+        directories.append(current)
+        metadata = os.fstat(current)
+        identities.append(_semantic_directory_identity(metadata))
+        for component in path.parts[1:-1]:
+            current = os.open(component, directory_flags, dir_fd=current)
+            directories.append(current)
+            metadata = os.fstat(current)
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise OSError(f"semantic ancestor {component!r} is not a directory")
+            identities.append(_semantic_directory_identity(metadata))
+        if len(path.parts) < 2:
+            raise OSError("semantic manifest path names no file")
+        file_descriptor = os.open(path.name, file_flags, dir_fd=current)
+        if not stat.S_ISREG(os.fstat(file_descriptor).st_mode):
+            raise OSError("semantic manifest is not a regular file")
+        return directories, identities, file_descriptor
+    except BaseException:
+        if file_descriptor >= 0:
+            os.close(file_descriptor)
+        for descriptor in reversed(directories):
+            os.close(descriptor)
+        raise
+
+
+def _confirm_semantic_manifest_path(
+    path: Path,
+    directory_identities: list[
+        tuple[int, int, int, int, int, int, int, int, int]
+    ],
+    expected_identity: dict[str, int],
+) -> None:
+    """Prove the lexical chain still names the retained physical file."""
+
+    directory_flags = (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_CLOEXEC
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    verified_directories = [os.open("/", directory_flags)]
+    try:
+        current = verified_directories[0]
+        metadata = os.fstat(current)
+        if _semantic_directory_identity(metadata) != directory_identities[0]:
+            raise OSError("semantic root directory identity changed")
+        for index, component in enumerate(path.parts[1:-1], start=1):
+            current = os.open(
+                component,
+                directory_flags,
+                dir_fd=current,
+            )
+            verified_directories.append(current)
+            metadata = os.fstat(current)
+            if (
+                _semantic_directory_identity(metadata)
+                != directory_identities[index]
+            ):
+                raise OSError("semantic manifest ancestor was replaced")
+        path_metadata = os.stat(path.name, dir_fd=current, follow_symlinks=False)
+        if _semantic_file_identity(path_metadata) != expected_identity:
+            raise OSError("semantic manifest path identity changed")
+        if any(
+            _semantic_directory_identity(os.fstat(descriptor)) != expected
+            for descriptor, expected in zip(
+                verified_directories,
+                directory_identities,
+                strict=True,
+            )
+        ):
+            raise OSError("semantic manifest ancestor changed during confirmation")
+    finally:
+        for descriptor in reversed(verified_directories):
+            os.close(descriptor)
+
+
+def _load_canonical_support_authority(
+    support: SupportFile,
+    context: str,
+) -> dict[str, Any]:
+    """Read one reviewed authority through a stable no-follow path snapshot."""
+
+    directories: list[int] = []
+    descriptor = -1
+    try:
+        directories, directory_identities, descriptor = (
+            _open_semantic_manifest_no_follow(support.path)
+        )
+        before = os.fstat(descriptor)
+        identity = _semantic_file_identity(before)
+        payload = _read_retained_file(descriptor)
+        after = os.fstat(descriptor)
+        _confirm_semantic_manifest_path(
+            support.path,
+            directory_identities,
+            identity,
+        )
+        if any(
+            _semantic_directory_identity(os.fstat(directory)) != expected
+            for directory, expected in zip(
+                directories,
+                directory_identities,
+                strict=True,
+            )
+        ):
+            raise OSError("reviewed authority ancestor changed during read")
+        value = json.loads(payload)
+        if (
+            _semantic_file_identity(after) != identity
+            or stat.S_IMODE(before.st_mode) != support.mode
+            or sha256_bytes(payload) != support.sha256
+            or not isinstance(value, dict)
+            or canonical_json_bytes(value) != payload
+        ):
+            raise RunnerFailure(f"{context} reviewed authority differs", exit_code=2)
+        return value
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RunnerFailure(
+            f"{context} reviewed authority is unavailable: {error}",
+            exit_code=2,
+        ) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        for directory in reversed(directories):
+            os.close(directory)
+
+
+@dataclass
+class RetainedSemanticManifest:
+    """An open, immutable semantic-evidence file retained for the whole run."""
+
+    context: str
+    path: Path
+    sha256: str
+    descriptor: int
+    value: dict[str, Any] | None
+    identity: dict[str, int]
+
+    def verify(self) -> None:
+        if self.descriptor < 0:
+            raise RunnerFailure(f"{self.context} retained descriptor is closed")
+        directories: list[int] = []
+        directory_identities: list[
+            tuple[int, int, int, int, int, int, int, int, int]
+        ] = []
+        live_descriptor = -1
+        try:
+            directories, directory_identities, live_descriptor = (
+                _open_semantic_manifest_no_follow(self.path)
+            )
+            live_metadata_before = os.fstat(live_descriptor)
+            descriptor_metadata_before = os.fstat(self.descriptor)
+            path_digest = _sha256_retained_file(live_descriptor)
+            descriptor_digest = _sha256_retained_file(self.descriptor)
+            live_metadata_after = os.fstat(live_descriptor)
+            descriptor_metadata_after = os.fstat(self.descriptor)
+            if any(
+                _semantic_directory_identity(metadata) != expected
+                for metadata, expected in zip(
+                    (os.fstat(descriptor) for descriptor in directories),
+                    directory_identities,
+                    strict=True,
+                )
+            ):
+                raise OSError("semantic manifest ancestor changed while retained")
+            _confirm_semantic_manifest_path(
+                self.path,
+                directory_identities,
+                self.identity,
+            )
+            if any(
+                _semantic_directory_identity(os.fstat(descriptor)) != expected
+                for descriptor, expected in zip(
+                    directories,
+                    directory_identities,
+                    strict=True,
+                )
+            ):
+                raise OSError("semantic manifest ancestor changed after confirmation")
+        except OSError as error:
+            raise RunnerFailure(
+                f"{self.context} retained evidence is unavailable: {error}"
+            ) from error
+        finally:
+            if live_descriptor >= 0:
+                os.close(live_descriptor)
+            for descriptor in reversed(directories):
+                os.close(descriptor)
+        if (
+            _semantic_file_identity(live_metadata_before) != self.identity
+            or _semantic_file_identity(live_metadata_after) != self.identity
+            or _semantic_file_identity(descriptor_metadata_before) != self.identity
+            or _semantic_file_identity(descriptor_metadata_after) != self.identity
+            or path_digest != self.sha256
+            or descriptor_digest != self.sha256
+        ):
+            raise RunnerFailure(f"{self.context} retained evidence changed")
+
+    def close(self) -> None:
+        if self.descriptor >= 0:
+            descriptor = self.descriptor
+            self.descriptor = -1
+            os.close(descriptor)
+
+
+def _final_verify_close_retained_manifests(
+    manifests: Iterable[RetainedSemanticManifest],
+    primary_error: BaseException,
+) -> list[str]:
+    """Final-verify and close partial lifetime state without replacing its error."""
+
+    secondary_errors: list[str] = []
+    for semantic_manifest in manifests:
+        if semantic_manifest.descriptor < 0:
+            secondary_errors.append(
+                f"{semantic_manifest.context} final verification: "
+                "retained descriptor was already closed"
+            )
+            continue
+        try:
+            semantic_manifest.verify()
+        except BaseException as error:
+            secondary_errors.append(
+                f"{semantic_manifest.context} final verification: "
+                f"{error.__class__.__name__}: {error}"
+            )
+        finally:
+            try:
+                semantic_manifest.close()
+            except BaseException as error:
+                secondary_errors.append(
+                    f"{semantic_manifest.context} final close: "
+                    f"{error.__class__.__name__}: {error}"
+                )
+    for secondary in secondary_errors:
+        try:
+            primary_error.add_note(f"secondary semantic lifetime failure: {secondary}")
+        except BaseException:
+            break
+    return secondary_errors
+
+
+def _validate_semantic_manifest_entry(
+    entry: Any,
+    *,
+    index: int,
+    trusted_system: bool,
+    paths: set[str],
+    context: str,
+) -> str:
+    if not isinstance(entry, dict) or set(entry) != SEMANTIC_MANIFEST_ENTRY_FIELDS:
+        raise RunnerFailure(f"{context} manifest entry fields differ", exit_code=2)
+    relative = entry.get("path")
+    candidate = PurePosixPath(relative) if isinstance(relative, str) else None
+    if (
+        candidate is None
+        or (
+            relative != "."
+            and (
+                candidate.is_absolute()
+                or str(candidate) != relative
+                or any(part in {".", ".."} for part in candidate.parts)
+            )
+        )
+        or relative in paths
+        or (index == 0) != (relative == ".")
+    ):
+        raise RunnerFailure(f"{context} manifest path differs", exit_code=2)
+    paths.add(relative)
+    kind = entry.get("file_type")
+    if kind not in {"directory", "regular", "symlink"} or any(
+        not isinstance(entry.get(field), int)
+        or isinstance(entry.get(field), bool)
+        for field in (
+            "changed_ns",
+            "device",
+            "gid",
+            "inode",
+            "link_count",
+            "modified_ns",
+            "permissions",
+            "size",
+            "uid",
+        )
+    ):
+        raise RunnerFailure(f"{context} manifest metadata differs", exit_code=2)
+    if kind == "directory":
+        if any(
+            entry.get(field) is not None
+            for field in ("sha256", "symlink_target", "symlink_scope")
+        ):
+            raise RunnerFailure(f"{context} directory evidence differs", exit_code=2)
+    elif kind == "regular":
+        digest = entry.get("sha256")
+        if (
+            entry.get("symlink_target") is not None
+            or entry.get("symlink_scope") is not None
+            or (
+                digest is not None
+                if trusted_system
+                else not isinstance(digest, str) or not SHA256_RE.fullmatch(digest)
+            )
+        ):
+            raise RunnerFailure(
+                f"{context} regular-file evidence differs", exit_code=2
+            )
+    elif (
+        not isinstance(entry.get("symlink_target"), str)
+        or not isinstance(entry.get("sha256"), str)
+        or not SHA256_RE.fullmatch(entry["sha256"])
+        or entry.get("symlink_scope")
+        not in (
+            {"within_closure", "guest_inaccessible_external"}
+            if trusted_system
+            else {"within_root"}
+        )
+    ):
+        raise RunnerFailure(f"{context} symlink evidence differs", exit_code=2)
+    if trusted_system and (
+        entry["uid"] != 0 or (kind != "symlink" and entry["permissions"] & 0o022)
+    ):
+        raise RunnerFailure(f"{context} trusted-system policy differs", exit_code=2)
+    return str(kind)
+
+
+def _validate_recursive_semantic_manifest(
+    value: Any,
+    role: str,
+    context: str,
+    *,
+    trusted_system: bool,
+) -> dict[str, Any]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"entries", "role", "schema"}
+        or value.get("schema") != RECURSIVE_TREE_AUTHORITY_SCHEMA
+        or value.get("role") != role
+        or not isinstance(value.get("entries"), list)
+        or not value["entries"]
+    ):
+        raise RunnerFailure(f"{context} recursive manifest fields differ", exit_code=2)
+    paths: set[str] = set()
+    directory_count = sum(
+        _validate_semantic_manifest_entry(
+            entry,
+            index=index,
+            trusted_system=trusted_system,
+            paths=paths,
+            context=context,
+        )
+        == "directory"
+        for index, entry in enumerate(value["entries"])
+    )
+    if directory_count < 1:
+        raise RunnerFailure(f"{context} has no directory evidence", exit_code=2)
+    return value
+
+
+def _retain_semantic_manifest(
+    raw_path: Any,
+    expected_sha256: Any,
+    expected_schema: str,
+    context: str,
+) -> RetainedSemanticManifest:
+    if not isinstance(raw_path, str) or str(Path(raw_path)) != raw_path:
+        raise RunnerFailure(f"{context} evidence path is not canonical", exit_code=2)
+    path = Path(raw_path)
+    if not path.is_absolute():
+        raise RunnerFailure(f"{context} evidence path is not absolute", exit_code=2)
+    if not isinstance(expected_sha256, str) or not SHA256_RE.fullmatch(
+        expected_sha256
+    ):
+        raise RunnerFailure(f"{context} evidence digest differs", exit_code=2)
+    directories: list[int] = []
+    descriptor = -1
+    try:
+        directories, directory_identities, descriptor = (
+            _open_semantic_manifest_no_follow(path)
+        )
+        metadata_before = os.fstat(descriptor)
+        identity = _semantic_file_identity(metadata_before)
+        if (
+            not stat.S_ISREG(metadata_before.st_mode)
+            or stat.S_IMODE(metadata_before.st_mode) != 0o444
+            or metadata_before.st_nlink != 1
+        ):
+            raise RunnerFailure(
+                f"{context} evidence is not canonical single-link 0444",
+                exit_code=2,
+            )
+        payload = _read_retained_file(descriptor)
+        metadata_after = os.fstat(descriptor)
+        if any(
+            _semantic_directory_identity(os.fstat(directory)) != expected
+            for directory, expected in zip(
+                directories,
+                directory_identities,
+                strict=True,
+            )
+        ):
+            raise OSError("semantic manifest ancestor changed during retention")
+        _confirm_semantic_manifest_path(path, directory_identities, identity)
+        if any(
+            _semantic_directory_identity(os.fstat(directory)) != expected
+            for directory, expected in zip(
+                directories,
+                directory_identities,
+                strict=True,
+            )
+        ):
+            raise OSError("semantic manifest ancestor changed after retention")
+        value = json.loads(payload)
+        if (
+            _semantic_file_identity(metadata_after) != identity
+            or sha256_bytes(payload) != expected_sha256
+            or not isinstance(value, dict)
+            or value.get("schema") != expected_schema
+            or canonical_json_bytes(value) != payload
+        ):
+            raise RunnerFailure(f"{context} evidence binding differs", exit_code=2)
+        retained = RetainedSemanticManifest(
+            context=context,
+            path=path,
+            sha256=expected_sha256,
+            descriptor=descriptor,
+            value=value,
+            identity=identity,
+        )
+        descriptor = -1
+        try:
+            retained.verify()
+        except BaseException:
+            retained.close()
+            raise
+        return retained
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RunnerFailure(
+            f"{context} evidence cannot be retained: {error}", exit_code=2
+        ) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        for directory in reversed(directories):
+            os.close(directory)
+
+
+def _current_build_expected_passed_file_descriptors(
+    build: Any, context: str
+) -> int:
+    """Reproduce current/build_children.py's complete inherited-FD count."""
+
+    if not isinstance(build, dict):
+        raise RunnerFailure(f"{context} build is absent", exit_code=2)
+    cargo_config = build.get("cargo_config_prebuild")
+    if (
+        not isinstance(cargo_config, dict)
+        or set(cargo_config) != CURRENT_BUILD_CARGO_CONFIG_FIELDS
+        or cargo_config.get("schema") != CURRENT_BUILD_CARGO_CONFIG_SCHEMA
+    ):
+        raise RunnerFailure(
+            f"{context} Cargo config authority differs", exit_code=2
+        )
+    cargo_search = cargo_config.get("cargo_search")
+    cargo_home_tree = cargo_config.get("cargo_home_tree")
+    preserved = cargo_config.get("preserved_top_level_entries")
+    if (
+        not isinstance(cargo_search, dict)
+        or set(cargo_search) != CURRENT_BUILD_CARGO_SEARCH_FIELDS
+        or not isinstance(cargo_search.get("entries"), list)
+        or len(cargo_search["entries"]) != 8
+        or not isinstance(cargo_home_tree, dict)
+        or set(cargo_home_tree) != CURRENT_BUILD_CARGO_HOME_TREE_FIELDS
+        or not isinstance(preserved, dict)
+        or set(preserved) != {"cargo-home", "source"}
+    ):
+        raise RunnerFailure(
+            f"{context} Cargo config record shape differs", exit_code=2
+        )
+
+    for origin in ("cargo-home", "source"):
+        entries = preserved[origin]
+        if not isinstance(entries, list):
+            raise RunnerFailure(
+                f"{context} preserved {origin} entries differ", exit_code=2
+            )
+        names: list[str] = []
+        for entry in entries:
+            if (
+                not isinstance(entry, dict)
+                or set(entry) != CURRENT_BUILD_PRESERVED_ENTRY_FIELDS
+                or not isinstance(entry.get("identity"), dict)
+                or not isinstance(entry.get("name"), str)
+                or entry.get("type") not in {"directory", "regular"}
+            ):
+                raise RunnerFailure(
+                    f"{context} preserved {origin} entry differs", exit_code=2
+                )
+            name = entry["name"]
+            selected = PurePosixPath(name)
+            if (
+                not name
+                or len(selected.parts) != 1
+                or name in {".", "..", "config", "config.toml"}
+            ):
+                raise RunnerFailure(
+                    f"{context} preserved {origin} name differs", exit_code=2
+                )
+            identity_fields = (
+                CURRENT_BUILD_PRESERVED_DIRECTORY_IDENTITY_FIELDS
+                if entry["type"] == "directory"
+                else CURRENT_BUILD_PRESERVED_REGULAR_IDENTITY_FIELDS
+            )
+            if set(entry["identity"]) != identity_fields:
+                raise RunnerFailure(
+                    f"{context} preserved {origin} identity differs", exit_code=2
+                )
+            names.append(name)
+        if names != sorted(names) or len(names) != len(set(names)):
+            raise RunnerFailure(
+                f"{context} preserved {origin} order differs", exit_code=2
+            )
+
+    argv = build.get("argv")
+    if not isinstance(argv, list) or not all(
+        isinstance(argument, str) for argument in argv
+    ):
+        raise RunnerFailure(f"{context} sandbox argv differs", exit_code=2)
+    argv_descriptor_bindings = sum(
+        argument in SEMANTIC_DESCRIPTOR_OPTIONS for argument in argv
+    )
+    cargo_home_entries = preserved["cargo-home"]
+    # CargoConfigSearchGuard retains the unbound source .cargo root and every
+    # Cargo-home child already covered by its root bind. run_capture then adds
+    # the separately retained bwrap execution lease.
+    return argv_descriptor_bindings + 2 + len(cargo_home_entries)
+
+
+def _validate_semantic_sandbox(
+    argv: Any,
+    environment: Any,
+    context: str,
+    *,
+    passed_file_descriptors: Any,
+    expected_passed_file_descriptors: int | None,
+    require_passed_file_descriptors: bool = True,
+    expected_fd_destinations: set[str],
+    writable_fd_destinations: set[str],
+    expected_data_destinations: set[str] | None = None,
+    expected_descriptor_bindings: tuple[tuple[str, str], ...] | None = None,
+) -> None:
+    if expected_data_destinations is None:
+        expected_data_destinations = set()
+    if (
+        not isinstance(argv, list)
+        or not argv
+        or not all(isinstance(argument, str) for argument in argv)
+        or not isinstance(environment, dict)
+        or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in environment.items()
+        )
+        or environment.get("RUSTUP_HOME") != "/nonexistent"
+    ):
+        raise RunnerFailure(f"{context} sandbox environment differs", exit_code=2)
+    forbidden_options = {"--dev", "--dev-bind", "--proc"}
+    if forbidden_options & set(argv):
+        raise RunnerFailure(f"{context} exposes legacy dev/proc", exit_code=2)
+    triples = list(zip(argv, argv[1:], argv[2:]))
+    if (
+        sum(left == "--dir" and right == "/dev" for left, right in zip(argv, argv[1:]))
+        != 1
+        or sum(
+            left == "--dir" and right == "/proc"
+            for left, right in zip(argv, argv[1:])
+        )
+        != 1
+        or any(
+            option in {"--ro-bind", "--bind"} and source == "/" and target == "/"
+            for option, source, target in triples
+        )
+        or any(
+            argument in {"/dev", "/proc"} and argv[index - 1] != "--dir"
+            for index, argument in enumerate(argv)
+            if index > 0
+        )
+        or any(
+            argument.startswith("/dev/") or argument.startswith("/proc/")
+            for argument in argv
+        )
+        or "/asterism/rustup-home" in argv
+    ):
+        raise RunnerFailure(f"{context} sandbox mount authority differs", exit_code=2)
+    descriptor_bindings = []
+    for index, option in enumerate(argv):
+        if option not in SEMANTIC_DESCRIPTOR_OPTIONS:
+            continue
+        if index + 2 >= len(argv) or not argv[index + 1].isdecimal():
+            raise RunnerFailure(f"{context} sandbox descriptor differs", exit_code=2)
+        descriptor = int(argv[index + 1])
+        if descriptor < 3 or str(descriptor) != argv[index + 1]:
+            raise RunnerFailure(f"{context} sandbox descriptor differs", exit_code=2)
+        descriptor_bindings.append((descriptor, argv[index + 2], option))
+    expected_descriptors = len(expected_fd_destinations) + len(
+        expected_data_destinations
+    )
+    observed_descriptor_bindings = tuple(
+        (option, path) for _descriptor, path, option in descriptor_bindings
+    )
+    passed_topology_differs = False
+    if require_passed_file_descriptors:
+        passed_topology_differs = (
+            expected_passed_file_descriptors is None
+            or isinstance(passed_file_descriptors, bool)
+            or passed_file_descriptors != expected_passed_file_descriptors
+        )
+    if (
+        len(descriptor_bindings) != expected_descriptors
+        or len({descriptor for descriptor, _path, _option in descriptor_bindings})
+        != expected_descriptors
+        or len({path for _descriptor, path, _option in descriptor_bindings})
+        != expected_descriptors
+        or {
+            path
+            for _descriptor, path, option in descriptor_bindings
+            if option in {"--ro-bind-fd", "--bind-fd"}
+        }
+        != expected_fd_destinations
+        or {
+            path
+            for _descriptor, path, option in descriptor_bindings
+            if option in {"--ro-bind-data", "--bind-data"}
+        }
+        != expected_data_destinations
+        or {
+            path
+            for _descriptor, path, option in descriptor_bindings
+            if option == "--bind-fd"
+        }
+        != writable_fd_destinations
+        or any(option == "--bind-data" for _descriptor, _path, option in descriptor_bindings)
+        or (
+            expected_descriptor_bindings is not None
+            and observed_descriptor_bindings != expected_descriptor_bindings
+        )
+        or passed_topology_differs
+    ):
+        raise RunnerFailure(f"{context} sandbox descriptor topology differs", exit_code=2)
+
+
+def _semantic_authority_bindings(
+    value: Any,
+    context: str,
+    *,
+    source_role: str,
+) -> list[tuple[str, str, str, str, str, dict[str, Any]]]:
+    if (
+        not isinstance(value, dict)
+        or set(value)
+        != {
+            "cargo_home",
+            "runtime_sha256",
+            "schema",
+            "source",
+            "toolchain",
+            "trusted_system_closure",
+        }
+        or value.get("schema") != SEMANTIC_INPUT_AUTHORITY_SCHEMA
+    ):
+        raise RunnerFailure(f"{context} semantic authority fields differ", exit_code=2)
+    bindings: list[tuple[str, str, str, str, str, dict[str, Any]]] = []
+    for name, role in (
+        ("source", source_role),
+        ("toolchain", "toolchain"),
+        ("cargo_home", "cargo_home"),
+    ):
+        binding = value.get(name)
+        if (
+            not isinstance(binding, dict)
+            or set(binding) != SEMANTIC_TREE_BINDING_FIELDS
+            or binding.get("schema") != RECURSIVE_TREE_AUTHORITY_SCHEMA
+            or binding.get("role") != role
+            or not isinstance(binding.get("entry_count"), int)
+            or isinstance(binding.get("entry_count"), bool)
+            or binding["entry_count"] < 1
+            or not isinstance(binding.get("watch_count"), int)
+            or isinstance(binding.get("watch_count"), bool)
+            or binding["watch_count"] < 1
+            or binding.get("equal_pre_post") is not True
+            or binding.get("mutation_events_absent") is not True
+        ):
+            raise RunnerFailure(
+                f"{context} semantic {name} binding differs", exit_code=2
+            )
+        bindings.append(
+            (
+                str(binding.get("manifest_path")),
+                str(binding.get("manifest_sha256")),
+                RECURSIVE_TREE_AUTHORITY_SCHEMA,
+                role,
+                name,
+                binding,
+            )
+        )
+    closure = value.get("trusted_system_closure")
+    mounts = closure.get("mounts") if isinstance(closure, dict) else None
+    mount_fields = {
+        "device",
+        "gid",
+        "guest_path",
+        "host_path",
+        "inode",
+        "permissions",
+        "resolved_path",
+        "trusted_root_owned_non_writable",
+        "uid",
+    }
+    if (
+        not isinstance(closure, dict)
+        or set(closure) != SEMANTIC_CLOSURE_BINDING_FIELDS
+        or closure.get("schema") != TRUSTED_SYSTEM_CLOSURE_SCHEMA
+        or not isinstance(closure.get("entry_count"), int)
+        or isinstance(closure.get("entry_count"), bool)
+        or closure["entry_count"] < 3
+        or not isinstance(closure.get("watch_count"), int)
+        or isinstance(closure.get("watch_count"), bool)
+        or closure["watch_count"] < 3
+        or closure.get("mutation_events_absent") is not True
+        or not isinstance(mounts, list)
+        or len(mounts) != len(TRUSTED_SYSTEM_MOUNTS)
+        or any(
+            not isinstance(mount, dict)
+            or set(mount) != mount_fields
+            or mount.get("host_path") != host
+            or mount.get("resolved_path") != host
+            or mount.get("guest_path") != guest
+            or mount.get("trusted_root_owned_non_writable") is not True
+            or mount.get("uid") != 0
+            or not all(
+                isinstance(mount.get(field), int)
+                and not isinstance(mount.get(field), bool)
+                for field in ("device", "gid", "inode", "permissions", "uid")
+            )
+            or mount.get("permissions", 0) & 0o022
+            for mount, (host, guest) in zip(mounts or [], TRUSTED_SYSTEM_MOUNTS, strict=True)
+        )
+    ):
+        raise RunnerFailure(f"{context} trusted-system closure differs", exit_code=2)
+    bindings.append(
+        (
+            str(closure.get("manifest_path")),
+            str(closure.get("sha256")),
+            TRUSTED_SYSTEM_CLOSURE_SCHEMA,
+            "trusted_system_closure",
+            "trusted_system_closure",
+            closure,
+        )
+    )
+    runtime_sha256 = value.get("runtime_sha256")
+    if (
+        not isinstance(runtime_sha256, str)
+        or not SHA256_RE.fullmatch(runtime_sha256)
+        or runtime_sha256 != _semantic_runtime_sha256(value)
+    ):
+        raise RunnerFailure(f"{context} semantic runtime digest differs", exit_code=2)
+    return bindings
+
+
+def _claim_semantic_physical_identity(
+    seen: dict[tuple[int, int], str],
+    snapshot: RetainedSemanticManifest,
+) -> None:
+    physical_identity = (
+        snapshot.identity["device"],
+        snapshot.identity["inode"],
+    )
+    prior_context = seen.get(physical_identity)
+    if prior_context is not None:
+        raise RunnerFailure(
+            f"semantic manifest physical alias: {prior_context} and "
+            f"{snapshot.context}",
+            exit_code=2,
+        )
+    seen[physical_identity] = snapshot.context
+
+
+def retain_prepared_semantic_manifests(
+    prepared: Prepared,
+) -> tuple[list[RetainedSemanticManifest], dict[str, int]]:
+    """Project the exact 12 + 20 + 16 semantic evidence topology."""
+
+    records: list[
+        tuple[str, str, str, str, str, str, dict[str, Any]]
+    ] = []
+    runtime_digests: set[str] = set()
+
+    def add(
+        section: str,
+        authority: Any,
+        context: str,
+        *,
+        source_role: str = "source",
+    ) -> None:
+        if isinstance(authority, dict) and isinstance(
+            authority.get("runtime_sha256"), str
+        ):
+            runtime_digests.add(authority["runtime_sha256"])
+        for path, digest, schema, role, component, binding in _semantic_authority_bindings(
+            authority, context, source_role=source_role
+        ):
+            records.append(
+                (
+                    section,
+                    path,
+                    digest,
+                    schema,
+                    role,
+                    f"{context} {component}",
+                    binding,
+                )
+            )
+
+    current_file = prepared.source_review_files.get("current_children_attestation")
+    if current_file is None:
+        raise RunnerFailure("current-child semantic authority is absent", exit_code=2)
+    current = _load_canonical_support_authority(
+        current_file,
+        "current-child semantic authority",
+    )
+    current_builds = current.get("builds")
+    if (
+        current.get("schema") != CURRENT_CHILDREN_ATTESTATION_SCHEMA
+        or not isinstance(current_builds, dict)
+        or set(current_builds) != {"children", "hooked_release", "pristine_release"}
+    ):
+        raise RunnerFailure("current-child semantic topology differs", exit_code=2)
+    for name in ("children", "hooked_release", "pristine_release"):
+        build = current_builds[name]
+        if not isinstance(build, dict):
+            raise RunnerFailure(f"current-child {name} build is absent", exit_code=2)
+        execution = build.get("execution")
+        passed = (
+            execution.get("passed_file_descriptors")
+            if isinstance(execution, dict)
+            else None
+        )
+        expected_passed = _current_build_expected_passed_file_descriptors(
+            build, f"current-child {name}"
+        )
+        _validate_semantic_sandbox(
+            build.get("argv"),
+            build.get("environment"),
+            f"current-child {name}",
+            passed_file_descriptors=passed,
+            expected_passed_file_descriptors=expected_passed,
+            expected_fd_destinations=(
+                CURRENT_BUILD_FD_DESTINATIONS
+                | {"/asterism/rustc_workspace_wrapper.py", "/asterism/receipt"}
+                if name == "children"
+                else CURRENT_BUILD_FD_DESTINATIONS
+            ),
+            writable_fd_destinations=(
+                {"/asterism/target", "/asterism/receipt"}
+                if name == "children"
+                else {"/asterism/target"}
+            ),
+            expected_data_destinations={
+                "/asterism/source/.cargo/config.toml"
+            },
+        )
+        add("current", build.get("semantic_input_authority"), f"current-child {name}")
+
+    prepared_variants = prepared.value.get("variants")
+    if not isinstance(prepared_variants, dict) or set(prepared_variants) != set(VARIANTS):
+        raise RunnerFailure("prepared release semantic topology differs", exit_code=2)
+    release_authorities: dict[str, dict[str, Any]] = {}
+    for name in VARIANTS:
+        item = prepared_variants[name]
+        attestation = item.get("attestation") if isinstance(item, dict) else None
+        authority = (
+            attestation.get("semantic_input_authority")
+            if isinstance(attestation, dict)
+            else None
+        )
+        _validate_semantic_sandbox(
+            attestation.get("build_argv") if isinstance(attestation, dict) else None,
+            attestation.get("build_env") if isinstance(attestation, dict) else None,
+            f"release {name}",
+            passed_file_descriptors=None,
+            expected_passed_file_descriptors=None,
+            require_passed_file_descriptors=False,
+            expected_fd_destinations=RELEASE_BUILD_DESTINATIONS,
+            writable_fd_destinations={"/asterism/target"},
+            expected_descriptor_bindings=RELEASE_BUILD_DESCRIPTOR_BINDINGS,
+        )
+        if not isinstance(authority, dict):
+            raise RunnerFailure(f"release {name} semantic authority is absent", exit_code=2)
+        release_authorities[name] = authority
+        add("release", authority, f"release {name}")
+    proof_builds = prepared.release_compile_out_value.get("builds")
+    if not isinstance(proof_builds, dict) or set(proof_builds) != {"ordinary_a", "overlay_a"}:
+        raise RunnerFailure("release proof semantic topology differs", exit_code=2)
+    ordinary = proof_builds["ordinary_a"]
+    overlay = proof_builds["overlay_a"]
+    ordinary_attestation = ordinary.get("attestation") if isinstance(ordinary, dict) else None
+    overlay_attestation = overlay.get("attestation") if isinstance(overlay, dict) else None
+    if (
+        not isinstance(ordinary_attestation, dict)
+        or ordinary_attestation.get("semantic_input_authority")
+        != release_authorities["A"]
+        or not isinstance(overlay_attestation, dict)
+    ):
+        raise RunnerFailure("release ordinary-A semantic alias differs", exit_code=2)
+    _validate_semantic_sandbox(
+        overlay_attestation.get("build_argv"),
+        overlay_attestation.get("build_env"),
+        "release overlay A",
+        passed_file_descriptors=None,
+        expected_passed_file_descriptors=None,
+        require_passed_file_descriptors=False,
+        expected_fd_destinations=RELEASE_BUILD_DESTINATIONS,
+        writable_fd_destinations={"/asterism/target"},
+        expected_descriptor_bindings=RELEASE_BUILD_DESCRIPTOR_BINDINGS,
+    )
+    add(
+        "release",
+        overlay_attestation.get("semantic_input_authority"),
+        "release overlay A",
+    )
+
+    lock_authority_file = prepared.source_review_files.get("lock_authority")
+    if lock_authority_file is None:
+        raise RunnerFailure("reviewed resolver authority is absent", exit_code=2)
+    lock_authority = _load_canonical_support_authority(
+        lock_authority_file,
+        "resolver semantic authority",
+    )
+    lock_manifest = lock_authority.get("lock_manifest")
+    lock_payload = (
+        lock_manifest.get("payload") if isinstance(lock_manifest, dict) else None
+    )
+    resolver_variants = (
+        lock_payload.get("variants") if isinstance(lock_payload, dict) else None
+    )
+    approval_variants = prepared.source_approval_value.get("variants")
+    if (
+        not isinstance(resolver_variants, dict)
+        or set(resolver_variants) != set(VARIANTS)
+        or not isinstance(approval_variants, dict)
+        or set(approval_variants) != set(VARIANTS)
+    ):
+        raise RunnerFailure("resolver semantic topology differs", exit_code=2)
+    for name in VARIANTS:
+        item = resolver_variants[name]
+        approval_item = approval_variants[name]
+        if not isinstance(item, dict) or not isinstance(approval_item, dict):
+            raise RunnerFailure(f"resolver {name} authority is absent", exit_code=2)
+        final = item.get("resolver")
+        current_attempt = item.get("current_lock_attempt")
+        if (
+            approval_item.get("lock_resolution") != final
+            or approval_item.get("current_lock_attempt") != current_attempt
+        ):
+            raise RunnerFailure(
+                f"resolver {name} approval/review authority differs",
+                exit_code=2,
+            )
+        if name in {"A", "B"}:
+            if (
+                current_attempt is not None
+                or not isinstance(final, dict)
+                or final.get("resolver_kind") != "tracked_git_readback"
+                or "semantic_input_authority" in final
+            ):
+                raise RunnerFailure(f"resolver {name} topology differs", exit_code=2)
+            continue
+        for role, record in (("current", current_attempt), ("generated", final)):
+            if (
+                not isinstance(record, dict)
+                or record.get("resolver_kind") != "sandboxed_cargo_resolution"
+            ):
+                raise RunnerFailure(
+                    f"resolver {name} {role} topology differs", exit_code=2
+                )
+            _validate_semantic_sandbox(
+                record.get("argv"),
+                record.get("environment"),
+                f"resolver {name} {role}",
+                passed_file_descriptors=record.get("passed_file_descriptors"),
+                expected_passed_file_descriptors=13,
+                expected_fd_destinations=RESOLVER_DESTINATIONS,
+                writable_fd_destinations={"/asterism/source"},
+                expected_descriptor_bindings=RESOLVER_DESCRIPTOR_BINDINGS,
+            )
+            add(
+                "resolver",
+                record.get("semantic_input_authority"),
+                f"resolver {name} {role}",
+                source_role="resolution_source_without_cargo_lock",
+            )
+
+    counts = {
+        section: sum(record[0] == section for record in records)
+        for section in SEMANTIC_MANIFEST_COUNTS
+    }
+    if (
+        counts != SEMANTIC_MANIFEST_COUNTS
+        or len(records) != SEMANTIC_MANIFEST_TOTAL
+        or len(runtime_digests) != 1
+    ):
+        raise RunnerFailure(
+            f"semantic manifest topology differs: counts={counts} "
+            f"runtime_digests={len(runtime_digests)}",
+            exit_code=2,
+        )
+    retained: list[RetainedSemanticManifest] = []
+    seen_paths: dict[str, str] = {}
+    seen_identities: dict[tuple[int, int], str] = {}
+    try:
+        for _section, path, digest, _schema, _role, _context, _binding in records:
+            prior = seen_paths.get(path)
+            if prior is not None:
+                conflict = "conflicting digest" if prior != digest else "path alias"
+                raise RunnerFailure(
+                    f"semantic manifest {conflict}: {path}", exit_code=2
+                )
+            seen_paths[path] = digest
+        for _section, path, digest, schema, role, context, binding in records:
+            snapshot = _retain_semantic_manifest(path, digest, schema, context)
+            retained.append(snapshot)
+            _claim_semantic_physical_identity(seen_identities, snapshot)
+            if snapshot.value is None:
+                raise RunnerFailure(f"{context} retained evidence is absent", exit_code=2)
+            if schema == RECURSIVE_TREE_AUTHORITY_SCHEMA:
+                tree = _validate_recursive_semantic_manifest(
+                    snapshot.value, role, context, trusted_system=False
+                )
+                if (
+                    len(tree["entries"]) != binding["entry_count"]
+                    or sum(
+                        entry["file_type"] == "directory"
+                        for entry in tree["entries"]
+                    )
+                    != binding["watch_count"]
+                ):
+                    raise RunnerFailure(
+                        f"{context} evidence cardinality differs", exit_code=2
+                    )
+            else:
+                closure = snapshot.value
+                evidence_mounts = closure.get("mounts")
+                if (
+                    set(closure) != {"mounts", "schema"}
+                    or not isinstance(evidence_mounts, list)
+                    or len(evidence_mounts) != len(TRUSTED_SYSTEM_MOUNTS)
+                ):
+                    raise RunnerFailure(
+                        f"{context} closure evidence fields differ", exit_code=2
+                    )
+                entry_count = 0
+                watch_count = 0
+                for evidence_mount, binding_mount, (host, guest) in zip(
+                    evidence_mounts,
+                    binding["mounts"],
+                    TRUSTED_SYSTEM_MOUNTS,
+                    strict=True,
+                ):
+                    if (
+                        not isinstance(evidence_mount, dict)
+                        or set(evidence_mount)
+                        != {"guest_path", "host_path", "resolved_path", "tree"}
+                        or evidence_mount.get("guest_path") != guest
+                        or evidence_mount.get("host_path") != host
+                        or evidence_mount.get("resolved_path") != host
+                    ):
+                        raise RunnerFailure(
+                            f"{context} closure mount evidence differs", exit_code=2
+                        )
+                    tree = _validate_recursive_semantic_manifest(
+                        evidence_mount.get("tree"),
+                        "system-" + guest.removeprefix("/").replace("/", "-"),
+                        f"{context} {guest}",
+                        trusted_system=True,
+                    )
+                    root_entry = tree["entries"][0]
+                    if any(
+                        binding_mount[field] != root_entry[field]
+                        for field in ("device", "gid", "inode", "permissions", "uid")
+                    ):
+                        raise RunnerFailure(
+                            f"{context} closure root binding differs", exit_code=2
+                        )
+                    entry_count += len(tree["entries"])
+                    watch_count += sum(
+                        entry["file_type"] == "directory"
+                        for entry in tree["entries"]
+                    )
+                if (
+                    entry_count != binding["entry_count"]
+                    or watch_count != binding["watch_count"]
+                ):
+                    raise RunnerFailure(
+                        f"{context} closure cardinality differs", exit_code=2
+                    )
+            snapshot.value = None
+        if (
+            len(retained) != SEMANTIC_MANIFEST_TOTAL
+            or len(seen_identities) != SEMANTIC_MANIFEST_TOTAL
+        ):
+            raise RunnerFailure("semantic retained set is incomplete", exit_code=2)
+        return retained, counts
+    except BaseException as error:
+        _final_verify_close_retained_manifests(retained, error)
+        raise
 
 
 def resolve_bound_file(
@@ -2985,19 +4347,41 @@ class RebaselineRunner:
         # config/provenance/artifacts.  It is sealed into a one-shot memfd only
         # at the real evaluator boundary.
         self.corpus_execution_authority: list[dict[str, Any]] = []
+        self.semantic_manifests: list[RetainedSemanticManifest] = []
+        self.semantic_manifest_counts: dict[str, int] = {}
+        try:
+            self.semantic_manifests, self.semantic_manifest_counts = (
+                retain_prepared_semantic_manifests(prepared)
+            )
+            self._initialize_after_semantic_retention()
+        except BaseException as error:
+            secondary_errors = _final_verify_close_retained_manifests(
+                self.semantic_manifests,
+                error,
+            )
+            for secondary in secondary_errors:
+                self._report_secondary_failure(
+                    "runner construction semantic finalization",
+                    RunnerFailure(secondary),
+                )
+            raise
+
+    def _initialize_after_semantic_retention(self) -> None:
+        """Finish fallible construction under explicit retained-FD cleanup."""
+
         self.frozen_files = self._frozen_file_bindings()
-        self.config = config_for(prepared, schema)
+        self.config = config_for(self.prepared, self.schema)
         self.config["attempt_nonce"] = self.attempt_nonce
-        self.config_path = output / "config.json"
-        self.provenance_path = output / "provenance.json"
-        self.guard_manifest = output / "guard-manifest.jsonl"
-        self.child_manifest = output / "child-manifest.jsonl"
-        self.raw_manifest = output / "raw-manifest.json"
-        self.resource_manifest = output / "resource-manifest.jsonl"
-        self.correctness_manifest = output / "correctness-manifest.jsonl"
-        self.auxiliary_manifest = output / "auxiliary-manifest.jsonl"
-        self.lease_manifest = output / "lease-manifest.jsonl"
-        self.attempt_scratch = scratch_root / "attempts" / self.attempt_nonce
+        self.config_path = self.output / "config.json"
+        self.provenance_path = self.output / "provenance.json"
+        self.guard_manifest = self.output / "guard-manifest.jsonl"
+        self.child_manifest = self.output / "child-manifest.jsonl"
+        self.raw_manifest = self.output / "raw-manifest.json"
+        self.resource_manifest = self.output / "resource-manifest.jsonl"
+        self.correctness_manifest = self.output / "correctness-manifest.jsonl"
+        self.auxiliary_manifest = self.output / "auxiliary-manifest.jsonl"
+        self.lease_manifest = self.output / "lease-manifest.jsonl"
+        self.attempt_scratch = self.scratch_root / "attempts" / self.attempt_nonce
         self.runtime_home = self.attempt_scratch / "home"
         self.initial_filesystem: dict[str, Any] | None = None
         self.initial_free_bytes: int | None = None
@@ -3006,7 +4390,7 @@ class RebaselineRunner:
             self._prepared_tree_state() if self.prepared.inputs else None
         )
         self.csv_paths = {
-            track: output / filename for track, filename in CSV_FILENAMES.items()
+            track: self.output / filename for track, filename in CSV_FILENAMES.items()
         }
         transition_plans = (
             [*self.contract_plans(), *self.smoke_plans()]
@@ -3044,6 +4428,33 @@ class RebaselineRunner:
                 )
         if {"correctness", "fault"}.issubset(self.prepared.tools):
             self._refresh_correctness_execution()
+
+    def __del__(self) -> None:
+        for semantic_manifest in getattr(self, "semantic_manifests", ()):
+            try:
+                semantic_manifest.close()
+            except BaseException:
+                pass
+
+    @staticmethod
+    def _report_secondary_failure(context: str, error: BaseException) -> None:
+        """Best-effort diagnostics which can never replace the primary outcome."""
+
+        try:
+            print(
+                f"secondary failure during {context}: "
+                f"{error.__class__.__name__}: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+        except BaseException:
+            pass
+
+    @staticmethod
+    def _emit_primary_failure(failure: RunnerFailure) -> None:
+        """Best-effort primary visibility when the durable log cannot publish."""
+
+        print(f"fail-stop: {failure.reason}", flush=True)
 
     def publish_frozen_inputs(self) -> None:
         self._verify_prepared_tree()
@@ -3450,6 +4861,16 @@ class RebaselineRunner:
             values[str(input_file.path)] = input_file.sha256
         for source_review_file in self.prepared.source_review_files.values():
             values[str(source_review_file.path)] = source_review_file.sha256
+        for semantic_manifest in self.semantic_manifests:
+            prior = values.get(str(semantic_manifest.path))
+            if prior is not None:
+                conflict = (
+                    "conflicting hashes" if prior != semantic_manifest.sha256 else "path alias"
+                )
+                raise RunnerFailure(
+                    f"semantic manifest has {conflict}: {semantic_manifest.path}"
+                )
+            values[str(semantic_manifest.path)] = semantic_manifest.sha256
         for path, digest, _mode, _identity, _label in (
             self._release_compile_out_file_bindings()
         ):
@@ -3599,8 +5020,15 @@ class RebaselineRunner:
 
     def verify_frozen(self) -> None:
         self.phase = "frozen_recheck"
+        self.verify_semantic_manifests()
         self._verify_prepared_input_metadata()
+        semantic_paths = {
+            str(semantic_manifest.path)
+            for semantic_manifest in self.semantic_manifests
+        }
         for raw_path, expected in self.frozen_files.items():
+            if raw_path in semantic_paths:
+                continue
             path = Path(raw_path)
             if not path.is_file() or sha256(path) != expected:
                 raise RunnerFailure(f"frozen artifact changed: {path}")
@@ -3613,6 +5041,17 @@ class RebaselineRunner:
                 or load_canonical_json(self.prepared.claim_path) != self.claim
             ):
                 raise RunnerFailure("single-use claim changed")
+
+    def verify_semantic_manifests(self) -> None:
+        """Recheck the exact retained semantic set without unrelated I/O."""
+
+        if (
+            self.semantic_manifest_counts != SEMANTIC_MANIFEST_COUNTS
+            or len(self.semantic_manifests) != SEMANTIC_MANIFEST_TOTAL
+        ):
+            raise RunnerFailure("semantic manifest lifetime set is incomplete")
+        for semantic_manifest in self.semantic_manifests:
+            semantic_manifest.verify()
 
     def _verify_prepared_input_metadata(self) -> None:
         bindings: list[tuple[Path, str, int]] = [
@@ -6886,13 +8325,117 @@ class RebaselineRunner:
         }
         atomic_json(self.output / "failure.json", value)
 
+    def close_semantic_manifests(self) -> None:
+        errors: list[str] = []
+        for semantic_manifest in getattr(self, "semantic_manifests", ()):
+            try:
+                semantic_manifest.close()
+            except BaseException as error:
+                errors.append(
+                    f"{semantic_manifest.context}: "
+                    f"{error.__class__.__name__}: {error}"
+                )
+        if errors:
+            raise RunnerFailure(
+                "semantic manifest descriptor cleanup failed: " + "; ".join(errors)
+            )
+
+    def finish_semantic_lifetime(
+        self,
+        primary_failure: RunnerFailure | None = None,
+    ) -> RunnerFailure | None:
+        """Reverify then close every retained FD, preserving any primary failure."""
+
+        if not any(
+            semantic_manifest.descriptor >= 0
+            for semantic_manifest in getattr(self, "semantic_manifests", ())
+        ):
+            return primary_failure
+        boundary_failure: RunnerFailure | None = None
+        manifests = list(getattr(self, "semantic_manifests", ()))
+        if (
+            getattr(self, "semantic_manifest_counts", None)
+            != SEMANTIC_MANIFEST_COUNTS
+            or len(manifests) != SEMANTIC_MANIFEST_TOTAL
+        ):
+            boundary_failure = RunnerFailure(
+                "semantic manifest lifetime set is incomplete"
+            )
+        for semantic_manifest in manifests:
+            try:
+                semantic_manifest.verify()
+            except RunnerFailure as error:
+                if boundary_failure is None:
+                    boundary_failure = error
+            except BaseException as error:
+                if boundary_failure is None:
+                    boundary_failure = RunnerFailure(
+                        "unhandled semantic lifetime recheck failure: "
+                        f"{error.__class__.__name__}: {error}",
+                        exit_code=30,
+                    )
+            finally:
+                try:
+                    semantic_manifest.close()
+                except BaseException as error:
+                    if boundary_failure is None:
+                        boundary_failure = RunnerFailure(
+                            "semantic manifest descriptor cleanup failed: "
+                            f"{semantic_manifest.context}: "
+                            f"{error.__class__.__name__}: {error}"
+                        )
+        if boundary_failure is None:
+            return primary_failure
+        if primary_failure is None:
+            return boundary_failure
+        return RunnerFailure(
+            f"{primary_failure.reason}; semantic lifetime boundary failed: "
+            f"{boundary_failure.reason}",
+            exit_code=primary_failure.exit_code,
+        )
+
     def run(self) -> int:
+        try:
+            return self._run_with_retained_semantic_authority()
+        finally:
+            try:
+                self.close_semantic_manifests()
+            except BaseException as cleanup_error:
+                self._report_secondary_failure(
+                    "final semantic cleanup",
+                    cleanup_error,
+                )
+
+    def _publish_runner_failure(self, failure: RunnerFailure) -> int:
+        """Attempt all failure side effects without replacing the primary failure."""
+
+        actions: tuple[tuple[str, Callable[[], None]], ...] = (
+            ("failure artifact publication", lambda: self.write_failure(failure)),
+            ("inconclusive lease release", lambda: self.release_lease("INCONCLUSIVE")),
+            ("failure log publication", lambda: self.log(f"fail-stop: {failure.reason}")),
+        )
+        log_published = False
+        for context, action in actions:
+            try:
+                action()
+                if context == "failure log publication":
+                    log_published = True
+            except BaseException as error:
+                self._report_secondary_failure(context, error)
+        if not log_published:
+            try:
+                self._emit_primary_failure(failure)
+            except BaseException:
+                pass
+        return failure.exit_code
+
+    def _run_with_retained_semantic_authority(self) -> int:
         def interrupted(signum: int, _frame: Any) -> None:
             raise RunnerFailure(f"runner received signal {signum}")
 
-        signal.signal(signal.SIGINT, interrupted)
-        signal.signal(signal.SIGTERM, interrupted)
         try:
+            signal.signal(signal.SIGINT, interrupted)
+            signal.signal(signal.SIGTERM, interrupted)
             self.output.mkdir(parents=False, exist_ok=False)
             self.scratch_root.mkdir(parents=True, exist_ok=True)
             self.attempt_scratch.mkdir(parents=True, exist_ok=False)
@@ -6923,6 +8466,9 @@ class RebaselineRunner:
                 evaluator_transition, result = self._invoke_evaluator(
                     pre_evaluator, correctness_only=True
                 )
+                boundary_failure = self.finish_semantic_lifetime()
+                if boundary_failure is not None:
+                    raise boundary_failure
                 self.publish_terminal(evaluator_transition, result)
                 return 0
             corpora = self.seed_reopen_corpora()
@@ -6942,26 +8488,21 @@ class RebaselineRunner:
             )
             self.finalize_provenance()
             evaluator_transition, result = self._invoke_evaluator(pre_evaluator)
+            boundary_failure = self.finish_semantic_lifetime()
+            if boundary_failure is not None:
+                raise boundary_failure
             self.publish_terminal(evaluator_transition, result)
             return 0
         except RunnerFailure as failure:
-            try:
-                self.write_failure(failure)
-            finally:
-                self.release_lease("INCONCLUSIVE")
-            self.log(f"fail-stop: {failure.reason}")
-            return failure.exit_code
+            failure = self.finish_semantic_lifetime(failure) or failure
+            return self._publish_runner_failure(failure)
         except BaseException as error:
             failure = RunnerFailure(
                 f"unhandled runner failure: {error.__class__.__name__}: {error}",
                 exit_code=30,
             )
-            try:
-                self.write_failure(failure)
-            finally:
-                self.release_lease("INCONCLUSIVE")
-            self.log(f"fail-stop: {failure.reason}")
-            return failure.exit_code
+            failure = self.finish_semantic_lifetime(failure) or failure
+            return self._publish_runner_failure(failure)
 
 
     def _settle(self, durability: str | None, label: str) -> list[dict[str, Any]]:
@@ -8640,6 +10181,272 @@ raise SystemExit(9 if row_ordinal == 3 else 0)
     atomic_write(path, payload.encode(), mode=0o755)
 
 
+def _fixture_semantic_tree(role: str, seed: int, *, trusted: bool = False) -> dict[str, Any]:
+    return {
+        "entries": [
+            {
+                "changed_ns": seed,
+                "device": 100 + seed,
+                "file_type": "directory",
+                "gid": 0,
+                "inode": 1_000 + seed,
+                "link_count": 2,
+                "modified_ns": seed,
+                "path": ".",
+                "permissions": 0o555 if trusted else 0o755,
+                "sha256": None,
+                "size": 0,
+                "symlink_scope": None,
+                "symlink_target": None,
+                "uid": 0 if trusted else os.getuid(),
+            }
+        ],
+        "role": role,
+        "schema": RECURSIVE_TREE_AUTHORITY_SCHEMA,
+    }
+
+
+def _fixture_semantic_authority(
+    root: Path,
+    label: str,
+    seed: int,
+    *,
+    source_role: str = "source",
+) -> dict[str, Any]:
+    bindings: dict[str, dict[str, Any]] = {}
+    for offset, (component, role) in enumerate(
+        (
+            ("source", source_role),
+            ("toolchain", "toolchain"),
+            ("cargo_home", "cargo_home"),
+        )
+    ):
+        component_seed = seed if component == "source" else 500 + offset
+        value = _fixture_semantic_tree(role, component_seed)
+        path = root / f"{label}-{component}.json"
+        atomic_json(path, value)
+        path.chmod(0o444)
+        bindings[component] = {
+            "entry_count": 1,
+            "equal_pre_post": True,
+            "manifest_path": str(path.resolve()),
+            "manifest_sha256": sha256(path),
+            "mutation_events_absent": True,
+            "role": role,
+            "schema": RECURSIVE_TREE_AUTHORITY_SCHEMA,
+            "watch_count": 1,
+        }
+    evidence_mounts = []
+    binding_mounts = []
+    for offset, (host, guest) in enumerate(TRUSTED_SYSTEM_MOUNTS, start=3):
+        role = "system-" + guest.removeprefix("/").replace("/", "-")
+        tree = _fixture_semantic_tree(role, 700 + offset, trusted=True)
+        evidence_mounts.append(
+            {
+                "guest_path": guest,
+                "host_path": host,
+                "resolved_path": host,
+                "tree": tree,
+            }
+        )
+        entry = tree["entries"][0]
+        binding_mounts.append(
+            {
+                "device": entry["device"],
+                "gid": entry["gid"],
+                "guest_path": guest,
+                "host_path": host,
+                "inode": entry["inode"],
+                "permissions": entry["permissions"],
+                "resolved_path": host,
+                "trusted_root_owned_non_writable": True,
+                "uid": entry["uid"],
+            }
+        )
+    closure_value = {
+        "mounts": evidence_mounts,
+        "schema": TRUSTED_SYSTEM_CLOSURE_SCHEMA,
+    }
+    closure_path = root / f"{label}-trusted-system-closure.json"
+    atomic_json(closure_path, closure_value)
+    closure_path.chmod(0o444)
+    closure = {
+        "entry_count": 3,
+        "manifest_path": str(closure_path.resolve()),
+        "mounts": binding_mounts,
+        "mutation_events_absent": True,
+        "schema": TRUSTED_SYSTEM_CLOSURE_SCHEMA,
+        "sha256": sha256(closure_path),
+        "watch_count": 3,
+    }
+    authority = {
+        **bindings,
+        "runtime_sha256": "0" * 64,
+        "schema": SEMANTIC_INPUT_AUTHORITY_SCHEMA,
+        "trusted_system_closure": closure,
+    }
+    authority["runtime_sha256"] = _semantic_runtime_sha256(authority)
+    return authority
+
+
+def _fixture_sandbox_argv(
+    destinations: set[str],
+    *,
+    writable_destinations: set[str],
+    data_destinations: set[str] | None = None,
+    descriptor_bindings: tuple[tuple[str, str], ...] | None = None,
+) -> list[str]:
+    if data_destinations is None:
+        data_destinations = set()
+    argv = [
+        "/usr/bin/bwrap",
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-net",
+        "--dir",
+        "/dev",
+        "--dir",
+        "/proc",
+        "--tmpfs",
+        "/tmp",
+    ]
+    descriptor = 10
+    bindings = descriptor_bindings or tuple(
+        (
+            "--bind-fd" if destination in writable_destinations else "--ro-bind-fd",
+            destination,
+        )
+        for destination in sorted(destinations)
+    )
+    if (
+        {destination for _option, destination in bindings} != destinations
+        or {
+            destination
+            for option, destination in bindings
+            if option == "--bind-fd"
+        }
+        != writable_destinations
+    ):
+        raise AssertionError("fixture descriptor binding topology differs")
+    for option, destination in bindings:
+        argv.extend(
+            [
+                option,
+                str(descriptor),
+                destination,
+            ]
+        )
+        descriptor += 1
+    for destination in sorted(data_destinations):
+        argv.extend(["--ro-bind-data", str(descriptor), destination])
+        descriptor += 1
+    return argv
+
+
+def _fixture_current_cargo_config(
+    preserved_cargo_home: tuple[dict[str, Any], ...] = (),
+) -> dict[str, Any]:
+    guest_paths = (
+        "/asterism/source/.cargo/config.toml",
+        "/asterism/source/.cargo/config",
+        "/asterism/.cargo/config.toml",
+        "/asterism/.cargo/config",
+        "/.cargo/config.toml",
+        "/.cargo/config",
+        "/asterism/cargo-home/config.toml",
+        "/asterism/cargo-home/config",
+    )
+    search_entries = [
+        {
+            "path": path,
+            "sha256": "a" * 64 if index == 0 else None,
+            "status": "present" if index == 0 else "absent",
+        }
+        for index, path in enumerate(guest_paths)
+    ]
+    cargo_home_entry_count = 1 + len(preserved_cargo_home)
+    cargo_home_watch_count = 1 + sum(
+        entry.get("type") == "directory" for entry in preserved_cargo_home
+    )
+    return {
+        "cargo_search": {
+            "cargo_home_path": "/asterism/cargo-home",
+            "cwd": "/asterism/source",
+            "entries": search_entries,
+            "schema": "asterism-rebaseline-cargo-config-search-v3",
+        },
+        "cargo_home_tree": {
+            "entry_count": cargo_home_entry_count,
+            "equal_pre_post": True,
+            "path": "/fixture/manifests/cargo-home.json",
+            "post_sha256": "b" * 64,
+            "pre_sha256": "b" * 64,
+            "watch_count": cargo_home_watch_count,
+        },
+        "preserved_top_level_entries": {
+            "cargo-home": list(preserved_cargo_home),
+            "source": [],
+        },
+        "schema": CURRENT_BUILD_CARGO_CONFIG_SCHEMA,
+    }
+
+
+def _fixture_preserved_cargo_home_directory(name: str, ordinal: int) -> dict[str, Any]:
+    return {
+        "identity": {
+            "changed_ns": ordinal,
+            "device": 1,
+            "file_type": stat.S_IFDIR,
+            "inode": ordinal,
+            "link_count": 2,
+            "modified_ns": ordinal,
+            "path": f"/fixture/cargo-home/{name}",
+            "permissions": 0o755,
+            "size": 4096,
+        },
+        "name": name,
+        "type": "directory",
+    }
+
+
+def _fixture_build_sandbox(
+    authority: dict[str, Any],
+    destinations: set[str],
+    *,
+    writable_destinations: set[str],
+    data_destinations: set[str] | None = None,
+    passed_file_descriptors: int | None = None,
+    include_passed_file_descriptors: bool = True,
+    descriptor_bindings: tuple[tuple[str, str], ...] | None = None,
+) -> dict[str, Any]:
+    if data_destinations is None:
+        data_destinations = set()
+    cargo_config = _fixture_current_cargo_config()
+    return {
+        "argv": _fixture_sandbox_argv(
+            destinations,
+            writable_destinations=writable_destinations,
+            data_destinations=data_destinations,
+            descriptor_bindings=descriptor_bindings,
+        ),
+        "environment": {"RUSTUP_HOME": "/nonexistent"},
+        "cargo_config_prebuild": cargo_config,
+        "cargo_config_postbuild": json.loads(canonical_json_bytes(cargo_config)),
+        "execution": (
+            {
+                "passed_file_descriptors": (
+                    len(destinations) + len(data_destinations) + 1
+                    if passed_file_descriptors is None
+                    else passed_file_descriptors
+                )
+            }
+            if include_passed_file_descriptors
+            else {}
+        ),
+        "semantic_input_authority": authority,
+    }
+
+
 def _fixture_prepared(root: Path, executable: Path) -> Prepared:
     digest = sha256(executable)
     bound = Executable("fake", executable, digest, stat.S_IMODE(executable.stat().st_mode), "ast-fake")
@@ -8687,12 +10494,119 @@ def _fixture_prepared(root: Path, executable: Path) -> Prepared:
         "lock_authority": bindings / "lock-review-authority.json",
         "lock_review_bundle": bindings / "lock-review-bundle.json",
     }
+    semantic_root = root / "semantic-manifests"
+    semantic_root.mkdir()
+    authorities: dict[str, dict[str, Any]] = {}
+    seed = 1
+    for label in (
+        "current-children",
+        "current-hooked-release",
+        "current-pristine-release",
+        "release-A",
+        "release-B",
+        "release-C",
+        "release-D",
+        "release-overlay-A",
+    ):
+        authorities[label] = _fixture_semantic_authority(
+            semantic_root, label, seed
+        )
+        seed += 10
+    for variant in ("C", "D"):
+        for role in ("current", "generated"):
+            label = f"resolver-{variant}-{role}"
+            authorities[label] = _fixture_semantic_authority(
+                semantic_root,
+                label,
+                seed,
+                source_role="resolution_source_without_cargo_lock",
+            )
+            seed += 10
+    current_builds = {}
+    for name, label, destinations, writable, passed in (
+        (
+            "children",
+            "current-children",
+            CURRENT_BUILD_FD_DESTINATIONS
+            | {"/asterism/rustc_workspace_wrapper.py", "/asterism/receipt"},
+            {"/asterism/target", "/asterism/receipt"},
+            15,
+        ),
+        (
+            "hooked_release",
+            "current-hooked-release",
+            CURRENT_BUILD_FD_DESTINATIONS,
+            {"/asterism/target"},
+            13,
+        ),
+        (
+            "pristine_release",
+            "current-pristine-release",
+            CURRENT_BUILD_FD_DESTINATIONS,
+            {"/asterism/target"},
+            13,
+        ),
+    ):
+        current_builds[name] = _fixture_build_sandbox(
+            authorities[label],
+            destinations,
+            writable_destinations=writable,
+            data_destinations={"/asterism/source/.cargo/config.toml"},
+            passed_file_descriptors=passed,
+        )
+    approval_variants: dict[str, dict[str, Any]] = {}
+    lock_variants: dict[str, dict[str, Any]] = {}
+    for name in VARIANTS:
+        if name in {"A", "B"}:
+            tracked = {"resolver_kind": "tracked_git_readback"}
+            approval_variants[name] = {
+                "current_lock_attempt": None,
+                "lock_resolution": tracked,
+            }
+            lock_variants[name] = {
+                "current_lock_attempt": None,
+                "resolver": json.loads(canonical_json_bytes(tracked)),
+            }
+            continue
+        records = {}
+        for role in ("current", "generated"):
+            sandbox = _fixture_build_sandbox(
+                authorities[f"resolver-{name}-{role}"],
+                RESOLVER_DESTINATIONS,
+                writable_destinations={"/asterism/source"},
+                descriptor_bindings=RESOLVER_DESCRIPTOR_BINDINGS,
+            )
+            records[role] = {
+                "argv": sandbox["argv"],
+                "environment": sandbox["environment"],
+                "passed_file_descriptors": sandbox["execution"][
+                    "passed_file_descriptors"
+                ],
+                "resolver_kind": "sandboxed_cargo_resolution",
+                "semantic_input_authority": sandbox["semantic_input_authority"],
+            }
+        approval_variants[name] = {
+            "current_lock_attempt": records["current"],
+            "lock_resolution": records["generated"],
+        }
+        lock_variants[name] = {
+            "current_lock_attempt": json.loads(
+                canonical_json_bytes(records["current"])
+            ),
+            "resolver": json.loads(canonical_json_bytes(records["generated"])),
+        }
     source_review_values = {
         "bundle": {"schema": "bn-3hch-source-review-bundle-v1"},
         "current_children_attestation": {
-            "schema": "bn-30fs-current-children-build-v1"
+            "builds": current_builds,
+            "schema": CURRENT_CHILDREN_ATTESTATION_SCHEMA,
         },
-        "lock_authority": {"schema": "bn-31gp-current-lock-authority-v1"},
+        "lock_authority": {
+            "lock_manifest": {
+                "payload": {"variants": lock_variants},
+            },
+            "schema": "bn-31gp-current-lock-authority-v1",
+        },
         "lock_review_bundle": {
             "schema": "bn-31gp-current-lock-review-bundle-v1"
         },
@@ -8702,8 +10616,40 @@ def _fixture_prepared(root: Path, executable: Path) -> Prepared:
         source_review_path.chmod(0o444)
     manifests = root / "manifests"
     manifests.mkdir()
+    release_attestations = {}
+    for name in VARIANTS:
+        sandbox = _fixture_build_sandbox(
+            authorities[f"release-{name}"],
+            RELEASE_BUILD_DESTINATIONS,
+            writable_destinations={"/asterism/target"},
+            include_passed_file_descriptors=False,
+            descriptor_bindings=RELEASE_BUILD_DESCRIPTOR_BINDINGS,
+        )
+        release_attestations[name] = {
+            "build_argv": sandbox["argv"],
+            "build_child": sandbox["execution"],
+            "build_env": sandbox["environment"],
+            "semantic_input_authority": sandbox["semantic_input_authority"],
+        }
+    overlay_sandbox = _fixture_build_sandbox(
+        authorities["release-overlay-A"],
+        RELEASE_BUILD_DESTINATIONS,
+        writable_destinations={"/asterism/target"},
+        include_passed_file_descriptors=False,
+        descriptor_bindings=RELEASE_BUILD_DESCRIPTOR_BINDINGS,
+    )
+    overlay_attestation = {
+        "build_argv": overlay_sandbox["argv"],
+        "build_child": overlay_sandbox["execution"],
+        "build_env": overlay_sandbox["environment"],
+        "semantic_input_authority": overlay_sandbox["semantic_input_authority"],
+    }
     release_compile_out_path = manifests / "release-compile-out.json"
     release_compile_out_value = {
+        "builds": {
+            "ordinary_a": {"attestation": release_attestations["A"]},
+            "overlay_a": {"attestation": overlay_attestation},
+        },
         "protocol": PROTOCOL,
         "protocol_sha256": PROTOCOL_SHA256,
         "schema": "bn-3hch-release-compile-out-v1",
@@ -8711,22 +10657,35 @@ def _fixture_prepared(root: Path, executable: Path) -> Prepared:
     }
     atomic_json(release_compile_out_path, release_compile_out_value)
     release_compile_out_path.chmod(0o444)
+    source_approval_value = {
+        "review_id": "fixture-review",
+        "status": "approved",
+        "variants": approval_variants,
+    }
     atomic_json(tools_manifest, tools_manifest_value)
-    atomic_json(approval, {"status": "approved", "review_id": "fixture-review"})
+    atomic_json(approval, source_approval_value)
     atomic_json(manifest, {"fixture": True})
     tools_manifest.chmod(0o444)
     bindings.chmod(0o555)
     manifests.chmod(0o555)
     approval.chmod(0o444)
     manifest.chmod(0o444)
+    semantic_root.chmod(0o555)
+    prepared_value = {
+        "tooling_commit": "1" * 40,
+        "tooling_tree": "2" * 40,
+        "variants": {
+            name: {"attestation": release_attestations[name]} for name in VARIANTS
+        },
+    }
     return Prepared(
         path=manifest,
         digest=sha256(manifest),
-        value={"tooling_commit": "1" * 40, "tooling_tree": "2" * 40},
+        value=prepared_value,
         root=root,
         source_approval=approval,
         source_approval_sha256=sha256(approval),
-        source_approval_value={"status": "approved", "review_id": "fixture-review"},
+        source_approval_value=source_approval_value,
         source_review_files={
             name: SupportFile(
                 f"prepared-source-review-{name}",
@@ -8763,6 +10722,826 @@ def _fixture_prepared(root: Path, executable: Path) -> Prepared:
     )
 
 
+def _detached(value: Any) -> Any:
+    return json.loads(canonical_json_bytes(value))
+
+
+def _fixture_with_release_a_mutation(
+    prepared: Prepared, mutation: Callable[[dict[str, Any]], None]
+) -> Prepared:
+    value = _detached(prepared.value)
+    proof = _detached(prepared.release_compile_out_value)
+    attestation = value["variants"]["A"]["attestation"]
+    mutation(attestation)
+    proof["builds"]["ordinary_a"]["attestation"] = _detached(attestation)
+    return replace(
+        prepared,
+        value=value,
+        release_compile_out_value=proof,
+    )
+
+
+def _semantic_authority_static_checks(
+    root: Path, prepared: Prepared
+) -> tuple[dict[str, bool], dict[str, str]]:
+    checks: dict[str, bool] = {}
+    details: dict[str, str] = {}
+    hostile = root / "hostile-semantic"
+    hostile.mkdir()
+
+    def rejected(name: str, candidate: Prepared) -> None:
+        snapshots: list[RetainedSemanticManifest] = []
+        try:
+            snapshots, _counts = retain_prepared_semantic_manifests(candidate)
+        except RunnerFailure as error:
+            checks[name] = True
+            details[name] = error.reason
+        else:
+            checks[name] = False
+            details[name] = "hostile semantic authority was accepted"
+        finally:
+            for snapshot in snapshots:
+                snapshot.close()
+
+    snapshots, counts = retain_prepared_semantic_manifests(prepared)
+    try:
+        checks["exact_12_20_16_topology"] = (
+            counts == SEMANTIC_MANIFEST_COUNTS
+            and len(snapshots) == SEMANTIC_MANIFEST_TOTAL
+        )
+        checks["all_48_retained_and_rechecked"] = all(
+            snapshot.verify() is None and snapshot.descriptor >= 0
+            for snapshot in snapshots
+        )
+        release_children = [
+            prepared.value["variants"][name]["attestation"]["build_child"]
+            for name in VARIANTS
+        ] + [
+            prepared.release_compile_out_value["builds"][proof]["attestation"][
+                "build_child"
+            ]
+            for proof in ("ordinary_a", "overlay_a")
+        ]
+        checks["release_child_omits_invented_passed_fd_count"] = all(
+            "passed_file_descriptors" not in child for child in release_children
+        )
+        identities: dict[tuple[int, int], str] = {}
+        _claim_semantic_physical_identity(identities, snapshots[0])
+        physical_alias = replace(
+            snapshots[1],
+            context="hostile physical alias",
+            identity=dict(snapshots[0].identity),
+        )
+        try:
+            _claim_semantic_physical_identity(identities, physical_alias)
+        except RunnerFailure as error:
+            checks["physical_identity_alias_rejected"] = True
+            details["physical_identity_alias_rejected"] = error.reason
+        else:
+            checks["physical_identity_alias_rejected"] = False
+            details["physical_identity_alias_rejected"] = (
+                "duplicate retained device/inode was accepted"
+            )
+    finally:
+        for snapshot in snapshots:
+            snapshot.close()
+    checks["all_48_closed_at_lifetime_boundary"] = all(
+        snapshot.descriptor == -1 for snapshot in snapshots
+    )
+
+    def authority(attestation: dict[str, Any]) -> dict[str, Any]:
+        return attestation["semantic_input_authority"]
+
+    rejected(
+        "missing_manifest_rejected",
+        _fixture_with_release_a_mutation(
+            prepared,
+            lambda attestation: authority(attestation)["source"].__setitem__(
+                "manifest_path", str((hostile / "missing.json").resolve())
+            ),
+        ),
+    )
+
+    def swap_source_toolchain(attestation: dict[str, Any]) -> None:
+        value = authority(attestation)
+        value["source"], value["toolchain"] = value["toolchain"], value["source"]
+        value["runtime_sha256"] = _semantic_runtime_sha256(value)
+
+    rejected(
+        "swapped_source_toolchain_rejected",
+        _fixture_with_release_a_mutation(prepared, swap_source_toolchain),
+    )
+
+    original_source = Path(
+        prepared.value["variants"]["A"]["attestation"][
+            "semantic_input_authority"
+        ]["source"]["manifest_path"]
+    )
+
+    def bind_release_source(attestation: dict[str, Any], path: Path) -> None:
+        binding = authority(attestation)["source"]
+        binding["manifest_path"] = str(path.absolute())
+        binding["manifest_sha256"] = sha256_bytes(path.read_bytes())
+
+    symlink_path = hostile / "symlink.json"
+    symlink_path.symlink_to(original_source)
+    rejected(
+        "symlink_manifest_rejected",
+        _fixture_with_release_a_mutation(
+            prepared, lambda attestation: bind_release_source(attestation, symlink_path)
+        ),
+    )
+    symlink_path.unlink()
+
+    hardlink_path = hostile / "hardlink.json"
+    os.link(original_source, hardlink_path)
+    try:
+        rejected(
+            "hardlink_manifest_rejected",
+            _fixture_with_release_a_mutation(
+                prepared,
+                lambda attestation: bind_release_source(attestation, hardlink_path),
+            ),
+        )
+    finally:
+        hardlink_path.unlink()
+
+    writable_path = hostile / "writable.json"
+    atomic_write(writable_path, original_source.read_bytes(), mode=0o644)
+    rejected(
+        "writable_manifest_rejected",
+        _fixture_with_release_a_mutation(
+            prepared, lambda attestation: bind_release_source(attestation, writable_path)
+        ),
+    )
+
+    toolchain_binding = prepared.value["variants"]["A"]["attestation"][
+        "semantic_input_authority"
+    ]["toolchain"]
+
+    def collide_source_path(attestation: dict[str, Any], *, digest: str) -> None:
+        binding = authority(attestation)["source"]
+        binding["manifest_path"] = toolchain_binding["manifest_path"]
+        binding["manifest_sha256"] = digest
+
+    rejected(
+        "path_alias_rejected",
+        _fixture_with_release_a_mutation(
+            prepared,
+            lambda attestation: collide_source_path(
+                attestation, digest=toolchain_binding["manifest_sha256"]
+            ),
+        ),
+    )
+    rejected(
+        "path_digest_conflict_rejected",
+        _fixture_with_release_a_mutation(
+            prepared,
+            lambda attestation: collide_source_path(
+                attestation, digest=authority(attestation)["source"]["manifest_sha256"]
+            ),
+        ),
+    )
+
+    approval = _detached(prepared.source_approval_value)
+    del approval["variants"]["C"]["current_lock_attempt"][
+        "semantic_input_authority"
+    ]
+    rejected(
+        "resolver_omission_rejected",
+        replace(prepared, source_approval_value=approval),
+    )
+    approval = _detached(prepared.source_approval_value)
+    approval["variants"]["C"]["lock_resolution"][
+        "passed_file_descriptors"
+    ] = 12
+    rejected(
+        "resolver_approval_review_divergence_rejected",
+        replace(prepared, source_approval_value=approval),
+    )
+    approval = _detached(prepared.source_approval_value)
+    approval["variants"]["A"]["current_lock_attempt"] = approval["variants"][
+        "C"
+    ]["current_lock_attempt"]
+    rejected(
+        "resolver_topology_rejected",
+        replace(prepared, source_approval_value=approval),
+    )
+
+    def legacy_root(attestation: dict[str, Any]) -> None:
+        attestation["build_argv"][1:1] = ["--ro-bind", "/", "/"]
+
+    rejected(
+        "legacy_root_bind_rejected",
+        _fixture_with_release_a_mutation(prepared, legacy_root),
+    )
+
+    def legacy_dev(attestation: dict[str, Any]) -> None:
+        attestation["build_argv"][1:1] = ["--dev", "/dev"]
+
+    rejected(
+        "legacy_dev_bind_rejected",
+        _fixture_with_release_a_mutation(prepared, legacy_dev),
+    )
+
+    def legacy_proc(attestation: dict[str, Any]) -> None:
+        attestation["build_argv"][1:1] = ["--proc", "/proc"]
+
+    rejected(
+        "legacy_proc_bind_rejected",
+        _fixture_with_release_a_mutation(prepared, legacy_proc),
+    )
+    rejected(
+        "legacy_rustup_home_rejected",
+        _fixture_with_release_a_mutation(
+            prepared,
+            lambda attestation: attestation["build_env"].__setitem__(
+                "RUSTUP_HOME", "/asterism/rustup-home"
+            ),
+        ),
+    )
+    def reorder_release_bindings(attestation: dict[str, Any]) -> None:
+        argv = attestation["build_argv"]
+        starts = [
+            index
+            for index, argument in enumerate(argv)
+            if argument in {"--ro-bind-fd", "--bind-fd"}
+        ]
+        first, second = starts[:2]
+        argv[first : first + 3], argv[second : second + 3] = (
+            argv[second : second + 3],
+            argv[first : first + 3],
+        )
+
+    rejected(
+        "release_bind_descriptor_order_rejected",
+        _fixture_with_release_a_mutation(prepared, reorder_release_bindings),
+    )
+
+    post_path = hostile / "post-start.json"
+    atomic_write(post_path, original_source.read_bytes(), mode=0o444)
+    post_prepared = _fixture_with_release_a_mutation(
+        prepared, lambda attestation: bind_release_source(attestation, post_path)
+    )
+    post_snapshots, _post_counts = retain_prepared_semantic_manifests(post_prepared)
+    try:
+        post_path.chmod(0o644)
+        post_path.write_bytes(b"{}\n")
+        try:
+            for snapshot in post_snapshots:
+                snapshot.verify()
+        except RunnerFailure as error:
+            checks["post_start_mutation_rejected"] = True
+            details["post_start_mutation_rejected"] = error.reason
+        else:
+            checks["post_start_mutation_rejected"] = False
+            details["post_start_mutation_rejected"] = "post-start chmod was accepted"
+    finally:
+        post_path.chmod(0o444)
+        for snapshot in post_snapshots:
+            snapshot.close()
+
+    initial_root = hostile / "initial-retention-transient"
+    initial_root.mkdir()
+    initial_ancestor = initial_root / "live"
+    initial_ancestor.mkdir()
+    initial_path = initial_ancestor / "manifest.json"
+    atomic_write(initial_path, original_source.read_bytes(), mode=0o444)
+    initial_away = initial_root / "away"
+    original_retained_read = globals()["_read_retained_file"]
+    initial_swapped = False
+
+    def initial_transient_swap_restore(descriptor: int) -> bytes:
+        nonlocal initial_swapped
+        payload = original_retained_read(descriptor)
+        if not initial_swapped:
+            initial_ancestor.rename(initial_away)
+            initial_away.rename(initial_ancestor)
+            initial_swapped = True
+        return payload
+
+    globals()["_read_retained_file"] = initial_transient_swap_restore
+    initial_snapshot: RetainedSemanticManifest | None = None
+    try:
+        initial_snapshot = _retain_semantic_manifest(
+            str(initial_path),
+            sha256(initial_path),
+            RECURSIVE_TREE_AUTHORITY_SCHEMA,
+            "hostile initial retention transient swap",
+        )
+    except RunnerFailure as error:
+        checks["initial_retention_transient_ancestor_swap_rejected"] = (
+            initial_swapped
+        )
+        details["initial_retention_transient_ancestor_swap_rejected"] = error.reason
+    else:
+        checks["initial_retention_transient_ancestor_swap_rejected"] = False
+        details["initial_retention_transient_ancestor_swap_rejected"] = (
+            "initial retention accepted transient ancestor rename-away/restore"
+        )
+    finally:
+        globals()["_read_retained_file"] = original_retained_read
+        if initial_snapshot is not None:
+            initial_snapshot.close()
+
+    ancestor_root = hostile / "ancestor-live"
+    ancestor_root.mkdir()
+    ancestor_path = ancestor_root / "manifest.json"
+    atomic_write(ancestor_path, original_source.read_bytes(), mode=0o444)
+    ancestor_snapshot = _retain_semantic_manifest(
+        str(ancestor_path),
+        sha256(ancestor_path),
+        RECURSIVE_TREE_AUTHORITY_SCHEMA,
+        "hostile ancestor swap",
+    )
+    ancestor_target = hostile / "ancestor-target"
+    ancestor_root.rename(ancestor_target)
+    ancestor_root.symlink_to(ancestor_target, target_is_directory=True)
+    try:
+        ancestor_snapshot.verify()
+    except RunnerFailure as error:
+        checks["ancestor_symlink_swap_rejected"] = True
+        details["ancestor_symlink_swap_rejected"] = error.reason
+    else:
+        checks["ancestor_symlink_swap_rejected"] = False
+        details["ancestor_symlink_swap_rejected"] = "ancestor symlink was followed"
+    finally:
+        ancestor_snapshot.close()
+
+    gap_root = hostile / "path-gap"
+    gap_root.mkdir()
+    gap_path = gap_root / "manifest.json"
+    gap_replacement = gap_root / "replacement.json"
+    gap_retired = gap_root / "retired.json"
+    gap_payload = original_source.read_bytes()
+    atomic_write(gap_path, gap_payload, mode=0o444)
+    atomic_write(gap_replacement, gap_payload, mode=0o444)
+    gap_snapshot = _retain_semantic_manifest(
+        str(gap_path),
+        sha256(gap_path),
+        RECURSIVE_TREE_AUTHORITY_SCHEMA,
+        "hostile path recheck gap",
+    )
+    original_retained_hash = globals()["_sha256_retained_file"]
+    swapped_during_hash = False
+
+    def swap_after_retained_hash(descriptor: int) -> str:
+        nonlocal swapped_during_hash
+        digest = original_retained_hash(descriptor)
+        if descriptor == gap_snapshot.descriptor and not swapped_during_hash:
+            gap_path.rename(gap_retired)
+            gap_replacement.rename(gap_path)
+            swapped_during_hash = True
+        return digest
+
+    globals()["_sha256_retained_file"] = swap_after_retained_hash
+    try:
+        gap_snapshot.verify()
+    except RunnerFailure as error:
+        checks["path_swap_during_recheck_rejected"] = swapped_during_hash
+        details["path_swap_during_recheck_rejected"] = error.reason
+    else:
+        checks["path_swap_during_recheck_rejected"] = False
+        details["path_swap_during_recheck_rejected"] = (
+            "post-hash lexical path replacement was accepted"
+        )
+    finally:
+        globals()["_sha256_retained_file"] = original_retained_hash
+        gap_snapshot.close()
+
+    transient_root = hostile / "transient-ancestor"
+    transient_root.mkdir()
+    transient_ancestor = transient_root / "live"
+    transient_ancestor.mkdir()
+    transient_path = transient_ancestor / "manifest.json"
+    atomic_write(transient_path, gap_payload, mode=0o444)
+    transient_snapshot = _retain_semantic_manifest(
+        str(transient_path),
+        sha256(transient_path),
+        RECURSIVE_TREE_AUTHORITY_SCHEMA,
+        "hostile transient ancestor swap",
+    )
+    transient_away = transient_root / "away"
+    original_retained_hash = globals()["_sha256_retained_file"]
+    transient_swapped = False
+
+    def transient_swap_restore_after_hash(descriptor: int) -> str:
+        nonlocal transient_swapped
+        digest = original_retained_hash(descriptor)
+        if descriptor == transient_snapshot.descriptor and not transient_swapped:
+            transient_ancestor.rename(transient_away)
+            transient_away.rename(transient_ancestor)
+            transient_swapped = True
+        return digest
+
+    globals()["_sha256_retained_file"] = transient_swap_restore_after_hash
+    try:
+        transient_snapshot.verify()
+    except RunnerFailure as error:
+        checks["transient_ancestor_swap_restore_rejected"] = transient_swapped
+        details["transient_ancestor_swap_restore_rejected"] = error.reason
+    else:
+        checks["transient_ancestor_swap_restore_rejected"] = False
+        details["transient_ancestor_swap_restore_rejected"] = (
+            "transient ancestor rename-away/restore was accepted"
+        )
+    finally:
+        globals()["_sha256_retained_file"] = original_retained_hash
+        transient_snapshot.close()
+
+    reviewed_root = hostile / "reviewed-transient"
+    reviewed_root.mkdir()
+    reviewed_ancestor = reviewed_root / "live"
+    reviewed_ancestor.mkdir()
+    reviewed_path = reviewed_ancestor / "authority.json"
+    atomic_json(reviewed_path, {"schema": "hostile-reviewed-authority-v1"})
+    reviewed_path.chmod(0o444)
+    reviewed_support = SupportFile(
+        "hostile-reviewed-authority",
+        reviewed_path,
+        sha256(reviewed_path),
+        0o444,
+    )
+    reviewed_away = reviewed_root / "away"
+    original_retained_read = globals()["_read_retained_file"]
+    reviewed_swapped = False
+
+    def reviewed_transient_swap_restore(descriptor: int) -> bytes:
+        nonlocal reviewed_swapped
+        payload = original_retained_read(descriptor)
+        if not reviewed_swapped:
+            reviewed_ancestor.rename(reviewed_away)
+            reviewed_away.rename(reviewed_ancestor)
+            reviewed_swapped = True
+        return payload
+
+    globals()["_read_retained_file"] = reviewed_transient_swap_restore
+    try:
+        _load_canonical_support_authority(
+            reviewed_support,
+            "hostile reviewed transient swap",
+        )
+    except RunnerFailure as error:
+        checks["reviewed_authority_transient_ancestor_swap_rejected"] = (
+            reviewed_swapped
+        )
+        details["reviewed_authority_transient_ancestor_swap_rejected"] = error.reason
+    else:
+        checks["reviewed_authority_transient_ancestor_swap_rejected"] = False
+        details["reviewed_authority_transient_ancestor_swap_rejected"] = (
+            "reviewed authority transient ancestor swap was accepted"
+        )
+    finally:
+        globals()["_read_retained_file"] = original_retained_read
+
+    constructor_snapshots: list[RetainedSemanticManifest] = []
+    constructor_secondary: list[str] = []
+    constructor_mutated_path: Path | None = None
+    constructor_original_payload: bytes | None = None
+
+    class FailingSemanticRunner(RebaselineRunner):
+        def _initialize_after_semantic_retention(self) -> None:
+            nonlocal constructor_mutated_path, constructor_original_payload
+            constructor_snapshots.extend(self.semantic_manifests)
+            constructor_mutated_path = self.semantic_manifests[0].path
+            constructor_original_payload = constructor_mutated_path.read_bytes()
+            constructor_mutated_path.chmod(0o644)
+            constructor_mutated_path.write_bytes(b"{}\n")
+            raise RunnerFailure("synthetic constructor failure")
+
+        def _report_secondary_failure(
+            self,
+            context: str,
+            error: BaseException,
+        ) -> None:
+            constructor_secondary.append(f"{context}: {error}")
+
+    try:
+        FailingSemanticRunner(
+            prepared,
+            root / "unused-constructor-output",
+            object(),  # type: ignore[arg-type]
+            scratch_root=root / "unused-constructor-scratch",
+        )
+    except RunnerFailure as error:
+        notes = list(getattr(error, "__notes__", ()))
+        checks["constructor_failure_closes_all_48"] = (
+            error.reason == "synthetic constructor failure"
+            and len(constructor_snapshots) == SEMANTIC_MANIFEST_TOTAL
+            and all(snapshot.descriptor == -1 for snapshot in constructor_snapshots)
+            and any("final verification" in note for note in notes)
+            and any("retained evidence" in item for item in constructor_secondary)
+        )
+        details["constructor_failure_closes_all_48"] = (
+            f"primary={error.reason!r} notes={notes!r} "
+            f"secondary={constructor_secondary!r}"
+        )
+    else:
+        checks["constructor_failure_closes_all_48"] = False
+        details["constructor_failure_closes_all_48"] = (
+            "synthetic constructor failure was not raised"
+        )
+    finally:
+        if constructor_mutated_path is not None and constructor_original_payload is not None:
+            constructor_mutated_path.write_bytes(constructor_original_payload)
+            constructor_mutated_path.chmod(0o444)
+
+    original_retain_manifest = globals()["_retain_semantic_manifest"]
+    partial_snapshots: list[RetainedSemanticManifest] = []
+    partial_original_payload: bytes | None = None
+    partial_calls = 0
+
+    def fail_after_mutating_partial_retention(
+        raw_path: Any,
+        expected_sha256: Any,
+        expected_schema: str,
+        context: str,
+    ) -> RetainedSemanticManifest:
+        nonlocal partial_calls, partial_original_payload
+        partial_calls += 1
+        if partial_calls == 2:
+            raise RunnerFailure("synthetic partial retention failure", exit_code=26)
+        snapshot = original_retain_manifest(
+            raw_path,
+            expected_sha256,
+            expected_schema,
+            context,
+        )
+        if partial_calls == 1:
+            partial_snapshots.append(snapshot)
+            partial_original_payload = snapshot.path.read_bytes()
+            snapshot.path.chmod(0o644)
+            snapshot.path.write_bytes(b"{}\n")
+        return snapshot
+
+    globals()["_retain_semantic_manifest"] = fail_after_mutating_partial_retention
+    try:
+        retain_prepared_semantic_manifests(prepared)
+    except RunnerFailure as error:
+        notes = list(getattr(error, "__notes__", ()))
+        checks["partial_retention_failure_final_verifies_and_closes"] = (
+            error.reason == "synthetic partial retention failure"
+            and error.exit_code == 26
+            and len(partial_snapshots) == 1
+            and partial_snapshots[0].descriptor == -1
+            and any("final verification" in note for note in notes)
+        )
+        details["partial_retention_failure_final_verifies_and_closes"] = (
+            f"primary={error.reason!r} exit={error.exit_code} notes={notes!r}"
+        )
+    else:
+        checks["partial_retention_failure_final_verifies_and_closes"] = False
+        details["partial_retention_failure_final_verifies_and_closes"] = (
+            "synthetic partial retention failure was accepted"
+        )
+    finally:
+        globals()["_retain_semantic_manifest"] = original_retain_manifest
+        if partial_snapshots and partial_original_payload is not None:
+            partial_snapshots[0].path.write_bytes(partial_original_payload)
+            partial_snapshots[0].path.chmod(0o444)
+            partial_snapshots[0].close()
+
+    early_output = root / "early-output-that-must-remain-absent"
+    publication_runner = object.__new__(RebaselineRunner)
+    publication_runner.output = early_output
+    publication_attempts: list[str] = []
+
+    def publication_failure(label: str) -> NoReturn:
+        publication_attempts.append(label)
+        raise OSError(f"synthetic {label} failure")
+
+    publication_runner.write_failure = lambda _failure: publication_failure("write")
+    publication_runner.release_lease = lambda _outcome: publication_failure("lease")
+    publication_runner.log = lambda _message: publication_failure("log")
+    publication_runner._report_secondary_failure = (
+        lambda context, _error: publication_attempts.append(f"reported:{context}")
+    )
+    publication_runner._emit_primary_failure = (
+        lambda failure: publication_attempts.append(f"fallback:{failure.reason}")
+    )
+    early_failure = RunnerFailure("synthetic early pre-output failure", exit_code=24)
+    early_code = publication_runner._publish_runner_failure(early_failure)
+    checks["early_pre_output_secondary_failures_preserve_primary"] = (
+        not early_output.exists()
+        and early_failure.reason == "synthetic early pre-output failure"
+        and early_failure.exit_code == 24
+        and early_code == 24
+        and publication_attempts
+        == [
+            "write",
+            "reported:failure artifact publication",
+            "lease",
+            "reported:inconclusive lease release",
+            "log",
+            "reported:failure log publication",
+            "fallback:synthetic early pre-output failure",
+        ]
+    )
+    details["early_pre_output_secondary_failures_preserve_primary"] = (
+        f"reason={early_failure.reason!r} exit={early_code} "
+        f"attempts={publication_attempts!r}"
+    )
+
+    close_path = hostile / "close-idempotence.json"
+    atomic_write(close_path, gap_payload, mode=0o444)
+    close_snapshot = _retain_semantic_manifest(
+        str(close_path),
+        sha256(close_path),
+        RECURSIVE_TREE_AUTHORITY_SCHEMA,
+        "hostile close failure",
+    )
+    close_descriptor = close_snapshot.descriptor
+    original_os_close = os.close
+    close_attempts = 0
+
+    def failing_os_close(descriptor: int) -> None:
+        nonlocal close_attempts
+        if descriptor == close_descriptor:
+            close_attempts += 1
+            raise OSError("synthetic close failure")
+        original_os_close(descriptor)
+
+    os.close = failing_os_close
+    first_close_failed = False
+    try:
+        try:
+            close_snapshot.close()
+        except OSError:
+            first_close_failed = True
+        close_snapshot.close()
+    finally:
+        os.close = original_os_close
+        original_os_close(close_descriptor)
+    checks["descriptor_close_invalidates_before_error"] = (
+        first_close_failed
+        and close_attempts == 1
+        and close_snapshot.descriptor == -1
+    )
+    details["descriptor_close_invalidates_before_error"] = (
+        f"first_failed={first_close_failed} attempts={close_attempts} "
+        f"descriptor={close_snapshot.descriptor}"
+    )
+
+    second_close_runner = object.__new__(RebaselineRunner)
+    secondary_cleanup: list[str] = []
+    second_close_runner._run_with_retained_semantic_authority = lambda: 25
+    second_close_runner.close_semantic_manifests = lambda: publication_failure(
+        "second-close"
+    )
+    second_close_runner._report_secondary_failure = (
+        lambda context, _error: secondary_cleanup.append(context)
+    )
+    second_close_code = second_close_runner.run()
+    checks["second_close_failure_does_not_override_exit"] = (
+        second_close_code == 25
+        and publication_attempts[-1] == "second-close"
+        and secondary_cleanup == ["final semantic cleanup"]
+    )
+    details["second_close_failure_does_not_override_exit"] = (
+        f"exit={second_close_code} cleanup={secondary_cleanup!r}"
+    )
+
+    boundary_snapshots, boundary_counts = retain_prepared_semantic_manifests(prepared)
+    original_source_payload = original_source.read_bytes()
+    original_source.chmod(0o644)
+    original_source.write_bytes(b"{}\n")
+    boundary_runner = object.__new__(RebaselineRunner)
+    boundary_runner.semantic_manifests = boundary_snapshots
+    boundary_runner.semantic_manifest_counts = boundary_counts
+    primary = RunnerFailure("synthetic primary failure", exit_code=23)
+    try:
+        combined = boundary_runner.finish_semantic_lifetime(primary)
+        checks["final_boundary_rechecks_closes_and_preserves_primary"] = (
+            isinstance(combined, RunnerFailure)
+            and "synthetic primary failure" in combined.reason
+            and "semantic lifetime boundary failed" in combined.reason
+            and combined.exit_code == 23
+            and all(snapshot.descriptor == -1 for snapshot in boundary_snapshots)
+        )
+        details["final_boundary_rechecks_closes_and_preserves_primary"] = (
+            combined.reason if combined is not None else "boundary failure was absent"
+        )
+    finally:
+        original_source.write_bytes(original_source_payload)
+        original_source.chmod(0o444)
+        for snapshot in boundary_snapshots:
+            snapshot.close()
+
+    current = _detached(
+        load_canonical_json(
+            prepared.source_review_files["current_children_attestation"].path
+        )
+    )
+    preserved_current = _detached(current)
+    preserved_build = preserved_current["builds"]["children"]
+    preserved_build["cargo_config_prebuild"] = _fixture_current_cargo_config(
+        (_fixture_preserved_cargo_home_directory("registry", 101),)
+    )
+    preserved_build["execution"]["passed_file_descriptors"] += 1
+    preserved_path = hostile / "current-preserved-cargo-home.json"
+    atomic_json(preserved_path, preserved_current)
+    preserved_path.chmod(0o444)
+    source_review_files = dict(prepared.source_review_files)
+    source_review_files["current_children_attestation"] = SupportFile(
+        "prepared-source-review-current_children_attestation",
+        preserved_path,
+        sha256(preserved_path),
+        0o444,
+    )
+    preserved_snapshots: list[RetainedSemanticManifest] = []
+    try:
+        preserved_snapshots, preserved_counts = retain_prepared_semantic_manifests(
+            replace(prepared, source_review_files=source_review_files)
+        )
+        checks["current_child_preserved_cargo_home_fd_count_accepted"] = (
+            preserved_counts == SEMANTIC_MANIFEST_COUNTS
+            and len(preserved_snapshots) == SEMANTIC_MANIFEST_TOTAL
+        )
+        details["current_child_preserved_cargo_home_fd_count_accepted"] = (
+            f"passed={preserved_build['execution']['passed_file_descriptors']}"
+        )
+    except RunnerFailure as error:
+        checks["current_child_preserved_cargo_home_fd_count_accepted"] = False
+        details["current_child_preserved_cargo_home_fd_count_accepted"] = error.reason
+    finally:
+        for snapshot in preserved_snapshots:
+            snapshot.close()
+
+    count_drift_current = _detached(current)
+    count_drift_current["builds"]["children"]["execution"][
+        "passed_file_descriptors"
+    ] += 1
+    count_drift_path = hostile / "current-passed-fd-count-drift.json"
+    atomic_json(count_drift_path, count_drift_current)
+    count_drift_path.chmod(0o444)
+    source_review_files = dict(prepared.source_review_files)
+    source_review_files["current_children_attestation"] = SupportFile(
+        "prepared-source-review-current_children_attestation",
+        count_drift_path,
+        sha256(count_drift_path),
+        0o444,
+    )
+    rejected(
+        "current_child_exact_passed_fd_count_rejected",
+        replace(prepared, source_review_files=source_review_files),
+    )
+
+    malformed_config_current = _detached(current)
+    malformed_config_current["builds"]["children"]["cargo_config_prebuild"][
+        "preserved_top_level_entries"
+    ]["cargo-home"] = {}
+    malformed_config_path = hostile / "current-malformed-cargo-config.json"
+    atomic_json(malformed_config_path, malformed_config_current)
+    malformed_config_path.chmod(0o444)
+    source_review_files = dict(prepared.source_review_files)
+    source_review_files["current_children_attestation"] = SupportFile(
+        "prepared-source-review-current_children_attestation",
+        malformed_config_path,
+        sha256(malformed_config_path),
+        0o444,
+    )
+    rejected(
+        "current_child_malformed_cargo_config_rejected",
+        replace(prepared, source_review_files=source_review_files),
+    )
+
+    current["schema"] = "bn-30fs-current-children-build-v1"
+    legacy_current_path = hostile / "legacy-current-children.json"
+    atomic_json(legacy_current_path, current)
+    legacy_current_path.chmod(0o444)
+    source_review_files = dict(prepared.source_review_files)
+    source_review_files["current_children_attestation"] = SupportFile(
+        "prepared-source-review-current_children_attestation",
+        legacy_current_path,
+        sha256(legacy_current_path),
+        0o444,
+    )
+    rejected(
+        "legacy_current_child_v1_rejected",
+        replace(prepared, source_review_files=source_review_files),
+    )
+    return checks, details
+
+
+def run_semantic_authority_self_test(root: Path) -> int:
+    if root.exists() or root.is_symlink():
+        print(f"refusing non-fresh semantic self-test directory {root}", file=sys.stderr)
+        return 2
+    root.mkdir(parents=True)
+    prepared = _fixture_prepared(root, Path(sys.executable).resolve())
+    checks, details = _semantic_authority_static_checks(root, prepared)
+    report = {
+        "schema": "bn-32de-runner-semantic-authority-self-test-v1",
+        "outcome": "SELF_TEST_PASS" if all(checks.values()) else "SELF_TEST_FAILED",
+        "checks": checks,
+        "details": details,
+        "check_count": len(checks),
+    }
+    atomic_json(root / "semantic-authority-self-test.json", report)
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0 if all(checks.values()) else 30
+
+
 def run_self_test(root: Path) -> int:
     if root.exists() or root.is_symlink():
         print(f"refusing non-fresh self-test directory {root}", file=sys.stderr)
@@ -8773,6 +11552,9 @@ def run_self_test(root: Path) -> int:
     _write_fake_child(fake_child)
     python = Path(sys.executable).resolve()
     prepared = _fixture_prepared(root, python)
+    semantic_checks, semantic_details = _semantic_authority_static_checks(
+        root, prepared
+    )
     manifest_authority_accepted = False
     manifest_digest_rejected = False
     manifest_shape_rejected = False
@@ -8829,6 +11611,8 @@ def run_self_test(root: Path) -> int:
     runner.runtime_home.mkdir(mode=0o700)
     checks: dict[str, bool] = {}
     details: dict[str, Any] = {}
+    checks.update(semantic_checks)
+    details.update(semantic_details)
 
     def comm_identities(name: str) -> set[tuple[int, int]]:
         identities: set[tuple[int, int]] = set()
@@ -11013,6 +13797,7 @@ def run_self_test(root: Path) -> int:
     finally:
         runner.output = original_output
 
+    runner.close_semantic_manifests()
     report = {
         "schema": "bn-2l3n-runner-self-test-v3",
         "protocol": PROTOCOL,
@@ -11040,6 +13825,21 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
+    if raw[:1] == ["--semantic-authority-self-test"]:
+        if len(raw) != 2:
+            print(
+                "usage: run_rebaseline.sh --semantic-authority-self-test <fresh-dir>",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            return run_semantic_authority_self_test(Path(raw[1]).resolve())
+        except BaseException as error:
+            print(
+                f"semantic authority self-test failed internally: {error}",
+                file=sys.stderr,
+            )
+            return 30
     if raw[:1] == ["--self-test"]:
         if len(raw) != 2:
             print("usage: run_rebaseline.sh --self-test <fresh-dir>", file=sys.stderr)

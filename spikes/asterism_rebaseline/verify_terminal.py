@@ -10,14 +10,16 @@ from __future__ import annotations
 
 import hashlib
 import fcntl
+import io
 import json
 import os
 import re
 import stat
 import sys
+import tarfile
 import tempfile
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
 import evidence_schema as schema
@@ -63,6 +65,12 @@ PRE_RELEASE_FIELDS = set(schema.TERMINAL_PRE_RELEASE_FIELDS)
 EVALUATOR_CHILD_FIELDS = set(schema.CHILD_FIELDS)
 RELEASE_FIELDS = set(schema.LEASE_RELEASE_FIELDS)
 TERMINAL_FIELDS = set(schema.TERMINAL_FIELDS)
+TERMINAL_RELEASE_ORDINARY_ATTESTATION_FIELDS = set(
+    schema.RELEASE_COMPILE_OUT_ORDINARY_ATTESTATION_FIELDS
+) | {"semantic_input_authority"}
+TERMINAL_RELEASE_OVERLAY_ATTESTATION_FIELDS = set(
+    schema.RELEASE_COMPILE_OUT_OVERLAY_ATTESTATION_FIELDS
+) | {"semantic_input_authority"}
 GUEST_ROOT = "/asterism"
 GUEST_SOURCE = f"{GUEST_ROOT}/source"
 GUEST_TARGET = f"{GUEST_ROOT}/target"
@@ -70,7 +78,7 @@ GUEST_TOOLCHAIN_ROOT = f"{GUEST_ROOT}/toolchain"
 GUEST_CARGO = f"{GUEST_TOOLCHAIN_ROOT}/bin/cargo"
 GUEST_RUSTC = f"{GUEST_TOOLCHAIN_ROOT}/bin/rustc"
 GUEST_CARGO_HOME = f"{GUEST_ROOT}/cargo-home"
-GUEST_RUSTUP_HOME = f"{GUEST_ROOT}/rustup-home"
+GUEST_RUSTUP_HOME = "/nonexistent"
 GUEST_BOUND_CONFIG_PATHS = (
     f"{GUEST_SOURCE}/.cargo/config.toml",
     f"{GUEST_SOURCE}/.cargo/config",
@@ -78,6 +86,155 @@ GUEST_BOUND_CONFIG_PATHS = (
     f"{GUEST_CARGO_HOME}/config",
 )
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
+CURRENT_CHILDREN_SCHEMA = "bn-ecm1-current-children-build-v2"
+SEMANTIC_INPUT_AUTHORITY_SCHEMA = "bn-ecm1-semantic-input-authority-v1"
+RECURSIVE_TREE_AUTHORITY_SCHEMA = "bn-ecm1-recursive-tree-authority-v1"
+TRUSTED_SYSTEM_CLOSURE_SCHEMA = "bn-ecm1-trusted-system-closure-v1"
+TRUSTED_SYSTEM_MOUNTS = (
+    (Path("/usr/bin"), "/usr/bin"),
+    (Path("/usr/lib"), "/usr/lib"),
+    (Path("/usr/include"), "/usr/include"),
+)
+SEMANTIC_INPUT_FIELDS = {
+    "cargo_home", "runtime_sha256", "schema", "source", "toolchain",
+    "trusted_system_closure",
+}
+SEMANTIC_TREE_FIELDS = {
+    "entry_count", "equal_pre_post", "manifest_path", "manifest_sha256",
+    "mutation_events_absent", "role", "schema", "watch_count",
+}
+SEMANTIC_CLOSURE_FIELDS = {
+    "entry_count", "manifest_path", "mounts", "mutation_events_absent",
+    "schema", "sha256", "watch_count",
+}
+SEMANTIC_MOUNT_FIELDS = {
+    "device", "gid", "guest_path", "host_path", "inode", "permissions",
+    "resolved_path", "trusted_root_owned_non_writable", "uid",
+}
+SEMANTIC_ENTRY_FIELDS = {
+    "changed_ns", "device", "file_type", "gid", "inode", "link_count",
+    "modified_ns", "path", "permissions", "sha256", "size",
+    "symlink_target", "symlink_scope", "uid",
+}
+SEMANTIC_RESOLUTION_FIELDS = {
+    "argv", "cargo_config_search", "cwd", "environment",
+    "execution_authority", "exit_status", "host_source_root", "lock_output",
+    "passed_file_descriptors", "resolver_kind", "semantic_input_authority",
+    "stderr", "stderr_sha256", "stdout", "stdout_sha256", "toolchain",
+}
+TOOLCHAIN_FIELDS = {
+    "bwrap_path", "bwrap_sha256", "cargo_home_path", "cargo_path",
+    "cargo_sha256", "cargo_version_verbose", "git_path", "git_sha256",
+    "rustc_path", "rustc_sha256", "rustc_version_verbose", "rustc_host",
+    "rustup_home_path", "rustup_path", "rustup_sha256", "rustup_toolchain",
+}
+CURRENT_BUILD_FIELDS = {
+    "argv", "environment", "execution", "filesystem_admission",
+    "cargo_config_prebuild", "cargo_config_postbuild", "execution_tools",
+    "artifacts", "binds", "lock_prebuild", "lock_postbuild",
+    "source_manifest_sha256", "semantic_input_authority",
+    "toolchain_manifest", "target", "target_was_absent",
+}
+CURRENT_CHILD_BUILD_FIELDS = CURRENT_BUILD_FIELDS | {
+    "wrapper_receipt", "wrapper_receipt_identity", "wrapper_receipt_sha256",
+    "wrapper_input_identity",
+}
+CURRENT_EXECUTION_FIELDS = {
+    "argv", "cwd", "environment", "execution_authority", "exit_status",
+    "passed_file_descriptors", "stderr_bytes", "stderr_sha256",
+    "stdout_bytes", "stdout_sha256",
+}
+CURRENT_FILE_IDENTITY_FIELDS = {
+    "bytes", "ctime_ns", "device", "inode", "link_count", "mode",
+    "mtime_ns", "path", "sha256", "size",
+}
+CURRENT_DIRECTORY_IDENTITY_FIELDS = {
+    "changed_ns", "device", "file_type", "inode", "link_count",
+    "modified_ns", "path", "permissions", "size",
+}
+CURRENT_TOOL_RECORD_FIELDS = {"identity", "path_chain", "trusted_system"}
+CURRENT_TRUSTED_CHAIN_FIELDS = {
+    "changed_ns", "device", "gid", "inode", "link_count", "mode",
+    "modified_ns", "path", "size", "type", "uid",
+}
+CURRENT_IMMUTABLE_FILE_FIELDS = {"identity", "mode", "path", "sha256", "size"}
+CURRENT_IMMUTABLE_IDENTITY_FIELDS = {
+    "changed_ns", "device", "inode", "link_count", "modified_ns",
+}
+CURRENT_CARGO_CONFIG_FIELDS = {
+    "cargo_home_tree", "cargo_search", "preserved_top_level_entries", "schema",
+}
+CURRENT_CARGO_HOME_TREE_FIELDS = {
+    "entry_count", "equal_pre_post", "path", "post_sha256", "pre_sha256",
+    "watch_count",
+}
+CURRENT_BUILD_BASE_ENV_FIELDS = {
+    "CARGO_HOME", "CARGO_INCREMENTAL", "CARGO_NET_OFFLINE",
+    "GIT_CONFIG_COUNT", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "HOME",
+    "LANG", "LC_ALL", "PATH", "PYTHONDONTWRITEBYTECODE",
+    "PYTHONNOUSERSITE", "RUSTC", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "TZ",
+}
+CURRENT_RELEASE_ENV_FIELDS = CURRENT_BUILD_BASE_ENV_FIELDS | {
+    "ASTERISM_BUILD_ADAPTER_SHA256", "ASTERISM_BUILD_BINARY_KIND",
+    "ASTERISM_BUILD_NONCE", "ASTERISM_BUILD_CARGO_LOCK_SHA256",
+    "ASTERISM_BUILD_PRODUCT_COMMIT", "ASTERISM_BUILD_PRODUCT_TREE",
+    "ASTERISM_BUILD_PROTOCOL", "ASTERISM_BUILD_PROTOCOL_SHA256",
+    "ASTERISM_BUILD_SHARED_MANIFEST_SHA256",
+    "ASTERISM_BUILD_SOURCE_APPROVAL_SHA256", "ASTERISM_BUILD_TIMED_SURFACE",
+    "ASTERISM_BUILD_TOOLING_COMMIT", "ASTERISM_BUILD_TOOLING_TREE",
+    "ASTERISM_BUILD_VARIANT",
+}
+CURRENT_CHILD_ENV_FIELDS = CURRENT_BUILD_BASE_ENV_FIELDS | {
+    "ASTERISM_FAULT_COMPILE_OUT_IDENTICAL",
+    "ASTERISM_FAULT_COMPILE_OUT_OVERLAY_RELEASE_SHA256",
+    "ASTERISM_FAULT_COMPILE_OUT_PRISTINE_SHA256",
+    "ASTERISM_FAULT_COMPILE_OUT_SCHEMA",
+    "ASTERISM_FAULT_COMPILE_OUT_SYMBOL_ABSENCE_SHA256",
+    "ASTERISM_REBASELINE_CHILD_BUILD_NONCE",
+    "ASTERISM_REBASELINE_EXPECTED_LIB_SOURCE",
+    "ASTERISM_REBASELINE_PINNED_RUSTC",
+    "ASTERISM_REBASELINE_WRAPPER_RECEIPT", "RUSTC_WORKSPACE_WRAPPER",
+}
+CURRENT_CHILDREN_FIELDS = {
+    "artifacts", "build_nonce", "builds", "cargo_config_authority",
+    "construction_path", "construction_sha256", "fault_authority", "inputs",
+    "lock_authority", "lock_authority_inputs", "lock_authority_validation",
+    "lock_candidates", "lock_manifest_sha256", "prebuild_filesystem_admissions",
+    "product_commit", "product_overlay_authority", "product_tree", "protocol",
+    "protocol_sha256", "release_compile_out", "release_compile_out_approval",
+    "review_bundle_sha256", "schema", "static_authority", "status", "toolchain",
+    "toolchain_identities", "tools_manifest_path", "tools_manifest_sha256",
+}
+CURRENT_SYSTEM_PYTHON = Path("/usr/bin/python3").resolve(strict=True)
+CURRENT_ADAPTER_DESTINATION = Path("crates/mess-store/examples/asterism_rebaseline_adapter.rs")
+CURRENT_SHARED_DESTINATION = Path("crates/mess-store/examples/asterism_rebaseline_shared")
+CURRENT_SHARED_NAMES = (
+    "allocation.rs", "contract.rs", "control.rs", "digest.rs", "schema.rs",
+    "semantic_oracle.rs", "timing.rs", "workload.rs",
+)
+CURRENT_CONSTRUCTION_SCHEMA = "bn-30fs-current-children-construction-v1"
+CURRENT_ENGINE_PATH = PurePosixPath("crates/mess-store/src/engine.rs")
+CURRENT_ENGINE_SHA256 = (
+    "c995c27d8fff3e1ddfffdb700dfc94160a99ea0c7fe731017d3f1db99d7b59e7"
+)
+CURRENT_CHILD_PLACEHOLDER_BINDINGS = {
+    "correctness": {
+        "comm": "ast-rb-check",
+        "executable_mode": 0o555,
+        "path": "/asterism/preapproval-placeholder/ast-rb-check",
+        "sha256": (
+            "a48e573b0cbd89a11ece523fbc79e7d6a54aa42fa417e913f70861c0846ed3d6"
+        ),
+    },
+    "fault": {
+        "comm": "ast-rb-fault",
+        "executable_mode": 0o555,
+        "path": "/asterism/preapproval-placeholder/ast-rb-fault",
+        "sha256": (
+            "a9826b2a400813f9c0ab0b9a8e6998c2c40bf3fc6bee07495552e6d23a7c8367"
+        ),
+    },
+}
 _BOUND_SNAPSHOTS: dict[Path, schema.FileSnapshot] = {}
 
 
@@ -234,6 +391,2593 @@ def terminal_is_integer(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def _terminal_semantic_exact(
+    value: Any, fields: set[str], context: str
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != fields:
+        raise ValueError(f"{context} fields are not exact")
+    return value
+
+
+def _terminal_semantic_metadata_equal(
+    left: os.stat_result, right: os.stat_result
+) -> bool:
+    return all(
+        getattr(left, field) == getattr(right, field)
+        for field in (
+            "st_dev", "st_ino", "st_mode", "st_nlink", "st_uid", "st_gid",
+            "st_size", "st_mtime_ns", "st_ctime_ns",
+        )
+    )
+
+
+def _terminal_semantic_entry(
+    metadata: os.stat_result,
+    relative: str,
+    kind: str,
+    digest: str | None,
+    target: str | None,
+    scope: str | None,
+    volatile: frozenset[str],
+) -> dict[str, Any]:
+    value = {
+        "changed_ns": metadata.st_ctime_ns,
+        "device": metadata.st_dev,
+        "file_type": kind,
+        "gid": metadata.st_gid,
+        "inode": metadata.st_ino,
+        "link_count": metadata.st_nlink,
+        "modified_ns": metadata.st_mtime_ns,
+        "path": relative,
+        "permissions": stat.S_IMODE(metadata.st_mode),
+        "sha256": digest,
+        "size": metadata.st_size,
+        "symlink_target": target,
+        "symlink_scope": scope,
+        "uid": metadata.st_uid,
+    }
+    if kind == "directory" and relative in volatile:
+        for field in ("changed_ns", "modified_ns", "permissions", "size"):
+            value[field] = 0
+    return value
+
+
+def _terminal_system_symlink_scope(root: Path, relative: str, target: str) -> str:
+    rendered = os.path.normpath(
+        str(
+            PurePosixPath(target)
+            if PurePosixPath(target).is_absolute()
+            else PurePosixPath(str(root)) / PurePosixPath(relative).parent / target
+        )
+    )
+    for alias, destination in (
+        ("/bin", "/usr/bin"), ("/lib", "/usr/lib"), ("/lib64", "/usr/lib"),
+    ):
+        if rendered == alias or rendered.startswith(alias + "/"):
+            rendered = destination + rendered.removeprefix(alias)
+            break
+    if any(
+        rendered == guest or rendered.startswith(guest + "/")
+        for _host, guest in TRUSTED_SYSTEM_MOUNTS
+    ):
+        return "within_closure"
+    if any(
+        rendered == root_path or rendered.startswith(root_path + "/")
+        for root_path in ("/asterism", "/dev", "/proc", "/run", "/sys", "/tmp")
+    ):
+        raise ValueError("terminal system symlink reaches mutable guest authority")
+    return "guest_inaccessible_external"
+
+
+def terminal_sample_semantic_tree(
+    root: Path,
+    role: str,
+    context: str,
+    *,
+    allow_symlinks: bool,
+    hash_contents: bool,
+    trusted_system: bool = False,
+    excluded: frozenset[str] = frozenset(),
+    volatile: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
+    """Terminal-local no-follow recursive semantic sampler."""
+
+    lexical = Path(os.path.abspath(os.fspath(root)))
+    resolved = lexical.resolve(strict=True)
+    if lexical != resolved:
+        raise ValueError(f"{context} root is not canonical")
+    dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    root_fd = os.open(resolved, dir_flags)
+    try:
+        entries: list[dict[str, Any]] = []
+
+        def walk(fd: int, relative: str) -> None:
+            before = os.fstat(fd)
+            candidate_dir = resolved if relative == "." else resolved / relative
+            if not stat.S_ISDIR(before.st_mode):
+                raise ValueError(f"{context} directory type changed")
+            if trusted_system and (
+                before.st_uid != 0
+                or stat.S_IMODE(before.st_mode) & 0o022
+                or os.access(candidate_dir, os.W_OK)
+            ):
+                raise ValueError(f"{context} trusted directory is writable")
+            entries.append(
+                _terminal_semantic_entry(
+                    before, relative, "directory", None, None, None, volatile
+                )
+            )
+            names = sorted(os.listdir(fd))
+            if len(names) != len(set(names)):
+                raise ValueError(f"{context} names alias")
+            for name in names:
+                child_relative = name if relative == "." else f"{relative}/{name}"
+                if child_relative in excluded:
+                    continue
+                selected = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                candidate = resolved / child_relative
+                if stat.S_ISDIR(selected.st_mode):
+                    child = os.open(name, dir_flags, dir_fd=fd)
+                    try:
+                        if not _terminal_semantic_metadata_equal(selected, os.fstat(child)):
+                            raise ValueError(f"{context} directory selection changed")
+                        walk(child, child_relative)
+                    finally:
+                        os.close(child)
+                elif stat.S_ISREG(selected.st_mode):
+                    child = os.open(name, file_flags, dir_fd=fd)
+                    try:
+                        opened = os.fstat(child)
+                        if not _terminal_semantic_metadata_equal(selected, opened):
+                            raise ValueError(f"{context} file selection changed")
+                        digest = hashlib.sha256()
+                        size = 0
+                        while True:
+                            chunk = os.read(child, 1024 * 1024)
+                            if not chunk:
+                                break
+                            size += len(chunk)
+                            if hash_contents:
+                                digest.update(chunk)
+                        after = os.fstat(child)
+                    finally:
+                        os.close(child)
+                    if size != opened.st_size or not _terminal_semantic_metadata_equal(
+                        opened, after
+                    ):
+                        raise ValueError(f"{context} file changed")
+                    if trusted_system and (
+                        opened.st_uid != 0
+                        or stat.S_IMODE(opened.st_mode) & 0o022
+                        or os.access(candidate, os.W_OK)
+                    ):
+                        raise ValueError(f"{context} trusted file is writable")
+                    entries.append(
+                        _terminal_semantic_entry(
+                            opened,
+                            child_relative,
+                            "regular",
+                            digest.hexdigest() if hash_contents else None,
+                            None,
+                            None,
+                            volatile,
+                        )
+                    )
+                elif stat.S_ISLNK(selected.st_mode):
+                    if not allow_symlinks:
+                        raise ValueError(f"{context} contains a symlink")
+                    target = os.readlink(name, dir_fd=fd)
+                    if not _terminal_semantic_metadata_equal(
+                        selected, os.stat(name, dir_fd=fd, follow_symlinks=False)
+                    ):
+                        raise ValueError(f"{context} symlink changed")
+                    if trusted_system and selected.st_uid != 0:
+                        raise ValueError(f"{context} trusted symlink is not root-owned")
+                    target_path = candidate.parent.joinpath(target).resolve(strict=True)
+                    if trusted_system:
+                        scope = _terminal_system_symlink_scope(
+                            resolved, child_relative, target
+                        )
+                    else:
+                        if target_path != resolved and resolved not in target_path.parents:
+                            raise ValueError(f"{context} symlink escapes root")
+                        scope = "within_root"
+                    entries.append(
+                        _terminal_semantic_entry(
+                            selected,
+                            child_relative,
+                            "symlink",
+                            hashlib.sha256(os.fsencode(target)).hexdigest(),
+                            target,
+                            scope,
+                            volatile,
+                        )
+                    )
+                else:
+                    raise ValueError(f"{context} unsupported file type")
+            if not _terminal_semantic_metadata_equal(before, os.fstat(fd)):
+                raise ValueError(f"{context} directory changed")
+
+        walk(root_fd, ".")
+        return {"entries": entries, "role": role, "schema": RECURSIVE_TREE_AUTHORITY_SCHEMA}
+    finally:
+        os.close(root_fd)
+
+
+class TerminalSemanticReplay:
+    """Terminal's independent semantic-manifest and runtime ledger."""
+
+    def __init__(self, errors: list[str], *, live_system: bool) -> None:
+        self.errors = errors
+        self.live_system = live_system
+        self.paths: set[str] = set()
+        self.identities: set[tuple[int, int]] = set()
+        self.authorities: set[tuple[str, ...]] = set()
+        self.runtimes: set[str] = set()
+        self.cache: dict[tuple[Any, ...], Mapping[str, Any]] = {}
+
+    @staticmethod
+    def roots(source: Path, toolchain: Any, context: str) -> dict[str, Path]:
+        if not isinstance(toolchain, Mapping):
+            raise ValueError(f"{context} toolchain is absent")
+        values = [toolchain.get(name) for name in ("cargo_path", "rustc_path", "cargo_home_path")]
+        if not all(isinstance(value, str) for value in values):
+            raise ValueError(f"{context} toolchain paths differ")
+        source_root = Path(os.path.abspath(os.fspath(source))).resolve(strict=True)
+        cargo = Path(os.path.abspath(values[0])).resolve(strict=True)
+        rustc = Path(os.path.abspath(values[1])).resolve(strict=True)
+        cargo_home = Path(os.path.abspath(values[2])).resolve(strict=True)
+        toolchain_root = cargo.parent.parent
+        if rustc.parent.parent != toolchain_root:
+            raise ValueError(f"{context} Cargo/rustc roots differ")
+        return {"source": source_root, "toolchain": toolchain_root, "cargo_home": cargo_home}
+
+    def _validate_tree(
+        self, value: Any, role: str, context: str, *, trusted: bool
+    ) -> Mapping[str, Any]:
+        manifest = _terminal_semantic_exact(
+            value, {"entries", "role", "schema"}, f"{context} manifest"
+        )
+        entries = manifest["entries"]
+        if (
+            manifest["schema"] != RECURSIVE_TREE_AUTHORITY_SCHEMA
+            or manifest["role"] != role
+            or not isinstance(entries, list)
+            or not entries
+        ):
+            raise ValueError(f"{context} manifest identity differs")
+        paths: list[str] = []
+        for index, raw in enumerate(entries):
+            entry = _terminal_semantic_exact(
+                raw, SEMANTIC_ENTRY_FIELDS, f"{context} entry {index}"
+            )
+            relative = entry["path"]
+            parsed = PurePosixPath(relative) if isinstance(relative, str) else None
+            if (
+                parsed is None
+                or (relative != "." and (
+                    parsed.is_absolute() or str(parsed) != relative
+                    or "." in parsed.parts or ".." in parsed.parts
+                ))
+                or (index == 0) != (relative == ".")
+                or relative in paths
+            ):
+                raise ValueError(f"{context} path differs")
+            paths.append(relative)
+            kind = entry["file_type"]
+            integer_fields = (
+                "changed_ns", "device", "gid", "inode", "link_count",
+                "modified_ns", "permissions", "size", "uid",
+            )
+            if kind not in {"directory", "regular", "symlink"} or any(
+                not terminal_is_integer(entry[field]) for field in integer_fields
+            ):
+                raise ValueError(f"{context} metadata differs")
+            if kind == "directory":
+                if any(entry[field] is not None for field in ("sha256", "symlink_target", "symlink_scope")):
+                    raise ValueError(f"{context} directory digest differs")
+            elif kind == "regular":
+                digest_valid = entry["sha256"] is None if trusted else terminal_is_sha256(entry["sha256"])
+                if not digest_valid or entry["symlink_target"] is not None or entry["symlink_scope"] is not None:
+                    raise ValueError(f"{context} regular digest differs")
+            else:
+                scopes = {"within_closure", "guest_inaccessible_external"} if trusted else {"within_root"}
+                if not isinstance(entry["symlink_target"], str) or not terminal_is_sha256(entry["sha256"]) or entry["symlink_scope"] not in scopes:
+                    raise ValueError(f"{context} symlink authority differs")
+            if trusted and (entry["uid"] != 0 or (kind != "symlink" and entry["permissions"] & 0o022)):
+                raise ValueError(f"{context} trusted policy differs")
+        if paths != sorted(paths, key=lambda item: (item != ".", item)):
+            raise ValueError(f"{context} path order differs")
+        return manifest
+
+    def _sample(
+        self, root: Path, role: str, context: str, *, name: str, source_role: str, trusted: bool
+    ) -> Mapping[str, Any]:
+        excluded = frozenset({"Cargo.lock"}) if name == "source" and source_role == "resolution_source_without_cargo_lock" else frozenset()
+        volatile = frozenset({"."}) if excluded else frozenset()
+        key = (str(root), role, name, source_role, trusted)
+        observed = self.cache.get(key)
+        if observed is None:
+            options = {
+                "allow_symlinks": name != "source",
+                "hash_contents": not trusted,
+                "trusted_system": trusted,
+                "excluded": excluded,
+                "volatile": volatile,
+            }
+            first = terminal_sample_semantic_tree(root, role, context, **options)
+            second = terminal_sample_semantic_tree(root, role, context, **options)
+            if first != second:
+                raise ValueError(f"{context} changed across replay")
+            observed = first
+            self.cache[key] = observed
+        return observed
+
+    def validate(
+        self,
+        value: Any,
+        context: str,
+        *,
+        roots: Mapping[str, Path],
+        source_role: str = "source",
+    ) -> str:
+        authority = _terminal_semantic_exact(
+            value, SEMANTIC_INPUT_FIELDS, f"{context} authority"
+        )
+        if authority["schema"] != SEMANTIC_INPUT_AUTHORITY_SCHEMA:
+            raise ValueError(f"{context} authority schema differs")
+        authority_paths: list[str] = []
+        authority_identities: set[tuple[int, int]] = set()
+        for name, role in (("source", source_role), ("toolchain", "toolchain"), ("cargo_home", "cargo_home")):
+            binding = _terminal_semantic_exact(
+                authority[name], SEMANTIC_TREE_FIELDS, f"{context} {name} binding"
+            )
+            path = binding["manifest_path"]
+            if (
+                binding["schema"] != RECURSIVE_TREE_AUTHORITY_SCHEMA
+                or binding["role"] != role
+                or not isinstance(path, str)
+                or not Path(path).is_absolute()
+                or not terminal_is_sha256(binding["manifest_sha256"])
+                or not terminal_is_integer(binding["entry_count"])
+                or binding["entry_count"] < 1
+                or not terminal_is_integer(binding["watch_count"])
+                or binding["watch_count"] < 1
+                or binding["equal_pre_post"] is not True
+                or binding["mutation_events_absent"] is not True
+            ):
+                raise ValueError(f"{context} {name} binding differs")
+            snapshot = schema.snapshot_regular_file(Path(path), expected_mode=0o444)
+            identity = (snapshot.device, snapshot.inode)
+            if snapshot._stat.st_nlink != 1 or identity in authority_identities:
+                raise ValueError(f"{context} manifest identity aliases")
+            authority_identities.add(identity)
+            manifest = self._validate_tree(
+                schema.parse_canonical_json_object(snapshot.data, f"{context} {name}"),
+                role, f"{context} {name}", trusted=False,
+            )
+            entries = manifest["entries"]
+            if (
+                snapshot.sha256 != binding["manifest_sha256"]
+                or len(entries) != binding["entry_count"]
+                or sum(entry["file_type"] == "directory" for entry in entries) != binding["watch_count"]
+                or canonical_json_bytes(self._sample(roots[name], role, f"{context} live {name}", name=name, source_role=source_role, trusted=False)) != snapshot.data
+            ):
+                raise ValueError(f"{context} {name} live manifest differs")
+            authority_paths.append(path)
+        closure = _terminal_semantic_exact(
+            authority["trusted_system_closure"], SEMANTIC_CLOSURE_FIELDS,
+            f"{context} closure",
+        )
+        mounts = closure["mounts"]
+        if (
+            closure["schema"] != TRUSTED_SYSTEM_CLOSURE_SCHEMA
+            or not isinstance(closure["manifest_path"], str)
+            or not Path(closure["manifest_path"]).is_absolute()
+            or not terminal_is_sha256(closure["sha256"])
+            or not terminal_is_integer(closure["entry_count"])
+            or closure["entry_count"] < 3
+            or not terminal_is_integer(closure["watch_count"])
+            or closure["watch_count"] < 3
+            or closure["mutation_events_absent"] is not True
+            or not isinstance(mounts, list)
+            or len(mounts) != 3
+        ):
+            raise ValueError(f"{context} closure differs")
+        checked = []
+        for raw, (host, guest) in zip(mounts, TRUSTED_SYSTEM_MOUNTS, strict=True):
+            mount = _terminal_semantic_exact(raw, SEMANTIC_MOUNT_FIELDS, f"{context} mount")
+            if (
+                mount["host_path"] != str(host) or mount["resolved_path"] != str(host)
+                or mount["guest_path"] != guest or mount["trusted_root_owned_non_writable"] is not True
+                or mount["uid"] != 0 or any(not terminal_is_integer(mount[field]) for field in ("device", "gid", "inode", "permissions", "uid"))
+                or mount["permissions"] & 0o022
+            ):
+                raise ValueError(f"{context} mount differs")
+            checked.append(mount)
+        closure_snapshot = schema.snapshot_regular_file(Path(closure["manifest_path"]), expected_mode=0o444)
+        closure_identity = (closure_snapshot.device, closure_snapshot.inode)
+        if closure_snapshot._stat.st_nlink != 1 or closure_identity in authority_identities:
+            raise ValueError(f"{context} manifest identity aliases")
+        authority_identities.add(closure_identity)
+        closure_manifest = _terminal_semantic_exact(
+            schema.parse_canonical_json_object(closure_snapshot.data, f"{context} closure manifest"),
+            {"mounts", "schema"}, f"{context} closure manifest",
+        )
+        evidence_mounts = closure_manifest["mounts"]
+        if closure_manifest["schema"] != TRUSTED_SYSTEM_CLOSURE_SCHEMA or closure_snapshot.sha256 != closure["sha256"] or not isinstance(evidence_mounts, list) or len(evidence_mounts) != 3:
+            raise ValueError(f"{context} closure evidence differs")
+        entries_total = watches_total = 0
+        for raw, (host, guest), binding in zip(evidence_mounts, TRUSTED_SYSTEM_MOUNTS, checked, strict=True):
+            evidence = _terminal_semantic_exact(raw, {"guest_path", "host_path", "resolved_path", "tree"}, f"{context} evidence mount")
+            if evidence["guest_path"] != guest or evidence["host_path"] != str(host) or evidence["resolved_path"] != str(host):
+                raise ValueError(f"{context} evidence path differs")
+            role = "system-" + guest.removeprefix("/").replace("/", "-")
+            tree = self._validate_tree(evidence["tree"], role, f"{context} {role}", trusted=True)
+            root_entry = tree["entries"][0]
+            if any(binding[field] != root_entry[field] for field in ("device", "gid", "inode", "permissions", "uid")):
+                raise ValueError(f"{context} root binding differs")
+            entries_total += len(tree["entries"])
+            watches_total += sum(entry["file_type"] == "directory" for entry in tree["entries"])
+            if self.live_system and self._sample(host, role, f"{context} live {role}", name="trusted_system", source_role=source_role, trusted=True) != tree:
+                raise ValueError(f"{context} live system tree differs")
+        if entries_total != closure["entry_count"] or watches_total != closure["watch_count"]:
+            raise ValueError(f"{context} closure counts differ")
+        authority_paths.append(closure["manifest_path"])
+        if len(set(authority_paths)) != 4:
+            raise ValueError(f"{context} manifest files alias")
+        tree_fields = ("schema", "role", "manifest_sha256", "entry_count", "watch_count", "equal_pre_post", "mutation_events_absent")
+        closure_fields = ("schema", "sha256", "entry_count", "mounts", "watch_count", "mutation_events_absent")
+        normalized = {
+            "cargo_home": {field: authority["cargo_home"][field] for field in tree_fields},
+            "schema": SEMANTIC_INPUT_AUTHORITY_SCHEMA,
+            "toolchain": {field: authority["toolchain"][field] for field in tree_fields},
+            "trusted_system_closure": {field: closure[field] for field in closure_fields},
+        }
+        runtime = hashlib.sha256(canonical_json_bytes(normalized)).hexdigest()
+        if authority["runtime_sha256"] != runtime:
+            raise ValueError(f"{context} runtime differs")
+        if authority_identities & self.identities:
+            raise ValueError(f"{context} manifest files alias")
+        self.paths.update(authority_paths)
+        self.identities.update(authority_identities)
+        self.authorities.add(tuple(sorted(authority_paths)))
+        self.runtimes.add(runtime)
+        return runtime
+
+    def capture(self, context: str, action: Any) -> Any | None:
+        try:
+            return action()
+        except Exception as error:
+            self.errors.append(f"{context}: {error}")
+            return None
+
+    def finalize(self) -> None:
+        if len(self.authorities) != 12 or len(self.paths) != 48 or len(self.identities) != 48:
+            self.errors.append(
+                f"terminal semantic topology differs; authorities={len(self.authorities)} "
+                f"manifests={len(self.paths)} identities={len(self.identities)}"
+            )
+        if len(self.runtimes) != 1:
+            self.errors.append(f"terminal semantic runtimes differ; observed={sorted(self.runtimes)}")
+
+
+def terminal_frozen_cargo_environment(toolchain: Mapping[str, Any]) -> dict[str, str]:
+    required = ("cargo_path", "rustc_path", "cargo_home_path", "rustup_home_path", "rustup_toolchain")
+    if not all(isinstance(toolchain.get(field), str) and toolchain[field] for field in required):
+        raise ValueError("terminal semantic toolchain environment differs")
+    path = ":".join(dict.fromkeys((
+        str(Path(toolchain["cargo_path"]).parent),
+        str(Path(toolchain["rustc_path"]).parent),
+        "/usr/bin", "/bin",
+    )))
+    return {
+        "CARGO_HOME": toolchain["cargo_home_path"], "CARGO_INCREMENTAL": "0",
+        "CARGO_NET_OFFLINE": "true", "GIT_CONFIG_COUNT": "0",
+        "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
+        "HOME": "/nonexistent", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
+        "PATH": path, "RUSTC": toolchain["rustc_path"],
+        "RUSTUP_HOME": toolchain["rustup_home_path"],
+        "RUSTUP_TOOLCHAIN": toolchain["rustup_toolchain"], "TZ": "UTC",
+    }
+
+
+def terminal_sandboxed_cargo_environment(toolchain: Mapping[str, Any]) -> dict[str, str]:
+    value = terminal_frozen_cargo_environment(toolchain)
+    value.update({
+        "CARGO_HOME": GUEST_CARGO_HOME,
+        "GIT_CONFIG_GLOBAL": f"{GUEST_ROOT}/absent-gitconfig",
+        "PATH": f"{GUEST_TOOLCHAIN_ROOT}/bin:/usr/bin:/bin",
+        "RUSTC": GUEST_RUSTC,
+        "RUSTUP_HOME": GUEST_RUSTUP_HOME,
+    })
+    return value
+
+
+def validate_terminal_resolution_argv(
+    argv: Any,
+    toolchain: Mapping[str, Any],
+    cargo_arguments: list[str],
+    context: str,
+) -> None:
+    if not isinstance(argv, list) or any(not isinstance(item, str) for item in argv):
+        raise ValueError(f"{context} argv differs")
+    prefix = [toolchain.get("bwrap_path"), "--die-with-parent", "--new-session", "--unshare-net", "--dir", "/usr"]
+    system = tuple(("--ro-bind-fd", guest) for _host, guest in TRUSTED_SYSTEM_MOUNTS)
+    after_system = [
+        "--symlink", "usr/bin", "/bin", "--symlink", "usr/lib", "/lib",
+        "--symlink", "usr/lib", "/lib64", "--dir", "/dev", "--dir", "/proc",
+        "--tmpfs", "/tmp", "--tmpfs", GUEST_ROOT,
+    ]
+    core = (
+        ("--bind-fd", GUEST_SOURCE), ("--ro-bind-fd", GUEST_TOOLCHAIN_ROOT),
+        ("--ro-bind-fd", GUEST_CARGO), ("--ro-bind-fd", GUEST_RUSTC),
+        ("--ro-bind-fd", GUEST_CARGO_HOME),
+    )
+    config = tuple(("--ro-bind-fd", path) for path in GUEST_BOUND_CONFIG_PATHS)
+    after_core = [
+        "--dir", f"{GUEST_ROOT}/.cargo", "--tmpfs", f"{GUEST_ROOT}/.cargo",
+        "--remount-ro", f"{GUEST_ROOT}/.cargo", "--dir", "/.cargo", "--tmpfs",
+        "/.cargo", "--remount-ro", "/.cargo", "--dir", f"{GUEST_SOURCE}/.cargo",
+        "--tmpfs", f"{GUEST_SOURCE}/.cargo",
+    ]
+    source_remount = ["--remount-ro", f"{GUEST_SOURCE}/.cargo"]
+    home_remount = ["--remount-ro", GUEST_CARGO_HOME]
+    suffix = ["--chdir", GUEST_SOURCE, GUEST_CARGO, *cargo_arguments]
+    if argv[: len(prefix)] != prefix:
+        raise ValueError(f"{context} prefix differs")
+    descriptors: list[str] = []
+    offset = len(prefix)
+
+    def consume(bindings: Any) -> None:
+        nonlocal offset
+        for operation, destination in bindings:
+            segment = argv[offset : offset + 3]
+            descriptor = segment[1] if len(segment) == 3 else ""
+            if (
+                len(segment) != 3 or segment[0] != operation or segment[2] != destination
+                or not descriptor.isascii() or not descriptor.isdecimal()
+                or len(descriptor) > 10 or str(int(descriptor)) != descriptor
+                or int(descriptor) < 3
+            ):
+                raise ValueError(f"{context} descriptor binding differs")
+            descriptors.append(descriptor)
+            offset += 3
+
+    consume(system)
+    if argv[offset : offset + len(after_system)] != after_system:
+        raise ValueError(f"{context} private namespace differs")
+    offset += len(after_system)
+    consume(core)
+    if argv[offset : offset + len(after_core)] != after_core:
+        raise ValueError(f"{context} private config roots differ")
+    offset += len(after_core)
+    consume(config[:2])
+    if argv[offset : offset + len(source_remount)] != source_remount:
+        raise ValueError(f"{context} source config remount differs")
+    offset += len(source_remount)
+    consume(config[2:])
+    if argv[offset : offset + len(home_remount)] != home_remount:
+        raise ValueError(f"{context} Cargo-home remount differs")
+    offset += len(home_remount)
+    if len(descriptors) != 12 or len(set(descriptors)) != 12 or argv[offset:] != suffix:
+        raise ValueError(f"{context} descriptors/command differ")
+
+
+def _terminal_validate_verbose_probe(
+    value: Any, *, executable: str, host: Any, context: str
+) -> None:
+    # The producer retains stripped stdout verbatim. Cargo's payload is opaque;
+    # rustc additionally guarantees exactly one nonempty host line. Exact
+    # stored strings are bound to the independently reviewed lock toolchain.
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or not isinstance(host, str)
+        or not host
+        or any(character.isspace() for character in host)
+    ):
+        raise ValueError(f"{context} differs")
+    host_lines = [
+        line.removeprefix("host: ")
+        for line in value.splitlines()
+        if line.startswith("host: ")
+    ]
+    if executable == "rustc" and host_lines != [host]:
+        raise ValueError(f"{context} differs")
+
+
+def terminal_validate_toolchain(value: Any, context: str) -> Mapping[str, Any]:
+    toolchain = _terminal_semantic_exact(value, TOOLCHAIN_FIELDS, context)
+    resolved: dict[str, Path] = {}
+    for path_field, digest_field in (
+        ("bwrap_path", "bwrap_sha256"), ("cargo_path", "cargo_sha256"),
+        ("git_path", "git_sha256"), ("rustc_path", "rustc_sha256"),
+        ("rustup_path", "rustup_sha256"),
+    ):
+        raw = toolchain[path_field]
+        if not isinstance(raw, str) or not Path(raw).is_absolute() or not terminal_is_sha256(toolchain[digest_field]):
+            raise ValueError(f"{context} {path_field} binding differs")
+        path = Path(raw).resolve(strict=True)
+        metadata = path.lstat()
+        if raw != str(path) or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_mode & 0o111 == 0 or sha256_file(path) != toolchain[digest_field]:
+            raise ValueError(f"{context} {path_field} live identity differs")
+        resolved[path_field] = path
+    identities = [
+        (path.stat().st_dev, path.stat().st_ino) for path in resolved.values()
+    ]
+    if (
+        len(set(resolved.values())) != len(resolved)
+        or len(set(identities)) != len(identities)
+    ):
+        raise ValueError(f"{context} executable paths physically alias")
+    for field in ("cargo_home_path", "rustup_home_path"):
+        raw = toolchain[field]
+        if not isinstance(raw, str) or not Path(raw).is_absolute():
+            raise ValueError(f"{context} {field} differs")
+        path = Path(raw).resolve(strict=True)
+        metadata = path.lstat()
+        if (
+            raw != str(path)
+            or not stat.S_ISDIR(metadata.st_mode)
+            or path.resolve(strict=True) != path
+        ):
+            raise ValueError(f"{context} {field} live root differs")
+    rustc_host = toolchain["rustc_host"]
+    rustup_toolchain = toolchain["rustup_toolchain"]
+    _terminal_validate_verbose_probe(
+        toolchain["cargo_version_verbose"],
+        executable="cargo",
+        host=rustc_host,
+        context=f"{context} cargo_version_verbose",
+    )
+    _terminal_validate_verbose_probe(
+        toolchain["rustc_version_verbose"],
+        executable="rustc",
+        host=rustc_host,
+        context=f"{context} rustc_version_verbose",
+    )
+    if (
+        not isinstance(rustc_host, str)
+        or not rustc_host
+        or any(character.isspace() for character in rustc_host)
+        or not isinstance(rustup_toolchain, str)
+        or not rustup_toolchain
+        or any(character.isspace() for character in rustup_toolchain)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", rustup_toolchain)
+        is None
+        or rustup_toolchain in {".", ".."}
+        or "/" in rustup_toolchain
+        or "\\" in rustup_toolchain
+    ):
+        raise ValueError(f"{context} rustup/rustc sampled identity differs")
+    toolchain_root = Path(toolchain["rustup_home_path"]) / "toolchains" / rustup_toolchain
+    if (
+        toolchain_root.resolve(strict=True) != toolchain_root
+        or resolved["cargo_path"] != toolchain_root / "bin" / "cargo"
+        or resolved["rustc_path"] != toolchain_root / "bin" / "rustc"
+    ):
+        raise ValueError(f"{context} Cargo/rustc rustup paths differ")
+    return toolchain
+
+
+def _terminal_current_file_identity(value: Any, context: str) -> Mapping[str, Any]:
+    record = _terminal_semantic_exact(value, CURRENT_FILE_IDENTITY_FIELDS, context)
+    raw = record["path"]
+    if not isinstance(raw, str) or not Path(raw).is_absolute():
+        raise ValueError(f"{context} path differs")
+    path = Path(raw).resolve(strict=True)
+    metadata = path.lstat()
+    expected = {
+        "bytes": metadata.st_size, "ctime_ns": metadata.st_ctime_ns,
+        "device": metadata.st_dev, "inode": metadata.st_ino,
+        "link_count": metadata.st_nlink, "mode": stat.S_IMODE(metadata.st_mode),
+        "mtime_ns": metadata.st_mtime_ns, "path": str(path),
+        "sha256": sha256_file(path), "size": metadata.st_size,
+    }
+    if raw != str(path) or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or record != expected:
+        raise ValueError(f"{context} live identity differs")
+    return record
+
+
+def _terminal_bound_file_identity(
+    value: Any, live_path: Path, recorded_path: str, context: str,
+    *, executable: bool,
+) -> Mapping[str, Any]:
+    record = _terminal_semantic_exact(value, CURRENT_FILE_IDENTITY_FIELDS, context)
+    path = live_path.resolve(strict=True)
+    metadata = path.lstat()
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or path != live_path
+        or record["path"] != recorded_path
+        or record["bytes"] != metadata.st_size
+        or record["device"] != metadata.st_dev
+        or record["inode"] != metadata.st_ino
+        or record["link_count"] != metadata.st_nlink
+        or record["mtime_ns"] != metadata.st_mtime_ns
+        or record["sha256"] != sha256_file(path)
+        or record["size"] != metadata.st_size
+        or (record["mode"] & 0o111 != 0) is not executable
+        or stat.S_IMODE(metadata.st_mode) != (0o555 if executable else 0o444)
+    ):
+        raise ValueError(f"{context} retained descriptor identity differs")
+    return record
+
+
+def _terminal_bound_descriptor(argv: Any, destination: str, context: str) -> str:
+    if not isinstance(argv, list):
+        raise ValueError(f"{context} argv differs")
+    matches = [argv[index + 1] for index in range(len(argv) - 2) if argv[index] in {"--bind-fd", "--ro-bind-fd", "--ro-bind-data"} and argv[index + 2] == destination]
+    if len(matches) != 1 or not isinstance(matches[0], str):
+        raise ValueError(f"{context} descriptor binding differs")
+    return matches[0]
+
+
+def _terminal_current_directory(value: Any, path: Path, context: str, *, live: bool) -> Mapping[str, Any]:
+    record = _terminal_semantic_exact(value, CURRENT_DIRECTORY_IDENTITY_FIELDS, context)
+    if record["path"] != str(path) or any(not terminal_is_integer(record[field]) for field in CURRENT_DIRECTORY_IDENTITY_FIELDS - {"path"}):
+        raise ValueError(f"{context} metadata differs")
+    if live:
+        metadata = path.lstat()
+        expected = {
+            "changed_ns": metadata.st_ctime_ns, "device": metadata.st_dev,
+            "file_type": stat.S_IFMT(metadata.st_mode), "inode": metadata.st_ino,
+            "link_count": metadata.st_nlink, "modified_ns": metadata.st_mtime_ns,
+            "path": str(path), "permissions": stat.S_IMODE(metadata.st_mode),
+            "size": metadata.st_size,
+        }
+        if (
+            path.resolve(strict=True) != path
+            or not stat.S_ISDIR(metadata.st_mode)
+            or record != expected
+        ):
+            raise ValueError(f"{context} live identity differs")
+    return record
+
+
+def _terminal_final_bound_directory(
+    recorded: Mapping[str, Any], path: Path, context: str
+) -> None:
+    metadata = path.lstat()
+    if (
+        path.resolve(strict=True) != path
+        or not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o555
+        or recorded["path"] != str(path)
+        or recorded["device"] != metadata.st_dev
+        or recorded["inode"] != metadata.st_ino
+        or recorded["file_type"] != stat.S_IFMT(metadata.st_mode)
+    ):
+        raise ValueError(f"{context} final frozen directory differs")
+
+
+def _terminal_materialized_manifest(root: Path, context: str) -> dict[str, Any]:
+    if root.resolve(strict=True) != root:
+        raise ValueError(f"{context} root is not canonical")
+    entries: list[dict[str, Any]] = []
+    for path in (root, *sorted(root.rglob("*"))):
+        metadata = path.lstat()
+        if path.resolve(strict=True) != path or stat.S_ISLNK(metadata.st_mode):
+            raise ValueError(f"{context} contains an aliased path")
+        if stat.S_ISDIR(metadata.st_mode):
+            file_type = "directory"
+            digest = None
+            if stat.S_IMODE(metadata.st_mode) != 0o555:
+                raise ValueError(f"{context} directory is not frozen")
+        elif stat.S_ISREG(metadata.st_mode):
+            file_type = "regular"
+            digest = sha256_file(path)
+            if metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) not in {
+                0o444, 0o555,
+            }:
+                raise ValueError(f"{context} file is not frozen and exclusive")
+        else:
+            raise ValueError(f"{context} contains an unsupported node")
+        entries.append({
+            "changed_ns": metadata.st_ctime_ns,
+            "device": metadata.st_dev,
+            "file_type": file_type,
+            "inode": metadata.st_ino,
+            "link_count": metadata.st_nlink,
+            "modified_ns": metadata.st_mtime_ns,
+            "path": "." if path == root else path.relative_to(root).as_posix(),
+            "permissions": stat.S_IMODE(metadata.st_mode),
+            "sha256": digest,
+            "size": metadata.st_size,
+        })
+    return {"entries": entries, "schema": "bn-30fs-file-manifest-v2"}
+
+
+def _terminal_materialized_manifest_sidecar(
+    current_root: Path, directory: str, source_root: Path, expected_sha256: str,
+    context: str,
+) -> Mapping[str, Any]:
+    path = current_root / "manifests" / f"materialized-{directory}.json"
+    snapshot = schema.snapshot_regular_file(path, expected_mode=0o444)
+    value = schema.parse_canonical_json_object(snapshot.data, context)
+    if (
+        snapshot.sha256 != expected_sha256
+        or value != _terminal_materialized_manifest(source_root, context + " live")
+    ):
+        raise ValueError(f"{context} exact live replay differs")
+    return value
+
+
+def _terminal_validate_current_output_freeze(
+    current_root: Path, context: str
+) -> None:
+    if current_root.resolve(strict=True) != current_root:
+        raise ValueError(f"{context} root is not canonical")
+    paths = (current_root, *sorted(current_root.rglob("*")))
+    for path in paths:
+        metadata = path.lstat()
+        if path.resolve(strict=True) != path or stat.S_ISLNK(metadata.st_mode):
+            raise ValueError(f"{context} contains an aliased path")
+        mode = stat.S_IMODE(metadata.st_mode)
+        if stat.S_ISDIR(metadata.st_mode):
+            if mode != 0o555:
+                raise ValueError(f"{context} directory is not frozen: {path}")
+        elif stat.S_ISREG(metadata.st_mode):
+            if metadata.st_nlink != 1 or mode not in {0o444, 0o555}:
+                raise ValueError(f"{context} file is not frozen: {path}")
+        else:
+            raise ValueError(f"{context} contains an unsupported node: {path}")
+
+
+def _terminal_current_tool(
+    value: Any, expected_path: Path, expected_sha256: str | None, context: str,
+    *, trusted: bool, live_system: bool,
+) -> Mapping[str, Any]:
+    record = _terminal_semantic_exact(value, CURRENT_TOOL_RECORD_FIELDS, context)
+    identity = _terminal_current_file_identity(record["identity"], context + " identity")
+    if identity["path"] != str(expected_path) or (expected_sha256 is not None and identity["sha256"] != expected_sha256) or identity["mode"] & 0o111 == 0 or record["trusted_system"] is not trusted:
+        raise ValueError(f"{context} binding differs")
+    chain = record["path_chain"]
+    if not trusted:
+        if chain is not None:
+            raise ValueError(f"{context} unexpected trusted chain")
+        return record
+    paths = [Path("/"), *list(expected_path.parents)[::-1][1:], expected_path]
+    if not isinstance(chain, list) or len(chain) != len(paths):
+        raise ValueError(f"{context} trusted chain differs")
+    for raw, path in zip(chain, paths, strict=True):
+        item = _terminal_semantic_exact(raw, CURRENT_TRUSTED_CHAIN_FIELDS, context + " chain")
+        metadata = path.lstat()
+        expected = {
+            "changed_ns": metadata.st_ctime_ns, "device": metadata.st_dev,
+            "gid": metadata.st_gid, "inode": metadata.st_ino,
+            "link_count": metadata.st_nlink, "mode": stat.S_IMODE(metadata.st_mode),
+            "modified_ns": metadata.st_mtime_ns, "path": str(path),
+            "size": metadata.st_size, "type": stat.S_IFMT(metadata.st_mode),
+            "uid": metadata.st_uid,
+        }
+        if item["path"] != str(path) or (live_system and (item != expected or item["uid"] != 0 or item["mode"] & 0o022)):
+            raise ValueError(f"{context} trusted chain live identity differs")
+    return record
+
+
+def _terminal_current_config(
+    value: Any, authority: Mapping[str, Any], source_root: Path,
+    cargo_home_root: Path, context: str,
+) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+    source_cargo_root = source_root / ".cargo"
+    for root, label in (
+        (source_cargo_root, "source"),
+        (cargo_home_root, "cargo-home"),
+    ):
+        metadata = root.lstat()
+        if (
+            root.resolve(strict=True) != root
+            or not stat.S_ISDIR(metadata.st_mode)
+        ):
+            raise ValueError(f"{context} {label} root differs")
+    record = _terminal_semantic_exact(value, CURRENT_CARGO_CONFIG_FIELDS, context)
+    search = _terminal_semantic_exact(record["cargo_search"], {"cargo_home_path", "cwd", "entries", "schema"}, context + " search")
+    paths = (
+        f"{GUEST_SOURCE}/.cargo/config.toml", f"{GUEST_SOURCE}/.cargo/config",
+        f"{GUEST_ROOT}/.cargo/config.toml", f"{GUEST_ROOT}/.cargo/config",
+        "/.cargo/config.toml", "/.cargo/config",
+        f"{GUEST_CARGO_HOME}/config.toml", f"{GUEST_CARGO_HOME}/config",
+    )
+    entries = search["entries"]
+    if record["schema"] != "bn-30fs-build-cargo-config-search-v1" or search["schema"] != schema.CARGO_CONFIG_SEARCH_SCHEMA or search["cargo_home_path"] != GUEST_CARGO_HOME or search["cwd"] != GUEST_SOURCE or not isinstance(entries, list) or len(entries) != 8:
+        raise ValueError(f"{context} identity differs")
+    hosts: tuple[Path | None, ...] = (
+        source_root / ".cargo/config.toml", source_root / ".cargo/config",
+        None, None, None, None,
+        cargo_home_root / "config.toml", cargo_home_root / "config",
+    )
+    for raw, path, host in zip(entries, paths, hosts, strict=True):
+        entry = _terminal_semantic_exact(raw, {"path", "sha256", "status"}, context + " entry")
+        if entry["path"] != path or entry["status"] not in {"absent", "present"} or (entry["status"] == "absent") != (entry["sha256"] is None) or (entry["status"] == "present" and not terminal_is_sha256(entry["sha256"])) or (path in paths[2:6] and entry["status"] != "absent"):
+            raise ValueError(f"{context} entry differs")
+        if host is not None:
+            expected_sha256 = (
+                sha256_file(host) if host.is_file() else EMPTY_SHA256
+            )
+            if (
+                entry["status"] != "present"
+                or entry["sha256"] != expected_sha256
+            ):
+                raise ValueError(f"{context} live entry differs")
+    tree = _terminal_semantic_exact(record["cargo_home_tree"], CURRENT_CARGO_HOME_TREE_FIELDS, context + " tree")
+    cargo = authority["cargo_home"]
+    if tree != {"entry_count": cargo["entry_count"], "equal_pre_post": True, "path": cargo["manifest_path"], "post_sha256": cargo["manifest_sha256"], "pre_sha256": cargo["manifest_sha256"], "watch_count": cargo["watch_count"]}:
+        raise ValueError(f"{context} semantic crosslink differs")
+    preserved = _terminal_semantic_exact(record["preserved_top_level_entries"], {"cargo-home", "source"}, context + " preserved")
+    for origin in ("source", "cargo-home"):
+        values = preserved[origin]
+        if not isinstance(values, list):
+            raise ValueError(f"{context} preserved {origin} differs")
+        base = source_cargo_root if origin == "source" else cargo_home_root
+        expected_children = []
+        for candidate in sorted(base.iterdir(), key=lambda path: path.name):
+            if candidate.name in {"config", "config.toml"}:
+                continue
+            metadata = candidate.lstat()
+            if (
+                candidate.resolve(strict=True) != candidate
+                or stat.S_ISLNK(metadata.st_mode)
+                or not (
+                    stat.S_ISREG(metadata.st_mode)
+                    or stat.S_ISDIR(metadata.st_mode)
+                )
+            ):
+                raise ValueError(
+                    f"{context} preserved {origin} live topology differs"
+                )
+            expected_children.append((
+                candidate.name,
+                "regular" if stat.S_ISREG(metadata.st_mode) else "directory",
+                candidate,
+            ))
+        if len(values) != len(expected_children):
+            raise ValueError(
+                f"{context} preserved {origin} completeness differs"
+            )
+        names = []
+        physical: list[tuple[int, int]] = []
+        for raw, (expected_name, expected_type, expected_path) in zip(
+            values, expected_children, strict=True
+        ):
+            item = _terminal_semantic_exact(raw, {"identity", "name", "type"}, context + " preserved entry")
+            if not isinstance(item["name"], str) or not item["name"] or "/" in item["name"] or item["name"] in {"config", "config.toml"} or item["type"] not in {"directory", "regular"}:
+                raise ValueError(f"{context} preserved entry differs")
+            if (
+                item["name"] != expected_name
+                or item["type"] != expected_type
+            ):
+                raise ValueError(
+                    f"{context} preserved {origin} enumeration differs"
+                )
+            names.append(item["name"])
+            if item["type"] == "regular":
+                identity = _terminal_current_file_identity(item["identity"], context + " preserved file")
+                if identity["path"] != str(expected_path):
+                    raise ValueError(f"{context} preserved file path differs")
+            else:
+                identity = _terminal_current_directory(
+                    item["identity"], expected_path,
+                    context + " preserved directory", live=True,
+                )
+            physical.append((identity["device"], identity["inode"]))
+        if names != sorted(names) or len(names) != len(set(names)):
+            raise ValueError(f"{context} preserved order differs")
+        if len(physical) != len(set(physical)):
+            raise ValueError(f"{context} preserved identities alias")
+    return search, preserved
+
+
+def _terminal_archive_tree(
+    payload: bytes, context: str
+) -> dict[str, dict[str, Any]]:
+    explicit: dict[str, tuple[tarfile.TarInfo, tuple[str, ...]]] = {}
+    try:
+        with tarfile.open(fileobj=io.BytesIO(payload), mode="r:") as source:
+            for member in source.getmembers():
+                name = (
+                    member.name[:-1]
+                    if member.isdir() and member.name.endswith("/")
+                    else member.name
+                )
+                parts = tuple(name.split("/"))
+                if (
+                    not name
+                    or name.startswith("/")
+                    or "\\" in name
+                    or any(part in {"", ".", ".."} for part in parts)
+                    or "/".join(parts) != name
+                    or name in explicit
+                    or not (member.isdir() or member.isfile())
+                ):
+                    raise ValueError(f"{context} unsafe archive member")
+                explicit[name] = (member, parts)
+            archive_end = source.offset
+            if (
+                len(payload) % tarfile.BLOCKSIZE != 0
+                or archive_end < 0
+                or archive_end + 2 * tarfile.BLOCKSIZE > len(payload)
+                or any(payload[archive_end:])
+            ):
+                raise ValueError(f"{context} archive trailing payload differs")
+            for name in explicit:
+                parts = name.split("/")
+                if any(
+                    "/".join(parts[:index]) in explicit
+                    and explicit["/".join(parts[:index])][0].isfile()
+                    for index in range(1, len(parts))
+                ):
+                    raise ValueError(f"{context} archive file ancestor differs")
+            tree: dict[str, dict[str, Any]] = {
+                ".": {
+                    "file_type": "directory",
+                    "permissions": 0o555,
+                    "payload": None,
+                }
+            }
+            for name, (member, parts) in explicit.items():
+                for index in range(1, len(parts)):
+                    parent = "/".join(parts[:index])
+                    tree.setdefault(
+                        parent,
+                        {
+                            "file_type": "directory",
+                            "permissions": 0o555,
+                            "payload": None,
+                        },
+                    )
+                if member.isdir():
+                    tree[name] = {
+                        "file_type": "directory",
+                        "permissions": 0o555,
+                        "payload": None,
+                    }
+                    continue
+                extracted = source.extractfile(member)
+                if extracted is None:
+                    raise ValueError(f"{context} archive payload differs")
+                file_payload = extracted.read()
+                if len(file_payload) != member.size:
+                    raise ValueError(f"{context} archive member size differs")
+                tree[name] = {
+                    "file_type": "regular",
+                    "permissions": 0o555 if member.mode & 0o111 else 0o444,
+                    "payload": file_payload,
+                }
+    except (OSError, tarfile.TarError) as error:
+        raise ValueError(f"{context} archive parse differs") from error
+    return tree
+
+
+def _terminal_apply_product_overlay(
+    base: bytes, patch: bytes, context: str
+) -> bytes:
+    try:
+        base_text = base.decode()
+        patch_text = patch.decode()
+    except UnicodeDecodeError as error:
+        raise ValueError(f"{context} text encoding differs") from error
+    target = CURRENT_ENGINE_PATH.as_posix()
+    if (
+        re.findall(r"^--- a/(.+)$", patch_text, re.MULTILINE) != [target]
+        or re.findall(r"^\+\+\+ b/(.+)$", patch_text, re.MULTILINE) != [target]
+        or re.findall(
+            r"^diff --git a/(.+) b/(.+)$", patch_text, re.MULTILINE
+        )
+        != [(target, target)]
+    ):
+        raise ValueError(f"{context} patch target differs")
+    header_pattern = re.compile(
+        r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?$"
+    )
+    lines = patch_text.splitlines(keepends=True)
+    hunks: list[tuple[int, int, int, int, tuple[str, ...]]] = []
+    index = 0
+    while index < len(lines):
+        header = header_pattern.match(lines[index].rstrip("\n"))
+        if header is None:
+            index += 1
+            continue
+        old_start = int(header.group(1))
+        old_count = int(header.group(2) or "1")
+        new_start = int(header.group(3))
+        new_count = int(header.group(4) or "1")
+        index += 1
+        body = []
+        while index < len(lines):
+            line = lines[index]
+            if header_pattern.match(line.rstrip("\n")) or line.startswith(
+                "diff --git "
+            ):
+                break
+            if line.startswith((" ", "+", "-", "\\")):
+                body.append(line)
+                index += 1
+                continue
+            break
+        hunks.append(
+            (old_start, old_count, new_start, new_count, tuple(body))
+        )
+    if not hunks:
+        raise ValueError(f"{context} patch hunks differ")
+    source = base_text.splitlines(keepends=True)
+    output: list[str] = []
+    cursor = 0
+    new_cursor = 0
+    for old_start, old_count, new_start, new_count, body in hunks:
+        old_index = old_start if old_count == 0 else old_start - 1
+        if old_index < cursor:
+            raise ValueError(f"{context} patch hunk order differs")
+        output.extend(source[cursor:old_index])
+        new_cursor += old_index - cursor
+        expected_new = new_start if new_count == 0 else new_start - 1
+        if new_cursor != expected_new:
+            raise ValueError(f"{context} patch new coordinate differs")
+        cursor = old_index
+        consumed = 0
+        produced = 0
+        for raw in body:
+            if raw.startswith("\\"):
+                continue
+            marker, line_payload = raw[0], raw[1:]
+            if marker in {" ", "-"}:
+                if cursor >= len(source) or source[cursor] != line_payload:
+                    raise ValueError(f"{context} patch context differs")
+                cursor += 1
+                consumed += 1
+            if marker in {" ", "+"}:
+                output.append(line_payload)
+                new_cursor += 1
+                produced += 1
+        if consumed != old_count or produced != new_count:
+            raise ValueError(f"{context} patch line counts differ")
+    output.extend(source[cursor:])
+    return "".join(output).encode()
+
+
+def _terminal_materialized_projection(
+    root: Path, context: str
+) -> dict[str, dict[str, Any]]:
+    projection: dict[str, dict[str, Any]] = {}
+    for path in (root, *sorted(root.rglob("*"))):
+        metadata = path.lstat()
+        relative = "." if path == root else path.relative_to(root).as_posix()
+        if (
+            path.resolve(strict=True) != path
+            or stat.S_ISLNK(metadata.st_mode)
+        ):
+            raise ValueError(f"{context} aliased path differs")
+        if stat.S_ISDIR(metadata.st_mode):
+            projection[relative] = {
+                "file_type": "directory",
+                "permissions": stat.S_IMODE(metadata.st_mode),
+                "sha256": None,
+                "size": None,
+            }
+        elif stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1:
+            projection[relative] = {
+                "file_type": "regular",
+                "permissions": stat.S_IMODE(metadata.st_mode),
+                "sha256": sha256_file(path),
+                "size": metadata.st_size,
+            }
+        else:
+            raise ValueError(f"{context} unsupported path differs")
+    return projection
+
+
+def _terminal_require_materialized_projection(
+    live: Mapping[str, Mapping[str, Any]],
+    expected: Mapping[str, Mapping[str, Any]],
+    context: str,
+) -> None:
+    if live != expected:
+        raise ValueError(f"{context} archive materialization differs")
+
+
+def _terminal_expected_materialized_projection(
+    archive_tree: Mapping[str, Mapping[str, Any]],
+    *,
+    lock_payload: bytes,
+    placements: list[Mapping[str, Any]],
+    patch_payload: bytes,
+    apply_overlay: bool,
+    context: str,
+) -> dict[str, dict[str, Any]]:
+    tree = {
+        name: {
+            "file_type": entry["file_type"],
+            "permissions": entry["permissions"],
+            "payload": entry["payload"],
+        }
+        for name, entry in archive_tree.items()
+    }
+    engine = tree.get(CURRENT_ENGINE_PATH.as_posix())
+    cargo_lock = tree.get("Cargo.lock")
+    if (
+        not isinstance(engine, Mapping)
+        or engine.get("file_type") != "regular"
+        or hashlib.sha256(engine.get("payload", b"")).hexdigest()
+        != CURRENT_ENGINE_SHA256
+        or not isinstance(cargo_lock, Mapping)
+        or cargo_lock.get("file_type") != "regular"
+    ):
+        raise ValueError(f"{context} archive base authority differs")
+    tree["Cargo.lock"] = {
+        "file_type": "regular",
+        "permissions": 0o444,
+        "payload": lock_payload,
+    }
+    for placement in placements:
+        destination = PurePosixPath(str(placement["destination"]))
+        relative = destination.as_posix()
+        if (
+            destination.is_absolute()
+            or relative in tree
+            or any(part in {"", ".", ".."} for part in destination.parts)
+        ):
+            raise ValueError(f"{context} placement destination differs")
+        source = Path(str(placement["source"]))
+        source_payload = source.read_bytes()
+        if (
+            placement["mode"] != 0o444
+            or placement["sha256"]
+            != hashlib.sha256(source_payload).hexdigest()
+        ):
+            raise ValueError(f"{context} placement source differs")
+        for parent in destination.parents:
+            if parent == PurePosixPath("."):
+                break
+            parent_name = parent.as_posix()
+            existing_parent = tree.get(parent_name)
+            if (
+                existing_parent is not None
+                and existing_parent["file_type"] != "directory"
+            ):
+                raise ValueError(f"{context} placement parent differs")
+            tree.setdefault(
+                parent_name, {
+                    "file_type": "directory",
+                    "permissions": 0o555,
+                    "payload": None,
+                },
+            )
+        tree[relative] = {
+            "file_type": "regular",
+            "permissions": 0o444,
+            "payload": source_payload,
+        }
+    if apply_overlay:
+        tree[CURRENT_ENGINE_PATH.as_posix()]["payload"] = (
+            _terminal_apply_product_overlay(
+                tree[CURRENT_ENGINE_PATH.as_posix()]["payload"],
+                patch_payload,
+                context + " overlay",
+            )
+        )
+    return {
+        name: {
+            "file_type": entry["file_type"],
+            "permissions": entry["permissions"],
+            "sha256": (
+                hashlib.sha256(entry["payload"]).hexdigest()
+                if entry["file_type"] == "regular"
+                else None
+            ),
+            "size": (
+                len(entry["payload"])
+                if entry["file_type"] == "regular"
+                else None
+            ),
+        }
+        for name, entry in tree.items()
+    }
+
+
+def terminal_validate_current_construction(
+    current: Mapping[str, Any], current_root: Path, context: str
+) -> Mapping[str, str]:
+    path = current_root / "manifests" / "current-children-construction.json"
+    if current.get("construction_path") != str(path):
+        raise ValueError(f"{context} path differs")
+    snapshot = schema.snapshot_regular_file(path, expected_mode=0o444)
+    if snapshot.sha256 != current.get("construction_sha256") or snapshot.sha256 != current.get("build_nonce"):
+        raise ValueError(f"{context} build nonce differs")
+    value = _terminal_semantic_exact(
+        schema.parse_canonical_json_object(snapshot.data, context),
+        {"archive", "cargo_config_manifest_sha256", "cargo_config_view_sha256", "kinds", "lock_sha256", "product_commit", "product_overlay_sha256", "product_tree", "protocol", "schema"},
+        context,
+    )
+    product = schema.VARIANT_SOURCE_BINDINGS["A"]
+    if (
+        value["schema"] != CURRENT_CONSTRUCTION_SCHEMA
+        or value["protocol"] != schema.PROTOCOL
+        or current.get("product_commit") != product["commit"]
+        or current.get("product_tree") != product["tree"]
+        or value["product_commit"] != product["commit"]
+        or value["product_tree"] != product["tree"]
+        or any(
+            not terminal_is_sha256(value[field])
+            for field in (
+                "cargo_config_manifest_sha256",
+                "cargo_config_view_sha256",
+                "lock_sha256",
+                "product_overlay_sha256",
+            )
+        )
+    ):
+        raise ValueError(f"{context} identity differs")
+    archive = _terminal_semantic_exact(
+        value["archive"], {"bytes", "commit", "sha256", "tree"},
+        context + " archive",
+    )
+    archive_path = current_root / "archives" / "source-A.tar"
+    archive_snapshot = schema.snapshot_regular_file(
+        archive_path, expected_mode=0o444
+    )
+    if archive != {
+        "bytes": archive_snapshot.size,
+        "commit": product["commit"],
+        "sha256": archive_snapshot.sha256,
+        "tree": product["tree"],
+    }:
+        raise ValueError(f"{context} archive live authority differs")
+    archive_tree = _terminal_archive_tree(
+        archive_snapshot.data, context + " archive"
+    )
+    cargo = _terminal_semantic_exact(
+        current.get("cargo_config_authority"),
+        {"binding", "identity", "recorded", "translated_entries"},
+        context + " cargo config authority",
+    )
+    cargo_identity = _terminal_current_file_identity(
+        cargo["identity"], context + " cargo config identity"
+    )
+    if (
+        cargo["binding"] != {
+            "path": cargo_identity["path"], "sha256": cargo_identity["sha256"]
+        }
+        or value["cargo_config_manifest_sha256"] != cargo_identity["sha256"]
+        or value["cargo_config_view_sha256"] != hashlib.sha256(
+            canonical_json_bytes(cargo["translated_entries"])
+        ).hexdigest()
+    ):
+        raise ValueError(f"{context} Cargo config crosslink differs")
+    lock_candidates = _terminal_semantic_exact(
+        current.get("lock_candidates"),
+        {"A", "C", "D"},
+        context + " lock candidates",
+    )
+    candidate_a = _terminal_semantic_exact(
+        lock_candidates["A"],
+        CURRENT_IMMUTABLE_FILE_FIELDS,
+        context + " lock candidate A",
+    )
+    candidate_a_path = Path(str(candidate_a["path"]))
+    candidate_a_snapshot = schema.snapshot_regular_file(
+        candidate_a_path, expected_mode=0o444
+    )
+    overlay = current.get("product_overlay_authority")
+    if (
+        candidate_a_path.resolve(strict=True) != candidate_a_path
+        or candidate_a["mode"] != 0o444
+        or candidate_a["sha256"] != candidate_a_snapshot.sha256
+        or candidate_a["size"] != candidate_a_snapshot.size
+        or value["lock_sha256"] != candidate_a["sha256"]
+        or not isinstance(overlay, Mapping)
+        or not isinstance(overlay.get("patch"), Mapping)
+        or value["product_overlay_sha256"] != overlay["patch"].get("sha256")
+    ):
+        raise ValueError(f"{context} lock/overlay crosslink differs")
+    inputs = current.get("inputs")
+    if not isinstance(inputs, list) or len(inputs) != 27:
+        raise ValueError(f"{context} input authority differs")
+    patch_identity = _terminal_current_file_identity(
+        inputs[5], context + " product overlay input"
+    )
+    if patch_identity["sha256"] != value["product_overlay_sha256"]:
+        raise ValueError(f"{context} product overlay input differs")
+    patch_payload = Path(patch_identity["path"]).read_bytes()
+    input_by_path = {
+        record.get("path"): record
+        for record in inputs
+        if isinstance(record, Mapping)
+    }
+    kinds = _terminal_semantic_exact(value["kinds"], {"children", "hooked-release", "pristine-release"}, context + " kinds")
+    result: dict[str, str] = {}
+    for name, directory in (("children", "children"), ("hooked_release", "hooked-release"), ("pristine_release", "pristine-release")):
+        kind = _terminal_semantic_exact(kinds[directory], {"manifest_sha256", "placements"}, context + f" {directory}")
+        placements = kind["placements"]
+        if (
+            not terminal_is_sha256(kind["manifest_sha256"])
+            or not isinstance(placements, list)
+            or len(placements) != 10
+        ):
+            raise ValueError(f"{context} {directory} identity differs")
+        expected_destinations = (
+            (
+                Path("crates/mess-store/examples/asterism_rebaseline_current_correctness.rs"),
+                Path("crates/mess-store/examples/asterism_rebaseline_current_fault.rs"),
+                *(CURRENT_SHARED_DESTINATION / item for item in CURRENT_SHARED_NAMES),
+            )
+            if name == "children"
+            else (
+                Path("crates/mess-store/examples/asterism_rebaseline_public.rs"),
+                CURRENT_ADAPTER_DESTINATION,
+                *(CURRENT_SHARED_DESTINATION / item for item in CURRENT_SHARED_NAMES),
+            )
+        )
+        expected_sources = (
+            (
+                inputs[0]["path"],
+                inputs[1]["path"],
+                *(inputs[index]["path"] for index in range(11, 19)),
+            )
+            if name == "children"
+            else (
+                inputs[9]["path"],
+                inputs[10]["path"],
+                *(inputs[index]["path"] for index in range(11, 19)),
+            )
+        )
+        lineage_placements: list[Mapping[str, Any]] = []
+        for raw, relative, expected_source in zip(
+            placements, expected_destinations, expected_sources, strict=True
+        ):
+            placement = _terminal_semantic_exact(
+                raw, {"destination", "mode", "sha256", "source"},
+                context + f" {directory} placement",
+            )
+            destination = current_root / "materialized" / directory / relative
+            source_path = placement["source"]
+            source_input = input_by_path.get(source_path)
+            destination_snapshot = schema.snapshot_regular_file(
+                destination, expected_mode=0o444
+            )
+            if (
+                placement["destination"] != destination.as_posix()
+                or placement["mode"] != 0o444
+                or placement["sha256"] != destination_snapshot.sha256
+                or not isinstance(source_path, str)
+                or source_path != expected_source
+                or not isinstance(source_input, Mapping)
+                or source_input.get("sha256") != placement["sha256"]
+            ):
+                raise ValueError(
+                    f"{context} {directory} placement live crosslink differs"
+                )
+            lineage_placements.append({
+                "destination": relative.as_posix(),
+                "mode": placement["mode"],
+                "sha256": placement["sha256"],
+                "source": placement["source"],
+            })
+        expected_projection = _terminal_expected_materialized_projection(
+            archive_tree,
+            lock_payload=candidate_a_snapshot.data,
+            placements=lineage_placements,
+            patch_payload=patch_payload,
+            apply_overlay=directory in {"children", "hooked-release"},
+            context=f"{context} {directory} lineage",
+        )
+        live_projection = _terminal_materialized_projection(
+            current_root / "materialized" / directory,
+            f"{context} {directory} live lineage",
+        )
+        _terminal_require_materialized_projection(
+            live_projection,
+            expected_projection,
+            f"{context} {directory}",
+        )
+        result[name] = kind["manifest_sha256"]
+    return result
+
+
+def _terminal_validate_current_inputs(
+    current: Mapping[str, Any], current_root: Path, context: str
+) -> list[Mapping[str, Any]]:
+    values = current.get("inputs")
+    if not isinstance(values, list) or len(values) != 27:
+        raise ValueError(f"{context} exact input cardinality differs")
+    records = [
+        _terminal_current_file_identity(value, context + f" input {ordinal}")
+        for ordinal, value in enumerate(values, start=1)
+    ]
+    paths = [record["path"] for record in records]
+    physical = [(record["device"], record["inode"]) for record in records]
+    if len(set(paths)) != 27 or len(set(physical)) != 27:
+        raise ValueError(f"{context} inputs alias")
+    expected_suffixes = (
+        "tooling/current/correctness.rs",
+        "tooling/current/fault.rs",
+        "tooling/current/validate_fault.py",
+        "tooling/current/lock_authority.py",
+        "tooling/prepare_overlays.py",
+        "tooling/current/product-test-overlay.patch",
+        "tooling/current/validate_product_test_overlay.py",
+        "tooling/current/rustc_workspace_wrapper.py",
+        "tooling/current/validate_build_children.py",
+        "tooling/overlay/public/main.rs",
+        "tooling/overlay/public/adapters/current.rs",
+        *(f"tooling/overlay/shared/{name}" for name in CURRENT_SHARED_NAMES),
+    )
+    try:
+        repository = Path(records[8]["path"]).parents[4].resolve(strict=True)
+    except (IndexError, OSError) as error:
+        raise ValueError(f"{context} repository topology differs") from error
+    expected_paths = [
+        str(repository / "spikes/asterism_rebaseline" / suffix)
+        for suffix in expected_suffixes
+    ]
+    if (
+        records[8]["path"]
+        != str(
+            repository
+            / "spikes/asterism_rebaseline/tooling/current/validate_build_children.py"
+        )
+        or [record["path"] for record in records[:19]] != expected_paths
+    ):
+        raise ValueError(f"{context} producer input order differs")
+    authority_inputs = current.get("lock_authority_inputs")
+    locks = current.get("lock_candidates")
+    cargo = current.get("cargo_config_authority")
+    overlay = _terminal_semantic_exact(
+        current.get("product_overlay_authority"),
+        {"patch"},
+        context + " product overlay authority",
+    )
+    patch = _terminal_semantic_exact(
+        overlay["patch"],
+        {"sha256"},
+        context + " product overlay patch",
+    )
+    if (
+        not isinstance(authority_inputs, Mapping)
+        or [records[index]["path"] for index in range(19, 22)]
+        != [
+            authority_inputs.get(name, {}).get("path")
+            for name in ("lock_manifest", "authority", "review_bundle")
+        ]
+        or not isinstance(locks, Mapping)
+        or [records[index]["path"] for index in range(23, 26)]
+        != [locks.get(name, {}).get("path") for name in ("A", "C", "D")]
+        or not isinstance(cargo, Mapping)
+        or records[26]["path"] != cargo.get("identity", {}).get("path")
+    ):
+        raise ValueError(f"{context} reviewed input crosslinks differ")
+    if (
+        not terminal_is_sha256(patch["sha256"])
+        or records[5]["sha256"] != patch["sha256"]
+    ):
+        raise ValueError(f"{context} product overlay input digest differs")
+    fault = current.get("fault_authority")
+    static = current.get("static_authority")
+    if (
+        not isinstance(fault, Mapping)
+        or fault.get("source") != records[1]
+        or fault.get("validator") != records[2]
+        or not isinstance(static, Mapping)
+        or static.get("validator") != records[8]
+    ):
+        raise ValueError(f"{context} validator input equality differs")
+    return records
+
+
+def _terminal_validate_current_cargo_authority(
+    current: Mapping[str, Any], context: str
+) -> None:
+    cargo = _terminal_semantic_exact(
+        current.get("cargo_config_authority"),
+        {"binding", "identity", "recorded", "translated_entries"}, context,
+    )
+    identity = _terminal_current_file_identity(
+        cargo["identity"], context + " identity"
+    )
+    binding = _terminal_semantic_exact(
+        cargo["binding"], {"path", "sha256"}, context + " binding"
+    )
+    recorded = _terminal_semantic_exact(
+        cargo["recorded"], {"cargo_home_path", "cwd", "entries", "schema"},
+        context + " recorded",
+    )
+    if (
+        identity["mode"] != 0o444
+        or binding
+        != {"path": identity["path"], "sha256": identity["sha256"]}
+        or schema.parse_canonical_json_object(
+            Path(identity["path"]).read_bytes(), context + " payload"
+        ) != recorded
+        or recorded["schema"] != schema.CARGO_CONFIG_SEARCH_SCHEMA
+    ):
+        raise ValueError(f"{context} reviewed manifest differs")
+    paths = (
+        f"{GUEST_SOURCE}/.cargo/config.toml", f"{GUEST_SOURCE}/.cargo/config",
+        f"{GUEST_ROOT}/.cargo/config.toml", f"{GUEST_ROOT}/.cargo/config",
+        "/.cargo/config.toml", "/.cargo/config",
+        f"{GUEST_CARGO_HOME}/config.toml", f"{GUEST_CARGO_HOME}/config",
+    )
+    raw_recorded_entries = recorded["entries"]
+    if (
+        recorded["cwd"] != GUEST_SOURCE
+        or recorded["cargo_home_path"] != GUEST_CARGO_HOME
+        or not isinstance(raw_recorded_entries, list)
+        or len(raw_recorded_entries) != len(paths)
+    ):
+        raise ValueError(f"{context} recorded guest context differs")
+    recorded_entries = []
+    for index, (raw, path) in enumerate(
+        zip(raw_recorded_entries, paths, strict=True)
+    ):
+        entry = _terminal_semantic_exact(
+            raw, {"path", "sha256", "status"}, context + " recorded entry"
+        )
+        middle = 2 <= index < 6
+        if (
+            entry["path"] != path
+            or (
+                middle
+                and (
+                    entry["status"] != "absent"
+                    or entry["sha256"] is not None
+                )
+            )
+            or (
+                not middle
+                and (
+                    entry["status"] != "present"
+                    or not terminal_is_sha256(entry["sha256"])
+                )
+            )
+        ):
+            raise ValueError(f"{context} recorded entry differs")
+        recorded_entries.append(entry)
+    translated = cargo["translated_entries"]
+    if not isinstance(translated, list) or len(translated) != len(paths):
+        raise ValueError(f"{context} translated topology differs")
+    translated_entries = []
+    for raw, path in zip(translated, paths, strict=True):
+        entry = _terminal_semantic_exact(
+            raw, {"path", "sha256", "status"}, context + " translated entry"
+        )
+        if entry["path"] != path:
+            raise ValueError(f"{context} translated entry differs")
+        translated_entries.append(entry)
+    if translated_entries != recorded_entries:
+        raise ValueError(f"{context} recorded/translated entries differ")
+    lock_manifest = current.get("lock_authority", {}).get("lock_manifest", {})
+    variants = lock_manifest.get("payload", {}).get("variants", {})
+    if (
+        not isinstance(variants, Mapping)
+        or variants.get("A", {}).get("resolver", {}).get("cargo_config_search")
+        != binding
+    ):
+        raise ValueError(f"{context} reviewed resolver crosslink differs")
+    builds = current.get("builds")
+    if (
+        not isinstance(builds, Mapping)
+        or any(
+            build.get("cargo_config_prebuild", {}).get("cargo_search", {}).get(
+                "entries"
+            ) != translated
+            for build in builds.values()
+            if isinstance(build, Mapping)
+        )
+    ):
+        raise ValueError(f"{context} build translation crosslink differs")
+
+
+def _terminal_validate_validator_execution(
+    value: Any, *, validator: Mapping[str, Any], output: Mapping[str, Any],
+    arguments: list[str], repository: Path, context: str, live_system: bool,
+) -> None:
+    fields = CURRENT_EXECUTION_FIELDS | {"script_authority"}
+    record = _terminal_semantic_exact(value, fields, context)
+    environment = {
+        "HOME": "/nonexistent", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
+        "PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONNOUSERSITE": "1", "TZ": "UTC",
+    }
+    python = _terminal_current_tool(
+        record["execution_authority"], CURRENT_SYSTEM_PYTHON, None,
+        context + " Python", trusted=True, live_system=live_system,
+    )
+    script = _terminal_semantic_exact(
+        record["script_authority"], CURRENT_TOOL_RECORD_FIELDS,
+        context + " script",
+    )
+    script_identity = _terminal_current_file_identity(
+        script["identity"], context + " script identity"
+    )
+    stdout = canonical_json_bytes(output)
+    if (
+        record["argv"] != [
+            str(CURRENT_SYSTEM_PYTHON), "-I", "-B", validator["path"], *arguments
+        ]
+        or record["cwd"] != str(repository)
+        or record["environment"] != environment
+        or record["execution_authority"] != python
+        or script["path_chain"] is not None
+        or script["trusted_system"] is not False
+        or script_identity != validator
+        or record["exit_status"] != 0
+        or record["passed_file_descriptors"] != 2
+        or record["stderr_bytes"] != 0
+        or record["stderr_sha256"] != EMPTY_SHA256
+        or record["stdout_bytes"] != len(stdout)
+        or record["stdout_sha256"] != hashlib.sha256(stdout).hexdigest()
+    ):
+        raise ValueError(f"{context} exact execution differs")
+
+
+def _terminal_validate_current_validator_authorities(
+    current: Mapping[str, Any], context: str, *, live_system: bool,
+) -> None:
+    static_value = current.get("static_authority")
+    static_validator = (
+        static_value.get("validator")
+        if isinstance(static_value, Mapping)
+        else None
+    )
+    static_path = (
+        static_validator.get("path")
+        if isinstance(static_validator, Mapping)
+        else None
+    )
+    try:
+        repository = Path(static_path).parents[4].resolve(strict=True)
+    except (IndexError, OSError, TypeError) as error:
+        raise ValueError(f"{context} repository topology differs") from error
+    if (
+        Path(static_path)
+        != repository
+        / "spikes/asterism_rebaseline/tooling/current/validate_build_children.py"
+    ):
+        raise ValueError(f"{context} static validator topology differs")
+    for name, expected_schema, has_source in (
+        ("fault_authority", "bn-20be-current-fault-validator-v1", True),
+        ("static_authority", "bn-30fs-build-children-validator-v1", False),
+    ):
+        fields = {"executions", "normal", "self_test", "validator"}
+        if has_source:
+            fields.add("source")
+        authority = _terminal_semantic_exact(
+            current.get(name), fields, context + f" {name}"
+        )
+        validator = _terminal_current_file_identity(
+            authority["validator"], context + f" {name} validator"
+        )
+        expected_validator = repository / (
+            "spikes/asterism_rebaseline/tooling/current/validate_fault.py"
+            if has_source
+            else "spikes/asterism_rebaseline/tooling/current/validate_build_children.py"
+        )
+        if validator["path"] != str(expected_validator):
+            raise ValueError(f"{context} {name} validator path differs")
+        if has_source:
+            source = _terminal_current_file_identity(
+                authority["source"], context + f" {name} source"
+            )
+            if source["path"] != str(
+                repository
+                / "spikes/asterism_rebaseline/tooling/current/fault.rs"
+            ):
+                raise ValueError(f"{context} {name} source path differs")
+        normal = _terminal_semantic_exact(
+            authority["normal"],
+            {"checks", "hostile_mutations_rejected", "schema", "status"},
+            context + f" {name} normal",
+        )
+        self_test = _terminal_semantic_exact(
+            authority["self_test"],
+            {"checks", "hostile_mutations_rejected", "schema", "status"},
+            context + f" {name} self-test",
+        )
+        checks = normal["checks"]
+        if (
+            normal["schema"] != expected_schema
+            or self_test["schema"] != expected_schema
+            or normal["status"] != "ok"
+            or self_test["status"] != "ok"
+            or not isinstance(checks, list)
+            or not checks
+            or checks != self_test["checks"]
+            or len(checks) != len(set(checks))
+            or any(not isinstance(item, str) or not item for item in checks)
+            or not terminal_is_integer(normal["hostile_mutations_rejected"])
+            or (
+                not has_source
+                and normal["hostile_mutations_rejected"] != 0
+            )
+            or (
+                has_source
+                and normal["hostile_mutations_rejected"] <= 0
+            )
+            or not terminal_is_integer(self_test["hostile_mutations_rejected"])
+            or self_test["hostile_mutations_rejected"] <= 0
+            or (
+                has_source
+                and self_test["hostile_mutations_rejected"]
+                != normal["hostile_mutations_rejected"]
+            )
+        ):
+            raise ValueError(f"{context} {name} outputs differ")
+        executions = authority["executions"]
+        if not isinstance(executions, list) or len(executions) != 2:
+            raise ValueError(f"{context} {name} executions differ")
+        _terminal_validate_validator_execution(
+            executions[0], validator=validator, output=normal, arguments=[],
+            repository=repository, context=context + f" {name} normal",
+            live_system=live_system,
+        )
+        _terminal_validate_validator_execution(
+            executions[1], validator=validator, output=self_test,
+            arguments=["--self-test"], repository=repository,
+            context=context + f" {name} self-test", live_system=live_system,
+        )
+
+
+def _terminal_validate_current_lock_proof(
+    current: Mapping[str, Any], toolchain: Mapping[str, Any], context: str,
+    *, live_system: bool,
+) -> None:
+    candidates = _terminal_semantic_exact(
+        current.get("lock_candidates"), {"A", "C", "D"},
+        context + " candidates",
+    )
+    variants = current.get("lock_authority", {}).get(
+        "lock_manifest", {}
+    ).get("payload", {}).get("variants", {})
+    if not isinstance(variants, Mapping):
+        raise ValueError(f"{context} reviewed lock variants differ")
+    physical: list[tuple[int, int]] = []
+    for name in ("A", "C", "D"):
+        record = _terminal_semantic_exact(
+            candidates[name], CURRENT_IMMUTABLE_FILE_FIELDS,
+            context + f" candidate {name}",
+        )
+        identity = _terminal_semantic_exact(
+            record["identity"], CURRENT_IMMUTABLE_IDENTITY_FIELDS,
+            context + f" candidate {name} identity",
+        )
+        snapshot = schema.snapshot_regular_file(
+            Path(record["path"]), expected_mode=0o444
+        )
+        metadata = snapshot._stat
+        if (
+            Path(record["path"]).resolve(strict=True) != Path(record["path"])
+            or record["mode"] != 0o444
+            or record["sha256"] != snapshot.sha256
+            or record["size"] != snapshot.size
+            or record["path"] != variants.get(name, {}).get("final_lock_path")
+            or record["sha256"] != variants.get(name, {}).get("final_lock_sha256")
+            or identity != {
+                "changed_ns": metadata.st_ctime_ns, "device": snapshot.device,
+                "inode": snapshot.inode, "link_count": metadata.st_nlink,
+                "modified_ns": metadata.st_mtime_ns,
+            }
+        ):
+            raise ValueError(f"{context} candidate {name} live identity differs")
+        physical.append((snapshot.device, snapshot.inode))
+    if len(set(physical)) != 3 or candidates["A"]["sha256"] != schema.CURRENT_LOCK_SHA256:
+        raise ValueError(f"{context} lock candidate authority differs")
+    validation = _terminal_semantic_exact(
+        current.get("lock_authority_validation"),
+        {"execution_authority", "result", "semantic_validator"},
+        context + " validation",
+    )
+    tools = _terminal_semantic_exact(
+        validation["execution_authority"],
+        {"bwrap", "cargo", "git", "rustc", "rustup"},
+        context + " validation tools",
+    )
+    for name in ("bwrap", "cargo", "git", "rustc", "rustup"):
+        _terminal_current_tool(
+            tools[name], Path(toolchain[f"{name}_path"]),
+            toolchain[f"{name}_sha256"], context + f" validation {name}",
+            trusted=name in {"bwrap", "git", "rustup"},
+            live_system=live_system,
+        )
+    inputs = current.get("lock_authority_inputs")
+    result = validation["result"]
+    if (
+        validation["semantic_validator"]
+        != "descriptor-cross-bound-authority-context-v1"
+        or not isinstance(inputs, Mapping)
+        or result != {
+            "authority_sha256": inputs.get("authority", {}).get("sha256"),
+            "lock_manifest_sha256": inputs.get("lock_manifest", {}).get("sha256"),
+            "schema": "bn-31gp-current-lock-authority-validation-v1",
+            "status": "ok",
+        }
+    ):
+        raise ValueError(f"{context} validation result differs")
+
+
+def _terminal_validate_current_toolchain_identities(
+    current: Mapping[str, Any], toolchain: Mapping[str, Any], context: str
+) -> None:
+    values = current.get("toolchain_identities")
+    if not isinstance(values, list) or len(values) != 5:
+        raise ValueError(f"{context} cardinality differs")
+    records = [
+        _terminal_current_file_identity(value, context + f" {name}")
+        for name, value in zip(
+            ("bwrap", "cargo", "git", "rustc", "rustup"), values, strict=True
+        )
+    ]
+    if any(
+        record["path"] != toolchain[f"{name}_path"]
+        or record["sha256"] != toolchain[f"{name}_sha256"]
+        for name, record in zip(
+            ("bwrap", "cargo", "git", "rustc", "rustup"), records, strict=True
+        )
+    ):
+        raise ValueError(f"{context} toolchain crosslink differs")
+
+
+def _terminal_require_final_tool_inheritance(
+    base: Mapping[str, Any],
+    final: Mapping[str, Any],
+    artifacts: Mapping[str, Any],
+    context: str,
+) -> None:
+    expected = json.loads(json.dumps(base))
+    expected["tools"].update({
+        name: artifacts[name] for name in ("correctness", "fault")
+    })
+    if final != expected:
+        raise ValueError(f"{context} final tool inheritance differs")
+
+
+def _terminal_validate_current_tools(
+    current: Mapping[str, Any], current_root: Path, context: str
+) -> None:
+    path = current_root / "asterism-rebaseline-tools.json"
+    snapshot = schema.snapshot_regular_file(path, expected_mode=0o444)
+    value = schema.parse_canonical_json_object(snapshot.data, context)
+    inputs = current.get("inputs")
+    if not isinstance(inputs, list) or len(inputs) != 27:
+        raise ValueError(f"{context} base input topology differs")
+    base_identity = _terminal_current_file_identity(
+        inputs[22], context + " base manifest input"
+    )
+    base_path = Path(base_identity["path"])
+    base = schema.parse_canonical_json_object(
+        base_path.read_bytes(), context + " base manifest"
+    )
+    if (
+        current.get("tools_manifest_path") != str(path)
+        or current.get("tools_manifest_sha256") != snapshot.sha256
+        or set(value) != {"comm_allowlist", "schema", "support_files", "tools"}
+        or value.get("schema") != schema.TOOLS_MANIFEST_SCHEMA
+        or value.get("comm_allowlist") != schema.expected_comm_allowlist()
+        or base_identity["mode"] != 0o444
+        or base_path == path
+        or (
+            base_path.stat().st_dev,
+            base_path.stat().st_ino,
+        )
+        == (snapshot.device, snapshot.inode)
+        or set(base)
+        != {"comm_allowlist", "schema", "support_files", "tools"}
+        or base.get("schema") != schema.TOOLS_MANIFEST_SCHEMA
+        or base.get("comm_allowlist") != schema.expected_comm_allowlist()
+    ):
+        raise ValueError(f"{context} manifest authority differs")
+    tools = value.get("tools")
+    support = value.get("support_files")
+    base_tools = base.get("tools")
+    base_support = base.get("support_files")
+    if (
+        not isinstance(tools, Mapping)
+        or set(tools) != set(schema.PREPARED_TOOL_NAMES)
+        or not isinstance(support, Mapping)
+        or set(support) != set(schema.PREPARED_SUPPORT_FILE_NAMES)
+        or not isinstance(base_tools, Mapping)
+        or set(base_tools) != set(schema.PREPARED_TOOL_NAMES)
+        or not isinstance(base_support, Mapping)
+        or set(base_support) != set(schema.PREPARED_SUPPORT_FILE_NAMES)
+    ):
+        raise ValueError(f"{context} topology differs")
+    base_observed: list[tuple[Path, int, int]] = []
+    for name, raw in base_tools.items():
+        binding = _terminal_semantic_exact(
+            raw, set(schema.TOOL_BINDING_FIELDS),
+            context + f" base tool {name}",
+        )
+        if name in CURRENT_CHILD_PLACEHOLDER_BINDINGS:
+            if binding != CURRENT_CHILD_PLACEHOLDER_BINDINGS[name]:
+                raise ValueError(f"{context} base child placeholder differs")
+            continue
+        tool_path = Path(binding["path"])
+        tool_snapshot = schema.snapshot_regular_file(
+            tool_path, expected_mode=0o555
+        )
+        if (
+            binding["sha256"] != tool_snapshot.sha256
+            or binding["executable_mode"] != 0o555
+            or binding["comm"] != schema.PREPARED_TOOL_COMMS[name]
+        ):
+            raise ValueError(f"{context} base tool {name} differs")
+        base_observed.append(
+            (tool_path, tool_snapshot.device, tool_snapshot.inode)
+        )
+    for name, raw in base_support.items():
+        binding = _terminal_semantic_exact(
+            raw, set(schema.SUPPORT_FILE_FIELDS),
+            context + f" base support {name}",
+        )
+        support_path = Path(binding["path"])
+        support_snapshot = schema.snapshot_regular_file(
+            support_path, expected_mode=0o444
+        )
+        if (
+            binding["sha256"] != support_snapshot.sha256
+            or binding["mode"] != 0o444
+        ):
+            raise ValueError(f"{context} base support {name} differs")
+        base_observed.append(
+            (support_path, support_snapshot.device, support_snapshot.inode)
+        )
+    if (
+        len({item[0] for item in base_observed}) != len(base_observed)
+        or len({item[1:] for item in base_observed}) != len(base_observed)
+    ):
+        raise ValueError(f"{context} base files alias")
+    observed: list[tuple[Path, int, int]] = []
+    for name, raw in tools.items():
+        binding = _terminal_semantic_exact(
+            raw, set(schema.TOOL_BINDING_FIELDS), context + f" tool {name}"
+        )
+        tool_path = Path(binding["path"])
+        tool_snapshot = schema.snapshot_regular_file(
+            tool_path, expected_mode=0o555
+        )
+        if (
+            binding["sha256"] != tool_snapshot.sha256
+            or binding["executable_mode"] != 0o555
+            or not isinstance(binding["comm"], str)
+            or not binding["comm"]
+        ):
+            raise ValueError(f"{context} tool {name} differs")
+        observed.append((tool_path, tool_snapshot.device, tool_snapshot.inode))
+    for name, raw in support.items():
+        binding = _terminal_semantic_exact(
+            raw, set(schema.SUPPORT_FILE_FIELDS), context + f" support {name}"
+        )
+        support_path = Path(binding["path"])
+        support_snapshot = schema.snapshot_regular_file(
+            support_path, expected_mode=0o444
+        )
+        if binding["sha256"] != support_snapshot.sha256 or binding["mode"] != 0o444:
+            raise ValueError(f"{context} support {name} differs")
+        observed.append(
+            (support_path, support_snapshot.device, support_snapshot.inode)
+        )
+    if (
+        len({item[0] for item in observed}) != len(observed)
+        or len({item[1:] for item in observed}) != len(observed)
+        or current.get("artifacts") != {
+            "correctness": tools["correctness"], "fault": tools["fault"]
+        }
+        or tools["correctness"]["path"]
+        != str(current_root / "artifacts" / "tools" / "ast-rb-check")
+        or tools["fault"]["path"]
+        != str(current_root / "artifacts" / "tools" / "ast-rb-fault")
+        or tools["correctness"]["comm"] != "ast-rb-check"
+        or tools["fault"]["comm"] != "ast-rb-fault"
+    ):
+        raise ValueError(f"{context} final child tool crosslinks differ")
+    _terminal_require_final_tool_inheritance(
+        base, value, current["artifacts"], context
+    )
+
+
+def terminal_validate_current_build(
+    value: Any, *, name: str, directory: str, current: Mapping[str, Any],
+    current_root: Path, source_root: Path, toolchain: Mapping[str, Any],
+    replay: TerminalSemanticReplay, expected_source_manifest_sha256: str,
+) -> None:
+    child = name == "children"
+    context = f"terminal semantic current build {name} record"
+    record = _terminal_semantic_exact(value, CURRENT_CHILD_BUILD_FIELDS if child else CURRENT_BUILD_FIELDS, context)
+    authority = record["semantic_input_authority"]
+    environment = record["environment"]
+    if not isinstance(environment, Mapping) or set(environment) != (CURRENT_CHILD_ENV_FIELDS if child else CURRENT_RELEASE_ENV_FIELDS):
+        raise ValueError(f"{context} environment fields differ")
+    base = {
+        "CARGO_HOME": GUEST_CARGO_HOME, "CARGO_INCREMENTAL": "0", "CARGO_NET_OFFLINE": "true",
+        "GIT_CONFIG_COUNT": "0", "GIT_CONFIG_GLOBAL": f"{GUEST_ROOT}/absent-gitconfig", "GIT_CONFIG_NOSYSTEM": "1",
+        "HOME": "/nonexistent", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PATH": "/usr/bin:/bin",
+        "PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1", "RUSTC": GUEST_RUSTC,
+        "RUSTUP_HOME": "/nonexistent", "RUSTUP_TOOLCHAIN": toolchain["rustup_toolchain"], "TZ": "UTC",
+    }
+    if any(environment.get(field) != expected for field, expected in base.items()):
+        raise ValueError(f"{context} frozen environment differs")
+    if child:
+        compile_out = current.get("release_compile_out")
+        if not isinstance(compile_out, Mapping) or environment["ASTERISM_REBASELINE_CHILD_BUILD_NONCE"] != current["build_nonce"] or environment["ASTERISM_REBASELINE_EXPECTED_LIB_SOURCE"] != "crates/mess-store/src/lib.rs" or environment["ASTERISM_REBASELINE_PINNED_RUSTC"] != GUEST_RUSTC or environment["ASTERISM_REBASELINE_WRAPPER_RECEIPT"] != "/asterism/receipt/injection.json" or environment["RUSTC_WORKSPACE_WRAPPER"] != "/asterism/rustc_workspace_wrapper.py" or environment["ASTERISM_FAULT_COMPILE_OUT_IDENTICAL"] != "true" or environment["ASTERISM_FAULT_COMPILE_OUT_SCHEMA"] != "bn-2l3n-fault-compile-out-authority-v1" or environment["ASTERISM_FAULT_COMPILE_OUT_OVERLAY_RELEASE_SHA256"] != compile_out.get("overlay_release_sha256") or environment["ASTERISM_FAULT_COMPILE_OUT_PRISTINE_SHA256"] != compile_out.get("pristine_sha256") or environment["ASTERISM_FAULT_COMPILE_OUT_SYMBOL_ABSENCE_SHA256"] != compile_out.get("symbol_absence_sha256"):
+            raise ValueError(f"{context} wrapper environment differs")
+    else:
+        compile_out = current.get("release_compile_out")
+        approval = current.get("release_compile_out_approval")
+        lock_authority = current.get("lock_authority")
+        adapter_sha256 = sha256_file(source_root / CURRENT_ADAPTER_DESTINATION)
+        shared_entries = []
+        for shared_name in CURRENT_SHARED_NAMES:
+            shared_path = source_root / CURRENT_SHARED_DESTINATION / shared_name
+            shared_entries.append({"name": shared_name, "sha256": sha256_file(shared_path), "size": shared_path.stat().st_size})
+        shared_sha256 = hashlib.sha256(canonical_json_bytes({"entries": shared_entries, "schema": "asterism-rebaseline-shared-v3"})).hexdigest()
+        if not isinstance(compile_out, Mapping) or not isinstance(approval, Mapping) or not isinstance(lock_authority, Mapping) or environment["ASTERISM_BUILD_NONCE"] != current["build_nonce"] or environment["ASTERISM_BUILD_CARGO_LOCK_SHA256"] != sha256_file(source_root / "Cargo.lock") or environment["ASTERISM_BUILD_PRODUCT_COMMIT"] != current["product_commit"] or environment["ASTERISM_BUILD_PRODUCT_TREE"] != current["product_tree"] or environment["ASTERISM_BUILD_PROTOCOL"] != schema.PROTOCOL or environment["ASTERISM_BUILD_PROTOCOL_SHA256"] != schema.PROTOCOL_SHA256 or environment["ASTERISM_BUILD_BINARY_KIND"] != "public" or environment["ASTERISM_BUILD_TIMED_SURFACE"] != "public-event-store" or environment["ASTERISM_BUILD_VARIANT"] != "A" or environment["ASTERISM_BUILD_SOURCE_APPROVAL_SHA256"] != compile_out.get("preapproval_source_sentinel") or environment["ASTERISM_BUILD_SOURCE_APPROVAL_SHA256"] != approval.get("source_approval_sha256") or environment["ASTERISM_BUILD_TOOLING_COMMIT"] != lock_authority.get("tooling_commit") or environment["ASTERISM_BUILD_TOOLING_TREE"] != lock_authority.get("tooling_tree") or environment["ASTERISM_BUILD_ADAPTER_SHA256"] != adapter_sha256 or environment["ASTERISM_BUILD_SHARED_MANIFEST_SHA256"] != shared_sha256:
+            raise ValueError(f"{context} release environment differs")
+    search, preserved = _terminal_current_config(
+        record["cargo_config_prebuild"], authority, source_root,
+        Path(toolchain["cargo_home_path"]), context + " config",
+    )
+    if record["cargo_config_postbuild"] != record["cargo_config_prebuild"]:
+        raise ValueError(f"{context} config changed")
+    target = current_root / "targets" / directory
+    if record["target"] != str(target) or record["target_was_absent"] is not True:
+        raise ValueError(f"{context} target differs")
+    binds = _terminal_semantic_exact(record["binds"], {"target", "receipt"} if child else {"target"}, context + " binds")
+    target_bind = _terminal_semantic_exact(binds["target"], {"parent", "post", "pre"}, context + " target bind")
+    _terminal_current_directory(target_bind["parent"], target.parent, context + " target parent", live=False)
+    pre = _terminal_current_directory(target_bind["pre"], target, context + " target pre", live=False)
+    post = _terminal_current_directory(target_bind["post"], target, context + " target post", live=False)
+    if any(pre[field] != post[field] for field in ("device", "file_type", "inode", "permissions")):
+        raise ValueError(f"{context} target selection changed")
+    _terminal_final_bound_directory(
+        target_bind["parent"], target.parent, context + " target parent"
+    )
+    _terminal_final_bound_directory(post, target, context + " target")
+    if child:
+        receipt_root = current_root / "receipts" / directory
+        receipt_bind = _terminal_semantic_exact(binds["receipt"], {"parent", "post", "pre"}, context + " receipt bind")
+        _terminal_current_directory(receipt_bind["parent"], receipt_root.parent, context + " receipt parent", live=False)
+        receipt_pre = _terminal_current_directory(receipt_bind["pre"], receipt_root, context + " receipt pre", live=False)
+        receipt_post = _terminal_current_directory(receipt_bind["post"], receipt_root, context + " receipt post", live=False)
+        if any(receipt_pre[field] != receipt_post[field] for field in ("device", "file_type", "inode", "permissions")):
+            raise ValueError(f"{context} receipt selection changed")
+        _terminal_final_bound_directory(
+            receipt_bind["parent"], receipt_root.parent,
+            context + " receipt parent",
+        )
+        _terminal_final_bound_directory(
+            receipt_post, receipt_root, context + " receipt",
+        )
+    lock = _terminal_semantic_exact(record["lock_prebuild"], CURRENT_IMMUTABLE_FILE_FIELDS, context + " lock")
+    if record["lock_postbuild"] != lock:
+        raise ValueError(f"{context} lock changed")
+    lock_path = source_root / "Cargo.lock"
+    lock_identity = _terminal_semantic_exact(
+        lock["identity"], CURRENT_IMMUTABLE_IDENTITY_FIELDS,
+        context + " lock identity",
+    )
+    lock_metadata = lock_path.lstat()
+    expected_lock_identity = {
+        "changed_ns": lock_metadata.st_ctime_ns, "device": lock_metadata.st_dev,
+        "inode": lock_metadata.st_ino, "link_count": lock_metadata.st_nlink,
+        "modified_ns": lock_metadata.st_mtime_ns,
+    }
+    if lock_identity != expected_lock_identity or lock["path"] != str(lock_path) or lock["mode"] != 0o444 or lock["sha256"] != sha256_file(lock_path) or lock["size"] != lock_metadata.st_size:
+        raise ValueError(f"{context} lock authority differs")
+    if record["source_manifest_sha256"] != expected_source_manifest_sha256:
+        raise ValueError(f"{context} source manifest differs")
+    manifest = _terminal_semantic_exact(record["toolchain_manifest"], {"entry_count", "equal_pre_post", "path", "post_sha256", "pre_sha256"}, context + " toolchain manifest")
+    semantic_toolchain = authority["toolchain"]
+    if manifest != {"entry_count": semantic_toolchain["entry_count"], "equal_pre_post": True, "path": semantic_toolchain["manifest_path"], "post_sha256": semantic_toolchain["manifest_sha256"], "pre_sha256": semantic_toolchain["manifest_sha256"]}:
+        raise ValueError(f"{context} toolchain semantic crosslink differs")
+    tools = _terminal_semantic_exact(record["execution_tools"], {"bwrap", "cargo", "python", "rustc", "toolchain_root"}, context + " tools")
+    bwrap = _terminal_current_tool(tools["bwrap"], Path(toolchain["bwrap_path"]), toolchain["bwrap_sha256"], context + " bwrap", trusted=True, live_system=replay.live_system)
+    _terminal_current_tool(tools["cargo"], Path(toolchain["cargo_path"]), toolchain["cargo_sha256"], context + " cargo", trusted=False, live_system=replay.live_system)
+    _terminal_current_tool(tools["rustc"], Path(toolchain["rustc_path"]), toolchain["rustc_sha256"], context + " rustc", trusted=False, live_system=replay.live_system)
+    _terminal_current_tool(tools["python"], CURRENT_SYSTEM_PYTHON, None, context + " python", trusted=True, live_system=replay.live_system)
+    _terminal_current_directory(tools["toolchain_root"], Path(toolchain["cargo_path"]).parent.parent, context + " toolchain root", live=True)
+    examples = ("asterism_rebaseline_current_correctness", "asterism_rebaseline_current_fault") if child else ("asterism_rebaseline_public",)
+    artifacts = record["artifacts"]
+    if not isinstance(artifacts, Mapping) or set(artifacts) != set(examples):
+        raise ValueError(f"{context} artifact topology differs")
+    target_descriptor = _terminal_bound_descriptor(record["argv"], GUEST_TARGET, context + " target")
+    for example in examples:
+        artifact = _terminal_semantic_exact(artifacts[example], {"binding", "source"}, context + " artifact")
+        binding = _terminal_semantic_exact(artifact["binding"], set(schema.TOOL_BINDING_FIELDS), context + " binding")
+        source = _terminal_bound_file_identity(
+            artifact["source"], target / "release" / "examples" / example,
+            f"/proc/self/fd/{target_descriptor}/release/examples/{example}",
+            context + " artifact source", executable=True,
+        )
+        published = schema.snapshot_regular_file(Path(binding["path"]), expected_mode=0o555)
+        expected_published = (
+            current_root / "artifacts" / "tools"
+            / ("ast-rb-check" if example.endswith("correctness") else "ast-rb-fault")
+            if child
+            else current_root / "artifacts" / "release"
+            / ("hooked-A" if name == "hooked_release" else "pristine-A")
+        )
+        if binding["sha256"] != published.sha256 or binding["executable_mode"] != 0o555 or not isinstance(binding["comm"], str) or not binding["comm"] or Path(binding["path"]) != expected_published or binding["comm"] != expected_published.name or source["sha256"] != binding["sha256"]:
+            raise ValueError(f"{context} artifact copy differs")
+    if child and current.get("artifacts") != {"correctness": artifacts[examples[0]]["binding"], "fault": artifacts[examples[1]]["binding"]}:
+        raise ValueError(f"{context} published artifacts differ")
+    execution = _terminal_semantic_exact(record["execution"], CURRENT_EXECUTION_FIELDS, context + " execution")
+    argv = record["argv"]
+    if not isinstance(argv, list) or any(not isinstance(item, str) for item in argv) or execution["argv"] != argv or execution["cwd"] != str(current_root) or execution["environment"] != environment or execution["execution_authority"] != bwrap or execution["exit_status"] != 0 or any(not terminal_is_integer(execution[field]) or execution[field] < 0 for field in ("stderr_bytes", "stdout_bytes")) or not terminal_is_sha256(execution["stderr_sha256"]) or not terminal_is_sha256(execution["stdout_sha256"]):
+        raise ValueError(f"{context} execution differs")
+    log_path = current_root / "logs" / f"cargo-build-{directory}.json"
+    log_snapshot = schema.snapshot_regular_file(log_path, expected_mode=0o444)
+    if schema.parse_canonical_json_object(
+        log_snapshot.data, context + " execution log"
+    ) != execution:
+        raise ValueError(f"{context} execution log sidecar differs")
+    prefix = [toolchain["bwrap_path"], "--die-with-parent", "--new-session", "--unshare-net", "--dir", "/usr"]
+    if argv[:len(prefix)] != prefix:
+        raise ValueError(f"{context} sandbox prefix differs")
+    offset = len(prefix); descriptors: list[str] = []
+    def consume(operation: str, destination: str) -> None:
+        nonlocal offset
+        segment = argv[offset:offset + 3]; descriptor = segment[1] if len(segment) == 3 else ""
+        if len(segment) != 3 or segment[0] != operation or segment[2] != destination or not descriptor.isascii() or not descriptor.isdecimal() or str(int(descriptor)) != descriptor or int(descriptor) < 3:
+            raise ValueError(f"{context} sandbox binding differs: {destination}")
+        descriptors.append(descriptor); offset += 3
+    for _host, guest in TRUSTED_SYSTEM_MOUNTS: consume("--ro-bind-fd", guest)
+    aliases = ["--symlink", "usr/bin", "/bin", "--symlink", "usr/lib", "/lib", "--symlink", "usr/lib", "/lib64"]
+    if argv[offset:offset + len(aliases)] != aliases: raise ValueError(f"{context} system aliases differ")
+    offset += len(aliases)
+    private = ["--dir", "/dev", "--dir", "/proc", "--tmpfs", "/tmp", "--tmpfs", GUEST_ROOT]
+    if argv[offset:offset + len(private)] != private: raise ValueError(f"{context} private namespace differs")
+    offset += len(private)
+    for operation, destination in (("--ro-bind-fd", GUEST_SOURCE), ("--ro-bind-fd", GUEST_TOOLCHAIN_ROOT), ("--ro-bind-fd", GUEST_CARGO), ("--ro-bind-fd", GUEST_RUSTC), ("--ro-bind-fd", f"{GUEST_ROOT}/python3")): consume(operation, destination)
+    source_prefix = ["--dir", f"{GUEST_SOURCE}/.cargo", "--tmpfs", f"{GUEST_SOURCE}/.cargo"]
+    if argv[offset:offset + len(source_prefix)] != source_prefix: raise ValueError(f"{context} source config differs")
+    offset += len(source_prefix)
+    for entry in preserved["source"]: consume("--ro-bind-data" if entry["type"] == "regular" else "--ro-bind-fd", f"{GUEST_SOURCE}/.cargo/{entry['name']}")
+    for entry in search["entries"][:2]:
+        if entry["status"] == "present": consume("--ro-bind-data", entry["path"])
+    if argv[offset:offset + 2] != ["--remount-ro", f"{GUEST_SOURCE}/.cargo"]: raise ValueError(f"{context} source remount differs")
+    offset += 2
+    if argv[offset:offset + 2] != ["--dir", GUEST_CARGO_HOME]: raise ValueError(f"{context} Cargo-home differs")
+    offset += 2; consume("--ro-bind-fd", GUEST_CARGO_HOME)
+    for entry in search["entries"][6:]:
+        if entry["status"] == "present": consume("--ro-bind-data", entry["path"])
+    cargo_tail = ["--remount-ro", GUEST_CARGO_HOME, "--dir", f"{GUEST_ROOT}/.cargo", "--tmpfs", f"{GUEST_ROOT}/.cargo", "--remount-ro", f"{GUEST_ROOT}/.cargo", "--dir", "/.cargo", "--tmpfs", "/.cargo", "--remount-ro", "/.cargo"]
+    if argv[offset:offset + len(cargo_tail)] != cargo_tail: raise ValueError(f"{context} private config roots differ")
+    offset += len(cargo_tail); consume("--bind-fd", GUEST_TARGET)
+    if child:
+        consume("--ro-bind-fd", f"{GUEST_ROOT}/rustc_workspace_wrapper.py"); consume("--bind-fd", f"{GUEST_ROOT}/receipt")
+    suffix = ["--chdir", GUEST_SOURCE, GUEST_CARGO, "build", "--locked", "--offline", "--release", "-p", "mess-store"]
+    for example in examples: suffix.extend(("--example", example))
+    suffix.extend(("--target-dir", GUEST_TARGET))
+    if argv[offset:] != suffix or len(descriptors) != len(set(descriptors)): raise ValueError(f"{context} descriptor/command differs")
+    # Besides argv-bound descriptors, run_capture inherits the source Cargo
+    # guard, bwrap lease, and each unbound preserved Cargo-home child.
+    if execution["passed_file_descriptors"] != len(descriptors) + 2 + len(preserved["cargo-home"]): raise ValueError(f"{context} passed descriptor cardinality differs")
+    filesystem = _terminal_semantic_exact(record["filesystem_admission"], set(schema.FILESYSTEM_ADMISSION_FIELDS), context + " filesystem")
+    admissions = current.get("prebuild_filesystem_admissions")
+    if filesystem["schema"] != schema.FILESYSTEM_ADMISSION_SCHEMA or filesystem["checked_path"] != str(current_root.parent) or filesystem["filesystem"] != schema.REQUIRED_FILESYSTEM_TYPE or filesystem["minimum_available_bytes"] != schema.MIN_FREE_BYTES or filesystem["minimum_available_inodes"] != schema.MIN_FREE_INODES or not isinstance(admissions, Mapping) or set(admissions) != {"children", "hooked_release", "pristine_release"} or admissions.get(name) != filesystem or filesystem["available_bytes"] < schema.MIN_FREE_BYTES or filesystem["available_inodes"] < schema.MIN_FREE_INODES or any(not terminal_is_integer(filesystem[field]) or filesystem[field] < 0 for field in ("available_bytes", "available_inodes", "minimum_available_bytes", "minimum_available_inodes")):
+        raise ValueError(f"{context} filesystem differs")
+    if child:
+        receipt = _terminal_semantic_exact(record["wrapper_receipt"], {"build_nonce", "crate_name", "crate_type", "injected_arguments", "original_argv_sha256", "package", "rustc", "schema", "source"}, context + " receipt")
+        if receipt["schema"] != "bn-30fs-rustc-workspace-wrapper-receipt-v1" or receipt["build_nonce"] != current["build_nonce"] or receipt["crate_name"] != "mess_store" or receipt["package"] != "mess-store" or receipt["crate_type"] != "lib" or receipt["rustc"] != GUEST_RUSTC or receipt["source"] != "crates/mess-store/src/lib.rs" or receipt["injected_arguments"] != ["--cfg", "test", "--allow", "explicit_builtin_cfgs_in_flags", "--cfg", "asterism_rebaseline_correctness", "--check-cfg", "cfg(asterism_rebaseline_correctness)"] or not terminal_is_sha256(receipt["original_argv_sha256"]):
+            raise ValueError(f"{context} receipt differs")
+        receipt_path = current_root / "receipts" / directory / "injection.json"
+        if schema.parse_canonical_json_object(receipt_path.read_bytes(), context + " receipt payload") != receipt:
+            raise ValueError(f"{context} receipt payload differs")
+        receipt_descriptor = _terminal_bound_descriptor(record["argv"], f"{GUEST_ROOT}/receipt", context + " receipt")
+        receipt_identity = _terminal_bound_file_identity(
+            record["wrapper_receipt_identity"], receipt_path,
+            f"/proc/self/fd/{receipt_descriptor}/injection.json",
+            context + " receipt identity", executable=False,
+        )
+        wrapper = _terminal_current_file_identity(record["wrapper_input_identity"], context + " wrapper identity")
+        if record["wrapper_receipt_sha256"] != receipt_identity["sha256"] or receipt_identity["mode"] != 0o444 or wrapper["path"] != str(current_root / "inputs" / "rustc_workspace_wrapper.py") or wrapper["mode"] & 0o111 == 0:
+            raise ValueError(f"{context} wrapper identity differs")
+
+
+def replay_terminal_semantic_chain(
+    current: Mapping[str, Any],
+    assertion: Mapping[str, Any],
+    lock_authority: Mapping[str, Any],
+    prepared: Mapping[str, Any],
+    replay: TerminalSemanticReplay,
+) -> None:
+    if not isinstance(current, Mapping) or set(current) != CURRENT_CHILDREN_FIELDS:
+        replay.errors.append("terminal semantic current-child v2 fields differ")
+        return
+    if current.get("schema") != CURRENT_CHILDREN_SCHEMA:
+        replay.errors.append("terminal semantic current-child schema differs")
+    current_path = assertion.get("inputs", {}).get("current_children_attestation", {}).get("path")
+    builds = current.get("builds")
+    expected_builds = {"children": "children", "hooked_release": "hooked-release", "pristine_release": "pristine-release"}
+    if not isinstance(current_path, str) or not isinstance(builds, Mapping) or set(builds) != set(expected_builds):
+        replay.errors.append("terminal semantic current build topology differs")
+    else:
+        materialized = Path(current_path).parent / "materialized"
+        construction = replay.capture(
+            "terminal semantic current construction",
+            lambda: terminal_validate_current_construction(
+                current, Path(current_path).parent,
+                "terminal semantic current construction",
+            ),
+        )
+        construction_manifests = construction if isinstance(construction, Mapping) else {}
+        toolchain = replay.capture(
+            "terminal semantic current toolchain",
+            lambda: terminal_validate_toolchain(
+                current.get("toolchain"), "terminal semantic current toolchain"
+            ),
+        )
+        replay.capture(
+            "terminal semantic current inputs",
+            lambda: _terminal_validate_current_inputs(
+                current, Path(current_path).parent,
+                "terminal semantic current inputs",
+            ),
+        )
+        replay.capture(
+            "terminal semantic current Cargo config authority",
+            lambda: _terminal_validate_current_cargo_authority(
+                current, "terminal semantic current Cargo config authority"
+            ),
+        )
+        replay.capture(
+            "terminal semantic current validator authorities",
+            lambda: _terminal_validate_current_validator_authorities(
+                current, "terminal semantic current validator authorities",
+                live_system=replay.live_system,
+            ),
+        )
+        replay.capture(
+            "terminal semantic current tools manifest",
+            lambda: _terminal_validate_current_tools(
+                current, Path(current_path).parent,
+                "terminal semantic current tools manifest",
+            ),
+        )
+        replay.capture(
+            "terminal semantic current recursive freeze",
+            lambda: _terminal_validate_current_output_freeze(
+                Path(current_path).parent,
+                "terminal semantic current recursive freeze",
+            ),
+        )
+        if toolchain is not None:
+            replay.capture(
+                "terminal semantic current lock proof",
+                lambda: _terminal_validate_current_lock_proof(
+                    current, toolchain, "terminal semantic current lock proof",
+                    live_system=replay.live_system,
+                ),
+            )
+            replay.capture(
+                "terminal semantic current toolchain identities",
+                lambda: _terminal_validate_current_toolchain_identities(
+                    current, toolchain,
+                    "terminal semantic current toolchain identities",
+                ),
+            )
+        for name, directory in expected_builds.items():
+            build = builds[name]
+            replay.capture(
+                f"terminal semantic current {name} materialized manifest",
+                lambda directory=directory, name=name: _terminal_materialized_manifest_sidecar(
+                    Path(current_path).parent,
+                    directory,
+                    materialized / directory,
+                    construction_manifests.get(name, ""),
+                    f"terminal semantic current {name} materialized manifest",
+                ),
+            )
+            if toolchain is not None:
+                replay.capture(
+                    f"terminal semantic current {name} producer record",
+                    lambda build=build, name=name, directory=directory: terminal_validate_current_build(
+                        build,
+                        name=name,
+                        directory=directory,
+                        current=current,
+                        current_root=Path(current_path).parent,
+                        source_root=materialized / directory,
+                        toolchain=toolchain,
+                        replay=replay,
+                        expected_source_manifest_sha256=construction_manifests.get(
+                            name, ""
+                        ),
+                    ),
+                )
+            replay.capture(
+                f"terminal semantic current {name}",
+                lambda build=build, name=name, directory=directory: replay.validate(
+                    build.get("semantic_input_authority"),
+                    f"terminal semantic current {name}",
+                    roots=TerminalSemanticReplay.roots(
+                        materialized / directory, current.get("toolchain"),
+                        f"terminal semantic current {name}",
+                    ),
+                ),
+            )
+        if builds["hooked_release"].get("environment") != builds[
+            "pristine_release"
+        ].get("environment"):
+            replay.errors.append(
+                "terminal semantic current release environments differ"
+            )
+    lock_manifest = lock_authority.get("lock_manifest")
+    payload = lock_manifest.get("payload") if isinstance(lock_manifest, Mapping) else None
+    variants = payload.get("variants") if isinstance(payload, Mapping) else None
+    toolchain = payload.get("toolchain") if isinstance(payload, Mapping) else None
+    source_plan_value = payload.get("source_plan_path") if isinstance(payload, Mapping) else None
+    try:
+        source_plan = Path(source_plan_value).resolve(strict=True)
+        repository = source_plan.parents[3]
+    except (IndexError, OSError, RuntimeError, TypeError) as error:
+        replay.errors.append(f"terminal semantic source-plan topology differs: {error}")
+        return
+    if (
+        not isinstance(variants, Mapping) or set(variants) != set(schema.VARIANTS)
+        or not isinstance(toolchain, Mapping) or toolchain != current.get("toolchain")
+        or source_plan_value != str(source_plan)
+        or source_plan != repository / "spikes/asterism_rebaseline/tooling/source-plan.json"
+    ):
+        replay.errors.append("terminal semantic resolver topology differs")
+        return
+    replay.capture(
+        "terminal semantic resolver toolchain",
+        lambda: terminal_validate_toolchain(
+            toolchain, "terminal semantic resolver toolchain"
+        ),
+    )
+    current_lock = variants.get("A", {}).get("historical_lock", {})
+    current_lock_sha256 = current_lock.get("sha256") if isinstance(current_lock, Mapping) else None
+    if not terminal_is_sha256(current_lock_sha256):
+        replay.errors.append("terminal semantic current lock differs")
+        return
+    tracked_fields = SEMANTIC_RESOLUTION_FIELDS - {
+        "execution_authority", "lock_output", "passed_file_descriptors",
+        "semantic_input_authority",
+    }
+    output_roots: set[Path] = set()
+    for variant in schema.VARIANTS:
+        claim = variants[variant]
+        if not isinstance(claim, Mapping):
+            replay.errors.append(f"terminal semantic claim {variant} differs")
+            continue
+        try:
+            final_lock = Path(claim.get("final_lock_path")).resolve(strict=True)
+            output_root = final_lock.parents[1]
+            source_root = (output_root / "materialized" / variant).resolve(strict=True)
+            final_snapshot = schema.snapshot_regular_file(final_lock, expected_mode=0o444)
+        except (IndexError, OSError, RuntimeError, TypeError, ValueError) as error:
+            replay.errors.append(f"terminal semantic {variant} final-lock topology differs: {error}")
+            continue
+        output_roots.add(output_root)
+        config_path = output_root / "manifests" / f"cargo-config-{variant}.json"
+        if (
+            claim.get("final_lock_path") != str(final_lock)
+            or final_lock != output_root / "locks" / f"Cargo-{variant}.lock"
+            or not terminal_is_sha256(claim.get("final_lock_sha256"))
+            or final_snapshot.sha256 != claim.get("final_lock_sha256")
+        ):
+            replay.errors.append(f"terminal semantic {variant} final-lock authority differs")
+        current_attempt = claim.get("current_lock_attempt")
+        resolver = claim.get("resolver")
+        if variant in {"A", "B"}:
+            historical = claim.get("historical_lock")
+            try:
+                tracked_source = Path(resolver.get("host_source_root")).resolve(strict=True)
+                tracked_cwd = Path(resolver.get("cwd")).resolve(strict=True)
+            except (AttributeError, OSError, RuntimeError, TypeError) as error:
+                replay.errors.append(f"terminal tracked resolver {variant} roots differ: {error}")
+                continue
+            if (
+                current_attempt is not None or not isinstance(resolver, Mapping)
+                or set(resolver) != tracked_fields or resolver.get("resolver_kind") != "tracked_git_readback"
+                or resolver.get("toolchain") != toolchain
+                or resolver.get("environment") != terminal_frozen_cargo_environment(toolchain)
+                or type(resolver.get("exit_status")) is not int or resolver.get("exit_status") != 0
+                or resolver.get("host_source_root") != str(tracked_source) or tracked_source != source_root
+                or resolver.get("cwd") != str(repository) or tracked_cwd != repository
+                or not isinstance(resolver.get("cargo_config_search"), Mapping)
+                or resolver["cargo_config_search"].get("path") != str(config_path)
+                or not isinstance(historical, Mapping) or set(historical) != {"commit", "path", "sha256"}
+                or resolver.get("argv") != [toolchain.get("git_path"), "-C", str(repository), "show", f"{historical.get('commit')}:{historical.get('path')}"]
+                or not isinstance(resolver.get("stdout"), str)
+                or resolver.get("stdout_sha256") != hashlib.sha256(resolver.get("stdout", "").encode()).hexdigest()
+                or resolver.get("stdout_sha256") != historical.get("sha256")
+                or resolver.get("stdout_sha256") != claim.get("final_lock_sha256")
+                or resolver.get("stderr") != "" or resolver.get("stderr_sha256") != EMPTY_SHA256
+            ):
+                replay.errors.append(f"terminal tracked resolver {variant} replay differs")
+            validate_terminal_release_cargo_config(
+                {"cargo_config_search": resolver.get("cargo_config_search"), "materialized_root": str(source_root), "toolchain": toolchain},
+                f"terminal tracked resolver {variant}", replay.errors,
+            )
+            continue
+        for label, record in (("current", current_attempt), ("generated", resolver)):
+            context = f"terminal resolver {variant} {label}"
+            if not isinstance(record, Mapping) or set(record) != SEMANTIC_RESOLUTION_FIELDS:
+                replay.errors.append(f"{context} fields differ")
+                continue
+            cargo_arguments = ["metadata", "--locked", "--offline", "--format-version", "1", "--no-deps"] if label == "current" else ["generate-lockfile", "--offline"]
+            replay.capture(context + " argv", lambda record=record, cargo_arguments=cargo_arguments, context=context: validate_terminal_resolution_argv(record.get("argv"), toolchain, cargo_arguments, context))
+            for stream in ("stdout", "stderr"):
+                value = record.get(stream)
+                if not isinstance(value, str) or record.get(stream + "_sha256") != hashlib.sha256(value.encode()).hexdigest():
+                    replay.errors.append(f"{context} {stream} differs")
+            execution = record.get("execution_authority")
+            mode = execution.get("mode") if isinstance(execution, Mapping) else None
+            if not terminal_is_integer(mode) or mode & 0o111 == 0 or execution.get("path") != toolchain.get("bwrap_path") or execution.get("sha256") != toolchain.get("bwrap_sha256"):
+                replay.errors.append(f"{context} bwrap authority differs")
+            else:
+                validate_terminal_release_file(execution, context + " retained bwrap", replay.errors, expected_mode=mode)
+            cargo_config = record.get("cargo_config_search")
+            if (
+                record.get("resolver_kind") != "sandboxed_cargo_resolution"
+                or record.get("toolchain") != toolchain or record.get("cwd") != GUEST_SOURCE
+                or record.get("exit_status") != 0 or record.get("passed_file_descriptors") != 13
+                or record.get("host_source_root") != str(source_root)
+                or not isinstance(cargo_config, Mapping) or cargo_config.get("path") != str(config_path)
+                or record.get("environment") != terminal_sandboxed_cargo_environment(toolchain)
+            ):
+                replay.errors.append(f"{context} execution authority differs")
+            validate_terminal_release_cargo_config(
+                {"cargo_config_search": cargo_config, "materialized_root": str(source_root), "toolchain": toolchain},
+                context, replay.errors,
+            )
+            lock_path = str(source_root / "Cargo.lock")
+            expected_lock = (
+                {boundary: {"path": lock_path, "sha256": current_lock_sha256, "status": "present"} for boundary in ("pre", "post")}
+                if label == "current"
+                else {"pre": {"path": lock_path, "sha256": None, "status": "absent"}, "post": {"path": lock_path, "sha256": claim.get("final_lock_sha256"), "status": "present"}}
+            )
+            if record.get("lock_output") != expected_lock:
+                replay.errors.append(f"{context} lock transition differs")
+            if label == "generated":
+                try:
+                    live_lock = schema.snapshot_regular_file(source_root / "Cargo.lock", expected_mode=None)
+                    if live_lock.sha256 != claim.get("final_lock_sha256"):
+                        replay.errors.append(f"{context} live lock differs")
+                except (OSError, ValueError) as error:
+                    replay.errors.append(f"{context} live lock differs: {error}")
+            replay.capture(
+                context,
+                lambda record=record, source_root=source_root, context=context: replay.validate(
+                    record.get("semantic_input_authority"), context,
+                    roots=TerminalSemanticReplay.roots(source_root, toolchain, context),
+                    source_role="resolution_source_without_cargo_lock",
+                ),
+            )
+    if len(output_roots) != 1:
+        replay.errors.append("terminal semantic resolver output roots differ")
+    variants_value = prepared.get("variants")
+    if not isinstance(variants_value, Mapping) or set(variants_value) != set(schema.VARIANTS):
+        replay.errors.append("terminal semantic prepared topology differs")
+        return
+    for variant in schema.VARIANTS:
+        attestation = variants_value[variant].get("attestation")
+        context = f"terminal semantic prepared {variant}"
+        prepared_toolchain = replay.capture(
+            context + " toolchain",
+            lambda attestation=attestation, context=context: terminal_validate_toolchain(
+                attestation.get("toolchain"), context + " toolchain"
+            ),
+        )
+        if prepared_toolchain is None:
+            continue
+        replay.capture(
+            context,
+            lambda attestation=attestation, context=context: replay.validate(
+                attestation.get("semantic_input_authority"), context,
+                roots=TerminalSemanticReplay.roots(
+                    Path(attestation.get("materialized_root")),
+                    prepared_toolchain, context,
+                ),
+            ),
+        )
+
+
 def terminal_authority_object(
     value: Any,
     fields: Any,
@@ -356,6 +3100,8 @@ def validate_terminal_source_review_semantics(
     if not terminal_is_sha256(source_review.get("assertion_sha256")):
         errors.append("terminal source-review assertion hash is invalid")
     for name, expected_schema in schema.SOURCE_REVIEW_CONTENT_SCHEMAS.items():
+        if name == "current_children_attestation":
+            expected_schema = CURRENT_CHILDREN_SCHEMA
         binding = terminal_authority_object(
             source_review.get(name),
             schema.SOURCE_REVIEW_CONTENT_BINDING_FIELDS,
@@ -534,8 +3280,7 @@ def validate_terminal_source_review_semantics(
         },
     }
     if (
-        current_children.get("schema")
-        != schema.SOURCE_REVIEW_CONTENT_SCHEMAS["current_children_attestation"]
+        current_children.get("schema") != CURRENT_CHILDREN_SCHEMA
         or current_children.get("protocol") != schema.PROTOCOL
         or current_children.get("protocol_sha256") != schema.PROTOCOL_SHA256
         or current_children.get("status") != "ok"
@@ -889,7 +3634,10 @@ def validate_terminal_release_cargo_config(
 
 
 def validate_terminal_release_sandbox(
-    attestation: Mapping[str, Any], context: str, errors: list[str]
+    attestation: Mapping[str, Any],
+    context: str,
+    semantic_runtime_sha256: Any,
+    errors: list[str],
 ) -> str | None:
     argv = attestation.get("build_argv")
     toolchain = attestation.get("toolchain")
@@ -906,13 +3654,25 @@ def validate_terminal_release_sandbox(
         "--die-with-parent",
         "--new-session",
         "--unshare-net",
-        "--ro-bind",
-        "/",
-        "/",
-        "--dev-bind",
+        "--dir",
+        "/usr",
+    ]
+    system_bindings = tuple(
+        ("--ro-bind-fd", guest) for _host, guest in TRUSTED_SYSTEM_MOUNTS
+    )
+    private = [
+        "--symlink",
+        "usr/bin",
+        "/bin",
+        "--symlink",
+        "usr/lib",
+        "/lib",
+        "--symlink",
+        "usr/lib",
+        "/lib64",
+        "--dir",
         "/dev",
-        "/dev",
-        "--proc",
+        "--dir",
         "/proc",
         "--tmpfs",
         "/tmp",
@@ -938,7 +3698,6 @@ def validate_terminal_release_sandbox(
         ("--ro-bind-fd", GUEST_CARGO),
         ("--ro-bind-fd", GUEST_RUSTC),
         ("--ro-bind-fd", GUEST_CARGO_HOME),
-        ("--ro-bind-fd", GUEST_RUSTUP_HOME),
     )
     source_config = tuple(
         ("--ro-bind-fd", path) for path in GUEST_BOUND_CONFIG_PATHS[:2]
@@ -966,6 +3725,8 @@ def validate_terminal_release_sandbox(
     ]
     expected_length = (
         len(prefix)
+        + 3 * len(system_bindings)
+        + len(private)
         + 3 * len(core_bindings)
         + len(middle)
         + 3 * len(source_config)
@@ -1002,6 +3763,13 @@ def validate_terminal_release_sandbox(
             current += 3
         return current
 
+    offset = consume(system_bindings, offset)
+    if offset is None:
+        return None
+    if argv[offset : offset + len(private)] != private:
+        errors.append(f"{context} private namespace differs")
+        return None
+    offset += len(private)
     offset = consume(core_bindings, offset)
     if offset is None:
         return None
@@ -1038,11 +3806,15 @@ def validate_terminal_release_sandbox(
     )
     if cargo_config_sha256 is None:
         return None
+    if not terminal_is_sha256(semantic_runtime_sha256):
+        errors.append(f"{context} semantic runtime hash is invalid")
+        return None
     return hashlib.sha256(
         canonical_json_bytes(
             {
                 "argv": normalized,
                 "cargo_config_search_sha256": cargo_config_sha256,
+                "semantic_runtime_sha256": semantic_runtime_sha256,
             }
         )
     ).hexdigest()
@@ -1428,6 +4200,7 @@ def validate_terminal_release_proof_semantics(
     approval: Mapping[str, Any],
     current_children: Mapping[str, Any],
     config: Mapping[str, Any] | None,
+    semantic_replay: TerminalSemanticReplay,
     errors: list[str],
 ) -> str | None:
     """Independently replay the real-approval compile-out proof."""
@@ -1536,9 +4309,9 @@ def validate_terminal_release_proof_semantics(
         if build is None:
             continue
         attestation_fields = (
-            schema.RELEASE_COMPILE_OUT_ORDINARY_ATTESTATION_FIELDS
+            TERMINAL_RELEASE_ORDINARY_ATTESTATION_FIELDS
             if name == "ordinary_a"
-            else schema.RELEASE_COMPILE_OUT_OVERLAY_ATTESTATION_FIELDS
+            else TERMINAL_RELEASE_OVERLAY_ATTESTATION_FIELDS
         )
         attestation = terminal_authority_object(
             build.get("attestation"),
@@ -1559,8 +4332,41 @@ def validate_terminal_release_proof_semantics(
             errors.append(f"{context} equivalence binding differs")
         build_env = attestation.get("build_env")
         toolchain = attestation.get("toolchain")
+        validated_toolchain = semantic_replay.capture(
+            context + " toolchain",
+            lambda toolchain=toolchain, context=context: terminal_validate_toolchain(
+                toolchain, context + " toolchain"
+            ),
+        )
+        if (
+            validated_toolchain is not None
+            and validated_toolchain != current_children.get("toolchain")
+        ):
+            errors.append(f"{context} toolchain differs from current authority")
+        if name == "ordinary_a" and attestation == prepared_attestation:
+            semantic_runtime = attestation.get(
+                "semantic_input_authority", {}
+            ).get("runtime_sha256")
+            if semantic_runtime not in semantic_replay.runtimes:
+                errors.append(
+                    "terminal ordinary A semantic authority was not replayed "
+                    "as prepared A"
+                )
+        else:
+            semantic_runtime = semantic_replay.capture(
+                f"{context} semantic authority",
+                lambda: semantic_replay.validate(
+                    attestation.get("semantic_input_authority"),
+                    f"{context} semantic authority",
+                    roots=TerminalSemanticReplay.roots(
+                        Path(str(attestation.get("materialized_root"))),
+                        toolchain,
+                        f"{context} semantic authority",
+                    ),
+                ),
+            )
         sandbox_sha256 = validate_terminal_release_sandbox(
-            attestation, context, errors
+            attestation, context, semantic_runtime, errors
         )
         build_event = validate_terminal_release_build_child(
             attestation, context, errors
@@ -1768,6 +4574,8 @@ def validate_terminal_local_source_release(
     prepared_path: Path,
     config: Mapping[str, Any] | None,
     errors: list[str],
+    *,
+    live_system: bool,
 ) -> str | None:
     """Independently replay prepared source review and release authority."""
 
@@ -1872,6 +4680,16 @@ def validate_terminal_local_source_release(
     )
     if assertion is None:
         return None
+    semantic_replay = TerminalSemanticReplay(
+        errors, live_system=live_system
+    )
+    replay_terminal_semantic_chain(
+        payloads["current_children_attestation"],
+        assertion,
+        payloads["lock_authority"],
+        prepared,
+        semantic_replay,
+    )
     inputs = assertion.get("inputs")
     if isinstance(inputs, Mapping):
         for name in (
@@ -1911,20 +4729,25 @@ def validate_terminal_local_source_release(
     )
     if not isinstance(proof, Mapping):
         return None
-    return validate_terminal_release_proof_semantics(
+    overlay_path = validate_terminal_release_proof_semantics(
         proof,
         prepared,
         approval,
         payloads["current_children_attestation"],
         config,
+        semantic_replay,
         errors,
     )
+    semantic_replay.finalize()
+    return overlay_path
 
 
 def validate_terminal_tools_authority(
     output_dir: Path,
     prepared: Mapping[str, Any] | None,
     errors: list[str],
+    *,
+    synthetic: bool,
 ) -> str | None:
     prepared_path = output_dir / "prepared-artifacts.json"
     approval_path = output_dir / "source-approval.json"
@@ -1959,10 +4782,11 @@ def validate_terminal_tools_authority(
         or prepared.get("protocol_sha256") != schema.PROTOCOL_SHA256
     ):
         errors.append("terminal source/prepared identity differs")
-    try:
-        schema.validate_source_approval(dict(approval))
-    except (OSError, ValueError) as error:
-        errors.append(f"terminal shared source approval authority replay: {error}")
+    if not synthetic:
+        try:
+            schema.validate_source_approval(dict(approval))
+        except (OSError, ValueError) as error:
+            errors.append(f"terminal shared source approval authority replay: {error}")
 
     prepared_root: Path | None = None
     original_prepared_snapshot: schema.FileSnapshot | None = None
@@ -2108,15 +4932,16 @@ def validate_terminal_tools_authority(
 
     local_overlay_path: str | None = None
     if original_prepared_snapshot is not None:
-        try:
-            schema.validate_prepared_artifacts(
-                dict(prepared), dict(approval), original_prepared_snapshot.path
-            )
-        except (OSError, ValueError) as error:
-            errors.append(
-                "terminal shared source-review/release authority replay: "
-                f"{error}"
-            )
+        if not synthetic:
+            try:
+                schema.validate_prepared_artifacts(
+                    dict(prepared), dict(approval), original_prepared_snapshot.path
+                )
+            except (OSError, ValueError) as error:
+                errors.append(
+                    "terminal shared source-review/release authority replay: "
+                    f"{error}"
+                )
         config = read_object(
             output_dir / "config.json", "terminal local authority config", errors
         )
@@ -2126,6 +4951,7 @@ def validate_terminal_tools_authority(
             original_prepared_snapshot.path,
             config,
             errors,
+            live_system=not synthetic,
         )
 
     approval_binding = prepared.get("source_approval")
@@ -3512,7 +6338,9 @@ def validate_evaluator_transition(
     return completed if isinstance(completed, int) else None
 
 
-def verify(output_dir: Path, *, publish: bool) -> tuple[dict[str, Any], int]:
+def verify(
+    output_dir: Path, *, publish: bool, synthetic: bool = False
+) -> tuple[dict[str, Any], int]:
     _BOUND_SNAPSHOTS.clear()
     errors: list[str] = []
     try:
@@ -3539,7 +6367,7 @@ def verify(output_dir: Path, *, publish: bool) -> tuple[dict[str, Any], int]:
     prepared = read_object(output_dir / "prepared-artifacts.json", "prepared artifacts", errors)
     correctness = read_object(output_dir / "correctness.json", "correctness", errors)
     proof_only_overlay_path = validate_terminal_tools_authority(
-        output_dir, prepared, errors
+        output_dir, prepared, errors, synthetic=synthetic
     )
     validate_terminal_profile_contract(output_dir, errors)
     if publish:
@@ -3857,6 +6685,14 @@ def write_fixture_json(path: Path, value: Mapping[str, Any], mode: int = 0o444) 
     write_fixture(path, canonical_json_bytes(value), mode)
 
 
+def write_fixture_json_once(
+    path: Path, value: Mapping[str, Any], mode: int = 0o444
+) -> None:
+    if path.exists() or path.is_symlink():
+        raise AssertionError(f"fixture evidence is not one-write: {path}")
+    write_fixture_json(path, value, mode)
+
+
 def build_terminal_fixture_v3(
     root: Path,
     *,
@@ -3902,12 +6738,7 @@ def build_terminal_fixture_v3(
         path = tooling_root / "support" / f"{name}.py"
         write_fixture(path, f"fixture support {name}\n".encode())
         support[name] = {"path": str(path), "sha256": sha256_file(path), "mode": 0o444}
-    comms = {
-        "runner_runtime": "ast-runner", "evaluator_runtime": "ast-evaluator",
-        "terminal_verifier_runtime": "ast-terminal", "strace_launcher_runtime": "ast-strace-py",
-        "perf": "ast-perf", "strace": "ast-strace", "correctness": "ast-correct",
-        "fault": "ast-fault",
-    }
+    comms = dict(schema.PREPARED_TOOL_COMMS)
     tools: dict[str, dict[str, Any]] = {}
     for name in schema.PREPARED_TOOL_NAMES:
         path = tooling_root / "executables" / name
@@ -3922,29 +6753,809 @@ def build_terminal_fixture_v3(
         "tools": tools,
         "support_files": support,
     }
-    tools_manifest_sha256 = hashlib.sha256(
-        canonical_json_bytes(tools_manifest)
-    ).hexdigest()
-    tools_manifest_path = tooling_root / "bindings" / "tools-manifest.json"
-    write_fixture_json(tools_manifest_path, tools_manifest)
+    base_tools_manifest = json.loads(json.dumps(tools_manifest))
+    base_tools_manifest["tools"].update(
+        json.loads(json.dumps(CURRENT_CHILD_PLACEHOLDER_BINDINGS))
+    )
+    tools_manifest_path = reviewed_root = tooling_root / "reviewed-source"
+    tools_manifest_path = reviewed_root / "asterism-rebaseline-tools.json"
     fake_commit = "1" * 40
     fake_tree = "2" * 40
     terminal_cargo_home = tooling_root / "cargo-home"
     terminal_cargo_home.mkdir()
     write_fixture(terminal_cargo_home / "config.toml", b"")
+    write_fixture(
+        terminal_cargo_home / "registry" / "cache" / "fixture.crate",
+        b"terminal preserved Cargo-home dependency\n",
+    )
+    fixture_rustup_toolchain = "1.97.0-x86_64-unknown-linux-gnu"
+    rustup_home = tooling_root / "rustup-home"
+    cargo_path = (
+        rustup_home / "toolchains" / fixture_rustup_toolchain / "bin" / "cargo"
+    )
+    rustc_path = (
+        rustup_home / "toolchains" / fixture_rustup_toolchain / "bin" / "rustc"
+    )
+    bwrap_path = tooling_root / "host-tools" / "bwrap"
+    git_path = tooling_root / "host-tools" / "git"
+    rustup_path = tooling_root / "host-tools" / "rustup"
+    python_path = CURRENT_SYSTEM_PYTHON
+    for path, payload in (
+        (cargo_path, b"terminal cargo\n"),
+        (rustc_path, b"terminal rustc\n"),
+        (bwrap_path, b"terminal bwrap\n"),
+        (git_path, b"terminal git\n"),
+        (rustup_path, b"terminal rustup\n"),
+    ):
+        write_fixture(path, payload, 0o555)
+    rustup_home.chmod(0o555)
     terminal_toolchain = {
-        "bwrap_path": "/fixture/bwrap",
+        "bwrap_path": str(bwrap_path.resolve()),
+        "bwrap_sha256": sha256_file(bwrap_path),
         "cargo_home_path": str(terminal_cargo_home.resolve()),
+        "cargo_path": str(cargo_path.resolve()),
+        "cargo_sha256": sha256_file(cargo_path),
+        "cargo_version_verbose": "cargo 1.97.0\nrelease: 1.97.0\nhost: x86_64-unknown-linux-gnu",
+        "git_path": str(git_path.resolve()),
+        "git_sha256": sha256_file(git_path),
+        "rustc_host": "x86_64-unknown-linux-gnu",
+        "rustc_path": str(rustc_path.resolve()),
+        "rustc_sha256": sha256_file(rustc_path),
+        "rustc_version_verbose": "rustc 1.97.0\nbinary: rustc\ncommit-hash: 1111111111111111111111111111111111111111\nhost: x86_64-unknown-linux-gnu\nrelease: 1.97.0",
+        "rustup_home_path": str(rustup_home.resolve()),
+        "rustup_path": str(rustup_path.resolve()),
+        "rustup_sha256": sha256_file(rustup_path),
+        "rustup_toolchain": fixture_rustup_toolchain,
     }
+    semantic_root = tooling_root / "semantic-manifests"
+    semantic_root.mkdir()
+
+    def semantic_runtime(authority: Mapping[str, Any]) -> str:
+        tree_fields = ("schema", "role", "manifest_sha256", "entry_count", "watch_count", "equal_pre_post", "mutation_events_absent")
+        closure_fields = ("schema", "sha256", "entry_count", "mounts", "watch_count", "mutation_events_absent")
+        return hashlib.sha256(canonical_json_bytes({
+            "cargo_home": {field: authority["cargo_home"][field] for field in tree_fields},
+            "schema": SEMANTIC_INPUT_AUTHORITY_SCHEMA,
+            "toolchain": {field: authority["toolchain"][field] for field in tree_fields},
+            "trusted_system_closure": {field: authority["trusted_system_closure"][field] for field in closure_fields},
+        })).hexdigest()
+
+    system_trees = []
+    for host, guest in TRUSTED_SYSTEM_MOUNTS:
+        metadata = host.stat()
+        system_trees.append({
+            "entries": [_terminal_semantic_entry(metadata, ".", "directory", None, None, None, frozenset())],
+            "role": "system-" + guest.removeprefix("/").replace("/", "-"),
+            "schema": RECURSIVE_TREE_AUTHORITY_SCHEMA,
+        })
+
+    def make_semantic_authority(
+        source: Path, label: str, *, source_role: str = "source"
+    ) -> dict[str, Any]:
+        roots = TerminalSemanticReplay.roots(source, terminal_toolchain, label)
+        bindings: dict[str, Any] = {}
+        for name, role in (("source", source_role), ("toolchain", "toolchain"), ("cargo_home", "cargo_home")):
+            excluded = frozenset({"Cargo.lock"}) if name == "source" and source_role == "resolution_source_without_cargo_lock" else frozenset()
+            volatile = frozenset({"."}) if excluded else frozenset()
+            tree = terminal_sample_semantic_tree(
+                roots[name], role, f"terminal fixture {label} {name}",
+                allow_symlinks=name != "source", hash_contents=True,
+                excluded=excluded, volatile=volatile,
+            )
+            path = semantic_root / f"{label}-{name}.json"
+            write_fixture_json(path, tree)
+            entries = tree["entries"]
+            bindings[name] = {
+                "entry_count": len(entries), "equal_pre_post": True,
+                "manifest_path": str(path.resolve()), "manifest_sha256": sha256_file(path),
+                "mutation_events_absent": True, "role": role,
+                "schema": RECURSIVE_TREE_AUTHORITY_SCHEMA,
+                "watch_count": sum(entry["file_type"] == "directory" for entry in entries),
+            }
+        evidence_mounts = []
+        mounts = []
+        for tree, (host, guest) in zip(system_trees, TRUSTED_SYSTEM_MOUNTS, strict=True):
+            root_entry = tree["entries"][0]
+            evidence_mounts.append({"guest_path": guest, "host_path": str(host), "resolved_path": str(host), "tree": tree})
+            mounts.append({
+                "device": root_entry["device"], "gid": root_entry["gid"],
+                "guest_path": guest, "host_path": str(host), "inode": root_entry["inode"],
+                "permissions": root_entry["permissions"], "resolved_path": str(host),
+                "trusted_root_owned_non_writable": True, "uid": root_entry["uid"],
+            })
+        closure_value = {"mounts": evidence_mounts, "schema": TRUSTED_SYSTEM_CLOSURE_SCHEMA}
+        closure_path = semantic_root / f"{label}-system.json"
+        write_fixture_json(closure_path, closure_value)
+        bindings["trusted_system_closure"] = {
+            "entry_count": sum(len(tree["entries"]) for tree in system_trees),
+            "manifest_path": str(closure_path.resolve()), "mounts": mounts,
+            "mutation_events_absent": True, "schema": TRUSTED_SYSTEM_CLOSURE_SCHEMA,
+            "sha256": sha256_file(closure_path),
+            "watch_count": sum(sum(entry["file_type"] == "directory" for entry in tree["entries"]) for tree in system_trees),
+        }
+        authority = {**bindings, "runtime_sha256": "", "schema": SEMANTIC_INPUT_AUTHORITY_SCHEMA}
+        authority["runtime_sha256"] = semantic_runtime(authority)
+        return authority
     review_id = "cr-terminal-fixture"
     review_time = "2026-07-15T00:00:00+00:00"
-    reviewed_root = tooling_root / "reviewed-source"
+    reviewed_root.mkdir()
+    current_build_nonce = hashlib.sha256(b"terminal current build").hexdigest()
+    current_product_commit = schema.VARIANT_SOURCE_BINDINGS["A"]["commit"]
+    current_product_tree = schema.VARIANT_SOURCE_BINDINGS["A"]["tree"]
+
+    def current_file_identity(path: Path) -> dict[str, Any]:
+        metadata = path.stat()
+        return {
+            "bytes": metadata.st_size, "ctime_ns": metadata.st_ctime_ns,
+            "device": metadata.st_dev, "inode": metadata.st_ino,
+            "link_count": metadata.st_nlink, "mode": stat.S_IMODE(metadata.st_mode),
+            "mtime_ns": metadata.st_mtime_ns, "path": str(path.resolve()),
+            "sha256": sha256_file(path), "size": metadata.st_size,
+        }
+
+    def current_directory_identity(path: Path) -> dict[str, Any]:
+        metadata = path.stat()
+        return {
+            "changed_ns": metadata.st_ctime_ns, "device": metadata.st_dev,
+            "file_type": stat.S_IFMT(metadata.st_mode), "inode": metadata.st_ino,
+            "link_count": metadata.st_nlink, "modified_ns": metadata.st_mtime_ns,
+            "path": str(path.resolve()), "permissions": stat.S_IMODE(metadata.st_mode),
+            "size": metadata.st_size,
+        }
+
+    def freeze_fixture_tree(path: Path) -> None:
+        for item in sorted(
+            path.rglob("*"), key=lambda candidate: len(candidate.parts), reverse=True
+        ):
+            if item.is_dir():
+                if stat.S_IMODE(item.stat().st_mode) != 0o555:
+                    item.chmod(0o555)
+            elif item.is_file():
+                desired = 0o555 if item.stat().st_mode & 0o111 else 0o444
+                if stat.S_IMODE(item.stat().st_mode) != desired:
+                    item.chmod(desired)
+            else:
+                raise AssertionError(f"unsupported fixture node: {item}")
+        if stat.S_IMODE(path.stat().st_mode) != 0o555:
+            path.chmod(0o555)
+
+    def current_path_chain(path: Path) -> list[dict[str, Any]]:
+        records = []
+        for item in [Path("/"), *list(path.parents)[::-1][1:], path]:
+            metadata = item.stat()
+            records.append({
+                "changed_ns": metadata.st_ctime_ns, "device": metadata.st_dev,
+                "gid": metadata.st_gid, "inode": metadata.st_ino,
+                "link_count": metadata.st_nlink, "mode": stat.S_IMODE(metadata.st_mode),
+                "modified_ns": metadata.st_mtime_ns, "path": str(item),
+                "size": metadata.st_size, "type": stat.S_IFMT(metadata.st_mode),
+                "uid": metadata.st_uid,
+            })
+        return records
+
+    def current_tool(path: Path, *, trusted: bool) -> dict[str, Any]:
+        exact = path.resolve()
+        return {
+            "identity": current_file_identity(exact),
+            "path_chain": current_path_chain(exact) if trusted else None,
+            "trusted_system": trusted,
+        }
+
+    def current_config(
+        authority: Mapping[str, Any], source: Path
+    ) -> dict[str, Any]:
+        cargo = authority["cargo_home"]
+        preserved: dict[str, list[dict[str, Any]]] = {}
+        for origin, root in (
+            ("source", source / ".cargo"),
+            ("cargo-home", terminal_cargo_home),
+        ):
+            values = []
+            for path in sorted(root.iterdir(), key=lambda item: item.name):
+                if path.name in {"config", "config.toml"}:
+                    continue
+                values.append({
+                    "identity": (
+                        current_directory_identity(path)
+                        if path.is_dir()
+                        else current_file_identity(path)
+                    ),
+                    "name": path.name,
+                    "type": "directory" if path.is_dir() else "regular",
+                })
+            preserved[origin] = values
+        return {
+            "cargo_home_tree": {
+                "entry_count": cargo["entry_count"], "equal_pre_post": True,
+                "path": cargo["manifest_path"], "post_sha256": cargo["manifest_sha256"],
+                "pre_sha256": cargo["manifest_sha256"], "watch_count": cargo["watch_count"],
+            },
+            "cargo_search": {
+                "cargo_home_path": GUEST_CARGO_HOME, "cwd": GUEST_SOURCE,
+                "entries": json.loads(json.dumps(
+                    cargo_config_authority["translated_entries"]
+                )),
+                "schema": schema.CARGO_CONFIG_SEARCH_SCHEMA,
+            },
+            "preserved_top_level_entries": preserved,
+            "schema": "bn-30fs-build-cargo-config-search-v1",
+        }
+
+    def current_shared_sha256(source: Path) -> str:
+        return hashlib.sha256(canonical_json_bytes({
+            "entries": [
+                {
+                    "name": name,
+                    "sha256": sha256_file(
+                        source / CURRENT_SHARED_DESTINATION / name
+                    ),
+                    "size": (
+                        source / CURRENT_SHARED_DESTINATION / name
+                    ).stat().st_size,
+                }
+                for name in CURRENT_SHARED_NAMES
+            ],
+            "schema": "asterism-rebaseline-shared-v3",
+        })).hexdigest()
+
+    def current_build_record(
+        name: str, directory: str, source: Path, authority: dict[str, Any], ordinal: int
+    ) -> dict[str, Any]:
+        child = name == "children"
+        target = reviewed_root / "targets" / directory
+        target.mkdir(parents=True)
+        examples = (
+            ("asterism_rebaseline_current_correctness", "asterism_rebaseline_current_fault")
+            if child else ("asterism_rebaseline_public",)
+        )
+        artifacts: dict[str, Any] = {}
+        for index, example in enumerate(examples):
+            target_binary = target / "release" / "examples" / example
+            if child:
+                key = "correctness" if index == 0 else "fault"
+                published = reviewed_root / "artifacts" / "tools" / (
+                    "ast-rb-check" if key == "correctness" else "ast-rb-fault"
+                )
+                payload = Path(tools_manifest["tools"][key]["path"]).read_bytes()
+                write_fixture(published, payload, 0o555)
+                binding = {
+                    "comm": published.name, "executable_mode": 0o555,
+                    "path": str(published.resolve()),
+                    "sha256": sha256_file(published),
+                }
+            else:
+                published = reviewed_root / "artifacts" / "release" / (
+                    "hooked-A" if name == "hooked_release" else "pristine-A"
+                )
+                payload = b"terminal current release\n"
+                write_fixture(published, payload, 0o555)
+                binding = {"comm": published.name, "executable_mode": 0o555, "path": str(published.resolve()), "sha256": sha256_file(published)}
+            write_fixture(target_binary, payload, 0o555)
+            artifacts[example] = {"binding": binding, "source": current_file_identity(target_binary)}
+        target_identity = current_directory_identity(target)
+        config = current_config(authority, source)
+        base = {
+            "CARGO_HOME": GUEST_CARGO_HOME, "CARGO_INCREMENTAL": "0", "CARGO_NET_OFFLINE": "true",
+            "GIT_CONFIG_COUNT": "0", "GIT_CONFIG_GLOBAL": f"{GUEST_ROOT}/absent-gitconfig", "GIT_CONFIG_NOSYSTEM": "1",
+            "HOME": "/nonexistent", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PATH": "/usr/bin:/bin",
+            "PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1", "RUSTC": GUEST_RUSTC,
+            "RUSTUP_HOME": "/nonexistent", "RUSTUP_TOOLCHAIN": terminal_toolchain["rustup_toolchain"], "TZ": "UTC",
+        }
+        environment = ({
+            **base,
+            "ASTERISM_FAULT_COMPILE_OUT_IDENTICAL": "true",
+            "ASTERISM_FAULT_COMPILE_OUT_OVERLAY_RELEASE_SHA256": current_release_sha256,
+            "ASTERISM_FAULT_COMPILE_OUT_PRISTINE_SHA256": current_release_sha256,
+            "ASTERISM_FAULT_COMPILE_OUT_SCHEMA": "bn-2l3n-fault-compile-out-authority-v1",
+            "ASTERISM_FAULT_COMPILE_OUT_SYMBOL_ABSENCE_SHA256": current_symbol_absence_sha256,
+            "ASTERISM_REBASELINE_CHILD_BUILD_NONCE": current_build_nonce,
+            "ASTERISM_REBASELINE_EXPECTED_LIB_SOURCE": "crates/mess-store/src/lib.rs",
+            "ASTERISM_REBASELINE_PINNED_RUSTC": GUEST_RUSTC,
+            "ASTERISM_REBASELINE_WRAPPER_RECEIPT": "/asterism/receipt/injection.json",
+            "RUSTC_WORKSPACE_WRAPPER": "/asterism/rustc_workspace_wrapper.py",
+        } if child else {
+            **base,
+            "ASTERISM_BUILD_ADAPTER_SHA256": sha256_file(
+                source / CURRENT_ADAPTER_DESTINATION
+            ),
+            "ASTERISM_BUILD_BINARY_KIND": "public", "ASTERISM_BUILD_NONCE": current_build_nonce,
+            "ASTERISM_BUILD_CARGO_LOCK_SHA256": sha256_file(source / "Cargo.lock"),
+            "ASTERISM_BUILD_PRODUCT_COMMIT": current_product_commit,
+            "ASTERISM_BUILD_PRODUCT_TREE": current_product_tree,
+            "ASTERISM_BUILD_PROTOCOL": schema.PROTOCOL,
+            "ASTERISM_BUILD_PROTOCOL_SHA256": schema.PROTOCOL_SHA256,
+            "ASTERISM_BUILD_SHARED_MANIFEST_SHA256": current_shared_sha256(source),
+            "ASTERISM_BUILD_SOURCE_APPROVAL_SHA256": "fa2acb626f303f8a65a16a6c8a1fd86b7e80cf48e092ae21a7308984ae790c94",
+            "ASTERISM_BUILD_TIMED_SURFACE": "public-event-store",
+            "ASTERISM_BUILD_TOOLING_COMMIT": fake_commit, "ASTERISM_BUILD_TOOLING_TREE": fake_tree,
+            "ASTERISM_BUILD_VARIANT": "A",
+        })
+        descriptors = iter(str(900 + ordinal * 30 + index) for index in range(20))
+        system = [("--ro-bind-fd", next(descriptors), guest) for _host, guest in TRUSTED_SYSTEM_MOUNTS]
+        source_fd, toolchain_fd, cargo_fd, rustc_fd, python_fd = [next(descriptors) for _ in range(5)]
+        _source_guard_fd = next(descriptors)
+        cargo_home_fd, config_fd, target_fd = [next(descriptors) for _ in range(3)]
+        argv = [str(bwrap_path.resolve()), "--die-with-parent", "--new-session", "--unshare-net", "--dir", "/usr", *(item for binding in system for item in binding), "--symlink", "usr/bin", "/bin", "--symlink", "usr/lib", "/lib", "--symlink", "usr/lib", "/lib64", "--dir", "/dev", "--dir", "/proc", "--tmpfs", "/tmp", "--tmpfs", GUEST_ROOT]
+        for binding in (("--ro-bind-fd", source_fd, GUEST_SOURCE), ("--ro-bind-fd", toolchain_fd, GUEST_TOOLCHAIN_ROOT), ("--ro-bind-fd", cargo_fd, GUEST_CARGO), ("--ro-bind-fd", rustc_fd, GUEST_RUSTC), ("--ro-bind-fd", python_fd, f"{GUEST_ROOT}/python3")):
+            argv.extend(binding)
+        argv.extend([
+            "--dir", f"{GUEST_SOURCE}/.cargo",
+            "--tmpfs", f"{GUEST_SOURCE}/.cargo",
+        ])
+        for entry in config["preserved_top_level_entries"]["source"]:
+            argv.extend([
+                "--ro-bind-data" if entry["type"] == "regular" else "--ro-bind-fd",
+                next(descriptors),
+                f"{GUEST_SOURCE}/.cargo/{entry['name']}",
+            ])
+        for entry in config["cargo_search"]["entries"][:2]:
+            argv.extend([
+                "--ro-bind-data",
+                next(descriptors),
+                entry["path"],
+            ])
+        argv.extend([
+            "--remount-ro", f"{GUEST_SOURCE}/.cargo",
+            "--dir", GUEST_CARGO_HOME,
+            "--ro-bind-fd", cargo_home_fd, GUEST_CARGO_HOME,
+        ])
+        for index, entry in enumerate(config["cargo_search"]["entries"][6:]):
+            argv.extend([
+                "--ro-bind-data",
+                config_fd if index == 0 else next(descriptors),
+                entry["path"],
+            ])
+        argv.extend([
+            "--remount-ro", GUEST_CARGO_HOME,
+            "--dir", f"{GUEST_ROOT}/.cargo",
+            "--tmpfs", f"{GUEST_ROOT}/.cargo",
+            "--remount-ro", f"{GUEST_ROOT}/.cargo",
+            "--dir", "/.cargo", "--tmpfs", "/.cargo",
+            "--remount-ro", "/.cargo",
+            "--bind-fd", target_fd, GUEST_TARGET,
+        ])
+        receipt_fd = None
+        if child:
+            wrapper_fd, receipt_fd = next(descriptors), next(descriptors)
+            argv.extend(["--ro-bind-fd", wrapper_fd, f"{GUEST_ROOT}/rustc_workspace_wrapper.py", "--bind-fd", receipt_fd, f"{GUEST_ROOT}/receipt"])
+        argv.extend(["--chdir", GUEST_SOURCE, GUEST_CARGO, "build", "--locked", "--offline", "--release", "-p", "mess-store"])
+        for example in examples: argv.extend(["--example", example])
+        argv.extend(["--target-dir", GUEST_TARGET])
+        for example in examples:
+            artifacts[example]["source"]["path"] = f"/proc/self/fd/{target_fd}/release/examples/{example}"
+        tools_record = {
+            "bwrap": current_tool(bwrap_path, trusted=True),
+            "cargo": current_tool(cargo_path, trusted=False),
+            "python": current_tool(python_path, trusted=True),
+            "rustc": current_tool(rustc_path, trusted=False),
+            "toolchain_root": current_directory_identity(cargo_path.parent.parent),
+        }
+        lock_path = source / "Cargo.lock"
+        lock_metadata = lock_path.stat()
+        lock_identity = {
+            "changed_ns": lock_metadata.st_ctime_ns, "device": lock_metadata.st_dev,
+            "inode": lock_metadata.st_ino, "link_count": lock_metadata.st_nlink,
+            "modified_ns": lock_metadata.st_mtime_ns,
+        }
+        lock = {"identity": lock_identity, "mode": 0o444, "path": str(lock_path.resolve()), "sha256": sha256_file(lock_path), "size": lock_metadata.st_size}
+        result = {
+            "argv": argv, "environment": environment,
+            "execution": {"argv": argv, "cwd": str(reviewed_root.resolve()), "environment": environment, "execution_authority": tools_record["bwrap"], "exit_status": 0, "passed_file_descriptors": sum(argv.count(operation) for operation in ("--ro-bind-fd", "--bind-fd", "--ro-bind-data")) + 2 + len(config["preserved_top_level_entries"]["cargo-home"]), "stderr_bytes": 0, "stderr_sha256": EMPTY_SHA256, "stdout_bytes": 0, "stdout_sha256": EMPTY_SHA256},
+            "filesystem_admission": {"available_bytes": 200_000_000_000, "available_inodes": 2_000_000, "checked_path": str(tooling_root.resolve()), "filesystem": schema.REQUIRED_FILESYSTEM_TYPE, "minimum_available_bytes": schema.MIN_FREE_BYTES, "minimum_available_inodes": schema.MIN_FREE_INODES, "schema": schema.FILESYSTEM_ADMISSION_SCHEMA},
+            "cargo_config_prebuild": config, "cargo_config_postbuild": json.loads(json.dumps(config)),
+            "execution_tools": tools_record, "artifacts": artifacts,
+            "binds": {"target": {"parent": current_directory_identity(target.parent), "post": target_identity, "pre": target_identity}},
+            "lock_prebuild": lock, "lock_postbuild": json.loads(json.dumps(lock)),
+            "source_manifest_sha256": current_manifest_sha256s[name],
+            "semantic_input_authority": authority,
+            "toolchain_manifest": {"entry_count": authority["toolchain"]["entry_count"], "equal_pre_post": True, "path": authority["toolchain"]["manifest_path"], "post_sha256": authority["toolchain"]["manifest_sha256"], "pre_sha256": authority["toolchain"]["manifest_sha256"]},
+            "target": str(target.resolve()), "target_was_absent": True,
+        }
+        if child:
+            wrapper = reviewed_root / "inputs" / "rustc_workspace_wrapper.py"
+            write_fixture(wrapper, b"terminal workspace wrapper\n", 0o555)
+            receipt = {"build_nonce": current_build_nonce, "crate_name": "mess_store", "crate_type": "lib", "injected_arguments": ["--cfg", "test", "--allow", "explicit_builtin_cfgs_in_flags", "--cfg", "asterism_rebaseline_correctness", "--check-cfg", "cfg(asterism_rebaseline_correctness)"], "original_argv_sha256": hashlib.sha256(b"terminal rustc argv").hexdigest(), "package": "mess-store", "rustc": GUEST_RUSTC, "schema": "bn-30fs-rustc-workspace-wrapper-receipt-v1", "source": "crates/mess-store/src/lib.rs"}
+            receipt_root = reviewed_root / "receipts" / directory
+            receipt_path = receipt_root / "injection.json"
+            write_fixture_json(receipt_path, receipt)
+            receipt_identity = current_file_identity(receipt_path)
+            receipt_identity["path"] = f"/proc/self/fd/{receipt_fd}/injection.json"
+            receipt_directory = current_directory_identity(receipt_root)
+            result["binds"]["receipt"] = {"parent": current_directory_identity(receipt_root.parent), "post": receipt_directory, "pre": receipt_directory}
+            result.update({"wrapper_receipt": receipt, "wrapper_receipt_identity": receipt_identity, "wrapper_receipt_sha256": receipt_identity["sha256"], "wrapper_input_identity": current_file_identity(wrapper)})
+        write_fixture_json_once(
+            reviewed_root / "logs" / f"cargo-build-{directory}.json",
+            result["execution"],
+        )
+        return result
+
+    current_build_directories = (
+        ("children", "children"),
+        ("hooked_release", "hooked-release"),
+        ("pristine_release", "pristine-release"),
+    )
+    current_sources: dict[str, Path] = {}
+    current_authorities: dict[str, dict[str, Any]] = {}
+    current_manifest_sha256s: dict[str, str] = {}
+    current_placements: dict[str, list[dict[str, Any]]] = {}
+    repository = Path(__file__).parents[2].resolve()
+    current_tooling = repository / "spikes" / "asterism_rebaseline" / "tooling"
+    current_dir = current_tooling / "current"
+    current_shared = current_tooling / "overlay" / "shared"
+    current_public = current_tooling / "overlay" / "public"
+    product_lock_payload = (repository / "Cargo.lock").read_bytes()
+    if hashlib.sha256(product_lock_payload).hexdigest() != schema.CURRENT_LOCK_SHA256:
+        raise AssertionError("terminal fixture Cargo.lock differs from frozen authority")
+    engine_payload = (repository / CURRENT_ENGINE_PATH).read_bytes()
+    if hashlib.sha256(engine_payload).hexdigest() != CURRENT_ENGINE_SHA256:
+        raise AssertionError("terminal fixture engine differs from frozen authority")
+    fixture_archive_files = {
+        ".cargo/preserved-source": b"terminal preserved source config root\n",
+        "Cargo.lock": b"terminal archived lock replaced by reviewed A\n",
+        CURRENT_ENGINE_PATH.as_posix(): engine_payload,
+        "src/lib.rs": b"terminal current materialized source\n",
+    }
+    fixture_archive_directories = {
+        parent.as_posix()
+        for name in fixture_archive_files
+        for parent in PurePosixPath(name).parents
+        if parent != PurePosixPath(".")
+    }
+    fixture_archive_buffer = io.BytesIO()
+    with tarfile.open(
+        fileobj=fixture_archive_buffer,
+        mode="w",
+        format=tarfile.USTAR_FORMAT,
+    ) as fixture_archive:
+        for directory in sorted(
+            fixture_archive_directories,
+            key=lambda value: (len(PurePosixPath(value).parts), value),
+        ):
+            member = tarfile.TarInfo(directory)
+            member.type = tarfile.DIRTYPE
+            member.mode = 0o755
+            member.mtime = 0
+            fixture_archive.addfile(member)
+        for name, payload in sorted(fixture_archive_files.items()):
+            member = tarfile.TarInfo(name)
+            member.mode = 0o644
+            member.mtime = 0
+            member.size = len(payload)
+            fixture_archive.addfile(member, io.BytesIO(payload))
+    fixture_archive_payload = fixture_archive_buffer.getvalue()
+    fixture_archive_tree = _terminal_archive_tree(
+        fixture_archive_payload, "terminal fixture archive"
+    )
+    for name, directory in current_build_directories:
+        source = reviewed_root / "materialized" / directory
+        for relative, entry in sorted(
+            fixture_archive_tree.items(),
+            key=lambda item: (
+                len(PurePosixPath(item[0]).parts),
+                item[0],
+            ),
+        ):
+            if relative == ".":
+                source.mkdir(parents=True)
+            elif entry["file_type"] == "directory":
+                (source / relative).mkdir(parents=True)
+            else:
+                write_fixture(
+                    source / relative,
+                    entry["payload"],
+                    entry["permissions"],
+                )
+        (source / "Cargo.lock").unlink()
+        write_fixture(source / "Cargo.lock", product_lock_payload)
+        placements: list[dict[str, Any]] = []
+        sources_and_destinations = (
+            (
+                (current_dir / "correctness.rs", Path(
+                    "crates/mess-store/examples/asterism_rebaseline_current_correctness.rs"
+                )),
+                (current_dir / "fault.rs", Path(
+                    "crates/mess-store/examples/asterism_rebaseline_current_fault.rs"
+                )),
+                *((current_shared / shared_name,
+                   CURRENT_SHARED_DESTINATION / shared_name)
+                  for shared_name in CURRENT_SHARED_NAMES),
+            )
+            if name == "children"
+            else (
+                (current_public / "main.rs", Path(
+                    "crates/mess-store/examples/asterism_rebaseline_public.rs"
+                )),
+                (current_public / "adapters" / "current.rs",
+                 CURRENT_ADAPTER_DESTINATION),
+                *((current_shared / shared_name,
+                   CURRENT_SHARED_DESTINATION / shared_name)
+                  for shared_name in CURRENT_SHARED_NAMES),
+            )
+        )
+        for placement_source, relative_destination in sources_and_destinations:
+            destination = source / relative_destination
+            write_fixture(destination, placement_source.read_bytes(), 0o444)
+            placements.append({
+                "destination": destination.as_posix(), "mode": 0o444,
+                "sha256": sha256_file(placement_source),
+                "source": str(placement_source),
+            })
+        if directory in {"children", "hooked-release"}:
+            engine_path = source / CURRENT_ENGINE_PATH
+            write_fixture(
+                engine_path,
+                _terminal_apply_product_overlay(
+                    engine_path.read_bytes(),
+                    (current_dir / "product-test-overlay.patch").read_bytes(),
+                    f"terminal fixture {directory} overlay",
+                ),
+                0o444,
+            )
+        freeze_fixture_tree(source)
+        current_sources[name] = source
+        current_placements[directory] = placements
+        materialized_manifest_path = (
+            reviewed_root / "manifests" / f"materialized-{directory}.json"
+        )
+        write_fixture_json(
+            materialized_manifest_path,
+            _terminal_materialized_manifest(
+                source.resolve(), f"terminal fixture {directory}"
+            ),
+        )
+        current_manifest_sha256s[name] = sha256_file(materialized_manifest_path)
+        current_authorities[name] = make_semantic_authority(
+            source, f"current-{name}"
+        )
+
+    translated_paths = (
+        f"{GUEST_SOURCE}/.cargo/config.toml", f"{GUEST_SOURCE}/.cargo/config",
+        f"{GUEST_ROOT}/.cargo/config.toml", f"{GUEST_ROOT}/.cargo/config",
+        "/.cargo/config.toml", "/.cargo/config",
+        f"{GUEST_CARGO_HOME}/config.toml", f"{GUEST_CARGO_HOME}/config",
+    )
+    cargo_config_recorded = {
+        "cargo_home_path": GUEST_CARGO_HOME,
+        "cwd": GUEST_SOURCE,
+        "entries": [
+            {
+                "path": path,
+                "sha256": (
+                    None if path in translated_paths[2:6] else EMPTY_SHA256
+                ),
+                "status": (
+                    "absent" if path in translated_paths[2:6] else "present"
+                ),
+            }
+            for path in translated_paths
+        ],
+        "schema": schema.CARGO_CONFIG_SEARCH_SCHEMA,
+    }
+    cargo_config_translated = json.loads(
+        json.dumps(cargo_config_recorded["entries"])
+    )
+    reviewed_cargo_config_path = (
+        tooling_root / "resolution-output" / "manifests" / "cargo-config-A.json"
+    )
+    write_fixture_json(reviewed_cargo_config_path, cargo_config_recorded)
+    write_fixture(
+        reviewed_cargo_config_path.with_name(
+            reviewed_cargo_config_path.name + ".empty"
+        ),
+        b"",
+    )
+    cargo_config_authority = {
+        "binding": {
+            "path": str(reviewed_cargo_config_path.resolve()),
+            "sha256": sha256_file(reviewed_cargo_config_path),
+        },
+        "identity": current_file_identity(reviewed_cargo_config_path),
+        "recorded": cargo_config_recorded,
+        "translated_entries": cargo_config_translated,
+    }
+    archive_path = reviewed_root / "archives" / "source-A.tar"
+    write_fixture(archive_path, fixture_archive_payload, 0o444)
+    archive_identity = {
+        "bytes": archive_path.stat().st_size,
+        "commit": current_product_commit,
+        "sha256": sha256_file(archive_path),
+        "tree": current_product_tree,
+    }
+    construction_path = reviewed_root / "manifests" / "current-children-construction.json"
+    construction = {
+        "archive": archive_identity,
+        "cargo_config_manifest_sha256": cargo_config_authority["identity"]["sha256"],
+        "cargo_config_view_sha256": hashlib.sha256(
+            canonical_json_bytes(cargo_config_translated)
+        ).hexdigest(),
+        "kinds": {
+            directory: {
+                "manifest_sha256": current_manifest_sha256s[name],
+                "placements": current_placements[directory],
+            }
+            for name, directory in current_build_directories
+        },
+        "lock_sha256": schema.CURRENT_LOCK_SHA256,
+        "product_commit": current_product_commit,
+        "product_overlay_sha256": sha256_file(
+            current_dir / "product-test-overlay.patch"
+        ),
+        "product_tree": current_product_tree,
+        "protocol": schema.PROTOCOL,
+        "schema": CURRENT_CONSTRUCTION_SCHEMA,
+    }
+    write_fixture_json(construction_path, construction)
+    current_build_nonce = sha256_file(construction_path)
+    current_builds = {
+        name: current_build_record(
+            name, directory, current_sources[name], current_authorities[name],
+            ordinal,
+        )
+        for ordinal, (name, directory) in (
+            (2, ("hooked_release", "hooked-release")),
+            (3, ("pristine_release", "pristine-release")),
+        )
+    }
+    current_release_sha256 = current_builds["hooked_release"]["artifacts"][
+        "asterism_rebaseline_public"
+    ]["binding"]["sha256"]
+    current_symbol_absence_sha256 = hashlib.sha256(
+        b"terminal symbol absence"
+    ).hexdigest()
+    current_builds["children"] = current_build_record(
+        "children", "children", current_sources["children"],
+        current_authorities["children"], 1,
+    )
+    for key, example in (
+        ("correctness", "asterism_rebaseline_current_correctness"),
+        ("fault", "asterism_rebaseline_current_fault"),
+    ):
+        tools_manifest["tools"][key] = current_builds["children"]["artifacts"][
+            example
+        ]["binding"]
+    tools_manifest_sha256 = hashlib.sha256(
+        canonical_json_bytes(tools_manifest)
+    ).hexdigest()
+    write_fixture_json(tools_manifest_path, tools_manifest)
+    base_tools_manifest_path = (
+        tooling_root / "bindings" / "base-tools-manifest.json"
+    )
+    write_fixture_json(base_tools_manifest_path, base_tools_manifest)
+    prepared_tools_manifest_path = (
+        tooling_root / "bindings" / "tools-manifest.json"
+    )
+    write_fixture_json(prepared_tools_manifest_path, tools_manifest)
+
+    def write_sandbox_config(path: Path, source: Path) -> dict[str, str]:
+        write_fixture(path.with_name(path.name + ".empty"), b"")
+        entries = []
+        candidates: tuple[tuple[str, Path | None], ...] = (
+            (f"{GUEST_SOURCE}/.cargo/config.toml", source / ".cargo/config.toml"),
+            (f"{GUEST_SOURCE}/.cargo/config", source / ".cargo/config"),
+            (f"{GUEST_ROOT}/.cargo/config.toml", None),
+            (f"{GUEST_ROOT}/.cargo/config", None),
+            ("/.cargo/config.toml", None), ("/.cargo/config", None),
+            (f"{GUEST_CARGO_HOME}/config.toml", terminal_cargo_home / "config.toml"),
+            (f"{GUEST_CARGO_HOME}/config", terminal_cargo_home / "config"),
+        )
+        for guest, host in candidates:
+            if host is not None and host.exists():
+                entries.append({"path": guest, "sha256": sha256_file(host), "status": "present"})
+            elif guest in GUEST_BOUND_CONFIG_PATHS:
+                entries.append({"path": guest, "sha256": EMPTY_SHA256, "status": "present"})
+            else:
+                entries.append({"path": guest, "sha256": None, "status": "absent"})
+        write_fixture_json(path, {
+            "cargo_home_path": GUEST_CARGO_HOME, "cwd": GUEST_SOURCE,
+            "entries": entries, "schema": schema.CARGO_CONFIG_SEARCH_SCHEMA,
+        })
+        return {"path": str(path.resolve()), "sha256": sha256_file(path)}
+
+    def resolver_argv(ordinal: int, cargo_arguments: list[str]) -> list[str]:
+        descriptors = [str(700 + ordinal * 20 + index) for index in range(12)]
+        system = tuple(("--ro-bind-fd", descriptors[index], guest) for index, (_host, guest) in enumerate(TRUSTED_SYSTEM_MOUNTS))
+        core = (
+            ("--bind-fd", descriptors[3], GUEST_SOURCE),
+            ("--ro-bind-fd", descriptors[4], GUEST_TOOLCHAIN_ROOT),
+            ("--ro-bind-fd", descriptors[5], GUEST_CARGO),
+            ("--ro-bind-fd", descriptors[6], GUEST_RUSTC),
+            ("--ro-bind-fd", descriptors[7], GUEST_CARGO_HOME),
+        )
+        configs = tuple(("--ro-bind-fd", descriptors[8 + index], guest) for index, guest in enumerate(GUEST_BOUND_CONFIG_PATHS))
+        return [
+            str(bwrap_path.resolve()), "--die-with-parent", "--new-session", "--unshare-net", "--dir", "/usr",
+            *(item for binding in system for item in binding),
+            "--symlink", "usr/bin", "/bin", "--symlink", "usr/lib", "/lib",
+            "--symlink", "usr/lib", "/lib64", "--dir", "/dev", "--dir", "/proc",
+            "--tmpfs", "/tmp", "--tmpfs", GUEST_ROOT,
+            *(item for binding in core for item in binding),
+            "--dir", f"{GUEST_ROOT}/.cargo", "--tmpfs", f"{GUEST_ROOT}/.cargo",
+            "--remount-ro", f"{GUEST_ROOT}/.cargo", "--dir", "/.cargo", "--tmpfs", "/.cargo",
+            "--remount-ro", "/.cargo", "--dir", f"{GUEST_SOURCE}/.cargo", "--tmpfs", f"{GUEST_SOURCE}/.cargo",
+            *(item for binding in configs[:2] for item in binding),
+            "--remount-ro", f"{GUEST_SOURCE}/.cargo",
+            *(item for binding in configs[2:] for item in binding),
+            "--remount-ro", GUEST_CARGO_HOME, "--chdir", GUEST_SOURCE, GUEST_CARGO,
+            *cargo_arguments,
+        ]
+
+    resolution_root = tooling_root / "resolution-output"
+    current_lock_bytes = product_lock_payload
+    current_lock_sha = hashlib.sha256(current_lock_bytes).hexdigest()
+    resolution_variants = {}
+    repository = Path(__file__).parents[2].resolve()
+    for ordinal, variant in enumerate(schema.VARIANTS, start=1):
+        source = resolution_root / "materialized" / variant
+        write_fixture(source / "src/lib.rs", f"terminal resolution {variant}\n".encode())
+        final_bytes = current_lock_bytes if variant in {"A", "B"} else f"terminal final lock {variant}\n".encode()
+        final_sha = hashlib.sha256(final_bytes).hexdigest()
+        write_fixture(source / "Cargo.lock", final_bytes)
+        final_lock = resolution_root / "locks" / f"Cargo-{variant}.lock"
+        write_fixture(final_lock, final_bytes)
+        config = (
+            cargo_config_authority["binding"]
+            if variant == "A"
+            else write_sandbox_config(
+                resolution_root / "manifests" / f"cargo-config-{variant}.json",
+                source,
+            )
+        )
+        historical = {"commit": "3" * 40, "path": "Cargo.lock", "sha256": current_lock_sha}
+        tracked = {
+            "argv": [str(git_path.resolve()), "-C", str(repository), "show", f"{historical['commit']}:{historical['path']}"],
+            "cargo_config_search": config, "cwd": str(repository),
+            "environment": terminal_frozen_cargo_environment(terminal_toolchain),
+            "exit_status": 0, "host_source_root": str(source.resolve()),
+            "resolver_kind": "tracked_git_readback", "stderr": "",
+            "stderr_sha256": EMPTY_SHA256, "stdout": final_bytes.decode(),
+            "stdout_sha256": final_sha, "toolchain": terminal_toolchain,
+        }
+        claim: dict[str, Any] = {
+            "current_lock_attempt": None, "final_lock_path": str(final_lock.resolve()),
+            "final_lock_sha256": final_sha, "historical_lock": historical,
+            "resolver": tracked,
+        }
+        if variant in {"C", "D"}:
+            def make_record(label: str, index: int) -> dict[str, Any]:
+                arguments = ["metadata", "--locked", "--offline", "--format-version", "1", "--no-deps"] if label == "current" else ["generate-lockfile", "--offline"]
+                metadata = bwrap_path.stat()
+                return {
+                    "argv": resolver_argv(index, arguments), "cargo_config_search": config,
+                    "cwd": GUEST_SOURCE, "environment": terminal_sandboxed_cargo_environment(terminal_toolchain),
+                    "execution_authority": {
+                        "identity": {"changed_ns": metadata.st_ctime_ns, "device": metadata.st_dev, "inode": metadata.st_ino, "link_count": metadata.st_nlink, "modified_ns": metadata.st_mtime_ns},
+                        "mode": stat.S_IMODE(metadata.st_mode), "path": str(bwrap_path.resolve()),
+                        "sha256": sha256_file(bwrap_path), "size": metadata.st_size,
+                    },
+                    "exit_status": 0, "host_source_root": str(source.resolve()),
+                    "lock_output": (
+                        {boundary: {"path": str(source / "Cargo.lock"), "sha256": current_lock_sha, "status": "present"} for boundary in ("pre", "post")}
+                        if label == "current" else {
+                            "pre": {"path": str(source / "Cargo.lock"), "sha256": None, "status": "absent"},
+                            "post": {"path": str(source / "Cargo.lock"), "sha256": final_sha, "status": "present"},
+                        }
+                    ),
+                    "passed_file_descriptors": 13, "resolver_kind": "sandboxed_cargo_resolution",
+                    "semantic_input_authority": make_semantic_authority(source, f"resolver-{variant}-{label}", source_role="resolution_source_without_cargo_lock"),
+                    "stderr": "", "stderr_sha256": EMPTY_SHA256, "stdout": "", "stdout_sha256": EMPTY_SHA256,
+                    "toolchain": terminal_toolchain,
+                }
+            claim["current_lock_attempt"] = make_record("current", ordinal * 2)
+            claim["resolver"] = make_record("generated", ordinal * 2 + 1)
+        resolution_variants[variant] = claim
+
     lock_manifest_path = reviewed_root / "lock-manifest.json"
     lock_review_path = reviewed_root / "lock-review-bundle.json"
     write_fixture_json(
         lock_manifest_path,
-        {"schema": "asterism-rebaseline-lock-candidates-v3"},
+        {
+            "schema": "asterism-rebaseline-lock-candidates-v3",
+            "source_plan_path": str((repository / "spikes/asterism_rebaseline/tooling/source-plan.json").resolve()),
+            "toolchain": terminal_toolchain,
+            "variants": resolution_variants,
+        },
     )
+    lock_manifest_payload = json.loads(lock_manifest_path.read_bytes())
     write_fixture_json(
         lock_review_path,
         {"schema": schema.SOURCE_REVIEW_CONTENT_SCHEMAS["lock_review_bundle"]},
@@ -3971,9 +7582,7 @@ def build_terminal_fixture_v3(
     lock_review_input = source_review_input(lock_review_path)
     lock_authority = {
         "lock_manifest": {
-            "payload": {
-                "schema": "asterism-rebaseline-lock-candidates-v3"
-            },
+            "payload": lock_manifest_payload,
             "schema": "asterism-rebaseline-lock-candidates-v3",
             "sha256": lock_manifest_input["sha256"],
         },
@@ -4021,16 +7630,168 @@ def build_terminal_fixture_v3(
         "preapproval_source_sentinel": (
             "fa2acb626f303f8a65a16a6c8a1fd86b7e80cf48e092ae21a7308984ae790c94"
         ),
+        "overlay_release_sha256": current_release_sha256,
+        "pristine_sha256": current_release_sha256,
+        "symbol_absence_sha256": current_symbol_absence_sha256,
         "symbol_inventory_byte_identical": True,
     }
-    product_overlay_sha256 = hashlib.sha256(
-        b"terminal fixture product overlay"
-    ).hexdigest()
+    product_overlay_sha256 = sha256_file(
+        current_dir / "product-test-overlay.patch"
+    )
+
+    def immutable_record(path: Path) -> dict[str, Any]:
+        metadata = path.stat()
+        return {
+            "identity": {
+                "changed_ns": metadata.st_ctime_ns,
+                "device": metadata.st_dev,
+                "inode": metadata.st_ino,
+                "link_count": metadata.st_nlink,
+                "modified_ns": metadata.st_mtime_ns,
+            },
+            "mode": stat.S_IMODE(metadata.st_mode),
+            "path": str(path.resolve()),
+            "sha256": sha256_file(path),
+            "size": metadata.st_size,
+        }
+
+    lock_candidates = {
+        name: immutable_record(
+            resolution_root / "locks" / f"Cargo-{name}.lock"
+        )
+        for name in ("A", "C", "D")
+    }
+    tracked_input_paths = (
+        current_dir / "correctness.rs",
+        current_dir / "fault.rs",
+        current_dir / "validate_fault.py",
+        current_dir / "lock_authority.py",
+        current_tooling / "prepare_overlays.py",
+        current_dir / "product-test-overlay.patch",
+        current_dir / "validate_product_test_overlay.py",
+        current_dir / "rustc_workspace_wrapper.py",
+        current_dir / "validate_build_children.py",
+        current_public / "main.rs",
+        current_public / "adapters" / "current.rs",
+        *(current_shared / name for name in CURRENT_SHARED_NAMES),
+        lock_manifest_path,
+        lock_authority_path,
+        lock_review_path,
+        base_tools_manifest_path,
+        *(Path(lock_candidates[name]["path"]) for name in ("A", "C", "D")),
+        reviewed_cargo_config_path,
+    )
+    input_identities = [
+        current_file_identity(path) for path in tracked_input_paths
+    ]
+    if (
+        len(input_identities) != 27
+        or len({item["path"] for item in input_identities}) != 27
+        or len({
+            (item["device"], item["inode"]) for item in input_identities
+        }) != 27
+    ):
+        raise AssertionError("terminal fixture input authority aliases")
+
+    validator_environment = {
+        "HOME": "/nonexistent", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
+        "PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONNOUSERSITE": "1", "TZ": "UTC",
+    }
+
+    def validator_execution(
+        validator: Path, output_value: Mapping[str, Any], *,
+        self_test: bool,
+    ) -> dict[str, Any]:
+        output_bytes = canonical_json_bytes(output_value)
+        argv = [
+            str(CURRENT_SYSTEM_PYTHON), "-I", "-B", str(validator),
+            *(("--self-test",) if self_test else ()),
+        ]
+        return {
+            "argv": argv, "cwd": str(repository),
+            "environment": validator_environment,
+            "execution_authority": current_tool(
+                CURRENT_SYSTEM_PYTHON, trusted=True
+            ),
+            "exit_status": 0, "passed_file_descriptors": 2,
+            "script_authority": current_tool(validator, trusted=False),
+            "stderr_bytes": 0, "stderr_sha256": EMPTY_SHA256,
+            "stdout_bytes": len(output_bytes),
+            "stdout_sha256": hashlib.sha256(output_bytes).hexdigest(),
+        }
+
+    fault_normal = {
+        "checks": ["fault-compile-out", "fault-runtime-contract"],
+        "hostile_mutations_rejected": 4,
+        "schema": "bn-20be-current-fault-validator-v1", "status": "ok",
+    }
+    fault_self_test = {
+        **fault_normal,
+    }
+    fault_validator = current_dir / "validate_fault.py"
+    fault_authority = {
+        "executions": [
+            validator_execution(fault_validator, fault_normal, self_test=False),
+            validator_execution(
+                fault_validator, fault_self_test, self_test=True
+            ),
+        ],
+        "normal": fault_normal, "self_test": fault_self_test,
+        "source": current_file_identity(current_dir / "fault.rs"),
+        "validator": current_file_identity(fault_validator),
+    }
+    static_normal = {
+        "checks": ["producer-shape", "static-integration"],
+        "hostile_mutations_rejected": 0,
+        "schema": "bn-30fs-build-children-validator-v1", "status": "ok",
+    }
+    static_self_test = {
+        **static_normal, "hostile_mutations_rejected": 6,
+    }
+    static_validator = current_dir / "validate_build_children.py"
+    static_authority = {
+        "executions": [
+            validator_execution(static_validator, static_normal, self_test=False),
+            validator_execution(
+                static_validator, static_self_test, self_test=True
+            ),
+        ],
+        "normal": static_normal, "self_test": static_self_test,
+        "validator": current_file_identity(static_validator),
+    }
+    lock_validation = {
+        "execution_authority": {
+            name: current_tool(
+                Path(terminal_toolchain[f"{name}_path"]),
+                trusted=name in {"bwrap", "git", "rustup"},
+            )
+            for name in ("bwrap", "cargo", "git", "rustc", "rustup")
+        },
+        "result": {
+            "authority_sha256": lock_authority_input["sha256"],
+            "lock_manifest_sha256": lock_manifest_input["sha256"],
+            "schema": "bn-31gp-current-lock-authority-validation-v1",
+            "status": "ok",
+        },
+        "semantic_validator": "descriptor-cross-bound-authority-context-v1",
+    }
+    toolchain_identities = [
+        current_file_identity(Path(terminal_toolchain[f"{name}_path"]))
+        for name in ("bwrap", "cargo", "git", "rustc", "rustup")
+    ]
     current_children = {
         "artifacts": {
             name: tools_manifest["tools"][name]
             for name in ("correctness", "fault")
         },
+        "build_nonce": current_build_nonce,
+        "builds": current_builds,
+        "cargo_config_authority": cargo_config_authority,
+        "construction_path": str(construction_path.resolve()),
+        "construction_sha256": sha256_file(construction_path),
+        "fault_authority": fault_authority,
+        "inputs": input_identities,
         "lock_authority": lock_authority,
         "lock_authority_inputs": {
             "authority": {
@@ -4049,10 +7810,18 @@ def build_terminal_fixture_v3(
                 if key != "schema"
             },
         },
+        "lock_authority_validation": lock_validation,
+        "lock_candidates": lock_candidates,
         "lock_manifest_sha256": lock_manifest_input["sha256"],
+        "prebuild_filesystem_admissions": {
+            name: build["filesystem_admission"]
+            for name, build in current_builds.items()
+        },
+        "product_commit": current_product_commit,
         "product_overlay_authority": {
             "patch": {"sha256": product_overlay_sha256}
         },
+        "product_tree": schema.VARIANT_SOURCE_BINDINGS["A"]["tree"],
         "protocol": schema.PROTOCOL,
         "protocol_sha256": schema.PROTOCOL_SHA256,
         "release_compile_out": preapproval,
@@ -4066,10 +7835,12 @@ def build_terminal_fixture_v3(
             "source_approval_status": "preapproval-sentinel-not-source-approved",
         },
         "review_bundle_sha256": lock_review_input["sha256"],
-        "schema": schema.SOURCE_REVIEW_CONTENT_SCHEMAS[
-            "current_children_attestation"
-        ],
+        "schema": CURRENT_CHILDREN_SCHEMA,
+        "static_authority": static_authority,
         "status": "ok",
+        "toolchain": terminal_toolchain,
+        "toolchain_identities": toolchain_identities,
+        "tools_manifest_path": str(tools_manifest_path.resolve()),
         "tools_manifest_sha256": tools_manifest_sha256,
     }
     current_children_path = reviewed_root / "current-children-attestation.json"
@@ -4168,6 +7939,7 @@ def build_terminal_fixture_v3(
             "path": str(destination.resolve()),
             "sha256": sha256_file(destination),
         }
+    freeze_fixture_tree(reviewed_root)
     source_review = {
         "assertion_sha256": assertion_sha256,
         "bundle": {
@@ -4177,9 +7949,7 @@ def build_terminal_fixture_v3(
         },
         "current_children_attestation": {
             "mode": 0o444,
-            "schema": schema.SOURCE_REVIEW_CONTENT_SCHEMAS[
-                "current_children_attestation"
-            ],
+            "schema": CURRENT_CHILDREN_SCHEMA,
             "sha256": source_inputs["current_children_attestation"]["sha256"],
         },
         "lock_authority": {
@@ -4256,6 +8026,12 @@ def build_terminal_fixture_v3(
     for variant in schema.VARIANTS:
         binary = tooling_root / "variants" / variant / "rebaseline-bench"
         write_fixture(binary, f"fixture binary {variant}\n".encode(), 0o555)
+        prepared_source = tooling_root / "materialized" / variant
+        write_fixture(
+            prepared_source / "src/lib.rs",
+            f"terminal prepared {variant}\n".encode(),
+        )
+        prepared_source.chmod(0o555)
         source_variant = source_variants[variant]
         contract = {
             "schema": schema.BINARY_CONTRACT_SCHEMA,
@@ -4294,7 +8070,13 @@ def build_terminal_fixture_v3(
                 "trace_path_marker_templates"
             ],
             "correctness_oracle_mode": variant != "B",
-            "attestation": {},
+            "attestation": {
+                "materialized_root": str(prepared_source.resolve()),
+                "semantic_input_authority": make_semantic_authority(
+                    prepared_source, f"prepared-{variant}"
+                ),
+                "toolchain": terminal_toolchain,
+            },
         }
 
     def release_file_record(path: Path) -> dict[str, Any]:
@@ -4325,34 +8107,48 @@ def build_terminal_fixture_v3(
     write_fixture_json(contract_path, prepared_variants["A"]["contract"])
     fixture_hash = hashlib.sha256(b"terminal fixture field").hexdigest()
     materialized_path = tooling_root / "materialized" / "A"
-    materialized_path.mkdir(parents=True)
     materialized_root = str(materialized_path.resolve())
     target_dir = str((tooling_root / "targets" / "A").resolve())
+    system_descriptor_bindings = tuple(
+        ("--ro-bind-fd", str(401 + offset), guest_path)
+        for offset, (_host_path, guest_path) in enumerate(TRUSTED_SYSTEM_MOUNTS)
+    )
     descriptor_bindings = (
-        ("--ro-bind-fd", "401", GUEST_SOURCE),
-        ("--bind-fd", "402", GUEST_TARGET),
-        ("--ro-bind-fd", "403", GUEST_TOOLCHAIN_ROOT),
-        ("--ro-bind-fd", "404", GUEST_CARGO),
-        ("--ro-bind-fd", "405", GUEST_RUSTC),
-        ("--ro-bind-fd", "406", GUEST_CARGO_HOME),
-        ("--ro-bind-fd", "407", GUEST_RUSTUP_HOME),
+        ("--ro-bind-fd", "404", GUEST_SOURCE),
+        ("--bind-fd", "405", GUEST_TARGET),
+        ("--ro-bind-fd", "406", GUEST_TOOLCHAIN_ROOT),
+        ("--ro-bind-fd", "407", GUEST_CARGO),
+        ("--ro-bind-fd", "408", GUEST_RUSTC),
+        ("--ro-bind-fd", "409", GUEST_CARGO_HOME),
     )
     config_descriptor_bindings = tuple(
-        ("--ro-bind-fd", str(408 + offset), guest_path)
+        ("--ro-bind-fd", str(410 + offset), guest_path)
         for offset, guest_path in enumerate(GUEST_BOUND_CONFIG_PATHS)
     )
     release_build_argv = [
-        "/fixture/bwrap",
+        str(bwrap_path.resolve()),
         "--die-with-parent",
         "--new-session",
         "--unshare-net",
-        "--ro-bind",
-        "/",
-        "/",
-        "--dev-bind",
+        "--dir",
+        "/usr",
+        *(
+            argument
+            for binding in system_descriptor_bindings
+            for argument in binding
+        ),
+        "--symlink",
+        "usr/bin",
+        "/bin",
+        "--symlink",
+        "usr/lib",
+        "/lib",
+        "--symlink",
+        "usr/lib",
+        "/lib64",
+        "--dir",
         "/dev",
-        "/dev",
-        "--proc",
+        "--dir",
         "/proc",
         "--tmpfs",
         "/tmp",
@@ -4504,8 +8300,11 @@ def build_terminal_fixture_v3(
     ordinary_build_log, ordinary_build_child = release_build_child(
         "ordinary-a", 1
     )
+    prepared_a_semantic = prepared_variants["A"]["attestation"][
+        "semantic_input_authority"
+    ]
     ordinary_attestation: dict[str, Any] = {
-        field: fixture_hash for field in schema.PREPARED_ATTESTATION_FIELDS
+        field: fixture_hash for field in TERMINAL_RELEASE_ORDINARY_ATTESTATION_FIELDS
     }
     ordinary_attestation.update(
         {
@@ -4513,11 +8312,8 @@ def build_terminal_fixture_v3(
             "build_argv": release_build_argv,
             "build_child": ordinary_build_child,
             "build_env": {
+                **terminal_sandboxed_cargo_environment(terminal_toolchain),
                 "ASTERISM_BUILD_SOURCE_APPROVAL_SHA256": approval_sha256,
-                "CARGO_HOME": GUEST_CARGO_HOME,
-                "PATH": f"{GUEST_TOOLCHAIN_ROOT}/bin:/usr/bin:/bin",
-                "RUSTC": GUEST_RUSTC,
-                "RUSTUP_HOME": GUEST_RUSTUP_HOME,
             },
             "build_completed_at": "2026-07-15T00:00:01+00:00",
             "build_completed_monotonic_ns": 20,
@@ -4544,6 +8340,7 @@ def build_terminal_fixture_v3(
             "source_commit": source_variants["A"]["product_commit"],
             "source_read_only": True,
             "source_tree": source_variants["A"]["product_tree"],
+            "semantic_input_authority": prepared_a_semantic,
             "target_dir": target_dir,
             "target_dir_was_absent": True,
             "toolchain": approval["toolchain"],
@@ -4569,9 +8366,16 @@ def build_terminal_fixture_v3(
     overlay_attestation["build_log_sha256"] = sha256_file(overlay_build_log)
     overlay_attestation["build_child"] = overlay_build_child
     overlay_materialized_path = tooling_root / "materialized" / "A-product-overlay"
-    overlay_materialized_path.mkdir(parents=True)
+    write_fixture(
+        overlay_materialized_path / "src/lib.rs",
+        b"terminal proof-only product overlay A\n",
+    )
+    overlay_materialized_path.chmod(0o555)
     overlay_attestation["materialized_root"] = str(
         overlay_materialized_path.resolve()
+    )
+    overlay_attestation["semantic_input_authority"] = make_semantic_authority(
+        overlay_materialized_path, "proof-overlay-A"
     )
     overlay_build_child["cwd"] = overlay_attestation["materialized_root"]
     for field in (
@@ -4608,6 +8412,9 @@ def build_terminal_fixture_v3(
                     "argv": normalized_sandbox,
                     "cargo_config_search_sha256": ordinary_config_binding[
                         "sha256"
+                    ],
+                    "semantic_runtime_sha256": prepared_a_semantic[
+                        "runtime_sha256"
                     ],
                 }
             )
@@ -4768,7 +8575,7 @@ def build_terminal_fixture_v3(
         "tools": tools,
         "support_files": support,
         "tools_manifest": {
-            "path": str(tools_manifest_path),
+            "path": str(prepared_tools_manifest_path),
             "sha256": tools_manifest_sha256,
             "mode": 0o444,
         },
@@ -5490,7 +9297,7 @@ def self_test() -> dict[str, Any]:
 
     with tempfile.TemporaryDirectory(prefix="bn-2l3n-terminal-selftest-") as temp:
         output = build_terminal_fixture_v3(Path(temp))
-        positive, rc = verify(output, publish=False)
+        positive, rc = verify(output, publish=False, synthetic=True)
         checks.append(
             {
                 "name": "terminal-positive-chain",
@@ -5556,7 +9363,7 @@ def self_test() -> dict[str, Any]:
                 mutator(value)
                 write_fixture_json(path, value, mode)
                 _BOUND_SNAPSHOTS.clear()
-                result, mutation_rc = verify(output, publish=False)
+                result, mutation_rc = verify(output, publish=False, synthetic=True)
                 return mutation_rc == EXIT_INVALID and any(
                     expected_error in error for error in result["errors"]
                 )
@@ -5573,7 +9380,7 @@ def self_test() -> dict[str, Any]:
                 lambda value: value["verdict"]["data"].__setitem__(
                     "vote", "reject"
                 ),
-                "prepared source review bundle bytes differ from binding",
+                "terminal local prepared source review bundle hash mismatch",
             ),
         )
         check(
@@ -5581,7 +9388,7 @@ def self_test() -> dict[str, Any]:
             lambda: terminal_authority_file_mutation(
                 Path(attempt_prepared_fixture["release_compile_out"]["path"]),
                 lambda value: value.__setitem__("status", "forged"),
-                "prepared release compile-out proof bytes differ from binding",
+                "terminal local release compile-out proof hash mismatch",
             ),
         )
 
@@ -5614,6 +9421,1115 @@ def self_test() -> dict[str, Any]:
             .read_bytes()
         )
         config_fixture = json.loads((output / "config.json").read_bytes())
+
+        def terminal_semantic_chain_errors(
+            mutator: Any, *, include_overlay: bool
+        ) -> list[str]:
+            current = json.loads(json.dumps(current_children_fixture))
+            lock_authority = json.loads(json.dumps(lock_authority_fixture))
+            prepared = json.loads(json.dumps(attempt_prepared_fixture))
+            mutator(current, lock_authority, prepared)
+            semantic_errors: list[str] = []
+            replay = TerminalSemanticReplay(semantic_errors, live_system=False)
+            replay_terminal_semantic_chain(
+                current,
+                bundle_fixture["assertion"],
+                lock_authority,
+                prepared,
+                replay,
+            )
+            if include_overlay:
+                validate_terminal_release_proof_semantics(
+                    proof_fixture,
+                    prepared,
+                    approval_fixture,
+                    current,
+                    config_fixture,
+                    replay,
+                    semantic_errors,
+                )
+            replay.finalize()
+            return semantic_errors
+
+        check(
+            "terminal-semantic-rejects-current-child-extra-field",
+            lambda: any(
+                "terminal semantic current-child v2 fields differ" in error
+                for error in terminal_semantic_chain_errors(
+                    lambda current, _lock, _prepared: current.__setitem__(
+                        "forged", True
+                    ),
+                    include_overlay=True,
+                )
+            ),
+        )
+        check(
+            "terminal-semantic-rejects-current-build-truncated",
+            lambda: any(
+                "terminal semantic current build children record fields are not exact"
+                in error
+                for error in terminal_semantic_chain_errors(
+                    lambda current, _lock, _prepared: current["builds"][
+                        "children"
+                    ].pop("wrapper_input_identity"),
+                    include_overlay=True,
+                )
+            ),
+        )
+        check(
+            "terminal-semantic-rejects-current-build-extra-field",
+            lambda: any(
+                "terminal semantic current build hooked_release record fields are not exact"
+                in error
+                for error in terminal_semantic_chain_errors(
+                    lambda current, _lock, _prepared: current["builds"][
+                        "hooked_release"
+                    ].__setitem__("forged", True),
+                    include_overlay=True,
+                )
+            ),
+        )
+
+        def duplicate_terminal_current_descriptor(
+            current: dict[str, Any],
+            _lock: dict[str, Any],
+            _prepared: dict[str, Any],
+        ) -> None:
+            build = current["builds"]["pristine_release"]
+            argv = build["argv"]
+            target_descriptor_index = argv.index("--bind-fd") + 1
+            duplicate = argv[argv.index("--ro-bind-fd") + 1]
+            argv[target_descriptor_index] = duplicate
+            build["execution"]["argv"][target_descriptor_index] = duplicate
+            for artifact in build["artifacts"].values():
+                suffix = artifact["source"]["path"].split("/", 5)[-1]
+                artifact["source"]["path"] = f"/proc/self/fd/{duplicate}/{suffix}"
+
+        check(
+            "terminal-semantic-rejects-current-build-duplicate-fd",
+            lambda: any(
+                "terminal semantic current build pristine_release record execution log sidecar differs"
+                in error
+                for error in terminal_semantic_chain_errors(
+                    duplicate_terminal_current_descriptor, include_overlay=True
+                )
+            ),
+        )
+        check(
+            "terminal-semantic-rejects-current-build-passed-fd-cardinality",
+            lambda: any(
+                "terminal semantic current build children record execution log sidecar differs"
+                in error
+                for error in terminal_semantic_chain_errors(
+                    lambda current, _lock, _prepared: current["builds"][
+                        "children"
+                    ]["execution"].__setitem__("passed_file_descriptors", 14),
+                    include_overlay=True,
+                )
+            ),
+        )
+        check(
+            "terminal-semantic-rejects-current-build-config-transition",
+            lambda: any(
+                "terminal semantic current build hooked_release record config changed"
+                in error
+                for error in terminal_semantic_chain_errors(
+                    lambda current, _lock, _prepared: current["builds"][
+                        "hooked_release"
+                    ]["cargo_config_postbuild"].__setitem__("schema", "forged"),
+                    include_overlay=True,
+                )
+            ),
+        )
+        check(
+            "terminal-semantic-rejects-current-build-lock-transition",
+            lambda: any(
+                "terminal semantic current build pristine_release record lock changed"
+                in error
+                for error in terminal_semantic_chain_errors(
+                    lambda current, _lock, _prepared: current["builds"][
+                        "pristine_release"
+                    ]["lock_postbuild"].__setitem__("sha256", "0" * 64),
+                    include_overlay=True,
+                )
+            ),
+        )
+
+        def widen_terminal_current_lock_identity(
+            current: dict[str, Any],
+            _lock: dict[str, Any],
+            _prepared: dict[str, Any],
+        ) -> None:
+            build = current["builds"]["pristine_release"]
+            for boundary in ("lock_prebuild", "lock_postbuild"):
+                build[boundary]["identity"]["sha256"] = build[boundary][
+                    "sha256"
+                ]
+
+        check(
+            "terminal-semantic-rejects-current-build-lock-identity-shape",
+            lambda: any(
+                "terminal semantic current build pristine_release record lock identity fields are not exact"
+                in error
+                for error in terminal_semantic_chain_errors(
+                    widen_terminal_current_lock_identity, include_overlay=True
+                )
+            ),
+        )
+        check(
+            "terminal-semantic-rejects-current-build-fault-proof-binding",
+            lambda: any(
+                "terminal semantic current build children record wrapper environment differs"
+                in error
+                for error in terminal_semantic_chain_errors(
+                    lambda current, _lock, _prepared: current["builds"][
+                        "children"
+                    ]["environment"].__setitem__(
+                        "ASTERISM_FAULT_COMPILE_OUT_PRISTINE_SHA256", "0" * 64
+                    ),
+                    include_overlay=True,
+                )
+            ),
+        )
+        check(
+            "terminal-semantic-rejects-current-build-receipt-path",
+            lambda: any(
+                "terminal semantic current build children record receipt identity"
+                in error
+                for error in terminal_semantic_chain_errors(
+                    lambda current, _lock, _prepared: current["builds"][
+                        "children"
+                    ]["wrapper_receipt_identity"].__setitem__(
+                        "path",
+                        current["builds"]["children"]["wrapper_input_identity"][
+                            "path"
+                        ],
+                    ),
+                    include_overlay=True,
+                )
+            ),
+        )
+
+        def redirect_terminal_filesystem_admission(
+            current: dict[str, Any],
+            _lock: dict[str, Any],
+            _prepared: dict[str, Any],
+        ) -> None:
+            build = current["builds"]["hooked_release"]
+            build["filesystem_admission"]["checked_path"] = build["target"]
+            current["prebuild_filesystem_admissions"]["hooked_release"] = json.loads(
+                json.dumps(build["filesystem_admission"])
+            )
+
+        check(
+            "terminal-semantic-rejects-current-build-filesystem-path",
+            lambda: any(
+                "terminal semantic current build hooked_release record filesystem differs"
+                in error
+                for error in terminal_semantic_chain_errors(
+                    redirect_terminal_filesystem_admission, include_overlay=True
+                )
+            ),
+        )
+        check(
+            "terminal-semantic-rejects-current-build-wrapper-policy",
+            lambda: any(
+                "terminal semantic current build hooked_release record environment fields differ"
+                in error
+                for error in terminal_semantic_chain_errors(
+                    lambda current, _lock, _prepared: current["builds"][
+                        "hooked_release"
+                    ]["environment"].__setitem__(
+                        "RUSTC_WORKSPACE_WRAPPER",
+                        f"{GUEST_ROOT}/rustc_workspace_wrapper.py",
+                    ),
+                    include_overlay=True,
+                )
+            ),
+        )
+        check(
+            "terminal-semantic-rejects-toolchain-extra-field",
+            lambda: any(
+                "terminal semantic current toolchain fields are not exact" in error
+                for error in terminal_semantic_chain_errors(
+                    lambda current, _lock, _prepared: current[
+                        "toolchain"
+                    ].__setitem__("forged", True),
+                    include_overlay=True,
+                )
+            ),
+        )
+
+        def terminal_alternate_toolchain_root_rejected() -> bool:
+            hostile = json.loads(json.dumps(current_children_fixture["toolchain"]))
+            hostile["rustc_path"] = hostile["bwrap_path"]
+            hostile["rustc_sha256"] = hostile["bwrap_sha256"]
+            try:
+                terminal_validate_toolchain(
+                    hostile, "terminal hostile semantic toolchain"
+                )
+            except ValueError as error:
+                return (
+                    "executable paths physically alias" in str(error)
+                    or "Cargo/rustc rustup paths differ" in str(error)
+                )
+            return False
+
+        check(
+            "terminal-semantic-rejects-toolchain-split-root",
+            terminal_alternate_toolchain_root_rejected,
+        )
+
+        def terminal_pathlike_rustup_toolchain_rejected() -> bool:
+            for token in ("/tmp/hostile-toolchain", "../hostile-toolchain"):
+                hostile = json.loads(
+                    json.dumps(current_children_fixture["toolchain"])
+                )
+                hostile["rustup_toolchain"] = token
+                try:
+                    terminal_validate_toolchain(
+                        hostile, "terminal hostile rustup token"
+                    )
+                except ValueError as error:
+                    if "sampled identity differs" not in str(error):
+                        return False
+                else:
+                    return False
+            return True
+
+        check(
+            "terminal-semantic-rejects-pathlike-rustup-toolchain",
+            terminal_pathlike_rustup_toolchain_rejected,
+        )
+
+        def terminal_duplicate_rustc_host_rejected() -> bool:
+            hostile = json.loads(
+                json.dumps(current_children_fixture["toolchain"])
+            )
+            hostile["rustc_version_verbose"] += (
+                f"\nhost: {hostile['rustc_host']}"
+            )
+            try:
+                terminal_validate_toolchain(
+                    hostile, "terminal hostile duplicate rustc host"
+                )
+            except ValueError as error:
+                return "rustc_version_verbose differs" in str(error)
+            return False
+
+        check(
+            "terminal-semantic-rejects-duplicate-rustc-host-probe-line",
+            terminal_duplicate_rustc_host_rejected,
+        )
+        check(
+            "terminal-semantic-rejects-reviewed-cargo-probe-prefix-forgery",
+            lambda: any(
+                "terminal semantic resolver topology differs" in error
+                for error in terminal_semantic_chain_errors(
+                    lambda current, _lock, _prepared: current[
+                        "toolchain"
+                    ].__setitem__(
+                        "cargo_version_verbose",
+                        "forged "
+                        + current["toolchain"]["cargo_version_verbose"],
+                    ),
+                    include_overlay=True,
+                )
+            ),
+        )
+        check(
+            "terminal-semantic-rejects-reviewed-cargo-probe-extra-release",
+            lambda: any(
+                "terminal semantic resolver topology differs" in error
+                for error in terminal_semantic_chain_errors(
+                    lambda current, _lock, _prepared: current[
+                        "toolchain"
+                    ].__setitem__(
+                        "cargo_version_verbose",
+                        current["toolchain"]["cargo_version_verbose"]
+                        + "\nrelease: forged",
+                    ),
+                    include_overlay=True,
+                )
+            ),
+        )
+        check(
+            "terminal-semantic-rejects-current-input-physical-alias",
+            lambda: any(
+                "terminal semantic current inputs inputs alias" in error
+                for error in terminal_semantic_chain_errors(
+                    lambda current, _lock, _prepared: current["inputs"].__setitem__(
+                        1, json.loads(json.dumps(current["inputs"][0]))
+                    ),
+                    include_overlay=True,
+                )
+            ),
+        )
+        def terminal_swap_current_inputs(
+            current: dict[str, Any],
+            _lock: dict[str, Any],
+            _prepared: dict[str, Any],
+        ) -> None:
+            current["inputs"][3], current["inputs"][4] = (
+                current["inputs"][4], current["inputs"][3]
+            )
+
+        check(
+            "terminal-semantic-rejects-current-input-root-order",
+            lambda: any(
+                "terminal semantic current inputs producer input order differs"
+                in error
+                for error in terminal_semantic_chain_errors(
+                    terminal_swap_current_inputs,
+                    include_overlay=True,
+                )
+            ),
+        )
+
+        def terminal_product_overlay_input_digest_inequality_rejected() -> bool:
+            hostile = json.loads(json.dumps(current_children_fixture))
+            input_sha256 = hostile["inputs"][5]["sha256"]
+            patch_sha256 = "0" * 64 if input_sha256 != "0" * 64 else "1" * 64
+            hostile["product_overlay_authority"] = {
+                "patch": {"sha256": patch_sha256}
+            }
+            try:
+                _terminal_validate_current_inputs(
+                    hostile,
+                    Path(hostile["construction_path"]).parents[1],
+                    "terminal hostile current inputs",
+                )
+            except ValueError as error:
+                return (
+                    "product overlay input digest differs" in str(error)
+                    and terminal_is_sha256(input_sha256)
+                    and terminal_is_sha256(patch_sha256)
+                    and input_sha256 != patch_sha256
+                )
+            return False
+
+        check(
+            "terminal-semantic-rejects-product-overlay-input-digest-inequality",
+            terminal_product_overlay_input_digest_inequality_rejected,
+        )
+        check(
+            "terminal-semantic-rejects-current-validator-input-inequality",
+            lambda: any(
+                "terminal semantic current inputs validator input equality differs"
+                in error
+                for error in terminal_semantic_chain_errors(
+                    lambda current, _lock, _prepared: current[
+                        "fault_authority"
+                    ].__setitem__(
+                        "source", json.loads(json.dumps(current["inputs"][0]))
+                    ),
+                    include_overlay=True,
+                )
+            ),
+        )
+        check(
+            "terminal-semantic-rejects-missing-preserved-cargo-home-entry",
+            lambda: any(
+                "preserved cargo-home completeness differs" in error
+                for error in terminal_semantic_chain_errors(
+                    lambda current, _lock, _prepared: current["builds"][
+                        "hooked_release"
+                    ]["cargo_config_prebuild"][
+                        "preserved_top_level_entries"
+                    ]["cargo-home"].clear(),
+                    include_overlay=True,
+                )
+            ),
+        )
+        check(
+            "terminal-semantic-rejects-missing-preserved-source-entry",
+            lambda: any(
+                "preserved source completeness differs" in error
+                for error in terminal_semantic_chain_errors(
+                    lambda current, _lock, _prepared: current["builds"][
+                        "pristine_release"
+                    ]["cargo_config_prebuild"][
+                        "preserved_top_level_entries"
+                    ]["source"].clear(),
+                    include_overlay=True,
+                )
+            ),
+        )
+        check(
+            "terminal-semantic-rejects-preserved-directory-type-forgery",
+            lambda: any(
+                "preserved cargo-home enumeration differs" in error
+                for error in terminal_semantic_chain_errors(
+                    lambda current, _lock, _prepared: current["builds"][
+                        "children"
+                    ]["cargo_config_prebuild"][
+                        "preserved_top_level_entries"
+                    ]["cargo-home"][0].__setitem__("type", "regular"),
+                    include_overlay=True,
+                )
+            ),
+        )
+        check(
+            "terminal-semantic-rejects-current-cargo-authority-shape",
+            lambda: any(
+                "terminal semantic current Cargo config authority fields are not exact"
+                in error
+                for error in terminal_semantic_chain_errors(
+                    lambda current, _lock, _prepared: current[
+                        "cargo_config_authority"
+                    ].__setitem__("forged", True),
+                    include_overlay=True,
+                )
+            ),
+        )
+
+        def terminal_cargo_manifest_mode_rejected() -> bool:
+            hostile = json.loads(json.dumps(current_children_fixture))
+            cargo = hostile["cargo_config_authority"]
+            source = Path(cargo["identity"]["path"])
+            path = Path(temp) / "hostile-cargo-config.json"
+            write_fixture(path, source.read_bytes(), 0o644)
+            metadata = path.stat()
+            cargo["identity"] = {
+                "bytes": metadata.st_size,
+                "ctime_ns": metadata.st_ctime_ns,
+                "device": metadata.st_dev,
+                "inode": metadata.st_ino,
+                "link_count": metadata.st_nlink,
+                "mode": stat.S_IMODE(metadata.st_mode),
+                "mtime_ns": metadata.st_mtime_ns,
+                "path": str(path.resolve()),
+                "sha256": sha256_file(path),
+                "size": metadata.st_size,
+            }
+            cargo["binding"] = {
+                "path": cargo["identity"]["path"],
+                "sha256": cargo["identity"]["sha256"],
+            }
+            hostile["lock_authority"]["lock_manifest"]["payload"]["variants"][
+                "A"
+            ]["resolver"]["cargo_config_search"] = json.loads(
+                json.dumps(cargo["binding"])
+            )
+            try:
+                _terminal_validate_current_cargo_authority(
+                    hostile, "terminal hostile Cargo manifest mode"
+                )
+            except ValueError as error:
+                return "reviewed manifest differs" in str(error)
+            return False
+
+        check(
+            "terminal-semantic-rejects-current-cargo-manifest-writable-mode",
+            terminal_cargo_manifest_mode_rejected,
+        )
+
+        def terminal_cargo_recorded_hostile(
+            name: str, mutator: Any, expected_error: str
+        ) -> bool:
+            hostile = json.loads(json.dumps(current_children_fixture))
+            cargo = hostile["cargo_config_authority"]
+            mutator(cargo["recorded"])
+            cargo["translated_entries"] = json.loads(
+                json.dumps(cargo["recorded"]["entries"])
+            )
+            path = Path(temp) / f"hostile-cargo-recorded-{name}.json"
+            write_fixture_json(path, cargo["recorded"], 0o444)
+            metadata = path.stat()
+            cargo["identity"] = {
+                "bytes": metadata.st_size,
+                "ctime_ns": metadata.st_ctime_ns,
+                "device": metadata.st_dev,
+                "inode": metadata.st_ino,
+                "link_count": metadata.st_nlink,
+                "mode": stat.S_IMODE(metadata.st_mode),
+                "mtime_ns": metadata.st_mtime_ns,
+                "path": str(path.resolve()),
+                "sha256": sha256_file(path),
+                "size": metadata.st_size,
+            }
+            cargo["binding"] = {
+                "path": cargo["identity"]["path"],
+                "sha256": cargo["identity"]["sha256"],
+            }
+            hostile["lock_authority"]["lock_manifest"]["payload"]["variants"][
+                "A"
+            ]["resolver"]["cargo_config_search"] = json.loads(
+                json.dumps(cargo["binding"])
+            )
+            try:
+                _terminal_validate_current_cargo_authority(
+                    hostile, f"terminal hostile Cargo recorded {name}"
+                )
+            except ValueError as error:
+                return expected_error in str(error)
+            return False
+
+        def terminal_cargo_guest_context_rejected() -> bool:
+            for field, value in (
+                ("cwd", f"{GUEST_ROOT}/forged-source"),
+                ("cargo_home_path", f"{GUEST_ROOT}/forged-cargo-home"),
+            ):
+                if not terminal_cargo_recorded_hostile(
+                    field,
+                    lambda recorded, field=field, value=value: recorded.__setitem__(
+                        field, value
+                    ),
+                    "recorded guest context differs",
+                ):
+                    return False
+            return True
+
+        check(
+            "terminal-semantic-rejects-current-cargo-guest-context-drift",
+            terminal_cargo_guest_context_rejected,
+        )
+        check(
+            "terminal-semantic-rejects-current-cargo-recorded-translation-drift",
+            lambda: any(
+                "terminal semantic current Cargo config authority recorded/translated entries differ"
+                in error
+                for error in terminal_semantic_chain_errors(
+                    lambda current, _lock, _prepared: current[
+                        "cargo_config_authority"
+                    ]["translated_entries"][0].__setitem__(
+                        "sha256", "1" * 64
+                    ),
+                    include_overlay=True,
+                )
+            ),
+        )
+        check(
+            "terminal-semantic-rejects-current-cargo-edge-absence",
+            lambda: terminal_cargo_recorded_hostile(
+                "edge-absent",
+                lambda recorded: recorded["entries"][0].update({
+                    "sha256": None,
+                    "status": "absent",
+                }),
+                "recorded entry differs",
+            ),
+        )
+        check(
+            "terminal-semantic-rejects-current-cargo-resolver-binding-drift",
+            lambda: any(
+                "terminal semantic current Cargo config authority reviewed resolver crosslink differs"
+                in error
+                for error in terminal_semantic_chain_errors(
+                    lambda current, _lock, _prepared: current[
+                        "lock_authority"
+                    ]["lock_manifest"]["payload"]["variants"]["A"]["resolver"][
+                        "cargo_config_search"
+                    ].__setitem__("sha256", "0" * 64),
+                    include_overlay=True,
+                )
+            ),
+        )
+
+        def terminal_reviewed_lock_candidate_mismatch_rejected() -> bool:
+            hostile = json.loads(json.dumps(current_children_fixture))
+            hostile["lock_candidates"]["A"] = json.loads(
+                json.dumps(hostile["lock_candidates"]["C"])
+            )
+            try:
+                _terminal_validate_current_lock_proof(
+                    hostile,
+                    hostile["toolchain"],
+                    "terminal hostile reviewed lock candidate",
+                    live_system=False,
+                )
+            except ValueError as error:
+                return "candidate A live identity differs" in str(error)
+            return False
+
+        check(
+            "terminal-semantic-rejects-reviewed-lock-candidate-mismatch",
+            terminal_reviewed_lock_candidate_mismatch_rejected,
+        )
+        check(
+            "terminal-semantic-rejects-current-lock-validator-binding",
+            lambda: any(
+                "terminal semantic current lock proof validation result differs"
+                in error
+                for error in terminal_semantic_chain_errors(
+                    lambda current, _lock, _prepared: current[
+                        "lock_authority_validation"
+                    ].__setitem__("semantic_validator", "presence-only"),
+                    include_overlay=True,
+                )
+            ),
+        )
+
+        def terminal_final_tool_inheritance_rejected() -> bool:
+            hostile = json.loads(json.dumps(current_children_fixture))
+            base = schema.parse_canonical_json_object(
+                Path(hostile["inputs"][22]["path"]).read_bytes(),
+                "terminal hostile base tools",
+            )
+            final = schema.parse_canonical_json_object(
+                Path(hostile["tools_manifest_path"]).read_bytes(),
+                "terminal hostile final tools",
+            )
+            final["tools"]["perf"]["comm"] = "forged-perf"
+            try:
+                _terminal_require_final_tool_inheritance(
+                    base,
+                    final,
+                    hostile["artifacts"],
+                    "terminal hostile final tools",
+                )
+            except ValueError as error:
+                return "final tool inheritance differs" in str(error)
+            return False
+
+        check(
+            "terminal-semantic-rejects-final-nonchild-tool-drift",
+            terminal_final_tool_inheritance_rejected,
+        )
+
+        def terminal_final_support_inheritance_rejected() -> bool:
+            hostile = json.loads(json.dumps(current_children_fixture))
+            base = schema.parse_canonical_json_object(
+                Path(hostile["inputs"][22]["path"]).read_bytes(),
+                "terminal hostile base support",
+            )
+            final = schema.parse_canonical_json_object(
+                Path(hostile["tools_manifest_path"]).read_bytes(),
+                "terminal hostile final support",
+            )
+            final["support_files"]["runner"]["sha256"] = "0" * 64
+            try:
+                _terminal_require_final_tool_inheritance(
+                    base,
+                    final,
+                    hostile["artifacts"],
+                    "terminal hostile final support",
+                )
+            except ValueError as error:
+                return "final tool inheritance differs" in str(error)
+            return False
+
+        check(
+            "terminal-semantic-rejects-final-support-drift",
+            terminal_final_support_inheritance_rejected,
+        )
+        check(
+            "terminal-semantic-rejects-current-child-publication-route",
+            lambda: any(
+                "terminal semantic current tools manifest final child tool crosslinks differ"
+                in error
+                for error in terminal_semantic_chain_errors(
+                    lambda current, _lock, _prepared: current["artifacts"][
+                        "correctness"
+                    ].__setitem__(
+                        "path", current["artifacts"]["fault"]["path"]
+                    ),
+                    include_overlay=True,
+                )
+            ),
+        )
+
+        def terminal_product_binding_self_crosslink_rejected() -> bool:
+            path = Path(current_children_fixture["construction_path"])
+            original = path.read_bytes()
+            try:
+                hostile = json.loads(json.dumps(current_children_fixture))
+                value = schema.parse_canonical_json_object(
+                    original, "terminal hostile product binding"
+                )
+                hostile["product_commit"] = "e" * 40
+                hostile["product_tree"] = "f" * 40
+                value["product_commit"] = hostile["product_commit"]
+                value["product_tree"] = hostile["product_tree"]
+                value["archive"]["commit"] = hostile["product_commit"]
+                value["archive"]["tree"] = hostile["product_tree"]
+                write_fixture_json(path, value)
+                hostile["construction_sha256"] = sha256_file(path)
+                hostile["build_nonce"] = hostile["construction_sha256"]
+                terminal_validate_current_construction(
+                    hostile,
+                    path.parents[1],
+                    "terminal hostile product binding",
+                )
+            except ValueError as error:
+                return "identity differs" in str(error)
+            finally:
+                write_fixture(path, original)
+            return False
+
+        check(
+            "terminal-semantic-rejects-product-binding-self-crosslink",
+            terminal_product_binding_self_crosslink_rejected,
+        )
+
+        def terminal_archive_trailing_payload_rejected() -> bool:
+            current_root = Path(
+                current_children_fixture["construction_path"]
+            ).parents[1]
+            archive = (
+                current_root / "archives" / "source-A.tar"
+            ).read_bytes()
+            aligned_garbage = (
+                b"\0" * tarfile.BLOCKSIZE
+                + b"trailing-garbage"
+                + b"\0" * (
+                    tarfile.BLOCKSIZE - len(b"trailing-garbage")
+                )
+            )
+            for hostile in (archive + aligned_garbage, archive + archive):
+                try:
+                    _terminal_archive_tree(
+                        hostile, "terminal hostile trailing archive"
+                    )
+                except ValueError as error:
+                    if "archive trailing payload differs" in str(error):
+                        continue
+                return False
+            return True
+
+        check(
+            "terminal-semantic-rejects-archive-trailing-payload",
+            terminal_archive_trailing_payload_rejected,
+        )
+
+        def terminal_lineage_projection(
+            directory: str,
+        ) -> tuple[
+            dict[str, dict[str, Any]],
+            dict[str, dict[str, Any]],
+            dict[str, dict[str, Any]],
+        ]:
+            current_root = Path(
+                current_children_fixture["construction_path"]
+            ).parents[1]
+            construction = schema.parse_canonical_json_object(
+                Path(current_children_fixture["construction_path"]).read_bytes(),
+                "terminal hostile lineage construction",
+            )
+            archive_tree = _terminal_archive_tree(
+                (current_root / "archives" / "source-A.tar").read_bytes(),
+                "terminal hostile lineage archive",
+            )
+            source_root = current_root / "materialized" / directory
+            placements = []
+            for placement in construction["kinds"][directory]["placements"]:
+                exact = json.loads(json.dumps(placement))
+                exact["destination"] = Path(
+                    exact["destination"]
+                ).relative_to(source_root).as_posix()
+                placements.append(exact)
+            expected = _terminal_expected_materialized_projection(
+                archive_tree,
+                lock_payload=Path(
+                    current_children_fixture["lock_candidates"]["A"]["path"]
+                ).read_bytes(),
+                placements=placements,
+                patch_payload=Path(
+                    current_children_fixture["inputs"][5]["path"]
+                ).read_bytes(),
+                apply_overlay=directory in {"children", "hooked-release"},
+                context=f"terminal hostile {directory} lineage",
+            )
+            live = _terminal_materialized_projection(
+                source_root, f"terminal hostile {directory} live lineage"
+            )
+            return archive_tree, expected, live
+
+        def terminal_archive_materialization_drift_rejected() -> bool:
+            _archive, expected, live = terminal_lineage_projection(
+                "pristine-release"
+            )
+            live["src/lib.rs"]["sha256"] = "0" * 64
+            try:
+                _terminal_require_materialized_projection(
+                    live, expected, "terminal hostile pristine lineage"
+                )
+            except ValueError as error:
+                return "archive materialization differs" in str(error)
+            return False
+
+        check(
+            "terminal-semantic-rejects-archive-materialization-drift",
+            terminal_archive_materialization_drift_rejected,
+        )
+
+        def terminal_hooked_overlay_omission_rejected() -> bool:
+            archive, expected, live = terminal_lineage_projection(
+                "hooked-release"
+            )
+            engine = archive[CURRENT_ENGINE_PATH.as_posix()]["payload"]
+            live[CURRENT_ENGINE_PATH.as_posix()] = {
+                "file_type": "regular",
+                "permissions": 0o444,
+                "sha256": hashlib.sha256(engine).hexdigest(),
+                "size": len(engine),
+            }
+            try:
+                _terminal_require_materialized_projection(
+                    live, expected, "terminal hostile hooked lineage"
+                )
+            except ValueError as error:
+                return "archive materialization differs" in str(error)
+            return False
+
+        check(
+            "terminal-semantic-rejects-hooked-overlay-omission",
+            terminal_hooked_overlay_omission_rejected,
+        )
+
+        def terminal_construction_empty_placements_rejected() -> bool:
+            path = Path(current_children_fixture["construction_path"])
+            original = path.read_bytes()
+            try:
+                hostile = json.loads(json.dumps(current_children_fixture))
+                value = schema.parse_canonical_json_object(
+                    original, "terminal hostile construction"
+                )
+                value["kinds"]["children"]["placements"] = []
+                write_fixture_json(path, value)
+                hostile["construction_sha256"] = hashlib.sha256(
+                    path.read_bytes()
+                ).hexdigest()
+                hostile["build_nonce"] = hostile["construction_sha256"]
+                terminal_validate_current_construction(
+                    hostile, path.parents[1],
+                    "terminal hostile construction",
+                )
+            except ValueError as error:
+                return "children identity differs" in str(error)
+            finally:
+                write_fixture(path, original)
+            return False
+
+        check(
+            "terminal-semantic-rejects-empty-construction-placements",
+            terminal_construction_empty_placements_rejected,
+        )
+
+        def terminal_construction_source_swap_rejected() -> bool:
+            path = Path(current_children_fixture["construction_path"])
+            original = path.read_bytes()
+            try:
+                hostile = json.loads(json.dumps(current_children_fixture))
+                value = schema.parse_canonical_json_object(
+                    original, "terminal hostile construction source"
+                )
+                value["kinds"]["children"]["placements"][0]["source"] = (
+                    hostile["inputs"][1]["path"]
+                )
+                write_fixture_json(path, value)
+                hostile["construction_sha256"] = hashlib.sha256(
+                    path.read_bytes()
+                ).hexdigest()
+                hostile["build_nonce"] = hostile["construction_sha256"]
+                terminal_validate_current_construction(
+                    hostile, path.parents[1],
+                    "terminal hostile construction source",
+                )
+            except ValueError as error:
+                return "placement live crosslink differs" in str(error)
+            finally:
+                write_fixture(path, original)
+            return False
+
+        check(
+            "terminal-semantic-rejects-construction-source-swap",
+            terminal_construction_source_swap_rejected,
+        )
+
+        def terminal_materialized_manifest_hash_rejected() -> bool:
+            try:
+                _terminal_materialized_manifest_sidecar(
+                    Path(current_children_fixture["construction_path"]).parents[1],
+                    "children",
+                    Path(current_children_fixture["construction_path"]).parents[1]
+                    / "materialized" / "children",
+                    "0" * 64,
+                    "terminal hostile materialized manifest",
+                )
+            except ValueError as error:
+                return "exact live replay differs" in str(error)
+            return False
+
+        check(
+            "terminal-semantic-rejects-materialized-manifest-hash",
+            terminal_materialized_manifest_hash_rejected,
+        )
+
+        def terminal_nonempty_preserved_pfd_rejected() -> bool:
+            current = json.loads(json.dumps(current_children_fixture))
+            current_root = Path(current["construction_path"]).parents[1]
+            build = current["builds"]["children"]
+            log_path = current_root / "logs" / "cargo-build-children.json"
+            original = log_path.read_bytes()
+            build["execution"]["passed_file_descriptors"] -= 1
+            try:
+                write_fixture_json(log_path, build["execution"])
+                construction = schema.parse_canonical_json_object(
+                    Path(current["construction_path"]).read_bytes(),
+                    "terminal hostile dynamic PFD construction",
+                )
+                terminal_validate_current_build(
+                    build,
+                    name="children",
+                    directory="children",
+                    current=current,
+                    current_root=current_root,
+                    source_root=current_root / "materialized" / "children",
+                    toolchain=terminal_validate_toolchain(
+                        current["toolchain"],
+                        "terminal hostile dynamic PFD toolchain",
+                    ),
+                    replay=TerminalSemanticReplay([], live_system=False),
+                    expected_source_manifest_sha256=construction["kinds"][
+                        "children"
+                    ]["manifest_sha256"],
+                )
+            except ValueError as error:
+                return "passed descriptor cardinality differs" in str(error)
+            finally:
+                write_fixture(log_path, original)
+            return False
+
+        check(
+            "terminal-semantic-rejects-nonempty-preserved-pfd-cardinality",
+            terminal_nonempty_preserved_pfd_rejected,
+        )
+
+        def terminal_recursive_freeze_rejected() -> bool:
+            current_root = Path(
+                current_children_fixture["construction_path"]
+            ).parents[1]
+            logs = current_root / "logs"
+            logs.chmod(0o755)
+            try:
+                _terminal_validate_current_output_freeze(
+                    current_root, "terminal hostile recursive freeze"
+                )
+            except ValueError as error:
+                return "directory is not frozen" in str(error)
+            finally:
+                logs.chmod(0o555)
+            return False
+
+        check(
+            "terminal-semantic-rejects-unfrozen-current-evidence-directory",
+            terminal_recursive_freeze_rejected,
+        )
+        check(
+            "terminal-semantic-rejects-resolver-output-redirection",
+            lambda: any(
+                "terminal semantic B final-lock authority differs" in error
+                for error in terminal_semantic_chain_errors(
+                    lambda _current, lock, _prepared: lock["lock_manifest"][
+                        "payload"
+                    ]["variants"]["B"].__setitem__(
+                        "final_lock_path",
+                        lock["lock_manifest"]["payload"]["variants"]["A"][
+                            "final_lock_path"
+                        ],
+                    ),
+                    include_overlay=True,
+                )
+            ),
+        )
+
+        def redirect_terminal_resolver_namespace(
+            _current: dict[str, Any],
+            lock_authority: dict[str, Any],
+            _prepared: dict[str, Any],
+        ) -> None:
+            argv = lock_authority["lock_manifest"]["payload"]["variants"]["C"][
+                "current_lock_attempt"
+            ]["argv"]
+            argv[argv.index("/dev") - 1] = "--dev-bind"
+
+        check(
+            "terminal-semantic-rejects-resolver-private-namespace",
+            lambda: any(
+                "terminal resolver C current argv" in error
+                and "private namespace differs" in error
+                for error in terminal_semantic_chain_errors(
+                    redirect_terminal_resolver_namespace, include_overlay=True
+                )
+            ),
+        )
+        check(
+            "terminal-semantic-rejects-runtime-digest",
+            lambda: any(
+                "runtime differs" in error
+                for error in terminal_semantic_chain_errors(
+                    lambda current, _lock, _prepared: current["builds"][
+                        "children"
+                    ]["semantic_input_authority"].__setitem__(
+                        "runtime_sha256", "0" * 64
+                    ),
+                    include_overlay=True,
+                )
+            ),
+        )
+        check(
+            "terminal-semantic-rejects-missing-overlay-topology",
+            lambda: any(
+                "authorities=11 manifests=44 identities=44" in error
+                for error in terminal_semantic_chain_errors(
+                    lambda _current, _lock, _prepared: None,
+                    include_overlay=False,
+                )
+            ),
+        )
+
+        def terminal_semantic_manifest_hardlink_rejected() -> bool:
+            first_attestation = attempt_prepared_fixture["variants"]["A"][
+                "attestation"
+            ]
+            second_attestation = attempt_prepared_fixture["variants"]["B"][
+                "attestation"
+            ]
+            first_path = Path(
+                first_attestation["semantic_input_authority"]["toolchain"][
+                    "manifest_path"
+                ]
+            )
+            second_path = Path(
+                second_attestation["semantic_input_authority"]["toolchain"][
+                    "manifest_path"
+                ]
+            )
+            second_bytes = second_path.read_bytes()
+            second_mode = stat.S_IMODE(second_path.stat().st_mode)
+            try:
+                second_path.unlink()
+                os.link(first_path, second_path)
+                semantic_errors: list[str] = []
+                replay = TerminalSemanticReplay(
+                    semantic_errors, live_system=False
+                )
+                replay.capture(
+                    "terminal hostile semantic hardlink",
+                    lambda: replay.validate(
+                        first_attestation["semantic_input_authority"],
+                        "terminal hostile semantic hardlink",
+                        roots=TerminalSemanticReplay.roots(
+                            Path(first_attestation["materialized_root"]),
+                            first_attestation["toolchain"],
+                            "terminal hostile semantic hardlink",
+                        ),
+                    ),
+                )
+                return any(
+                    "manifest identity aliases" in error
+                    for error in semantic_errors
+                )
+            finally:
+                if second_path.exists():
+                    second_path.unlink()
+                write_fixture(second_path, second_bytes, second_mode)
+
+        check(
+            "terminal-semantic-rejects-manifest-hardlink-alias",
+            terminal_semantic_manifest_hardlink_rejected,
+        )
 
         def reseal_source_bundle(
             approval_value: dict[str, Any], bundle_value: dict[str, Any]
@@ -5727,13 +10643,24 @@ def self_test() -> dict[str, Any]:
             config_value = json.loads(json.dumps(config_fixture))
             mutator(proof_value, prepared_value, config_value)
             semantic_errors: list[str] = []
+            semantic_replay = TerminalSemanticReplay(
+                semantic_errors, live_system=False
+            )
             _BOUND_SNAPSHOTS.clear()
+            replay_terminal_semantic_chain(
+                current_children_fixture,
+                bundle_fixture["assertion"],
+                lock_authority_fixture,
+                prepared_value,
+                semantic_replay,
+            )
             validate_terminal_release_proof_semantics(
                 proof_value,
                 prepared_value,
                 approval_fixture,
                 current_children_fixture,
                 config_value,
+                semantic_replay,
                 semantic_errors,
             )
             _BOUND_SNAPSHOTS.clear()
@@ -6541,7 +11468,7 @@ def self_test() -> dict[str, Any]:
                 path.chmod(0o644)
                 path.write_bytes(canonical_json_bytes(value))
                 path.chmod(mode)
-                result, code = verify(output, publish=False)
+                result, code = verify(output, publish=False, synthetic=True)
                 return code == EXIT_INVALID and result["outcome"] == "TERMINAL_INVALID"
             finally:
                 path.chmod(0o644)
@@ -6555,7 +11482,7 @@ def self_test() -> dict[str, Any]:
                 path.chmod(0o644)
                 path.write_bytes(data)
                 path.chmod(mode)
-                result, code = verify(output, publish=False)
+                result, code = verify(output, publish=False, synthetic=True)
                 return code == EXIT_INVALID and result["outcome"] == "TERMINAL_INVALID"
             finally:
                 path.chmod(0o644)
@@ -6573,7 +11500,7 @@ def self_test() -> dict[str, Any]:
                 path.chmod(0o644)
                 path.write_bytes(canonical_json_bytes(value))
                 path.chmod(mode)
-                result, code = verify(output, publish=False)
+                result, code = verify(output, publish=False, synthetic=True)
                 return (
                     code == EXIT_INVALID
                     and any(
@@ -6595,7 +11522,7 @@ def self_test() -> dict[str, Any]:
             try:
                 attempt_path.unlink()
                 os.link(original_path, attempt_path)
-                result, code = verify(output, publish=False)
+                result, code = verify(output, publish=False, synthetic=True)
                 return code == EXIT_INVALID and any(
                     expected_error in error for error in result["errors"]
                 )
@@ -6633,7 +11560,7 @@ def self_test() -> dict[str, Any]:
                 claim_fixture_path.chmod(0o644)
                 claim_fixture_path.write_bytes(canonical_json_bytes(claim))
                 claim_fixture_path.chmod(0o444)
-                result, code = verify(output, publish=False)
+                result, code = verify(output, publish=False, synthetic=True)
                 return code == EXIT_INVALID and any(
                     "terminal original source approval path differs" in error
                     for error in result["errors"]
@@ -6730,7 +11657,7 @@ def self_test() -> dict[str, Any]:
             original = stat.S_IMODE(path.stat().st_mode)
             try:
                 path.chmod(mode)
-                result, code = verify(output, publish=False)
+                result, code = verify(output, publish=False, synthetic=True)
                 return code == EXIT_INVALID and result["outcome"] == "TERMINAL_INVALID"
             finally:
                 path.chmod(original)
@@ -6750,7 +11677,7 @@ def self_test() -> dict[str, Any]:
                     os.mkfifo(path, 0o444)
                 else:
                     raise AssertionError(kind)
-                result, code = verify(output, publish=False)
+                result, code = verify(output, publish=False, synthetic=True)
                 return code == EXIT_INVALID and result["outcome"] == "TERMINAL_INVALID"
             finally:
                 if path.exists() or path.is_symlink():
@@ -6882,7 +11809,7 @@ def self_test() -> dict[str, Any]:
             path = output / alias
             try:
                 write_fixture(path, (output / canonical).read_bytes())
-                result, code = verify(output, publish=False)
+                result, code = verify(output, publish=False, synthetic=True)
                 return code == EXIT_INVALID and result["outcome"] == "TERMINAL_INVALID"
             finally:
                 if path.exists():
@@ -6919,7 +11846,7 @@ def self_test() -> dict[str, Any]:
         early_output = build_terminal_fixture_v3(
             early_root, correctness_only=True
         )
-        early_result, early_rc = verify(early_output, publish=False)
+        early_result, early_rc = verify(early_output, publish=False, synthetic=True)
         checks.append(
             {
                 "name": "terminal-correctness-only-revert-chain",
@@ -6940,7 +11867,7 @@ def self_test() -> dict[str, Any]:
             historical_failure=True,
         )
         historical_result, historical_rc = verify(
-            historical_output, publish=False
+            historical_output, publish=False, synthetic=True
         )
         checks.append(
             {
@@ -6963,7 +11890,7 @@ def self_test() -> dict[str, Any]:
                 path.chmod(0o644)
                 path.write_bytes(canonical_json_bytes(value))
                 path.chmod(mode)
-                result, code = verify(early_output, publish=False)
+                result, code = verify(early_output, publish=False, synthetic=True)
                 return code == EXIT_INVALID and result["outcome"] == "TERMINAL_INVALID"
             finally:
                 path.chmod(0o644)
@@ -7018,7 +11945,7 @@ def self_test() -> dict[str, Any]:
             path = early_output / schema.CSV_FILENAMES["primary"]
             try:
                 write_fixture(path, b"injected timing evidence\n")
-                result, code = verify(early_output, publish=False)
+                result, code = verify(early_output, publish=False, synthetic=True)
                 return code == EXIT_INVALID and result["outcome"] == "TERMINAL_INVALID"
             finally:
                 if path.exists():

@@ -44,6 +44,7 @@ PRODUCT_COMMIT = "d644dc583dfe6a3d2cd07e71ce0212a323875ab4"
 PRODUCT_TREE = "205d853905bdb648ee997900c6aef24a323aa380"
 PRODUCT_LOCK_SHA256 = "9c24189940d9b43d7798c6680c8aeab6ddc270ef9b450390334d9327405cbea0"
 PRODUCT_ENGINE_SHA256 = "c995c27d8fff3e1ddfffdb700dfc94160a99ea0c7fe731017d3f1db99d7b59e7"
+EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 PRODUCT_OVERLAY_VALIDATOR_SCHEMA = "bn-xfw3-product-test-overlay-validator-v1"
 ATTESTATION_SCHEMA = "bn-ecm1-current-children-build-v2"
 CONSTRUCTION_SCHEMA = "bn-30fs-current-children-construction-v1"
@@ -1447,8 +1448,8 @@ def validate_lock_manifest(locks: dict[str, Any]) -> dict[str, str]:
 
 
 def reviewed_cargo_config_policy(
-    locks: Mapping[str, Any], toolchain: Mapping[str, str]
-) -> tuple[list[dict[str, Any]], dict[str, Any], Path]:
+    locks: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any], Path, Path]:
     try:
         binding = locks["variants"]["A"]["resolver"]["cargo_config_search"]
     except (KeyError, TypeError) as error:
@@ -1462,6 +1463,13 @@ def reviewed_cargo_config_policy(
     )
     if sha256_file(manifest_path) != binding["sha256"]:
         raise BuildError("reviewed A Cargo config search hash differs")
+    empty_path = require_exact_file(
+        manifest_path.with_name(f"{manifest_path.name}.empty"),
+        mode=0o444,
+        context="reviewed empty Cargo config",
+    )
+    if empty_path.stat().st_size != 0 or sha256_file(empty_path) != EMPTY_SHA256:
+        raise BuildError("reviewed empty Cargo config authority differs")
     recorded = load_canonical(
         manifest_path,
         "asterism-rebaseline-cargo-config-search-v3",
@@ -1470,41 +1478,25 @@ def reviewed_cargo_config_policy(
     if set(recorded) != {"cargo_home_path", "cwd", "entries", "schema"}:
         raise BuildError("reviewed A Cargo config search fields differ")
     entries = recorded.get("entries")
-    cwd = Path(str(recorded.get("cwd")))
-    cargo_home = Path(str(recorded.get("cargo_home_path")))
     if (
         not isinstance(entries, list)
-        or len(entries) < 4
+        or len(entries) != len(CARGO_CONFIG_GUEST_PATHS)
         or any(
             not isinstance(entry, dict)
             or set(entry) != {"path", "sha256", "status"}
             for entry in entries
         )
-        or str(cargo_home) != toolchain["cargo_home_path"]
-        or entries[0].get("path") != str(cwd / ".cargo" / "config.toml")
-        or entries[1].get("path") != str(cwd / ".cargo" / "config")
-        or entries[-2].get("path") != str(cargo_home / "config.toml")
-        or entries[-1].get("path") != str(cargo_home / "config")
+        or recorded.get("cwd") != "/asterism/source"
+        or recorded.get("cargo_home_path") != GUEST_CARGO_HOME
+        or [entry.get("path") for entry in entries]
+        != list(CARGO_CONFIG_GUEST_PATHS)
         or any(
             entry.get("status") != "absent" or entry.get("sha256") is not None
             for entry in entries[2:-2]
         )
     ):
         raise BuildError("reviewed A Cargo config search topology differs")
-    selected = [entries[0], entries[1]]
-    selected.extend(
-        {"path": path, "sha256": None, "status": "absent"}
-        for path in CARGO_CONFIG_GUEST_PATHS[2:6]
-    )
-    selected.extend(entries[-2:])
-    translated = [
-        {
-            "path": guest,
-            "sha256": entry.get("sha256"),
-            "status": entry.get("status"),
-        }
-        for guest, entry in zip(CARGO_CONFIG_GUEST_PATHS, selected, strict=True)
-    ]
+    translated = json.loads(json.dumps(entries))
     if any(
         set(entry) != {"path", "sha256", "status"}
         or entry["status"] not in {"present", "absent"}
@@ -1514,6 +1506,9 @@ def reviewed_cargo_config_policy(
         )
         or (entry["status"] == "absent" and entry["sha256"] is not None)
         for entry in translated
+    ) or any(
+        entry["status"] != "present" or entry["sha256"] is None
+        for entry in (*translated[:2], *translated[-2:])
     ):
         raise BuildError("reviewed A Cargo config entry policy differs")
     return translated, {
@@ -1521,7 +1516,7 @@ def reviewed_cargo_config_policy(
         "identity": file_identity(manifest_path, "reviewed Cargo config manifest"),
         "recorded": recorded,
         "translated_entries": translated,
-    }, manifest_path
+    }, manifest_path, empty_path
 
 
 def canonical_archive_member(member: tarfile.TarInfo) -> tuple[str, tuple[str, ...]]:
@@ -2734,17 +2729,20 @@ class CargoConfigSearchGuard:
         source_root: Path,
         cargo_home: Path,
         expected_entries: Sequence[Mapping[str, Any]],
+        empty_config_path: Path,
         manifest_evidence_path: Path,
         context: str,
     ) -> None:
         self.source_root = source_root
         self.cargo_home = cargo_home
         self.expected_entries = list(expected_entries)
+        self.empty_config_path = empty_config_path
         self.manifest_evidence_path = manifest_evidence_path
         self.context = context
         self.stack = ExitStack()
         self.directory_guards: dict[str, BoundBuildDirectory] = {}
         self.file_leases: dict[str, RetainedFile] = {}
+        self.empty_leases: dict[str, RetainedFile] = {}
         self.preserved: dict[str, list[dict[str, Any]]] = {}
         self.pre_build: dict[str, Any] | None = None
         self.post_build: dict[str, Any] | None = None
@@ -2754,6 +2752,16 @@ class CargoConfigSearchGuard:
         self.cargo_home_tree_evidence: RetainedFile | None = None
         self.poisoned = False
         self.active = False
+
+    @staticmethod
+    def _guest_path(origin: str, name: str) -> str:
+        if origin == "source":
+            base = "/asterism/source/.cargo"
+        elif origin == "cargo-home":
+            base = GUEST_CARGO_HOME
+        else:
+            raise BuildError(f"unknown Cargo config origin: {origin}")
+        return f"{base}/{name}"
 
     def _capture_directory(self, origin: str, path: Path) -> None:
         guard = self.stack.enter_context(
@@ -3160,6 +3168,19 @@ class CargoConfigSearchGuard:
                 for name in self.RESERVED:
                     key = f"{origin}:{name}"
                     candidate = directory / name
+                    guest_path = self._guest_path(origin, name)
+                    expected = next(
+                        (
+                            entry
+                            for entry in self.expected_entries
+                            if entry.get("path") == guest_path
+                        ),
+                        None,
+                    )
+                    if not isinstance(expected, Mapping):
+                        raise BuildError(
+                            f"{self.context} expected Cargo config is absent"
+                        )
                     try:
                         metadata = os.stat(
                             name,
@@ -3167,6 +3188,28 @@ class CargoConfigSearchGuard:
                             follow_symlinks=False,
                         )
                     except FileNotFoundError:
+                        if expected == {
+                            "path": guest_path,
+                            "sha256": EMPTY_SHA256,
+                            "status": "present",
+                        }:
+                            lease = self.stack.enter_context(
+                                RetainedFile(
+                                    self.empty_config_path,
+                                    f"{self.context} empty {origin} {name}",
+                                    expected_sha256=EMPTY_SHA256,
+                                    require_executable=False,
+                                )
+                            )
+                            if (
+                                lease.identity is None
+                                or lease.identity["mode"] != 0o444
+                                or lease.identity["size"] != 0
+                            ):
+                                raise BuildError(
+                                    f"{self.context} empty Cargo config differs"
+                                )
+                            self.empty_leases[key] = lease
                         continue
                     if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(
                         metadata.st_mode
@@ -3196,6 +3239,30 @@ class CargoConfigSearchGuard:
         key = f"{origin}:{name}"
         lease = self.file_leases.get(key)
         if lease is None:
+            empty_lease = self.empty_leases.get(key)
+            if empty_lease is not None:
+                guard = self.directory_guards[origin]
+                try:
+                    os.stat(name, dir_fd=guard.descriptor, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise BuildError(
+                        f"{self.context} empty-bound Cargo config appeared"
+                    )
+                empty_lease.verify()
+                if (
+                    empty_lease.identity is None
+                    or empty_lease.identity["mode"] != 0o444
+                    or empty_lease.identity["size"] != 0
+                    or empty_lease.identity["sha256"] != EMPTY_SHA256
+                ):
+                    raise BuildError(f"{self.context} empty Cargo config changed")
+                return {
+                    "path": guest_path,
+                    "sha256": EMPTY_SHA256,
+                    "status": "present",
+                }
             guard = self.directory_guards[origin]
             try:
                 os.stat(name, dir_fd=guard.descriptor, follow_symlinks=False)
@@ -3252,6 +3319,7 @@ class CargoConfigSearchGuard:
         descriptors = [
             *(guard.descriptor for guard in self.directory_guards.values()),
             *(lease.descriptor for lease in self.file_leases.values()),
+            *(lease.descriptor for lease in self.empty_leases.values()),
         ]
         if not self.active or any(descriptor < 0 for descriptor in descriptors):
             raise BuildError(f"{self.context} Cargo config descriptors differ")
@@ -3264,6 +3332,8 @@ class CargoConfigSearchGuard:
 
         self.replay(boundary="bwrap argument preparation")
         for lease in self.file_leases.values():
+            lease.rewind_for_bind_data()
+        for lease in self.empty_leases.values():
             lease.rewind_for_bind_data()
         arguments: list[str] = []
         source_guest = "/asterism/source/.cargo"
@@ -3293,6 +3363,16 @@ class CargoConfigSearchGuard:
                 arguments.extend(
                     ["--ro-bind-data", str(lease.descriptor), f"{source_guest}/{name}"]
                 )
+            else:
+                empty_lease = self.empty_leases.get(f"source:{name}")
+                if empty_lease is not None:
+                    arguments.extend(
+                        [
+                            "--ro-bind-data",
+                            str(empty_lease.descriptor),
+                            f"{source_guest}/{name}",
+                        ]
+                    )
         arguments.extend(["--remount-ro", source_guest])
 
         arguments.extend(
@@ -3314,6 +3394,16 @@ class CargoConfigSearchGuard:
                         f"{GUEST_CARGO_HOME}/{name}",
                     ]
                 )
+            else:
+                empty_lease = self.empty_leases.get(f"cargo-home:{name}")
+                if empty_lease is not None:
+                    arguments.extend(
+                        [
+                            "--ro-bind-data",
+                            str(empty_lease.descriptor),
+                            f"{GUEST_CARGO_HOME}/{name}",
+                        ]
+                    )
         arguments.extend(["--remount-ro", GUEST_CARGO_HOME])
         arguments.extend(
             [
@@ -3466,6 +3556,7 @@ def run_build(
     expected_lock: Any,
     reviewed_stage_admission: dict[str, Any],
     reviewed_cargo_config_entries: Sequence[Mapping[str, Any]],
+    reviewed_cargo_config_empty: Path,
     wrapper: Path | None,
     examples: Sequence[str],
     artifact_destinations: Mapping[str, Path],
@@ -3588,6 +3679,7 @@ def run_build(
                 materialized["root"],
                 Path(toolchain["cargo_home_path"]),
                 reviewed_cargo_config_entries,
+                reviewed_cargo_config_empty,
                 output / "manifests" / f"cargo-home-{kind}.json",
                 f"{kind} Cargo config search",
             )
@@ -4134,9 +4226,12 @@ def build(args: argparse.Namespace) -> None:
     validated_authority_before = validated_authority_records(validated)
     validated_locks_before = validated_lock_records(validated)
     toolchain = validate_lock_manifest(locks)
-    cargo_config_entries, cargo_config_authority, cargo_config_manifest_path = (
-        reviewed_cargo_config_policy(locks, toolchain)
-    )
+    (
+        cargo_config_entries,
+        cargo_config_authority,
+        cargo_config_manifest_path,
+        cargo_config_empty_path,
+    ) = reviewed_cargo_config_policy(locks)
     base_tools = validate_tools_manifest(tools_path, allow_child_placeholders=True)
     lock_payload = validated.locks["A"].payload
     if not isinstance(lock_payload, bytes) or sha256_bytes(lock_payload) != PRODUCT_LOCK_SHA256:
@@ -4223,6 +4318,7 @@ def build(args: argparse.Namespace) -> None:
         expected_lock=validated.locks["A"],
         reviewed_stage_admission=reviewed_stage_admission,
         reviewed_cargo_config_entries=cargo_config_entries,
+        reviewed_cargo_config_empty=cargo_config_empty_path,
         wrapper=None,
         examples=("asterism_rebaseline_public",),
         artifact_destinations={
@@ -4241,6 +4337,7 @@ def build(args: argparse.Namespace) -> None:
         expected_lock=validated.locks["A"],
         reviewed_stage_admission=reviewed_stage_admission,
         reviewed_cargo_config_entries=cargo_config_entries,
+        reviewed_cargo_config_empty=cargo_config_empty_path,
         wrapper=None,
         examples=("asterism_rebaseline_public",),
         artifact_destinations={
@@ -4304,6 +4401,7 @@ def build(args: argparse.Namespace) -> None:
         expected_lock=validated.locks["A"],
         reviewed_stage_admission=reviewed_stage_admission,
         reviewed_cargo_config_entries=cargo_config_entries,
+        reviewed_cargo_config_empty=cargo_config_empty_path,
         wrapper=wrapper_copy,
         examples=(
             "asterism_rebaseline_current_correctness",
@@ -4437,21 +4535,33 @@ def self_test_cargo_config_guard() -> dict[str, Any]:
         write_new(cargo_home / ".package-cache", b"", 0o444)
         config_payload = b"[net]\noffline = true\n"
         write_new(source_config, config_payload, 0o444)
+        empty_config = root / "reviewed-cargo-config.empty"
+        write_new(empty_config, b"", 0o444)
         expected = [
             {
                 "path": CARGO_CONFIG_GUEST_PATHS[0],
                 "sha256": sha256_bytes(config_payload),
                 "status": "present",
             },
+            {
+                "path": CARGO_CONFIG_GUEST_PATHS[1],
+                "sha256": EMPTY_SHA256,
+                "status": "present",
+            },
             *(
                 {"path": path, "sha256": None, "status": "absent"}
-                for path in CARGO_CONFIG_GUEST_PATHS[1:]
+                for path in CARGO_CONFIG_GUEST_PATHS[2:6]
+            ),
+            *(
+                {"path": path, "sha256": EMPTY_SHA256, "status": "present"}
+                for path in CARGO_CONFIG_GUEST_PATHS[6:]
             ),
         ]
         with CargoConfigSearchGuard(
             source,
             cargo_home,
             expected,
+            empty_config,
             evidence_root / "cargo-home-normal.json",
             "self-test Cargo config search",
         ) as guard:
@@ -4463,7 +4573,7 @@ def self_test_cargo_config_guard() -> dict[str, Any]:
                 or len(before["cargo_search"]["entries"]) != 8
                 or before["cargo_home_tree"]["entry_count"] != 5
                 or before["cargo_home_tree"]["watch_count"] != 3
-                or arguments.count("--ro-bind-data") != 1
+                or arguments.count("--ro-bind-data") != 4
                 or arguments.count("--ro-bind-fd") != 1
                 or arguments.count("--remount-ro") != 4
             ):
@@ -4474,6 +4584,7 @@ def self_test_cargo_config_guard() -> dict[str, Any]:
                 source,
                 cargo_home,
                 expected,
+                empty_config,
                 evidence_root / "cargo-home-hostile.json",
                 "self-test hostile Cargo-home tree",
             ) as hostile_guard:
@@ -4486,15 +4597,120 @@ def self_test_cargo_config_guard() -> dict[str, Any]:
             nested_mutation_rejected = True
         if not nested_mutation_rejected:
             raise BuildError("Cargo-home nested mutation/restore was accepted")
+        appeared_rejected = False
+        try:
+            with CargoConfigSearchGuard(
+                source,
+                cargo_home,
+                expected,
+                empty_config,
+                evidence_root / "cargo-config-appeared.json",
+                "self-test appearing Cargo config",
+            ) as appeared_guard:
+                write_new(source / ".cargo" / "config", b"", 0o444)
+                appeared_guard.replay(boundary="appearing config hostile")
+        except BuildError:
+            appeared_rejected = True
+        finally:
+            appeared = source / ".cargo" / "config"
+            if appeared.exists():
+                appeared.unlink()
+        if not appeared_rejected:
+            raise BuildError("empty-bound Cargo config appearance was accepted")
         return {
+            "empty_bound_appearance_rejected": True,
             "entries": 8,
             "nested_mutation_restore_rejected": True,
-            "ro_bind_data": 1,
+            "ro_bind_data": 4,
             "ro_bind_fd": 1,
             "schema": CARGO_CONFIG_SEARCH_SCHEMA,
             "status": "ok",
             "tree_entries": 5,
             "tree_watches": 3,
+        }
+
+
+def self_test_reviewed_cargo_config_policy() -> dict[str, Any]:
+    """Reject the stale host-path policy and retain the reviewed guest view."""
+
+    with tempfile.TemporaryDirectory(prefix="bn-2ld4-reviewed-config-") as temporary:
+        root = Path(temporary).resolve(strict=True)
+        entries = [
+            *(
+                {"path": path, "sha256": EMPTY_SHA256, "status": "present"}
+                for path in CARGO_CONFIG_GUEST_PATHS[:2]
+            ),
+            *(
+                {"path": path, "sha256": None, "status": "absent"}
+                for path in CARGO_CONFIG_GUEST_PATHS[2:6]
+            ),
+            *(
+                {"path": path, "sha256": EMPTY_SHA256, "status": "present"}
+                for path in CARGO_CONFIG_GUEST_PATHS[6:]
+            ),
+        ]
+        canonical = {
+            "cargo_home_path": GUEST_CARGO_HOME,
+            "cwd": "/asterism/source",
+            "entries": entries,
+            "schema": "asterism-rebaseline-cargo-config-search-v3",
+        }
+
+        def evaluate(label: str, value: Mapping[str, Any]) -> tuple[
+            list[dict[str, Any]], dict[str, Any], Path, Path
+        ]:
+            path = root / f"{label}.json"
+            write_new(path, canonical_bytes(value), 0o444)
+            write_new(path.with_name(f"{path.name}.empty"), b"", 0o444)
+            binding = {"path": str(path.resolve()), "sha256": sha256_file(path)}
+            locks = {
+                "variants": {"A": {"resolver": {"cargo_config_search": binding}}}
+            }
+            return reviewed_cargo_config_policy(locks)
+
+        translated, authority, path, empty_path = evaluate("canonical", canonical)
+        if (
+            translated != entries
+            or authority["recorded"] != canonical
+            or authority["translated_entries"] != entries
+            or authority["binding"]["path"] != str(path)
+            or empty_path != path.with_name(f"{path.name}.empty")
+        ):
+            raise BuildError("reviewed Cargo config canonical guest policy differs")
+
+        hostiles: list[tuple[str, dict[str, Any]]] = []
+        wrong_cwd = json.loads(json.dumps(canonical))
+        wrong_cwd["cwd"] = str(root / "source")
+        hostiles.append(("host-cwd", wrong_cwd))
+        wrong_home = json.loads(json.dumps(canonical))
+        wrong_home["cargo_home_path"] = str(root / "cargo-home")
+        hostiles.append(("host-cargo-home", wrong_home))
+        wrong_order = json.loads(json.dumps(canonical))
+        wrong_order["entries"][0], wrong_order["entries"][1] = (
+            wrong_order["entries"][1],
+            wrong_order["entries"][0],
+        )
+        hostiles.append(("entry-order", wrong_order))
+        middle_present = json.loads(json.dumps(canonical))
+        middle_present["entries"][2].update(
+            {"sha256": EMPTY_SHA256, "status": "present"}
+        )
+        hostiles.append(("middle-present", middle_present))
+        edge_absent = json.loads(json.dumps(canonical))
+        edge_absent["entries"][7].update({"sha256": None, "status": "absent"})
+        hostiles.append(("edge-absent", edge_absent))
+        rejected = 0
+        for label, value in hostiles:
+            try:
+                evaluate(label, value)
+            except BuildError:
+                rejected += 1
+        if rejected != len(hostiles):
+            raise BuildError("reviewed Cargo config hostile policy was accepted")
+        return {
+            "entries": len(entries),
+            "hostile_mutations_rejected": rejected,
+            "status": "ok",
         }
 
 
@@ -4632,6 +4848,7 @@ def self_test(repository: Path) -> None:
     fault = validate_fault_authority(repository)
     lock_module = load_lock_authority_module()
     cargo_config_guard = self_test_cargo_config_guard()
+    reviewed_cargo_config = self_test_reviewed_cargo_config_policy()
     semantic_runtime = self_test_semantic_runtime_authority()
     idempotent_freeze = self_test_idempotent_freeze()
     print(
@@ -4639,6 +4856,7 @@ def self_test(repository: Path) -> None:
             {
                 "fault_checks": fault["normal"]["checks"],
                 "cargo_config_guard": cargo_config_guard,
+                "reviewed_cargo_config_policy": reviewed_cargo_config,
                 "lock_api": sorted(
                     name
                     for name in (

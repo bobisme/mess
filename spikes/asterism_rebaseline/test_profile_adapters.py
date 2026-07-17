@@ -14,6 +14,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 MODULE_PATH = Path(__file__).with_name("profile_adapters.py")
@@ -89,6 +90,530 @@ def release_file_binding(path: Path) -> dict[str, object]:
             "modified_ns": metadata.st_mtime_ns,
         },
     }
+
+
+def review_input_binding(path: Path, schema: str) -> dict[str, object]:
+    binding = release_file_binding(path)
+    return {**binding, "schema": schema}
+
+
+def sandbox_environment(
+    toolchain: dict[str, object], *, release: bool = False
+) -> dict[str, str]:
+    environment = {
+        "CARGO_HOME": adapters._GUEST_CARGO_HOME,
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_NET_OFFLINE": "true",
+        "GIT_CONFIG_COUNT": "0",
+        "GIT_CONFIG_GLOBAL": f"{adapters._GUEST_ROOT}/absent-gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "HOME": "/nonexistent",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": f"{adapters._GUEST_TOOLCHAIN_ROOT}/bin:/usr/bin:/bin",
+        "RUSTC": adapters._GUEST_RUSTC,
+        "RUSTUP_HOME": "/nonexistent",
+        "RUSTUP_TOOLCHAIN": str(toolchain["rustup_toolchain"]),
+        "TZ": "UTC",
+    }
+    if release:
+        environment.update(
+            {name: f"synthetic-{name.lower()}" for name in adapters._RELEASE_BUILD_ENVIRONMENT_FIELDS}
+        )
+    return environment
+
+
+def current_sandbox_environment(toolchain: dict[str, object]) -> dict[str, str]:
+    environment = sandbox_environment(toolchain)
+    environment["PATH"] = "/usr/bin:/bin"
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment["PYTHONNOUSERSITE"] = "1"
+    return environment
+
+
+def current_file_identity(path: Path, *, logical_path: str | None = None) -> dict[str, object]:
+    metadata = path.stat()
+    payload = path.read_bytes()
+    return {
+        "bytes": metadata.st_size,
+        "ctime_ns": metadata.st_ctime_ns,
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "link_count": metadata.st_nlink,
+        "mode": stat.S_IMODE(metadata.st_mode),
+        "mtime_ns": metadata.st_mtime_ns,
+        "path": logical_path or str(path.resolve()),
+        "sha256": sha256(payload),
+        "size": metadata.st_size,
+    }
+
+
+def current_directory_identity(path: Path) -> dict[str, object]:
+    metadata = path.stat()
+    return {
+        "changed_ns": metadata.st_ctime_ns,
+        "device": metadata.st_dev,
+        "file_type": stat.S_IFMT(metadata.st_mode),
+        "inode": metadata.st_ino,
+        "link_count": metadata.st_nlink,
+        "modified_ns": metadata.st_mtime_ns,
+        "path": str(path.resolve()),
+        "permissions": stat.S_IMODE(metadata.st_mode),
+        "size": metadata.st_size,
+    }
+
+
+def current_path_chain(path: Path) -> list[dict[str, object]]:
+    selected = Path("/")
+    paths = [selected]
+    for part in path.parts[1:]:
+        selected /= part
+        paths.append(selected)
+    records = []
+    for selected in paths:
+        metadata = selected.lstat()
+        records.append(
+            {
+                "changed_ns": metadata.st_ctime_ns,
+                "device": metadata.st_dev,
+                "gid": metadata.st_gid,
+                "inode": metadata.st_ino,
+                "link_count": metadata.st_nlink,
+                "mode": stat.S_IMODE(metadata.st_mode),
+                "modified_ns": metadata.st_mtime_ns,
+                "path": str(selected),
+                "size": metadata.st_size,
+                "type": stat.S_IFMT(metadata.st_mode),
+                "uid": metadata.st_uid,
+            }
+        )
+    return records
+
+
+def current_retained_file(path: Path, *, trusted: bool) -> dict[str, object]:
+    exact = path.resolve(strict=True)
+    return {
+        "identity": current_file_identity(exact),
+        "path_chain": current_path_chain(exact) if trusted else None,
+        "trusted_system": trusted,
+    }
+
+
+def prepare_tree(root: Path, name: str, payload: bytes = b"semantic input\n") -> None:
+    root.mkdir(parents=True)
+    entry = root / name
+    entry.write_bytes(payload)
+    entry.chmod(0o444)
+    root.chmod(0o555)
+
+
+def write_cargo_config_manifest(
+    path: Path, source_root: Path, cargo_home: Path
+) -> str:
+    candidates: tuple[tuple[str, Path | None], ...] = (
+        (
+            f"{adapters._GUEST_SOURCE}/.cargo/config.toml",
+            source_root / ".cargo/config.toml",
+        ),
+        (f"{adapters._GUEST_SOURCE}/.cargo/config", source_root / ".cargo/config"),
+        (f"{adapters._GUEST_ROOT}/.cargo/config.toml", None),
+        (f"{adapters._GUEST_ROOT}/.cargo/config", None),
+        ("/.cargo/config.toml", None),
+        ("/.cargo/config", None),
+        (
+            f"{adapters._GUEST_CARGO_HOME}/config.toml",
+            cargo_home / "config.toml",
+        ),
+        (f"{adapters._GUEST_CARGO_HOME}/config", cargo_home / "config"),
+    )
+    entries = []
+    for guest, host in candidates:
+        if host is None:
+            entries.append({"path": guest, "status": "absent", "sha256": None})
+        else:
+            digest = sha256(host.read_bytes()) if host.exists() else sha256(b"")
+            entries.append({"path": guest, "status": "present", "sha256": digest})
+    digest = write_canonical(
+        path,
+        {
+            "schema": adapters._CARGO_CONFIG_SEARCH_SCHEMA,
+            "cargo_home_path": adapters._GUEST_CARGO_HOME,
+            "cwd": adapters._GUEST_SOURCE,
+            "entries": entries,
+        },
+        0o444,
+    )
+    empty = path.with_name(f"{path.name}.empty")
+    empty.write_bytes(b"")
+    empty.chmod(0o444)
+    return digest
+
+
+def fixture_recursive_manifest(
+    root: Path,
+    role: str,
+    *,
+    hash_regular_contents: bool,
+    excluded_relative_paths: tuple[str, ...] = (),
+    volatile_directory_metadata_paths: tuple[str, ...] = (),
+) -> dict[str, object]:
+    entries: list[dict[str, object]] = []
+
+    def record(path: Path, relative: str, kind: str) -> dict[str, object]:
+        metadata = path.lstat()
+        item: dict[str, object] = {
+            "changed_ns": metadata.st_ctime_ns,
+            "device": metadata.st_dev,
+            "file_type": kind,
+            "gid": metadata.st_gid,
+            "inode": metadata.st_ino,
+            "link_count": metadata.st_nlink,
+            "modified_ns": metadata.st_mtime_ns,
+            "path": relative,
+            "permissions": stat.S_IMODE(metadata.st_mode),
+            "sha256": (
+                sha256(path.read_bytes())
+                if kind == "regular" and hash_regular_contents
+                else None
+            ),
+            "size": metadata.st_size,
+            "symlink_target": None,
+            "symlink_scope": None,
+            "uid": metadata.st_uid,
+        }
+        if kind == "directory" and relative in volatile_directory_metadata_paths:
+            for field in ("changed_ns", "modified_ns", "permissions", "size"):
+                item[field] = 0
+        return item
+
+    def walk(directory: Path, relative: str) -> None:
+        entries.append(record(directory, relative, "directory"))
+        for child in sorted(directory.iterdir(), key=lambda path: path.name):
+            child_relative = child.name if relative == "." else f"{relative}/{child.name}"
+            if child_relative in excluded_relative_paths:
+                continue
+            metadata = child.lstat()
+            if stat.S_ISDIR(metadata.st_mode):
+                walk(child, child_relative)
+            elif stat.S_ISREG(metadata.st_mode):
+                entries.append(record(child, child_relative, "regular"))
+            else:
+                raise AssertionError(f"fixture has an unsupported node: {child}")
+
+    walk(root, ".")
+    return {
+        "entries": entries,
+        "role": role,
+        "schema": adapters._RECURSIVE_TREE_AUTHORITY_SCHEMA,
+    }
+
+
+def fixture_semantic_runtime_sha256(authority: dict[str, object]) -> str:
+    tree_fields = (
+        "schema",
+        "role",
+        "manifest_sha256",
+        "entry_count",
+        "watch_count",
+        "equal_pre_post",
+        "mutation_events_absent",
+    )
+    closure_fields = (
+        "schema",
+        "sha256",
+        "entry_count",
+        "mounts",
+        "watch_count",
+        "mutation_events_absent",
+    )
+    normalized = {
+        "cargo_home": {
+            field: authority["cargo_home"][field] for field in tree_fields
+        },
+        "schema": adapters._SEMANTIC_INPUT_AUTHORITY_SCHEMA,
+        "toolchain": {
+            field: authority["toolchain"][field] for field in tree_fields
+        },
+        "trusted_system_closure": {
+            field: authority["trusted_system_closure"][field]
+            for field in closure_fields
+        },
+    }
+    return sha256(adapters.canonical_json(normalized))
+
+
+def semantic_authority(
+    *,
+    source_root: Path,
+    toolchain_root: Path,
+    cargo_home: Path,
+    paths: dict[str, Path],
+    source_role: str = "source",
+) -> dict[str, object]:
+    specifications = (
+        (
+            "source",
+            source_root,
+            source_role,
+            True,
+            ("Cargo.lock",)
+            if source_role == "resolution_source_without_cargo_lock"
+            else (),
+            (".",) if source_role == "resolution_source_without_cargo_lock" else (),
+        ),
+        ("toolchain", toolchain_root, "toolchain", True, (), ()),
+        ("cargo_home", cargo_home, "cargo_home", True, (), ()),
+    )
+    authority: dict[str, object] = {
+        "schema": adapters._SEMANTIC_INPUT_AUTHORITY_SCHEMA
+    }
+    for name, root, role, hash_contents, excluded, volatile in specifications:
+        manifest = fixture_recursive_manifest(
+            root,
+            role,
+            hash_regular_contents=hash_contents,
+            excluded_relative_paths=excluded,
+            volatile_directory_metadata_paths=volatile,
+        )
+        digest = write_canonical(paths[name], manifest, 0o444)
+        entries = manifest["entries"]
+        authority[name] = {
+            "entry_count": len(entries),
+            "equal_pre_post": True,
+            "manifest_path": str(paths[name]),
+            "manifest_sha256": digest,
+            "mutation_events_absent": True,
+            "role": role,
+            "schema": adapters._RECURSIVE_TREE_AUTHORITY_SCHEMA,
+            "watch_count": sum(
+                entry["file_type"] == "directory" for entry in entries
+            ),
+        }
+    roots = tuple(path.resolve(strict=True) for path, _guest in adapters._TRUSTED_SYSTEM_MOUNTS)
+    evidence_mounts = []
+    binding_mounts = []
+    closure_entries = 0
+    closure_watches = 0
+    for (host, guest), resolved in zip(
+        adapters._TRUSTED_SYSTEM_MOUNTS, roots, strict=True
+    ):
+        role = "system-" + guest.removeprefix("/").replace("/", "-")
+        tree = fixture_recursive_manifest(
+            resolved,
+            role,
+            hash_regular_contents=False,
+        )
+        root_entry = tree["entries"][0]
+        evidence_mounts.append(
+            {
+                "guest_path": guest,
+                "host_path": str(host),
+                "resolved_path": str(resolved),
+                "tree": tree,
+            }
+        )
+        binding_mounts.append(
+            {
+                "device": root_entry["device"],
+                "gid": root_entry["gid"],
+                "guest_path": guest,
+                "host_path": str(host),
+                "inode": root_entry["inode"],
+                "permissions": root_entry["permissions"],
+                "resolved_path": str(resolved),
+                "trusted_root_owned_non_writable": True,
+                "uid": root_entry["uid"],
+            }
+        )
+        closure_entries += len(tree["entries"])
+        closure_watches += sum(
+            entry["file_type"] == "directory" for entry in tree["entries"]
+        )
+    closure_value = {
+        "mounts": evidence_mounts,
+        "schema": adapters._TRUSTED_SYSTEM_CLOSURE_SCHEMA,
+    }
+    closure_sha = write_canonical(paths["closure"], closure_value, 0o444)
+    closure = {
+        "entry_count": closure_entries,
+        "manifest_path": str(paths["closure"]),
+        "mounts": binding_mounts,
+        "mutation_events_absent": True,
+        "schema": adapters._TRUSTED_SYSTEM_CLOSURE_SCHEMA,
+        "sha256": closure_sha,
+        "watch_count": closure_watches,
+    }
+    authority["trusted_system_closure"] = closure
+    authority["runtime_sha256"] = fixture_semantic_runtime_sha256(authority)
+    return authority
+
+
+def semantic_paths(root: Path, label: str, *, resolver: bool = False) -> dict[str, Path]:
+    if resolver:
+        return {
+            "source": root / f"resolution-source-{label}.json",
+            "toolchain": root / f"resolution-toolchain-{label}.json",
+            "cargo_home": root / f"resolution-cargo-home-{label}.json",
+            "closure": root / f"resolution-{label}-system-closure.json",
+        }
+    return {
+        "source": root / f"semantic-source-{label}.json",
+        "toolchain": root / f"semantic-toolchain-{label}.json",
+        "cargo_home": root / f"semantic-cargo-home-{label}.json",
+        "closure": root / f"{label}-system-closure.json",
+    }
+
+
+def fixture_trusted_mounts(root: Path) -> tuple[tuple[Path, str], ...]:
+    return (
+        (root / "trusted" / "usr-bin", "/usr/bin"),
+        (root / "trusted" / "usr-lib", "/usr/lib"),
+        (root / "trusted" / "usr-include", "/usr/include"),
+    )
+
+
+def release_attestation(
+    *,
+    prepared_root: Path,
+    label: str,
+    source_root: Path,
+    toolchain: dict[str, object],
+    package: str,
+    example: str,
+    descriptors: range,
+    source_approval_sha256: str,
+    contract: dict[str, object],
+) -> dict[str, object]:
+    paths = semantic_paths(prepared_root / "manifests", label)
+    semantic = semantic_authority(
+        source_root=source_root,
+        toolchain_root=Path(str(toolchain["cargo_path"])).parent.parent,
+        cargo_home=Path(str(toolchain["cargo_home_path"])),
+        paths=paths,
+    )
+    names = (
+        *(f"system:{guest}" for _host, guest in adapters._TRUSTED_SYSTEM_MOUNTS),
+        "source",
+        "target",
+        "toolchain_root",
+        "cargo",
+        "rustc",
+        "cargo_home",
+        *(f"config:{guest}" for guest in adapters._GUEST_BOUND_CONFIG_PATHS),
+    )
+    descriptor_map = dict(zip(names, descriptors, strict=True))
+    config_path = prepared_root / "manifests" / f"cargo-config-{label}.json"
+    config_sha = write_cargo_config_manifest(
+        config_path, source_root, Path(str(toolchain["cargo_home_path"]))
+    )
+    argv = adapters._release_sandbox_argv(
+        descriptor_map, package, example, str(toolchain["bwrap_path"])
+    )
+    build_env = sandbox_environment(toolchain, release=True)
+    build_env["ASTERISM_BUILD_SOURCE_APPROVAL_SHA256"] = source_approval_sha256
+    normalized = list(argv)
+    for index, argument in enumerate(normalized):
+        if argument in {"--ro-bind-fd", "--bind-fd"}:
+            normalized[index + 1] = f"$FD:{normalized[index + 2]}"
+    sequence = {
+        "build-A": 1,
+        "build-B": 3,
+        "build-C": 5,
+        "build-D": 7,
+        "build-A-product-overlay": 10,
+    }[label]
+    build_log_path = prepared_root / "logs" / f"{label}.json"
+    build_log_sha256 = write_canonical(
+        build_log_path,
+        {
+            "exit_status": 0,
+            "stderr": "",
+            "stderr_sha256": sha256(b""),
+            "stdout": "",
+            "stdout_sha256": sha256(b""),
+        },
+        0o444,
+    )
+    pid = 400 + sequence
+    started_at = f"2026-07-16T00:00:{sequence:02d}+00:00"
+    completed_at = f"2026-07-16T00:00:{sequence + 1:02d}+00:00"
+    build_child = {
+        "argv": argv,
+        "completed_at": completed_at,
+        "completed_monotonic_ns": sequence + 1,
+        "cwd": str(source_root),
+        "exit_status": 0,
+        "output_path": str(build_log_path),
+        "output_sha256": build_log_sha256,
+        "pid": pid,
+        "process_group_absent": True,
+        "reaping": {"pid": pid, "start_ticks": pid + 1, "status": "absent"},
+        "start_ticks": pid + 1,
+        "started_at": started_at,
+        "started_monotonic_ns": sequence,
+        "timed_out": False,
+        "waited_pid": pid,
+    }
+    contract_output = prepared_root / "manifests" / f"contract-{label}.json"
+    contract_output_sha256 = write_canonical(contract_output, contract, 0o444)
+    attestation: dict[str, object] = {
+        "source_commit": "1" * 40,
+        "source_tree": "2" * 40,
+        "source_archive_path": str(prepared_root / "archives" / f"{label}.tar"),
+        "source_archive_sha256": "1" * 64,
+        "source_archive_bytes": 1,
+        "archive_manifest_path": str(
+            prepared_root / "manifests" / f"archive-{label}.json"
+        ),
+        "archive_manifest_sha256": "2" * 64,
+        "overlay_manifest_path": str(
+            prepared_root / "manifests" / f"overlay-{label}.json"
+        ),
+        "overlay_manifest_sha256": "3" * 64,
+        "materialized_root": str(source_root),
+        "materialized_manifest_path": str(
+            prepared_root / "manifests" / f"materialized-{label}.json"
+        ),
+        "materialized_manifest_sha256": "4" * 64,
+        "materialized_manifest_pre_sha256": "4" * 64,
+        "materialized_manifest_post_sha256": "4" * 64,
+        "source_read_only": True,
+        "cargo_lock_path": str(source_root / "Cargo.lock"),
+        "cargo_lock_sha256": "5" * 64,
+        "cargo_lock_pre_sha256": "5" * 64,
+        "cargo_lock_post_sha256": "5" * 64,
+        "target_dir": str(prepared_root / "targets" / label),
+        "target_dir_was_absent": True,
+        "build_nonce": "4" * 64,
+        "build_argv": argv,
+        "build_env": build_env,
+        "cargo_config_search": {
+            "path": str(config_path),
+            "sha256": config_sha,
+        },
+        "semantic_input_authority": semantic,
+        "toolchain": toolchain,
+        "build_started_at": started_at,
+        "build_started_monotonic_ns": sequence,
+        "build_completed_at": completed_at,
+        "build_completed_monotonic_ns": sequence + 1,
+        "build_log_path": str(build_log_path),
+        "build_log_sha256": build_log_sha256,
+        "build_child": build_child,
+        "contract_output_path": str(contract_output),
+        "contract_output_sha256": contract_output_sha256,
+        "contract_child": {},
+    }
+    attestation["_sandbox_sha256"] = sha256(
+        adapters.canonical_json(
+            {
+                "argv": normalized,
+                "cargo_config_search_sha256": config_sha,
+                "semantic_runtime_sha256": semantic["runtime_sha256"],
+            }
+        )
+    )
+    return attestation
 
 
 def nm_child(
@@ -388,15 +913,602 @@ def live_authority(
     nm_path.write_bytes(b"synthetic nm executable\n")
     nm_path.chmod(0o555)
 
-    preapproval_compile_out = {
+    bwrap = Path("/usr/bin/true").resolve(strict=True)
+    rustup = Path("/usr/bin/false").resolve(strict=True)
+    toolchain_root = root / "toolchain"
+    toolchain_bin = toolchain_root / "bin"
+    toolchain_bin.mkdir(parents=True)
+    cargo = toolchain_bin / "cargo"
+    git = toolchain_bin / "git"
+    rustc = toolchain_bin / "rustc"
+    for tool in (cargo, git, rustc):
+        tool.write_bytes(f"synthetic {tool.name}\n".encode())
+        tool.chmod(0o555)
+    toolchain_bin.chmod(0o555)
+    toolchain_root.chmod(0o555)
+    cargo_home = root / "cargo-home"
+    prepare_tree(cargo_home, "config.toml", b"[net]\noffline = true\n")
+    cargo_home.chmod(0o755)
+    cargo_home_preserved = cargo_home / "registry-cache"
+    cargo_home_preserved.write_bytes(b"synthetic preserved Cargo-home child\n")
+    cargo_home_preserved.chmod(0o444)
+    cargo_home.chmod(0o555)
+    rustup_home = root / "rustup-home"
+    rustup_home.mkdir()
+    rustup_home.chmod(0o555)
+    toolchain: dict[str, object] = {
+        "bwrap_path": str(bwrap),
+        "bwrap_sha256": sha256(bwrap.read_bytes()),
+        "cargo_home_path": str(cargo_home),
+        "cargo_path": str(cargo),
+        "cargo_sha256": sha256(cargo.read_bytes()),
+        "cargo_version_verbose": "cargo 1.99.0 (synthetic)",
+        "git_path": str(git),
+        "git_sha256": sha256(git.read_bytes()),
+        "rustc_path": str(rustc),
+        "rustc_sha256": sha256(rustc.read_bytes()),
+        "rustc_version_verbose": (
+            "rustc 1.99.0 (synthetic)\n"
+            "binary: rustc\n"
+            "host: x86_64-unknown-linux-gnu"
+        ),
+        "rustc_host": "x86_64-unknown-linux-gnu",
+        "rustup_home_path": str(rustup_home),
+        "rustup_path": str(rustup),
+        "rustup_sha256": sha256(rustup.read_bytes()),
+        "rustup_toolchain": "synthetic-stable",
+    }
+    for index, (trusted_root, _guest) in enumerate(
+        adapters._TRUSTED_SYSTEM_MOUNTS
+    ):
+        prepare_tree(trusted_root, f"trusted-{index}", b"trusted metadata\n")
+
+    current_root = root / "reviewed-current"
+    current_manifests = current_root / "manifests"
+    current_manifests.mkdir(parents=True)
+    (current_root / "logs").mkdir()
+    (current_root / "targets").mkdir()
+    (current_root / "artifacts" / "tools").mkdir(parents=True)
+    (current_root / "artifacts" / "release").mkdir()
+    (current_root / "receipts").mkdir()
+    (current_root / "inputs").mkdir()
+    wrapper_input = current_root / "inputs" / "rustc_workspace_wrapper.py"
+    wrapper_input.write_bytes(b"#!/usr/bin/python3\n# synthetic wrapper\n")
+    wrapper_input.chmod(0o555)
+    current_lock_payload = b"synthetic lock A\n"
+    current_lock_sha256 = sha256(current_lock_payload)
+    build_nonce = "0" * 64
+    current_compile_out = {
         "binary_byte_identical": True,
         "forbidden_hook_strings": list(adapters._FORBIDDEN_RELEASE_HOOK_STRINGS),
+        "overlay_release_sha256": "6" * 64,
+        "pristine_sha256": "6" * 64,
+        "symbol_absence_sha256": "7" * 64,
         "symbol_inventory_byte_identical": True,
     }
-    current_children = {
-        "release_compile_out": preapproval_compile_out,
-        "schema": "bn-30fs-current-children-build-v1",
+    filesystem_admissions: dict[str, object] = {}
+    current_builds: dict[str, object] = {}
+    for name, source_name in (
+        ("children", "children"),
+        ("hooked_release", "hooked-release"),
+        ("pristine_release", "pristine-release"),
+    ):
+        source_root = current_root / "materialized" / source_name
+        source_root.mkdir(parents=True)
+        (source_root / "Cargo.toml").write_bytes(f"[{name}]\n".encode())
+        (source_root / "Cargo.toml").chmod(0o444)
+        (source_root / "Cargo.lock").write_bytes(current_lock_payload)
+        (source_root / "Cargo.lock").chmod(0o444)
+        (source_root / ".cargo").mkdir()
+        (source_root / ".cargo").chmod(0o555)
+        source_root.chmod(0o555)
+        paths = semantic_paths(current_manifests, source_name)
+        paths["cargo_home"] = current_manifests / f"cargo-home-{source_name}.json"
+        semantic = semantic_authority(
+            source_root=source_root,
+            toolchain_root=toolchain_root,
+            cargo_home=cargo_home,
+            paths=paths,
+        )
+        materialized_manifest_sha256 = write_canonical(
+            current_manifests / f"materialized-{source_name}.json",
+            {
+                "entries": [{"path": "."}, {"path": "Cargo.lock"}, {"path": "Cargo.toml"}],
+                "schema": "bn-30fs-file-manifest-v2",
+            },
+            0o444,
+        )
+        cargo_search_entries = [
+            {
+                "path": f"{adapters._GUEST_SOURCE}/.cargo/config.toml",
+                "sha256": None,
+                "status": "absent",
+            },
+            {
+                "path": f"{adapters._GUEST_SOURCE}/.cargo/config",
+                "sha256": None,
+                "status": "absent",
+            },
+            *(
+                {
+                    "path": path,
+                    "sha256": None,
+                    "status": "absent",
+                }
+                for path in (
+                    f"{adapters._GUEST_ROOT}/.cargo/config.toml",
+                    f"{adapters._GUEST_ROOT}/.cargo/config",
+                    "/.cargo/config.toml",
+                    "/.cargo/config",
+                )
+            ),
+            {
+                "path": f"{adapters._GUEST_CARGO_HOME}/config.toml",
+                "sha256": sha256((cargo_home / "config.toml").read_bytes()),
+                "status": "present",
+            },
+            {
+                "path": f"{adapters._GUEST_CARGO_HOME}/config",
+                "sha256": None,
+                "status": "absent",
+            },
+        ]
+        semantic_cargo_home = semantic["cargo_home"]
+        cargo_config = {
+            "cargo_search": {
+                "cargo_home_path": adapters._GUEST_CARGO_HOME,
+                "cwd": adapters._GUEST_SOURCE,
+                "entries": cargo_search_entries,
+                "schema": adapters._CARGO_CONFIG_SEARCH_SCHEMA,
+            },
+            "cargo_home_tree": {
+                "entry_count": semantic_cargo_home["entry_count"],
+                "equal_pre_post": True,
+                "path": semantic_cargo_home["manifest_path"],
+                "post_sha256": semantic_cargo_home["manifest_sha256"],
+                "pre_sha256": semantic_cargo_home["manifest_sha256"],
+                "watch_count": semantic_cargo_home["watch_count"],
+            },
+            "preserved_top_level_entries": {
+                "cargo-home": [
+                    {
+                        "identity": current_file_identity(cargo_home_preserved),
+                        "name": cargo_home_preserved.name,
+                        "type": "regular",
+                    }
+                ],
+                "source": [],
+            },
+            "schema": adapters._CURRENT_CARGO_CONFIG_SCHEMA,
+        }
+        config_bindings = (
+            ("cargo_home", "--ro-bind-fd", adapters._GUEST_CARGO_HOME),
+            (
+                f"config:{adapters._GUEST_CARGO_HOME}/config.toml",
+                "--ro-bind-data",
+                f"{adapters._GUEST_CARGO_HOME}/config.toml",
+            ),
+        )
+        descriptor_names = (
+            *(f"system:{guest}" for _host, guest in adapters._TRUSTED_SYSTEM_MOUNTS),
+            "source",
+            "toolchain_root",
+            "cargo",
+            "rustc",
+            "python",
+            *(binding[0] for binding in config_bindings),
+            "target",
+            *(("wrapper", "receipt") if name == "children" else ()),
+        )
+        descriptors = dict(
+            zip(descriptor_names, range(100, 100 + len(descriptor_names)), strict=True)
+        )
+        examples = (
+            (
+                "asterism_rebaseline_current_correctness",
+                "asterism_rebaseline_current_fault",
+            )
+            if name == "children"
+            else ("asterism_rebaseline_public",)
+        )
+        argv = adapters._current_build_argv(
+            descriptors,
+            config_bindings,
+            bwrap_path=str(bwrap),
+            examples=examples,
+            wrapper=name == "children",
+        )
+        environment = current_sandbox_environment(toolchain)
+        if name == "children":
+            environment.update(
+                {
+                    "ASTERISM_FAULT_COMPILE_OUT_IDENTICAL": "true",
+                    "ASTERISM_FAULT_COMPILE_OUT_OVERLAY_RELEASE_SHA256": current_compile_out["overlay_release_sha256"],
+                    "ASTERISM_FAULT_COMPILE_OUT_PRISTINE_SHA256": current_compile_out["pristine_sha256"],
+                    "ASTERISM_FAULT_COMPILE_OUT_SCHEMA": adapters._CURRENT_FAULT_COMPILE_OUT_SCHEMA,
+                    "ASTERISM_FAULT_COMPILE_OUT_SYMBOL_ABSENCE_SHA256": current_compile_out["symbol_absence_sha256"],
+                    "ASTERISM_REBASELINE_CHILD_BUILD_NONCE": build_nonce,
+                    "ASTERISM_REBASELINE_EXPECTED_LIB_SOURCE": adapters._CURRENT_EXPECTED_LIB_SOURCE,
+                    "ASTERISM_REBASELINE_PINNED_RUSTC": adapters._GUEST_RUSTC,
+                    "ASTERISM_REBASELINE_WRAPPER_RECEIPT": f"{adapters._GUEST_ROOT}/receipt/injection.json",
+                    "RUSTC_WORKSPACE_WRAPPER": f"{adapters._GUEST_ROOT}/rustc_workspace_wrapper.py",
+                }
+            )
+        else:
+            environment.update(
+                {
+                    "ASTERISM_BUILD_ADAPTER_SHA256": "8" * 64,
+                    "ASTERISM_BUILD_BINARY_KIND": "public",
+                    "ASTERISM_BUILD_NONCE": build_nonce,
+                    "ASTERISM_BUILD_CARGO_LOCK_SHA256": current_lock_sha256,
+                    "ASTERISM_BUILD_PRODUCT_COMMIT": adapters.VARIANT_SOURCE_BINDINGS["A"]["commit"],
+                    "ASTERISM_BUILD_PRODUCT_TREE": adapters.VARIANT_SOURCE_BINDINGS["A"]["tree"],
+                    "ASTERISM_BUILD_PROTOCOL": adapters.PROTOCOL,
+                    "ASTERISM_BUILD_PROTOCOL_SHA256": adapters.PROTOCOL_SHA256,
+                    "ASTERISM_BUILD_SHARED_MANIFEST_SHA256": "9" * 64,
+                    "ASTERISM_BUILD_SOURCE_APPROVAL_SHA256": "fa2acb626f303f8a65a16a6c8a1fd86b7e80cf48e092ae21a7308984ae790c94",
+                    "ASTERISM_BUILD_TIMED_SURFACE": "public-event-store",
+                    "ASTERISM_BUILD_TOOLING_COMMIT": "1" * 40,
+                    "ASTERISM_BUILD_TOOLING_TREE": "2" * 40,
+                    "ASTERISM_BUILD_VARIANT": "A",
+                }
+            )
+        target = current_root / "targets" / source_name
+        target_examples = target / "release" / "examples"
+        target_examples.mkdir(parents=True)
+        current_artifacts: dict[str, object] = {}
+        artifact_destinations = {
+            "asterism_rebaseline_current_correctness": current_root / "artifacts" / "tools" / "ast-rb-check",
+            "asterism_rebaseline_current_fault": current_root / "artifacts" / "tools" / "ast-rb-fault",
+            "asterism_rebaseline_public": current_root
+            / "artifacts"
+            / "release"
+            / ("hooked-A" if name == "hooked_release" else "pristine-A"),
+        }
+        for example in examples:
+            source_artifact = target_examples / example
+            source_artifact.write_bytes(f"synthetic current {source_name} {example}\n".encode())
+            source_artifact.chmod(0o555)
+            destination = artifact_destinations[example]
+            destination.write_bytes(source_artifact.read_bytes())
+            destination.chmod(0o555)
+            current_artifacts[example] = {
+                "binding": {
+                    "comm": destination.name,
+                    "executable_mode": 0o555,
+                    "path": str(destination.resolve()),
+                    "sha256": sha256(destination.read_bytes()),
+                },
+                "source": current_file_identity(
+                    source_artifact,
+                    logical_path=(
+                        f"/proc/self/fd/{descriptors['target']}"
+                        f"/release/examples/{example}"
+                    ),
+                ),
+            }
+        target_identity = current_directory_identity(target)
+        binds: dict[str, object] = {
+            "target": {
+                "parent": current_directory_identity(target.parent),
+                "post": target_identity,
+                "pre": dict(target_identity),
+            }
+        }
+        execution_tools = {
+            "bwrap": current_retained_file(bwrap, trusted=True),
+            "cargo": current_retained_file(cargo, trusted=False),
+            "python": current_retained_file(
+                Path("/usr/bin/python3").resolve(strict=True), trusted=True
+            ),
+            "rustc": current_retained_file(rustc, trusted=False),
+            "toolchain_root": current_directory_identity(toolchain_root),
+        }
+        execution = {
+            "argv": argv,
+            "cwd": str(current_root),
+            "environment": dict(sorted(environment.items())),
+            "exit_status": 0,
+            "execution_authority": execution_tools["bwrap"],
+            "passed_file_descriptors": (
+                len(descriptor_names)
+                + 2
+                + len(cargo_config["preserved_top_level_entries"]["cargo-home"])
+            ),
+            "stderr_bytes": 0,
+            "stderr_sha256": sha256(b""),
+            "stdout_bytes": 0,
+            "stdout_sha256": sha256(b""),
+        }
+        filesystem_admission = {"build": source_name, "schema": "synthetic-admission-v1"}
+        filesystem_admissions[name] = filesystem_admission
+        current_build: dict[str, object] = {
+            "argv": argv,
+            "environment": dict(sorted(environment.items())),
+            "execution": execution,
+            "filesystem_admission": filesystem_admission,
+            "cargo_config_prebuild": cargo_config,
+            "cargo_config_postbuild": cargo_config,
+            "execution_tools": execution_tools,
+            "artifacts": current_artifacts,
+            "binds": binds,
+            "lock_prebuild": release_file_binding(source_root / "Cargo.lock"),
+            "lock_postbuild": release_file_binding(source_root / "Cargo.lock"),
+            "source_manifest_sha256": materialized_manifest_sha256,
+            "semantic_input_authority": semantic,
+            "toolchain_manifest": {
+                "entry_count": semantic["toolchain"]["entry_count"],
+                "equal_pre_post": True,
+                "path": semantic["toolchain"]["manifest_path"],
+                "post_sha256": semantic["toolchain"]["manifest_sha256"],
+                "pre_sha256": semantic["toolchain"]["manifest_sha256"],
+            },
+            "target": str(target.resolve()),
+            "target_was_absent": True,
+        }
+        if name == "children":
+            receipt_root = current_root / "receipts" / "children"
+            receipt_root.mkdir()
+            receipt = {
+                "build_nonce": build_nonce,
+                "crate_name": "mess_store",
+                "crate_type": "lib",
+                "injected_arguments": list(adapters._CURRENT_WRAPPER_ARGUMENTS),
+                "original_argv_sha256": "b" * 64,
+                "package": "mess-store",
+                "rustc": adapters._GUEST_RUSTC,
+                "schema": adapters._CURRENT_WRAPPER_RECEIPT_SCHEMA,
+                "source": adapters._CURRENT_EXPECTED_LIB_SOURCE,
+            }
+            receipt_path = receipt_root / "injection.json"
+            write_canonical(receipt_path, receipt, 0o444)
+            receipt_identity = current_directory_identity(receipt_root)
+            binds["receipt"] = {
+                "parent": current_directory_identity(receipt_root.parent),
+                "post": receipt_identity,
+                "pre": dict(receipt_identity),
+            }
+            current_build.update(
+                {
+                    "wrapper_receipt": receipt,
+                    "wrapper_receipt_identity": current_file_identity(
+                        receipt_path,
+                        logical_path=(
+                            f"/proc/self/fd/{descriptors['receipt']}/injection.json"
+                        ),
+                    ),
+                    "wrapper_receipt_sha256": sha256(receipt_path.read_bytes()),
+                    "wrapper_input_identity": current_file_identity(wrapper_input),
+                }
+            )
+        write_canonical(
+            current_root / "logs" / f"cargo-build-{source_name}.json",
+            execution,
+            0o444,
+        )
+        current_builds[name] = current_build
+
+    lock_root = root / "reviewed-locks"
+    lock_manifests = lock_root / "manifests"
+    lock_manifests.mkdir(parents=True)
+    repository = root / "repository"
+    source_plan_path = (
+        repository
+        / "spikes"
+        / "asterism_rebaseline"
+        / "tooling"
+        / "source-plan.json"
+    )
+    write_canonical(source_plan_path, {"schema": "synthetic-source-plan-v1"}, 0o444)
+    lock_claims: dict[str, object] = {}
+    for variant_name in ("A", "B"):
+        resolver_source = lock_root / "materialized" / variant_name
+        resolver_source.mkdir(parents=True)
+        (resolver_source / "Cargo.toml").write_bytes(
+            f"[resolver-{variant_name}]\n".encode()
+        )
+        (resolver_source / "Cargo.toml").chmod(0o444)
+        resolver_source.chmod(0o555)
+        lock_payload = (
+            current_lock_payload
+            if variant_name == "A"
+            else b"synthetic lock B\n"
+        )
+        final_lock = lock_root / "locks" / f"Cargo-{variant_name}.lock"
+        final_lock.parent.mkdir(parents=True, exist_ok=True)
+        final_lock.write_bytes(lock_payload)
+        final_lock.chmod(0o444)
+        config_path = lock_manifests / f"cargo-config-{variant_name}.json"
+        config_sha256 = write_cargo_config_manifest(
+            config_path, resolver_source, cargo_home
+        )
+        historical = {
+            "commit": variant_name.lower() * 40,
+            "path": "Cargo.lock",
+            "sha256": sha256(lock_payload),
+        }
+        tracked_environment = {
+            "CARGO_HOME": str(cargo_home),
+            "CARGO_INCREMENTAL": "0",
+            "CARGO_NET_OFFLINE": "true",
+            "GIT_CONFIG_COUNT": "0",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "HOME": "/nonexistent",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "PATH": f"{toolchain_bin}:/usr/bin:/bin",
+            "RUSTC": str(rustc),
+            "RUSTUP_HOME": str(rustup_home),
+            "RUSTUP_TOOLCHAIN": "synthetic-stable",
+            "TZ": "UTC",
+        }
+        tracked = {
+            "argv": [
+                str(git),
+                "-C",
+                str(repository),
+                "show",
+                f"{historical['commit']}:{historical['path']}",
+            ],
+            "cargo_config_search": {
+                "path": str(config_path),
+                "sha256": config_sha256,
+            },
+            "cwd": str(repository),
+            "environment": tracked_environment,
+            "exit_status": 0,
+            "host_source_root": str(resolver_source),
+            "resolver_kind": "tracked_git_readback",
+            "stderr": "",
+            "stderr_sha256": sha256(b""),
+            "stdout": lock_payload.decode(),
+            "stdout_sha256": sha256(lock_payload),
+            "toolchain": toolchain,
+        }
+        lock_claims[variant_name] = {
+            "current_lock_attempt": None,
+            "final_lock_path": str(final_lock),
+            "final_lock_sha256": sha256(lock_payload),
+            "historical_lock": historical,
+            "resolver": tracked,
+        }
+    for variant_name in ("C", "D"):
+        resolver_source = lock_root / "materialized" / variant_name
+        resolver_source.mkdir(parents=True)
+        (resolver_source / "Cargo.toml").write_bytes(
+            f"[resolver-{variant_name}]\n".encode()
+        )
+        (resolver_source / "Cargo.toml").chmod(0o444)
+        lock_payload = f"synthetic lock {variant_name}\n".encode()
+        (resolver_source / "Cargo.lock").write_bytes(lock_payload)
+        (resolver_source / "Cargo.lock").chmod(0o444)
+        resolver_source.chmod(0o555)
+        final_lock = lock_root / "locks" / f"Cargo-{variant_name}.lock"
+        final_lock.parent.mkdir(parents=True, exist_ok=True)
+        final_lock.write_bytes(lock_payload)
+        final_lock.chmod(0o444)
+        config_path = lock_manifests / f"cargo-config-{variant_name}.json"
+        config_sha256 = write_cargo_config_manifest(
+            config_path, resolver_source, cargo_home
+        )
+
+        def resolver_record(role: str) -> dict[str, object]:
+            label = (
+                f"current-lock-{variant_name}"
+                if role == "current"
+                else f"resolved-lock-{variant_name}"
+            )
+            semantic = semantic_authority(
+                source_root=resolver_source,
+                toolchain_root=toolchain_root,
+                cargo_home=cargo_home,
+                paths=semantic_paths(lock_manifests, label, resolver=True),
+                source_role="resolution_source_without_cargo_lock",
+            )
+            descriptor_names = (
+                *(
+                    f"system:{guest}"
+                    for _host, guest in adapters._TRUSTED_SYSTEM_MOUNTS
+                ),
+                "source",
+                "toolchain_root",
+                "cargo",
+                "rustc",
+                "cargo_home",
+                *(f"config:{guest}" for guest in adapters._GUEST_BOUND_CONFIG_PATHS),
+            )
+            descriptors = dict(
+                zip(descriptor_names, range(40, 52), strict=True)
+            )
+            arguments = (
+                [
+                    "metadata",
+                    "--locked",
+                    "--offline",
+                    "--format-version",
+                    "1",
+                    "--no-deps",
+                ]
+                if role == "current"
+                else ["generate-lockfile", "--offline"]
+            )
+            digest = (
+                current_lock_sha256 if role == "current" else sha256(lock_payload)
+            )
+            boundary = {
+                "path": str(resolver_source / "Cargo.lock"),
+                "sha256": digest,
+                "status": "present",
+            }
+            lock_output = (
+                {"pre": boundary, "post": dict(boundary)}
+                if role == "current"
+                else {
+                    "pre": {
+                        "path": str(resolver_source / "Cargo.lock"),
+                        "sha256": None,
+                        "status": "absent",
+                    },
+                    "post": boundary,
+                }
+            )
+            return {
+                "argv": adapters._resolution_sandbox_argv(
+                    descriptors, arguments, str(bwrap)
+                ),
+                "cargo_config_search": {
+                    "path": str(config_path),
+                    "sha256": config_sha256,
+                },
+                "cwd": adapters._GUEST_SOURCE,
+                "environment": sandbox_environment(toolchain),
+                "execution_authority": release_file_binding(bwrap),
+                "exit_status": 0,
+                "host_source_root": str(resolver_source),
+                "lock_output": lock_output,
+                "passed_file_descriptors": 13,
+                "resolver_kind": "sandboxed_cargo_resolution",
+                "semantic_input_authority": semantic,
+                "stderr": "",
+                "stderr_sha256": sha256(b""),
+                "stdout": "",
+                "stdout_sha256": sha256(b""),
+                "toolchain": toolchain,
+            }
+
+        lock_claims[variant_name] = {
+            "current_lock_attempt": resolver_record("current"),
+            "final_lock_path": str(final_lock),
+            "final_lock_sha256": sha256(lock_payload),
+            "historical_lock": {
+                "commit": variant_name.lower() * 40,
+                "path": "Cargo.lock",
+                "sha256": sha256(lock_payload),
+            },
+            "resolver": resolver_record("generated"),
+        }
+    reviewed_lock_manifest_path = lock_root / "lock-candidates.json"
+    reviewed_lock_manifest = {
+        "schema": adapters._LOCK_CANDIDATES_SCHEMA,
+        "source_plan_path": str(source_plan_path),
+        "toolchain": toolchain,
+        "variants": lock_claims,
     }
+    write_canonical(reviewed_lock_manifest_path, reviewed_lock_manifest, 0o444)
+    lock_manifest_binding = review_input_binding(
+        reviewed_lock_manifest_path, adapters._LOCK_CANDIDATES_SCHEMA
+    )
+    embedded_lock_binding = {
+        **lock_manifest_binding,
+        "payload": reviewed_lock_manifest,
+    }
+    lock_authority_value = {
+        "lock_manifest": embedded_lock_binding,
+        "schema": "bn-31gp-current-lock-authority-v1",
+    }
+
+    preapproval_compile_out = current_compile_out
     requirement = {
         "binary_byte_identical": True,
         "cfg_test": False,
@@ -417,8 +1529,94 @@ def live_authority(
         "symbol_inventory_byte_identical": True,
         "variant": "A",
     }
-    assertion = {
+    lock_review_value = {"schema": "bn-31gp-current-lock-review-bundle-v1"}
+    tools_review_value = {
+        "schema": "asterism-rebaseline-tools-v3",
+        "support_files": {
+            "profile_adapter": {
+                "path": str(adapter),
+                "sha256": adapter_sha,
+                "mode": 0o444,
+            }
+        },
+        "tools": tools,
+    }
+    reviewed_lock_authority_path = current_root / "lock-review-authority.json"
+    reviewed_lock_review_path = current_root / "lock-review-bundle.json"
+    reviewed_tools_path = current_root / "tools-manifest.json"
+    write_canonical(reviewed_lock_authority_path, lock_authority_value, 0o444)
+    write_canonical(reviewed_lock_review_path, lock_review_value, 0o444)
+    write_canonical(reviewed_tools_path, tools_review_value, 0o444)
+    lock_authority_binding = review_input_binding(
+        reviewed_lock_authority_path, "bn-31gp-current-lock-authority-v1"
+    )
+    lock_review_binding = review_input_binding(
+        reviewed_lock_review_path, "bn-31gp-current-lock-review-bundle-v1"
+    )
+    tools_binding = review_input_binding(
+        reviewed_tools_path, "asterism-rebaseline-tools-v3"
+    )
+
+    def without_schema(binding: dict[str, object]) -> dict[str, object]:
+        return {field: value for field, value in binding.items() if field != "schema"}
+
+    current_children = {
+        "artifacts": {},
+        "build_nonce": build_nonce,
+        "builds": current_builds,
+        "cargo_config_authority": {},
+        "construction_path": "/authority/construction.py",
+        "construction_sha256": "0" * 64,
+        "fault_authority": {},
         "inputs": {},
+        "lock_authority": lock_authority_value,
+        "lock_authority_inputs": {
+            "authority": without_schema(lock_authority_binding),
+            "lock_manifest": without_schema(lock_manifest_binding),
+            "review_bundle": without_schema(lock_review_binding),
+        },
+        "lock_authority_validation": {},
+        "lock_candidates": {},
+        "lock_manifest_sha256": lock_manifest_binding["sha256"],
+        "prebuild_filesystem_admissions": filesystem_admissions,
+        "product_commit": adapters.VARIANT_SOURCE_BINDINGS["A"]["commit"],
+        "product_overlay_authority": {
+            "patch": {"sha256": adapters._CURRENT_PRODUCT_OVERLAY_SHA256}
+        },
+        "product_tree": adapters.VARIANT_SOURCE_BINDINGS["A"]["tree"],
+        "protocol": adapters.PROTOCOL,
+        "protocol_sha256": adapters.PROTOCOL_SHA256,
+        "release_compile_out": preapproval_compile_out,
+        "release_compile_out_approval": {
+            "final_integration_action": (
+                "repeat-release-equality-proof-under-real-source-approval"
+            ),
+            "source_approval_sha256": (
+                "fa2acb626f303f8a65a16a6c8a1fd86b7e80cf48e092ae21a7308984ae790c94"
+            ),
+            "source_approval_status": "preapproval-sentinel-not-source-approved",
+        },
+        "review_bundle_sha256": lock_review_binding["sha256"],
+        "schema": adapters._CURRENT_CHILDREN_ATTESTATION_SCHEMA,
+        "static_authority": {},
+        "status": "ok",
+        "toolchain": toolchain,
+        "toolchain_identities": {},
+        "tools_manifest_path": str(reviewed_tools_path),
+        "tools_manifest_sha256": tools_binding["sha256"],
+    }
+    reviewed_current_path = current_root / "current-children-attestation.json"
+    write_canonical(reviewed_current_path, current_children, 0o444)
+    assertion = {
+        "inputs": {
+            "current_children_attestation": review_input_binding(
+                reviewed_current_path, adapters._CURRENT_CHILDREN_ATTESTATION_SCHEMA
+            ),
+            "lock_authority": lock_authority_binding,
+            "lock_manifest": lock_manifest_binding,
+            "lock_review_bundle": lock_review_binding,
+            "tools_manifest": tools_binding,
+        },
         "open_findings": 0,
         "protocol": adapters.PROTOCOL,
         "protocol_sha256": adapters.PROTOCOL_SHA256,
@@ -438,10 +1636,8 @@ def live_authority(
             "verdict": {},
         },
         "current_children_attestation": current_children,
-        "lock_authority": {"schema": "bn-31gp-current-lock-authority-v1"},
-        "lock_review_bundle": {
-            "schema": "bn-31gp-current-lock-review-bundle-v1"
-        },
+        "lock_authority": lock_authority_value,
+        "lock_review_bundle": lock_review_value,
     }
     source_review_paths = {
         "bundle": bindings / "source-review-bundle.json",
@@ -475,6 +1671,7 @@ def live_authority(
         "status": "approved",
         "protocol": adapters.PROTOCOL,
         "protocol_sha256": adapters.PROTOCOL_SHA256,
+        "tools_manifest_sha256": tools_binding["sha256"],
         "source_review": approved_source_review,
         "variants": {
             variant: {
@@ -496,6 +1693,21 @@ def live_authority(
     }
     original_approval_path = bindings / "source-approval.json"
     approval_sha = write_canonical(original_approval_path, approval, 0o444)
+    prepared_contracts = {
+        variant_name: {
+            "protocol_sha256": adapters.PROTOCOL_SHA256,
+            "product_commit": adapters.VARIANT_SOURCE_BINDINGS[variant_name][
+                "commit"
+            ],
+            "product_tree": adapters.VARIANT_SOURCE_BINDINGS[variant_name]["tree"],
+            "profile_role_lifetime": (
+                adapters.C_ROLE_LIFETIME_CONTRACT
+                if variant_name == "C"
+                else "not_applicable"
+            ),
+        }
+        for variant_name in ("A", "B", "C", "D")
+    }
     ordinary_nm_child = nm_child(
         name="ordinary_a",
         pid=301,
@@ -510,22 +1722,69 @@ def live_authority(
         inventory=overlay_inventory,
         prepared_root=prepared_root,
     )
+    release_attestations: dict[str, dict[str, object]] = {}
+    release_sandbox_hashes: dict[str, str] = {}
+    for variant_name in ("A", "B", "C", "D"):
+        source_root = prepared_root / "materialized" / variant_name
+        prepare_tree(source_root, "Cargo.toml", f"[release-{variant_name}]\n".encode())
+        attestation = release_attestation(
+            prepared_root=prepared_root,
+            label=f"build-{variant_name}",
+            source_root=source_root,
+            toolchain=toolchain,
+            package="mess-log" if variant_name == "B" else "mess-store",
+            example=(
+                "asterism_rebaseline_bare"
+                if variant_name == "B"
+                else "asterism_rebaseline_public"
+            ),
+            descriptors=range(60, 73),
+            source_approval_sha256=approval_sha,
+            contract=prepared_contracts[variant_name],
+        )
+        release_sandbox_hashes[variant_name] = str(
+            attestation.pop("_sandbox_sha256")
+        )
+        release_attestations[variant_name] = attestation
+    overlay_source = prepared_root / "materialized" / "A-product-overlay"
+    prepare_tree(overlay_source, "Cargo.toml", b"[release-A-overlay]\n")
+    overlay_attestation = release_attestation(
+        prepared_root=prepared_root,
+        label="build-A-product-overlay",
+        source_root=overlay_source,
+        toolchain=toolchain,
+        package="mess-store",
+        example="asterism_rebaseline_public",
+        descriptors=range(80, 93),
+        source_approval_sha256=approval_sha,
+        contract=prepared_contracts["A"],
+    )
+    overlay_attestation["product_overlay_sha256"] = (
+        adapters._CURRENT_PRODUCT_OVERLAY_SHA256
+    )
+    overlay_sandbox_sha = str(overlay_attestation.pop("_sandbox_sha256"))
+    assert overlay_sandbox_sha == release_sandbox_hashes["A"]
     equivalence = {
         "source_approval_sha256": approval_sha,
-        "contract_sha256": "3" * 64,
+        "contract_sha256": sha256(
+            adapters.canonical_json(prepared_contracts["A"])
+        ),
         "build_nonce": "4" * 64,
         "cargo_lock_sha256": "5" * 64,
-        "toolchain_sha256": "6" * 64,
-        "build_environment_sha256": "7" * 64,
-        "sandbox_sha256": "8" * 64,
+        "toolchain_sha256": sha256(adapters.canonical_json(toolchain)),
+        "build_environment_sha256": sha256(
+            adapters.canonical_json(release_attestations["A"]["build_env"])
+        ),
+        "sandbox_sha256": release_sandbox_hashes["A"],
         "cfg_test": False,
         "rustc_workspace_wrapper": "absent",
         "ordinary_a_role": "published",
         "overlay_a_role": "proof_only",
     }
 
-    def release_build(name: str, artifact_role: str) -> dict[str, object]:
-        attestation = {"artifact_role": artifact_role, "role": name}
+    def release_build(
+        name: str, artifact_role: str, attestation: dict[str, object]
+    ) -> dict[str, object]:
         return {
             "role": name,
             "artifact_role": artifact_role,
@@ -557,8 +1816,12 @@ def live_authority(
         "product_overlay_sha256": adapters._CURRENT_PRODUCT_OVERLAY_SHA256,
         "equivalence_contract": equivalence,
         "builds": {
-            "ordinary_a": release_build("ordinary_a", "published"),
-            "overlay_a": release_build("overlay_a", "proof_only"),
+            "ordinary_a": release_build(
+                "ordinary_a", "published", release_attestations["A"]
+            ),
+            "overlay_a": release_build(
+                "overlay_a", "proof_only", overlay_attestation
+            ),
         },
         "binaries": {
             "ordinary_a": release_file_binding(ordinary_a_binary),
@@ -584,10 +1847,43 @@ def live_authority(
         release_compile_out_path, release_compile_out, 0o444
     )
     claim_path = prepared_root / "claims" / "single-use-claim.json"
+    prepared_variants: dict[str, object] = {}
+    for variant_name in ("A", "B", "C", "D"):
+        if variant_name == variant:
+            variant_binary = binary
+            variant_comm = comm
+        elif variant_name == "A":
+            variant_binary = ordinary_a_binary
+            variant_comm = ordinary_a_binary.name
+        else:
+            variant_binary = artifacts / f"ast-rb-{variant_name.lower()}"
+            variant_binary.write_bytes(
+                f"synthetic {variant_name} executable\n".encode()
+            )
+            variant_binary.chmod(0o555)
+            variant_comm = variant_binary.name
+        prepared_variants[variant_name] = {
+            "attestation": release_attestations[variant_name],
+            "artifact_root": str(artifacts),
+            "binary": {
+                "path": str(variant_binary.resolve()),
+                "sha256": sha256(variant_binary.read_bytes()),
+            },
+            "executable_mode": 0o555,
+            "comm": variant_comm,
+            "contract": prepared_contracts[variant_name],
+            "contract_argv": [str(variant_binary)],
+            "contract_env": {},
+            "evidence_argv": [str(variant_binary)],
+            "evidence_env": {},
+            "trace_path_marker_templates": {},
+            "correctness_oracle_mode": variant_name != "B",
+        }
     prepared = {
         "schema": "bn-2l3n-prepared-artifacts-v3",
         "protocol": adapters.PROTOCOL,
         "protocol_sha256": adapters.PROTOCOL_SHA256,
+        "toolchain": toolchain,
         "source_approval": {
             "path": str(original_approval_path),
             "sha256": approval_sha,
@@ -614,36 +1910,8 @@ def live_authority(
             }
         },
         "tools": tools,
-        "variants": {
-            variant: {
-                "binary": {"path": str(binary), "sha256": binary_sha},
-                "executable_mode": 0o555,
-                "comm": comm,
-                "contract": {
-                    "protocol_sha256": adapters.PROTOCOL_SHA256,
-                    "product_commit": source["commit"],
-                    "product_tree": source["tree"],
-                    "profile_role_lifetime": role_lifetime,
-                },
-            }
-        },
+        "variants": prepared_variants,
     }
-    if variant != "A":
-        source_a = adapters.VARIANT_SOURCE_BINDINGS["A"]
-        prepared["variants"]["A"] = {
-            "binary": {
-                "path": str(ordinary_a_binary.resolve()),
-                "sha256": sha256(ordinary_a_binary.read_bytes()),
-            },
-            "executable_mode": 0o555,
-            "comm": ordinary_a_binary.name,
-            "contract": {
-                "protocol_sha256": adapters.PROTOCOL_SHA256,
-                "product_commit": source_a["commit"],
-                "product_tree": source_a["tree"],
-                "profile_role_lifetime": "not_applicable",
-            },
-        }
     original_prepared_path = prepared_root / "prepared-artifacts.json"
     prepared_sha = write_canonical(original_prepared_path, prepared, 0o444)
     claim = {
@@ -1058,6 +2326,14 @@ class AuthorityMutationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
+        self.mount_patch = mock.patch.object(
+            adapters, "_TRUSTED_SYSTEM_MOUNTS", fixture_trusted_mounts(self.root)
+        )
+        self.owner_patch = mock.patch.object(
+            adapters, "_TRUSTED_SYSTEM_OWNER_UID", os.getuid()
+        )
+        self.mount_patch.start()
+        self.owner_patch.start()
         self.pid = 150
         process = self.root / str(self.pid)
         process.mkdir(parents=True)
@@ -1079,7 +2355,11 @@ class AuthorityMutationTests(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
-        self.temporary.cleanup()
+        try:
+            self.temporary.cleanup()
+        finally:
+            self.owner_patch.stop()
+            self.mount_patch.stop()
 
     def construct(self, authority: dict[str, object] | None = None) -> object:
         return adapters.ProfileCoordinator.for_child(
@@ -1172,6 +2452,690 @@ class AuthorityMutationTests(unittest.TestCase):
                 "sha256", proof_sha
             )
         )
+
+    def current_semantic_case(
+        self, name: str = "children"
+    ) -> tuple[dict[str, object], dict[str, Path], dict[str, Path]]:
+        paths = self.authority_paths()
+        bundle = json.loads(paths["source_review_bundle"].read_bytes())
+        reviewed = Path(
+            str(bundle["assertion"]["inputs"]["current_children_attestation"]["path"])
+        )
+        current = json.loads(reviewed.read_bytes())
+        source_name = {
+            "children": "children",
+            "hooked_release": "hooked-release",
+            "pristine_release": "pristine-release",
+        }[name]
+        return (
+            current["builds"][name]["semantic_input_authority"],
+            {
+                "source": reviewed.parent / "materialized" / source_name,
+                "toolchain": Path(str(current["toolchain"]["cargo_path"])).parent.parent,
+                "cargo_home": Path(str(current["toolchain"]["cargo_home_path"])),
+            },
+            {
+                "source": reviewed.parent
+                / "manifests"
+                / f"semantic-source-{source_name}.json",
+                "toolchain": reviewed.parent
+                / "manifests"
+                / f"semantic-toolchain-{source_name}.json",
+                "cargo_home": reviewed.parent
+                / "manifests"
+                / f"cargo-home-{source_name}.json",
+                "closure": reviewed.parent
+                / "manifests"
+                / f"{source_name}-system-closure.json",
+            },
+        )
+
+    def current_build_case(
+        self, name: str = "children"
+    ) -> tuple[dict[str, object], Path, dict[str, object], Path, str]:
+        paths = self.authority_paths()
+        bundle = json.loads(paths["source_review_bundle"].read_bytes())
+        reviewed = Path(
+            str(bundle["assertion"]["inputs"]["current_children_attestation"]["path"])
+        )
+        current = json.loads(reviewed.read_bytes())
+        toolchain, toolchain_root = adapters._validate_toolchain_contract(
+            current["toolchain"], "positive current toolchain"
+        )
+        source_name = {
+            "children": "children",
+            "hooked_release": "hooked-release",
+            "pristine_release": "pristine-release",
+        }[name]
+        return current, reviewed.parent, dict(toolchain), toolchain_root, source_name
+
+    def validate_current_build(
+        self, name: str, build: dict[str, object]
+    ) -> None:
+        current, current_root, toolchain, toolchain_root, source_name = (
+            self.current_build_case(name)
+        )
+        adapters._validate_current_build_record(
+            build,
+            f"current hostile {name}",
+            name=name,
+            source_name=source_name,
+            current=current,
+            current_root=current_root,
+            toolchain=toolchain,
+            toolchain_root=toolchain_root,
+            filesystem_admission=current["prebuild_filesystem_admissions"][name],
+        )
+
+    def test_current_build_records_and_wrapper_policy_are_exact(self) -> None:
+        current, _root, _toolchain, _toolchain_root, _source_name = (
+            self.current_build_case()
+        )
+        self.validate_current_build("children", current["builds"]["children"])
+        self.validate_current_build(
+            "hooked_release", current["builds"]["hooked_release"]
+        )
+        children = current["builds"]["children"]
+        argv_descriptor_count = sum(
+            argument in {"--ro-bind-fd", "--bind-fd", "--ro-bind-data"}
+            for argument in children["argv"]
+        )
+        cargo_home_preserved_count = len(
+            children["cargo_config_prebuild"]["preserved_top_level_entries"][
+                "cargo-home"
+            ]
+        )
+        self.assertGreater(cargo_home_preserved_count, 0)
+        self.assertEqual(
+            children["execution"]["passed_file_descriptors"],
+            argv_descriptor_count + 2 + cargo_home_preserved_count,
+        )
+        hostiles: list[tuple[str, str, dict[str, object]]] = []
+        missing = json.loads(json.dumps(current["builds"]["children"]))
+        del missing["execution_tools"]
+        hostiles.append(("missing-build-field", "children", missing))
+        truncated = json.loads(json.dumps(current["builds"]["children"]))
+        del truncated["execution"]["stdout_sha256"]
+        hostiles.append(("truncated-execution", "children", truncated))
+        root_bind = json.loads(json.dumps(current["builds"]["children"]))
+        root_bind["argv"][4:4] = ["--ro-bind", "/", "/"]
+        hostiles.append(("host-root-bind", "children", root_bind))
+        extra_environment = json.loads(json.dumps(current["builds"]["children"]))
+        extra_environment["environment"]["ASTERISM_UNREVIEWED"] = "present"
+        hostiles.append(("extra-asterism", "children", extra_environment))
+        release_wrapper = json.loads(json.dumps(current["builds"]["hooked_release"]))
+        release_wrapper["environment"]["RUSTC_WORKSPACE_WRAPPER"] = "/forged"
+        hostiles.append(("release-wrapper-environment", "hooked_release", release_wrapper))
+        release_receipt = json.loads(json.dumps(current["builds"]["hooked_release"]))
+        release_receipt["wrapper_receipt"] = {}
+        hostiles.append(("release-wrapper-field", "hooked_release", release_receipt))
+        fd_count = json.loads(json.dumps(current["builds"]["children"]))
+        fd_count["execution"]["passed_file_descriptors"] -= cargo_home_preserved_count
+        hostiles.append(("preserved-cargo-home-fd-cardinality", "children", fd_count))
+        lock = json.loads(json.dumps(current["builds"]["children"]))
+        del lock["lock_postbuild"]["identity"]
+        hostiles.append(("truncated-lock", "children", lock))
+        config = json.loads(json.dumps(current["builds"]["children"]))
+        del config["cargo_config_prebuild"]["cargo_home_tree"]["watch_count"]
+        hostiles.append(("truncated-config", "children", config))
+        tool = json.loads(json.dumps(current["builds"]["children"]))
+        del tool["execution_tools"]["cargo"]["identity"]["sha256"]
+        hostiles.append(("truncated-tool", "children", tool))
+        for hostile_name, build_name, hostile in hostiles:
+            with self.subTest(hostile_name), self.assertRaises(
+                adapters.ProfileEvidenceError
+            ):
+                self.validate_current_build(build_name, hostile)
+
+    def test_exact_toolchain_contract_hash_version_and_shared_root(self) -> None:
+        current, _root, toolchain, expected_root, _source_name = (
+            self.current_build_case()
+        )
+        observed, observed_root = adapters._validate_toolchain_contract(
+            toolchain, "positive exact toolchain"
+        )
+        self.assertEqual(set(observed), set(adapters._TOOLCHAIN_FIELDS))
+        self.assertEqual(observed_root, expected_root)
+        hostiles: list[tuple[str, dict[str, object]]] = []
+        missing = dict(toolchain)
+        del missing["cargo_version_verbose"]
+        hostiles.append(("missing-field", missing))
+        extra = dict(toolchain)
+        extra["legacy_channel"] = "stable"
+        hostiles.append(("extra-field", extra))
+        digest = dict(toolchain)
+        digest["rustup_sha256"] = "0" * 64
+        hostiles.append(("hash", digest))
+        cargo_version = dict(toolchain)
+        cargo_version["cargo_version_verbose"] = ""
+        hostiles.append(("cargo-version", cargo_version))
+        rustc_host = dict(toolchain)
+        rustc_host["rustc_host"] = "aarch64-unknown-linux-gnu"
+        hostiles.append(("rustc-host", rustc_host))
+        other_root = self.root / "other-toolchain"
+        other_bin = other_root / "bin"
+        other_bin.mkdir(parents=True)
+        other_rustc = other_bin / "rustc"
+        other_rustc.write_bytes(Path(str(toolchain["rustc_path"])).read_bytes())
+        other_rustc.chmod(0o555)
+        other_bin.chmod(0o555)
+        other_root.chmod(0o555)
+        split_root = dict(toolchain)
+        split_root["rustc_path"] = str(other_rustc)
+        split_root["rustc_sha256"] = sha256(other_rustc.read_bytes())
+        hostiles.append(("split-semantic-root", split_root))
+        for name, hostile in hostiles:
+            with self.subTest(name=name), self.assertRaises(
+                adapters.ProfileEvidenceError
+            ):
+                adapters._validate_toolchain_contract(hostile, f"hostile {name}")
+    def test_exact_48_manifest_topology_and_one_runtime(self) -> None:
+        paths = self.authority_paths()
+        bundle = json.loads(paths["source_review_bundle"].read_bytes())
+        assertion = bundle["assertion"]
+        reviewed_current = Path(
+            str(assertion["inputs"]["current_children_attestation"]["path"])
+        )
+        current = json.loads(reviewed_current.read_bytes())
+        prepared = json.loads(paths["original_prepared"].read_bytes())
+        proof = json.loads(paths["release_compile_out"].read_bytes())
+        locks = current["lock_authority"]["lock_manifest"]["payload"]
+        authorities = [
+            *(build["semantic_input_authority"] for build in current["builds"].values()),
+            *(
+                prepared["variants"][variant]["attestation"][
+                    "semantic_input_authority"
+                ]
+                for variant in ("A", "B", "C", "D")
+            ),
+            proof["builds"]["overlay_a"]["attestation"][
+                "semantic_input_authority"
+            ],
+            *(
+                locks["variants"][variant][record]["semantic_input_authority"]
+                for variant in ("C", "D")
+                for record in ("current_lock_attempt", "resolver")
+            ),
+        ]
+        manifest_paths = [
+            authority[name]["manifest_path"]
+            for authority in authorities
+            for name in ("source", "toolchain", "cargo_home", "trusted_system_closure")
+        ]
+        self.assertEqual(len(authorities), 12)
+        self.assertEqual(len(manifest_paths), 48)
+        self.assertEqual(len(set(manifest_paths)), 48)
+        self.assertEqual(len({authority["runtime_sha256"] for authority in authorities}), 1)
+
+    def test_semantic_schema_count_path_runtime_and_mount_hostiles_fail(self) -> None:
+        authority, live_roots, expected_paths = self.current_semantic_case()
+        adapters._validate_semantic_input_authority(
+            authority,
+            "positive current semantic authority",
+            live_roots=live_roots,
+            expected_manifest_paths=expected_paths,
+        )
+        mutations = []
+        legacy = json.loads(json.dumps(authority))
+        legacy["schema"] = "bn-ecm1-semantic-input-authority-v0"
+        mutations.append(("legacy-schema", legacy))
+        bool_count = json.loads(json.dumps(authority))
+        bool_count["source"]["entry_count"] = True
+        mutations.append(("bool-count", bool_count))
+        collision = json.loads(json.dumps(authority))
+        collision["source"]["manifest_path"] = collision["toolchain"]["manifest_path"]
+        mutations.append(("path-collision", collision))
+        runtime = json.loads(json.dumps(authority))
+        runtime["runtime_sha256"] = "0" * 64
+        mutations.append(("runtime", runtime))
+        mounts = json.loads(json.dumps(authority))
+        mounts["trusted_system_closure"]["mounts"].reverse()
+        mutations.append(("mount-order", mounts))
+        for name, mutated in mutations:
+            with self.subTest(name=name), self.assertRaises(
+                adapters.ProfileEvidenceError
+            ):
+                adapters._validate_semantic_input_authority(
+                    mutated,
+                    f"hostile {name}",
+                    live_roots=live_roots,
+                    expected_manifest_paths=expected_paths,
+                )
+
+    def test_semantic_manifest_tamper_type_and_hardlink_fail(self) -> None:
+        authority, live_roots, expected_paths = self.current_semantic_case()
+        source_path = expected_paths["source"]
+        original_payload = source_path.read_bytes()
+        original_digest = authority["source"]["manifest_sha256"]
+        source_path.chmod(0o644)
+        source_path.write_bytes(original_payload + b" ")
+        source_path.chmod(0o444)
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters._validate_semantic_input_authority(
+                authority,
+                "tampered manifest",
+                live_roots=live_roots,
+                expected_manifest_paths=expected_paths,
+            )
+        source_path.chmod(0o644)
+        source_path.write_bytes(original_payload)
+        source_path.chmod(0o444)
+        manifest = json.loads(source_path.read_bytes())
+        manifest["entries"][0]["file_type"] = "socket"
+        source_path.chmod(0o644)
+        digest = write_canonical(source_path, manifest, 0o444)
+        authority["source"]["manifest_sha256"] = digest
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters._validate_semantic_input_authority(
+                authority,
+                "invalid manifest type",
+                live_roots=live_roots,
+                expected_manifest_paths=expected_paths,
+            )
+        source_path.chmod(0o644)
+        source_path.write_bytes(original_payload)
+        source_path.chmod(0o444)
+        authority["source"]["manifest_sha256"] = original_digest
+        os.link(expected_paths["source"], expected_paths["source"].with_suffix(".alias"))
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters._validate_semantic_input_authority(
+                authority,
+                "hardlinked manifest",
+                live_roots=live_roots,
+                expected_manifest_paths=expected_paths,
+            )
+
+    def test_semantic_manifest_identity_unbounded_snapshot_and_trusted_reads(self) -> None:
+        authority, live_roots, expected_paths = self.current_semantic_case()
+        identities: set[tuple[int, int]] = set()
+        with mock.patch.object(
+            adapters, "_immutable_file_payload", wraps=adapters._immutable_file_payload
+        ) as snapshot:
+            adapters._validate_semantic_input_authority(
+                authority,
+                "positive manifest identities",
+                live_roots=live_roots,
+                expected_manifest_paths=expected_paths,
+                manifest_identities=identities,
+            )
+        self.assertEqual(len(identities), 4)
+        self.assertTrue(
+            any(call.kwargs.get("limit") is None for call in snapshot.call_args_list)
+        )
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters._validate_semantic_input_authority(
+                authority,
+                "globally aliased manifest identities",
+                live_roots=live_roots,
+                expected_manifest_paths=expected_paths,
+                manifest_identities=identities,
+            )
+        trusted_root = adapters._TRUSTED_SYSTEM_MOUNTS[0][0]
+        with mock.patch.object(adapters.os, "pread", wraps=os.pread) as pread:
+            adapters._recursive_live_manifest(
+                trusted_root,
+                "system-usr-bin",
+                "trusted-system size replay",
+                allow_internal_symlinks=True,
+                hash_regular_contents=False,
+                trusted_system_roots=tuple(
+                    host for host, _guest in adapters._TRUSTED_SYSTEM_MOUNTS
+                ),
+            )
+        self.assertGreater(pread.call_count, 0)
+
+    def test_current_and_prepared_crosslinks_are_exact(self) -> None:
+        paths = self.authority_paths()
+        bundle = json.loads(paths["source_review_bundle"].read_bytes())
+        assertion = bundle["assertion"]
+        current = json.loads(paths["source_review_current_children_attestation"].read_bytes())
+        approval = json.loads(paths["original_approval"].read_bytes())
+        adapters._validate_current_preapproval(current, assertion, approval)
+        current_hostiles: list[tuple[str, dict[str, object]]] = []
+        for name, mutate in (
+            ("protocol", lambda value: value.__setitem__("protocol_sha256", "0" * 64)),
+            ("tools", lambda value: value.__setitem__("tools_manifest_sha256", "0" * 64)),
+            (
+                "lock-input",
+                lambda value: value["lock_authority_inputs"].__setitem__(
+                    "authority", {}
+                ),
+            ),
+            (
+                "sentinel",
+                lambda value: value.__setitem__("release_compile_out_approval", {}),
+            ),
+            (
+                "overlay",
+                lambda value: value["product_overlay_authority"]["patch"].__setitem__(
+                    "sha256", "0" * 64
+                ),
+            ),
+        ):
+            hostile = json.loads(json.dumps(current))
+            mutate(hostile)
+            current_hostiles.append((name, hostile))
+        for name, hostile in current_hostiles:
+            with self.subTest(current=name), self.assertRaises(
+                adapters.ProfileEvidenceError
+            ):
+                adapters._validate_current_preapproval(hostile, assertion, approval)
+
+        prepared = json.loads(paths["original_prepared"].read_bytes())
+        toolchain = prepared["toolchain"]
+        attestation = prepared["variants"]["A"]["attestation"]
+        adapters._validate_prepared_release_attestation(
+            attestation, toolchain, "positive prepared A"
+        )
+        prepared_hostiles = []
+        missing = json.loads(json.dumps(attestation))
+        del missing["source_read_only"]
+        prepared_hostiles.append(("missing-field", missing))
+        for name, field, value in (
+            ("source-writable", "source_read_only", False),
+            ("stale-target", "target_dir_was_absent", False),
+            ("materialized-post", "materialized_manifest_post_sha256", "0" * 64),
+            ("lock-post", "cargo_lock_post_sha256", "0" * 64),
+        ):
+            hostile = json.loads(json.dumps(attestation))
+            hostile[field] = value
+            prepared_hostiles.append((name, hostile))
+        for name, hostile in prepared_hostiles:
+            with self.subTest(prepared=name), self.assertRaises(
+                adapters.ProfileEvidenceError
+            ):
+                adapters._validate_prepared_release_attestation(
+                    hostile, toolchain, f"hostile prepared {name}"
+                )
+
+    def test_cargo_config_and_build_completion_are_deeply_replayed(self) -> None:
+        paths = self.authority_paths()
+        proof = json.loads(paths["release_compile_out"].read_bytes())
+        attestation = proof["builds"]["ordinary_a"]["attestation"]
+        self.assertEqual(
+            adapters._cargo_config_sha256(attestation, "positive Cargo config"),
+            attestation["cargo_config_search"]["sha256"],
+        )
+        adapters._validate_release_build_child(attestation, "positive build child")
+        child_hostile = json.loads(json.dumps(attestation))
+        child_hostile["build_child"]["argv"] = ["forged"]
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters._validate_release_build_child(child_hostile, "forged build child")
+
+        original_manifest = Path(attestation["cargo_config_search"]["path"])
+        hostile_manifest = self.root / "hostile-cargo-config.json"
+        value = json.loads(original_manifest.read_bytes())
+        value["entries"].reverse()
+        hostile_sha256 = write_canonical(hostile_manifest, value, 0o444)
+        hostile_empty = hostile_manifest.with_name(f"{hostile_manifest.name}.empty")
+        hostile_empty.write_bytes(b"")
+        hostile_empty.chmod(0o444)
+        config_hostile = json.loads(json.dumps(attestation))
+        config_hostile["cargo_config_search"] = {
+            "path": str(hostile_manifest),
+            "sha256": hostile_sha256,
+        }
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters._cargo_config_sha256(config_hostile, "reordered Cargo config")
+
+        contract_path = Path(attestation["contract_output_path"])
+        contract_payload = contract_path.read_bytes()
+        contract_path.chmod(0o644)
+        contract_path.write_bytes(b"{}\n")
+        contract_path.chmod(0o444)
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            self.construct()
+        contract_path.chmod(0o644)
+        contract_path.write_bytes(contract_payload)
+        contract_path.chmod(0o444)
+
+    def test_release_sandbox_root_dev_proc_fd_and_rustup_hostiles_fail(self) -> None:
+        paths = self.authority_paths()
+        proof = json.loads(paths["release_compile_out"].read_bytes())
+        record = proof["builds"]["ordinary_a"]
+        attestation = record["attestation"]
+        runtime = attestation["semantic_input_authority"]["runtime_sha256"]
+        self.assertEqual(
+            adapters._validate_release_sandbox(
+                attestation,
+                "positive release sandbox",
+                package="mess-store",
+                example="asterism_rebaseline_public",
+                runtime_sha256=runtime,
+            ),
+            record["sandbox_sha256"],
+        )
+        hostiles = []
+        root_bind = json.loads(json.dumps(attestation))
+        root_bind["build_argv"][4:4] = ["--ro-bind", "/", "/"]
+        hostiles.append(("root-bind", root_bind))
+        real_dev = json.loads(json.dumps(attestation))
+        real_dev["build_argv"][real_dev["build_argv"].index("--dir")] = "--dev"
+        hostiles.append(("real-dev", real_dev))
+        real_proc = json.loads(json.dumps(attestation))
+        proc_index = real_proc["build_argv"].index("/proc")
+        real_proc["build_argv"][proc_index - 1] = "--proc"
+        hostiles.append(("real-proc", real_proc))
+        rustup = json.loads(json.dumps(attestation))
+        rustup["build_env"]["RUSTUP_HOME"] = "/host/rustup"
+        hostiles.append(("rustup", rustup))
+        aliased = json.loads(json.dumps(attestation))
+        descriptor_indexes = [
+            index + 1
+            for index, argument in enumerate(aliased["build_argv"])
+            if argument in {"--ro-bind-fd", "--bind-fd"}
+        ]
+        aliased["build_argv"][descriptor_indexes[1]] = aliased["build_argv"][
+            descriptor_indexes[0]
+        ]
+        hostiles.append(("aliased-fd", aliased))
+        for name, hostile in hostiles:
+            with self.subTest(name=name), self.assertRaises(
+                adapters.ProfileEvidenceError
+            ):
+                adapters._validate_release_sandbox(
+                    hostile,
+                    f"hostile release {name}",
+                    package="mess-store",
+                    example="asterism_rebaseline_public",
+                    runtime_sha256=runtime,
+                )
+
+    def test_resolver_kind_cwd_fd_role_and_topology_hostiles_fail(self) -> None:
+        paths = self.authority_paths()
+        current = json.loads(
+            Path(
+                json.loads(paths["source_review_bundle"].read_bytes())["assertion"][
+                    "inputs"
+                ]["current_children_attestation"]["path"]
+            ).read_bytes()
+        )
+        locks = current["lock_authority"]["lock_manifest"]["payload"]
+        toolchain = locks["toolchain"]
+        claim = locks["variants"]["C"]
+        lock_root = Path(claim["final_lock_path"]).parent.parent
+        current_lock_sha256 = locks["variants"]["A"]["historical_lock"]["sha256"]
+        valid = claim["current_lock_attempt"]
+        runtime_digests: set[str] = set()
+        manifest_paths: list[Path] = []
+        adapters._validate_resolver_record(
+            valid,
+            variant="C",
+            role="current",
+            lock_root=lock_root,
+            toolchain=toolchain,
+            runtime_digests=runtime_digests,
+            manifest_paths=manifest_paths,
+            expected_current_lock_sha256=current_lock_sha256,
+            expected_final_lock_sha256=claim["final_lock_sha256"],
+        )
+        hostiles = []
+        for name, field, value in (
+            ("kind", "resolver_kind", "tracked_git_readback"),
+            ("cwd", "cwd", valid["host_source_root"]),
+            ("fd-count", "passed_file_descriptors", 12),
+        ):
+            hostile = json.loads(json.dumps(valid))
+            hostile[field] = value
+            hostiles.append((name, hostile))
+        role = json.loads(json.dumps(valid))
+        role["semantic_input_authority"]["source"]["role"] = "source"
+        hostiles.append(("semantic-role", role))
+        for name, hostile in hostiles:
+            with self.subTest(name=name), self.assertRaises(
+                adapters.ProfileEvidenceError
+            ):
+                adapters._validate_resolver_record(
+                    hostile,
+                    variant="C",
+                    role="current",
+                    lock_root=lock_root,
+                    toolchain=toolchain,
+                    runtime_digests=set(),
+                    manifest_paths=[],
+                    expected_current_lock_sha256=current_lock_sha256,
+                    expected_final_lock_sha256=claim["final_lock_sha256"],
+                )
+
+    def test_current_lock_must_equal_variant_a_historical_lock(self) -> None:
+        paths = self.authority_paths()
+        current = json.loads(
+            Path(
+                json.loads(paths["source_review_bundle"].read_bytes())["assertion"][
+                    "inputs"
+                ]["current_children_attestation"]["path"]
+            ).read_bytes()
+        )
+        locks = current["lock_authority"]["lock_manifest"]["payload"]
+        toolchain = locks["toolchain"]
+        expected_current = locks["variants"]["A"]["historical_lock"]["sha256"]
+        claim = locks["variants"]["C"]
+        hostile = json.loads(json.dumps(claim["current_lock_attempt"]))
+        hostile["lock_output"]["pre"]["sha256"] = "f" * 64
+        hostile["lock_output"]["post"]["sha256"] = "f" * 64
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters._validate_resolver_record(
+                hostile,
+                variant="C",
+                role="current",
+                lock_root=Path(claim["final_lock_path"]).parent.parent,
+                toolchain=toolchain,
+                runtime_digests=set(),
+                manifest_paths=[],
+                expected_current_lock_sha256=expected_current,
+                expected_final_lock_sha256=claim["final_lock_sha256"],
+            )
+
+    def test_tracked_resolver_records_are_exactly_replayed(self) -> None:
+        paths = self.authority_paths()
+        current = json.loads(
+            Path(
+                json.loads(paths["source_review_bundle"].read_bytes())["assertion"][
+                    "inputs"
+                ]["current_children_attestation"]["path"]
+            ).read_bytes()
+        )
+        locks = current["lock_authority"]["lock_manifest"]["payload"]
+        toolchain = locks["toolchain"]
+        lock_root = Path(locks["variants"]["A"]["final_lock_path"]).parent.parent
+        repository = adapters._lock_repository_from_source_plan(
+            locks["source_plan_path"]
+        )
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters._lock_repository_from_source_plan(str(paths["original_prepared"]))
+        for variant in ("A", "B"):
+            claim = locks["variants"][variant]
+            adapters._validate_tracked_resolver_record(
+                claim["resolver"],
+                claim=claim,
+                variant=variant,
+                lock_root=lock_root,
+                repository=repository,
+                toolchain=toolchain,
+            )
+        base_claim = locks["variants"]["A"]
+        hostiles: list[tuple[str, dict[str, object]]] = []
+        current_attempt = json.loads(json.dumps(base_claim))
+        current_attempt["current_lock_attempt"] = {}
+        hostiles.append(("current-attempt", current_attempt))
+        argv = json.loads(json.dumps(base_claim))
+        argv["resolver"]["argv"][-1] = "forged:Cargo.lock"
+        hostiles.append(("argv", argv))
+        environment = json.loads(json.dumps(base_claim))
+        environment["resolver"]["environment"]["HOME"] = str(self.root)
+        hostiles.append(("environment", environment))
+        cwd = json.loads(json.dumps(base_claim))
+        cwd["resolver"]["cwd"] = str(self.root)
+        cwd["resolver"]["argv"][2] = str(self.root)
+        hostiles.append(("repository", cwd))
+        materialized = json.loads(json.dumps(base_claim))
+        materialized["resolver"]["host_source_root"] = str(repository)
+        hostiles.append(("materialized-root", materialized))
+        config = json.loads(json.dumps(base_claim))
+        config["resolver"]["cargo_config_search"]["path"] = str(
+            paths["original_prepared"]
+        )
+        hostiles.append(("config-topology", config))
+        final_lock = json.loads(json.dumps(base_claim))
+        final_lock["final_lock_path"] = locks["variants"]["B"]["final_lock_path"]
+        final_lock["final_lock_sha256"] = locks["variants"]["B"][
+            "final_lock_sha256"
+        ]
+        final_lock["historical_lock"]["sha256"] = final_lock["final_lock_sha256"]
+        final_lock["resolver"]["stdout"] = locks["variants"]["B"]["resolver"][
+            "stdout"
+        ]
+        final_lock["resolver"]["stdout_sha256"] = final_lock["final_lock_sha256"]
+        hostiles.append(("final-lock-topology", final_lock))
+        output = json.loads(json.dumps(base_claim))
+        output["resolver"]["stdout"] = "forged lock\n"
+        output["resolver"]["stdout_sha256"] = sha256(b"forged lock\n")
+        output["historical_lock"]["sha256"] = output["resolver"]["stdout_sha256"]
+        output["final_lock_sha256"] = output["resolver"]["stdout_sha256"]
+        hostiles.append(("output", output))
+        for name, hostile in hostiles:
+            with self.subTest(name=name), self.assertRaises(
+                adapters.ProfileEvidenceError
+            ):
+                adapters._validate_tracked_resolver_record(
+                    hostile["resolver"],
+                    claim=hostile,
+                    variant="A",
+                    lock_root=lock_root,
+                    repository=repository,
+                    toolchain=toolchain,
+                )
+
+    def test_generated_resolver_replays_live_materialized_lock(self) -> None:
+        paths = self.authority_paths()
+        current = json.loads(
+            Path(
+                json.loads(paths["source_review_bundle"].read_bytes())["assertion"][
+                    "inputs"
+                ]["current_children_attestation"]["path"]
+            ).read_bytes()
+        )
+        locks = current["lock_authority"]["lock_manifest"]["payload"]
+        claim = locks["variants"]["C"]
+        lock_root = Path(claim["final_lock_path"]).parent.parent
+        live_lock = lock_root / "materialized" / "C" / "Cargo.lock"
+        live_lock.chmod(0o644)
+        live_lock.write_bytes(b"forged generated lock\n")
+        live_lock.chmod(0o444)
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters._validate_resolver_record(
+                claim["resolver"],
+                variant="C",
+                role="generated",
+                lock_root=lock_root,
+                toolchain=locks["toolchain"],
+                runtime_digests=set(),
+                manifest_paths=[],
+                expected_current_lock_sha256=locks["variants"]["A"][
+                    "historical_lock"
+                ]["sha256"],
+                expected_final_lock_sha256=claim["final_lock_sha256"],
+            )
 
     def test_distinct_attempt_copies_replay_original_authority(self) -> None:
         paths = self.authority_paths()
@@ -1465,6 +3429,14 @@ class CoordinatorTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
+        self.mount_patch = mock.patch.object(
+            adapters, "_TRUSTED_SYSTEM_MOUNTS", fixture_trusted_mounts(self.root)
+        )
+        self.owner_patch = mock.patch.object(
+            adapters, "_TRUSTED_SYSTEM_OWNER_UID", os.getuid()
+        )
+        self.mount_patch.start()
+        self.owner_patch.start()
         self.pid = 200
         process = self.root / str(self.pid)
         process.mkdir(parents=True)
@@ -1491,7 +3463,11 @@ class CoordinatorTests(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
-        self.temporary.cleanup()
+        try:
+            self.temporary.cleanup()
+        finally:
+            self.owner_patch.stop()
+            self.mount_patch.stop()
 
     def test_fjall_phase_roles_and_window(self) -> None:
         context = {"cell": "group-b1"}

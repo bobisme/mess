@@ -399,6 +399,10 @@ def validate_builder(source: str) -> list[str]:
         "def self_test_cargo_config_guard() -> dict[str, Any]:",
         "cargo_config_guard = self_test_cargo_config_guard()",
         '"cargo_config_guard": cargo_config_guard',
+        '"empty_bound_appearance_rejected": True',
+        "def self_test_reviewed_cargo_config_policy() -> dict[str, Any]:",
+        "reviewed_cargo_config = self_test_reviewed_cargo_config_policy()",
+        '"reviewed_cargo_config_policy": reviewed_cargo_config',
         'semantic_runtime = self_test_semantic_runtime_authority()',
         '"semantic_runtime_authority": semantic_runtime',
         '"mount_path_drift_rejected": True',
@@ -519,7 +523,11 @@ def validate_builder(source: str) -> list[str]:
         "reviewed_cargo_config_entries=cargo_config_entries"
     ) != 3:
         fail("builder_cargo_config", "each build needs exact Cargo config authority")
-    if source.count('"--ro-bind-data"') != 4:
+    if source.count(
+        "reviewed_cargo_config_empty=cargo_config_empty_path"
+    ) != 3:
+        fail("builder_cargo_config", "each build needs reviewed empty config authority")
+    if source.count('"--ro-bind-data"') != 6:
         fail("builder_cargo_config", "Cargo config/data view must use exact-byte FD binds")
     if source.count('record["stdin_bytes"] = len(stdin_payload)') != 1:
         fail("builder_execution_lease", "stdin payload evidence cardinality differs")
@@ -572,14 +580,34 @@ def validate_builder(source: str) -> list[str]:
         "def read_bound_regular_file(",
         "builder_cargo_config",
     )
+    cargo_policy = slice_between(
+        source,
+        "def reviewed_cargo_config_policy(",
+        "def canonical_archive_member(",
+        "builder_cargo_config",
+    )
+    for marker in (
+        'recorded.get("cwd") != "/asterism/source"',
+        'recorded.get("cargo_home_path") != GUEST_CARGO_HOME',
+        '!= list(CARGO_CONFIG_GUEST_PATHS)',
+        'manifest_path.with_name(f"{manifest_path.name}.empty")',
+        'sha256_file(empty_path) != EMPTY_SHA256',
+        "translated = json.loads(json.dumps(entries))",
+        'entry["status"] != "present" or entry["sha256"] is None',
+    ):
+        require_once(cargo_policy, marker, "builder_cargo_config")
     for marker in CARGO_CONFIG_GUEST_MARKERS:
         require_once(source, marker, "builder_cargo_config")
     for marker in (
         "len(self.expected_entries) != len(CARGO_CONFIG_GUEST_PATHS)",
+        "self.empty_leases: dict[str, RetainedFile] = {}",
+        "if expected == {",
+        "empty_lease = self.empty_leases.get(key)",
+        'f"{self.context} empty-bound Cargo config appeared"',
+        "*(lease.descriptor for lease in self.empty_leases.values())",
         'self.pre_build = self.replay(boundary="guard activation")',
         'self.post_build = self.replay(boundary="guard exit")',
         "if self.post_build != self.pre_build:",
-        "lease.rewind_for_bind_data()",
         '"--ro-bind-data"',
         '"--ro-bind-fd"',
     ):
@@ -588,6 +616,8 @@ def validate_builder(source: str) -> list[str]:
                 fail("builder_cargo_config", f"Cargo view marker absent: {marker}")
         else:
             require_once(cargo_guard, marker, "builder_cargo_config")
+    if cargo_guard.count("lease.rewind_for_bind_data()") != 2:
+        fail("builder_cargo_config", "actual/empty Cargo config rewinds differ")
     static_authority = slice_between(
         source,
         "def validate_static_authority(",
@@ -1223,6 +1253,42 @@ def self_test(
         "cargo_config_guard = self_test_cargo_config_guard()",
         'cargo_config_guard = {"status": "ok"}',
         "builder_contract",
+    )
+    reject_builder(
+        "builder_reviewed_cargo_config_policy_probe_not_run",
+        "reviewed_cargo_config = self_test_reviewed_cargo_config_policy()",
+        'reviewed_cargo_config = {"status": "ok"}',
+        "builder_contract",
+    )
+    reject_builder(
+        "builder_reviewed_cargo_config_reinterprets_guest_cwd",
+        'recorded.get("cwd") != "/asterism/source"',
+        'recorded.get("cwd") == recorded.get("cwd")',
+        "builder_cargo_config",
+    )
+    reject_builder(
+        "builder_reviewed_cargo_config_reinterprets_guest_home",
+        'recorded.get("cargo_home_path") != GUEST_CARGO_HOME',
+        'recorded.get("cargo_home_path") == recorded.get("cargo_home_path")',
+        "builder_cargo_config",
+    )
+    reject_builder(
+        "builder_reviewed_cargo_config_translates_again",
+        "translated = json.loads(json.dumps(entries))",
+        "translated = []  # hostile discarded reviewed guest view",
+        "builder_cargo_config",
+    )
+    reject_builder(
+        "builder_reviewed_empty_cargo_config_unbound",
+        "if expected == {",
+        "if False and expected == {",
+        "builder_cargo_config",
+    )
+    reject_builder(
+        "builder_empty_bound_cargo_config_appearance_accepted",
+        'raise BuildError(\n                        f"{self.context} empty-bound Cargo config appeared"\n                    )',
+        "pass  # hostile accepts a path that appeared after empty binding",
+        "builder_cargo_config",
     )
     reject_builder(
         "builder_cargo_config_not_exact_bytes",

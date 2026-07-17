@@ -24,7 +24,7 @@ import tempfile
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Final
 
 
@@ -664,7 +664,7 @@ SOURCE_REVIEW_FIELDS: Final = (
 SOURCE_REVIEW_CONTENT_BINDING_FIELDS: Final = ("schema", "sha256", "mode")
 SOURCE_REVIEW_CONTENT_SCHEMAS: Final = {
     "bundle": SOURCE_REVIEW_BUNDLE_SCHEMA,
-    "current_children_attestation": "bn-30fs-current-children-build-v1",
+    "current_children_attestation": "bn-ecm1-current-children-build-v2",
     "lock_authority": "bn-31gp-current-lock-authority-v1",
     "lock_review_bundle": "bn-31gp-current-lock-review-bundle-v1",
 }
@@ -893,6 +893,7 @@ PREPARED_ATTESTATION_FIELDS: Final = (
     "build_argv",
     "build_env",
     "cargo_config_search",
+    "semantic_input_authority",
     "build_started_at",
     "build_started_monotonic_ns",
     "build_completed_at",
@@ -918,7 +919,105 @@ _RELEASE_GUEST_TOOLCHAIN_ROOT: Final = f"{_RELEASE_GUEST_ROOT}/toolchain"
 _RELEASE_GUEST_CARGO: Final = f"{_RELEASE_GUEST_TOOLCHAIN_ROOT}/bin/cargo"
 _RELEASE_GUEST_RUSTC: Final = f"{_RELEASE_GUEST_TOOLCHAIN_ROOT}/bin/rustc"
 _RELEASE_GUEST_CARGO_HOME: Final = f"{_RELEASE_GUEST_ROOT}/cargo-home"
-_RELEASE_GUEST_RUSTUP_HOME: Final = f"{_RELEASE_GUEST_ROOT}/rustup-home"
+_RELEASE_GUEST_RUSTUP_HOME: Final = "/nonexistent"
+SEMANTIC_INPUT_AUTHORITY_SCHEMA: Final = "bn-ecm1-semantic-input-authority-v1"
+RECURSIVE_TREE_AUTHORITY_SCHEMA: Final = "bn-ecm1-recursive-tree-authority-v1"
+TRUSTED_SYSTEM_CLOSURE_SCHEMA: Final = "bn-ecm1-trusted-system-closure-v1"
+TRUSTED_SYSTEM_MOUNTS: Final = (
+    (Path("/usr/bin"), "/usr/bin"),
+    (Path("/usr/lib"), "/usr/lib"),
+    (Path("/usr/include"), "/usr/include"),
+)
+SEMANTIC_INPUT_AUTHORITY_FIELDS: Final = (
+    "cargo_home",
+    "runtime_sha256",
+    "schema",
+    "source",
+    "toolchain",
+    "trusted_system_closure",
+)
+SEMANTIC_TREE_BINDING_FIELDS: Final = (
+    "entry_count",
+    "equal_pre_post",
+    "manifest_path",
+    "manifest_sha256",
+    "mutation_events_absent",
+    "role",
+    "schema",
+    "watch_count",
+)
+SEMANTIC_CLOSURE_FIELDS: Final = (
+    "entry_count",
+    "manifest_path",
+    "mounts",
+    "mutation_events_absent",
+    "schema",
+    "sha256",
+    "watch_count",
+)
+SEMANTIC_CLOSURE_MOUNT_FIELDS: Final = (
+    "device",
+    "gid",
+    "guest_path",
+    "host_path",
+    "inode",
+    "permissions",
+    "resolved_path",
+    "trusted_root_owned_non_writable",
+    "uid",
+)
+SEMANTIC_MANIFEST_ENTRY_FIELDS: Final = (
+    "changed_ns",
+    "device",
+    "file_type",
+    "gid",
+    "inode",
+    "link_count",
+    "modified_ns",
+    "path",
+    "permissions",
+    "sha256",
+    "size",
+    "symlink_target",
+    "symlink_scope",
+    "uid",
+)
+SEMANTIC_RESOLUTION_FIELDS: Final = (
+    "argv",
+    "cargo_config_search",
+    "cwd",
+    "environment",
+    "execution_authority",
+    "exit_status",
+    "host_source_root",
+    "lock_output",
+    "passed_file_descriptors",
+    "resolver_kind",
+    "semantic_input_authority",
+    "stderr",
+    "stderr_sha256",
+    "stdout",
+    "stdout_sha256",
+    "toolchain",
+)
+TRACKED_RESOLUTION_FIELDS: Final = tuple(
+    field
+    for field in SEMANTIC_RESOLUTION_FIELDS
+    if field
+    not in {
+        "execution_authority",
+        "lock_output",
+        "passed_file_descriptors",
+        "semantic_input_authority",
+    }
+)
+LOCK_SOURCE_PLAN_RELATIVE_PATH: Final = Path(
+    "spikes/asterism_rebaseline/tooling/source-plan.json"
+)
+_RELEASE_SANDBOX_SYSTEM_BINDINGS: Final = tuple(
+    ("--ro-bind-fd", guest_path)
+    for _host_path, guest_path in TRUSTED_SYSTEM_MOUNTS
+)
 _RELEASE_SANDBOX_CORE_BINDINGS: Final = (
     ("--ro-bind-fd", _RELEASE_GUEST_SOURCE),
     ("--bind-fd", _RELEASE_GUEST_TARGET),
@@ -926,7 +1025,13 @@ _RELEASE_SANDBOX_CORE_BINDINGS: Final = (
     ("--ro-bind-fd", _RELEASE_GUEST_CARGO),
     ("--ro-bind-fd", _RELEASE_GUEST_RUSTC),
     ("--ro-bind-fd", _RELEASE_GUEST_CARGO_HOME),
-    ("--ro-bind-fd", _RELEASE_GUEST_RUSTUP_HOME),
+)
+_RESOLUTION_SANDBOX_CORE_BINDINGS: Final = (
+    ("--bind-fd", _RELEASE_GUEST_SOURCE),
+    ("--ro-bind-fd", _RELEASE_GUEST_TOOLCHAIN_ROOT),
+    ("--ro-bind-fd", _RELEASE_GUEST_CARGO),
+    ("--ro-bind-fd", _RELEASE_GUEST_RUSTC),
+    ("--ro-bind-fd", _RELEASE_GUEST_CARGO_HOME),
 )
 _RELEASE_SANDBOX_CONFIG_PATHS: Final = (
     f"{_RELEASE_GUEST_SOURCE}/.cargo/config.toml",
@@ -2783,6 +2888,7 @@ def sha256_bytes(value: bytes) -> str:
 _SOURCE_REVIEW_IDENTIFIER: Final = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._:/@+\-]{0,255}\Z"
 )
+_SHA256: Final = re.compile(r"[0-9a-f]{64}\Z")
 _SOURCE_REVIEW_ZONED_TIME: Final = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
     r"(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})\Z"
@@ -3123,11 +3229,1423 @@ def _strip_source_input_schema(value: Mapping[str, Any]) -> dict[str, Any]:
     return {field: value[field] for field in SOURCE_REVIEW_INPUT_FIELDS if field != "schema"}
 
 
+def _semantic_metadata_equal(
+    left: os.stat_result, right: os.stat_result
+) -> bool:
+    return all(
+        getattr(left, field) == getattr(right, field)
+        for field in (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_nlink",
+            "st_uid",
+            "st_gid",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+    )
+
+
+def _semantic_system_symlink_scope(
+    root: Path, relative: str, target: str
+) -> str:
+    rendered = os.path.normpath(
+        str(
+            PurePosixPath(target)
+            if PurePosixPath(target).is_absolute()
+            else PurePosixPath(str(root))
+            / PurePosixPath(relative).parent
+            / target
+        )
+    )
+    for alias, destination in (
+        ("/bin", "/usr/bin"),
+        ("/lib", "/usr/lib"),
+        ("/lib64", "/usr/lib"),
+    ):
+        if rendered == alias or rendered.startswith(alias + "/"):
+            rendered = destination + rendered.removeprefix(alias)
+            break
+    exposed = tuple(guest for _host, guest in TRUSTED_SYSTEM_MOUNTS)
+    if any(
+        rendered == authority or rendered.startswith(authority + "/")
+        for authority in exposed
+    ):
+        return "within_closure"
+    if any(
+        rendered == authority or rendered.startswith(authority + "/")
+        for authority in ("/asterism", "/dev", "/proc", "/run", "/sys", "/tmp")
+    ):
+        raise ValueError("semantic system symlink reaches mutable guest authority")
+    return "guest_inaccessible_external"
+
+
+def _semantic_entry(
+    metadata: os.stat_result,
+    relative: str,
+    file_type: str,
+    digest: str | None,
+    symlink_target: str | None,
+    symlink_scope: str | None,
+    *,
+    volatile_directory_metadata_paths: frozenset[str],
+) -> dict[str, Any]:
+    entry = {
+        "changed_ns": metadata.st_ctime_ns,
+        "device": metadata.st_dev,
+        "file_type": file_type,
+        "gid": metadata.st_gid,
+        "inode": metadata.st_ino,
+        "link_count": metadata.st_nlink,
+        "modified_ns": metadata.st_mtime_ns,
+        "path": relative,
+        "permissions": stat.S_IMODE(metadata.st_mode),
+        "sha256": digest,
+        "size": metadata.st_size,
+        "symlink_target": symlink_target,
+        "symlink_scope": symlink_scope,
+        "uid": metadata.st_uid,
+    }
+    if file_type == "directory" and relative in volatile_directory_metadata_paths:
+        for field in ("changed_ns", "modified_ns", "permissions", "size"):
+            entry[field] = 0
+    return entry
+
+
+def _sample_recursive_semantic_manifest(
+    root: Path,
+    role: str,
+    context: str,
+    *,
+    allow_internal_symlinks: bool,
+    hash_regular_contents: bool,
+    trusted_system: bool = False,
+    excluded_relative_paths: frozenset[str] = frozenset(),
+    volatile_directory_metadata_paths: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
+    """Independently resample a semantic tree through no-follow descriptors."""
+
+    lexical = _absolute_lexical_path(Path(root))
+    resolved = lexical.resolve(strict=True)
+    if lexical != resolved:
+        raise ValueError(f"{context} root is not canonical")
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    regular_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    root_descriptor = os.open(resolved, directory_flags)
+    try:
+        entries: list[dict[str, Any]] = []
+
+        def walk(descriptor: int, relative: str) -> None:
+            before = os.fstat(descriptor)
+            directory_path = (
+                resolved if relative == "." else resolved / relative
+            )
+            if not stat.S_ISDIR(before.st_mode):
+                raise ValueError(f"{context} directory type changed")
+            if trusted_system and (
+                before.st_uid != 0
+                or stat.S_IMODE(before.st_mode) & 0o022
+                or os.access(directory_path, os.W_OK)
+            ):
+                raise ValueError(f"{context} trusted directory is writable")
+            entries.append(
+                _semantic_entry(
+                    before,
+                    relative,
+                    "directory",
+                    None,
+                    None,
+                    None,
+                    volatile_directory_metadata_paths=(
+                        volatile_directory_metadata_paths
+                    ),
+                )
+            )
+            names = sorted(os.listdir(descriptor))
+            if len(names) != len(set(names)):
+                raise ValueError(f"{context} directory names alias")
+            for name in names:
+                child_relative = name if relative == "." else f"{relative}/{name}"
+                if child_relative in excluded_relative_paths:
+                    continue
+                selected = os.stat(
+                    name, dir_fd=descriptor, follow_symlinks=False
+                )
+                candidate = resolved / child_relative
+                if stat.S_ISDIR(selected.st_mode):
+                    child = os.open(name, directory_flags, dir_fd=descriptor)
+                    try:
+                        if not _semantic_metadata_equal(selected, os.fstat(child)):
+                            raise ValueError(
+                                f"{context} directory selection changed"
+                            )
+                        walk(child, child_relative)
+                    finally:
+                        os.close(child)
+                elif stat.S_ISREG(selected.st_mode):
+                    child = os.open(name, regular_flags, dir_fd=descriptor)
+                    try:
+                        opened = os.fstat(child)
+                        if not _semantic_metadata_equal(selected, opened):
+                            raise ValueError(
+                                f"{context} regular-file selection changed"
+                            )
+                        digest = hashlib.sha256()
+                        observed_size = 0
+                        while True:
+                            chunk = os.read(child, 1024 * 1024)
+                            if not chunk:
+                                break
+                            observed_size += len(chunk)
+                            if hash_regular_contents:
+                                digest.update(chunk)
+                        after = os.fstat(child)
+                    finally:
+                        os.close(child)
+                    if (
+                        observed_size != opened.st_size
+                        or not _semantic_metadata_equal(opened, after)
+                    ):
+                        raise ValueError(f"{context} regular file changed")
+                    if trusted_system and (
+                        opened.st_uid != 0
+                        or stat.S_IMODE(opened.st_mode) & 0o022
+                        or os.access(candidate, os.W_OK)
+                    ):
+                        raise ValueError(
+                            f"{context} trusted regular file is writable"
+                        )
+                    entries.append(
+                        _semantic_entry(
+                            opened,
+                            child_relative,
+                            "regular",
+                            digest.hexdigest() if hash_regular_contents else None,
+                            None,
+                            None,
+                            volatile_directory_metadata_paths=(
+                                volatile_directory_metadata_paths
+                            ),
+                        )
+                    )
+                elif stat.S_ISLNK(selected.st_mode):
+                    if not allow_internal_symlinks:
+                        raise ValueError(f"{context} contains a symlink")
+                    target = os.readlink(name, dir_fd=descriptor)
+                    selected_after = os.stat(
+                        name, dir_fd=descriptor, follow_symlinks=False
+                    )
+                    if not _semantic_metadata_equal(selected, selected_after):
+                        raise ValueError(f"{context} symlink changed")
+                    if trusted_system and selected.st_uid != 0:
+                        raise ValueError(
+                            f"{context} trusted symlink is not root-owned"
+                        )
+                    try:
+                        target_path = candidate.parent.joinpath(target).resolve(
+                            strict=True
+                        )
+                    except (OSError, RuntimeError) as error:
+                        raise ValueError(
+                            f"{context} symlink target is unresolved"
+                        ) from error
+                    if trusted_system:
+                        scope = _semantic_system_symlink_scope(
+                            resolved, child_relative, target
+                        )
+                    else:
+                        if target_path != resolved and resolved not in target_path.parents:
+                            raise ValueError(f"{context} symlink escapes root")
+                        scope = "within_root"
+                    entries.append(
+                        _semantic_entry(
+                            selected,
+                            child_relative,
+                            "symlink",
+                            hashlib.sha256(os.fsencode(target)).hexdigest(),
+                            target,
+                            scope,
+                            volatile_directory_metadata_paths=(
+                                volatile_directory_metadata_paths
+                            ),
+                        )
+                    )
+                else:
+                    raise ValueError(f"{context} contains unsupported file type")
+            after = os.fstat(descriptor)
+            if not _semantic_metadata_equal(before, after):
+                raise ValueError(f"{context} directory changed")
+
+        walk(root_descriptor, ".")
+        return {
+            "entries": entries,
+            "role": role,
+            "schema": RECURSIVE_TREE_AUTHORITY_SCHEMA,
+        }
+    finally:
+        os.close(root_descriptor)
+
+
+def _validate_recursive_semantic_manifest(
+    value: Any, role: str, context: str, *, trusted_system: bool
+) -> Mapping[str, Any]:
+    manifest = _authority_object(
+        value,
+        ("entries", "role", "schema"),
+        f"{context} recursive manifest",
+    )
+    entries = manifest["entries"]
+    if (
+        manifest["schema"] != RECURSIVE_TREE_AUTHORITY_SCHEMA
+        or manifest["role"] != role
+        or not isinstance(entries, list)
+        or not entries
+    ):
+        raise ValueError(f"{context} recursive manifest identity differs")
+    paths: list[str] = []
+    for index, entry_value in enumerate(entries):
+        entry = _authority_object(
+            entry_value,
+            SEMANTIC_MANIFEST_ENTRY_FIELDS,
+            f"{context} recursive entry {index}",
+        )
+        relative = entry["path"]
+        parsed = PurePosixPath(relative) if isinstance(relative, str) else None
+        if (
+            parsed is None
+            or (
+                relative != "."
+                and (
+                    parsed.is_absolute()
+                    or str(parsed) != relative
+                    or "." in parsed.parts
+                    or ".." in parsed.parts
+                )
+            )
+            or (index == 0) != (relative == ".")
+            or relative in paths
+        ):
+            raise ValueError(f"{context} recursive path differs")
+        paths.append(relative)
+        kind = entry["file_type"]
+        integer_fields = (
+            "changed_ns",
+            "device",
+            "gid",
+            "inode",
+            "link_count",
+            "modified_ns",
+            "permissions",
+            "size",
+            "uid",
+        )
+        if kind not in {"directory", "regular", "symlink"} or any(
+            not _is_integer(entry[field]) for field in integer_fields
+        ):
+            raise ValueError(f"{context} recursive metadata differs")
+        if kind == "directory":
+            if any(
+                entry[field] is not None
+                for field in ("sha256", "symlink_target", "symlink_scope")
+            ):
+                raise ValueError(f"{context} directory digest differs")
+        elif kind == "regular":
+            digest_valid = (
+                entry["sha256"] is None
+                if trusted_system
+                else isinstance(entry["sha256"], str)
+                and _SHA256.fullmatch(entry["sha256"]) is not None
+            )
+            if (
+                entry["symlink_target"] is not None
+                or entry["symlink_scope"] is not None
+                or not digest_valid
+            ):
+                raise ValueError(f"{context} regular digest differs")
+        elif (
+            not isinstance(entry["symlink_target"], str)
+            or not isinstance(entry["sha256"], str)
+            or not _SHA256.fullmatch(entry["sha256"])
+            or entry["symlink_scope"]
+            not in (
+                {"within_closure", "guest_inaccessible_external"}
+                if trusted_system
+                else {"within_root"}
+            )
+        ):
+            raise ValueError(f"{context} symlink authority differs")
+        if trusted_system and (
+            entry["uid"] != 0
+            or (kind != "symlink" and entry["permissions"] & 0o022)
+        ):
+            raise ValueError(f"{context} trusted-system policy differs")
+    if paths != sorted(paths, key=lambda path: (path != ".", path)):
+        raise ValueError(f"{context} recursive path order differs")
+    return manifest
+
+
+def semantic_runtime_sha256(
+    components: Mapping[str, Mapping[str, Any]]
+) -> str:
+    """Recompute runtime identity, excluding source and evidence paths only."""
+
+    if set(components) != {
+        "cargo_home",
+        "toolchain",
+        "trusted_system_closure",
+    }:
+        raise ValueError("semantic runtime component names differ")
+    tree_fields = (
+        "schema",
+        "role",
+        "manifest_sha256",
+        "entry_count",
+        "watch_count",
+        "equal_pre_post",
+        "mutation_events_absent",
+    )
+    closure_fields = (
+        "schema",
+        "sha256",
+        "entry_count",
+        "mounts",
+        "watch_count",
+        "mutation_events_absent",
+    )
+    closure = components["trusted_system_closure"]
+    mounts = closure.get("mounts")
+    if (
+        not isinstance(mounts, list)
+        or len(mounts) != len(TRUSTED_SYSTEM_MOUNTS)
+        or any(
+            not isinstance(mount, Mapping)
+            or mount.get("guest_path") != guest_path
+            or mount.get("host_path") != str(host_path)
+            or mount.get("resolved_path") != str(host_path)
+            for mount, (host_path, guest_path) in zip(
+                mounts, TRUSTED_SYSTEM_MOUNTS, strict=True
+            )
+        )
+    ):
+        raise ValueError("semantic runtime trusted-system mounts differ")
+    normalized = {
+        "cargo_home": {
+            field: components["cargo_home"].get(field) for field in tree_fields
+        },
+        "schema": SEMANTIC_INPUT_AUTHORITY_SCHEMA,
+        "toolchain": {
+            field: components["toolchain"].get(field) for field in tree_fields
+        },
+        "trusted_system_closure": {
+            field: closure.get(field) for field in closure_fields
+        },
+    }
+    return sha256_bytes(canonical_json_bytes(normalized))
+
+
+def _validate_semantic_input_authority(
+    value: Any,
+    context: str,
+    *,
+    live_roots: Mapping[str, Path] | None,
+    source_role: str = "source",
+    live_manifest_cache: dict[tuple[Any, ...], Mapping[str, Any]] | None = None,
+    manifest_paths: set[str] | None = None,
+    manifest_identities: set[tuple[int, int]] | None = None,
+) -> str:
+    authority = _authority_object(
+        value, SEMANTIC_INPUT_AUTHORITY_FIELDS, f"{context} semantic authority"
+    )
+    if authority["schema"] != SEMANTIC_INPUT_AUTHORITY_SCHEMA:
+        raise ValueError(f"{context} semantic authority schema differs")
+    roles = {
+        "source": source_role,
+        "toolchain": "toolchain",
+        "cargo_home": "cargo_home",
+    }
+    authority_manifest_paths: set[str] = set()
+    authority_manifest_identities: set[tuple[int, int]] = set()
+    for name, role in roles.items():
+        binding = _authority_object(
+            authority[name],
+            SEMANTIC_TREE_BINDING_FIELDS,
+            f"{context} semantic {name}",
+        )
+        if (
+            binding["schema"] != RECURSIVE_TREE_AUTHORITY_SCHEMA
+            or binding["role"] != role
+            or not isinstance(binding["manifest_path"], str)
+            or not Path(binding["manifest_path"]).is_absolute()
+            or not isinstance(binding["manifest_sha256"], str)
+            or not _SHA256.fullmatch(binding["manifest_sha256"])
+            or not _is_integer(binding["entry_count"])
+            or binding["entry_count"] < 1
+            or not _is_integer(binding["watch_count"])
+            or binding["watch_count"] < 1
+            or binding["equal_pre_post"] is not True
+            or binding["mutation_events_absent"] is not True
+        ):
+            raise ValueError(f"{context} semantic {name} binding differs")
+        if binding["manifest_path"] in authority_manifest_paths:
+            raise ValueError(f"{context} semantic manifest paths alias")
+        authority_manifest_paths.add(binding["manifest_path"])
+        snapshot = snapshot_regular_file(
+            Path(binding["manifest_path"]), expected_mode=ARTIFACT_FILE_MODE
+        )
+        identity = (snapshot.device, snapshot.inode)
+        if snapshot._stat.st_nlink != 1 or identity in authority_manifest_identities:
+            raise ValueError(f"{context} semantic manifest identity aliases")
+        authority_manifest_identities.add(identity)
+        manifest = _validate_recursive_semantic_manifest(
+            parse_canonical_json_object(
+                snapshot.data, f"{context} semantic {name} manifest"
+            ),
+            role,
+            f"{context} semantic {name}",
+            trusted_system=False,
+        )
+        entries = manifest["entries"]
+        if (
+            snapshot.sha256 != binding["manifest_sha256"]
+            or len(entries) != binding["entry_count"]
+            or sum(entry["file_type"] == "directory" for entry in entries)
+            != binding["watch_count"]
+        ):
+            raise ValueError(f"{context} semantic {name} manifest differs")
+        if live_roots is not None:
+            excluded = (
+                frozenset({"Cargo.lock"})
+                if source_role == "resolution_source_without_cargo_lock"
+                and name == "source"
+                else frozenset()
+            )
+            volatile = (
+                frozenset({"."})
+                if source_role == "resolution_source_without_cargo_lock"
+                and name == "source"
+                else frozenset()
+            )
+            key = (
+                str(live_roots[name]),
+                role,
+                name != "source",
+                True,
+                False,
+                tuple(sorted(excluded)),
+                tuple(sorted(volatile)),
+            )
+            observed = (
+                live_manifest_cache.get(key)
+                if live_manifest_cache is not None
+                else None
+            )
+            if observed is None:
+                observed = _sample_recursive_semantic_manifest(
+                    live_roots[name],
+                    role,
+                    f"{context} live semantic {name}",
+                    allow_internal_symlinks=name != "source",
+                    hash_regular_contents=True,
+                    excluded_relative_paths=excluded,
+                    volatile_directory_metadata_paths=volatile,
+                )
+                confirmed = _sample_recursive_semantic_manifest(
+                    live_roots[name],
+                    role,
+                    f"{context} confirmed live semantic {name}",
+                    allow_internal_symlinks=name != "source",
+                    hash_regular_contents=True,
+                    excluded_relative_paths=excluded,
+                    volatile_directory_metadata_paths=volatile,
+                )
+                if observed != confirmed:
+                    raise ValueError(
+                        f"{context} live semantic {name} changed between samples"
+                    )
+                if live_manifest_cache is not None:
+                    live_manifest_cache[key] = observed
+            if canonical_json_bytes(observed) != snapshot.data:
+                raise ValueError(f"{context} live semantic {name} differs")
+
+    closure = _authority_object(
+        authority["trusted_system_closure"],
+        SEMANTIC_CLOSURE_FIELDS,
+        f"{context} trusted-system closure",
+    )
+    mounts = closure["mounts"]
+    if (
+        closure["schema"] != TRUSTED_SYSTEM_CLOSURE_SCHEMA
+        or not isinstance(closure["manifest_path"], str)
+        or not Path(closure["manifest_path"]).is_absolute()
+        or not isinstance(closure["sha256"], str)
+        or not _SHA256.fullmatch(closure["sha256"])
+        or not _is_integer(closure["entry_count"])
+        or closure["entry_count"] < len(TRUSTED_SYSTEM_MOUNTS)
+        or not _is_integer(closure["watch_count"])
+        or closure["watch_count"] < len(TRUSTED_SYSTEM_MOUNTS)
+        or closure["mutation_events_absent"] is not True
+        or not isinstance(mounts, list)
+        or len(mounts) != len(TRUSTED_SYSTEM_MOUNTS)
+    ):
+        raise ValueError(f"{context} trusted-system closure differs")
+    if closure["manifest_path"] in authority_manifest_paths:
+        raise ValueError(f"{context} semantic manifest paths alias")
+    authority_manifest_paths.add(closure["manifest_path"])
+    validated_mounts = []
+    for index, (mount_value, (host_path, guest_path)) in enumerate(
+        zip(mounts, TRUSTED_SYSTEM_MOUNTS, strict=True)
+    ):
+        mount = _authority_object(
+            mount_value,
+            SEMANTIC_CLOSURE_MOUNT_FIELDS,
+            f"{context} trusted-system mount {index}",
+        )
+        if (
+            mount["host_path"] != str(host_path)
+            or mount["resolved_path"] != str(host_path)
+            or mount["guest_path"] != guest_path
+            or mount["trusted_root_owned_non_writable"] is not True
+            or mount["uid"] != 0
+            or any(
+                not _is_integer(mount[field])
+                for field in ("device", "gid", "inode", "permissions", "uid")
+            )
+            or mount["permissions"] & 0o022
+        ):
+            raise ValueError(f"{context} trusted-system mount differs")
+        validated_mounts.append(mount)
+    closure_snapshot = snapshot_regular_file(
+        Path(closure["manifest_path"]), expected_mode=ARTIFACT_FILE_MODE
+    )
+    closure_identity = (closure_snapshot.device, closure_snapshot.inode)
+    if (
+        closure_snapshot._stat.st_nlink != 1
+        or closure_identity in authority_manifest_identities
+    ):
+        raise ValueError(f"{context} semantic manifest identity aliases")
+    authority_manifest_identities.add(closure_identity)
+    closure_value = _authority_object(
+        parse_canonical_json_object(
+            closure_snapshot.data, f"{context} trusted-system closure manifest"
+        ),
+        ("mounts", "schema"),
+        f"{context} trusted-system closure manifest",
+    )
+    evidence_mounts = closure_value["mounts"]
+    if (
+        closure_value["schema"] != TRUSTED_SYSTEM_CLOSURE_SCHEMA
+        or closure_snapshot.sha256 != closure["sha256"]
+        or not isinstance(evidence_mounts, list)
+        or len(evidence_mounts) != len(TRUSTED_SYSTEM_MOUNTS)
+    ):
+        raise ValueError(f"{context} trusted-system closure evidence differs")
+    total_entries = 0
+    total_watches = 0
+    for index, (evidence_value, (host_path, guest_path), binding) in enumerate(
+        zip(evidence_mounts, TRUSTED_SYSTEM_MOUNTS, validated_mounts, strict=True)
+    ):
+        evidence = _authority_object(
+            evidence_value,
+            ("guest_path", "host_path", "resolved_path", "tree"),
+            f"{context} trusted-system evidence mount {index}",
+        )
+        if (
+            evidence["guest_path"] != guest_path
+            or evidence["host_path"] != str(host_path)
+            or evidence["resolved_path"] != str(host_path)
+        ):
+            raise ValueError(f"{context} trusted-system evidence path differs")
+        role = "system-" + guest_path.removeprefix("/").replace("/", "-")
+        tree = _validate_recursive_semantic_manifest(
+            evidence["tree"],
+            role,
+            f"{context} trusted system {guest_path}",
+            trusted_system=True,
+        )
+        root_entry = tree["entries"][0]
+        for field in ("device", "gid", "inode", "permissions", "uid"):
+            if binding[field] != root_entry[field]:
+                raise ValueError(
+                    f"{context} trusted-system root binding differs"
+                )
+        total_entries += len(tree["entries"])
+        total_watches += sum(
+            entry["file_type"] == "directory" for entry in tree["entries"]
+        )
+        if live_roots is not None:
+            key = (str(host_path), role, True, False, True, (), ())
+            observed = (
+                live_manifest_cache.get(key)
+                if live_manifest_cache is not None
+                else None
+            )
+            if observed is None:
+                observed = _sample_recursive_semantic_manifest(
+                    host_path,
+                    role,
+                    f"{context} live trusted system {guest_path}",
+                    allow_internal_symlinks=True,
+                    hash_regular_contents=False,
+                    trusted_system=True,
+                )
+                confirmed = _sample_recursive_semantic_manifest(
+                    host_path,
+                    role,
+                    f"{context} confirmed live trusted system {guest_path}",
+                    allow_internal_symlinks=True,
+                    hash_regular_contents=False,
+                    trusted_system=True,
+                )
+                if observed != confirmed:
+                    raise ValueError(
+                        f"{context} live trusted system {guest_path} changed "
+                        "between samples"
+                    )
+                if live_manifest_cache is not None:
+                    live_manifest_cache[key] = observed
+            if observed != tree:
+                raise ValueError(
+                    f"{context} live trusted system {guest_path} differs"
+                )
+    if (
+        total_entries != closure["entry_count"]
+        or total_watches != closure["watch_count"]
+    ):
+        raise ValueError(f"{context} trusted-system closure counts differ")
+    components = {
+        name: authority[name]
+        for name in ("cargo_home", "toolchain", "trusted_system_closure")
+    }
+    runtime_sha256 = semantic_runtime_sha256(components)
+    if authority["runtime_sha256"] != runtime_sha256:
+        raise ValueError(f"{context} semantic runtime digest differs")
+    if manifest_paths is not None:
+        if authority_manifest_paths & manifest_paths:
+            raise ValueError(f"{context} semantic manifest topology aliases")
+        manifest_paths.update(authority_manifest_paths)
+    if manifest_identities is not None:
+        if authority_manifest_identities & manifest_identities:
+            raise ValueError(f"{context} semantic manifest files alias")
+        manifest_identities.update(authority_manifest_identities)
+    return runtime_sha256
+
+
+def _semantic_live_roots(
+    source_root: Path, toolchain: Any, context: str
+) -> dict[str, Path]:
+    if not isinstance(toolchain, Mapping):
+        raise ValueError(f"{context} semantic toolchain is absent")
+    cargo_path = toolchain.get("cargo_path")
+    rustc_path = toolchain.get("rustc_path")
+    cargo_home_path = toolchain.get("cargo_home_path")
+    if not all(
+        isinstance(value, str)
+        for value in (cargo_path, rustc_path, cargo_home_path)
+    ):
+        raise ValueError(f"{context} semantic toolchain paths differ")
+    try:
+        source = _absolute_lexical_path(source_root).resolve(strict=True)
+        cargo = _absolute_lexical_path(Path(cargo_path)).resolve(strict=True)
+        rustc = _absolute_lexical_path(Path(rustc_path)).resolve(strict=True)
+        cargo_home = _absolute_lexical_path(Path(cargo_home_path)).resolve(
+            strict=True
+        )
+    except (OSError, RuntimeError, ValueError) as error:
+        raise ValueError(f"{context} semantic live roots differ") from error
+    toolchain_root = cargo.parent.parent
+    if rustc.parent.parent != toolchain_root:
+        raise ValueError(f"{context} Cargo/rustc toolchain roots differ")
+    return {
+        "cargo_home": cargo_home,
+        "source": source,
+        "toolchain": toolchain_root,
+    }
+
+
+def _validate_current_semantic_authorities(
+    attestation: Mapping[str, Any],
+    assertion: Mapping[str, Any],
+    cache: dict[tuple[Any, ...], Mapping[str, Any]],
+    manifest_paths: set[str],
+    manifest_identities: set[tuple[int, int]],
+) -> str:
+    builds = attestation.get("builds")
+    expected_builds = {
+        "children": "children",
+        "hooked_release": "hooked-release",
+        "pristine_release": "pristine-release",
+    }
+    if not isinstance(builds, Mapping) or set(builds) != set(expected_builds):
+        raise ValueError("current semantic build topology differs")
+    current_path = assertion["inputs"]["current_children_attestation"]["path"]
+    if not isinstance(current_path, str):
+        raise ValueError("current semantic reviewed path differs")
+    materialized = _absolute_lexical_path(Path(current_path)).parent / "materialized"
+    runtimes = set()
+    for name, directory in expected_builds.items():
+        build = builds[name]
+        if not isinstance(build, Mapping):
+            raise ValueError(f"current semantic build {name} is not an object")
+        roots = _semantic_live_roots(
+            materialized / directory,
+            attestation.get("toolchain"),
+            f"current semantic build {name}",
+        )
+        runtimes.add(
+            _validate_semantic_input_authority(
+                build.get("semantic_input_authority"),
+                f"current semantic build {name}",
+                live_roots=roots,
+                live_manifest_cache=cache,
+                manifest_paths=manifest_paths,
+                manifest_identities=manifest_identities,
+            )
+        )
+    if len(runtimes) != 1:
+        raise ValueError("current builds used different semantic runtimes")
+    return next(iter(runtimes))
+
+
+def _frozen_cargo_environment(toolchain: Mapping[str, Any]) -> dict[str, str]:
+    cargo_path = toolchain.get("cargo_path")
+    rustc_path = toolchain.get("rustc_path")
+    cargo_home_path = toolchain.get("cargo_home_path")
+    rustup_home_path = toolchain.get("rustup_home_path")
+    rustup_toolchain = toolchain.get("rustup_toolchain")
+    if not all(
+        isinstance(value, str) and value
+        for value in (
+            cargo_path,
+            rustc_path,
+            cargo_home_path,
+            rustup_home_path,
+            rustup_toolchain,
+        )
+    ):
+        raise ValueError("semantic Cargo environment toolchain differs")
+    path = ":".join(
+        dict.fromkeys(
+            (
+                str(Path(cargo_path).parent),
+                str(Path(rustc_path).parent),
+                "/usr/bin",
+                "/bin",
+            )
+        )
+    )
+    return {
+        "CARGO_HOME": cargo_home_path,
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_NET_OFFLINE": "true",
+        "GIT_CONFIG_COUNT": "0",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "HOME": "/nonexistent",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": path,
+        "RUSTC": rustc_path,
+        "RUSTUP_HOME": rustup_home_path,
+        "RUSTUP_TOOLCHAIN": rustup_toolchain,
+        "TZ": "UTC",
+    }
+
+
+def _sandboxed_cargo_environment(toolchain: Mapping[str, Any]) -> dict[str, str]:
+    environment = _frozen_cargo_environment(toolchain)
+    environment.update(
+        {
+            "CARGO_HOME": _RELEASE_GUEST_CARGO_HOME,
+            "GIT_CONFIG_GLOBAL": f"{_RELEASE_GUEST_ROOT}/absent-gitconfig",
+            "PATH": f"{_RELEASE_GUEST_TOOLCHAIN_ROOT}/bin:/usr/bin:/bin",
+            "RUSTC": _RELEASE_GUEST_RUSTC,
+            "RUSTUP_HOME": _RELEASE_GUEST_RUSTUP_HOME,
+        }
+    )
+    return environment
+
+
+def _validate_resolution_sandbox_argv(
+    argv: Any,
+    toolchain: Mapping[str, Any],
+    cargo_arguments: Sequence[str],
+    context: str,
+) -> None:
+    bwrap_path = toolchain.get("bwrap_path")
+    if (
+        not isinstance(argv, list)
+        or any(not isinstance(argument, str) for argument in argv)
+        or not isinstance(bwrap_path, str)
+    ):
+        raise ValueError(f"{context} resolver argv differs")
+    prefix = [
+        bwrap_path,
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-net",
+        "--dir",
+        "/usr",
+    ]
+    after_system = [
+        "--symlink",
+        "usr/bin",
+        "/bin",
+        "--symlink",
+        "usr/lib",
+        "/lib",
+        "--symlink",
+        "usr/lib",
+        "/lib64",
+        "--dir",
+        "/dev",
+        "--dir",
+        "/proc",
+        "--tmpfs",
+        "/tmp",
+        "--tmpfs",
+        _RELEASE_GUEST_ROOT,
+    ]
+    after_core = [
+        "--dir",
+        f"{_RELEASE_GUEST_ROOT}/.cargo",
+        "--tmpfs",
+        f"{_RELEASE_GUEST_ROOT}/.cargo",
+        "--remount-ro",
+        f"{_RELEASE_GUEST_ROOT}/.cargo",
+        "--dir",
+        "/.cargo",
+        "--tmpfs",
+        "/.cargo",
+        "--remount-ro",
+        "/.cargo",
+        "--dir",
+        f"{_RELEASE_GUEST_SOURCE}/.cargo",
+        "--tmpfs",
+        f"{_RELEASE_GUEST_SOURCE}/.cargo",
+    ]
+    source_remount = [
+        "--remount-ro",
+        f"{_RELEASE_GUEST_SOURCE}/.cargo",
+    ]
+    cargo_home_remount = [
+        "--remount-ro",
+        _RELEASE_GUEST_CARGO_HOME,
+    ]
+    suffix = [
+        "--chdir",
+        _RELEASE_GUEST_SOURCE,
+        _RELEASE_GUEST_CARGO,
+        *cargo_arguments,
+    ]
+    if argv[: len(prefix)] != prefix:
+        raise ValueError(f"{context} resolver sandbox prefix differs")
+    descriptors: list[str] = []
+    offset = len(prefix)
+
+    def consume(
+        bindings: Sequence[tuple[str, str]], start: int
+    ) -> int:
+        current = start
+        for operation, destination in bindings:
+            segment = argv[current : current + 3]
+            descriptor = segment[1] if len(segment) == 3 else ""
+            if (
+                len(segment) != 3
+                or segment[0] != operation
+                or segment[2] != destination
+                or not descriptor.isascii()
+                or not descriptor.isdecimal()
+                or len(descriptor) > 10
+                or str(int(descriptor)) != descriptor
+                or int(descriptor) < 3
+            ):
+                raise ValueError(
+                    f"{context} resolver descriptor binding differs"
+                )
+            descriptors.append(descriptor)
+            current += 3
+        return current
+
+    offset = consume(_RELEASE_SANDBOX_SYSTEM_BINDINGS, offset)
+    if argv[offset : offset + len(after_system)] != after_system:
+        raise ValueError(f"{context} resolver private namespace differs")
+    offset += len(after_system)
+    offset = consume(_RESOLUTION_SANDBOX_CORE_BINDINGS, offset)
+    if argv[offset : offset + len(after_core)] != after_core:
+        raise ValueError(f"{context} resolver private config roots differ")
+    offset += len(after_core)
+    offset = consume(_RELEASE_SANDBOX_SOURCE_CONFIG_BINDINGS, offset)
+    if argv[offset : offset + len(source_remount)] != source_remount:
+        raise ValueError(f"{context} resolver source config remount differs")
+    offset += len(source_remount)
+    offset = consume(_RELEASE_SANDBOX_CARGO_HOME_CONFIG_BINDINGS, offset)
+    if argv[offset : offset + len(cargo_home_remount)] != cargo_home_remount:
+        raise ValueError(f"{context} resolver Cargo config remount differs")
+    offset += len(cargo_home_remount)
+    if (
+        len(descriptors) != 12
+        or len(set(descriptors)) != len(descriptors)
+        or argv[offset:] != suffix
+    ):
+        raise ValueError(f"{context} resolver descriptors/command differ")
+
+
+def _validate_resolution_record(
+    record: Mapping[str, Any],
+    claim: Mapping[str, Any],
+    variant: str,
+    label: str,
+    expected_toolchain: Mapping[str, Any],
+    current_lock_sha256: str,
+) -> None:
+    context = f"lock semantic {variant} {label} resolver"
+    cargo_arguments = (
+        ("metadata", "--locked", "--offline", "--format-version", "1", "--no-deps")
+        if label == "current"
+        else ("generate-lockfile", "--offline")
+    )
+    _validate_resolution_sandbox_argv(
+        record["argv"], expected_toolchain, cargo_arguments, context
+    )
+    if record["environment"] != _sandboxed_cargo_environment(expected_toolchain):
+        raise ValueError(f"{context} environment differs")
+    for stream in ("stdout", "stderr"):
+        payload = record[stream]
+        if (
+            not isinstance(payload, str)
+            or record[f"{stream}_sha256"]
+            != sha256_bytes(payload.encode())
+        ):
+            raise ValueError(f"{context} {stream} authority differs")
+    execution = _authority_object(
+        record["execution_authority"],
+        RELEASE_COMPILE_OUT_FILE_FIELDS,
+        f"{context} execution authority",
+    )
+    mode = execution["mode"]
+    if (
+        not _is_integer(mode)
+        or mode & 0o111 == 0
+        or execution["path"] != expected_toolchain.get("bwrap_path")
+        or execution["sha256"] != expected_toolchain.get("bwrap_sha256")
+    ):
+        raise ValueError(f"{context} bwrap authority differs")
+    _validate_release_file_record(
+        execution, f"{context} retained bwrap", expected_mode=mode
+    )
+    _release_cargo_config_sha256(
+        {
+            "cargo_config_search": record["cargo_config_search"],
+            "materialized_root": record["host_source_root"],
+            "toolchain": expected_toolchain,
+        },
+        context,
+    )
+    lock_output = _authority_object(
+        record["lock_output"], ("post", "pre"), f"{context} lock output"
+    )
+    source_root = Path(record["host_source_root"])
+    expected_path = str(source_root / "Cargo.lock")
+    for boundary in ("pre", "post"):
+        _authority_object(
+            lock_output[boundary],
+            ("path", "sha256", "status"),
+            f"{context} lock {boundary}",
+        )
+    expected_lock_output = (
+        {
+            boundary: {
+                "path": expected_path,
+                "sha256": current_lock_sha256,
+                "status": "present",
+            }
+            for boundary in ("post", "pre")
+        }
+        if label == "current"
+        else {
+            "post": {
+                "path": expected_path,
+                "sha256": claim.get("final_lock_sha256"),
+                "status": "present",
+            },
+            "pre": {
+                "path": expected_path,
+                "sha256": None,
+                "status": "absent",
+            },
+        }
+    )
+    if lock_output != expected_lock_output:
+        raise ValueError(f"{context} lock transition differs")
+    if label == "generated":
+        live_lock = snapshot_regular_file(
+            source_root / "Cargo.lock", expected_mode=None
+        )
+        if live_lock.sha256 != claim.get("final_lock_sha256"):
+            raise ValueError(f"{context} live generated lock differs")
+
+
+def _lock_repository_from_source_plan(value: Any) -> Path:
+    """Derive the repository only from the producer's fixed plan topology."""
+
+    try:
+        source_plan = _absolute_lexical_path(
+            Path(value)
+        ).resolve(strict=True)
+        repository = source_plan.parents[3]
+    except (IndexError, OSError, RuntimeError, TypeError, ValueError) as error:
+        raise ValueError("lock semantic source-plan topology differs") from error
+    if (
+        value != str(source_plan)
+        or source_plan != repository / LOCK_SOURCE_PLAN_RELATIVE_PATH
+    ):
+        raise ValueError("lock semantic source-plan topology differs")
+    return repository
+
+
+def _validate_resolution_semantic_authorities(
+    lock_authority: Mapping[str, Any],
+    cache: dict[tuple[Any, ...], Mapping[str, Any]],
+    manifest_paths: set[str],
+    manifest_identities: set[tuple[int, int]],
+) -> set[str]:
+    lock_manifest = lock_authority.get("lock_manifest")
+    payload = (
+        lock_manifest.get("payload")
+        if isinstance(lock_manifest, Mapping)
+        else None
+    )
+    variants = payload.get("variants") if isinstance(payload, Mapping) else None
+    expected_toolchain = (
+        payload.get("toolchain") if isinstance(payload, Mapping) else None
+    )
+    if (
+        not isinstance(variants, Mapping)
+        or set(variants) != set(VARIANTS)
+        or not isinstance(expected_toolchain, Mapping)
+    ):
+        raise ValueError("lock semantic variant topology differs")
+    source_plan_path = payload.get("source_plan_path")
+    repository = _lock_repository_from_source_plan(source_plan_path)
+    variant_a = variants["A"]
+    current_lock = (
+        variant_a.get("historical_lock")
+        if isinstance(variant_a, Mapping)
+        else None
+    )
+    current_lock_sha256 = (
+        current_lock.get("sha256")
+        if isinstance(current_lock, Mapping)
+        else None
+    )
+    if (
+        not isinstance(current_lock_sha256, str)
+        or not _SHA256.fullmatch(current_lock_sha256)
+    ):
+        raise ValueError("lock semantic current lock authority differs")
+    runtimes: set[str] = set()
+    output_roots: set[Path] = set()
+    for variant in VARIANTS:
+        claim = variants[variant]
+        if not isinstance(claim, Mapping):
+            raise ValueError(f"lock semantic variant {variant} differs")
+        final_lock_text = claim.get("final_lock_path")
+        try:
+            final_lock = _absolute_lexical_path(
+                Path(final_lock_text)
+            ).resolve(strict=True)
+            output_root = final_lock.parents[1]
+            expected_source_root = (
+                output_root / "materialized" / variant
+            ).resolve(strict=True)
+        except (
+            IndexError,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as error:
+            raise ValueError(
+                f"lock semantic variant {variant} final-lock topology differs"
+            ) from error
+        expected_config_path = (
+            output_root / "manifests" / f"cargo-config-{variant}.json"
+        )
+        output_roots.add(output_root)
+        if (
+            final_lock_text != str(final_lock)
+            or final_lock != output_root / "locks" / f"Cargo-{variant}.lock"
+            or not isinstance(claim.get("final_lock_sha256"), str)
+            or not _SHA256.fullmatch(claim["final_lock_sha256"])
+            or snapshot_regular_file(final_lock, expected_mode=0o444).sha256
+            != claim["final_lock_sha256"]
+        ):
+            raise ValueError(
+                f"lock semantic variant {variant} final-lock authority differs"
+            )
+        current_attempt = claim.get("current_lock_attempt")
+        resolver = claim.get("resolver")
+        if variant in {"A", "B"}:
+            if current_attempt is not None:
+                raise ValueError(
+                    f"lock semantic variant {variant} has a current attempt"
+                )
+            tracked = _authority_object(
+                resolver,
+                TRACKED_RESOLUTION_FIELDS,
+                f"lock semantic tracked resolver {variant}",
+            )
+            if (
+                tracked["resolver_kind"] != "tracked_git_readback"
+                or tracked["toolchain"] != expected_toolchain
+                or tracked["environment"]
+                != _frozen_cargo_environment(expected_toolchain)
+                or not isinstance(tracked["argv"], list)
+                or any(
+                    not isinstance(argument, str)
+                    for argument in tracked["argv"]
+                )
+                or not isinstance(tracked["cwd"], str)
+                or not isinstance(tracked["host_source_root"], str)
+                or not _is_integer(tracked["exit_status"])
+                or tracked["exit_status"] != 0
+                or not isinstance(tracked["stdout"], str)
+                or not isinstance(tracked["stderr"], str)
+                or tracked["stdout_sha256"]
+                != sha256_bytes(tracked["stdout"].encode())
+                or tracked["stderr_sha256"]
+                != sha256_bytes(tracked["stderr"].encode())
+            ):
+                raise ValueError(
+                    f"lock semantic tracked resolver {variant} differs"
+                )
+            historical = claim.get("historical_lock")
+            source_root = tracked["host_source_root"]
+            try:
+                resolved_source = _absolute_lexical_path(
+                    Path(source_root)
+                ).resolve(strict=True)
+                resolved_cwd = _absolute_lexical_path(
+                    Path(tracked["cwd"])
+                ).resolve(strict=True)
+            except (OSError, RuntimeError, ValueError) as error:
+                raise ValueError(
+                    f"lock semantic tracked resolver {variant} roots differ"
+                ) from error
+            if (
+                source_root != str(resolved_source)
+                or resolved_source != expected_source_root
+                or tracked["cwd"] != str(repository)
+                or resolved_cwd != repository
+                or not isinstance(tracked["cargo_config_search"], Mapping)
+                or tracked["cargo_config_search"].get("path")
+                != str(expected_config_path)
+                or not isinstance(historical, Mapping)
+                or set(historical) != {"commit", "path", "sha256"}
+                or tracked["argv"]
+                != [
+                    expected_toolchain.get("git_path"),
+                    "-C",
+                    str(resolved_cwd),
+                    "show",
+                    f"{historical['commit']}:{historical['path']}",
+                ]
+                or tracked["stdout_sha256"] != historical["sha256"]
+                or tracked["stdout_sha256"] != claim.get("final_lock_sha256")
+                or tracked["stderr"] != ""
+            ):
+                raise ValueError(
+                    f"lock semantic tracked resolver {variant} replay differs"
+                )
+            _release_cargo_config_sha256(
+                {
+                    "cargo_config_search": tracked["cargo_config_search"],
+                    "materialized_root": source_root,
+                    "toolchain": expected_toolchain,
+                },
+                f"lock semantic tracked resolver {variant}",
+            )
+            continue
+        if not isinstance(current_attempt, Mapping) or not isinstance(
+            resolver, Mapping
+        ):
+            raise ValueError(
+                f"lock semantic variant {variant} resolution topology differs"
+            )
+        for label, record_value in (
+            ("current", current_attempt),
+            ("generated", resolver),
+        ):
+            record = _authority_object(
+                record_value,
+                SEMANTIC_RESOLUTION_FIELDS,
+                f"lock semantic {variant} {label} resolver",
+            )
+            source_root = record["host_source_root"]
+            if (
+                record["resolver_kind"] != "sandboxed_cargo_resolution"
+                or record["toolchain"] != expected_toolchain
+                or record["cwd"] != _RELEASE_GUEST_SOURCE
+                or record["exit_status"] != 0
+                or not _is_integer(record["passed_file_descriptors"])
+                or record["passed_file_descriptors"] != 13
+                or not isinstance(source_root, str)
+            ):
+                raise ValueError(
+                    f"lock semantic {variant} {label} resolver differs"
+                )
+            roots = _semantic_live_roots(
+                Path(source_root),
+                record["toolchain"],
+                f"lock semantic {variant} {label} resolver",
+            )
+            if source_root != str(roots["source"]):
+                raise ValueError(
+                    f"lock semantic {variant} {label} source root differs"
+                )
+            cargo_config = record["cargo_config_search"]
+            if (
+                roots["source"] != expected_source_root
+                or not isinstance(cargo_config, Mapping)
+                or cargo_config.get("path") != str(expected_config_path)
+            ):
+                raise ValueError(
+                    f"lock semantic {variant} {label} topology differs"
+                )
+            _validate_resolution_record(
+                record,
+                claim,
+                variant,
+                label,
+                expected_toolchain,
+                current_lock_sha256,
+            )
+            runtimes.add(
+                _validate_semantic_input_authority(
+                    record["semantic_input_authority"],
+                    f"lock semantic {variant} {label} resolver",
+                    live_roots=roots,
+                    source_role="resolution_source_without_cargo_lock",
+                    live_manifest_cache=cache,
+                    manifest_paths=manifest_paths,
+                    manifest_identities=manifest_identities,
+                )
+            )
+    if len(runtimes) != 1 or len(output_roots) != 1:
+        raise ValueError("lock resolutions used different semantic runtimes")
+    return runtimes
+
+
+def _validate_release_semantic_authority(
+    attestation: Mapping[str, Any],
+    context: str,
+    cache: dict[tuple[Any, ...], Mapping[str, Any]],
+    manifest_paths: set[str] | None = None,
+    manifest_identities: set[tuple[int, int]] | None = None,
+) -> str:
+    """Replay one release build's semantic authority against its live roots."""
+
+    materialized_root, _device, _inode = _release_materialized_root_identity(
+        attestation, context
+    )
+    roots = _semantic_live_roots(
+        Path(materialized_root), attestation.get("toolchain"), context
+    )
+    return _validate_semantic_input_authority(
+        attestation.get("semantic_input_authority"),
+        context,
+        live_roots=roots,
+        live_manifest_cache=cache,
+        manifest_paths=manifest_paths,
+        manifest_identities=manifest_identities,
+    )
+
+
+def _validate_prepared_release_semantics(
+    prepared: Mapping[str, Any],
+    cache: dict[tuple[Any, ...], Mapping[str, Any]],
+    manifest_paths: set[str],
+    manifest_identities: set[tuple[int, int]],
+) -> str:
+    """Replay all four published release builds, not only the selected one."""
+
+    variants = prepared.get("variants")
+    if not isinstance(variants, Mapping) or set(variants) != set(VARIANTS):
+        raise ValueError("prepared release semantic topology differs")
+    runtimes: set[str] = set()
+    for variant in VARIANTS:
+        prepared_variant = _authority_object(
+            variants[variant],
+            PREPARED_VARIANT_FIELDS,
+            f"prepared release variant {variant}",
+        )
+        attestation = _authority_object(
+            prepared_variant["attestation"],
+            PREPARED_ATTESTATION_FIELDS,
+            f"prepared release variant {variant} attestation",
+        )
+        build_environment = attestation["build_env"]
+        if (
+            attestation["toolchain"] != prepared.get("toolchain")
+            or attestation["source_read_only"] is not True
+            or attestation["target_dir_was_absent"] is not True
+            or attestation["materialized_manifest_pre_sha256"]
+            != attestation["materialized_manifest_sha256"]
+            or attestation["materialized_manifest_post_sha256"]
+            != attestation["materialized_manifest_sha256"]
+            or attestation["cargo_lock_pre_sha256"]
+            != attestation["cargo_lock_sha256"]
+            or attestation["cargo_lock_post_sha256"]
+            != attestation["cargo_lock_sha256"]
+            or not isinstance(build_environment, Mapping)
+            or build_environment.get("CARGO_HOME") != _RELEASE_GUEST_CARGO_HOME
+            or build_environment.get("RUSTC") != _RELEASE_GUEST_RUSTC
+            or build_environment.get("RUSTUP_HOME") != _RELEASE_GUEST_RUSTUP_HOME
+            or build_environment.get("PATH")
+            != f"{_RELEASE_GUEST_TOOLCHAIN_ROOT}/bin:/usr/bin:/bin"
+            or any(
+                field in build_environment
+                for field in (
+                    "RUSTC_WORKSPACE_WRAPPER",
+                    "RUSTC_WRAPPER",
+                    "RUSTFLAGS",
+                    "CARGO_ENCODED_RUSTFLAGS",
+                )
+            )
+        ):
+            raise ValueError(
+                f"prepared release variant {variant} authority differs"
+            )
+        _release_sandbox_sha256(
+            attestation, f"prepared release variant {variant}"
+        )
+        _validate_release_build_child(
+            attestation, f"prepared release variant {variant}"
+        )
+        runtimes.add(
+            _validate_release_semantic_authority(
+                attestation,
+                f"prepared release variant {variant}",
+                cache,
+                manifest_paths,
+                manifest_identities,
+            )
+        )
+    if len(runtimes) != 1:
+        raise ValueError("prepared releases used different semantic runtimes")
+    return next(iter(runtimes))
+
+
 def _validate_preapproval_attestation(
     attestation: Mapping[str, Any],
     assertion: Mapping[str, Any],
     approval: Mapping[str, Any],
-) -> None:
+    cache: dict[tuple[Any, ...], Mapping[str, Any]],
+    manifest_paths: set[str],
+    manifest_identities: set[tuple[int, int]],
+) -> str:
     inputs = assertion["inputs"]
     if (
         attestation.get("schema") != SOURCE_REVIEW_CONTENT_SCHEMAS[
@@ -3191,6 +4709,13 @@ def _validate_preapproval_attestation(
         or patch.get("sha256") != requirement["product_overlay_sha256"]
     ):
         raise ValueError("current children product overlay binding differs")
+    return _validate_current_semantic_authorities(
+        attestation,
+        assertion,
+        cache,
+        manifest_paths,
+        manifest_identities,
+    )
 
 
 def _validate_release_file_record(
@@ -3338,13 +4863,22 @@ def _release_sandbox_sha256(
         "--die-with-parent",
         "--new-session",
         "--unshare-net",
-        "--ro-bind",
-        "/",
-        "/",
-        "--dev-bind",
+        "--dir",
+        "/usr",
+    ]
+    after_system = [
+        "--symlink",
+        "usr/bin",
+        "/bin",
+        "--symlink",
+        "usr/lib",
+        "/lib",
+        "--symlink",
+        "usr/lib",
+        "/lib64",
+        "--dir",
         "/dev",
-        "/dev",
-        "--proc",
+        "--dir",
         "/proc",
         "--tmpfs",
         "/tmp",
@@ -3394,6 +4928,8 @@ def _release_sandbox_sha256(
     ]
     expected_length = (
         len(prefix)
+        + 3 * len(_RELEASE_SANDBOX_SYSTEM_BINDINGS)
+        + len(after_system)
         + 3 * len(_RELEASE_SANDBOX_CORE_BINDINGS)
         + len(middle)
         + 3 * len(_RELEASE_SANDBOX_SOURCE_CONFIG_BINDINGS)
@@ -3433,6 +4969,10 @@ def _release_sandbox_sha256(
             current += 3
         return current
 
+    offset = consume_bindings(_RELEASE_SANDBOX_SYSTEM_BINDINGS, offset)
+    if argv[offset : offset + len(after_system)] != after_system:
+        raise ValueError(f"{context} sandbox private namespace differs")
+    offset += len(after_system)
     offset = consume_bindings(_RELEASE_SANDBOX_CORE_BINDINGS, offset)
     if argv[offset : offset + len(middle)] != middle:
         raise ValueError(f"{context} private source Cargo config mount differs")
@@ -3461,11 +5001,17 @@ def _release_sandbox_sha256(
     if not isinstance(build_child, Mapping) or build_child.get("argv") != argv:
         raise ValueError(f"{context} child argv differs from sandbox authority")
     cargo_config_sha256 = _release_cargo_config_sha256(attestation, context)
+    semantic_runtime = _validate_semantic_input_authority(
+        attestation.get("semantic_input_authority"),
+        context,
+        live_roots=None,
+    )
     return sha256_bytes(
         canonical_json_bytes(
             {
                 "argv": normalized,
                 "cargo_config_search_sha256": cargo_config_sha256,
+                "semantic_runtime_sha256": semantic_runtime,
             }
         )
     )
@@ -3637,262 +5183,15 @@ def _validate_release_build_events(
         raise ValueError("release build wall chronology overlaps")
 
 
-def _release_cargo_config_sha256(
-    attestation: Mapping[str, Any], context: str
-) -> str:
-    binding = _authority_object(
-        attestation["cargo_config_search"],
-        FILE_BINDING_FIELDS,
-        f"{context} Cargo config binding",
-    )
-    manifest_sha256 = _authority_sha256(
-        binding["sha256"], f"{context} Cargo config manifest hash"
-    )
-    manifest_path = Path(str(binding["path"]))
-    manifest_snapshot = snapshot_regular_file(
-        manifest_path, expected_mode=ARTIFACT_FILE_MODE
-    )
-    if manifest_snapshot.sha256 != manifest_sha256:
-        raise ValueError(f"{context} Cargo config manifest bytes differ")
-    manifest = _authority_object(
-        parse_canonical_json_object(
-            manifest_snapshot.data, f"{context} Cargo config manifest"
-        ),
-        CARGO_CONFIG_SEARCH_FIELDS,
-        f"{context} Cargo config manifest",
-    )
-    if (
-        manifest["schema"] != CARGO_CONFIG_SEARCH_SCHEMA
-        or manifest["cwd"] != _RELEASE_GUEST_SOURCE
-        or manifest["cargo_home_path"] != _RELEASE_GUEST_CARGO_HOME
-    ):
-        raise ValueError(f"{context} Cargo config guest identity differs")
-    try:
-        source_root = Path(str(attestation["materialized_root"])).resolve(
-            strict=True
-        )
-        toolchain = attestation["toolchain"]
-        if not isinstance(toolchain, Mapping) or not isinstance(
-            toolchain.get("cargo_home_path"), str
-        ):
-            raise ValueError("Cargo home authority is absent")
-        cargo_home = Path(
-            toolchain["cargo_home_path"]
-        ).resolve(strict=True)
-    except (KeyError, OSError, TypeError, ValueError) as error:
-        raise ValueError(f"{context} Cargo config host roots differ") from error
-    candidates: tuple[tuple[str, Path | None], ...] = (
-        (
-            f"{_RELEASE_GUEST_SOURCE}/.cargo/config.toml",
-            source_root / ".cargo/config.toml",
-        ),
-        (
-            f"{_RELEASE_GUEST_SOURCE}/.cargo/config",
-            source_root / ".cargo/config",
-        ),
-        (f"{_RELEASE_GUEST_ROOT}/.cargo/config.toml", None),
-        (f"{_RELEASE_GUEST_ROOT}/.cargo/config", None),
-        ("/.cargo/config.toml", None),
-        ("/.cargo/config", None),
-        (
-            f"{_RELEASE_GUEST_CARGO_HOME}/config.toml",
-            cargo_home / "config.toml",
-        ),
-        (f"{_RELEASE_GUEST_CARGO_HOME}/config", cargo_home / "config"),
-    )
-    entries = manifest["entries"]
-    if not isinstance(entries, list) or len(entries) != len(candidates):
-        raise ValueError(f"{context} Cargo config candidate cardinality differs")
-    for ordinal, (entry_value, (guest_path, host_path)) in enumerate(
-        zip(entries, candidates, strict=True), start=1
-    ):
-        entry = _authority_object(
-            entry_value,
-            CARGO_CONFIG_SEARCH_ENTRY_FIELDS,
-            f"{context} Cargo config entry {ordinal}",
-        )
-        if entry["path"] != guest_path:
-            raise ValueError(f"{context} Cargo config guest path/order differs")
-        if host_path is None:
-            if entry["status"] != "absent" or entry["sha256"] is not None:
-                raise ValueError(f"{context} private Cargo config path is not absent")
-            continue
-        if host_path.is_symlink():
-            raise ValueError(f"{context} Cargo config host input is a symlink")
-        expected_sha256 = _EMPTY_SHA256
-        if host_path.exists():
-            expected_sha256 = snapshot_regular_file(
-                host_path, expected_mode=None
-            ).sha256
-        if (
-            entry["status"] != "present"
-            or entry["sha256"] != expected_sha256
-        ):
-            raise ValueError(f"{context} effective Cargo config bytes differ")
-    empty_snapshot = snapshot_regular_file(
-        manifest_path.with_name(f"{manifest_path.name}.empty"),
-        expected_mode=ARTIFACT_FILE_MODE,
-    )
-    if empty_snapshot.sha256 != _EMPTY_SHA256 or empty_snapshot.size != 0:
-        raise ValueError(f"{context} empty Cargo config authority differs")
-    return manifest_sha256
-
-
-def _release_sandbox_sha256(
-    attestation: Mapping[str, Any], context: str
-) -> str:
-    argv = attestation["build_argv"]
-    toolchain = attestation["toolchain"]
-    if (
-        not isinstance(argv, list)
-        or any(not isinstance(argument, str) for argument in argv)
-        or not isinstance(toolchain, Mapping)
-        or not isinstance(toolchain.get("bwrap_path"), str)
-    ):
-        raise ValueError(f"{context} sandbox authority is invalid")
-    prefix = [
-        toolchain["bwrap_path"],
-        "--die-with-parent",
-        "--new-session",
-        "--unshare-net",
-        "--ro-bind",
-        "/",
-        "/",
-        "--dev-bind",
-        "/dev",
-        "/dev",
-        "--proc",
-        "/proc",
-        "--tmpfs",
-        "/tmp",
-        "--tmpfs",
-        _RELEASE_GUEST_ROOT,
-        "--dir",
-        f"{_RELEASE_GUEST_ROOT}/.cargo",
-        "--tmpfs",
-        f"{_RELEASE_GUEST_ROOT}/.cargo",
-        "--remount-ro",
-        f"{_RELEASE_GUEST_ROOT}/.cargo",
-        "--dir",
-        "/.cargo",
-        "--tmpfs",
-        "/.cargo",
-        "--remount-ro",
-        "/.cargo",
-    ]
-    middle = [
-        "--dir",
-        f"{_RELEASE_GUEST_SOURCE}/.cargo",
-        "--tmpfs",
-        f"{_RELEASE_GUEST_SOURCE}/.cargo",
-    ]
-    source_config_remount = [
-        "--remount-ro",
-        f"{_RELEASE_GUEST_SOURCE}/.cargo",
-    ]
-    cargo_home_config_remount = [
-        "--remount-ro",
-        _RELEASE_GUEST_CARGO_HOME,
-    ]
-    suffix = [
-        "--chdir",
-        _RELEASE_GUEST_SOURCE,
-        _RELEASE_GUEST_CARGO,
-        "build",
-        "--locked",
-        "--offline",
-        "--release",
-        "-p",
-        "mess-store",
-        "--example",
-        "asterism_rebaseline_public",
-        "--target-dir",
-        _RELEASE_GUEST_TARGET,
-    ]
-    expected_length = (
-        len(prefix)
-        + 3 * len(_RELEASE_SANDBOX_CORE_BINDINGS)
-        + len(middle)
-        + 3 * len(_RELEASE_SANDBOX_SOURCE_CONFIG_BINDINGS)
-        + len(source_config_remount)
-        + 3 * len(_RELEASE_SANDBOX_CARGO_HOME_CONFIG_BINDINGS)
-        + len(cargo_home_config_remount)
-        + len(suffix)
-    )
-    if len(argv) != expected_length or argv[: len(prefix)] != prefix:
-        raise ValueError(f"{context} sandbox prefix/cardinality differs")
-    descriptors: list[str] = []
-    normalized = list(argv)
-    offset = len(prefix)
-
-    def consume_bindings(
-        bindings: Sequence[tuple[str, str]], start: int
-    ) -> int:
-        current = start
-        for operation, destination in bindings:
-            segment = argv[current : current + 3]
-            descriptor = segment[1] if len(segment) == 3 else ""
-            if (
-                len(segment) != 3
-                or segment[0] != operation
-                or segment[2] != destination
-                or not descriptor.isascii()
-                or not descriptor.isdecimal()
-                or len(descriptor) > 10
-                or str(int(descriptor)) != descriptor
-                or int(descriptor) < 3
-            ):
-                raise ValueError(
-                    f"{context} descriptor binding differs: {destination}"
-                )
-            descriptors.append(descriptor)
-            normalized[current + 1] = f"$FD:{destination}"
-            current += 3
-        return current
-
-    offset = consume_bindings(_RELEASE_SANDBOX_CORE_BINDINGS, offset)
-    if argv[offset : offset + len(middle)] != middle:
-        raise ValueError(f"{context} private source Cargo config mount differs")
-    offset += len(middle)
-    offset = consume_bindings(_RELEASE_SANDBOX_SOURCE_CONFIG_BINDINGS, offset)
-    if argv[offset : offset + len(source_config_remount)] != source_config_remount:
-        raise ValueError(f"{context} source Cargo config remount differs")
-    offset += len(source_config_remount)
-    offset = consume_bindings(
-        _RELEASE_SANDBOX_CARGO_HOME_CONFIG_BINDINGS, offset
-    )
-    if (
-        argv[offset : offset + len(cargo_home_config_remount)]
-        != cargo_home_config_remount
-    ):
-        raise ValueError(f"{context} Cargo-home config remount differs")
-    offset += len(cargo_home_config_remount)
-    if len(set(descriptors)) != len(descriptors) or argv[offset:] != suffix:
-        raise ValueError(f"{context} sandbox descriptors/command differ")
-    if any(
-        not isinstance(attestation[field], str) or attestation[field] in argv
-        for field in ("materialized_root", "target_dir")
-    ):
-        raise ValueError(f"{context} sandbox exposes a mutable host path")
-    build_child = attestation["build_child"]
-    if not isinstance(build_child, Mapping) or build_child.get("argv") != argv:
-        raise ValueError(f"{context} child argv differs from sandbox authority")
-    cargo_config_sha256 = _release_cargo_config_sha256(attestation, context)
-    return sha256_bytes(
-        canonical_json_bytes(
-            {
-                "argv": normalized,
-                "cargo_config_search_sha256": cargo_config_sha256,
-            }
-        )
-    )
-
-
 def _validate_release_compile_out(
     proof: Mapping[str, Any],
     prepared: Mapping[str, Any],
     approval: Mapping[str, Any],
     current_attestation: Mapping[str, Any],
+    expected_runtime_sha256: str,
+    cache: dict[tuple[Any, ...], Mapping[str, Any]],
+    manifest_paths: set[str],
+    manifest_identities: set[tuple[int, int]],
 ) -> None:
     value = _authority_object(proof, RELEASE_COMPILE_OUT_FIELDS, "release compile-out proof")
     approval_sha256 = sha256_bytes(canonical_json_bytes(approval))
@@ -3966,6 +5265,7 @@ def _validate_release_compile_out(
             tuple[str, int, int],
         ],
     ] = {}
+    semantic_runtimes = {expected_runtime_sha256}
     for name in RELEASE_COMPILE_OUT_BUILD_NAMES:
         build = _authority_object(
             builds[name], RELEASE_COMPILE_OUT_BUILD_FIELDS, f"release build {name}"
@@ -3988,6 +5288,13 @@ def _validate_release_compile_out(
             != sha256_bytes(canonical_json_bytes(attestation))
         ):
             raise ValueError(f"release build {name} equivalence binding differs")
+        if (
+            name == "ordinary_a"
+            and attestation != prepared["variants"]["A"]["attestation"]
+        ):
+            raise ValueError(
+                "release ordinary A attestation differs from published A"
+            )
         build_environment = attestation["build_env"]
         if not isinstance(build_environment, Mapping):
             raise ValueError(f"release build {name} environment is not an object")
@@ -3998,6 +5305,18 @@ def _validate_release_compile_out(
             attestation, f"release build {name}"
         )
         build_events[name] = (attestation, child, log_snapshot, root_identity)
+        if name == "ordinary_a":
+            semantic_runtimes.add(expected_runtime_sha256)
+        else:
+            semantic_runtimes.add(
+                _validate_release_semantic_authority(
+                    attestation,
+                    f"release build {name}",
+                    cache,
+                    manifest_paths,
+                    manifest_identities,
+                )
+            )
         if (
             attestation["build_nonce"] != build["build_nonce"]
             or attestation["cargo_lock_sha256"] != build["cargo_lock_sha256"]
@@ -4046,6 +5365,8 @@ def _validate_release_compile_out(
             != requirement["product_overlay_sha256"]
         ):
             raise ValueError("proof-only overlay A authority differs")
+    if len(semantic_runtimes) != 1:
+        raise ValueError("current/release builds used different semantic runtimes")
     _validate_release_build_events(build_events)
 
     binaries = value["binaries"]
@@ -4225,6 +5546,9 @@ def validate_prepared_artifacts(
     """Replay local source-review copies and the real-approval release proof."""
 
     validate_source_approval(approval)
+    semantic_cache: dict[tuple[Any, ...], Mapping[str, Any]] = {}
+    semantic_manifest_paths: set[str] = set()
+    semantic_manifest_identities: set[tuple[int, int]] = set()
     value = _authority_object(prepared, PREPARED_FIELDS, "prepared artifacts")
     if (
         value["schema"] != PREPARED_ARTIFACTS_SCHEMA
@@ -4290,8 +5614,13 @@ def validate_prepared_artifacts(
         raise ValueError("prepared source review bundle differs from approval")
     if inputs["tools_manifest"]["sha256"] != approval["tools_manifest_sha256"]:
         raise ValueError("source review tools manifest differs from approval")
-    _validate_preapproval_attestation(
-        payloads["current_children_attestation"], assertion, approval
+    current_runtime_sha256 = _validate_preapproval_attestation(
+        payloads["current_children_attestation"],
+        assertion,
+        approval,
+        semantic_cache,
+        semantic_manifest_paths,
+        semantic_manifest_identities,
     )
     if (
         payloads["current_children_attestation"].get("lock_authority")
@@ -4326,6 +5655,24 @@ def validate_prepared_artifacts(
     lock_review = payloads["lock_review_bundle"]
     if lock_review.get("schema") != SOURCE_REVIEW_CONTENT_SCHEMAS["lock_review_bundle"]:
         raise ValueError("prepared lock review bundle schema differs")
+    resolution_runtimes = _validate_resolution_semantic_authorities(
+        lock_authority,
+        semantic_cache,
+        semantic_manifest_paths,
+        semantic_manifest_identities,
+    )
+    prepared_runtime_sha256 = _validate_prepared_release_semantics(
+        value,
+        semantic_cache,
+        semantic_manifest_paths,
+        semantic_manifest_identities,
+    )
+    observed_runtimes = resolution_runtimes | {
+        current_runtime_sha256,
+        prepared_runtime_sha256,
+    }
+    if observed_runtimes != {current_runtime_sha256}:
+        raise ValueError("build/resolution semantic runtimes differ")
 
     _proof_snapshot, proof = _snapshot_prepared_binding(
         value["release_compile_out"],
@@ -4339,7 +5686,16 @@ def validate_prepared_artifacts(
         value,
         approval,
         payloads["current_children_attestation"],
+        current_runtime_sha256,
+        semantic_cache,
+        semantic_manifest_paths,
+        semantic_manifest_identities,
     )
+    if (
+        len(semantic_manifest_paths) != 48
+        or len(semantic_manifest_identities) != 48
+    ):
+        raise ValueError("semantic manifest topology is not exactly 48 files")
 
 
 def source_authority_self_test() -> dict[str, Any]:
@@ -4493,10 +5849,29 @@ def source_authority_self_test() -> dict[str, Any]:
 
     with tempfile.TemporaryDirectory(prefix="evidence-schema-sandbox-") as temporary:
         fixture_root = Path(temporary)
+        source_plan_path = (
+            Path(__file__).resolve().parent / "tooling" / "source-plan.json"
+        )
+        if _lock_repository_from_source_plan(
+            str(source_plan_path)
+        ) != Path(__file__).resolve().parents[2]:
+            raise AssertionError("resolver source-plan topology differs")
+        reject(
+            "resolver_source_plan_topology",
+            lambda: _lock_repository_from_source_plan(
+                str(Path(__file__).resolve())
+            ),
+        )
         source_root = fixture_root / "source"
         cargo_home = fixture_root / "cargo-home"
+        toolchain_root = fixture_root / "toolchain"
         (source_root / ".cargo").mkdir(parents=True)
         cargo_home.mkdir()
+        (toolchain_root / "bin").mkdir(parents=True)
+        cargo_path = toolchain_root / "bin" / "cargo"
+        rustc_path = toolchain_root / "bin" / "rustc"
+        cargo_path.write_bytes(b"fixture-cargo")
+        rustc_path.write_bytes(b"fixture-rustc")
         config_manifest_path = fixture_root / "cargo-config.json"
         config_manifest = {
             "cargo_home_path": _RELEASE_GUEST_CARGO_HOME,
@@ -4535,20 +5910,171 @@ def source_authority_self_test() -> dict[str, Any]:
         )
         empty_config_path.write_bytes(b"")
         empty_config_path.chmod(0o444)
-        core_descriptors = tuple(str(401 + index) for index in range(7))
-        config_descriptors = tuple(str(408 + index) for index in range(4))
+
+        def static_manifest(role: str, path: Path, *, uid: int) -> dict[str, Any]:
+            value = {
+                "entries": [
+                    {
+                        "changed_ns": 1,
+                        "device": 10 + uid,
+                        "file_type": "directory",
+                        "gid": 0,
+                        "inode": 20 + uid,
+                        "link_count": 2,
+                        "modified_ns": 1,
+                        "path": ".",
+                        "permissions": 0o755,
+                        "sha256": None,
+                        "size": 0,
+                        "symlink_target": None,
+                        "symlink_scope": None,
+                        "uid": uid,
+                    }
+                ],
+                "role": role,
+                "schema": RECURSIVE_TREE_AUTHORITY_SCHEMA,
+            }
+            path.write_bytes(canonical_json_bytes(value))
+            path.chmod(ARTIFACT_FILE_MODE)
+            return value
+
+        semantic_root = fixture_root / "semantic"
+        semantic_root.mkdir()
+        runtime_components: dict[str, Any] = {}
+        semantic_tree_values: dict[str, Mapping[str, Any]] = {}
+        for name, role in (("cargo_home", "cargo_home"), ("toolchain", "toolchain")):
+            path = semantic_root / f"{name}.json"
+            value = static_manifest(role, path, uid=1000)
+            semantic_tree_values[name] = value
+            runtime_components[name] = {
+                "entry_count": 1,
+                "equal_pre_post": True,
+                "manifest_path": str(path.resolve()),
+                "manifest_sha256": sha256_bytes(canonical_json_bytes(value)),
+                "mutation_events_absent": True,
+                "role": role,
+                "schema": RECURSIVE_TREE_AUTHORITY_SCHEMA,
+                "watch_count": 1,
+            }
+        source_manifest_path = semantic_root / "source.json"
+        source_manifest = static_manifest("source", source_manifest_path, uid=1000)
+        system_evidence_mounts = []
+        system_bindings = []
+        for index, (host_path, guest_path) in enumerate(TRUSTED_SYSTEM_MOUNTS):
+            role = "system-" + guest_path.removeprefix("/").replace("/", "-")
+            tree_path = semantic_root / f"system-{index}.json"
+            tree = static_manifest(role, tree_path, uid=0)
+            root_entry = tree["entries"][0]
+            system_evidence_mounts.append(
+                {
+                    "guest_path": guest_path,
+                    "host_path": str(host_path),
+                    "resolved_path": str(host_path),
+                    "tree": tree,
+                }
+            )
+            system_bindings.append(
+                {
+                    "device": root_entry["device"],
+                    "gid": root_entry["gid"],
+                    "guest_path": guest_path,
+                    "host_path": str(host_path),
+                    "inode": root_entry["inode"],
+                    "permissions": root_entry["permissions"],
+                    "resolved_path": str(host_path),
+                    "trusted_root_owned_non_writable": True,
+                    "uid": 0,
+                }
+            )
+        closure_manifest_path = semantic_root / "system-closure.json"
+        closure_manifest = {
+            "mounts": system_evidence_mounts,
+            "schema": TRUSTED_SYSTEM_CLOSURE_SCHEMA,
+        }
+        closure_manifest_path.write_bytes(canonical_json_bytes(closure_manifest))
+        closure_manifest_path.chmod(ARTIFACT_FILE_MODE)
+        runtime_components["trusted_system_closure"] = {
+            "entry_count": len(TRUSTED_SYSTEM_MOUNTS),
+            "manifest_path": str(closure_manifest_path.resolve()),
+            "mounts": system_bindings,
+            "mutation_events_absent": True,
+            "schema": TRUSTED_SYSTEM_CLOSURE_SCHEMA,
+            "sha256": sha256_bytes(canonical_json_bytes(closure_manifest)),
+            "watch_count": len(TRUSTED_SYSTEM_MOUNTS),
+        }
+        semantic_authority = {
+            **runtime_components,
+            "runtime_sha256": semantic_runtime_sha256(runtime_components),
+            "schema": SEMANTIC_INPUT_AUTHORITY_SCHEMA,
+            "source": {
+                "entry_count": 1,
+                "equal_pre_post": True,
+                "manifest_path": str(source_manifest_path.resolve()),
+                "manifest_sha256": sha256_bytes(
+                    canonical_json_bytes(source_manifest)
+                ),
+                "mutation_events_absent": True,
+                "role": "source",
+                "schema": RECURSIVE_TREE_AUTHORITY_SCHEMA,
+                "watch_count": 1,
+            },
+        }
+        relocated_semantic = json.loads(json.dumps(semantic_authority))
+        for name in ("source", "cargo_home", "toolchain"):
+            relocated_semantic[name]["manifest_path"] = f"/relocated/{name}.json"
+        relocated_semantic["trusted_system_closure"]["manifest_path"] = (
+            "/relocated/system.json"
+        )
+        relocated_components = {
+            name: relocated_semantic[name]
+            for name in ("cargo_home", "toolchain", "trusted_system_closure")
+        }
+        if semantic_runtime_sha256(relocated_components) != semantic_authority[
+            "runtime_sha256"
+        ]:
+            raise AssertionError("semantic runtime digest depends on evidence paths")
+        source_drift = json.loads(json.dumps(semantic_authority))
+        source_drift["source"]["manifest_sha256"] = "f" * 64
+        source_drift_components = {
+            name: source_drift[name]
+            for name in ("cargo_home", "toolchain", "trusted_system_closure")
+        }
+        if semantic_runtime_sha256(source_drift_components) != semantic_authority[
+            "runtime_sha256"
+        ]:
+            raise AssertionError("semantic runtime digest includes source identity")
+
+        system_descriptors = tuple(str(401 + index) for index in range(3))
+        core_descriptors = tuple(str(404 + index) for index in range(6))
+        config_descriptors = tuple(str(410 + index) for index in range(4))
         sandbox_argv = [
             "/usr/bin/bwrap",
             "--die-with-parent",
             "--new-session",
             "--unshare-net",
-            "--ro-bind",
-            "/",
-            "/",
-            "--dev-bind",
+            "--dir",
+            "/usr",
+            *(
+                argument
+                for descriptor, (operation, destination) in zip(
+                    system_descriptors,
+                    _RELEASE_SANDBOX_SYSTEM_BINDINGS,
+                    strict=True,
+                )
+                for argument in (operation, descriptor, destination)
+            ),
+            "--symlink",
+            "usr/bin",
+            "/bin",
+            "--symlink",
+            "usr/lib",
+            "/lib",
+            "--symlink",
+            "usr/lib",
+            "/lib64",
+            "--dir",
             "/dev",
-            "/dev",
-            "--proc",
+            "--dir",
             "/proc",
             "--tmpfs",
             "/tmp",
@@ -4623,13 +6149,80 @@ def source_authority_self_test() -> dict[str, Any]:
                 "path": str(config_manifest_path),
                 "sha256": config_sha256,
             },
+            "semantic_input_authority": semantic_authority,
             "materialized_root": str(source_root),
             "target_dir": "/host/target",
             "toolchain": {
                 "bwrap_path": "/usr/bin/bwrap",
+                "cargo_path": str(cargo_path.resolve()),
                 "cargo_home_path": str(cargo_home),
+                "rustc_path": str(rustc_path.resolve()),
             },
         }
+        release_semantic_cache: dict[tuple[Any, ...], Mapping[str, Any]] = {
+            (
+                str(source_root.resolve()),
+                "source",
+                False,
+                True,
+                False,
+                (),
+                (),
+            ): source_manifest,
+            (
+                str(cargo_home.resolve()),
+                "cargo_home",
+                True,
+                True,
+                False,
+                (),
+                (),
+            ): semantic_tree_values["cargo_home"],
+            (
+                str(toolchain_root.resolve()),
+                "toolchain",
+                True,
+                True,
+                False,
+                (),
+                (),
+            ): semantic_tree_values["toolchain"],
+        }
+        for evidence_mount in system_evidence_mounts:
+            guest_path = evidence_mount["guest_path"]
+            role = "system-" + guest_path.removeprefix("/").replace("/", "-")
+            release_semantic_cache[
+                (
+                    evidence_mount["host_path"],
+                    role,
+                    True,
+                    False,
+                    True,
+                    (),
+                    (),
+                )
+            ] = evidence_mount["tree"]
+        release_manifest_paths: set[str] = set()
+        if (
+            _validate_release_semantic_authority(
+                sandbox_attestation,
+                "self-test release semantic authority",
+                release_semantic_cache,
+                release_manifest_paths,
+            )
+            != semantic_authority["runtime_sha256"]
+            or len(release_manifest_paths) != 4
+        ):
+            raise AssertionError("release semantic authority replay differs")
+        reject(
+            "semantic_manifest_topology_alias",
+            lambda: _validate_semantic_input_authority(
+                semantic_authority,
+                "self-test aliased semantic authority",
+                live_roots=None,
+                manifest_paths=release_manifest_paths,
+            ),
+        )
         normalized_sandbox = list(sandbox_argv)
         descriptor_indexes = []
         for index, argument in enumerate(sandbox_argv):
@@ -4641,6 +6234,9 @@ def source_authority_self_test() -> dict[str, Any]:
                 {
                     "argv": normalized_sandbox,
                     "cargo_config_search_sha256": config_sha256,
+                    "semantic_runtime_sha256": semantic_authority[
+                        "runtime_sha256"
+                    ],
                 }
             )
         )
@@ -4676,6 +6272,34 @@ def source_authority_self_test() -> dict[str, Any]:
             "sandbox_config_hash": lambda hostile: hostile[
                 "cargo_config_search"
             ].__setitem__("sha256", "f" * 64),
+            "sandbox_semantic_runtime_hash": lambda hostile: hostile[
+                "semantic_input_authority"
+            ].__setitem__("runtime_sha256", "f" * 64),
+            "sandbox_semantic_mount_path": lambda hostile: hostile[
+                "semantic_input_authority"
+            ]["trusted_system_closure"]["mounts"][0].__setitem__(
+                "host_path", "/forged"
+            ),
+            "sandbox_semantic_missing_source": lambda hostile: hostile[
+                "semantic_input_authority"
+            ].pop("source"),
+            "sandbox_semantic_bool_count": lambda hostile: hostile[
+                "semantic_input_authority"
+            ]["source"].__setitem__("entry_count", True),
+            "sandbox_semantic_manifest_hash": lambda hostile: hostile[
+                "semantic_input_authority"
+            ]["source"].__setitem__("manifest_sha256", "f" * 64),
+            "sandbox_semantic_mount_order": lambda hostile: hostile[
+                "semantic_input_authority"
+            ]["trusted_system_closure"]["mounts"].reverse(),
+            "sandbox_legacy_root_bind": lambda hostile: hostile[
+                "build_argv"
+            ].__setitem__(4, "--ro-bind"),
+            "sandbox_legacy_dev_bind": lambda hostile: hostile[
+                "build_argv"
+            ].__setitem__(
+                hostile["build_argv"].index("/dev") - 1, "--dev-bind"
+            ),
         }
         for name, mutate in sandbox_hostiles.items():
             hostile = json.loads(json.dumps(sandbox_attestation))
@@ -4686,6 +6310,47 @@ def source_authority_self_test() -> dict[str, Any]:
                 name,
                 lambda hostile=hostile: _release_sandbox_sha256(hostile, name),
             )
+        hardlink_manifest_path = semantic_root / "source-hardlink.json"
+        os.link(source_manifest_path, hardlink_manifest_path)
+        hardlinked_semantic = json.loads(json.dumps(semantic_authority))
+        hardlinked_semantic["source"]["manifest_path"] = str(
+            hardlink_manifest_path.resolve()
+        )
+        reject(
+            "semantic_manifest_hardlink",
+            lambda: _validate_semantic_input_authority(
+                hardlinked_semantic,
+                "self-test hardlinked semantic manifest",
+                live_roots=None,
+            ),
+        )
+
+        live_tree_root = fixture_root / "live-semantic-tree"
+        live_tree_root.mkdir()
+        live_payload_path = live_tree_root / "input.bin"
+        live_payload_path.write_bytes(b"semantic-live-one")
+        sampled_live_tree = _sample_recursive_semantic_manifest(
+            live_tree_root,
+            "source",
+            "self-test live semantic tree",
+            allow_internal_symlinks=False,
+            hash_regular_contents=True,
+        )
+        _validate_recursive_semantic_manifest(
+            sampled_live_tree,
+            "source",
+            "self-test live semantic tree",
+            trusted_system=False,
+        )
+        live_payload_path.write_bytes(b"semantic-live-two")
+        if _sample_recursive_semantic_manifest(
+            live_tree_root,
+            "source",
+            "self-test changed semantic tree",
+            allow_internal_symlinks=False,
+            hash_regular_contents=True,
+        ) == sampled_live_tree:
+            raise AssertionError("semantic live-tree drift was not observed")
 
         build_log_path = fixture_root / "release-build.json"
         build_log_path.write_bytes(
@@ -4949,7 +6614,7 @@ def source_authority_self_test() -> dict[str, Any]:
     return {
         "canonical_checks": 3,
         "hostile_mutations_rejected": len(rejected),
-        "schema": "bn-28w0-evidence-schema-self-test-v1",
+        "schema": "bn-17nh-evidence-schema-self-test-v2",
         "status": "ok",
     }
 
