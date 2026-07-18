@@ -36,10 +36,10 @@ PRODUCT_OVERLAY = Path(__file__).resolve().parent / PRODUCT_OVERLAY_DESTINATION
 EXACT_PRODUCT_COMMIT = "d644dc583dfe6a3d2cd07e71ce0212a323875ab4"
 EXACT_PRODUCT_TREE = "205d853905bdb648ee997900c6aef24a323aa380"
 EXACT_PRODUCT_OVERLAY_REVIEWED_COMMIT = (
-    "ded1d69e6ba30dceec5ead61239d47a405234512"
+    "86027c98605d9ea01c3e385b0702741723d5a538"
 )
 EXACT_PRODUCT_OVERLAY_SHA256 = (
-    "0e38a70c9917de5892c7f049ed2103e4431103fbaebb3073d6398574a9453574"
+    "db060c902d7d1a2664dcaea44525adac727b1bef1de32bb01b33be2561143a39"
 )
 EXACT_CASES = (
     ("public-ordinary-append-command-cache-read-subscribe", "correctness"),
@@ -671,7 +671,7 @@ def validate_product_authority_values(
         checks = validate_product_overlay_patch(overlay_text)
     except (UnicodeDecodeError, ProductOverlayValidationError) as error:
         raise PreparationError("current product test overlay authority failed") from error
-    if len(checks) != 9 or len(set(checks)) != 9:
+    if len(checks) != 11 or len(set(checks)) != 11:
         raise PreparationError("current product test overlay check set differs")
     return checks
 
@@ -863,6 +863,8 @@ def self_test() -> None:
     )
     overlay_snapshot = snapshot_named(snapshots, PRODUCT_OVERLAY_DESTINATION)
     overlay_payload = overlay_snapshot.payload
+    if overlay_snapshot.sha256 != EXACT_PRODUCT_OVERLAY_SHA256:
+        raise AssertionError("reviewed overlay snapshot hash differs")
     overlay_input = next(
         item
         for item in manifest["inputs"]

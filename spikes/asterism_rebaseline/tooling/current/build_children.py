@@ -25,6 +25,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import stat
 import struct
 import subprocess
@@ -206,6 +207,8 @@ TOOLCHAIN_FIELDS = {
     "rustc_sha256",
     "rustc_version_verbose",
     "rustc_host",
+    "rust_lld_path",
+    "rust_lld_sha256",
     "rustup_home_path",
     "rustup_path",
     "rustup_sha256",
@@ -221,10 +224,14 @@ FORBIDDEN_RELEASE_TOKENS = (
 )
 MAX_CAPTURE_BYTES = 64 * 1024 * 1024
 SYSTEM_PYTHON = Path("/usr/bin/python3").resolve(strict=True)
-GUEST_CARGO_HOME = "/asterism/cargo-home"
-GUEST_TOOLCHAIN_ROOT = "/asterism/toolchain"
+GUEST_ROOT = "/asterism"
+GUEST_CARGO_HOME = f"{GUEST_ROOT}/cargo-home"
+GUEST_TARGET = f"{GUEST_ROOT}/target"
+GUEST_TOOLCHAIN_ROOT = f"{GUEST_ROOT}/toolchain"
+GUEST_TOOLCHAIN_BIN = f"{GUEST_TOOLCHAIN_ROOT}/bin"
 GUEST_CARGO = f"{GUEST_TOOLCHAIN_ROOT}/bin/cargo"
 GUEST_RUSTC = f"{GUEST_TOOLCHAIN_ROOT}/bin/rustc"
+HOST_DEV_NULL = Path("/dev/null")
 CARGO_CONFIG_SEARCH_SCHEMA = "bn-30fs-build-cargo-config-search-v1"
 SEMANTIC_INPUT_AUTHORITY_SCHEMA = "bn-ecm1-semantic-input-authority-v1"
 RECURSIVE_TREE_AUTHORITY_SCHEMA = "bn-ecm1-recursive-tree-authority-v1"
@@ -271,6 +278,15 @@ def canonical_bytes(value: Any) -> bytes:
         json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         + "\n"
     ).encode()
+
+
+def authority_canonical_bytes(value: Any) -> bytes:
+    """Canonical bytes for externally reviewed authority producers."""
+
+    return (
+        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        + "\n"
+    ).encode("utf-8")
 
 
 def sha256_bytes(payload: bytes) -> str:
@@ -342,6 +358,8 @@ def system_symlink_scope(root: Path, relative: str, target: str) -> str:
         else PurePosixPath(str(root)) / PurePosixPath(relative).parent / target
     )
     rendered = os.path.normpath(str(raw_guest))
+    if rendered.startswith("/"):
+        rendered = "/" + rendered.lstrip("/")
     for alias, destination in (
         ("/bin", "/usr/bin"),
         ("/lib", "/usr/lib"),
@@ -356,12 +374,31 @@ def system_symlink_scope(root: Path, relative: str, target: str) -> str:
         for authority in exposed
     ):
         return "within_closure"
-    if any(
+    if rendered == "/" or any(
         rendered == authority or rendered.startswith(authority + "/")
         for authority in ("/asterism", "/dev", "/proc", "/run", "/sys", "/tmp")
     ):
         raise BuildError("trusted system symlink reaches mutable guest authority")
     return "guest_inaccessible_external"
+
+
+def recursive_symlink_scope(
+    root: Path,
+    relative: str,
+    target: str,
+    *,
+    trusted_system: bool,
+) -> str:
+    if trusted_system:
+        return system_symlink_scope(root, relative, target)
+    candidate = root / Path(relative).parent / target
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise BuildError("symlink target is unresolved") from error
+    if resolved != root and root not in resolved.parents:
+        raise BuildError("symlink escapes the retained root")
+    return "within_root"
 
 
 def sha256_file(path: Path) -> str:
@@ -449,9 +486,25 @@ def parse_canonical(payload: bytes, schema: str, context: str) -> dict[str, Any]
     return value
 
 
+def parse_external_canonical(
+    payload: bytes, schema: str, context: str
+) -> dict[str, Any]:
+    """Parse the UTF-8 canonical form emitted by authority producers."""
+
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise BuildError(f"{context} is not JSON") from error
+    if not isinstance(value, dict) or value.get("schema") != schema:
+        raise BuildError(f"{context} schema differs")
+    if payload != authority_canonical_bytes(value):
+        raise BuildError(f"{context} is not authority-canonical JSON+LF")
+    return value
+
+
 def load_canonical(path: Path, schema: str, context: str) -> dict[str, Any]:
     require_exact_file(path, mode=0o444, context=context)
-    return parse_canonical(path.read_bytes(), schema, context)
+    return parse_external_canonical(path.read_bytes(), schema, context)
 
 
 def validate_wrapper_receipt(
@@ -687,6 +740,114 @@ class RetainedFile:
             "identity": self.identity,
             "path_chain": self.chain,
             "trusted_system": self.trusted_system,
+        }
+
+    def close(self) -> None:
+        if self.descriptor >= 0:
+            os.close(self.descriptor)
+            self.descriptor = -1
+
+    def __exit__(self, child_type: Any, child_error: Any, traceback: Any) -> bool:
+        verification_error = None
+        try:
+            self.verify()
+        except BuildError as error:
+            verification_error = error
+        finally:
+            self.close()
+        if verification_error is not None:
+            raise verification_error
+        return False
+
+
+class RetainedDevice:
+    """Retain and attest the one writable character device needed by Cargo."""
+
+    def __init__(self, path: Path, context: str) -> None:
+        self.path = path
+        self.context = context
+        self.descriptor = -1
+        self.identity: dict[str, Any] | None = None
+        self.chain: list[dict[str, Any]] | None = None
+
+    @staticmethod
+    def _identity(metadata: os.stat_result, path: Path) -> dict[str, Any]:
+        return {
+            "changed_ns": metadata.st_ctime_ns,
+            "device": metadata.st_dev,
+            "gid": metadata.st_gid,
+            "inode": metadata.st_ino,
+            "link_count": metadata.st_nlink,
+            "major": os.major(metadata.st_rdev),
+            "minor": os.minor(metadata.st_rdev),
+            "modified_ns": metadata.st_mtime_ns,
+            "path": str(path),
+            "permissions": stat.S_IMODE(metadata.st_mode),
+            "size": metadata.st_size,
+            "type": stat.S_IFMT(metadata.st_mode),
+            "uid": metadata.st_uid,
+        }
+
+    def _snapshot(self) -> dict[str, Any]:
+        metadata = os.fstat(self.descriptor)
+        identity = self._identity(metadata, self.path)
+        if (
+            not stat.S_ISCHR(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or stat.S_IMODE(metadata.st_mode) != 0o666
+            or metadata.st_nlink != 1
+            or os.major(metadata.st_rdev) != 1
+            or os.minor(metadata.st_rdev) != 3
+        ):
+            raise BuildError(f"{self.context} is not the exact null device")
+        return identity
+
+    def __enter__(self) -> RetainedDevice:
+        exact = self.path.resolve(strict=True)
+        if exact != self.path:
+            raise BuildError(f"{self.context} path differs")
+        self.chain = trusted_root_chain(exact.parent, self.context)
+        self.descriptor = os.open(
+            exact,
+            os.O_RDWR | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            self.identity = self._snapshot()
+            if self._identity(exact.lstat(), exact) != self.identity:
+                raise BuildError(f"{self.context} descriptor/path identity differs")
+        except Exception:
+            self.close()
+            raise
+        return self
+
+    @property
+    def pass_fds(self) -> tuple[int, ...]:
+        if self.descriptor < 0:
+            raise BuildError(f"{self.context} retained device is inactive")
+        return (self.descriptor,)
+
+    @property
+    def proc_path(self) -> str:
+        return f"/proc/self/fd/{self.pass_fds[0]}"
+
+    def verify(self) -> None:
+        if self.identity is None or self.chain is None:
+            raise BuildError(f"{self.context} retained identity is absent")
+        if (
+            self._snapshot() != self.identity
+            or self._identity(self.path.lstat(), self.path) != self.identity
+            or trusted_root_chain(self.path.parent, self.context) != self.chain
+        ):
+            raise BuildError(f"{self.context} changed across retained use")
+
+    def record(self) -> dict[str, Any]:
+        if self.identity is None:
+            raise BuildError(f"{self.context} retained identity is absent")
+        return {
+            "identity": self.identity,
+            "parent_path_chain": self.chain,
+            "trusted_system": True,
         }
 
     def close(self) -> None:
@@ -1168,7 +1329,11 @@ def validated_lock_records(validated: Any) -> dict[str, dict[str, Any]]:
     if not isinstance(locks, dict) or set(locks) != {"A", "C", "D"}:
         raise BuildError("ValidatedAuthority.locks must be the exact A/C/D set")
     records = {
-        name: immutable_snapshot_record(snapshot, f"validated {name}")
+        name: immutable_snapshot_record(
+            snapshot,
+            f"validated {name}",
+            require_value=False,
+        )
         for name, snapshot in sorted(locks.items())
     }
     paths = [record["path"] for record in records.values()]
@@ -1337,11 +1502,17 @@ def validate_product_overlay_authority(repository: Path) -> dict[str, Any]:
         executions.append(execution)
     normal_checks = outputs[0].get("checks")
     self_checks = outputs[1].get("checks")
+    required_normal_checks = {
+        "exact_source_and_patch_applicability",
+        "original_release_line_mapping_preserved",
+        "exact_test_only_eof_tail_identity",
+    }
     if (
         outputs[0].get("outcome") != "PASS"
         or outputs[1].get("outcome") != "SELF_TEST_PASS"
         or not isinstance(normal_checks, list)
         or not normal_checks
+        or not required_normal_checks <= set(normal_checks)
         or len(normal_checks) != len(set(normal_checks))
         or any(not isinstance(item, str) or not item for item in normal_checks)
         or not isinstance(self_checks, list)
@@ -1437,6 +1608,26 @@ def validate_lock_manifest(locks: dict[str, Any]) -> dict[str, str]:
         )
         if sha256_file(path) != toolchain[f"{field}_sha256"]:
             raise BuildError(f"pinned {field} hash differs")
+    rustc_host = toolchain.get("rustc_host")
+    if (
+        not isinstance(rustc_host, str)
+        or re.fullmatch(r"[A-Za-z0-9_-]+", rustc_host) is None
+    ):
+        raise BuildError("lock manifest rustc host differs")
+    rust_lld_path = require_exact_file(
+        Path(str(toolchain["rust_lld_path"])), context="pinned rust-lld"
+    )
+    if (
+        rust_lld_path
+        != Path(str(toolchain["cargo_path"])).parent.parent
+        / "lib"
+        / "rustlib"
+        / rustc_host
+        / "bin"
+        / "rust-lld"
+        or sha256_file(rust_lld_path) != toolchain["rust_lld_sha256"]
+    ):
+        raise BuildError("pinned rust-lld authority differs")
     a = variants["A"]
     if not isinstance(a, dict) or a.get("final_lock_sha256") != PRODUCT_LOCK_SHA256:
         raise BuildError("A final lock authority differs")
@@ -1898,6 +2089,9 @@ def cargo_environment(
         "HOME": "/nonexistent",
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
+        # /proc stays empty, so glibc needs the attested executable origin to
+        # expand rustc's $ORIGIN/../lib RUNPATH.
+        "LD_ORIGIN_PATH": GUEST_TOOLCHAIN_BIN,
         "PATH": path,
         "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONNOUSERSITE": "1",
@@ -1921,6 +2115,8 @@ def sandboxed_build_argv(
     toolchain_ro_bind: Sequence[str],
     cargo_bind: Sequence[str],
     rustc_bind: Sequence[str],
+    rust_lld_bind: Sequence[str],
+    dev_null_source: str,
     python_bind: Sequence[str],
     cargo_config_args: Sequence[str],
     target_bind: Sequence[str],
@@ -1936,6 +2132,9 @@ def sandboxed_build_argv(
         *trusted_system_args,
         "--dir",
         "/dev",
+        "--dev-bind",
+        dev_null_source,
+        "/dev/null",
         "--dir",
         "/proc",
         "--tmpfs",
@@ -1946,6 +2145,7 @@ def sandboxed_build_argv(
         *toolchain_ro_bind,
         *cargo_bind,
         *rustc_bind,
+        *rust_lld_bind,
         *python_bind,
         *cargo_config_args,
         *target_bind,
@@ -2326,7 +2526,16 @@ class RecursiveTreeAuthorityGuard:
         relative: str,
         selected: os.stat_result,
     ) -> dict[str, Any]:
-        flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+        access_mode = (
+            os.O_RDONLY
+            if self.hash_regular_contents
+            else getattr(os, "O_PATH", 0)
+        )
+        if not self.hash_regular_contents and access_mode == 0:
+            raise BuildError(
+                f"{self.context} metadata-only file descriptors are unavailable"
+            )
+        flags = access_mode | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(name, flags, dir_fd=parent_descriptor)
         try:
             opened_before = os.fstat(descriptor)
@@ -2400,18 +2609,15 @@ class RecursiveTreeAuthorityGuard:
         selected_after = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
         if not same_manifest_metadata(selected, selected_after):
             raise BuildError(f"{self.context} symlink changed while snapshotting")
-        candidate = self.path / Path(relative).parent / target
         try:
-            candidate.resolve(strict=True)
-        except OSError as error:
-            raise BuildError(f"{self.context} symlink target is unresolved") from error
-        if not self.trusted_system_roots:
-            resolved = candidate.resolve(strict=True)
-            if resolved != self.path and self.path not in resolved.parents:
-                raise BuildError(f"{self.context} symlink escapes the retained root")
-            scope = "within_root"
-        else:
-            scope = system_symlink_scope(self.path, relative, target)
+            scope = recursive_symlink_scope(
+                self.path,
+                relative,
+                target,
+                trusted_system=bool(self.trusted_system_roots),
+            )
+        except BuildError as error:
+            raise BuildError(f"{self.context} {error}") from error
         self._trusted_system_entry(selected, relative, symlink=True)
         return self._entry_record(
             selected,
@@ -3377,10 +3583,9 @@ class CargoConfigSearchGuard:
 
         arguments.extend(
             [
-                "--dir",
-                GUEST_CARGO_HOME,
-                "--ro-bind-fd",
-                str(self.directory_guards["cargo-home"].descriptor),
+                "--overlay-src",
+                f"/proc/self/fd/{self.directory_guards['cargo-home'].descriptor}",
+                "--tmp-overlay",
                 GUEST_CARGO_HOME,
             ]
         )
@@ -3440,13 +3645,73 @@ class CargoConfigSearchGuard:
         return False
 
 
+def cargo_example_hardlink_aliases(
+    directory_descriptor: int,
+    name: str,
+    metadata: os.stat_result,
+    context: str,
+) -> list[str]:
+    if metadata.st_nlink != 2:
+        raise BuildError(f"{context} Cargo hard-link count differs")
+    enumeration_descriptor = os.open(
+        ".",
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_CLOEXEC
+        | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=directory_descriptor,
+    )
+    try:
+        aliases = []
+        for candidate in sorted(os.listdir(enumeration_descriptor)):
+            observed = os.stat(
+                candidate,
+                dir_fd=enumeration_descriptor,
+                follow_symlinks=False,
+            )
+            if (observed.st_dev, observed.st_ino) != (
+                metadata.st_dev,
+                metadata.st_ino,
+            ):
+                continue
+            if not stat.S_ISREG(observed.st_mode) or not same_manifest_metadata(
+                observed, metadata
+            ):
+                raise BuildError(f"{context} Cargo hard-link identity differs")
+            aliases.append(candidate)
+    finally:
+        os.close(enumeration_descriptor)
+    if len(aliases) != metadata.st_nlink:
+        raise BuildError(f"{context} Cargo hard link escapes the target directory")
+    hashed = [
+        alias
+        for alias in aliases
+        if alias != name
+        and re.fullmatch(rf"{re.escape(name)}-[0-9a-f]{{16}}", alias)
+        is not None
+    ]
+    if len(aliases) != 2 or name not in aliases or len(hashed) != 1:
+        raise BuildError(f"{context} Cargo hard-link aliases differ")
+    return aliases
+
+
 def read_bound_regular_file(
     root_descriptor: int,
     relative: Path,
     context: str,
     *,
     require_executable: bool,
+    expected_link_count: int = 1,
+    normalize_mode: int | None = None,
 ) -> tuple[bytes, dict[str, Any]]:
+    if (
+        not isinstance(expected_link_count, int)
+        or isinstance(expected_link_count, bool)
+        or expected_link_count not in {1, 2}
+    ):
+        raise BuildError(f"{context} expected hard-link count differs")
+    if normalize_mode is not None and normalize_mode != 0o555:
+        raise BuildError(f"{context} normalized mode differs")
     if (
         relative.is_absolute()
         or not relative.parts
@@ -3487,12 +3752,53 @@ def read_bound_regular_file(
             os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
             dir_fd=directories[-1],
         )
+        opened_before = os.fstat(file_descriptor)
+        aliases_before = None
+        if expected_link_count == 2:
+            aliases_before = cargo_example_hardlink_aliases(
+                directories[-1],
+                relative.parts[-1],
+                opened_before,
+                context,
+            )
+        if normalize_mode is not None:
+            if (
+                not stat.S_ISREG(opened_before.st_mode)
+                or opened_before.st_nlink != expected_link_count
+                or (require_executable and opened_before.st_mode & 0o111 == 0)
+            ):
+                raise BuildError(f"{context} pre-normalization identity differs")
+            os.fchmod(file_descriptor, normalize_mode)
+            normalized = os.fstat(file_descriptor)
+            stable_fields = ("st_dev", "st_ino", "st_nlink", "st_size", "st_mtime_ns")
+            if (
+                any(
+                    getattr(opened_before, field) != getattr(normalized, field)
+                    for field in stable_fields
+                )
+                or stat.S_IMODE(normalized.st_mode) != normalize_mode
+            ):
+                raise BuildError(f"{context} mode normalization changed identity")
+            opened_before = normalized
+            if expected_link_count == 2:
+                normalized_aliases = cargo_example_hardlink_aliases(
+                    directories[-1],
+                    relative.parts[-1],
+                    opened_before,
+                    context,
+                )
+                if normalized_aliases != aliases_before:
+                    raise BuildError(
+                        f"{context} Cargo hard-link aliases changed during normalization"
+                    )
+                aliases_before = normalized_aliases
         logical_path = Path(f"/proc/self/fd/{root_descriptor}") / relative
         payload, identity = snapshot_open_file(
             file_descriptor,
             logical_path,
             context,
             require_executable=require_executable,
+            expected_link_count=expected_link_count,
         )
         relative_metadata = os.stat(
             relative.parts[-1],
@@ -3500,8 +3806,26 @@ def read_bound_regular_file(
             follow_symlinks=False,
         )
         opened_metadata = os.fstat(file_descriptor)
-        if not same_manifest_metadata(relative_metadata, opened_metadata):
+        if (
+            not same_manifest_metadata(relative_metadata, opened_metadata)
+            or identity["device"] != opened_metadata.st_dev
+            or identity["inode"] != opened_metadata.st_ino
+            or identity["link_count"] != opened_metadata.st_nlink
+            or identity["mode"] != stat.S_IMODE(opened_metadata.st_mode)
+            or identity["size"] != opened_metadata.st_size
+            or identity["mtime_ns"] != opened_metadata.st_mtime_ns
+            or identity["ctime_ns"] != opened_metadata.st_ctime_ns
+        ):
             raise BuildError(f"{context} relative file selection changed")
+        if expected_link_count == 2:
+            aliases_after = cargo_example_hardlink_aliases(
+                directories[-1],
+                relative.parts[-1],
+                opened_metadata,
+                context,
+            )
+            if aliases_after != aliases_before:
+                raise BuildError(f"{context} Cargo hard-link aliases changed")
         for descriptor, expected in zip(directories, snapshots, strict=True):
             if (
                 descriptor_directory_identity(
@@ -3528,6 +3852,8 @@ def copy_bound_artifact(
         relative,
         f"built artifact {relative.name}",
         require_executable=True,
+        expected_link_count=2,
+        normalize_mode=0o555,
     )
     write_new(destination, payload, 0o555)
     binding = {
@@ -3543,6 +3869,368 @@ def copy_bound_artifact(
     ):
         raise BuildError(f"copied artifact differs: {destination}")
     return {"binding": binding, "source": source_identity}
+
+
+def cargo_target_artifact_paths(
+    root_descriptor: int,
+    target: Path,
+    examples: Sequence[str],
+    context: str,
+) -> set[Path]:
+    if target.resolve(strict=True) != target:
+        raise BuildError(f"{context} target path differs")
+    directory_flags = (
+        getattr(os, "O_PATH", os.O_RDONLY)
+        | os.O_DIRECTORY
+        | os.O_CLOEXEC
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    directories = [os.dup(root_descriptor)]
+    try:
+        for component in ("release", "examples"):
+            directories.append(
+                os.open(component, directory_flags, dir_fd=directories[-1])
+            )
+        examples_descriptor = directories[-1]
+        allowed = set()
+        for example in examples:
+            metadata = os.stat(
+                example,
+                dir_fd=examples_descriptor,
+                follow_symlinks=False,
+            )
+            aliases = cargo_example_hardlink_aliases(
+                examples_descriptor, example, metadata, context
+            )
+            allowed.update(
+                Path("release") / "examples" / alias for alias in aliases
+            )
+        if len(allowed) != len(examples) * 2:
+            raise BuildError(f"{context} Cargo artifact alias cardinality differs")
+        return allowed
+    finally:
+        for descriptor in reversed(directories):
+            os.close(descriptor)
+
+
+def snapshot_cargo_target(
+    root_descriptor: int,
+    target: Path,
+    context: str,
+) -> tuple[
+    dict[Path, os.stat_result],
+    dict[Path, os.stat_result],
+    dict[Path, tuple[str, ...]],
+]:
+    root_identity = descriptor_directory_identity(
+        root_descriptor, target, context
+    )
+    live_identity = directory_identity(target, context)
+    selection_fields = ("device", "file_type", "inode", "permissions")
+    if any(
+        root_identity[field] != live_identity[field]
+        for field in selection_fields
+    ):
+        raise BuildError(f"{context} retained target selection differs")
+    directory_flags = (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_CLOEXEC
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    root = os.open(".", directory_flags, dir_fd=root_descriptor)
+    directories: dict[Path, os.stat_result] = {}
+    regular_files: dict[Path, os.stat_result] = {}
+    children: dict[Path, tuple[str, ...]] = {}
+
+    def walk(descriptor: int, relative: Path) -> None:
+        before = os.fstat(descriptor)
+        if not stat.S_ISDIR(before.st_mode):
+            raise BuildError(f"{context} Cargo target directory changed type")
+        names = tuple(sorted(os.listdir(descriptor)))
+        if len(names) != len(set(names)):
+            raise BuildError(f"{context} Cargo target names alias")
+        directories[relative] = before
+        children[relative] = names
+        for name in names:
+            selected = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            child_relative = relative / name
+            if stat.S_ISDIR(selected.st_mode):
+                child = os.open(name, directory_flags, dir_fd=descriptor)
+                try:
+                    opened = os.fstat(child)
+                    if not same_manifest_metadata(selected, opened):
+                        raise BuildError(
+                            f"{context} Cargo target directory selection changed"
+                        )
+                    walk(child, child_relative)
+                    selected_after = os.stat(
+                        name, dir_fd=descriptor, follow_symlinks=False
+                    )
+                    if not same_manifest_metadata(opened, selected_after):
+                        raise BuildError(
+                            f"{context} Cargo target directory changed during snapshot"
+                        )
+                finally:
+                    os.close(child)
+            elif stat.S_ISREG(selected.st_mode):
+                regular_files[child_relative] = selected
+            elif stat.S_ISLNK(selected.st_mode):
+                raise BuildError(f"{context} Cargo target contains a symlink")
+            else:
+                raise BuildError(
+                    f"{context} Cargo target contains an unsupported node"
+                )
+        if not same_manifest_metadata(before, os.fstat(descriptor)):
+            raise BuildError(f"{context} Cargo target changed during snapshot")
+
+    try:
+        walk(root, Path())
+    finally:
+        os.close(root)
+    hardlinks: dict[tuple[int, int], list[os.stat_result]] = {}
+    for metadata in regular_files.values():
+        hardlinks.setdefault((metadata.st_dev, metadata.st_ino), []).append(metadata)
+    for aliases in hardlinks.values():
+        if (
+            len(aliases) != aliases[0].st_nlink
+            or any(
+                not same_manifest_metadata(aliases[0], alias)
+                for alias in aliases[1:]
+            )
+        ):
+            raise BuildError(f"{context} Cargo target hard link escapes the target")
+    return directories, regular_files, children
+
+
+def prune_cargo_target(
+    root_descriptor: int,
+    target: Path,
+    examples: Sequence[str],
+    context: str,
+) -> None:
+    allowed_files = cargo_target_artifact_paths(
+        root_descriptor, target, examples, context
+    )
+    allowed_directories = {Path()}
+    for path in allowed_files:
+        allowed_directories.update(
+            parent for parent in path.parents if parent != Path(".")
+        )
+    directories, regular_files, children = snapshot_cargo_target(
+        root_descriptor, target, context
+    )
+    if not allowed_files <= set(regular_files):
+        raise BuildError(f"{context} Cargo artifact is absent from target snapshot")
+    directory_flags = (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_CLOEXEC
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    root = os.open(".", directory_flags, dir_fd=root_descriptor)
+
+    def same_selection(
+        observed: os.stat_result, expected: os.stat_result
+    ) -> bool:
+        return (
+            observed.st_dev,
+            observed.st_ino,
+            stat.S_IFMT(observed.st_mode),
+        ) == (
+            expected.st_dev,
+            expected.st_ino,
+            stat.S_IFMT(expected.st_mode),
+        )
+
+    def prune(descriptor: int, relative: Path) -> None:
+        names = tuple(sorted(os.listdir(descriptor)))
+        if names != children.get(relative):
+            raise BuildError(f"{context} Cargo target names changed before pruning")
+        for name in names:
+            child_relative = relative / name
+            selected = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            if child_relative in directories:
+                if not same_manifest_metadata(
+                    selected, directories[child_relative]
+                ):
+                    raise BuildError(
+                        f"{context} Cargo target directory changed before pruning"
+                    )
+                child = os.open(name, directory_flags, dir_fd=descriptor)
+                try:
+                    if not same_selection(os.fstat(child), selected):
+                        raise BuildError(
+                            f"{context} Cargo target directory selection changed"
+                        )
+                    prune(child, child_relative)
+                    retained = os.fstat(child)
+                    selected_after = os.stat(
+                        name, dir_fd=descriptor, follow_symlinks=False
+                    )
+                    if not same_selection(retained, selected_after):
+                        raise BuildError(
+                            f"{context} Cargo target directory changed during pruning"
+                        )
+                finally:
+                    os.close(child)
+                if child_relative not in allowed_directories:
+                    os.rmdir(name, dir_fd=descriptor)
+            elif child_relative in regular_files:
+                expected = regular_files[child_relative]
+                stable_fields = (
+                    "st_dev",
+                    "st_ino",
+                    "st_mode",
+                    "st_size",
+                    "st_mtime_ns",
+                )
+                if any(
+                    getattr(selected, field) != getattr(expected, field)
+                    for field in stable_fields
+                ):
+                    raise BuildError(
+                        f"{context} Cargo target file changed before pruning"
+                    )
+                if child_relative not in allowed_files:
+                    os.unlink(name, dir_fd=descriptor)
+            else:
+                raise BuildError(f"{context} Cargo target topology changed")
+
+    try:
+        if not same_manifest_metadata(os.fstat(root), directories[Path()]):
+            raise BuildError(f"{context} Cargo target changed before pruning")
+        prune(root, Path())
+    finally:
+        os.close(root)
+    final_directories, final_files, _final_children = snapshot_cargo_target(
+        root_descriptor, target, context
+    )
+    if (
+        set(final_directories) != allowed_directories
+        or set(final_files) != allowed_files
+    ):
+        raise BuildError(f"{context} pruned Cargo target topology differs")
+    if any(
+        not same_manifest_metadata(final_files[path], regular_files[path])
+        for path in allowed_files
+    ):
+        raise BuildError(f"{context} Cargo artifact changed during pruning")
+    if (
+        cargo_target_artifact_paths(root_descriptor, target, examples, context)
+        != allowed_files
+    ):
+        raise BuildError(f"{context} Cargo artifact aliases changed during pruning")
+
+
+def verify_frozen_build_artifacts(build: Mapping[str, Any], context: str) -> None:
+    target = Path(str(build["target"])).resolve(strict=True)
+    argv = build["argv"]
+    target_descriptors = [
+        argv[index + 1]
+        for index in range(len(argv) - 2)
+        if argv[index] == "--bind-fd" and argv[index + 2] == GUEST_TARGET
+    ]
+    if len(target_descriptors) != 1 or not str(target_descriptors[0]).isdigit():
+        raise BuildError(f"{context} frozen target descriptor differs")
+    descriptor = os.open(
+        target,
+        getattr(os, "O_PATH", os.O_RDONLY)
+        | os.O_DIRECTORY
+        | os.O_CLOEXEC
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        target_before = descriptor_directory_identity(descriptor, target, context)
+        recorded_target = build["binds"]["target"]["post"]
+        stable_target_fields = (
+            "device",
+            "file_type",
+            "inode",
+            "link_count",
+            "modified_ns",
+            "path",
+            "size",
+        )
+        if (
+            any(
+                target_before[field] != recorded_target[field]
+                for field in stable_target_fields
+            )
+            or target_before["permissions"] != 0o555
+        ):
+            raise BuildError(f"{context} frozen target identity differs")
+        artifacts = build["artifacts"]
+        allowed_files = cargo_target_artifact_paths(
+            descriptor, target, tuple(artifacts), context
+        )
+        frozen_directories, frozen_files, _children = snapshot_cargo_target(
+            descriptor, target, context
+        )
+        expected_directories = {Path()}
+        for path in allowed_files:
+            expected_directories.update(
+                parent for parent in path.parents if parent != Path(".")
+            )
+        if (
+            set(frozen_directories) != expected_directories
+            or set(frozen_files) != allowed_files
+        ):
+            raise BuildError(f"{context} frozen Cargo target topology differs")
+        for _replay_pass in range(2):
+            for example, artifact in artifacts.items():
+                relative = Path("release") / "examples" / example
+                payload, replayed_source = read_bound_regular_file(
+                    descriptor,
+                    relative,
+                    f"{context} frozen Cargo artifact {example}",
+                    require_executable=True,
+                    expected_link_count=2,
+                )
+                recorded_source = artifact["source"]
+                expected_recorded_path = (
+                    f"/proc/self/fd/{target_descriptors[0]}/{relative.as_posix()}"
+                )
+                if recorded_source.get("path") != expected_recorded_path:
+                    raise BuildError(f"{context} frozen Cargo artifact path differs")
+                replayed_source["path"] = expected_recorded_path
+                if replayed_source != recorded_source:
+                    raise BuildError(f"{context} frozen Cargo artifact identity differs")
+                binding = artifact["binding"]
+                published = Path(str(binding["path"])).resolve(strict=True)
+                published_descriptor, published_payload, published_identity = (
+                    open_built_binary(
+                        published, f"{context} frozen published artifact {example}"
+                    )
+                )
+                try:
+                    if (
+                        set(binding)
+                        != {"comm", "executable_mode", "path", "sha256"}
+                        or binding["comm"] != published.name
+                        or binding["executable_mode"] != 0o555
+                        or binding["path"] != str(published)
+                        or binding["sha256"] != published_identity["sha256"]
+                        or published_identity["mode"] != 0o555
+                        or published_identity["link_count"] != 1
+                        or published_identity["sha256"]
+                        != replayed_source["sha256"]
+                        or published_payload != payload
+                        or (
+                            published_identity["device"],
+                            published_identity["inode"],
+                        )
+                        == (replayed_source["device"], replayed_source["inode"])
+                    ):
+                        raise BuildError(
+                            f"{context} frozen published artifact differs"
+                        )
+                finally:
+                    os.close(published_descriptor)
+        if descriptor_directory_identity(descriptor, target, context) != target_before:
+            raise BuildError(f"{context} frozen target changed during replay")
+    finally:
+        os.close(descriptor)
 
 
 def run_build(
@@ -3606,6 +4294,26 @@ def run_build(
     toolchain_root = cargo_path.parent.parent
     if rustc_path.parent.parent != toolchain_root:
         raise BuildError(f"{kind} Cargo/rustc toolchain roots differ")
+    rustc_host = toolchain.get("rustc_host")
+    if (
+        not isinstance(rustc_host, str)
+        or re.fullmatch(r"[A-Za-z0-9_-]+", rustc_host) is None
+    ):
+        raise BuildError(f"{kind} rustc host differs")
+    rust_lld_path = Path(toolchain["rust_lld_path"])
+    if rust_lld_path != (
+        toolchain_root
+        / "lib"
+        / "rustlib"
+        / rustc_host
+        / "bin"
+        / "rust-lld"
+    ):
+        raise BuildError(f"{kind} rust-lld path differs")
+    guest_lld_path = (
+        f"{GUEST_TOOLCHAIN_ROOT}/lib/rustlib/{rustc_host}/bin/gcc-ld/ld.lld"
+    )
+    rust_lld_relative = rust_lld_path.relative_to(toolchain_root).as_posix()
     with ExitStack() as stack:
         bwrap_lease = stack.enter_context(
             RetainedFile(
@@ -3631,6 +4339,17 @@ def run_build(
                 expected_sha256=toolchain["rustc_sha256"],
                 require_executable=True,
             )
+        )
+        rust_lld_lease = stack.enter_context(
+            RetainedFile(
+                rust_lld_path,
+                f"{kind} real rust-lld executable",
+                expected_sha256=toolchain["rust_lld_sha256"],
+                require_executable=True,
+            )
+        )
+        dev_null_lease = stack.enter_context(
+            RetainedDevice(HOST_DEV_NULL, f"{kind} null device")
         )
         python_lease = stack.enter_context(
             RetainedFile(
@@ -3674,6 +4393,32 @@ def run_build(
                 allow_internal_symlinks=True,
             )
         )
+        if toolchain_guard.initial_manifest is None or rust_lld_lease.identity is None:
+            raise BuildError(f"{kind} rust-lld semantic authority is absent")
+        rust_lld_entries = [
+            entry
+            for entry in toolchain_guard.initial_manifest["entries"]
+            if entry.get("path") == rust_lld_relative
+        ]
+        rust_lld_metadata = os.fstat(rust_lld_lease.descriptor)
+        expected_rust_lld_entry = {
+            "changed_ns": rust_lld_metadata.st_ctime_ns,
+            "device": rust_lld_metadata.st_dev,
+            "file_type": "regular",
+            "gid": rust_lld_metadata.st_gid,
+            "inode": rust_lld_metadata.st_ino,
+            "link_count": rust_lld_metadata.st_nlink,
+            "modified_ns": rust_lld_metadata.st_mtime_ns,
+            "path": rust_lld_relative,
+            "permissions": stat.S_IMODE(rust_lld_metadata.st_mode),
+            "sha256": rust_lld_lease.identity["sha256"],
+            "size": rust_lld_metadata.st_size,
+            "symlink_target": None,
+            "symlink_scope": None,
+            "uid": rust_lld_metadata.st_uid,
+        }
+        if rust_lld_entries != [expected_rust_lld_entry]:
+            raise BuildError(f"{kind} rust-lld differs from toolchain authority")
         config_guard = stack.enter_context(
             CargoConfigSearchGuard(
                 materialized["root"],
@@ -3717,6 +4462,11 @@ def run_build(
         )
         cargo_bind = ("--ro-bind-fd", str(cargo_lease.descriptor), GUEST_CARGO)
         rustc_bind = ("--ro-bind-fd", str(rustc_lease.descriptor), GUEST_RUSTC)
+        rust_lld_bind = (
+            "--ro-bind-fd",
+            str(rust_lld_lease.descriptor),
+            guest_lld_path,
+        )
         python_bind = (
             "--ro-bind-fd",
             str(python_lease.descriptor),
@@ -3732,6 +4482,8 @@ def run_build(
             + system_guard.pass_fds
             + cargo_lease.pass_fds
             + rustc_lease.pass_fds
+            + rust_lld_lease.pass_fds
+            + dev_null_lease.pass_fds
             + python_lease.pass_fds
         )
         if wrapper is not None:
@@ -3761,6 +4513,10 @@ def run_build(
         toolchain_guard.replay("pre-Cargo launch")
         system_guard.replay("pre-Cargo launch")
         config_prebuild = config_guard.replay(boundary="pre-Cargo launch")
+        rust_lld_lease.verify()
+        dev_null_lease.verify()
+        if rust_lld_entries != [expected_rust_lld_entry]:
+            raise BuildError(f"{kind} rust-lld authority changed before launch")
         cargo_config_args = config_guard.prepare_bwrap_args()
         argv = sandboxed_build_argv(
             toolchain=toolchain,
@@ -3769,6 +4525,8 @@ def run_build(
             toolchain_ro_bind=toolchain_ro_bind,
             cargo_bind=cargo_bind,
             rustc_bind=rustc_bind,
+            rust_lld_bind=rust_lld_bind,
+            dev_null_source=dev_null_lease.proc_path,
             python_bind=python_bind,
             cargo_config_args=cargo_config_args,
             target_bind=target_bind,
@@ -3789,7 +4547,14 @@ def run_build(
             source_tree_guard.replay("post-Cargo boundary")
             toolchain_guard.replay("post-Cargo boundary")
             system_guard.replay("post-Cargo boundary")
-            for lease in (bwrap_lease, cargo_lease, rustc_lease, python_lease):
+            for lease in (
+                bwrap_lease,
+                cargo_lease,
+                rustc_lease,
+                rust_lld_lease,
+                dev_null_lease,
+                python_lease,
+            ):
                 lease.verify()
 
         record = run_logged(
@@ -3806,8 +4571,10 @@ def run_build(
         execution_tools = {
             "bwrap": bwrap_lease.record(),
             "cargo": cargo_lease.record(),
+            "dev_null": dev_null_lease.record(),
             "python": python_lease.record(),
             "rustc": rustc_lease.record(),
+            "rust_lld": rust_lld_lease.record(),
             "toolchain_root": toolchain_guard.root_guard.pre_bind,
         }
         after = file_manifest(materialized["root"])
@@ -3821,6 +4588,12 @@ def run_build(
             )
             for example in examples
         }
+        prune_cargo_target(
+            target_guard.descriptor,
+            target,
+            examples,
+            f"{kind} post-build target pruning",
+        )
         if wrapper is not None:
             assert receipt_guard is not None
             receipt_payload, receipt_identity = read_bound_regular_file(
@@ -3933,11 +4706,12 @@ def snapshot_open_file(
     context: str,
     *,
     require_executable: bool,
+    expected_link_count: int = 1,
 ) -> tuple[bytes, dict[str, Any]]:
     before = os.fstat(descriptor)
     if (
         not stat.S_ISREG(before.st_mode)
-        or before.st_nlink != 1
+        or before.st_nlink != expected_link_count
         or (require_executable and stat.S_IMODE(before.st_mode) & 0o111 == 0)
     ):
         raise BuildError(f"{context} descriptor is not one regular file")
@@ -4187,7 +4961,7 @@ def identities(paths: Iterable[Path], label: str) -> list[dict[str, Any]]:
 def toolchain_identities(toolchain: Mapping[str, str], label: str) -> list[dict[str, Any]]:
     return [
         file_identity(Path(toolchain[f"{name}_path"]), f"{label} {name}")
-        for name in ("bwrap", "cargo", "git", "rustc", "rustup")
+        for name in ("bwrap", "cargo", "git", "rustc", "rust_lld", "rustup")
     ]
 
 
@@ -4440,7 +5214,9 @@ def build(args: argparse.Namespace) -> None:
     final_tools = json.loads(json.dumps(base_tools))
     final_tools["tools"].update(child_bindings)
     final_tools_path = output / "asterism-rebaseline-tools.json"
-    write_new(final_tools_path, canonical_bytes(final_tools), 0o444)
+    write_new(
+        final_tools_path, authority_canonical_bytes(final_tools), 0o444
+    )
     if (
         validate_tools_manifest(
             final_tools_path, allow_child_placeholders=False
@@ -4510,9 +5286,212 @@ def build(args: argparse.Namespace) -> None:
         "tools_manifest_sha256": sha256_file(final_tools_path),
     }
     attestation_path = output / "current-children-attestation.json"
-    write_new(attestation_path, canonical_bytes(attestation), 0o444)
+    write_new(
+        attestation_path, authority_canonical_bytes(attestation), 0o444
+    )
     make_read_only(output)
-    print(canonical_bytes(attestation).decode(), end="")
+    verify_frozen_build_artifacts(
+        pristine_build, "pristine release post-freeze replay"
+    )
+    verify_frozen_build_artifacts(
+        hooked_build, "hooked release post-freeze replay"
+    )
+    verify_frozen_build_artifacts(child_build, "current children post-freeze replay")
+    print(authority_canonical_bytes(attestation).decode("utf-8"), end="")
+
+
+def self_test_cargo_example_hardlinks() -> dict[str, Any]:
+    """Accept only Cargo's exact in-directory example hard-link layout."""
+
+    example = "asterism_rebaseline_public"
+    hashed = f"{example}-0123456789abcdef"
+    payload = b"synthetic executable bytes\n"
+
+    def fixture(
+        root: Path,
+        label: str,
+        *,
+        local_aliases: Sequence[str] = (),
+        external_aliases: Sequence[str] = (),
+        scratch_external_alias: bool = False,
+        scratch_symlink: bool = False,
+    ) -> dict[str, Any]:
+        fixture_root = root / label
+        target = fixture_root / "target"
+        examples = target / "release" / "examples"
+        examples.mkdir(parents=True)
+        source = examples / example
+        write_new(source, payload, 0o755)
+        for alias in local_aliases:
+            os.link(source, examples / alias)
+        for alias in external_aliases:
+            os.link(source, fixture_root / alias)
+        scratch = target / "release" / "build" / "dependency-0123456789abcdef"
+        scratch.mkdir(parents=True)
+        scratch_binary = scratch / "build-script-build"
+        write_new(scratch_binary, b"synthetic Cargo build script\n", 0o755)
+        os.link(
+            scratch_binary,
+            scratch / "build_script_build-0123456789abcdef",
+        )
+        dependencies = target / "release" / "deps"
+        dependencies.mkdir()
+        write_new(dependencies / "dependency.rlib", b"synthetic rlib\n", 0o644)
+        if scratch_external_alias:
+            os.link(scratch_binary, fixture_root / "external-scratch-alias")
+        if scratch_symlink:
+            (target / "release" / "hostile-scratch-link").symlink_to(
+                fixture_root
+            )
+        destination = fixture_root / "sealed"
+        descriptor = os.open(
+            target,
+            getattr(os, "O_PATH", os.O_RDONLY)
+            | os.O_DIRECTORY
+            | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            artifact = copy_bound_artifact(
+                descriptor,
+                Path("release") / "examples" / example,
+                destination,
+            )
+            prune_cargo_target(
+                descriptor,
+                target,
+                (example,),
+                f"self-test {label} Cargo target pruning",
+            )
+            target_post = directory_identity(
+                target, f"self-test {label} post-build target"
+            )
+            make_read_only(target)
+            return {
+                "artifact": artifact,
+                "build": {
+                    "argv": ["--bind-fd", str(descriptor), GUEST_TARGET],
+                    "artifacts": {example: artifact},
+                    "binds": {"target": {"post": target_post}},
+                    "target": str(target.resolve()),
+                },
+            }
+        finally:
+            os.close(descriptor)
+
+    with tempfile.TemporaryDirectory(prefix="bn-1o85-cargo-hardlinks-") as temporary:
+        root = Path(temporary).resolve(strict=True)
+        try:
+            paired = fixture(root, "paired", local_aliases=(hashed,))
+            paired_artifact = paired["artifact"]
+            if (
+                paired_artifact["source"]["link_count"] != 2
+                or paired_artifact["source"]["mode"] != 0o555
+                or paired_artifact["binding"]["sha256"] != sha256_bytes(payload)
+            ):
+                raise BuildError("Cargo example hard-link acceptance differs")
+            paired_target = root / "paired" / "target"
+            expected_paths = {
+                Path("release"),
+                Path("release/examples"),
+                Path("release/examples") / example,
+                Path("release/examples") / hashed,
+            }
+            observed_paths = {
+                path.relative_to(paired_target)
+                for path in paired_target.rglob("*")
+            }
+            if observed_paths != expected_paths:
+                raise BuildError("Cargo target scratch pruning differs")
+            for alias in (example, hashed):
+                alias_path = paired_target / "release" / "examples" / alias
+                if stat.S_IMODE(alias_path.stat().st_mode) != 0o555:
+                    raise BuildError("Cargo example hard-link normalization differs")
+            paired_destination = root / "paired" / "sealed"
+            paired_identity = file_identity(
+                paired_destination, "self-test sealed Cargo artifact"
+            )
+            if (
+                paired_identity["link_count"] != 1
+                or paired_identity["mode"] != 0o555
+            ):
+                raise BuildError("sealed Cargo artifact is not one 0555 regular file")
+            verify_frozen_build_artifacts(
+                paired["build"], "self-test frozen Cargo artifact"
+            )
+            sealed_sha256 = sha256_file(paired_destination)
+            paired_source = (
+                paired_target / "release" / "examples" / example
+            )
+            paired_source.chmod(0o755)
+            paired_source.write_bytes(b"hostile post-copy drift\n")
+            paired_source.chmod(0o555)
+            try:
+                verify_frozen_build_artifacts(
+                    paired["build"], "self-test drifted frozen Cargo artifact"
+                )
+            except BuildError:
+                post_copy_drift_rejected = True
+            else:
+                post_copy_drift_rejected = False
+            if (
+                not post_copy_drift_rejected
+                or sha256_file(paired_destination) != sealed_sha256
+            ):
+                raise BuildError("post-copy Cargo artifact drift was accepted")
+
+            hostiles = (
+                ("single", {}),
+                ("wrong-name", {"local_aliases": (f"{example}-not-a-hash",)}),
+                ("external-only", {"external_aliases": ("outside",)}),
+                (
+                    "extra-external",
+                    {
+                        "local_aliases": (hashed,),
+                        "external_aliases": ("outside",),
+                    },
+                ),
+                (
+                    "scratch-external",
+                    {
+                        "local_aliases": (hashed,),
+                        "scratch_external_alias": True,
+                    },
+                ),
+                (
+                    "scratch-symlink",
+                    {"local_aliases": (hashed,), "scratch_symlink": True},
+                ),
+            )
+            rejected = 0
+            for label, arguments in hostiles:
+                try:
+                    fixture(root, label, **arguments)
+                except BuildError:
+                    rejected += 1
+            if rejected != len(hostiles):
+                raise BuildError(
+                    "hostile Cargo example hard-link layout was accepted"
+                )
+        finally:
+            for directory in sorted(
+                (
+                    path
+                    for path in root.rglob("*")
+                    if not path.is_symlink() and path.is_dir()
+                ),
+                key=lambda path: len(path.parts),
+            ):
+                directory.chmod(0o755)
+    return {
+        "hostile_layouts_rejected": rejected,
+        "paired_layout_accepted": True,
+        "post_copy_drift_rejected": True,
+        "scratch_pruned": True,
+        "sealed_single_link": True,
+        "single_layout_rejected": True,
+        "status": "ok",
+    }
 
 
 def self_test_cargo_config_guard() -> dict[str, Any]:
@@ -4568,14 +5547,31 @@ def self_test_cargo_config_guard() -> dict[str, Any]:
             before = guard.replay(boundary="self-test pre")
             arguments = guard.prepare_bwrap_args()
             after = guard.replay(boundary="self-test post", deep=True)
+            cargo_home_descriptor = guard.directory_guards[
+                "cargo-home"
+            ].descriptor
+            cargo_home_overlay = [
+                "--overlay-src",
+                f"/proc/self/fd/{cargo_home_descriptor}",
+                "--tmp-overlay",
+                GUEST_CARGO_HOME,
+            ]
             if (
                 before != after
                 or len(before["cargo_search"]["entries"]) != 8
                 or before["cargo_home_tree"]["entry_count"] != 5
                 or before["cargo_home_tree"]["watch_count"] != 3
                 or arguments.count("--ro-bind-data") != 4
-                or arguments.count("--ro-bind-fd") != 1
+                or arguments.count("--ro-bind-fd") != 0
+                or arguments.count("--overlay-src") != 1
+                or arguments.count("--tmp-overlay") != 1
                 or arguments.count("--remount-ro") != 4
+                or sum(
+                    arguments[index : index + len(cargo_home_overlay)]
+                    == cargo_home_overlay
+                    for index in range(len(arguments))
+                )
+                != 1
             ):
                 raise BuildError("Cargo config guard self-test differs")
         nested_mutation_rejected = False
@@ -4622,12 +5618,67 @@ def self_test_cargo_config_guard() -> dict[str, Any]:
             "entries": 8,
             "nested_mutation_restore_rejected": True,
             "ro_bind_data": 4,
-            "ro_bind_fd": 1,
+            "cargo_home_overlay": 1,
+            "ro_bind_fd": 0,
             "schema": CARGO_CONFIG_SEARCH_SCHEMA,
             "status": "ok",
             "tree_entries": 5,
             "tree_watches": 3,
         }
+
+
+def self_test_external_canonical_utf8() -> dict[str, Any]:
+    """Accept upstream authority UTF-8 without changing local output bytes."""
+
+    schema = "bn-ecm1-external-canonical-utf8-self-test-v1"
+    value = {"label": "A — current", "schema": schema}
+    local_canonical = canonical_bytes(value)
+    authority_canonical = authority_canonical_bytes(value)
+    if (
+        b"\\u2014" not in local_canonical
+        or b"\xe2\x80\x94" in local_canonical
+        or b"\xe2\x80\x94" not in authority_canonical
+        or b"\\u2014" in authority_canonical
+        or local_canonical == authority_canonical
+        or parse_canonical(
+            local_canonical, schema, "local canonical self-test"
+        )
+        != value
+    ):
+        raise BuildError("local/external canonical boundary self-test differs")
+    with tempfile.TemporaryDirectory(
+        prefix="bn-ecm1-external-canonical-"
+    ) as temporary:
+        root = Path(temporary).resolve(strict=True)
+        accepted_path = root / "authority-utf8.json"
+        accepted_path.write_bytes(authority_canonical)
+        accepted_path.chmod(0o444)
+        if load_canonical(
+            accepted_path, schema, "upstream authority UTF-8 self-test"
+        ) != value:
+            raise BuildError("upstream authority UTF-8 self-test differs")
+        escaped_path = root / "authority-ascii-escaped.json"
+        escaped_path.write_bytes(local_canonical)
+        escaped_path.chmod(0o444)
+        try:
+            load_canonical(
+                escaped_path,
+                schema,
+                "ASCII-escaped upstream authority hostile",
+            )
+        except BuildError:
+            pass
+        else:
+            raise BuildError(
+                "ASCII-escaped upstream authority alternate was accepted"
+            )
+    return {
+        "ascii_escaped_alternate_rejected": True,
+        "local_ascii_canonical_preserved": True,
+        "schema": schema,
+        "status": "ok",
+        "upstream_utf8_canonical_accepted": True,
+    }
 
 
 def self_test_reviewed_cargo_config_policy() -> dict[str, Any]:
@@ -4785,15 +5836,57 @@ def self_test_semantic_runtime_authority() -> dict[str, Any]:
         != "within_closure"
         or system_symlink_scope(Path("/usr/bin"), "manual", "/usr/share/man")
         != "guest_inaccessible_external"
+        or system_symlink_scope(
+            Path("/usr/lib"),
+            "gcc/x86_64-pc-linux-gnu/15.3.0/libitm.so",
+            "/usr/lib/libitm.so",
+        )
+        != "within_closure"
     ):
         raise BuildError("trusted system symlink namespace model differs")
-    special_root_rejected = False
-    try:
-        system_symlink_scope(Path("/usr/bin"), "hostile", "/proc/self/status")
-    except BuildError:
-        special_root_rejected = True
-    if not special_root_rejected:
-        raise BuildError("trusted system symlink reached exposed /proc")
+    for target in (
+        "/proc/self/status",
+        "//proc/self/status",
+        "//asterism/source",
+        "/",
+    ):
+        try:
+            system_symlink_scope(Path("/usr/bin"), "hostile", target)
+        except BuildError:
+            pass
+        else:
+            raise BuildError(
+                "trusted system symlink reached guest-accessible authority"
+            )
+    with tempfile.TemporaryDirectory(prefix="bn-ecm1-build-symlink-") as temporary:
+        temporary_root = Path(temporary).resolve(strict=True)
+        root = temporary_root / "source"
+        root.mkdir()
+        (temporary_root / "outside").write_bytes(b"outside")
+        if (
+            recursive_symlink_scope(
+                Path("/usr/lib"),
+                "gcc/x86_64-pc-linux-gnu/15.3.0/libitm.so",
+                "/usr/lib/libitm.so",
+                trusted_system=True,
+            )
+            != "within_closure"
+        ):
+            raise BuildError("trusted dangling symlink was rejected")
+        for target in ("missing", "../outside"):
+            try:
+                recursive_symlink_scope(
+                    root,
+                    "link",
+                    target,
+                    trusted_system=False,
+                )
+            except BuildError:
+                pass
+            else:
+                raise BuildError(
+                    "nontrusted dangling or escaping symlink was accepted"
+                )
     return {
         "manifest_drift_changes_digest": True,
         "mount_path_drift_rejected": True,
@@ -4837,7 +5930,140 @@ def self_test_idempotent_freeze() -> dict[str, Any]:
         if before != after:
             raise BuildError("idempotent final freeze changed recursive evidence")
         root.chmod(0o755)
-    return {"recursive_manifest_unchanged": True, "status": "ok"}
+
+        metadata_root = temporary_root / "metadata-only"
+        metadata_root.mkdir()
+        write_new(metadata_root / "unreadable", b"metadata only\n", 0o000)
+        metadata_root.chmod(0o555)
+        metadata_hashing = False
+        with RecursiveTreeAuthorityGuard(
+            metadata_root,
+            evidence_root / "metadata-only.json",
+            "metadata_only",
+            "metadata-only unreadable regular",
+            allow_internal_symlinks=False,
+            hash_regular_contents=metadata_hashing,
+        ) as metadata_guard:
+            assert metadata_guard.initial_manifest is not None
+            unreadable = next(
+                entry
+                for entry in metadata_guard.initial_manifest["entries"]
+                if entry["path"] == "unreadable"
+            )
+            if unreadable["permissions"] != 0 or unreadable["sha256"] is not None:
+                raise BuildError(
+                    "metadata-only unreadable regular required content access"
+                )
+
+        class FixtureTrustedTreeGuard(RecursiveTreeAuthorityGuard):
+            def _trusted_system_entry(
+                self,
+                metadata: os.stat_result,
+                relative: str,
+                *,
+                symlink: bool = False,
+            ) -> None:
+                return None
+
+        trusted_root = temporary_root / "trusted"
+        trusted_root.mkdir()
+        (trusted_root / "dangling").symlink_to("/usr/lib/libitm.so")
+        with FixtureTrustedTreeGuard(
+            trusted_root,
+            evidence_root / "trusted.json",
+            "system-usr-lib",
+            "trusted dangling fixture",
+            allow_internal_symlinks=True,
+            hash_regular_contents=metadata_hashing,
+            trusted_system_roots=(Path("/usr/lib"),),
+        ) as trusted_guard:
+            assert trusted_guard.initial_manifest is not None
+            dangling = next(
+                entry
+                for entry in trusted_guard.initial_manifest["entries"]
+                if entry["path"] == "dangling"
+            )
+            if dangling["symlink_scope"] != "within_closure":
+                raise BuildError("trusted guard rejected dangling closure symlink")
+    return {
+        "metadata_only_unreadable_retained": True,
+        "recursive_manifest_unchanged": True,
+        "status": "ok",
+        "trusted_dangling_symlink_retained": True,
+    }
+
+
+def self_test_validated_lock_records(
+    repository: Path, lock_module: Any
+) -> dict[str, Any]:
+    """Prove reviewed Cargo.lock snapshots remain raw immutable bytes."""
+
+    product_lock = (repository / LOCK_PATH).read_bytes()
+    if sha256_bytes(product_lock) != PRODUCT_LOCK_SHA256:
+        raise BuildError("self-test product Cargo.lock differs from frozen authority")
+    with tempfile.TemporaryDirectory(prefix="bn-30fs-validated-locks-") as temporary:
+        root = Path(temporary).resolve(strict=True)
+        payloads = {
+            "A": product_lock,
+            "C": b"# synthetic current lock C\n",
+            "D": b"# synthetic current lock D\n",
+        }
+        snapshots: dict[str, Any] = {}
+        for name, payload in payloads.items():
+            path = root / f"Cargo-{name}.lock"
+            write_new(path, payload, 0o444)
+            snapshot = lock_module.snapshot_file(path, f"self-test {name} lock")
+            if snapshot.value is not None:
+                raise BuildError("raw Cargo.lock snapshot unexpectedly parsed a value")
+            snapshots[name] = snapshot
+        records = validated_lock_records(types.SimpleNamespace(locks=snapshots))
+        if (
+            set(records) != {"A", "C", "D"}
+            or records["A"]["sha256"] != PRODUCT_LOCK_SHA256
+            or any(record["mode"] != 0o444 for record in records.values())
+        ):
+            raise BuildError("validated raw Cargo.lock records differ")
+    return {
+        "raw_value_none_accepted": True,
+        "records": sorted(records),
+        "status": "ok",
+    }
+
+
+def self_test_cargo_environment() -> dict[str, Any]:
+    """Exercise the exact guest-root environment before any real build."""
+
+    environment = cargo_environment(
+        {"rustup_toolchain": "self-test-toolchain"},
+        {"ASTERISM_SELF_TEST": "1"},
+    )
+    expected = {
+        "CARGO_HOME": f"{GUEST_ROOT}/cargo-home",
+        "GIT_CONFIG_GLOBAL": f"{GUEST_ROOT}/absent-gitconfig",
+        "LD_ORIGIN_PATH": f"{GUEST_ROOT}/toolchain/bin",
+        "RUSTC": f"{GUEST_ROOT}/toolchain/bin/rustc",
+        "RUSTUP_TOOLCHAIN": "self-test-toolchain",
+        "ASTERISM_SELF_TEST": "1",
+    }
+    if any(environment.get(name) != value for name, value in expected.items()):
+        raise BuildError("self-test Cargo guest environment differs")
+    for hostile in (
+        {"CARGO_HOME": "/hostile"},
+        {"LD_ORIGIN_PATH": "/host/toolchain/bin"},
+    ):
+        try:
+            cargo_environment(
+                {"rustup_toolchain": "self-test-toolchain"}, hostile
+            )
+        except BuildError:
+            pass
+        else:
+            raise BuildError("self-test Cargo environment override was accepted")
+    return {
+        "guest_root": GUEST_ROOT,
+        "override_rejected": True,
+        "status": "ok",
+    }
 
 
 def self_test(repository: Path) -> None:
@@ -4847,7 +6073,13 @@ def self_test(repository: Path) -> None:
     # command must fail closed until their independently reviewed bones land.
     fault = validate_fault_authority(repository)
     lock_module = load_lock_authority_module()
+    validated_lock_records_self_test = self_test_validated_lock_records(
+        repository, lock_module
+    )
+    cargo_artifact_hardlinks = self_test_cargo_example_hardlinks()
+    cargo_environment_self_test = self_test_cargo_environment()
     cargo_config_guard = self_test_cargo_config_guard()
+    external_canonical_utf8 = self_test_external_canonical_utf8()
     reviewed_cargo_config = self_test_reviewed_cargo_config_policy()
     semantic_runtime = self_test_semantic_runtime_authority()
     idempotent_freeze = self_test_idempotent_freeze()
@@ -4855,7 +6087,10 @@ def self_test(repository: Path) -> None:
         canonical_bytes(
             {
                 "fault_checks": fault["normal"]["checks"],
+                "cargo_artifact_hardlinks": cargo_artifact_hardlinks,
+                "cargo_environment": cargo_environment_self_test,
                 "cargo_config_guard": cargo_config_guard,
+                "external_canonical_utf8": external_canonical_utf8,
                 "reviewed_cargo_config_policy": reviewed_cargo_config,
                 "lock_api": sorted(
                     name
@@ -4867,6 +6102,7 @@ def self_test(repository: Path) -> None:
                     )
                     if callable(getattr(lock_module, name, None))
                 ),
+                "validated_lock_records": validated_lock_records_self_test,
                 "overlay_checks": overlay["normal"]["checks"],
                 "idempotent_freeze": idempotent_freeze,
                 "overlay_hostile_mutations_rejected": overlay[

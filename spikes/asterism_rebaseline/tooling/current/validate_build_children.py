@@ -260,6 +260,25 @@ def validate_builder(source: str) -> list[str]:
         'target_guard.bwrap_bind(\n            "/asterism/target", read_only=False',
         '"--ro-bind-fd",\n                str(wrapper_descriptor),',
         'receipt_guard.bwrap_bind(\n                "/asterism/receipt", read_only=False',
+        "def cargo_example_hardlink_aliases(",
+        "if metadata.st_nlink != 2:",
+        "if len(aliases) != metadata.st_nlink:",
+        'and re.fullmatch(rf"{re.escape(name)}-[0-9a-f]{{16}}", alias)',
+        "expected_link_count=expected_link_count,",
+        "os.fchmod(file_descriptor, normalize_mode)",
+        "expected_link_count=2,\n        normalize_mode=0o555,",
+        "def snapshot_cargo_target(",
+        "len(aliases) != aliases[0].st_nlink",
+        "os.unlink(name, dir_fd=descriptor)",
+        "os.rmdir(name, dir_fd=descriptor)",
+        'f"{kind} post-build target pruning",',
+        "def verify_frozen_build_artifacts(",
+        'target_before[field] != recorded_target[field]',
+        'target_before["permissions"] != 0o555',
+        "for _replay_pass in range(2):",
+        "if replayed_source != recorded_source:",
+        '== (replayed_source["device"], replayed_source["inode"])',
+        'verify_frozen_build_artifacts(child_build, "current children post-freeze replay")',
         "example: copy_bound_artifact(",
         "receipt_payload, receipt_identity = read_bound_regular_file(",
         "cwd=output,",
@@ -354,12 +373,20 @@ def validate_builder(source: str) -> list[str]:
         '"cargo_home_tree": dict(self.cargo_home_tree_binding or {})',
         'observed_sha256 != self.cargo_home_tree_binding["pre_sha256"]',
         '"watch_count": len(self.watch_descriptors)',
-        'str(self.directory_guards["cargo-home"].descriptor)',
         'output / "manifests" / f"cargo-home-{kind}.json"',
         'boundary="post-Cargo boundary", deep=True',
         "dependency.write_bytes(b\"hostile dependency bytes\\n\")",
         "dependency.write_bytes(dependency_payload)",
         '"nested_mutation_restore_rejected": True',
+        "cargo_artifact_hardlinks = self_test_cargo_example_hardlinks()",
+        '("single", {}),',
+        '("wrong-name", {"local_aliases": (f"{example}-not-a-hash",)}),',
+        '("external-only", {"external_aliases": ("outside",)}),',
+        '"scratch_external_alias": True,',
+        '"scratch_symlink": True',
+        '"scratch_pruned": True',
+        '"post_copy_drift_rejected": True',
+        '"cargo_artifact_hardlinks": cargo_artifact_hardlinks',
         '"/asterism/source/.cargo/config.toml"',
         'f"{GUEST_CARGO_HOME}/config"',
         "for lease in self.file_leases.values():\n            lease.rewind_for_bind_data()",
@@ -368,8 +395,11 @@ def validate_builder(source: str) -> list[str]:
         '"--tmpfs",\n                "/asterism/.cargo"',
         '"--tmpfs",\n                "/.cargo"',
         '"CARGO_HOME": GUEST_CARGO_HOME',
+        '"LD_ORIGIN_PATH": GUEST_TOOLCHAIN_BIN',
         '"RUSTC": GUEST_RUSTC',
         'GUEST_CARGO = f"{GUEST_TOOLCHAIN_ROOT}/bin/cargo"',
+        'GUEST_TOOLCHAIN_BIN = f"{GUEST_TOOLCHAIN_ROOT}/bin"',
+        'GUEST_ROOT = "/asterism"',
         'cargo_bind = ("--ro-bind-fd", str(cargo_lease.descriptor), GUEST_CARGO)',
         'rustc_bind = ("--ro-bind-fd", str(rustc_lease.descriptor), GUEST_RUSTC)',
         'ATTESTATION_SCHEMA = "bn-ecm1-current-children-build-v2"',
@@ -400,9 +430,30 @@ def validate_builder(source: str) -> list[str]:
         "cargo_config_guard = self_test_cargo_config_guard()",
         '"cargo_config_guard": cargo_config_guard',
         '"empty_bound_appearance_rejected": True',
+        "def authority_canonical_bytes(value: Any) -> bytes:",
+        'json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)',
+        "def parse_external_canonical(",
+        "return parse_external_canonical(path.read_bytes(), schema, context)",
+        "final_tools_path, authority_canonical_bytes(final_tools), 0o444",
+        "attestation_path, authority_canonical_bytes(attestation), 0o444",
+        'print(authority_canonical_bytes(attestation).decode("utf-8"), end="")',
+        "def self_test_external_canonical_utf8() -> dict[str, Any]:",
+        "external_canonical_utf8 = self_test_external_canonical_utf8()",
+        '"external_canonical_utf8": external_canonical_utf8',
+        '"ascii_escaped_alternate_rejected": True',
+        '"local_ascii_canonical_preserved": True',
+        '"upstream_utf8_canonical_accepted": True',
         "def self_test_reviewed_cargo_config_policy() -> dict[str, Any]:",
         "reviewed_cargo_config = self_test_reviewed_cargo_config_policy()",
         '"reviewed_cargo_config_policy": reviewed_cargo_config',
+        "def self_test_validated_lock_records(",
+        "validated_lock_records_self_test = self_test_validated_lock_records(",
+        '"validated_lock_records": validated_lock_records_self_test',
+        '"raw_value_none_accepted": True',
+        "def self_test_cargo_environment() -> dict[str, Any]:",
+        "cargo_environment_self_test = self_test_cargo_environment()",
+        '"cargo_environment": cargo_environment_self_test',
+        '"override_rejected": True',
         'semantic_runtime = self_test_semantic_runtime_authority()',
         '"semantic_runtime_authority": semantic_runtime',
         '"mount_path_drift_rejected": True',
@@ -438,15 +489,62 @@ def validate_builder(source: str) -> list[str]:
     ):
         fail("builder_system_closure", "builder exposes the whole host root")
     if (
-        '"--dev-bind"' in sandbox
+        sandbox.count('"--dev-bind"') != 1
         or '"--dev"' in sandbox
         or '"--proc"' in sandbox
         or '"--dir",\n        "/dev"' not in sandbox
+        or '"--dev-bind",\n        dev_null_source,\n        "/dev/null"' not in sandbox
         or '"--dir",\n        "/proc"' not in sandbox
+        or "*rust_lld_bind" not in sandbox
     ):
         fail(
             "builder_system_closure",
-            "builder exposes a device or proc interface instead of empty directories",
+            "builder null-device or pinned-linker sandbox contract differs",
+        )
+    retained_device = slice_between(
+        source, "class RetainedDevice:", "def run_capture(",
+        "builder_system_closure",
+    )
+    post_cargo_replay = slice_between(
+        source, "def replay_cargo_boundary()", "record = run_logged(",
+        "builder_system_closure",
+    )
+    if (
+        'RetainedDevice(HOST_DEV_NULL, f"{kind} null device")' not in source
+        or 'not stat.S_ISCHR(metadata.st_mode)' not in retained_device
+        or 'metadata.st_uid != 0' not in retained_device
+        or 'metadata.st_gid != 0' not in retained_device
+        or 'stat.S_IMODE(metadata.st_mode) != 0o666' not in retained_device
+        or 'metadata.st_nlink != 1' not in retained_device
+        or 'os.major(metadata.st_rdev) != 1' not in retained_device
+        or 'os.minor(metadata.st_rdev) != 3' not in retained_device
+        or 'self._identity(exact.lstat(), exact) != self.identity' not in retained_device
+        or 'self._snapshot() != self.identity' not in retained_device
+        or 'self._identity(self.path.lstat(), self.path) != self.identity'
+        not in retained_device
+        or 'trusted_root_chain(self.path.parent, self.context) != self.chain'
+        not in retained_device
+        or '"parent_path_chain": self.chain' not in retained_device
+        or 'rust_lld_path,' not in source
+        or 'expected_sha256=toolchain["rust_lld_sha256"]' not in source
+        or 'f"{GUEST_TOOLCHAIN_ROOT}/lib/rustlib/{rustc_host}/bin/gcc-ld/ld.lld"'
+        not in source
+        or 'rust_lld_bind=rust_lld_bind,' not in source
+        or 'dev_null_source=dev_null_lease.proc_path,' not in source
+        or '+ rust_lld_lease.pass_fds\n            + dev_null_lease.pass_fds'
+        not in source
+        or 'rust_lld_lease.verify()\n        dev_null_lease.verify()' not in source
+        or 'dev_null_lease,' not in post_cargo_replay
+        or source.count('re.fullmatch(r"[A-Za-z0-9_-]+", rustc_host) is None')
+        < 2
+        or '"dev_null": dev_null_lease.record()' not in source
+        or '"rust_lld": rust_lld_lease.record()' not in source
+        or '("bwrap", "cargo", "git", "rustc", "rust_lld", "rustup")'
+        not in source
+    ):
+        fail(
+            "builder_system_closure",
+            "builder does not retain the exact null device and pinned rust-lld",
         )
     if '"/etc"' in sandbox or 'Path("/etc")' in source:
         fail("builder_system_closure", "builder exposes unreviewed /etc authority")
@@ -515,8 +613,11 @@ def validate_builder(source: str) -> list[str]:
         fail("builder_build_count", "materialize definition/call cardinality differs")
     if source.count("verify_open_built_binary(") != 4:
         fail("builder_release_identity", "release binary verification differs")
-    if source.count("require_value=False") != 2:
-        fail("builder_lock_guard", "materialized lock snapshots require parsed values")
+    if source.count("require_value=False") != 3:
+        fail(
+            "builder_lock_guard",
+            "authority and materialized lock snapshots must remain raw bytes",
+        )
     if source.count("reviewed_stage_admission=reviewed_stage_admission") != 3:
         fail("builder_admission", "each of the three builds needs fresh admission")
     if source.count(
@@ -608,6 +709,9 @@ def validate_builder(source: str) -> list[str]:
         'self.pre_build = self.replay(boundary="guard activation")',
         'self.post_build = self.replay(boundary="guard exit")',
         "if self.post_build != self.pre_build:",
+        '"--overlay-src"',
+        '"--tmp-overlay"',
+        'f"/proc/self/fd/{self.directory_guards[\'cargo-home\'].descriptor}"',
         '"--ro-bind-data"',
         '"--ro-bind-fd"',
     ):
@@ -643,6 +747,9 @@ def validate_builder(source: str) -> list[str]:
         'value.get("patch_sha256") != patch_before["sha256"]',
         'outputs[0].get("outcome") != "PASS"',
         'outputs[1].get("outcome") != "SELF_TEST_PASS"',
+        '"original_release_line_mapping_preserved"',
+        '"exact_test_only_eof_tail_identity"',
+        "or not required_normal_checks <= set(normal_checks)",
         'self_checks[0] != "canonical_overlay"',
         'patch_after != patch_before or validator_after != validator_before',
     ):
@@ -813,6 +920,8 @@ def validate_builder(source: str) -> list[str]:
         "builder_inputs_toolchain_and_outputs_immutable",
         "builder_full_tree_identity_manifest",
         "builder_descriptor_bound_writable_binds_and_artifacts",
+        "builder_verified_cargo_example_hardlinks",
+        "builder_post_freeze_artifact_replay",
         "builder_overlay_and_static_hostile_authorities",
         "builder_descriptor_executable_selection_and_replay",
         "builder_cross_bound_lock_authority_context",
@@ -904,13 +1013,23 @@ def validate_overlay(patch: str, validator: str) -> list[str]:
     parse_python(validator, "validate_product_test_overlay.py", "overlay_validator")
     for marker in (
         'CORRECTNESS_CFG = "asterism_rebaseline_correctness"',
+        "def validate_original_line_mapping(",
+        '"contiguous non-tail change run shifts following lines"',
+        "def validate_tail_identity(",
+        '"line_shift_before_original_eof"',
+        '"original_release_line_mapping_preserved"',
+        '"exact_test_only_eof_tail_identity"',
         'if source.count(CORRECTNESS_CFG) != 2 or patch_text.count(CORRECTNESS_CFG) != 2:',
         '"missing_append_gate_negative_guard"',
         '"missing_seal_skip_negative_guard"',
         '"dev_only_test_modules_excluded_from_child_dependency_unit"',
     ):
         require_once(validator, marker, "overlay_validator")
-    return ["overlay_two_exact_dev_test_negative_guards"]
+    return [
+        "overlay_two_exact_dev_test_negative_guards",
+        "overlay_original_release_line_mapping",
+        "overlay_exact_test_only_eof_tail_identity",
+    ]
 
 
 def validate_all(
@@ -1014,6 +1133,30 @@ def self_test(
     )
     reject_builder("builder_unlocked", '"--locked"', '"--frozen-no"', "builder_contract")
     reject_builder("builder_online", '"--offline"', '"--online"', "builder_contract")
+    reject_builder(
+        "builder_external_authority_ascii_escaped",
+        'json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)',
+        'json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)',
+        "builder_contract",
+    )
+    reject_builder(
+        "builder_final_tools_not_authority_canonical",
+        "final_tools_path, authority_canonical_bytes(final_tools), 0o444",
+        "final_tools_path, canonical_bytes(final_tools), 0o444",
+        "builder_contract",
+    )
+    reject_builder(
+        "builder_attestation_not_authority_canonical",
+        "attestation_path, authority_canonical_bytes(attestation), 0o444",
+        "attestation_path, canonical_bytes(attestation), 0o444",
+        "builder_contract",
+    )
+    reject_builder(
+        "builder_stdout_not_authority_canonical",
+        'print(authority_canonical_bytes(attestation).decode("utf-8"), end="")',
+        'print(canonical_bytes(attestation).decode(), end="")',
+        "builder_contract",
+    )
     reject_builder(
         "builder_executes_mutable_path",
         "executable=execution_lease.proc_path",
@@ -1135,6 +1278,12 @@ def self_test(
         "builder_contract",
     )
     reject_builder(
+        "builder_host_toolchain_origin_path",
+        '"LD_ORIGIN_PATH": GUEST_TOOLCHAIN_BIN',
+        '"LD_ORIGIN_PATH": str(toolchain_root / "bin")',
+        "builder_contract",
+    )
+    reject_builder(
         "builder_cargo_not_fd_mounted",
         'cargo_bind = ("--ro-bind-fd", str(cargo_lease.descriptor), GUEST_CARGO)',
         'cargo_bind = ("--ro-bind", str(cargo_path), GUEST_CARGO)',
@@ -1213,10 +1362,16 @@ def self_test(
         "builder_contract",
     )
     reject_builder(
-        "builder_cargo_home_reopened_in_bwrap",
-        'str(self.directory_guards["cargo-home"].descriptor)',
-        "str(self.cargo_home)",
-        "builder_contract",
+        "builder_cargo_home_overlay_reopened_by_host_path",
+        'f"/proc/self/fd/{self.directory_guards[\'cargo-home\'].descriptor}"',
+        'str(self.cargo_home)',
+        "builder_cargo_config",
+    )
+    reject_builder(
+        "builder_cargo_home_overlay_removed",
+        '"--tmp-overlay",\n                GUEST_CARGO_HOME,',
+        '"--tmpfs",\n                GUEST_CARGO_HOME,',
+        "builder_cargo_config",
     )
     reject_builder(
         "builder_cargo_home_content_hash_unbound",
@@ -1351,6 +1506,108 @@ def self_test(
         "builder_system_closure",
     )
     reject_builder(
+        "builder_null_device_destination_broadened",
+        '"--dev-bind",\n        dev_null_source,\n        "/dev/null",',
+        '"--dev-bind",\n        dev_null_source,\n        "/dev/zero",',
+        "builder_system_closure",
+    )
+    reject_builder(
+        "builder_rust_lld_guest_shadow_removed",
+        "        *rust_lld_bind,\n",
+        "        # hostile omitted rust-lld guest shadow\n",
+        "builder_system_closure",
+    )
+    reject_builder(
+        "builder_rust_lld_reviewed_hash_removed",
+        'expected_sha256=toolchain["rust_lld_sha256"],',
+        "expected_sha256=None,  # hostile unpinned rust-lld",
+        "builder_system_closure",
+    )
+    reject_builder(
+        "builder_rust_lld_fd_not_inherited",
+        "+ rust_lld_lease.pass_fds\n            + dev_null_lease.pass_fds",
+        "+ ()  # hostile omitted rust-lld FD\n            + dev_null_lease.pass_fds",
+        "builder_system_closure",
+    )
+    reject_builder(
+        "builder_null_device_prelaunch_replay_removed",
+        "rust_lld_lease.verify()\n        dev_null_lease.verify()",
+        "rust_lld_lease.verify()\n        pass  # hostile omitted null-device replay",
+        "builder_system_closure",
+    )
+    reject_builder(
+        "builder_null_device_character_check_removed",
+        "not stat.S_ISCHR(metadata.st_mode)",
+        "False  # hostile accepted non-character device",
+        "builder_system_closure",
+    )
+    reject_builder(
+        "builder_null_device_uid_check_removed",
+        "not stat.S_ISCHR(metadata.st_mode)\n            or metadata.st_uid != 0",
+        "not stat.S_ISCHR(metadata.st_mode)\n            or False  # hostile accepted non-root UID",
+        "builder_system_closure",
+    )
+    reject_builder(
+        "builder_null_device_gid_check_removed",
+        "metadata.st_gid != 0",
+        "False  # hostile accepted non-root GID",
+        "builder_system_closure",
+    )
+    reject_builder(
+        "builder_null_device_link_check_removed",
+        "metadata.st_nlink != 1\n            or os.major(metadata.st_rdev) != 1",
+        "False\n            or os.major(metadata.st_rdev) != 1  # hostile accepted linked device",
+        "builder_system_closure",
+    )
+    reject_builder(
+        "builder_null_device_descriptor_path_crosscheck_removed",
+        "self._identity(exact.lstat(), exact) != self.identity",
+        "self._identity(exact.lstat(), exact) == self.identity",
+        "builder_system_closure",
+    )
+    reject_builder(
+        "builder_null_device_descriptor_replay_removed",
+        "self._snapshot() != self.identity",
+        "False  # hostile accepted retained descriptor drift",
+        "builder_system_closure",
+    )
+    reject_builder(
+        "builder_null_device_path_replay_removed",
+        "self._identity(self.path.lstat(), self.path) != self.identity",
+        "False  # hostile accepted retained path drift",
+        "builder_system_closure",
+    )
+    reject_builder(
+        "builder_null_device_parent_chain_replay_removed",
+        "trusted_root_chain(self.path.parent, self.context) != self.chain",
+        "False  # hostile accepted parent-chain drift",
+        "builder_system_closure",
+    )
+    reject_builder(
+        "builder_null_device_post_cargo_replay_removed",
+        "                dev_null_lease,\n",
+        "                # hostile omitted post-Cargo null-device replay\n",
+        "builder_system_closure",
+    )
+    reject_builder(
+        "builder_lock_manifest_unicode_rustc_host",
+        're.fullmatch(r"[A-Za-z0-9_-]+", rustc_host) is None\n    ):\n        raise BuildError("lock manifest rustc host differs")',
+        'rustc_host.replace("-", "").replace("_", "").isalnum() is False\n    ):\n        raise BuildError("lock manifest rustc host differs")',
+        "builder_system_closure",
+    )
+    reject_builder(
+        "builder_run_build_unicode_rustc_host",
+        're.fullmatch(r"[A-Za-z0-9_-]+", rustc_host) is None\n    ):\n        raise BuildError(f"{kind} rustc host differs")',
+        'rustc_host.replace("-", "").replace("_", "").isalnum() is False\n    ):\n        raise BuildError(f"{kind} rustc host differs")',
+        "builder_system_closure",
+    )
+    reject_builder(
+        "builder_rust_lld_toolchain_identity_omitted",
+        '("bwrap", "cargo", "git", "rustc", "rust_lld", "rustup")',
+        '("bwrap", "cargo", "git", "rustc", "rustup")',
+        "builder_system_closure",
+    )
+    reject_builder(
         "builder_system_closure_broadened_to_etc",
         '(Path("/usr/include"), "/usr/include")',
         '(Path("/etc"), "/etc")',
@@ -1411,6 +1668,18 @@ def self_test(
         'guard.pre_build,\n            f"{kind} prebuild Cargo.lock",\n            require_value=False,',
         'guard.pre_build,\n            f"{kind} prebuild Cargo.lock",\n            require_value=True,',
         "builder_lock_guard",
+    )
+    reject_builder(
+        "builder_validated_snapshot_requires_json_value",
+        'snapshot,\n            f"validated {name}",\n            require_value=False,',
+        'snapshot,\n            f"validated {name}",\n            require_value=True,',
+        "builder_lock_guard",
+    )
+    reject_builder(
+        "builder_guest_root_rebound",
+        'GUEST_ROOT = "/asterism"',
+        'GUEST_ROOT = "/asterism-forged"',
+        "builder_contract",
     )
     reject_builder(
         "builder_guard_path_instead_of_retained_fd",
@@ -1506,6 +1775,114 @@ def self_test(
         "builder_artifact_copy_uses_target_path",
         "example: copy_bound_artifact(",
         "example: copy_artifact(",
+        "builder_contract",
+    )
+    reject_builder(
+        "builder_cargo_artifact_external_hardlink_accepted",
+        "if len(aliases) != metadata.st_nlink:",
+        "if False:",
+        "builder_contract",
+    )
+    reject_builder(
+        "builder_cargo_artifact_alias_name_unbound",
+        'and re.fullmatch(rf"{re.escape(name)}-[0-9a-f]{{16}}", alias)',
+        "and alias != name",
+        "builder_contract",
+    )
+    reject_builder(
+        "builder_cargo_artifact_expected_link_count_widened",
+        "if metadata.st_nlink != 2:",
+        "if metadata.st_nlink not in {1, 2}:",
+        "builder_contract",
+    )
+    reject_builder(
+        "builder_cargo_artifact_mode_not_normalized",
+        "os.fchmod(file_descriptor, normalize_mode)",
+        "pass  # hostile omitted Cargo artifact mode normalization",
+        "builder_contract",
+    )
+    reject_builder(
+        "builder_cargo_artifact_link_policy_not_selected",
+        "expected_link_count=2,\n        normalize_mode=0o555,",
+        "expected_link_count=1,\n        normalize_mode=0o555,",
+        "builder_contract",
+    )
+    reject_builder(
+        "builder_cargo_target_pruning_omitted",
+        'f"{kind} post-build target pruning",',
+        'f"{kind} post-build target retained",',
+        "builder_contract",
+    )
+    reject_builder(
+        "builder_cargo_target_pruning_not_descriptor_relative_file",
+        "os.unlink(name, dir_fd=descriptor)",
+        "(target / child_relative).unlink()",
+        "builder_contract",
+    )
+    reject_builder(
+        "builder_cargo_target_pruning_not_descriptor_relative_directory",
+        "os.rmdir(name, dir_fd=descriptor)",
+        "(target / child_relative).rmdir()",
+        "builder_contract",
+    )
+    reject_builder(
+        "builder_cargo_target_external_scratch_hardlink_accepted",
+        "len(aliases) != aliases[0].st_nlink",
+        "len(aliases) < 0",
+        "builder_contract",
+    )
+    reject_builder(
+        "builder_cargo_target_scratch_probe_removed",
+        '"scratch_pruned": True',
+        '"scratch_pruned": False',
+        "builder_contract",
+    )
+    reject_builder(
+        "builder_cargo_target_symlink_probe_removed",
+        '"scratch_symlink": True',
+        '"scratch_symlink": False',
+        "builder_contract",
+    )
+    reject_builder(
+        "builder_cargo_artifact_external_alias_probe_removed",
+        '("external-only", {"external_aliases": ("outside",)}),',
+        '("external-only", {"external_aliases": ()}),',
+        "builder_contract",
+    )
+    reject_builder(
+        "builder_cargo_artifact_frozen_source_not_replayed",
+        "if replayed_source != recorded_source:",
+        "if False:",
+        "builder_contract",
+    )
+    reject_builder(
+        "builder_cargo_artifact_frozen_target_not_bound",
+        'target_before[field] != recorded_target[field]',
+        "False",
+        "builder_contract",
+    )
+    reject_builder(
+        "builder_cargo_artifact_frozen_target_not_read_only",
+        'target_before["permissions"] != 0o555',
+        "False",
+        "builder_contract",
+    )
+    reject_builder(
+        "builder_cargo_artifact_second_replay_removed",
+        "for _replay_pass in range(2):",
+        "for _replay_pass in range(1):",
+        "builder_contract",
+    )
+    reject_builder(
+        "builder_cargo_artifact_child_post_freeze_replay_removed",
+        'verify_frozen_build_artifacts(child_build, "current children post-freeze replay")',
+        'pass  # hostile omitted current-child post-freeze replay',
+        "builder_contract",
+    )
+    reject_builder(
+        "builder_cargo_artifact_post_copy_drift_probe_removed",
+        '"post_copy_drift_rejected": True',
+        '"post_copy_drift_rejected": False',
         "builder_contract",
     )
     reject_builder(
@@ -1632,6 +2009,12 @@ def self_test(
         "builder_contract",
     )
     reject_builder(
+        "builder_overlay_line_mapping_not_required",
+        '"original_release_line_mapping_preserved",',
+        '"other_overlay_check",',
+        "builder_overlay_authority",
+    )
+    reject_builder(
         "builder_static_self_test_not_run",
         'if outputs[1]["hostile_mutations_rejected"] <= 0:\n        raise BuildError("build-children static self-test rejected no hostiles")',
         'if outputs[1]["hostile_mutations_rejected"] < 0:\n        raise BuildError("build-children static self-test rejected no hostiles")',
@@ -1676,6 +2059,18 @@ def self_test(
         '"missing_other_guard"',
     )
     passed.append(expect_rejection("overlay_hostile_guard_missing", "overlay_validator", lambda: validate_overlay(patch, mutated_validator)))
+    mutated_validator = replace_once(
+        overlay_validator,
+        '"line_shift_before_original_eof"',
+        '"line_shift_probe_removed"',
+    )
+    passed.append(expect_rejection("overlay_line_mapping_probe_missing", "overlay_validator", lambda: validate_overlay(patch, mutated_validator)))
+    mutated_validator = replace_once(
+        overlay_validator,
+        '"exact_test_only_eof_tail_identity"',
+        '"other_tail_identity_check"',
+    )
+    passed.append(expect_rejection("overlay_tail_identity_check_missing", "overlay_validator", lambda: validate_overlay(patch, mutated_validator)))
     return passed
 
 

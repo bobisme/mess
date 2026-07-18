@@ -14,6 +14,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Callable
 from unittest import mock
 
 
@@ -117,6 +118,7 @@ def sandbox_environment(
         "TZ": "UTC",
     }
     if release:
+        environment["LD_ORIGIN_PATH"] = adapters._GUEST_TOOLCHAIN_BIN
         environment.update(
             {name: f"synthetic-{name.lower()}" for name in adapters._RELEASE_BUILD_ENVIRONMENT_FIELDS}
         )
@@ -125,6 +127,7 @@ def sandbox_environment(
 
 def current_sandbox_environment(toolchain: dict[str, object]) -> dict[str, str]:
     environment = sandbox_environment(toolchain)
+    environment["LD_ORIGIN_PATH"] = adapters._GUEST_TOOLCHAIN_BIN
     environment["PATH"] = "/usr/bin:/bin"
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     environment["PYTHONNOUSERSITE"] = "1"
@@ -196,6 +199,30 @@ def current_retained_file(path: Path, *, trusted: bool) -> dict[str, object]:
         "identity": current_file_identity(exact),
         "path_chain": current_path_chain(exact) if trusted else None,
         "trusted_system": trusted,
+    }
+
+
+def retained_null_device() -> dict[str, object]:
+    path = Path("/dev/null")
+    metadata = path.lstat()
+    return {
+        "identity": {
+            "changed_ns": metadata.st_ctime_ns,
+            "device": metadata.st_dev,
+            "gid": metadata.st_gid,
+            "inode": metadata.st_ino,
+            "link_count": metadata.st_nlink,
+            "major": os.major(metadata.st_rdev),
+            "minor": os.minor(metadata.st_rdev),
+            "modified_ns": metadata.st_mtime_ns,
+            "path": str(path),
+            "permissions": stat.S_IMODE(metadata.st_mode),
+            "size": metadata.st_size,
+            "type": stat.S_IFMT(metadata.st_mode),
+            "uid": metadata.st_uid,
+        },
+        "parent_path_chain": current_path_chain(path.parent),
+        "trusted_system": True,
     }
 
 
@@ -493,11 +520,13 @@ def release_attestation(
     )
     names = (
         *(f"system:{guest}" for _host, guest in adapters._TRUSTED_SYSTEM_MOUNTS),
+        "dev_null",
         "source",
         "target",
         "toolchain_root",
         "cargo",
         "rustc",
+        "rust_lld",
         "cargo_home",
         *(f"config:{guest}" for guest in adapters._GUEST_BOUND_CONFIG_PATHS),
     )
@@ -507,7 +536,11 @@ def release_attestation(
         config_path, source_root, Path(str(toolchain["cargo_home_path"]))
     )
     argv = adapters._release_sandbox_argv(
-        descriptor_map, package, example, str(toolchain["bwrap_path"])
+        descriptor_map,
+        package,
+        example,
+        str(toolchain["bwrap_path"]),
+        str(toolchain["rustc_host"]),
     )
     build_env = sandbox_environment(toolchain, release=True)
     build_env["ASTERISM_BUILD_SOURCE_APPROVAL_SHA256"] = source_approval_sha256
@@ -515,6 +548,10 @@ def release_attestation(
     for index, argument in enumerate(normalized):
         if argument in {"--ro-bind-fd", "--bind-fd"}:
             normalized[index + 1] = f"$FD:{normalized[index + 2]}"
+        elif argument == "--dev-bind":
+            normalized[index + 1] = "$FD:/dev/null"
+        elif argument == "--overlay-src":
+            normalized[index + 1] = "$FD:cargo-home-overlay"
     sequence = {
         "build-A": 1,
         "build-B": 3,
@@ -546,6 +583,7 @@ def release_attestation(
         "output_path": str(build_log_path),
         "output_sha256": build_log_sha256,
         "pid": pid,
+        "passed_file_descriptors": 16,
         "process_group_absent": True,
         "reaping": {"pid": pid, "start_ticks": pid + 1, "status": "absent"},
         "start_ticks": pid + 1,
@@ -556,6 +594,29 @@ def release_attestation(
     }
     contract_output = prepared_root / "manifests" / f"contract-{label}.json"
     contract_output_sha256 = write_canonical(contract_output, contract, 0o444)
+    toolchain_root = Path(str(toolchain["cargo_path"])).parent.parent
+    rust_lld_path = (
+        toolchain_root
+        / "lib"
+        / "rustlib"
+        / str(toolchain["rustc_host"])
+        / "bin"
+        / "rust-lld"
+    )
+    root_metadata = toolchain_root.lstat()
+    execution_tools = {
+        "bwrap": release_file_binding(Path(str(toolchain["bwrap_path"]))),
+        "cargo": release_file_binding(Path(str(toolchain["cargo_path"]))),
+        "dev_null": retained_null_device(),
+        "rustc": release_file_binding(Path(str(toolchain["rustc_path"]))),
+        "rust_lld": release_file_binding(rust_lld_path),
+        "toolchain_root": {
+            "device": root_metadata.st_dev,
+            "inode": root_metadata.st_ino,
+            "link_count": root_metadata.st_nlink,
+            "mode": stat.S_IMODE(root_metadata.st_mode),
+        },
+    }
     attestation: dict[str, object] = {
         "source_commit": "1" * 40,
         "source_tree": "2" * 40,
@@ -591,6 +652,7 @@ def release_attestation(
             "path": str(config_path),
             "sha256": config_sha,
         },
+        "execution_tools": execution_tools,
         "semantic_input_authority": semantic,
         "toolchain": toolchain,
         "build_started_at": started_at,
@@ -609,6 +671,9 @@ def release_attestation(
             {
                 "argv": normalized,
                 "cargo_config_search_sha256": config_sha,
+                "execution_tools_sha256": sha256(
+                    adapters.canonical_json(execution_tools)
+                ),
                 "semantic_runtime_sha256": semantic["runtime_sha256"],
             }
         )
@@ -924,6 +989,17 @@ def live_authority(
     for tool in (cargo, git, rustc):
         tool.write_bytes(f"synthetic {tool.name}\n".encode())
         tool.chmod(0o555)
+    rust_lld = (
+        toolchain_root
+        / "lib"
+        / "rustlib"
+        / "x86_64-unknown-linux-gnu"
+        / "bin"
+        / "rust-lld"
+    )
+    rust_lld.parent.mkdir(parents=True)
+    rust_lld.write_bytes(b"synthetic rust-lld\n")
+    rust_lld.chmod(0o555)
     toolchain_bin.chmod(0o555)
     toolchain_root.chmod(0o555)
     cargo_home = root / "cargo-home"
@@ -953,6 +1029,8 @@ def live_authority(
             "host: x86_64-unknown-linux-gnu"
         ),
         "rustc_host": "x86_64-unknown-linux-gnu",
+        "rust_lld_path": str(rust_lld),
+        "rust_lld_sha256": sha256(rust_lld.read_bytes()),
         "rustup_home_path": str(rustup_home),
         "rustup_path": str(rustup),
         "rustup_sha256": sha256(rustup.read_bytes()),
@@ -1092,7 +1170,7 @@ def live_authority(
                 "--ro-bind-data",
                 f"{adapters._GUEST_SOURCE}/.cargo/config",
             ),
-            ("cargo_home", "--ro-bind-fd", adapters._GUEST_CARGO_HOME),
+            ("cargo_home", "--tmp-overlay", adapters._GUEST_CARGO_HOME),
             (
                 f"config:{adapters._GUEST_CARGO_HOME}/config.toml",
                 "--ro-bind-data",
@@ -1106,10 +1184,12 @@ def live_authority(
         )
         descriptor_names = (
             *(f"system:{guest}" for _host, guest in adapters._TRUSTED_SYSTEM_MOUNTS),
+            "dev_null",
             "source",
             "toolchain_root",
             "cargo",
             "rustc",
+            "rust_lld",
             "python",
             *(binding[0] for binding in config_bindings),
             "target",
@@ -1130,6 +1210,7 @@ def live_authority(
             descriptors,
             config_bindings,
             bwrap_path=str(bwrap),
+            rustc_host=str(toolchain["rustc_host"]),
             examples=examples,
             wrapper=name == "children",
         )
@@ -1184,6 +1265,9 @@ def live_authority(
             source_artifact = target_examples / example
             source_artifact.write_bytes(f"synthetic current {source_name} {example}\n".encode())
             source_artifact.chmod(0o555)
+            source_artifact.with_name(
+                f"{example}-0123456789abcdef"
+            ).hardlink_to(source_artifact)
             destination = artifact_destinations[example]
             destination.write_bytes(source_artifact.read_bytes())
             destination.chmod(0o555)
@@ -1213,10 +1297,12 @@ def live_authority(
         execution_tools = {
             "bwrap": current_retained_file(bwrap, trusted=True),
             "cargo": current_retained_file(cargo, trusted=False),
+            "dev_null": retained_null_device(),
             "python": current_retained_file(
                 Path("/usr/bin/python3").resolve(strict=True), trusted=True
             ),
             "rustc": current_retained_file(rustc, trusted=False),
+            "rust_lld": current_retained_file(rust_lld, trusted=False),
             "toolchain_root": current_directory_identity(toolchain_root),
         }
         execution = {
@@ -1764,7 +1850,7 @@ def live_authority(
                 if variant_name == "B"
                 else "asterism_rebaseline_public"
             ),
-            descriptors=range(60, 73),
+            descriptors=range(60, 75),
             source_approval_sha256=approval_sha,
             contract=prepared_contracts[variant_name],
         )
@@ -1781,7 +1867,7 @@ def live_authority(
         toolchain=toolchain,
         package="mess-store",
         example="asterism_rebaseline_public",
-        descriptors=range(80, 93),
+        descriptors=range(80, 95),
         source_approval_sha256=approval_sha,
         contract=prepared_contracts["A"],
     )
@@ -1992,6 +2078,18 @@ def live_authority(
 
 
 class ParseTests(unittest.TestCase):
+    def test_current_overlay_constant_matches_reviewed_patch(self) -> None:
+        overlay = (
+            MODULE_PATH.parent
+            / "tooling"
+            / "current"
+            / "product-test-overlay.patch"
+        )
+        self.assertEqual(
+            sha256(overlay.read_bytes()),
+            adapters._CURRENT_PRODUCT_OVERLAY_SHA256,
+        )
+
     def test_profile_contract_exposes_integration_obligations(self) -> None:
         contract = adapters.profile_contract()
         self.assertEqual(
@@ -2585,7 +2683,14 @@ class AuthorityMutationTests(unittest.TestCase):
             ["absent"] * 4,
         )
         argv_descriptor_count = sum(
-            argument in {"--ro-bind-fd", "--bind-fd", "--ro-bind-data"}
+            argument
+            in {
+                "--ro-bind-fd",
+                "--bind-fd",
+                "--dev-bind",
+                "--ro-bind-data",
+                "--overlay-src",
+            }
             for argument in children["argv"]
         )
         cargo_home_preserved_count = len(
@@ -2617,9 +2722,102 @@ class AuthorityMutationTests(unittest.TestCase):
         root_bind = json.loads(json.dumps(current["builds"]["children"]))
         root_bind["argv"][4:4] = ["--ro-bind", "/", "/"]
         hostiles.append(("host-root-bind", "children", root_bind))
+
+        def add_current_overlay_hostile(
+            hostile_name: str, mutate: Callable[[list[str]], None]
+        ) -> None:
+            hostile = json.loads(json.dumps(current["builds"]["children"]))
+            mutate(hostile["argv"])
+            hostile["execution"]["argv"] = list(hostile["argv"])
+            hostiles.append((hostile_name, "children", hostile))
+
+        def replace_current_overlay_with_direct_bind(argv: list[str]) -> None:
+            index = argv.index("--overlay-src")
+            descriptor = argv[index + 1].removeprefix("/proc/self/fd/")
+            argv[index : index + 4] = [
+                "--ro-bind-fd",
+                descriptor,
+                adapters._GUEST_CARGO_HOME,
+            ]
+
+        def remove_current_overlay(argv: list[str]) -> None:
+            index = argv.index("--overlay-src")
+            del argv[index : index + 4]
+
+        def duplicate_current_overlay(argv: list[str]) -> None:
+            index = argv.index("--overlay-src")
+            argv[index:index] = argv[index : index + 4]
+
+        def reorder_current_overlay(argv: list[str]) -> None:
+            index = argv.index("--overlay-src")
+            overlay = argv[index : index + 4]
+            del argv[index : index + 4]
+            remount = next(
+                position
+                for position in range(len(argv) - 1)
+                if argv[position : position + 2]
+                == ["--remount-ro", adapters._GUEST_CARGO_HOME]
+            )
+            argv[remount:remount] = overlay
+
+        add_current_overlay_hostile(
+            "direct-cargo-home-bind", replace_current_overlay_with_direct_bind
+        )
+        add_current_overlay_hostile(
+            "host-cargo-home-overlay",
+            lambda argv: argv.__setitem__(
+                argv.index("--overlay-src") + 1, "/host/cargo-home"
+            ),
+        )
+        add_current_overlay_hostile(
+            "noncanonical-cargo-home-overlay-fd",
+            lambda argv: argv.__setitem__(
+                argv.index("--overlay-src") + 1, "/proc/self/fd/0100"
+            ),
+        )
+        add_current_overlay_hostile(
+            "aliased-cargo-home-overlay-fd",
+            lambda argv: argv.__setitem__(
+                argv.index("--overlay-src") + 1,
+                f"/proc/self/fd/{argv[argv.index('--ro-bind-fd') + 1]}",
+            ),
+        )
+        add_current_overlay_hostile(
+            "missing-cargo-home-overlay", remove_current_overlay
+        )
+        add_current_overlay_hostile(
+            "duplicate-cargo-home-overlay", duplicate_current_overlay
+        )
+        add_current_overlay_hostile(
+            "reordered-cargo-home-overlay", reorder_current_overlay
+        )
+        add_current_overlay_hostile(
+            "wrong-cargo-home-overlay-destination",
+            lambda argv: argv.__setitem__(
+                argv.index("--overlay-src") + 3, "/asterism/other-cargo-home"
+            ),
+        )
+        add_current_overlay_hostile(
+            "wrong-cargo-home-remount",
+            lambda argv: argv.__setitem__(
+                next(
+                    index + 1
+                    for index in range(len(argv) - 1)
+                    if argv[index : index + 2]
+                    == ["--remount-ro", adapters._GUEST_CARGO_HOME]
+                ),
+                "/asterism/other-cargo-home",
+            ),
+        )
         extra_environment = json.loads(json.dumps(current["builds"]["children"]))
         extra_environment["environment"]["ASTERISM_UNREVIEWED"] = "present"
         hostiles.append(("extra-asterism", "children", extra_environment))
+        missing_origin = json.loads(json.dumps(current["builds"]["children"]))
+        del missing_origin["environment"]["LD_ORIGIN_PATH"]
+        hostiles.append(("missing-loader-origin", "children", missing_origin))
+        host_origin = json.loads(json.dumps(current["builds"]["children"]))
+        host_origin["environment"]["LD_ORIGIN_PATH"] = "/host/toolchain/bin"
+        hostiles.append(("host-loader-origin", "children", host_origin))
         release_wrapper = json.loads(json.dumps(current["builds"]["hooked_release"]))
         release_wrapper["environment"]["RUSTC_WORKSPACE_WRAPPER"] = "/forged"
         hostiles.append(("release-wrapper-environment", "hooked_release", release_wrapper))
@@ -2629,6 +2827,15 @@ class AuthorityMutationTests(unittest.TestCase):
         fd_count = json.loads(json.dumps(current["builds"]["children"]))
         fd_count["execution"]["passed_file_descriptors"] -= cargo_home_preserved_count
         hostiles.append(("preserved-cargo-home-fd-cardinality", "children", fd_count))
+        for hostile_name, field, value in (
+            ("float-exit-status", "exit_status", 0.0),
+            ("bool-exit-status", "exit_status", False),
+            ("float-passed-file-descriptors", "passed_file_descriptors", 16.0),
+            ("bool-passed-file-descriptors", "passed_file_descriptors", True),
+        ):
+            scalar = json.loads(json.dumps(current["builds"]["children"]))
+            scalar["execution"][field] = value
+            hostiles.append((hostile_name, "children", scalar))
         lock = json.loads(json.dumps(current["builds"]["children"]))
         del lock["lock_postbuild"]["identity"]
         hostiles.append(("truncated-lock", "children", lock))
@@ -2651,11 +2858,56 @@ class AuthorityMutationTests(unittest.TestCase):
         tool = json.loads(json.dumps(current["builds"]["children"]))
         del tool["execution_tools"]["cargo"]["identity"]["sha256"]
         hostiles.append(("truncated-tool", "children", tool))
+        dev_float = json.loads(json.dumps(current["builds"]["children"]))
+        dev_float["execution_tools"]["dev_null"]["identity"]["minor"] = 3.0
+        hostiles.append(("float-null-device-minor", "children", dev_float))
+        lld_path = json.loads(json.dumps(current["builds"]["children"]))
+        lld_path["execution_tools"]["rust_lld"]["identity"]["path"] = str(
+            _toolchain["rustc_path"]
+        )
+        hostiles.append(("rust-lld-path", "children", lld_path))
+        for hostile_name, field, value in (
+            ("artifact-source-mode", "mode", 0o755),
+            (
+                "artifact-source-ctime",
+                "ctime_ns",
+                current["builds"]["children"]["artifacts"][
+                    "asterism_rebaseline_current_correctness"
+                ]["source"]["ctime_ns"]
+                + 1,
+            ),
+        ):
+            artifact_source = json.loads(
+                json.dumps(current["builds"]["children"])
+            )
+            artifact_source["artifacts"][
+                "asterism_rebaseline_current_correctness"
+            ]["source"][field] = value
+            hostiles.append((hostile_name, "children", artifact_source))
         for hostile_name, build_name, hostile in hostiles:
             with self.subTest(hostile_name), self.assertRaises(
                 adapters.ProfileEvidenceError
             ):
                 self.validate_current_build(build_name, hostile)
+        scratch = self.root / "artifact-source-replay"
+        scratch.mkdir()
+        primary = scratch / "artifact"
+        primary.write_bytes(b"synthetic profile artifact\n")
+        primary.chmod(0o555)
+        os.link(primary, scratch / "artifact-0123456789abcdef")
+        logical = Path("/proc/self/fd/900/release/examples/artifact")
+        record = current_file_identity(primary, logical_path=str(logical))
+        primary.chmod(0o755)
+        primary.chmod(0o555)
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters._current_bound_file_identity(
+                record,
+                "hostile profile chmod-restored artifact source",
+                actual_path=primary,
+                logical_path=str(logical),
+                executable=True,
+                expected_link_count=2,
+            )
 
     def test_exact_toolchain_contract_hash_version_and_shared_root(self) -> None:
         current, _root, toolchain, expected_root, _source_name = (
@@ -2682,6 +2934,14 @@ class AuthorityMutationTests(unittest.TestCase):
         rustc_host = dict(toolchain)
         rustc_host["rustc_host"] = "aarch64-unknown-linux-gnu"
         hostiles.append(("rustc-host", rustc_host))
+        path_host = dict(toolchain)
+        path_host["rustc_host"] = "../escape"
+        path_host["rustc_version_verbose"] = str(
+            toolchain["rustc_version_verbose"]
+        ).replace(
+            f"host: {toolchain['rustc_host']}", "host: ../escape"
+        )
+        hostiles.append(("path-like-rustc-host", path_host))
         other_root = self.root / "other-toolchain"
         other_bin = other_root / "bin"
         other_bin.mkdir(parents=True)
@@ -2917,6 +3177,14 @@ class AuthorityMutationTests(unittest.TestCase):
                 adapters._validate_prepared_release_attestation(
                     hostile, toolchain, f"hostile prepared {name}"
                 )
+        lld_topology = json.loads(json.dumps(attestation))
+        lld_topology["toolchain"]["rust_lld_path"] = lld_topology["toolchain"][
+            "rustc_path"
+        ]
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters._validate_prepared_execution_tools(
+                lld_topology, "hostile prepared rust-lld topology"
+            )
 
     def test_cargo_config_and_build_completion_are_deeply_replayed(self) -> None:
         paths = self.authority_paths()
@@ -2931,6 +3199,12 @@ class AuthorityMutationTests(unittest.TestCase):
         child_hostile["build_child"]["argv"] = ["forged"]
         with self.assertRaises(adapters.ProfileEvidenceError):
             adapters._validate_release_build_child(child_hostile, "forged build child")
+        descriptor_hostile = json.loads(json.dumps(attestation))
+        descriptor_hostile["build_child"]["passed_file_descriptors"] = 16.0
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters._validate_release_build_child(
+                descriptor_hostile, "forged build descriptor count"
+            )
 
         original_manifest = Path(attestation["cargo_config_search"]["path"])
         hostile_manifest = self.root / "hostile-cargo-config.json"
@@ -2989,6 +3263,20 @@ class AuthorityMutationTests(unittest.TestCase):
         rustup = json.loads(json.dumps(attestation))
         rustup["build_env"]["RUSTUP_HOME"] = "/host/rustup"
         hostiles.append(("rustup", rustup))
+        missing_origin = json.loads(json.dumps(attestation))
+        del missing_origin["build_env"]["LD_ORIGIN_PATH"]
+        hostiles.append(("missing-loader-origin", missing_origin))
+        host_origin = json.loads(json.dumps(attestation))
+        host_origin["build_env"]["LD_ORIGIN_PATH"] = "/host/toolchain/bin"
+        hostiles.append(("host-loader-origin", host_origin))
+        dev_float = json.loads(json.dumps(attestation))
+        dev_float["execution_tools"]["dev_null"]["identity"]["minor"] = 3.0
+        hostiles.append(("float-null-device-minor", dev_float))
+        lld_path = json.loads(json.dumps(attestation))
+        lld_path["execution_tools"]["rust_lld"]["path"] = str(
+            lld_path["toolchain"]["rustc_path"]
+        )
+        hostiles.append(("rust-lld-path", lld_path))
         aliased = json.loads(json.dumps(attestation))
         descriptor_indexes = [
             index + 1
@@ -2999,6 +3287,93 @@ class AuthorityMutationTests(unittest.TestCase):
             descriptor_indexes[0]
         ]
         hostiles.append(("aliased-fd", aliased))
+
+        def add_release_overlay_hostile(
+            hostile_name: str, mutate: Callable[[list[str]], None]
+        ) -> None:
+            hostile = json.loads(json.dumps(attestation))
+            mutate(hostile["build_argv"])
+            hostile["build_child"]["argv"] = list(hostile["build_argv"])
+            hostiles.append((hostile_name, hostile))
+
+        def replace_release_overlay_with_direct_bind(argv: list[str]) -> None:
+            index = argv.index("--overlay-src")
+            descriptor = argv[index + 1].removeprefix("/proc/self/fd/")
+            argv[index : index + 4] = [
+                "--ro-bind-fd",
+                descriptor,
+                adapters._GUEST_CARGO_HOME,
+            ]
+
+        def remove_release_overlay(argv: list[str]) -> None:
+            index = argv.index("--overlay-src")
+            del argv[index : index + 4]
+
+        def duplicate_release_overlay(argv: list[str]) -> None:
+            index = argv.index("--overlay-src")
+            argv[index:index] = argv[index : index + 4]
+
+        def reorder_release_overlay(argv: list[str]) -> None:
+            index = argv.index("--overlay-src")
+            overlay = argv[index : index + 4]
+            del argv[index : index + 4]
+            remount = next(
+                position
+                for position in range(len(argv) - 1)
+                if argv[position : position + 2]
+                == ["--remount-ro", adapters._GUEST_CARGO_HOME]
+            )
+            argv[remount:remount] = overlay
+
+        add_release_overlay_hostile(
+            "direct-cargo-home-bind", replace_release_overlay_with_direct_bind
+        )
+        add_release_overlay_hostile(
+            "host-cargo-home-overlay",
+            lambda argv: argv.__setitem__(
+                argv.index("--overlay-src") + 1, "/host/cargo-home"
+            ),
+        )
+        add_release_overlay_hostile(
+            "noncanonical-cargo-home-overlay-fd",
+            lambda argv: argv.__setitem__(
+                argv.index("--overlay-src") + 1, "/proc/self/fd/0409"
+            ),
+        )
+        add_release_overlay_hostile(
+            "aliased-cargo-home-overlay-fd",
+            lambda argv: argv.__setitem__(
+                argv.index("--overlay-src") + 1,
+                f"/proc/self/fd/{argv[argv.index('--ro-bind-fd') + 1]}",
+            ),
+        )
+        add_release_overlay_hostile(
+            "missing-cargo-home-overlay", remove_release_overlay
+        )
+        add_release_overlay_hostile(
+            "duplicate-cargo-home-overlay", duplicate_release_overlay
+        )
+        add_release_overlay_hostile(
+            "reordered-cargo-home-overlay", reorder_release_overlay
+        )
+        add_release_overlay_hostile(
+            "wrong-cargo-home-overlay-destination",
+            lambda argv: argv.__setitem__(
+                argv.index("--overlay-src") + 3, "/asterism/other-cargo-home"
+            ),
+        )
+        add_release_overlay_hostile(
+            "wrong-cargo-home-remount",
+            lambda argv: argv.__setitem__(
+                next(
+                    index + 1
+                    for index in range(len(argv) - 1)
+                    if argv[index : index + 2]
+                    == ["--remount-ro", adapters._GUEST_CARGO_HOME]
+                ),
+                "/asterism/other-cargo-home",
+            ),
+        )
         for name, hostile in hostiles:
             with self.subTest(name=name), self.assertRaises(
                 adapters.ProfileEvidenceError
@@ -3048,6 +3423,92 @@ class AuthorityMutationTests(unittest.TestCase):
             hostile = json.loads(json.dumps(valid))
             hostile[field] = value
             hostiles.append((name, hostile))
+
+        def add_resolution_overlay_hostile(
+            hostile_name: str, mutate: Callable[[list[str]], None]
+        ) -> None:
+            hostile = json.loads(json.dumps(valid))
+            mutate(hostile["argv"])
+            hostiles.append((hostile_name, hostile))
+
+        def replace_resolution_overlay_with_direct_bind(argv: list[str]) -> None:
+            index = argv.index("--overlay-src")
+            descriptor = argv[index + 1].removeprefix("/proc/self/fd/")
+            argv[index : index + 4] = [
+                "--ro-bind-fd",
+                descriptor,
+                adapters._GUEST_CARGO_HOME,
+            ]
+
+        def reorder_resolution_overlay(argv: list[str]) -> None:
+            index = argv.index("--overlay-src")
+            overlay = argv[index : index + 4]
+            del argv[index : index + 4]
+            remount = next(
+                position
+                for position in range(len(argv) - 1)
+                if argv[position : position + 2]
+                == ["--remount-ro", adapters._GUEST_CARGO_HOME]
+            )
+            argv[remount:remount] = overlay
+
+        def remove_resolution_overlay(argv: list[str]) -> None:
+            index = argv.index("--overlay-src")
+            del argv[index : index + 4]
+
+        def duplicate_resolution_overlay(argv: list[str]) -> None:
+            index = argv.index("--overlay-src")
+            argv[index:index] = argv[index : index + 4]
+
+        add_resolution_overlay_hostile(
+            "direct-cargo-home-bind", replace_resolution_overlay_with_direct_bind
+        )
+        add_resolution_overlay_hostile(
+            "host-cargo-home-overlay",
+            lambda argv: argv.__setitem__(
+                argv.index("--overlay-src") + 1, "/host/cargo-home"
+            ),
+        )
+        add_resolution_overlay_hostile(
+            "noncanonical-cargo-home-overlay-fd",
+            lambda argv: argv.__setitem__(
+                argv.index("--overlay-src") + 1, "/proc/self/fd/040"
+            ),
+        )
+        add_resolution_overlay_hostile(
+            "aliased-cargo-home-overlay-fd",
+            lambda argv: argv.__setitem__(
+                argv.index("--overlay-src") + 1,
+                f"/proc/self/fd/{argv[argv.index('--ro-bind-fd') + 1]}",
+            ),
+        )
+        add_resolution_overlay_hostile(
+            "missing-cargo-home-overlay", remove_resolution_overlay
+        )
+        add_resolution_overlay_hostile(
+            "duplicate-cargo-home-overlay", duplicate_resolution_overlay
+        )
+        add_resolution_overlay_hostile(
+            "reordered-cargo-home-overlay", reorder_resolution_overlay
+        )
+        add_resolution_overlay_hostile(
+            "wrong-cargo-home-overlay-destination",
+            lambda argv: argv.__setitem__(
+                argv.index("--overlay-src") + 3, "/asterism/other-cargo-home"
+            ),
+        )
+        add_resolution_overlay_hostile(
+            "wrong-cargo-home-remount",
+            lambda argv: argv.__setitem__(
+                next(
+                    index + 1
+                    for index in range(len(argv) - 1)
+                    if argv[index : index + 2]
+                    == ["--remount-ro", adapters._GUEST_CARGO_HOME]
+                ),
+                "/asterism/other-cargo-home",
+            ),
+        )
         role = json.loads(json.dumps(valid))
         role["semantic_input_authority"]["source"]["role"] = "source"
         hostiles.append(("semantic-role", role))

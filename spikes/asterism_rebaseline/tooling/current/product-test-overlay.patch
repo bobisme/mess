@@ -1,10 +1,75 @@
 diff --git a/crates/mess-store/src/engine.rs b/crates/mess-store/src/engine.rs
-index 5e03390..5eb5541 100644
+index 5e03390..ee78104 100644
 --- a/crates/mess-store/src/engine.rs
 +++ b/crates/mess-store/src/engine.rs
-@@ -402,3 +402,428 @@
- type EngineFile = <EngineFs as LogFs>::File;
--
+@@ -1347,3 +1347,3 @@
+ #[cfg(test)]
+-struct TestOwnerCohortGuard {
++pub struct TestOwnerCohortGuard {
+     gate:       Arc<TestOwnerCohortGate>,
+@@ -1500,3 +1500,3 @@
+-struct FlatOwner {
++struct FlatOwner { #[cfg(not(test))]
+-    direct:                          DirectCommitter<RealRuntime, EngineFs>,
++    direct:                          DirectCommitter<RealRuntime, EngineFs>, #[cfg(test)] direct: DirectCommitter<RealRuntime, TestEngineFs>,
+     publish:                         Arc<PublishState>,
+@@ -1511,2 +1511,2 @@
+-    cohort_gate:                     Arc<TestOwnerCohortGate>,
++    cohort_gate:                     Arc<TestOwnerCohortGate>, #[cfg(test)] test_hooks: Arc<TestEngineHooks>,
+ }
+@@ -1798,2 +1798,2 @@
+-        let mut first_error: Option<EngineError> = None;
++        let mut first_error: Option<EngineError> = None; #[cfg(test)] let mut published = false;
+         if let Some((first_version, count)) = reg_span {
+@@ -1821,2 +1821,2 @@
+-                        );
++                        ); #[cfg(test)] { published = true; }
+                     }
+@@ -1894,2 +1894,2 @@
+-            );
++            ); #[cfg(test)] { published = true; }
+             appended = Some(Appended {
+@@ -1903,2 +1903,2 @@
+-        };
++        }; #[cfg(test)] if published { self.test_hooks.rendezvous(TestEngineHookPoint::PostPublicationPreCompletion); }
+         completion.finish(result);
+@@ -1992,2 +1992,2 @@
+-        );
++        ); #[cfg(test)] self.test_hooks.rendezvous(TestEngineHookPoint::PostPublicationPreCompletion);
+         completion.finish(Ok(Appended {
+@@ -2009,2 +2009,2 @@
+-            #[cfg(test)]
++            #[cfg(test)] self.test_hooks.rendezvous(TestEngineHookPoint::Admission); #[cfg(test)]
+             self.cohort_gate.wait_until_cohort_admitted();
+@@ -2116,2 +2116,2 @@
+-    rt:                   RealRuntime,
++    rt:                   RealRuntime, #[cfg(test)] test_hooks: Arc<TestEngineHooks>,
+     /// The one flat-combined owner. Its thread owns the segment writer and
+@@ -2193,2 +2193,2 @@
+-    fn drop(&mut self) {
++    fn drop(&mut self) { #[cfg(test)] self.test_hooks.disarm_all();
+         // Order is load-bearing (`bn-1vu`). 1) Close and join the owner: it
+@@ -2550,2 +2550,2 @@
+-        let seg_path = segment_path(dir, active_seg_id);
++        let seg_path = segment_path(dir, active_seg_id); #[cfg(test)] let test_hooks = Arc::new(TestEngineHooks::default()); #[cfg(test)] let writer = test_segment_writer(&rt, plan, &seg_path, opts.segment_size, &test_hooks)?; #[cfg(not(test))]
+         let writer = match plan {
+@@ -2700,2 +2700,2 @@
+-            cohort_gate: Arc::clone(&owner_cohort_gate),
++            cohort_gate: Arc::clone(&owner_cohort_gate), #[cfg(test)] test_hooks: Arc::clone(&test_hooks),
+         };
+@@ -2711,2 +2711,2 @@
+-                rt,
++                rt, #[cfg(test)] test_hooks,
+                 owner: AppendOwner {
+@@ -4674,2 +4674,2 @@
+-#[cfg(all(test, not(miri)))]
++#[cfg(all(test, not(miri), not(asterism_rebaseline_correctness)))]
+ mod append_gate_tests;
+@@ -4677,2 +4677,2 @@
+-#[cfg(test)]
++#[cfg(all(test, not(asterism_rebaseline_correctness)))]
+ mod seal_skip_tests {
+@@ -4804,0 +4805,493 @@
 +/// Exact one-shot append-engine phases exposed only to product tests.
 +#[cfg(test)]
 +#[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -431,14 +496,8 @@ index 5e03390..5eb5541 100644
 +        self.inner.allocate(len)
 +    }
 +}
- /// One decoded, CRC-validated committed batch — the immutable block-backed
-@@ -1347,3 +1772,3 @@
- #[cfg(test)]
--struct TestOwnerCohortGuard {
-+pub struct TestOwnerCohortGuard {
-     gate:       Arc<TestOwnerCohortGate>,
-@@ -1353,2 +1778,9 @@
- #[cfg(test)]
++
++#[cfg(test)]
 +impl TestOwnerCohortGuard {
 +    pub fn wait_until_admitted(&self, at_least: usize) {
 +        self.gate.wait_until_admitted(at_least);
@@ -446,155 +505,61 @@ index 5e03390..5eb5541 100644
 +}
 +
 +#[cfg(test)]
- impl Drop for TestOwnerCohortGuard {
-@@ -1500,3 +1932,6 @@
- struct FlatOwner {
-+    #[cfg(not(test))]
-     direct:                          DirectCommitter<RealRuntime, EngineFs>,
-+    #[cfg(test)]
-+    direct: DirectCommitter<RealRuntime, TestEngineFs>,
-     publish:                         Arc<PublishState>,
-@@ -1511,2 +1946,4 @@
-     cohort_gate:                     Arc<TestOwnerCohortGate>,
-+    #[cfg(test)]
-+    test_hooks:                      Arc<TestEngineHooks>,
- }
-@@ -1798,2 +2235,4 @@
-         let mut first_error: Option<EngineError> = None;
-+        #[cfg(test)]
-+        let mut published = false;
-         if let Some((first_version, count)) = reg_span {
-@@ -1821,2 +2260,6 @@
-                         );
-+                        #[cfg(test)]
-+                        {
-+                            published = true;
-+                        }
-                     }
-@@ -1894,2 +2337,6 @@
-             );
-+            #[cfg(test)]
-+            {
-+                published = true;
-+            }
-             appended = Some(Appended {
-@@ -1903,2 +2350,8 @@
-         };
-+        #[cfg(test)]
-+        if published {
-+            self.test_hooks.rendezvous(
-+                TestEngineHookPoint::PostPublicationPreCompletion,
-+            );
-+        }
-         completion.finish(result);
-@@ -1992,2 +2445,6 @@
-         );
-+        #[cfg(test)]
-+        self.test_hooks.rendezvous(
-+            TestEngineHookPoint::PostPublicationPreCompletion,
-+        );
-         completion.finish(Ok(Appended {
-@@ -2009,2 +2466,4 @@
-             #[cfg(test)]
-+            self.test_hooks.rendezvous(TestEngineHookPoint::Admission);
-+            #[cfg(test)]
-             self.cohort_gate.wait_until_cohort_admitted();
-@@ -2116,2 +2575,4 @@
-     rt:                   RealRuntime,
-+    #[cfg(test)]
-+    test_hooks:           Arc<TestEngineHooks>,
-     /// The one flat-combined owner. Its thread owns the segment writer and
-@@ -2193,2 +2654,6 @@
-     fn drop(&mut self) {
-+        // Test-only unwind safety: release every engine rendezvous before the
-+        // owner join below, so a dropped guard/engine cannot strand shutdown.
-+        #[cfg(test)]
-+        self.test_hooks.disarm_all();
-         // Order is load-bearing (`bn-1vu`). 1) Close and join the owner: it
-@@ -2496,2 +2961,18 @@
- impl LogEngine {
++impl LogEngine {
 +    /// Arm one generation-bound engine hook. This API exists only in unit-test
 +    /// builds, so no release or benchmark binary can enable the overlay.
-+    #[cfg(test)]
 +    pub fn arm_test_hook(&self, hook: TestEngineHook) -> TestEngineHookGuard {
 +        self.inner.test_hooks.arm(hook)
 +    }
 +
 +    /// Cohort a known number of already-open-engine append intents.
-+    #[cfg(test)]
 +    pub fn arm_test_owner_cohort(
 +        &self,
 +        expected: usize,
 +    ) -> TestOwnerCohortGuard {
 +        self.inner.owner.cohort_gate.arm(expected)
 +    }
++}
 +
-     /// Open (creating if absent) a composed engine rooted at `dir`, default
-@@ -2550,2 +3031,5 @@
-         let seg_path = segment_path(dir, active_seg_id);
-+        #[cfg(test)]
-+        let test_hooks = Arc::new(TestEngineHooks::default());
-+        #[cfg(not(test))]
-         let writer = match plan {
-@@ -2584,3 +3068,42 @@
-         };
--
-+        #[cfg(test)]
-+        let writer = {
-+            // The hook state exists during open but cannot be armed until a
-+            // fully constructed LogEngine has been returned to the test.
-+            let fs = TestEngineFs {
-+                inner: rt.fs(),
-+                hooks: Arc::clone(&test_hooks),
++#[cfg(test)]
++fn test_segment_writer(
++    rt: &RealRuntime,
++    plan: ResumePlan,
++    seg_path: &Path,
++    segment_size: u64,
++    test_hooks: &Arc<TestEngineHooks>,
++) -> Result<SegmentWriter<TestEngineFs>, EngineError> {
++    let fs = TestEngineFs {
++        inner: rt.fs(),
++        hooks: Arc::clone(test_hooks),
++    };
++    match plan {
++        ResumePlan::Fresh => {
++            let params = SegmentParams {
++                segment_id:         ACTIVE_SEGMENT_ID,
++                base_pos:           0,
++                epoch:              1,
++                prev_segment_epoch: 0,
++                created_unix_nanos: 0,
++                segment_size,
 +            };
-+            match plan {
-+                ResumePlan::Fresh => {
-+                    let params = SegmentParams {
-+                        segment_id:         ACTIVE_SEGMENT_ID,
-+                        base_pos:           0,
-+                        epoch:              1,
-+                        prev_segment_epoch: 0,
-+                        created_unix_nanos: 0,
-+                        segment_size:       opts.segment_size,
-+                    };
-+                    SegmentWriter::create(&fs, &seg_path, params).map_err(
-+                        |e| EngineError::Open(format!("segment create: {e}")),
-+                    )?
-+                }
-+                ResumePlan::Resume(info) => {
-+                    let params = ResumeParams {
-+                        segment_id:    info.segment_id,
-+                        base_pos:      info.base_pos,
-+                        epoch:         info.epoch,
-+                        segment_size:  opts.segment_size,
-+                        write_off:     info.write_off,
-+                        next_batch_id: info.next_batch_id,
-+                        next_pos:      info.next_pos,
-+                        batch_count:   info.batch_count,
-+                        event_count:   info.event_count,
-+                    };
-+                    SegmentWriter::resume(&fs, &seg_path, params).map_err(
-+                        |e| EngineError::Open(format!("segment resume: {e}")),
-+                    )?
-+                }
-+            }
-+        };
-         // Wire live auto-roll (bn-1vu): the committer rolls to a fresh segment
-@@ -2700,2 +3223,4 @@
-             cohort_gate: Arc::clone(&owner_cohort_gate),
-+            #[cfg(test)]
-+            test_hooks: Arc::clone(&test_hooks),
-         };
-@@ -2711,2 +3236,4 @@
-                 rt,
-+                #[cfg(test)]
-+                test_hooks,
-                 owner: AppendOwner {
-@@ -4674,2 +5201,2 @@
--#[cfg(all(test, not(miri)))]
-+#[cfg(all(test, not(miri), not(asterism_rebaseline_correctness)))]
- mod append_gate_tests;
-@@ -4677,2 +5204,2 @@
--#[cfg(test)]
-+#[cfg(all(test, not(asterism_rebaseline_correctness)))]
- mod seal_skip_tests {
++            SegmentWriter::create(&fs, seg_path, params)
++                .map_err(|e| EngineError::Open(format!("segment create: {e}")))
++        }
++        ResumePlan::Resume(info) => {
++            let params = ResumeParams {
++                segment_id: info.segment_id,
++                base_pos: info.base_pos,
++                epoch: info.epoch,
++                segment_size,
++                write_off: info.write_off,
++                next_batch_id: info.next_batch_id,
++                next_pos: info.next_pos,
++                batch_count: info.batch_count,
++                event_count: info.event_count,
++            };
++            SegmentWriter::resume(&fs, seg_path, params)
++                .map_err(|e| EngineError::Open(format!("segment resume: {e}")))
++        }
++    }
++}

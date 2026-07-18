@@ -25,6 +25,94 @@ CORRECTNESS_CFG = "asterism_rebaseline_correctness"
 HERE = Path(__file__).resolve().parent
 REPOSITORY = HERE.parents[3]
 PATCH_PATH = HERE / "product-test-overlay.patch"
+EXPECTED_TAIL_SHA256 = "b7b960944a39ae0274655a778884fca6ad1d477e7c5f84ad1a655971636a21b5"
+ALLOWED_RELEASE_LINE_REPLACEMENTS = {
+    (
+        1348,
+        "struct TestOwnerCohortGuard {",
+        "pub struct TestOwnerCohortGuard {",
+    ),
+    (
+        1500,
+        "struct FlatOwner {",
+        "struct FlatOwner { #[cfg(not(test))]",
+    ),
+    (
+        1501,
+        "    direct:                          DirectCommitter<RealRuntime, EngineFs>,",
+        "    direct:                          DirectCommitter<RealRuntime, EngineFs>, #[cfg(test)] direct: DirectCommitter<RealRuntime, TestEngineFs>,",
+    ),
+    (
+        1511,
+        "    cohort_gate:                     Arc<TestOwnerCohortGate>,",
+        "    cohort_gate:                     Arc<TestOwnerCohortGate>, #[cfg(test)] test_hooks: Arc<TestEngineHooks>,",
+    ),
+    (
+        1798,
+        "        let mut first_error: Option<EngineError> = None;",
+        "        let mut first_error: Option<EngineError> = None; #[cfg(test)] let mut published = false;",
+    ),
+    (
+        1821,
+        "                        );",
+        "                        ); #[cfg(test)] { published = true; }",
+    ),
+    (
+        1894,
+        "            );",
+        "            ); #[cfg(test)] { published = true; }",
+    ),
+    (
+        1903,
+        "        };",
+        "        }; #[cfg(test)] if published { self.test_hooks.rendezvous(TestEngineHookPoint::PostPublicationPreCompletion); }",
+    ),
+    (
+        1992,
+        "        );",
+        "        ); #[cfg(test)] self.test_hooks.rendezvous(TestEngineHookPoint::PostPublicationPreCompletion);",
+    ),
+    (
+        2009,
+        "            #[cfg(test)]",
+        "            #[cfg(test)] self.test_hooks.rendezvous(TestEngineHookPoint::Admission); #[cfg(test)]",
+    ),
+    (
+        2116,
+        "    rt:                   RealRuntime,",
+        "    rt:                   RealRuntime, #[cfg(test)] test_hooks: Arc<TestEngineHooks>,",
+    ),
+    (
+        2193,
+        "    fn drop(&mut self) {",
+        "    fn drop(&mut self) { #[cfg(test)] self.test_hooks.disarm_all();",
+    ),
+    (
+        2550,
+        "        let seg_path = segment_path(dir, active_seg_id);",
+        "        let seg_path = segment_path(dir, active_seg_id); #[cfg(test)] let test_hooks = Arc::new(TestEngineHooks::default()); #[cfg(test)] let writer = test_segment_writer(&rt, plan, &seg_path, opts.segment_size, &test_hooks)?; #[cfg(not(test))]",
+    ),
+    (
+        2700,
+        "            cohort_gate: Arc::clone(&owner_cohort_gate),",
+        "            cohort_gate: Arc::clone(&owner_cohort_gate), #[cfg(test)] test_hooks: Arc::clone(&test_hooks),",
+    ),
+    (
+        2711,
+        "                rt,",
+        "                rt, #[cfg(test)] test_hooks,",
+    ),
+    (
+        4674,
+        "#[cfg(all(test, not(miri)))]",
+        "#[cfg(all(test, not(miri), not(asterism_rebaseline_correctness)))]",
+    ),
+    (
+        4677,
+        "#[cfg(test)]",
+        "#[cfg(all(test, not(asterism_rebaseline_correctness)))]",
+    ),
+}
 
 
 class ValidationError(RuntimeError):
@@ -63,7 +151,19 @@ def replace_once(text: str, old: str, new: str) -> str:
     return text.replace(old, new, 1)
 
 
+def move_tail_hunk_first(patch_text: str) -> str:
+    first_hunk = patch_text.index("@@ ")
+    tail_hunk = patch_text.index("@@ -4804,0 +4805,493 @@")
+    return (
+        patch_text[:first_hunk]
+        + patch_text[tail_hunk:]
+        + patch_text[first_hunk:tail_hunk]
+    )
+
+
 def parse_patch(patch_text: str) -> tuple[Path, list[Hunk]]:
+    if "\\ No newline at end of file" in patch_text:
+        fail("compatibility", "no-newline patch markers are forbidden")
     old_headers = re.findall(r"^--- a/(.+)$", patch_text, re.MULTILINE)
     new_headers = re.findall(r"^\+\+\+ b/(.+)$", patch_text, re.MULTILINE)
     diff_headers = re.findall(
@@ -152,6 +252,104 @@ def apply_in_memory(base: str, hunks: list[Hunk]) -> str:
     return "".join(output)
 
 
+def validate_original_line_mapping(
+    base: str,
+    patched: str,
+    hunks: list[Hunk],
+) -> None:
+    """Require a count-neutral prefix plus one pure append after the old EOF."""
+
+    original_lines = base.splitlines(keepends=True)
+    patched_lines = patched.splitlines(keepends=True)
+    if not base.endswith("\n") or not patched.endswith("\n"):
+        fail(
+            "original_line_mapping",
+            "base and patched engine source must retain a final newline",
+        )
+    tail_hunks = [
+        hunk
+        for hunk in hunks
+        if hunk.old_count == 0 and hunk.old_start == len(original_lines)
+    ]
+    if len(tail_hunks) != 1:
+        fail(
+            "original_line_mapping",
+            "overlay must contain exactly one pure append after original EOF",
+        )
+    tail = tail_hunks[0]
+    if (
+        hunks[-1] is not tail
+        or tail.new_start != len(original_lines) + 1
+        or tail.new_count <= 0
+        or any(not line.startswith("+") for line in tail.lines)
+        or sum(line.startswith("+") for line in tail.lines) != tail.new_count
+    ):
+        fail("original_line_mapping", "tail append shape differs")
+
+    for hunk in hunks:
+        if hunk is tail:
+            continue
+        if (
+            hunk.old_count <= 0
+            or hunk.old_start != hunk.new_start
+            or hunk.old_count != hunk.new_count
+        ):
+            fail(
+                "original_line_mapping",
+                "non-tail hunk changes the original line coordinates",
+            )
+        deleted = 0
+        added = 0
+
+        def finish_run() -> None:
+            nonlocal deleted, added
+            if deleted != added:
+                fail(
+                    "original_line_mapping",
+                    "contiguous non-tail change run shifts following lines",
+                )
+            deleted = 0
+            added = 0
+
+        for line in hunk.lines:
+            if line.startswith("-"):
+                deleted += 1
+            elif line.startswith("+"):
+                added += 1
+            elif line.startswith(" "):
+                finish_run()
+        finish_run()
+
+    if len(patched_lines) != len(original_lines) + tail.new_count:
+        fail("original_line_mapping", "patched line cardinality differs")
+    for ordinal, (original, observed) in enumerate(
+        zip(original_lines, patched_lines, strict=False),
+        start=1,
+    ):
+        original_text = original.removesuffix("\n")
+        observed_text = observed.removesuffix("\n")
+        if observed_text == original_text:
+            continue
+        if (
+            ordinal,
+            original_text,
+            observed_text,
+        ) in ALLOWED_RELEASE_LINE_REPLACEMENTS:
+            continue
+        fail(
+            "original_line_mapping",
+            f"original release tokens differ at line {ordinal}",
+        )
+
+
+def validate_tail_identity(hunks: list[Hunk]) -> None:
+    """Pin the complete cfg(test)-only EOF item surface."""
+
+    tail_bytes = "".join(line[1:] for line in hunks[-1].lines).encode()
+    if sha256(tail_bytes) != EXPECTED_TAIL_SHA256:
+        fail("tail_identity", "exact cfg(test)-only EOF append differs")
+
+
 def require(text: str, needle: str, code: str) -> None:
     if needle not in text:
         fail(code, f"required marker absent: {needle!r}")
@@ -192,16 +390,20 @@ def validate_cfg_dominance(source: str, patch_text: str) -> None:
         require_once(source, marker, "cfg_test_dominance")
 
     local_markers = (
-        "#[cfg(test)]\n    test_hooks:                      Arc<TestEngineHooks>",
-        "#[cfg(test)]\n    test_hooks:           Arc<TestEngineHooks>",
-        "// owner join below, so a dropped guard/engine cannot strand shutdown.\n        #[cfg(test)]\n        self.test_hooks.",
-        "#[cfg(test)]\n            self.test_hooks.rendezvous(",
-        "#[cfg(test)]\n        let test_hooks = Arc::new(TestEngineHooks::default());",
-        "#[cfg(test)]\n        let writer = {",
-        "#[cfg(test)]\n            test_hooks: Arc::clone(&test_hooks),",
-        "#[cfg(test)]\n                test_hooks,",
-        "#[cfg(test)]\n    pub fn arm_test_hook",
-        "#[cfg(test)]\n    pub fn arm_test_owner_cohort",
+        "struct FlatOwner { #[cfg(not(test))]",
+        "DirectCommitter<RealRuntime, EngineFs>, #[cfg(test)] direct: DirectCommitter<RealRuntime, TestEngineFs>",
+        "cohort_gate:                     Arc<TestOwnerCohortGate>, #[cfg(test)] test_hooks: Arc<TestEngineHooks>",
+        "rt:                   RealRuntime, #[cfg(test)] test_hooks: Arc<TestEngineHooks>",
+        "fn drop(&mut self) { #[cfg(test)] self.test_hooks.",
+        "            #[cfg(test)] self.test_hooks.rendezvous(",
+        "); #[cfg(test)]\n            self.cohort_gate.wait_until_cohort_admitted();",
+        "let seg_path = segment_path(dir, active_seg_id); #[cfg(test)] let test_hooks = Arc::new(TestEngineHooks::default());",
+        "test_segment_writer(&rt, plan, &seg_path, opts.segment_size, &test_hooks)?; #[cfg(not(test))]",
+        "cohort_gate: Arc::clone(&owner_cohort_gate), #[cfg(test)] test_hooks: Arc::clone(&test_hooks)",
+        "rt, #[cfg(test)] test_hooks,",
+        "#[cfg(test)]\nimpl LogEngine {",
+        "pub fn arm_test_hook",
+        "pub fn arm_test_owner_cohort",
     )
     for marker in local_markers:
         require_once(source, marker, "cfg_test_dominance")
@@ -331,9 +533,20 @@ def validate_after_open(source: str) -> None:
         "after_open_arming",
     )
     require(open_body, "let test_hooks = Arc::new(TestEngineHooks::default());", "after_open_arming")
-    require(open_body, "let fs = TestEngineFs {", "after_open_arming")
+    require(
+        open_body,
+        "test_segment_writer(&rt, plan, &seg_path, opts.segment_size, &test_hooks)?; "
+        "#[cfg(not(test))]\n        let writer = match plan {",
+        "after_open_arming",
+    )
+    require(open_body, "SegmentWriter::create(&rt.fs(),", "after_open_arming")
+    require(open_body, "SegmentWriter::resume(&rt.fs(),", "after_open_arming")
     if ".arm(" in open_body or "TestEngineHook::" in open_body:
         fail("after_open_arming", "hook can be armed during engine open")
+    helper = source[source.find("fn test_segment_writer(") :]
+    require(helper, "let fs = TestEngineFs {", "after_open_arming")
+    require(helper, "SegmentWriter::create(&fs,", "after_open_arming")
+    require(helper, "SegmentWriter::resume(&fs,", "after_open_arming")
     arm = function_slice(
         source,
         "    pub fn arm_test_hook(&self, hook: TestEngineHook)",
@@ -445,8 +658,12 @@ def validate_patch(
     validate_unwind(source)
     validate_faults(source)
     validate_normal_isolation(normal_overrides)
+    validate_original_line_mapping(base_bytes.decode(), source, hunks)
+    validate_tail_identity(hunks)
     return [
         "exact_source_and_patch_applicability",
+        "original_release_line_mapping_preserved",
+        "exact_test_only_eof_tail_identity",
         "cfg_test_dominance",
         "dev_only_test_modules_excluded_from_child_dependency_unit",
         "named_call_sites_and_order",
@@ -517,8 +734,8 @@ def self_test(patch_text: str) -> list[str]:
             "wrong_admission_site",
             replace_once(
                 patch_text,
-                "+            self.test_hooks.rendezvous(TestEngineHookPoint::Admission);",
-                "+            self.test_hooks.rendezvous(TestEngineHookPoint::PrePwrite);",
+                "self.test_hooks.rendezvous(TestEngineHookPoint::Admission);",
+                "self.test_hooks.rendezvous(TestEngineHookPoint::PrePwrite);",
             ),
             "named_call_sites",
         )
@@ -539,8 +756,8 @@ def self_test(patch_text: str) -> list[str]:
             "arming_during_open",
             replace_once(
                 patch_text,
-                "+        let test_hooks = Arc::new(TestEngineHooks::default());",
-                "+        let test_hooks = Arc::new(TestEngineHooks::default()); // hostile .arm(",
+                "let test_hooks = Arc::new(TestEngineHooks::default());",
+                "let test_hooks = Arc::new(TestEngineHooks::default()); // hostile .arm(",
             ),
             "after_open_arming",
         )
@@ -550,8 +767,8 @@ def self_test(patch_text: str) -> list[str]:
             "missing_unwind_disarm",
             replace_once(
                 patch_text,
-                "+        self.test_hooks.disarm_all();",
-                "+        self.test_hooks.release(0); // hostile missing global disarm",
+                "self.test_hooks.disarm_all();",
+                "self.test_hooks.release(0); // hostile missing global disarm",
             ),
             "unwind_safety",
         )
@@ -577,10 +794,72 @@ def self_test(patch_text: str) -> list[str]:
             "inapplicable_context",
             replace_once(
                 patch_text,
-                "@@ -402,3 +402,428 @@",
-                "@@ -403,3 +402,428 @@",
+                "@@ -1347,3 +1347,3 @@",
+                "@@ -1348,3 +1347,3 @@",
             ),
             "compatibility",
+        )
+    )
+    passed.append(
+        expect_rejection(
+            "line_shift_before_original_eof",
+            replace_once(
+                patch_text,
+                "-        let mut first_error: Option<EngineError> = None;\n"
+                "+        let mut first_error: Option<EngineError> = None; "
+                "#[cfg(test)] let mut published = false;\n"
+                "         if let Some((first_version, count)) = reg_span {",
+                "-        let mut first_error: Option<EngineError> = None;\n"
+                "         if let Some((first_version, count)) = reg_span {\n"
+                "+        let mut first_error: Option<EngineError> = None; "
+                "#[cfg(test)] let mut published = false;",
+            ),
+            "original_line_mapping",
+        )
+    )
+    passed.append(
+        expect_rejection(
+            "arbitrary_same_line_suffix",
+            replace_once(
+                patch_text,
+                "let mut first_error: Option<EngineError> = None; "
+                "#[cfg(test)] let mut published = false;",
+                "let mut first_error: Option<EngineError> = None; "
+                "#[cfg(test)] let mut published = false; panic!(\"hostile\");",
+            ),
+            "original_line_mapping",
+        )
+    )
+    passed.append(
+        expect_rejection(
+            "tail_item_surface_drift",
+            replace_once(
+                patch_text,
+                "+/// Exact one-shot append-engine phases exposed only to product tests.",
+                "+/// Altered one-shot append-engine phases exposed only to product tests.",
+            ),
+            "tail_identity",
+        )
+    )
+    passed.append(
+        expect_rejection(
+            "out_of_order_tail_hunk",
+            move_tail_hunk_first(patch_text),
+            "compatibility",
+        )
+    )
+    passed.append(
+        expect_rejection(
+            "forbidden_no_newline_marker",
+            patch_text + "\\ No newline at end of file\n",
+            "compatibility",
+        )
+    )
+    passed.append(
+        expect_rejection(
+            "missing_final_newline",
+            patch_text.removesuffix("\n"),
+            "original_line_mapping",
         )
     )
     return passed

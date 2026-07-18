@@ -164,7 +164,7 @@ fn run_point(
     let fs = runtime.fs();
     let mut params = SegmentParams::new(1, 0, 1, 0);
     params.segment_size = workload.segment_size();
-    let writer = SegmentWriter::create(&fs, root.join("segment-1.log"), params)
+    let writer = SegmentWriter::create(&fs, &root.join("segment-1.log"), params)
         .expect("create bare segment");
     let durability = match workload.durability {
         DurabilityKind::Process => Durability::Process,

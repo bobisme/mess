@@ -416,7 +416,7 @@ def production_context(
     if lock_value.get("toolchain") != toolchain:
         raise AuthorityError("lock manifest toolchain differs from current toolchain")
     plan = overlays.load_plan(repository, toolchain)
-    overlays.validate_lock_manifest(lock_value, plan)
+    overlays.validate_lock_manifest(repository, lock_value, plan)
     tooling_commit, tooling_tree = overlays.tooling_identity(repository, toolchain)
     if not is_lower_hex(tooling_commit, GIT_OBJECT_LENGTH) or not is_lower_hex(
         tooling_tree, GIT_OBJECT_LENGTH
@@ -1459,6 +1459,98 @@ def _mutated_snapshot(
     return snapshot_file(path, name, schema=schema)
 
 
+def _production_context_validator_boundary_self_test(repository: Path) -> None:
+    """Exercise the live validator signature and production forwarding boundary."""
+
+    try:
+        overlays.validate_lock_manifest(repository, {}, {})
+    except overlays.PreparationError:
+        pass
+    except TypeError as error:
+        raise AssertionError(
+            "current lock validator signature differs from production boundary"
+        ) from error
+    else:
+        raise AssertionError("empty lock manifest unexpectedly passed validation")
+
+    toolchain = {
+        "cargo_path": "/toolchain/bin/cargo",
+        "rustc_path": "/toolchain/bin/rustc",
+        "rustup_toolchain": "1.97.0-x86_64-unknown-linux-gnu",
+    }
+    plan = {"protocol_sha256": "1" * SHA256_LENGTH}
+    admission = {"schema": "fixture-filesystem-admission"}
+    lock_value = {
+        "filesystem_admission": admission,
+        "toolchain": toolchain,
+    }
+    calls: list[tuple[Any, ...]] = []
+    original_toolchain_identity = overlays.toolchain_identity
+    original_load_plan = overlays.load_plan
+    original_validate_lock_manifest = overlays.validate_lock_manifest
+    original_tooling_identity = overlays.tooling_identity
+
+    def fixture_toolchain_identity() -> dict[str, str]:
+        calls.append(("toolchain_identity",))
+        return toolchain
+
+    def fixture_load_plan(
+        observed_repository: Path,
+        observed_toolchain: dict[str, Any],
+    ) -> dict[str, Any]:
+        calls.append(("load_plan", observed_repository, observed_toolchain))
+        return plan
+
+    def fixture_validate_lock_manifest(
+        observed_repository: Path,
+        observed_locks: dict[str, Any],
+        observed_plan: dict[str, Any],
+    ) -> None:
+        calls.append(
+            (
+                "validate_lock_manifest",
+                observed_repository,
+                observed_locks,
+                observed_plan,
+            )
+        )
+
+    def fixture_tooling_identity(
+        observed_repository: Path,
+        observed_toolchain: dict[str, Any],
+    ) -> tuple[str, str]:
+        calls.append(("tooling_identity", observed_repository, observed_toolchain))
+        return "2" * GIT_OBJECT_LENGTH, "3" * GIT_OBJECT_LENGTH
+
+    try:
+        overlays.toolchain_identity = fixture_toolchain_identity
+        overlays.load_plan = fixture_load_plan
+        overlays.validate_lock_manifest = fixture_validate_lock_manifest
+        overlays.tooling_identity = fixture_tooling_identity
+        context = production_context(repository, lock_value)
+    finally:
+        overlays.toolchain_identity = original_toolchain_identity
+        overlays.load_plan = original_load_plan
+        overlays.validate_lock_manifest = original_validate_lock_manifest
+        overlays.tooling_identity = original_tooling_identity
+
+    if calls != [
+        ("toolchain_identity",),
+        ("load_plan", repository, toolchain),
+        ("validate_lock_manifest", repository, lock_value, plan),
+        ("tooling_identity", repository, toolchain),
+    ]:
+        raise AssertionError("production lock validator call boundary differs")
+    if context != AuthorityContext(
+        filesystem_admission=admission,
+        protocol_sha256=plan["protocol_sha256"],
+        toolchain=toolchain,
+        tooling_commit="2" * GIT_OBJECT_LENGTH,
+        tooling_tree="3" * GIT_OBJECT_LENGTH,
+    ):
+        raise AssertionError("production lock validator context differs")
+
+
 def self_test() -> None:
     hostile = 0
 
@@ -1473,6 +1565,7 @@ def self_test() -> None:
 
     with tempfile.TemporaryDirectory(prefix="bn-31gp-lock-authority-") as raw:
         root = Path(raw).resolve()
+        _production_context_validator_boundary_self_test(root)
         locks_directory = root / "locks"
         locks_directory.mkdir()
         variants: dict[str, Any] = {}

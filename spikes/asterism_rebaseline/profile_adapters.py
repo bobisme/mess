@@ -24,7 +24,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path, PurePosixPath
-from typing import Iterable, Mapping, Sequence
+from typing import Callable, Iterable, Mapping, Sequence
 
 
 PROTOCOL = "bn-2l3n-asterism-rebaseline-v3"
@@ -327,6 +327,21 @@ def canonical_json(value: object) -> bytes:
     ).encode()
 
 
+def _local_canonical_json(value: object) -> bytes:
+    """Return the ASCII-canonical form used by builder-local evidence."""
+
+    return (
+        json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("ascii")
+
+
 def profile_contract() -> dict[str, object]:
     """Return the frozen JSON-ready adapter contract consumed by tooling."""
 
@@ -542,6 +557,7 @@ _GUEST_ROOT = "/asterism"
 _GUEST_SOURCE = f"{_GUEST_ROOT}/source"
 _GUEST_TARGET = f"{_GUEST_ROOT}/target"
 _GUEST_TOOLCHAIN_ROOT = f"{_GUEST_ROOT}/toolchain"
+_GUEST_TOOLCHAIN_BIN = f"{_GUEST_TOOLCHAIN_ROOT}/bin"
 _GUEST_CARGO = f"{_GUEST_TOOLCHAIN_ROOT}/bin/cargo"
 _GUEST_RUSTC = f"{_GUEST_TOOLCHAIN_ROOT}/bin/rustc"
 _GUEST_CARGO_HOME = f"{_GUEST_ROOT}/cargo-home"
@@ -590,6 +606,8 @@ _TOOLCHAIN_FIELDS = (
     "rustc_sha256",
     "rustc_version_verbose",
     "rustc_host",
+    "rust_lld_path",
+    "rust_lld_sha256",
     "rustup_home_path",
     "rustup_path",
     "rustup_sha256",
@@ -742,6 +760,10 @@ _RELEASE_COMPILE_OUT_NM_CHILD_FIELDS = (
     "timed_out",
     "waited_pid",
 )
+_RELEASE_COMPILE_OUT_BUILD_CHILD_FIELDS = (
+    *_RELEASE_COMPILE_OUT_NM_CHILD_FIELDS,
+    "passed_file_descriptors",
+)
 _PREPARED_VARIANT_FIELDS = (
     "contract",
     "binary",
@@ -783,6 +805,7 @@ _PREPARED_ATTESTATION_FIELDS = (
     "build_argv",
     "build_env",
     "cargo_config_search",
+    "execution_tools",
     "semantic_input_authority",
     "build_started_at",
     "build_started_monotonic_ns",
@@ -804,7 +827,7 @@ _FORBIDDEN_RELEASE_HOOK_STRINGS = (
     "asterism_rebaseline_correctness",
 )
 _CURRENT_PRODUCT_OVERLAY_SHA256 = (
-    "0e38a70c9917de5892c7f049ed2103e4431103fbaebb3073d6398574a9453574"
+    "db060c902d7d1a2664dcaea44525adac727b1bef1de32bb01b33be2561143a39"
 )
 _AUTHORITY_FIELDS = frozenset(
     {
@@ -953,6 +976,22 @@ def _canonical_json_payload(payload: bytes, context: str) -> dict[str, object]:
     return value
 
 
+def _local_canonical_json_payload(
+    payload: bytes, context: str
+) -> dict[str, object]:
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ProfileEvidenceError(
+            f"{context} is not local canonical JSON: {error}"
+        ) from error
+    if not isinstance(value, dict) or _local_canonical_json(value) != payload:
+        raise ProfileEvidenceError(
+            f"{context} is not one local canonical JSON object"
+        )
+    return value
+
+
 def _canonical_json_snapshot(
     path_value: object,
     claimed_sha256: object,
@@ -964,11 +1003,11 @@ def _canonical_json_snapshot(
     return path, _canonical_json_payload(payload, context)
 
 
-def _unclaimed_canonical_json_snapshot(
+def _unclaimed_local_canonical_json_snapshot(
     path_value: object, context: str
 ) -> tuple[Path, bytes, dict[str, object]]:
     path, payload, _identity = _immutable_file_payload(path_value, 0o444, context)
-    return path, payload, _canonical_json_payload(payload, context)
+    return path, payload, _local_canonical_json_payload(payload, context)
 
 
 def _raw_artifact_snapshot(value: object, context: str) -> tuple[Path, bytes]:
@@ -2818,7 +2857,10 @@ def _recursive_live_manifest(
     }
 
 
-def _semantic_runtime_sha256(components: Mapping[str, object]) -> str:
+def _semantic_runtime_sha256(
+    components: Mapping[str, object],
+    canonical_bytes: Callable[[object], bytes] = canonical_json,
+) -> str:
     if set(components) != {"cargo_home", "toolchain", "trusted_system_closure"}:
         raise ProfileEvidenceError("semantic runtime authority components differ")
     tree_fields = (
@@ -2872,11 +2914,14 @@ def _semantic_runtime_sha256(components: Mapping[str, object]) -> str:
             field: closure.get(field) for field in closure_fields
         },
     }
-    return _sha256_bytes(canonical_json(normalized))
+    return _sha256_bytes(canonical_bytes(normalized))
 
 
 def _semantic_manifest_snapshot(
-    path_value: object, digest: object, context: str
+    path_value: object,
+    digest: object,
+    context: str,
+    canonical_payload: Callable[[bytes, str], dict[str, object]],
 ) -> tuple[Path, bytes, dict[str, object], tuple[int, int]]:
     if not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None:
         raise ProfileEvidenceError(f"{context} SHA-256 is malformed")
@@ -2885,7 +2930,7 @@ def _semantic_manifest_snapshot(
     )
     if _sha256_bytes(payload) != digest or identity[2] != 1:
         raise ProfileEvidenceError(f"{context} SHA-256 differs")
-    value = _canonical_json_payload(payload, context)
+    value = canonical_payload(payload, context)
     return path, payload, value, (identity[0], identity[1])
 
 
@@ -2898,6 +2943,10 @@ def _validate_semantic_input_authority(
     source_role: str = "source",
     live_cache: dict[tuple[object, ...], dict[str, object]] | None = None,
     manifest_identities: set[tuple[int, int]] | None = None,
+    manifest_canonical_payload: Callable[
+        [bytes, str], dict[str, object]
+    ] = _canonical_json_payload,
+    manifest_canonical_json: Callable[[object], bytes] = canonical_json,
 ) -> tuple[str, tuple[Path, Path, Path, Path]]:
     authority = _exact_mapping(
         value,
@@ -3002,6 +3051,7 @@ def _validate_semantic_input_authority(
             tree["manifest_path"],
             tree["manifest_sha256"],
             f"{context} semantic {name} evidence",
+            manifest_canonical_payload,
         )
         if identity in authority_manifest_identities:
             raise ProfileEvidenceError(f"{context} semantic manifest identity aliases")
@@ -3035,7 +3085,7 @@ def _validate_semantic_input_authority(
             and name == "source"
             else (),
         )
-        if canonical_json(observed) != payload:
+        if manifest_canonical_json(observed) != payload:
             raise ProfileEvidenceError(f"{context} live semantic {name} differs")
         manifest_paths.append(path)
 
@@ -3100,7 +3150,10 @@ def _validate_semantic_input_authority(
         bound_mounts.append(mount)
     closure_evidence_path, closure_payload, closure_evidence, closure_identity = (
         _semantic_manifest_snapshot(
-            closure["manifest_path"], closure["sha256"], f"{context} closure evidence"
+            closure["manifest_path"],
+            closure["sha256"],
+            f"{context} closure evidence",
+            manifest_canonical_payload,
         )
     )
     if closure_identity in authority_manifest_identities:
@@ -3162,7 +3215,7 @@ def _validate_semantic_input_authority(
         watch_count += sum(entry.get("file_type") == "directory" for entry in entries)
     if entry_count != closure["entry_count"] or watch_count != closure["watch_count"]:
         raise ProfileEvidenceError(f"{context} closure counts differ")
-    if canonical_json(dict(closure_value)) != closure_payload:
+    if manifest_canonical_json(dict(closure_value)) != closure_payload:
         raise ProfileEvidenceError(f"{context} closure canonical bytes differ")
     components = {
         name: authority[name]
@@ -3172,7 +3225,10 @@ def _validate_semantic_input_authority(
     if (
         not isinstance(runtime, str)
         or _SHA256_RE.fullmatch(runtime) is None
-        or runtime != _semantic_runtime_sha256(components)
+        or runtime
+        != _semantic_runtime_sha256(
+            components, canonical_bytes=manifest_canonical_json
+        )
     ):
         raise ProfileEvidenceError(f"{context} semantic runtime digest differs")
     manifest_paths.append(closure_evidence_path)
@@ -3236,6 +3292,8 @@ def _sandbox_environment(value: object, context: str, *, allow_extra: bool) -> N
         "RUSTUP_HOME": "/nonexistent",
         "TZ": "UTC",
     }
+    if allow_extra:
+        required["LD_ORIGIN_PATH"] = _GUEST_TOOLCHAIN_BIN
     if any(environment.get(name) != expected for name, expected in required.items()):
         raise ProfileEvidenceError(f"{context} sandbox environment differs")
     if not isinstance(environment.get("RUSTUP_TOOLCHAIN"), str) or not environment[
@@ -3366,6 +3424,66 @@ def _sandbox_descriptors(
     descriptors: dict[str, int] = {}
     observed: list[tuple[str, str, str]] = []
     for index, argument in enumerate(argv):
+        if argument == "--dev-bind":
+            segment = argv[index : index + 3]
+            source = segment[1] if len(segment) == 3 else ""
+            prefix = "/proc/self/fd/"
+            descriptor_text = (
+                source.removeprefix(prefix)
+                if isinstance(source, str) and source.startswith(prefix)
+                else ""
+            )
+            if (
+                len(segment) != 3
+                or segment[2] != "/dev/null"
+                or not descriptor_text.isdecimal()
+                or len(descriptor_text) > 10
+                or str(int(descriptor_text)) != descriptor_text
+                or int(descriptor_text) < 3
+            ):
+                raise ProfileEvidenceError(
+                    f"{context} null-device descriptor binding differs"
+                )
+            ordinal = len(observed)
+            if ordinal >= len(expected_bindings):
+                raise ProfileEvidenceError(
+                    f"{context} has an extra descriptor binding"
+                )
+            name, _option, _destination = expected_bindings[ordinal]
+            observed.append((name, "--dev-bind", segment[2]))
+            descriptors[name] = int(descriptor_text)
+            normalized[index + 1] = "$FD:/dev/null"
+            continue
+        if argument == "--overlay-src":
+            segment = argv[index : index + 4]
+            source = segment[1] if len(segment) == 4 else ""
+            prefix = "/proc/self/fd/"
+            descriptor_text = (
+                source.removeprefix(prefix)
+                if isinstance(source, str) and source.startswith(prefix)
+                else ""
+            )
+            if (
+                len(segment) != 4
+                or segment[2] != "--tmp-overlay"
+                or not descriptor_text.isdecimal()
+                or len(descriptor_text) > 10
+                or str(int(descriptor_text)) != descriptor_text
+                or int(descriptor_text) < 3
+            ):
+                raise ProfileEvidenceError(
+                    f"{context} overlay descriptor binding differs"
+                )
+            ordinal = len(observed)
+            if ordinal >= len(expected_bindings):
+                raise ProfileEvidenceError(
+                    f"{context} has an extra descriptor binding"
+                )
+            name, _option, _destination = expected_bindings[ordinal]
+            observed.append((name, "--tmp-overlay", segment[3]))
+            descriptors[name] = int(descriptor_text)
+            normalized[index + 1] = "$FD:cargo-home-overlay"
+            continue
         if argument not in {"--ro-bind-fd", "--bind-fd", "--ro-bind-data"}:
             continue
         descriptor_text = argv[index + 1] if index + 1 < len(argv) else ""
@@ -3391,8 +3509,15 @@ def _sandbox_descriptors(
 
 
 def _release_sandbox_argv(
-    descriptors: Mapping[str, int], package: str, example: str, bwrap_path: str
+    descriptors: Mapping[str, int],
+    package: str,
+    example: str,
+    bwrap_path: str,
+    rustc_host: str,
 ) -> list[str]:
+    rust_lld_guest_path = (
+        f"{_GUEST_TOOLCHAIN_ROOT}/lib/rustlib/{rustc_host}/bin/gcc-ld/ld.lld"
+    )
     argv = [
         bwrap_path,
         "--die-with-parent",
@@ -3416,6 +3541,9 @@ def _release_sandbox_argv(
             "/lib64",
             "--dir",
             "/dev",
+            "--dev-bind",
+            f"/proc/self/fd/{descriptors['dev_null']}",
+            "/dev/null",
             "--dir",
             "/proc",
             "--tmpfs",
@@ -3450,7 +3578,11 @@ def _release_sandbox_argv(
             str(descriptors["rustc"]),
             _GUEST_RUSTC,
             "--ro-bind-fd",
-            str(descriptors["cargo_home"]),
+            str(descriptors["rust_lld"]),
+            rust_lld_guest_path,
+            "--overlay-src",
+            f"/proc/self/fd/{descriptors['cargo_home']}",
+            "--tmp-overlay",
             _GUEST_CARGO_HOME,
             "--dir",
             f"{_GUEST_SOURCE}/.cargo",
@@ -3495,19 +3627,29 @@ def _validate_release_sandbox(
 ) -> str:
     toolchain = _as_mapping(attestation.get("toolchain"), f"{context} toolchain")
     bwrap_path = toolchain.get("bwrap_path")
-    if not isinstance(bwrap_path, str):
+    rustc_host = toolchain.get("rustc_host")
+    if (
+        not isinstance(bwrap_path, str)
+        or not isinstance(rustc_host, str)
+        or re.fullmatch(r"[A-Za-z0-9_-]+", rustc_host) is None
+    ):
         raise ProfileEvidenceError(f"{context} bwrap authority is absent")
+    rust_lld_guest_path = (
+        f"{_GUEST_TOOLCHAIN_ROOT}/lib/rustlib/{rustc_host}/bin/gcc-ld/ld.lld"
+    )
     system_bindings = tuple(
         (f"system:{guest}", "--ro-bind-fd", guest)
         for _host, guest in _TRUSTED_SYSTEM_MOUNTS
     )
     core_bindings = (
+        ("dev_null", "--dev-bind", "/dev/null"),
         ("source", "--ro-bind-fd", _GUEST_SOURCE),
         ("target", "--bind-fd", _GUEST_TARGET),
         ("toolchain_root", "--ro-bind-fd", _GUEST_TOOLCHAIN_ROOT),
         ("cargo", "--ro-bind-fd", _GUEST_CARGO),
         ("rustc", "--ro-bind-fd", _GUEST_RUSTC),
-        ("cargo_home", "--ro-bind-fd", _GUEST_CARGO_HOME),
+        ("rust_lld", "--ro-bind-fd", rust_lld_guest_path),
+        ("cargo_home", "--tmp-overlay", _GUEST_CARGO_HOME),
     )
     config_bindings = tuple(
         (f"config:{guest}", "--ro-bind-fd", guest)
@@ -3518,11 +3660,13 @@ def _validate_release_sandbox(
         attestation.get("build_argv"), expected_bindings, context
     )
     argv = attestation["build_argv"]
-    if argv != _release_sandbox_argv(descriptors, package, example, bwrap_path):
+    if argv != _release_sandbox_argv(
+        descriptors, package, example, bwrap_path, rustc_host
+    ):
         raise ProfileEvidenceError(f"{context} sandbox argv differs")
     if any(
         forbidden in argv
-        for forbidden in ("--dev", "--dev-bind", "--proc", "--share-net")
+        for forbidden in ("--dev", "--proc", "--share-net")
     ) or any(
         argv[index : index + 3] in (["--ro-bind", "/", "/"], ["--bind", "/", "/"])
         for index in range(max(0, len(argv) - 2))
@@ -3543,11 +3687,15 @@ def _validate_release_sandbox(
     ):
         raise ProfileEvidenceError(f"{context} sandbox/child authority differs")
     cargo_config_sha256 = _cargo_config_sha256(attestation, context)
+    execution_tools_sha256 = _validate_prepared_execution_tools(
+        attestation, context
+    )
     return _sha256_bytes(
         canonical_json(
             {
                 "argv": normalized,
                 "cargo_config_search_sha256": cargo_config_sha256,
+                "execution_tools_sha256": execution_tools_sha256,
                 "semantic_runtime_sha256": runtime_sha256,
             }
         )
@@ -3610,7 +3758,7 @@ def _validate_release_build_child(
 ]:
     child = _exact_mapping(
         attestation.get("build_child"),
-        _RELEASE_COMPILE_OUT_NM_CHILD_FIELDS,
+        _RELEASE_COMPILE_OUT_BUILD_CHILD_FIELDS,
         f"{context} build child",
     )
     reaping = _exact_mapping(
@@ -3647,6 +3795,8 @@ def _validate_release_build_child(
             for field in integer_fields
         )
         or child["waited_pid"] != child["pid"]
+        or type(child["passed_file_descriptors"]) is not int
+        or child["passed_file_descriptors"] != 16
         or child["exit_status"] != 0
         or isinstance(child["exit_status"], bool)
         or child["timed_out"] is not False
@@ -3735,8 +3885,9 @@ def _resolution_sandbox_argv(
             "--ro-bind-fd",
             str(descriptors["rustc"]),
             _GUEST_RUSTC,
-            "--ro-bind-fd",
-            str(descriptors["cargo_home"]),
+            "--overlay-src",
+            f"/proc/self/fd/{descriptors['cargo_home']}",
+            "--tmp-overlay",
             _GUEST_CARGO_HOME,
             "--dir",
             f"{_GUEST_ROOT}/.cargo",
@@ -3806,6 +3957,7 @@ def _current_sandbox(value: object, context: str) -> None:
         "HOME": "/nonexistent",
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
+        "LD_ORIGIN_PATH": _GUEST_TOOLCHAIN_BIN,
         "PATH": "/usr/bin:/bin",
         "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONNOUSERSITE": "1",
@@ -3907,7 +4059,7 @@ def _validate_toolchain_contract(value: object, context: str) -> tuple[Mapping[s
 
     toolchain = _exact_mapping(value, _TOOLCHAIN_FIELDS, context)
     executable_identities: set[tuple[int, int]] = set()
-    for name in ("bwrap", "cargo", "git", "rustc", "rustup"):
+    for name in ("bwrap", "cargo", "git", "rustc", "rust_lld", "rustup"):
         path_value = toolchain[f"{name}_path"]
         digest = toolchain[f"{name}_sha256"]
         path, payload, identity = _immutable_file_payload(
@@ -3971,7 +4123,7 @@ def _validate_toolchain_contract(value: object, context: str) -> tuple[Mapping[s
         len(host_lines) != 1
         or host_lines[0] != rustc_host
         or not isinstance(rustc_host, str)
-        or not rustc_host
+        or re.fullmatch(r"[A-Za-z0-9_-]+", rustc_host) is None
         or not isinstance(rustup_toolchain, str)
         or not rustup_toolchain
         or any(character.isspace() for character in rustup_toolchain)
@@ -3986,6 +4138,11 @@ def _validate_toolchain_contract(value: object, context: str) -> tuple[Mapping[s
         raise ProfileEvidenceError(f"{context} semantic toolchain root is absent") from error
     if cargo_root != rustc_root or not cargo_root.is_dir():
         raise ProfileEvidenceError(f"{context} Cargo/rustc semantic roots differ")
+    expected_rust_lld = (
+        cargo_root / "lib" / "rustlib" / str(rustc_host) / "bin" / "rust-lld"
+    )
+    if Path(str(toolchain["rust_lld_path"])) != expected_rust_lld:
+        raise ProfileEvidenceError(f"{context} rust-lld topology differs")
     return toolchain, cargo_root
 
 
@@ -4033,6 +4190,7 @@ def _current_file_identity(
     *,
     expected_path: Path | None = None,
     executable: bool,
+    expected_link_count: int = 1,
     replay_live: bool = True,
 ) -> Mapping[str, object]:
     identity = _exact_mapping(value, _CURRENT_FILE_IDENTITY_FIELDS, context)
@@ -4044,7 +4202,10 @@ def _current_file_identity(
         raise ProfileEvidenceError(f"{context} path differs")
     for field in ("bytes", "ctime_ns", "device", "inode", "link_count", "mode", "mtime_ns", "size"):
         _json_nonnegative_integer(identity[field], f"{context} {field}")
-    if identity["bytes"] != identity["size"] or identity["link_count"] != 1:
+    if (
+        identity["bytes"] != identity["size"]
+        or identity["link_count"] != expected_link_count
+    ):
         raise ProfileEvidenceError(f"{context} size/link identity differs")
     if executable and int(identity["mode"]) & 0o111 == 0:
         raise ProfileEvidenceError(f"{context} is not executable")
@@ -4122,6 +4283,164 @@ def _current_retained_file(
     elif record["path_chain"] is not None:
         raise ProfileEvidenceError(f"{context} non-system path chain differs")
     return record
+
+
+def _current_retained_null_device(
+    value: object, context: str
+) -> Mapping[str, object]:
+    record = _exact_mapping(
+        value, ("identity", "parent_path_chain", "trusted_system"), context
+    )
+    identity = _exact_mapping(
+        record["identity"],
+        (
+            "changed_ns",
+            "device",
+            "gid",
+            "inode",
+            "link_count",
+            "major",
+            "minor",
+            "modified_ns",
+            "path",
+            "permissions",
+            "size",
+            "type",
+            "uid",
+        ),
+        f"{context} identity",
+    )
+    metadata = Path("/dev/null").lstat()
+    expected = {
+        "changed_ns": metadata.st_ctime_ns,
+        "device": metadata.st_dev,
+        "gid": metadata.st_gid,
+        "inode": metadata.st_ino,
+        "link_count": metadata.st_nlink,
+        "major": os.major(metadata.st_rdev),
+        "minor": os.minor(metadata.st_rdev),
+        "modified_ns": metadata.st_mtime_ns,
+        "path": "/dev/null",
+        "permissions": stat.S_IMODE(metadata.st_mode),
+        "size": metadata.st_size,
+        "type": stat.S_IFMT(metadata.st_mode),
+        "uid": metadata.st_uid,
+    }
+    for field in expected:
+        if field != "path":
+            _json_nonnegative_integer(identity[field], f"{context} {field}")
+    if (
+        identity != expected
+        or record["trusted_system"] is not True
+        or not stat.S_ISCHR(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or stat.S_IMODE(metadata.st_mode) != 0o666
+        or metadata.st_nlink != 1
+        or os.major(metadata.st_rdev) != 1
+        or os.minor(metadata.st_rdev) != 3
+    ):
+        raise ProfileEvidenceError(f"{context} null-device authority differs")
+    _current_path_chain(Path("/dev"), record["parent_path_chain"], context)
+    return record
+
+
+def _validate_prepared_execution_tools(
+    attestation: Mapping[str, object], context: str
+) -> str:
+    tools = _exact_mapping(
+        attestation.get("execution_tools"),
+        ("bwrap", "cargo", "dev_null", "rustc", "rust_lld", "toolchain_root"),
+        f"{context} execution tools",
+    )
+    toolchain = _as_mapping(attestation.get("toolchain"), f"{context} toolchain")
+    rustc_host = toolchain.get("rustc_host")
+    cargo_path = Path(str(toolchain.get("cargo_path")))
+    rustc_path = Path(str(toolchain.get("rustc_path")))
+    toolchain_root = cargo_path.parent.parent
+    if (
+        not isinstance(rustc_host, str)
+        or re.fullmatch(r"[A-Za-z0-9_-]+", rustc_host) is None
+        or rustc_path.parent.parent != toolchain_root
+    ):
+        raise ProfileEvidenceError(f"{context} execution toolchain differs")
+    rust_lld_path = (
+        toolchain_root / "lib" / "rustlib" / rustc_host / "bin" / "rust-lld"
+    )
+    if Path(str(toolchain.get("rust_lld_path"))) != rust_lld_path:
+        raise ProfileEvidenceError(f"{context} rust-lld topology differs")
+    expected_files = {
+        "bwrap": (Path(str(toolchain.get("bwrap_path"))), toolchain.get("bwrap_sha256")),
+        "cargo": (cargo_path, toolchain.get("cargo_sha256")),
+        "rustc": (rustc_path, toolchain.get("rustc_sha256")),
+        "rust_lld": (
+            Path(str(toolchain.get("rust_lld_path"))),
+            toolchain.get("rust_lld_sha256"),
+        ),
+    }
+    for name, (path, expected_sha256) in expected_files.items():
+        binding = _exact_mapping(
+            tools[name], ("identity", "mode", "path", "sha256", "size"),
+            f"{context} {name} execution tool",
+        )
+        binding_identity = _exact_mapping(
+            binding["identity"],
+            ("changed_ns", "device", "inode", "link_count", "modified_ns"),
+            f"{context} {name} execution identity",
+        )
+        live_path, payload, observed = _immutable_file_payload(
+            str(path), None, f"{context} {name} execution tool"
+        )
+        expected = {
+            "identity": {
+                "changed_ns": observed[6],
+                "device": observed[0],
+                "inode": observed[1],
+                "link_count": observed[2],
+                "modified_ns": observed[5],
+            },
+            "mode": observed[4],
+            "path": str(live_path),
+            "sha256": _sha256_bytes(payload),
+            "size": observed[3],
+        }
+        for field in expected["identity"]:
+            _json_nonnegative_integer(
+                binding_identity[field],
+                f"{context} {name} execution identity {field}",
+            )
+        _json_nonnegative_integer(
+            binding["mode"], f"{context} {name} execution mode"
+        )
+        _json_nonnegative_integer(
+            binding["size"], f"{context} {name} execution size"
+        )
+        if (
+            binding != expected
+            or observed[2] != 1
+            or observed[4] & 0o111 == 0
+            or (expected_sha256 is not None and binding["sha256"] != expected_sha256)
+        ):
+            raise ProfileEvidenceError(f"{context} {name} execution binding differs")
+    _current_retained_null_device(tools["dev_null"], f"{context} dev-null tool")
+    root_metadata = toolchain_root.lstat()
+    root_binding = _exact_mapping(
+        tools["toolchain_root"],
+        ("device", "inode", "link_count", "mode"),
+        f"{context} toolchain-root binding",
+    )
+    for field in root_binding:
+        _json_nonnegative_integer(
+            root_binding[field], f"{context} toolchain-root {field}"
+        )
+    if root_binding != {
+        "device": root_metadata.st_dev,
+        "inode": root_metadata.st_ino,
+        "link_count": root_metadata.st_nlink,
+        "mode": stat.S_IMODE(root_metadata.st_mode),
+    }:
+        raise ProfileEvidenceError(f"{context} toolchain-root binding differs")
+    return _sha256_bytes(canonical_json(tools))
 
 
 def _current_directory_identity(
@@ -4273,7 +4592,7 @@ def _validate_current_cargo_config(
                 raise ProfileEvidenceError(f"{context} preserved {origin} type differs")
     for guest, _host in (candidates[0], candidates[1]):
         bindings.append((f"config:{guest}", "--ro-bind-data", guest))
-    bindings.append(("cargo_home", "--ro-bind-fd", _GUEST_CARGO_HOME))
+    bindings.append(("cargo_home", "--tmp-overlay", _GUEST_CARGO_HOME))
     for guest, _host in (candidates[6], candidates[7]):
         bindings.append((f"config:{guest}", "--ro-bind-data", guest))
     return record, tuple(bindings)
@@ -4284,9 +4603,13 @@ def _current_build_argv(
     config_bindings: Sequence[tuple[str, str, str]],
     *,
     bwrap_path: str,
+    rustc_host: str,
     examples: Sequence[str],
     wrapper: bool,
 ) -> list[str]:
+    rust_lld_guest_path = (
+        f"{_GUEST_TOOLCHAIN_ROOT}/lib/rustlib/{rustc_host}/bin/gcc-ld/ld.lld"
+    )
     argv = [
         bwrap_path,
         "--die-with-parent",
@@ -4310,6 +4633,9 @@ def _current_build_argv(
             "/lib64",
             "--dir",
             "/dev",
+            "--dev-bind",
+            f"/proc/self/fd/{descriptors['dev_null']}",
+            "/dev/null",
             "--dir",
             "/proc",
             "--tmpfs",
@@ -4329,6 +4655,9 @@ def _current_build_argv(
             str(descriptors["rustc"]),
             _GUEST_RUSTC,
             "--ro-bind-fd",
+            str(descriptors["rust_lld"]),
+            rust_lld_guest_path,
+            "--ro-bind-fd",
             str(descriptors["python"]),
             f"{_GUEST_ROOT}/python3",
             "--dir",
@@ -4340,8 +4669,22 @@ def _current_build_argv(
     cargo_home_seen = False
     for name, option, destination in config_bindings:
         if name == "cargo_home":
-            argv.extend(["--remount-ro", f"{_GUEST_SOURCE}/.cargo", "--dir", _GUEST_CARGO_HOME])
+            if option != "--tmp-overlay" or destination != _GUEST_CARGO_HOME:
+                raise ProfileEvidenceError(
+                    "current build Cargo-home overlay binding differs"
+                )
+            argv.extend(
+                [
+                    "--remount-ro",
+                    f"{_GUEST_SOURCE}/.cargo",
+                    "--overlay-src",
+                    f"/proc/self/fd/{descriptors[name]}",
+                    "--tmp-overlay",
+                    destination,
+                ]
+            )
             cargo_home_seen = True
+            continue
         argv.extend([option, str(descriptors[name]), destination])
     if not cargo_home_seen:
         raise ProfileEvidenceError("current build Cargo-home binding is absent")
@@ -4407,6 +4750,7 @@ def _current_base_environment(toolchain: Mapping[str, object]) -> dict[str, str]
         "HOME": "/nonexistent",
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
+        "LD_ORIGIN_PATH": _GUEST_TOOLCHAIN_BIN,
         "PATH": "/usr/bin:/bin",
         "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONNOUSERSITE": "1",
@@ -4500,15 +4844,20 @@ def _current_bound_file_identity(
     actual_path: Path,
     logical_path: str,
     executable: bool,
+    expected_link_count: int = 1,
 ) -> Mapping[str, object]:
     record = _current_file_identity(
         value,
         context,
         expected_path=Path(logical_path),
         executable=executable,
+        expected_link_count=expected_link_count,
         replay_live=False,
     )
-    _path, payload, observed = _immutable_file_payload(str(actual_path), None, context)
+    exact = actual_path.resolve(strict=True)
+    path, payload, observed = _immutable_file_payload(
+        str(exact), 0o555 if executable else 0o444, context, limit=None
+    )
     expected = {
         "bytes": len(payload),
         "ctime_ns": observed[6],
@@ -4521,8 +4870,8 @@ def _current_bound_file_identity(
         "sha256": _sha256_bytes(payload),
         "size": observed[3],
     }
-    if record != expected:
-        raise ProfileEvidenceError(f"{context} bound identity differs")
+    if path != exact or exact != actual_path or record != expected:
+        raise ProfileEvidenceError(f"{context} retained descriptor identity differs")
     return record
 
 
@@ -4570,12 +4919,26 @@ def _validate_current_build_record(
         if child
         else ("asterism_rebaseline_public",)
     )
+    rustc_host = toolchain.get("rustc_host")
+    if (
+        not isinstance(rustc_host, str)
+        or re.fullmatch(r"[A-Za-z0-9_-]+", rustc_host) is None
+    ):
+        raise ProfileEvidenceError(f"{context} rustc host differs")
+    rust_lld_path = (
+        toolchain_root / "lib" / "rustlib" / rustc_host / "bin" / "rust-lld"
+    )
+    rust_lld_guest_path = (
+        f"{_GUEST_TOOLCHAIN_ROOT}/lib/rustlib/{rustc_host}/bin/gcc-ld/ld.lld"
+    )
     expected_bindings = (
         *((f"system:{guest}", "--ro-bind-fd", guest) for _host, guest in _TRUSTED_SYSTEM_MOUNTS),
+        ("dev_null", "--dev-bind", "/dev/null"),
         ("source", "--ro-bind-fd", _GUEST_SOURCE),
         ("toolchain_root", "--ro-bind-fd", _GUEST_TOOLCHAIN_ROOT),
         ("cargo", "--ro-bind-fd", _GUEST_CARGO),
         ("rustc", "--ro-bind-fd", _GUEST_RUSTC),
+        ("rust_lld", "--ro-bind-fd", rust_lld_guest_path),
         ("python", "--ro-bind-fd", f"{_GUEST_ROOT}/python3"),
         *config_bindings,
         ("target", "--bind-fd", _GUEST_TARGET),
@@ -4593,13 +4956,14 @@ def _validate_current_build_record(
         descriptors,
         config_bindings,
         bwrap_path=str(toolchain["bwrap_path"]),
+        rustc_host=rustc_host,
         examples=examples,
         wrapper=child,
     ):
         raise ProfileEvidenceError(f"{context} exact sandbox argv differs")
     argv = build["argv"]
     assert isinstance(argv, list)
-    if any(forbidden in argv for forbidden in ("--dev", "--dev-bind", "--proc", "--share-net")) or any(
+    if any(forbidden in argv for forbidden in ("--dev", "--proc", "--share-net")) or any(
         argv[index : index + 3] in (["--ro-bind", "/", "/"], ["--bind", "/", "/"])
         for index in range(max(0, len(argv) - 2))
     ):
@@ -4613,7 +4977,9 @@ def _validate_current_build_record(
         lock_sha256=lock_sha256,
     )
     tools = _exact_mapping(
-        build["execution_tools"], ("bwrap", "cargo", "python", "rustc", "toolchain_root"), context
+        build["execution_tools"],
+        ("bwrap", "cargo", "dev_null", "python", "rustc", "rust_lld", "toolchain_root"),
+        context,
     )
     bwrap_record = _current_retained_file(
         tools["bwrap"], context, expected_path=Path(str(toolchain["bwrap_path"])), expected_sha256=toolchain["bwrap_sha256"], trusted_system=True
@@ -4624,6 +4990,12 @@ def _validate_current_build_record(
     _current_retained_file(
         tools["rustc"], context, expected_path=Path(str(toolchain["rustc_path"])), expected_sha256=toolchain["rustc_sha256"], trusted_system=False
     )
+    _current_retained_file(
+        tools["rust_lld"], context, expected_path=rust_lld_path,
+        expected_sha256=_sha256_bytes(rust_lld_path.read_bytes()),
+        trusted_system=False,
+    )
+    _current_retained_null_device(tools["dev_null"], f"{context} null device")
     system_python = Path("/usr/bin/python3").resolve(strict=True)
     _current_retained_file(
         tools["python"], context, expected_path=system_python, expected_sha256=_sha256_bytes(system_python.read_bytes()), trusted_system=True
@@ -4651,9 +5023,17 @@ def _validate_current_build_record(
         execution["argv"] != argv
         or execution["environment"] != environment
         or execution["cwd"] != str(current_root)
+        or _json_nonnegative_integer(
+            execution["exit_status"], f"{context} exit status"
+        )
+        != 0
         or execution["exit_status"] != 0
-        or isinstance(execution["exit_status"], bool)
         or execution["execution_authority"] != bwrap_record
+        or _json_nonnegative_integer(
+            execution["passed_file_descriptors"],
+            f"{context} passed file descriptors",
+        )
+        != expected_passed_descriptors
         or execution["passed_file_descriptors"] != expected_passed_descriptors
     ):
         raise ProfileEvidenceError(f"{context} execution replay differs")
@@ -4663,7 +5043,13 @@ def _validate_current_build_record(
     log_path, log_payload, log_identity = _immutable_file_payload(
         str(current_root / "logs" / f"cargo-build-{source_name}.json"), 0o444, f"{context} execution log", limit=None
     )
-    if log_identity[2] != 1 or _canonical_json_payload(log_payload, f"{context} execution log") != execution:
+    if (
+        log_identity[2] != 1
+        or _local_canonical_json_payload(
+            log_payload, f"{context} execution log"
+        )
+        != execution
+    ):
         raise ProfileEvidenceError(f"{context} execution log differs")
     if log_path != current_root / "logs" / f"cargo-build-{source_name}.json":
         raise ProfileEvidenceError(f"{context} execution log topology differs")
@@ -4712,12 +5098,16 @@ def _validate_current_build_record(
             or observed[2] != 1
         ):
             raise ProfileEvidenceError(f"{context} artifact binding differs")
-        source = _current_file_identity(
+        source = _current_bound_file_identity(
             artifact["source"],
             context,
-            expected_path=Path(f"/proc/self/fd/{descriptors['target']}/release/examples/{example}"),
+            actual_path=target / "release" / "examples" / example,
+            logical_path=(
+                f"/proc/self/fd/{descriptors['target']}"
+                f"/release/examples/{example}"
+            ),
             executable=True,
-            replay_live=False,
+            expected_link_count=2,
         )
         if source["sha256"] != binding["sha256"]:
             raise ProfileEvidenceError(f"{context} artifact source differs")
@@ -4740,7 +5130,7 @@ def _validate_current_build_record(
         0o444,
         f"{context} source manifest",
     )
-    source_manifest = _canonical_json_payload(
+    source_manifest = _local_canonical_json_payload(
         source_manifest_payload, f"{context} source manifest"
     )
     if (
@@ -4787,7 +5177,7 @@ def _validate_current_build_record(
             str(receipt_path), build["wrapper_receipt_sha256"], 0o444, context
         )
         if (
-            _canonical_json_payload(receipt_payload, context) != receipt
+            _local_canonical_json_payload(receipt_payload, context) != receipt
             or receipt_identity["sha256"] != build["wrapper_receipt_sha256"]
             or receipt != {
                 "build_nonce": current["build_nonce"],
@@ -5089,7 +5479,7 @@ def _validate_resolver_record(
         ("toolchain_root", "--ro-bind-fd", _GUEST_TOOLCHAIN_ROOT),
         ("cargo", "--ro-bind-fd", _GUEST_CARGO),
         ("rustc", "--ro-bind-fd", _GUEST_RUSTC),
-        ("cargo_home", "--ro-bind-fd", _GUEST_CARGO_HOME),
+        ("cargo_home", "--tmp-overlay", _GUEST_CARGO_HOME),
         *(
             (f"config:{guest}", "--ro-bind-fd", guest)
             for guest in _GUEST_BOUND_CONFIG_PATHS
@@ -5522,6 +5912,8 @@ def _validate_phase4_semantic_authority(
             },
             live_cache=live_cache,
             manifest_identities=manifest_identities,
+            manifest_canonical_payload=_local_canonical_json_payload,
+            manifest_canonical_json=_local_canonical_json,
         )
         runtime_digests.add(runtime)
         manifest_paths.extend(paths)
@@ -6339,7 +6731,7 @@ def validate_profile_authority(
         ("path",),
         "prepared single-use claim binding",
     )
-    claim_path, _claim_payload, prepared_claim = _unclaimed_canonical_json_snapshot(
+    claim_path, _claim_payload, prepared_claim = _unclaimed_local_canonical_json_snapshot(
         claim_binding["path"], "prepared single-use claim"
     )
     if (
@@ -7685,7 +8077,39 @@ def profile_fields(
     return detached
 
 
+def _canonical_type_self_test() -> None:
+    """Prove reviewed UTF-8 and builder-local ASCII forms stay disjoint."""
+
+    value = {
+        "label": "A — current",
+        "schema": "bn-ecm1-profile-canonical-type-self-test-v1",
+    }
+    reviewed = canonical_json(value)
+    local = _local_canonical_json(value)
+    if (
+        reviewed == local
+        or b"\xe2\x80\x94" not in reviewed
+        or b"\\u2014" in reviewed
+        or b"\\u2014" not in local
+        or b"\xe2\x80\x94" in local
+        or _canonical_json_payload(reviewed, "reviewed UTF-8 self-test") != value
+        or _local_canonical_json_payload(local, "local ASCII self-test") != value
+    ):
+        raise AssertionError("profile canonical type self-test differs")
+    for payload, parser, context in (
+        (local, _canonical_json_payload, "ASCII-escaped reviewed hostile"),
+        (reviewed, _local_canonical_json_payload, "UTF-8 local hostile"),
+    ):
+        try:
+            parser(payload, context)
+        except ProfileEvidenceError:
+            pass
+        else:
+            raise AssertionError(f"{context} was accepted")
+
+
 def main() -> int:
+    _canonical_type_self_test()
     print(canonical_json(profile_contract()).decode(), end="")
     return 0
 

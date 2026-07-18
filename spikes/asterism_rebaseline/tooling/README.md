@@ -42,11 +42,14 @@ both success and an unchanged lock, then run the exact offline
 hash. Validation reconstructs the complete argv and descriptor order, fixed
 guest cwd, canonical materialized source root, retained bubblewrap lease,
 environment, successful exit, UTF-8 stdout/stderr hashes, and both lock
-boundaries. Its fixed descriptor order is three system roots, five core
-bindings (source, toolchain root, Cargo, rustc, and Cargo home), and four Cargo
-config files, plus the separately retained bubblewrap executable: thirteen
-passed descriptors in total. The resolution source is recursively frozen
-except for the root needed to create `Cargo.lock`; inotify and a second
+boundaries. Its fixed descriptor order is three system roots, four ordinary
+core bindings (source, toolchain root, Cargo, and rustc), one retained-FD
+Cargo-home temporary overlay, and four Cargo config files, plus the separately
+retained bubblewrap executable: thirteen passed descriptors in total. The
+overlay makes absent config targets mountable without modifying the retained
+Cargo-home tree; the exact config files are then mounted and the overlay is
+remounted read-only before Cargo starts. The resolution source is recursively
+frozen except for the root needed to create `Cargo.lock`; inotify and a second
 manifest allow only that lock and its atomic temporary names to mutate.
 This command
 performs dependency resolution but does not compile Rust or emit a measurement
@@ -123,11 +126,14 @@ approval embeds the complete canonical tools object and its file hash;
    `cfg(test)`. Bubblewrap, Cargo, rustc, Git, both source roots, both target
    roots, the exact toolchain root, and the Cargo home are retained by
    descriptor across their use. The sandbox binds the three ordered system
-   roots first, then six core bindings (source, target, toolchain root, Cargo,
-   rustc, and Cargo home), then four exact config-file bindings. Bubblewrap is
-   a separate retained executable lease. All thirteen bind-descriptor numbers
-   are normalized, never a guest destination. Cargo-config evidence names the
-   guest cwd/home and all eight searched guest paths. Source and Cargo-home
+   roots first, then five ordinary core bindings (source, target, toolchain
+   root, Cargo, and rustc), exposes Cargo home through one retained-FD temporary
+   overlay, and then mounts four exact config files into that overlay before
+   remounting it read-only. Bubblewrap is a separate retained executable lease.
+   All thirteen sandbox descriptor operands are authority-bound and their
+   numbers are normalized, never a guest destination; with the bubblewrap
+   lease, the child inherits fourteen descriptors. Cargo-config evidence names
+   the guest cwd/home and all eight searched guest paths. Source and Cargo-home
    config files are private
    descriptor mounts containing either the retained reviewed bytes or an
    immutable empty substitute; ancestor `.cargo` directories are empty
@@ -209,6 +215,34 @@ runtimes can import the shared evidence schema without creating `__pycache__`
 or changing any support byte. Those imports are the last child executions;
 the producer then freezes the tree and terminally replays a whole-tree
 file/directory manifest plus every release compile-out binding and proof.
+
+`authority_inputs.py` is the fail-closed producer for the operational inputs
+that were previously hand assembled. `write-base-tools` creates immutable,
+role-distinct Python runtime copies, retained `perf`/`strace` copies, the six
+fixed support files, and the exact correctness/fault placeholders, then runs
+the downstream base-tools validator. Every producer output must be a fresh
+path outside the reviewed repository. The two review phases use this sequence:
+
+1. `write-lock-review-assertion` or `write-source-review-assertion` freezes the
+   exact assertion before review.
+2. Create a fresh Seal review at that detached tooling commit and approve it
+   with
+   `seal lgtm <review-id> -m "APPROVED assertion_sha256=<hash>; open_findings=0"`.
+3. `write-lock-review-bundle` or `write-source-review-bundle` consumes the
+   immutable assertion and exact per-review `events.jsonl`. It accepts only the
+   minimal terminal lifecycle `ReviewCreated`, optional `ReviewersRequested`,
+   one matching `ReviewerVoted(lgtm)`, and `ReviewApproved`; any thread,
+   abandonment, merge, block, duplicate vote, or other lifecycle event fails
+   closed. It recomputes all authority, publishes with an absent-output
+   requirement, and resamples every input after publication.
+
+Seal review events should be created in a separate clean worktree at the exact
+tooling commit. That keeps the source/build workspace clean while preserving
+the detached commit anchor required by both assertion validators. No author,
+timestamp, verdict reason, assertion body, commit, or tree is supplied as a
+free-form producer argument. Produce the bundle from that worktree's
+`.seal/reviews/<review-id>/events.jsonl` immediately after `seal lgtm`; do not
+add threads, abandon, or mark the review merged before bundle production.
 
 Contract and transition smokes are not performance evidence. Only the
 separately reviewed runner may drive evidence modes after all prepared hashes
