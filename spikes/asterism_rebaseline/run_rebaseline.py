@@ -614,6 +614,11 @@ def reject_superseded_authority(
         return
     if not isinstance(value, str):
         return
+    # The v3 protocol pins the current-children attestation schema itself at
+    # this -v2 identity (CURRENT_CHILDREN_ATTESTATION_SCHEMA, required exactly
+    # during prepared validation), so it is current authority, not superseded.
+    if value == CURRENT_CHILDREN_ATTESTATION_SCHEMA:
+        return
     leaf = path[-1] if path else ""
     identity_field = leaf == "protocol" or leaf == "schema" or leaf.endswith(
         "_schema"
@@ -14178,6 +14183,21 @@ def run_self_test(root: Path) -> int:
             checks[label] = True
         else:
             checks[label] = False
+    try:
+        reject_superseded_authority(
+            {
+                "source_review": {
+                    "current_children_attestation": {
+                        "schema": CURRENT_CHILDREN_ATTESTATION_SCHEMA,
+                    },
+                },
+            },
+            "pinned attestation schema accepted",
+        )
+    except RunnerFailure:
+        checks["pinned_attestation_schema_accepted"] = False
+    else:
+        checks["pinned_attestation_schema_accepted"] = True
     try:
         call_shared_validator(
             deep,
