@@ -1155,6 +1155,7 @@ def sample_semantic_tree(
                 raise ValueError(f"{context} directory changed")
 
         walk(root_fd, ".")
+        entries.sort(key=lambda entry: (entry["path"] != ".", entry["path"]))
         return {
             "entries": entries,
             "role": role,
@@ -16340,6 +16341,64 @@ def self_test() -> dict[str, Any]:
             passed = False
             detail = repr(error)
         checks.append({"name": name, "pass": passed, "detail": detail})
+
+    def semantic_sampler_prefix_sibling_order() -> bool:
+        import importlib.util
+
+        module_name = "_asterism_evaluator_prepare_overlays_self_test"
+        module_path = (
+            Path(schema.__file__).resolve().parent / "tooling" / "prepare_overlays.py"
+        )
+        spec = importlib.util.spec_from_file_location(module_name, module_path)
+        if spec is None or spec.loader is None:
+            return False
+        tooling = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = tooling
+        try:
+            spec.loader.exec_module(tooling)
+            with tempfile.TemporaryDirectory(
+                prefix="bn-1h32-evaluator-semantic-order-"
+            ) as temporary:
+                root = Path(temporary).resolve(strict=True)
+                (root / "a").mkdir()
+                (root / "a-b").mkdir()
+                (root / "a" / "b").write_bytes(b"a/b\n")
+                (root / "a-b" / "y").write_bytes(b"a-b/y\n")
+                produced = tooling.resample_recursive_manifest(
+                    root,
+                    "source",
+                    "evaluator producer prefix-sibling fixture",
+                    allow_internal_symlinks=False,
+                    hash_regular_contents=True,
+                )
+                sampled = sample_semantic_tree(
+                    root,
+                    "source",
+                    "evaluator prefix-sibling fixture",
+                    allow_internal_symlinks=False,
+                    hash_regular_contents=True,
+                )
+                validated = SemanticReplay(
+                    Problems(), live_system=False
+                )._validate_tree(
+                    sampled,
+                    "source",
+                    "evaluator prefix-sibling fixture",
+                    trusted_system=False,
+                )
+                return (
+                    sampled == produced
+                    and validated == sampled
+                    and [entry["path"] for entry in sampled["entries"]]
+                    == [".", "a", "a-b", "a-b/y", "a/b"]
+                )
+        finally:
+            sys.modules.pop(module_name, None)
+
+    check(
+        "semantic-sampler-prefix-sibling-order-matches-producer",
+        semantic_sampler_prefix_sibling_order,
+    )
 
     nm_identity = {
         "bytes": 17,

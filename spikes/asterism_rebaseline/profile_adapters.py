@@ -2567,7 +2567,7 @@ def _validate_recursive_manifest(
         or not entries
     ):
         raise ProfileEvidenceError(f"{context} recursive manifest fields differ")
-    paths: set[str] = set()
+    paths: list[str] = []
     directory_count = 0
     for index, item in enumerate(entries):
         entry = _exact_mapping(item, _SEMANTIC_MANIFEST_ENTRY_FIELDS, context)
@@ -2584,7 +2584,7 @@ def _validate_recursive_manifest(
             raise ProfileEvidenceError(f"{context} recursive manifest path differs")
         if relative in paths or (index == 0) != (relative == "."):
             raise ProfileEvidenceError(f"{context} recursive manifest paths alias")
-        paths.add(relative)
+        paths.append(relative)
         kind = entry["file_type"]
         if kind not in {"directory", "regular", "symlink"}:
             raise ProfileEvidenceError(f"{context} recursive manifest type differs")
@@ -2642,6 +2642,8 @@ def _validate_recursive_manifest(
             raise ProfileEvidenceError(f"{context} trusted system policy differs")
     if directory_count < 1:
         raise ProfileEvidenceError(f"{context} recursive directory set is empty")
+    if paths != sorted(paths, key=lambda path: (path != ".", path)):
+        raise ProfileEvidenceError(f"{context} recursive path order differs")
     return dict(manifest)
 
 
@@ -2850,6 +2852,7 @@ def _recursive_live_manifest(
         len(aliases) != aliases[0]["link_count"] for aliases in hardlinks.values()
     ):
         raise ProfileEvidenceError(f"{context} hard link escapes the retained tree")
+    entries.sort(key=lambda entry: (entry["path"] != ".", entry["path"]))
     return {
         "entries": entries,
         "role": role,

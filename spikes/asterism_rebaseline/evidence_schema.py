@@ -3524,6 +3524,7 @@ def _sample_recursive_semantic_manifest(
                 raise ValueError(f"{context} directory changed")
 
         walk(root_descriptor, ".")
+        entries.sort(key=lambda entry: (entry["path"] != ".", entry["path"]))
         return {
             "entries": entries,
             "role": role,
@@ -7015,6 +7016,14 @@ def source_authority_self_test() -> dict[str, Any]:
 
         live_tree_root = fixture_root / "live-semantic-tree"
         live_tree_root.mkdir()
+        (live_tree_root / "a").mkdir()
+        (live_tree_root / "a-b").mkdir()
+        (live_tree_root / "crates" / "mess").mkdir(parents=True)
+        (live_tree_root / "crates" / "mess-bench").mkdir()
+        (live_tree_root / "a" / "input").write_bytes(b"a\n")
+        (live_tree_root / "a-b" / "input").write_bytes(b"a-b\n")
+        (live_tree_root / "crates" / "mess" / "x").write_bytes(b"x\n")
+        (live_tree_root / "crates" / "mess-bench" / "y").write_bytes(b"y\n")
         live_payload_path = live_tree_root / "input.bin"
         live_payload_path.write_bytes(b"semantic-live-one")
         sampled_live_tree = _sample_recursive_semantic_manifest(
@@ -7030,6 +7039,20 @@ def source_authority_self_test() -> dict[str, Any]:
             "self-test live semantic tree",
             trusted_system=False,
         )
+        if [entry["path"] for entry in sampled_live_tree["entries"]] != [
+            ".",
+            "a",
+            "a-b",
+            "a-b/input",
+            "a/input",
+            "crates",
+            "crates/mess",
+            "crates/mess-bench",
+            "crates/mess-bench/y",
+            "crates/mess/x",
+            "input.bin",
+        ]:
+            raise AssertionError("semantic live-tree prefix-sibling order differs")
         live_payload_path.write_bytes(b"semantic-live-two")
         if _sample_recursive_semantic_manifest(
             live_tree_root,

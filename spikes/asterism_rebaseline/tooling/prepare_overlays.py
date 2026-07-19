@@ -284,6 +284,27 @@ class PreparationError(RuntimeError):
     pass
 
 
+def load_evidence_schema_self_test_module() -> Any:
+    """Load the real shared semantic-manifest validator for producer tests."""
+
+    import importlib.util
+
+    module_name = "_asterism_prepare_overlays_evidence_schema_self_test"
+    spec = importlib.util.spec_from_file_location(
+        module_name, HERE.parent / "evidence_schema.py"
+    )
+    if spec is None or spec.loader is None:
+        raise PreparationError("evidence-schema self-test module is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
+
+
 @dataclass(frozen=True)
 class CanonicalSnapshot:
     """One immutable regular-file observation used for every later binding."""
@@ -5818,6 +5839,7 @@ class RecursiveTreeAuthorityGuard:
                 raise PreparationError(
                     f"{self.context} recursive watch coverage differs"
                 )
+        entries.sort(key=lambda entry: (entry["path"] != ".", entry["path"]))
         return {
             "entries": entries,
             "role": self.role,
@@ -9080,6 +9102,7 @@ def source_review_and_compile_out_static_self_test() -> int:
 
 
 def idempotent_freeze_static_self_test() -> None:
+    evidence_schema = load_evidence_schema_self_test_module()
     assert (
         system_symlink_scope(Path("/usr/bin"), "tool", "/bin/sh")
         == "within_closure"
@@ -9112,6 +9135,55 @@ def idempotent_freeze_static_self_test() -> None:
             )
     with tempfile.TemporaryDirectory(prefix="bn-ecm1-prepare-freeze-") as temporary:
         temporary_root = Path(temporary).resolve(strict=True)
+        ordering_root = temporary_root / "ordering"
+        ordering_root.mkdir()
+        (ordering_root / "a").mkdir()
+        (ordering_root / "a-b").mkdir()
+        (ordering_root / "crates" / "mess").mkdir(parents=True)
+        (ordering_root / "crates" / "mess-bench").mkdir()
+        atomic_write(ordering_root / "a" / "input", b"a\n", mode=0o444)
+        atomic_write(ordering_root / "a-b" / "input", b"a-b\n", mode=0o444)
+        atomic_write(
+            ordering_root / "crates" / "mess" / "x", b"x\n", mode=0o444
+        )
+        atomic_write(
+            ordering_root / "crates" / "mess-bench" / "y",
+            b"y\n",
+            mode=0o444,
+        )
+        with RecursiveTreeAuthorityGuard(
+            ordering_root,
+            temporary_root / "ordering.json",
+            "source",
+            "prefix-sibling ordering fixture",
+            allow_internal_symlinks=False,
+        ) as ordering_guard:
+            assert ordering_guard.initial_manifest is not None
+            ordering_manifest = ordering_guard.initial_manifest
+            evidence_schema._validate_recursive_semantic_manifest(
+                ordering_manifest,
+                "source",
+                "prefix-sibling ordering fixture",
+                trusted_system=False,
+            )
+            ordering_paths = [
+                entry["path"] for entry in ordering_manifest["entries"]
+            ]
+            if ordering_paths != [
+                ".",
+                "a",
+                "a-b",
+                "a-b/input",
+                "a/input",
+                "crates",
+                "crates/mess",
+                "crates/mess-bench",
+                "crates/mess-bench/y",
+                "crates/mess/x",
+            ]:
+                raise PreparationError(
+                    "prefix-sibling recursive path order differs"
+                )
         root = temporary_root / "source"
         root.mkdir()
         outside = temporary_root / "outside"

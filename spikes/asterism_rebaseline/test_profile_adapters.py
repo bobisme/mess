@@ -3032,6 +3032,73 @@ class AuthorityMutationTests(unittest.TestCase):
                     expected_manifest_paths=expected_paths,
                 )
 
+    def test_recursive_live_manifest_prefix_sibling_order_matches_producer(
+        self,
+    ) -> None:
+        module_name = "_asterism_profile_prepare_overlays_self_test"
+        module_path = MODULE_PATH.parent / "tooling" / "prepare_overlays.py"
+        spec = importlib.util.spec_from_file_location(module_name, module_path)
+        assert spec is not None and spec.loader is not None
+        tooling = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = tooling
+        try:
+            spec.loader.exec_module(tooling)
+            with tempfile.TemporaryDirectory(
+                prefix="bn-1h32-profile-semantic-order-"
+            ) as temporary:
+                root = Path(temporary).resolve(strict=True)
+                (root / "a").mkdir()
+                (root / "a-b").mkdir()
+                (root / "a" / "b").write_bytes(b"a/b\n")
+                (root / "a-b" / "y").write_bytes(b"a-b/y\n")
+                produced = tooling.resample_recursive_manifest(
+                    root,
+                    "source",
+                    "profile producer prefix-sibling fixture",
+                    allow_internal_symlinks=False,
+                    hash_regular_contents=True,
+                )
+                sampled = adapters._recursive_live_manifest(
+                    root,
+                    "source",
+                    "profile prefix-sibling fixture",
+                    allow_internal_symlinks=False,
+                    hash_regular_contents=True,
+                )
+                self.assertEqual(sampled, produced)
+                self.assertEqual(
+                    [entry["path"] for entry in sampled["entries"]],
+                    [".", "a", "a-b", "a-b/y", "a/b"],
+                )
+                self.assertEqual(
+                    adapters._validate_recursive_manifest(
+                        sampled,
+                        "source",
+                        "profile prefix-sibling fixture",
+                        trusted_system=False,
+                    ),
+                    sampled,
+                )
+                entries_by_path = {
+                    entry["path"]: entry for entry in sampled["entries"]
+                }
+                depth_first = {
+                    **sampled,
+                    "entries": [
+                        entries_by_path[path]
+                        for path in (".", "a", "a/b", "a-b", "a-b/y")
+                    ],
+                }
+                with self.assertRaises(adapters.ProfileEvidenceError):
+                    adapters._validate_recursive_manifest(
+                        depth_first,
+                        "source",
+                        "profile depth-first hostile",
+                        trusted_system=False,
+                    )
+        finally:
+            sys.modules.pop(module_name, None)
+
     def test_semantic_manifest_tamper_type_and_hardlink_fail(self) -> None:
         authority, live_roots, expected_paths = self.current_semantic_case()
         source_path = expected_paths["source"]

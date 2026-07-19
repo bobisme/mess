@@ -273,6 +273,27 @@ class BuildError(RuntimeError):
     """An input, build transition, or attestation differs from authority."""
 
 
+def load_evidence_schema_self_test_module() -> Any:
+    """Load the real shared semantic-manifest validator for producer tests."""
+
+    import importlib.util
+
+    module_name = "_asterism_build_children_evidence_schema_self_test"
+    spec = importlib.util.spec_from_file_location(
+        module_name, TOOLING.parent / "evidence_schema.py"
+    )
+    if spec is None or spec.loader is None:
+        raise BuildError("evidence-schema self-test module is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
+
+
 def canonical_bytes(value: Any) -> bytes:
     return (
         json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
@@ -2708,6 +2729,7 @@ class RecursiveTreeAuthorityGuard:
             )
             if len(self.watch_descriptors) != directory_count:
                 raise BuildError(f"{self.context} recursive watch coverage differs")
+        entries.sort(key=lambda entry: (entry["path"] != ".", entry["path"]))
         return {
             "entries": entries,
             "role": self.role,
@@ -3299,6 +3321,7 @@ class CargoConfigSearchGuard:
             )
             if len(self.watch_descriptors) != directory_count:
                 raise BuildError(f"{self.context} Cargo-home watch coverage differs")
+        entries.sort(key=lambda entry: (entry["path"] != ".", entry["path"]))
         return {
             "entries": entries,
             "role": "cargo_home",
@@ -5497,6 +5520,7 @@ def self_test_cargo_example_hardlinks() -> dict[str, Any]:
 def self_test_cargo_config_guard() -> dict[str, Any]:
     """Exercise descriptor enumeration/replay without launching any process."""
 
+    evidence_schema = load_evidence_schema_self_test_module()
     with tempfile.TemporaryDirectory(prefix="bn-30fs-cargo-config-") as temporary:
         root = Path(temporary).resolve(strict=True)
         source = root / "source"
@@ -5508,10 +5532,20 @@ def self_test_cargo_config_guard() -> dict[str, Any]:
         evidence_root.mkdir()
         nested = cargo_home / "registry" / "cache"
         nested.mkdir(parents=True)
+        (cargo_home / "a").mkdir()
+        (cargo_home / "a-b").mkdir()
+        (cargo_home / "crates" / "mess").mkdir(parents=True)
+        (cargo_home / "crates" / "mess-bench").mkdir()
         dependency = nested / "dependency.crate"
         dependency_payload = b"reviewed dependency bytes\n"
         write_new(dependency, dependency_payload, 0o644)
         write_new(cargo_home / ".package-cache", b"", 0o444)
+        write_new(cargo_home / "a" / "input", b"a\n", 0o644)
+        write_new(cargo_home / "a-b" / "input", b"a-b\n", 0o644)
+        write_new(cargo_home / "crates" / "mess" / "x", b"x\n", 0o644)
+        write_new(
+            cargo_home / "crates" / "mess-bench" / "y", b"y\n", 0o644
+        )
         config_payload = b"[net]\noffline = true\n"
         write_new(source_config, config_payload, 0o444)
         empty_config = root / "reviewed-cargo-config.empty"
@@ -5556,11 +5590,20 @@ def self_test_cargo_config_guard() -> dict[str, Any]:
                 "--tmp-overlay",
                 GUEST_CARGO_HOME,
             ]
+            cargo_home_manifest = json.loads(
+                (evidence_root / "cargo-home-normal.json").read_bytes()
+            )
+            evidence_schema._validate_recursive_semantic_manifest(
+                cargo_home_manifest,
+                "cargo_home",
+                "self-test Cargo-home prefix-sibling ordering",
+                trusted_system=False,
+            )
             if (
                 before != after
                 or len(before["cargo_search"]["entries"]) != 8
-                or before["cargo_home_tree"]["entry_count"] != 5
-                or before["cargo_home_tree"]["watch_count"] != 3
+                or before["cargo_home_tree"]["entry_count"] != 14
+                or before["cargo_home_tree"]["watch_count"] != 8
                 or arguments.count("--ro-bind-data") != 4
                 or arguments.count("--ro-bind-fd") != 0
                 or arguments.count("--overlay-src") != 1
@@ -5617,13 +5660,14 @@ def self_test_cargo_config_guard() -> dict[str, Any]:
             "empty_bound_appearance_rejected": True,
             "entries": 8,
             "nested_mutation_restore_rejected": True,
+            "recursive_path_order_validated": True,
             "ro_bind_data": 4,
             "cargo_home_overlay": 1,
             "ro_bind_fd": 0,
             "schema": CARGO_CONFIG_SEARCH_SCHEMA,
             "status": "ok",
-            "tree_entries": 5,
-            "tree_watches": 3,
+            "tree_entries": 14,
+            "tree_watches": 8,
         }
 
 
@@ -5900,10 +5944,54 @@ def self_test_semantic_runtime_authority() -> dict[str, Any]:
 def self_test_idempotent_freeze() -> dict[str, Any]:
     """Prove final output freezing cannot invalidate pre-frozen input evidence."""
 
+    evidence_schema = load_evidence_schema_self_test_module()
     with tempfile.TemporaryDirectory(prefix="bn-ecm1-freeze-") as temporary:
         temporary_root = Path(temporary).resolve(strict=True)
         evidence_root = temporary_root / "evidence"
         evidence_root.mkdir()
+        ordering_root = temporary_root / "ordering"
+        ordering_root.mkdir()
+        (ordering_root / "a").mkdir()
+        (ordering_root / "a-b").mkdir()
+        (ordering_root / "crates" / "mess").mkdir(parents=True)
+        (ordering_root / "crates" / "mess-bench").mkdir()
+        write_new(ordering_root / "a" / "input", b"a\n", 0o444)
+        write_new(ordering_root / "a-b" / "input", b"a-b\n", 0o444)
+        write_new(ordering_root / "crates" / "mess" / "x", b"x\n", 0o444)
+        write_new(
+            ordering_root / "crates" / "mess-bench" / "y", b"y\n", 0o444
+        )
+        with RecursiveTreeAuthorityGuard(
+            ordering_root,
+            evidence_root / "ordering.json",
+            "source",
+            "prefix-sibling ordering fixture",
+            allow_internal_symlinks=False,
+        ) as ordering_guard:
+            assert ordering_guard.initial_manifest is not None
+            ordering_manifest = ordering_guard.initial_manifest
+            evidence_schema._validate_recursive_semantic_manifest(
+                ordering_manifest,
+                "source",
+                "prefix-sibling ordering fixture",
+                trusted_system=False,
+            )
+            ordering_paths = [
+                entry["path"] for entry in ordering_manifest["entries"]
+            ]
+            if ordering_paths != [
+                ".",
+                "a",
+                "a-b",
+                "a-b/input",
+                "a/input",
+                "crates",
+                "crates/mess",
+                "crates/mess-bench",
+                "crates/mess-bench/y",
+                "crates/mess/x",
+            ]:
+                raise BuildError("prefix-sibling recursive path order differs")
         root = temporary_root / "source"
         root.mkdir()
         write_new(root / "input.rs", b"fn main() {}\n", 0o444)
@@ -5987,6 +6075,7 @@ def self_test_idempotent_freeze() -> dict[str, Any]:
                 raise BuildError("trusted guard rejected dangling closure symlink")
     return {
         "metadata_only_unreadable_retained": True,
+        "prefix_sibling_order_validated": True,
         "recursive_manifest_unchanged": True,
         "status": "ok",
         "trusted_dangling_symlink_retained": True,
