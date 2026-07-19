@@ -1368,6 +1368,7 @@ class SemanticReplay:
             raise ValueError(f"{context} authority schema differs")
         authority_manifest_paths: list[str] = []
         authority_manifest_identities: set[tuple[int, int]] = set()
+        runtime_manifests: dict[str, Mapping[str, Any]] = {}
         for name, role in (
             ("source", source_role),
             ("toolchain", "toolchain"),
@@ -1411,6 +1412,8 @@ class SemanticReplay:
                 f"{context} {name}",
                 trusted_system=False,
             )
+            if name != "source":
+                runtime_manifests[name] = manifest
             entries = manifest["entries"]
             if (
                 snapshot.sha256 != binding["manifest_sha256"]
@@ -1492,6 +1495,7 @@ class SemanticReplay:
             {"mounts", "schema"},
             f"{context} closure manifest",
         )
+        runtime_manifests["trusted_system_closure"] = closure_manifest
         evidence_mounts = closure_manifest["mounts"]
         if (
             closure_manifest["schema"] != TRUSTED_SYSTEM_CLOSURE_SCHEMA
@@ -1590,17 +1594,26 @@ class SemanticReplay:
                 )
             },
         }
-        runtime = hashlib.sha256(canonicalize_manifest(normalized)).hexdigest()
-        if authority["runtime_sha256"] != runtime:
+        recorded_runtime = hashlib.sha256(
+            canonicalize_manifest(normalized)
+        ).hexdigest()
+        if authority["runtime_sha256"] != recorded_runtime:
             raise ValueError(f"{context} runtime digest differs")
+        components = {
+            name: authority[name]
+            for name in ("cargo_home", "toolchain", "trusted_system_closure")
+        }
+        content_runtime = schema.semantic_runtime_content_sha256(
+            components, runtime_manifests
+        )
         path_tuple = tuple(sorted(authority_manifest_paths))
         if authority_manifest_identities & self.manifest_identities:
             raise ValueError(f"{context} semantic manifest files alias")
         self.authority_paths.add(path_tuple)
         self.manifest_paths.update(authority_manifest_paths)
         self.manifest_identities.update(authority_manifest_identities)
-        self.runtimes.add(runtime)
-        return runtime
+        self.runtimes.add(content_runtime)
+        return content_runtime
 
     def capture(self, context: str, action: Callable[[], Any]) -> Any | None:
         try:
@@ -7588,7 +7601,13 @@ def validate_release_compile_out_proof(
                 if isinstance(attestation.get("cargo_config_search"), Mapping)
                 else None
             ),
-            semantic_runtime_sha256=semantic_runtime,
+            semantic_runtime_sha256=(
+                attestation["semantic_input_authority"].get("runtime_sha256")
+                if isinstance(
+                    attestation.get("semantic_input_authority"), Mapping
+                )
+                else None
+            ),
             rustc_host=embedded_toolchain.get("rustc_host"),
             execution_tools_sha256=execution_tools_sha256,
             package="mess-store",

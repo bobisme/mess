@@ -3698,6 +3698,48 @@ def semantic_runtime_sha256(
     return sha256_bytes(canonicalizer(normalized))
 
 
+def semantic_runtime_content_sha256(
+    components: Mapping[str, Mapping[str, Any]],
+    manifests: Mapping[str, Mapping[str, Any]],
+) -> str:
+    """Hash cross-producer runtime content using one UTF-8 representation."""
+
+    expected_names = {
+        "cargo_home",
+        "toolchain",
+        "trusted_system_closure",
+    }
+    if set(components) != expected_names:
+        raise ValueError("semantic runtime component names differ")
+    if set(manifests) != expected_names:
+        raise ValueError("semantic runtime manifest names differ")
+    normalized_components = {
+        "cargo_home": {
+            **components["cargo_home"],
+            "manifest_sha256": sha256_bytes(
+                prepared_authority_canonical_json_bytes(manifests["cargo_home"])
+            ),
+        },
+        "toolchain": {
+            **components["toolchain"],
+            "manifest_sha256": sha256_bytes(
+                prepared_authority_canonical_json_bytes(manifests["toolchain"])
+            ),
+        },
+        "trusted_system_closure": {
+            **components["trusted_system_closure"],
+            "sha256": sha256_bytes(
+                prepared_authority_canonical_json_bytes(
+                    manifests["trusted_system_closure"]
+                )
+            ),
+        },
+    }
+    return semantic_runtime_sha256(
+        normalized_components, prepared_authority=True
+    )
+
+
 def _validate_semantic_input_authority(
     value: Any,
     context: str,
@@ -3731,6 +3773,7 @@ def _validate_semantic_input_authority(
     }
     authority_manifest_paths: set[str] = set()
     authority_manifest_identities: set[tuple[int, int]] = set()
+    runtime_manifests: dict[str, Mapping[str, Any]] = {}
     for name, role in roles.items():
         binding = _authority_object(
             authority[name],
@@ -3770,6 +3813,8 @@ def _validate_semantic_input_authority(
             f"{context} semantic {name}",
             trusted_system=False,
         )
+        if name != "source":
+            runtime_manifests[name] = manifest
         entries = manifest["entries"]
         if (
             snapshot.sha256 != binding["manifest_sha256"]
@@ -3897,6 +3942,7 @@ def _validate_semantic_input_authority(
         ("mounts", "schema"),
         f"{context} trusted-system closure manifest",
     )
+    runtime_manifests["trusted_system_closure"] = closure_value
     evidence_mounts = closure_value["mounts"]
     if (
         closure_value["schema"] != TRUSTED_SYSTEM_CLOSURE_SCHEMA
@@ -3982,11 +4028,14 @@ def _validate_semantic_input_authority(
         name: authority[name]
         for name in ("cargo_home", "toolchain", "trusted_system_closure")
     }
-    runtime_sha256 = semantic_runtime_sha256(
+    recorded_runtime_sha256 = semantic_runtime_sha256(
         components, prepared_authority=prepared_authority
     )
-    if authority["runtime_sha256"] != runtime_sha256:
+    if authority["runtime_sha256"] != recorded_runtime_sha256:
         raise ValueError(f"{context} semantic runtime digest differs")
+    content_runtime_sha256 = semantic_runtime_content_sha256(
+        components, runtime_manifests
+    )
     if manifest_paths is not None:
         if authority_manifest_paths & manifest_paths:
             raise ValueError(f"{context} semantic manifest topology aliases")
@@ -3995,7 +4044,7 @@ def _validate_semantic_input_authority(
         if authority_manifest_identities & manifest_identities:
             raise ValueError(f"{context} semantic manifest files alias")
         manifest_identities.update(authority_manifest_identities)
-    return runtime_sha256
+    return content_runtime_sha256
 
 
 def _semantic_live_roots(
@@ -4657,8 +4706,60 @@ def _validate_release_semantic_authority(
     )
 
 
+def _release_build_target(variant: str) -> tuple[str, str]:
+    """Return the package/example pair for one release variant."""
+
+    if variant not in VARIANTS:
+        raise ValueError(f"unknown release variant {variant!r}")
+    if variant in PUBLIC_VARIANTS:
+        return "mess-store", "asterism_rebaseline_public"
+    if variant == "B":
+        return "mess-log", "asterism_rebaseline_bare"
+    raise ValueError(f"release variant {variant!r} has no build target")
+
+
+def _validate_prepared_release_variant_identity(
+    prepared_variant: Mapping[str, Any],
+    attestation: Mapping[str, Any],
+    approval_variant: Any,
+    variant: str,
+) -> None:
+    """Bind one prepared release record to its variant-map key."""
+
+    contract = _authority_object(
+        prepared_variant["contract"],
+        exact_binary_contract_fields(),
+        f"prepared release variant {variant} contract",
+    )
+    validate_binary_contract(contract)
+    approved = _authority_object(
+        approval_variant,
+        SOURCE_APPROVAL_VARIANT_FIELDS,
+        f"source approval variant {variant}",
+    )
+    build_environment = attestation["build_env"]
+    expected_source = VARIANT_SOURCE_BINDINGS[variant]
+    if (
+        not isinstance(build_environment, Mapping)
+        or contract["variant"] != variant
+        or contract["product_commit"] != expected_source["commit"]
+        or contract["product_tree"] != expected_source["tree"]
+        or attestation["source_commit"] != expected_source["commit"]
+        or attestation["source_tree"] != expected_source["tree"]
+        or build_environment.get("ASTERISM_BUILD_VARIANT") != variant
+        or build_environment.get("ASTERISM_BUILD_PRODUCT_COMMIT")
+        != expected_source["commit"]
+        or build_environment.get("ASTERISM_BUILD_PRODUCT_TREE")
+        != expected_source["tree"]
+        or approved["product_commit"] != expected_source["commit"]
+        or approved["product_tree"] != expected_source["tree"]
+    ):
+        raise ValueError(f"prepared release variant {variant} identity differs")
+
+
 def _validate_prepared_release_semantics(
     prepared: Mapping[str, Any],
+    approval: Mapping[str, Any],
     cache: dict[tuple[Any, ...], Mapping[str, Any]],
     manifest_paths: set[str],
     manifest_identities: set[tuple[int, int]],
@@ -4679,6 +4780,12 @@ def _validate_prepared_release_semantics(
             prepared_variant["attestation"],
             PREPARED_ATTESTATION_FIELDS,
             f"prepared release variant {variant} attestation",
+        )
+        _validate_prepared_release_variant_identity(
+            prepared_variant,
+            attestation,
+            approval["variants"][variant],
+            variant,
         )
         build_environment = attestation["build_env"]
         if (
@@ -4715,7 +4822,9 @@ def _validate_prepared_release_semantics(
                 f"prepared release variant {variant} authority differs"
             )
         _release_sandbox_sha256(
-            attestation, f"prepared release variant {variant}"
+            attestation,
+            f"prepared release variant {variant}",
+            expected_variant=variant,
         )
         _validate_release_build_child(
             attestation, f"prepared release variant {variant}"
@@ -4943,8 +5052,12 @@ def _release_cargo_config_sha256(
 
 
 def _release_sandbox_sha256(
-    attestation: Mapping[str, Any], context: str
+    attestation: Mapping[str, Any],
+    context: str,
+    *,
+    expected_variant: str,
 ) -> str:
+    expected_package, expected_example = _release_build_target(expected_variant)
     argv = attestation["build_argv"]
     toolchain = attestation["toolchain"]
     if (
@@ -5030,9 +5143,9 @@ def _release_sandbox_sha256(
         "--offline",
         "--release",
         "-p",
-        "mess-store",
+        expected_package,
         "--example",
-        "asterism_rebaseline_public",
+        expected_example,
         "--target-dir",
         _RELEASE_GUEST_TARGET,
     ]
@@ -5142,11 +5255,15 @@ def _release_sandbox_sha256(
     if not isinstance(build_child, Mapping) or build_child.get("argv") != argv:
         raise ValueError(f"{context} child argv differs from sandbox authority")
     cargo_config_sha256 = _release_cargo_config_sha256(attestation, context)
-    semantic_runtime = _validate_semantic_input_authority(
-        attestation.get("semantic_input_authority"),
+    semantic_authority = attestation.get("semantic_input_authority")
+    _validate_semantic_input_authority(
+        semantic_authority,
         context,
         live_roots=None,
         prepared_authority=True,
+    )
+    semantic_runtime = _authority_sha256(
+        semantic_authority["runtime_sha256"], f"{context} recorded runtime hash"
     )
     execution_tools_sha256 = _validate_prepared_execution_tools(
         attestation, context
@@ -5668,6 +5785,12 @@ def _validate_release_compile_out(
             attestation_fields,
             f"release build {name} attestation",
         )
+        _validate_prepared_release_variant_identity(
+            prepared["variants"]["A"],
+            attestation,
+            approval["variants"]["A"],
+            "A",
+        )
         if (
             build["role"] != name
             or build["artifact_role"] != equivalence[f"{name}_role"]
@@ -5689,7 +5812,9 @@ def _validate_release_compile_out(
         if not isinstance(build_environment, Mapping):
             raise ValueError(f"release build {name} environment is not an object")
         sandbox_sha256 = _release_sandbox_sha256(
-            attestation, f"release build {name}"
+            attestation,
+            f"release build {name}",
+            expected_variant="A",
         )
         child, log_snapshot, root_identity = _validate_release_build_child(
             attestation, f"release build {name}"
@@ -6065,6 +6190,7 @@ def validate_prepared_artifacts(
     )
     prepared_runtime_sha256 = _validate_prepared_release_semantics(
         value,
+        approval,
         semantic_cache,
         semantic_manifest_paths,
         semantic_manifest_identities,
@@ -6362,6 +6488,64 @@ def source_authority_self_test() -> dict[str, Any]:
         else:
             raise AssertionError(f"hostile source-authority mutation passed: {name}")
 
+    def release_variant_identity_fixture(
+        variant: str,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        source = VARIANT_SOURCE_BINDINGS[variant]
+        contract = {
+            "schema": BINARY_CONTRACT_SCHEMA,
+            "protocol": PROTOCOL,
+            "protocol_sha256": PROTOCOL_SHA256,
+            "tooling_commit": "c" * 40,
+            "tooling_tree": "d" * 40,
+            "variant": variant,
+            "product_commit": source["commit"],
+            "product_tree": source["tree"],
+            "adapter_sha256": "1" * 64,
+            "shared_manifest_sha256": "2" * 64,
+            "cargo_lock_sha256": "3" * 64,
+            "source_approval_sha256": "4" * 64,
+            "build_nonce": "5" * 64,
+            "binary_kind": "bare" if variant == "B" else "public",
+            "timed_surface": (
+                "raw-numeric" if variant == "B" else "public-event-store"
+            ),
+            "correctness_oracle_mode": variant != "B",
+            "profile_role_lifetime": (
+                PROFILE_C_ROLE_LIFETIME_CONTRACT
+                if variant == "C"
+                else "not_applicable"
+            ),
+            "contract_mode": True,
+            "rows_written": 0,
+        }
+        attestation = {
+            "source_commit": source["commit"],
+            "source_tree": source["tree"],
+            "build_env": {
+                "ASTERISM_BUILD_VARIANT": variant,
+                "ASTERISM_BUILD_PRODUCT_COMMIT": source["commit"],
+                "ASTERISM_BUILD_PRODUCT_TREE": source["tree"],
+            },
+        }
+        approved = {
+            field: None for field in SOURCE_APPROVAL_VARIANT_FIELDS
+        }
+        approved["product_commit"] = source["commit"]
+        approved["product_tree"] = source["tree"]
+        return {"contract": contract}, attestation, approved
+
+    for variant in VARIANTS:
+        _validate_prepared_release_variant_identity(
+            *release_variant_identity_fixture(variant), variant
+        )
+    reject(
+        "prepared_release_variant_c_d_swap",
+        lambda: _validate_prepared_release_variant_identity(
+            *release_variant_identity_fixture("D"), "C"
+        ),
+    )
+
     if (
         _semantic_symlink_scope(
             Path("/usr/lib"),
@@ -6600,6 +6784,72 @@ def source_authority_self_test() -> dict[str, Any]:
             "runtime_sha256"
         ]:
             raise AssertionError("semantic runtime digest includes source identity")
+
+        unicode_closure_manifest = json.loads(json.dumps(closure_manifest))
+        unicode_root = unicode_closure_manifest["mounts"][1]["tree"]["entries"][0]
+        unicode_closure_manifest["mounts"][1]["tree"]["entries"].append(
+            {
+                "changed_ns": 2,
+                "device": unicode_root["device"],
+                "file_type": "regular",
+                "gid": 0,
+                "inode": 999,
+                "link_count": 1,
+                "modified_ns": 2,
+                "path": "go/test/fixedbugs/issue27836.dir/Þfoo.go",
+                "permissions": 0o444,
+                "sha256": None,
+                "size": 1,
+                "symlink_target": None,
+                "symlink_scope": None,
+                "uid": 0,
+            }
+        )
+        _validate_recursive_semantic_manifest(
+            unicode_closure_manifest["mounts"][1]["tree"],
+            "system-usr-lib",
+            "self-test Unicode trusted-system tree",
+            trusted_system=True,
+        )
+        unicode_manifests = {
+            "cargo_home": semantic_tree_values["cargo_home"],
+            "toolchain": semantic_tree_values["toolchain"],
+            "trusted_system_closure": unicode_closure_manifest,
+        }
+        ascii_components = json.loads(json.dumps(runtime_components))
+        utf8_components = json.loads(json.dumps(runtime_components))
+        for components, canonicalize in (
+            (ascii_components, canonical_json_bytes),
+            (utf8_components, prepared_authority_canonical_json_bytes),
+        ):
+            components["trusted_system_closure"]["entry_count"] += 1
+            components["trusted_system_closure"]["sha256"] = sha256_bytes(
+                canonicalize(unicode_closure_manifest)
+            )
+        if semantic_runtime_sha256(
+            ascii_components
+        ) == semantic_runtime_sha256(
+            utf8_components, prepared_authority=True
+        ):
+            raise AssertionError("Unicode producer runtime digests unexpectedly match")
+        ascii_content_runtime = semantic_runtime_content_sha256(
+            ascii_components, unicode_manifests
+        )
+        utf8_content_runtime = semantic_runtime_content_sha256(
+            utf8_components, unicode_manifests
+        )
+        if ascii_content_runtime != utf8_content_runtime:
+            raise AssertionError("Unicode runtime content normalization differs")
+        changed_unicode_manifests = json.loads(json.dumps(unicode_manifests))
+        changed_unicode_manifests["trusted_system_closure"]["mounts"][1][
+            "tree"
+        ]["entries"][-1]["path"] = (
+            "go/test/fixedbugs/issue27836.dir/Þbar.go"
+        )
+        if semantic_runtime_content_sha256(
+            utf8_components, changed_unicode_manifests
+        ) == utf8_content_runtime:
+            raise AssertionError("changed Unicode runtime content was accepted")
 
         system_descriptors = tuple(str(401 + index) for index in range(3))
         dev_null_descriptor = "404"
@@ -6879,25 +7129,81 @@ def source_authority_self_test() -> dict[str, Any]:
         normalized_sandbox[dev_null_source_index] = "$FD:/dev/null"
         overlay_source_index = sandbox_argv.index("--overlay-src") + 1
         normalized_sandbox[overlay_source_index] = "$FD:cargo-home-overlay"
-        expected_sandbox_sha256 = sha256_bytes(
-            canonical_json_bytes(
-                {
-                    "argv": normalized_sandbox,
-                    "cargo_config_search_sha256": config_sha256,
-                    "execution_tools_sha256": sha256_bytes(
-                        prepared_authority_canonical_json_bytes(execution_tools)
-                    ),
-                    "semantic_runtime_sha256": semantic_authority[
-                        "runtime_sha256"
-                    ],
-                }
+        execution_tools_sha256 = sha256_bytes(
+            prepared_authority_canonical_json_bytes(execution_tools)
+        )
+
+        def expected_release_sandbox_sha256(
+            normalized_argv: Sequence[str],
+        ) -> str:
+            return sha256_bytes(
+                canonical_json_bytes(
+                    {
+                        "argv": normalized_argv,
+                        "cargo_config_search_sha256": config_sha256,
+                        "execution_tools_sha256": execution_tools_sha256,
+                        "semantic_runtime_sha256": semantic_authority[
+                            "runtime_sha256"
+                        ],
+                    }
+                )
             )
+
+        expected_sandbox_sha256 = expected_release_sandbox_sha256(
+            normalized_sandbox
         )
         if (
-            _release_sandbox_sha256(sandbox_attestation, "self-test")
+            _release_sandbox_sha256(
+                sandbox_attestation,
+                "self-test public release",
+                expected_variant="A",
+            )
             != expected_sandbox_sha256
         ):
-            raise AssertionError("canonical release sandbox hash differs")
+            raise AssertionError("canonical public release sandbox hash differs")
+
+        bare_package, bare_example = _release_build_target("B")
+        bare_argv = list(sandbox_attestation["build_argv"])
+        package_index = bare_argv.index("-p") + 1
+        example_index = bare_argv.index("--example") + 1
+        bare_argv[package_index] = bare_package
+        bare_argv[example_index] = bare_example
+        bare_attestation = {
+            **sandbox_attestation,
+            "build_argv": bare_argv,
+            "build_child": {"argv": bare_argv},
+        }
+        normalized_bare_sandbox = list(normalized_sandbox)
+        normalized_bare_sandbox[package_index] = bare_package
+        normalized_bare_sandbox[example_index] = bare_example
+        expected_bare_sandbox_sha256 = expected_release_sandbox_sha256(
+            normalized_bare_sandbox
+        )
+        if (
+            _release_sandbox_sha256(
+                bare_attestation,
+                "self-test bare release",
+                expected_variant="B",
+            )
+            != expected_bare_sandbox_sha256
+        ):
+            raise AssertionError("canonical bare release sandbox hash differs")
+        reject(
+            "sandbox_public_command_for_bare_variant",
+            lambda: _release_sandbox_sha256(
+                sandbox_attestation,
+                "self-test public command for bare variant",
+                expected_variant="B",
+            ),
+        )
+        reject(
+            "sandbox_bare_command_for_public_variant",
+            lambda: _release_sandbox_sha256(
+                bare_attestation,
+                "self-test bare command for public variant",
+                expected_variant="A",
+            ),
+        )
         sandbox_hostiles = {
             "sandbox_aliased_descriptor": lambda hostile: hostile[
                 "build_argv"
@@ -6997,7 +7303,11 @@ def source_authority_self_test() -> dict[str, Any]:
                 hostile["build_child"]["argv"] = list(hostile["build_argv"])
             reject(
                 name,
-                lambda hostile=hostile: _release_sandbox_sha256(hostile, name),
+                lambda hostile=hostile, name=name: _release_sandbox_sha256(
+                    hostile,
+                    name,
+                    expected_variant="A",
+                ),
             )
         hardlink_manifest_path = semantic_root / "source-hardlink.json"
         os.link(source_manifest_path, hardlink_manifest_path)

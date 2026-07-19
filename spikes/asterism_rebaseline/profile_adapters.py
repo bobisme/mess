@@ -2920,6 +2920,34 @@ def _semantic_runtime_sha256(
     return _sha256_bytes(canonical_bytes(normalized))
 
 
+def _semantic_runtime_content_sha256(
+    components: Mapping[str, object],
+    manifests: Mapping[str, object],
+) -> str:
+    expected_names = {"cargo_home", "toolchain", "trusted_system_closure"}
+    if set(components) != expected_names or set(manifests) != expected_names:
+        raise ProfileEvidenceError("semantic runtime content topology differs")
+    normalized_components = {
+        "cargo_home": {
+            **_as_mapping(components["cargo_home"], "semantic Cargo home"),
+            "manifest_sha256": _sha256_bytes(canonical_json(manifests["cargo_home"])),
+        },
+        "toolchain": {
+            **_as_mapping(components["toolchain"], "semantic toolchain"),
+            "manifest_sha256": _sha256_bytes(canonical_json(manifests["toolchain"])),
+        },
+        "trusted_system_closure": {
+            **_as_mapping(
+                components["trusted_system_closure"], "semantic closure"
+            ),
+            "sha256": _sha256_bytes(
+                canonical_json(manifests["trusted_system_closure"])
+            ),
+        },
+    }
+    return _semantic_runtime_sha256(normalized_components)
+
+
 def _semantic_manifest_snapshot(
     path_value: object,
     digest: object,
@@ -3026,6 +3054,7 @@ def _validate_semantic_input_authority(
     )
     manifest_paths: list[Path] = []
     authority_manifest_identities: set[tuple[int, int]] = set()
+    runtime_manifests: dict[str, object] = {}
     for name, role in (
         ("source", source_role),
         ("toolchain", "toolchain"),
@@ -3065,6 +3094,8 @@ def _validate_semantic_input_authority(
             f"{context} semantic {name} evidence",
             trusted_system=False,
         )
+        if name != "source":
+            runtime_manifests[name] = manifest
         entries = manifest["entries"]
         assert isinstance(entries, list)
         if (
@@ -3165,6 +3196,7 @@ def _validate_semantic_input_authority(
     closure_value = _exact_mapping(
         closure_evidence, ("mounts", "schema"), f"{context} closure evidence"
     )
+    runtime_manifests["trusted_system_closure"] = closure_value
     evidence_mounts = closure_value["mounts"]
     if (
         closure_value["schema"] != _TRUSTED_SYSTEM_CLOSURE_SCHEMA
@@ -3224,16 +3256,19 @@ def _validate_semantic_input_authority(
         name: authority[name]
         for name in ("cargo_home", "toolchain", "trusted_system_closure")
     }
-    runtime = authority["runtime_sha256"]
+    recorded_runtime = authority["runtime_sha256"]
     if (
-        not isinstance(runtime, str)
-        or _SHA256_RE.fullmatch(runtime) is None
-        or runtime
+        not isinstance(recorded_runtime, str)
+        or _SHA256_RE.fullmatch(recorded_runtime) is None
+        or recorded_runtime
         != _semantic_runtime_sha256(
             components, canonical_bytes=manifest_canonical_json
         )
     ):
         raise ProfileEvidenceError(f"{context} semantic runtime digest differs")
+    content_runtime = _semantic_runtime_content_sha256(
+        components, runtime_manifests
+    )
     manifest_paths.append(closure_evidence_path)
     if len(manifest_paths) != 4:
         raise ProfileEvidenceError(f"{context} semantic manifest count differs")
@@ -3241,7 +3276,7 @@ def _validate_semantic_input_authority(
         if authority_manifest_identities & manifest_identities:
             raise ProfileEvidenceError(f"{context} semantic manifest files alias")
         manifest_identities.update(authority_manifest_identities)
-    return runtime, (
+    return content_runtime, (
         manifest_paths[0],
         manifest_paths[1],
         manifest_paths[2],
@@ -6035,7 +6070,10 @@ def _validate_phase4_semantic_authority(
             context,
             package=package,
             example=example,
-            runtime_sha256=runtime,
+            runtime_sha256=_as_mapping(
+                attestation.get("semantic_input_authority"),
+                f"{context} semantic authority",
+            )["runtime_sha256"],
         )
         if context in {"prepared A", "proof overlay A"}:
             record = ordinary_record if context == "prepared A" else overlay_record

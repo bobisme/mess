@@ -772,6 +772,7 @@ class TerminalSemanticReplay:
             raise ValueError(f"{context} authority schema differs")
         authority_paths: list[str] = []
         authority_identities: set[tuple[int, int]] = set()
+        runtime_manifests: dict[str, Mapping[str, Any]] = {}
         for name, role in (("source", source_role), ("toolchain", "toolchain"), ("cargo_home", "cargo_home")):
             binding = _terminal_semantic_exact(
                 authority[name], SEMANTIC_TREE_FIELDS, f"{context} {name} binding"
@@ -800,6 +801,8 @@ class TerminalSemanticReplay:
                 parse_manifest(snapshot.data, f"{context} {name}"),
                 role, f"{context} {name}", trusted=False,
             )
+            if name != "source":
+                runtime_manifests[name] = manifest
             entries = manifest["entries"]
             if (
                 snapshot.sha256 != binding["manifest_sha256"]
@@ -848,6 +851,7 @@ class TerminalSemanticReplay:
             parse_manifest(closure_snapshot.data, f"{context} closure manifest"),
             {"mounts", "schema"}, f"{context} closure manifest",
         )
+        runtime_manifests["trusted_system_closure"] = closure_manifest
         evidence_mounts = closure_manifest["mounts"]
         if closure_manifest["schema"] != TRUSTED_SYSTEM_CLOSURE_SCHEMA or closure_snapshot.sha256 != closure["sha256"] or not isinstance(evidence_mounts, list) or len(evidence_mounts) != 3:
             raise ValueError(f"{context} closure evidence differs")
@@ -878,16 +882,25 @@ class TerminalSemanticReplay:
             "toolchain": {field: authority["toolchain"][field] for field in tree_fields},
             "trusted_system_closure": {field: closure[field] for field in closure_fields},
         }
-        runtime = hashlib.sha256(canonicalize_manifest(normalized)).hexdigest()
-        if authority["runtime_sha256"] != runtime:
+        recorded_runtime = hashlib.sha256(
+            canonicalize_manifest(normalized)
+        ).hexdigest()
+        if authority["runtime_sha256"] != recorded_runtime:
             raise ValueError(f"{context} runtime differs")
+        components = {
+            name: authority[name]
+            for name in ("cargo_home", "toolchain", "trusted_system_closure")
+        }
+        content_runtime = schema.semantic_runtime_content_sha256(
+            components, runtime_manifests
+        )
         if authority_identities & self.identities:
             raise ValueError(f"{context} manifest files alias")
         self.paths.update(authority_paths)
         self.identities.update(authority_identities)
         self.authorities.add(tuple(sorted(authority_paths)))
-        self.runtimes.add(runtime)
-        return runtime
+        self.runtimes.add(content_runtime)
+        return content_runtime
 
     def capture(self, context: str, action: Any) -> Any | None:
         try:
@@ -4885,8 +4898,14 @@ def validate_terminal_release_proof_semantics(
                     prepared_authority=True,
                 ),
             )
+        semantic_authority = attestation.get("semantic_input_authority")
+        recorded_runtime = (
+            semantic_authority.get("runtime_sha256")
+            if isinstance(semantic_authority, Mapping)
+            else None
+        )
         sandbox_sha256 = validate_terminal_release_sandbox(
-            attestation, context, semantic_runtime, errors
+            attestation, context, recorded_runtime, errors
         )
         build_event = validate_terminal_release_build_child(
             attestation, context, errors
