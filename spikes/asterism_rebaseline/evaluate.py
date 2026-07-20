@@ -3564,7 +3564,8 @@ def validate_current_top_authorities(
     expected_prefix = [
         current_dir / "correctness.rs", current_dir / "fault.rs",
         current_dir / "validate_fault.py", current_dir / "lock_authority.py",
-        tooling / "prepare_overlays.py", current_dir / "product-test-overlay.patch",
+        tooling / "prepare_overlays.py", tooling / "overlay_pins.py",
+        current_dir / "product-test-overlay.patch",
         current_dir / "validate_product_test_overlay.py",
         current_dir / "rustc_workspace_wrapper.py",
         current_dir / "validate_build_children.py",
@@ -3576,7 +3577,7 @@ def validate_current_top_authorities(
         Path(str(lock_inputs["review_bundle"]["path"])),
     ]
     inputs = current.get("inputs")
-    if not isinstance(inputs, list) or len(inputs) != 27:
+    if not isinstance(inputs, list) or len(inputs) != 28:
         raise ValueError("semantic current input cardinality differs")
     input_records = [
         _current_live_file_identity(raw, f"semantic current input {index}")
@@ -3584,31 +3585,31 @@ def validate_current_top_authorities(
     ]
     expected_paths = [
         *expected_prefix,
-        Path(str(input_records[22]["path"])),
+        Path(str(input_records[23]["path"])),
         *(Path(record["path"]) for record in candidate_records),
         config_path,
     ]
     if (
         [record["path"] for record in input_records]
         != [str(path.resolve(strict=True)) for path in expected_paths]
-        or len({record["path"] for record in input_records}) != 27
-        or len({(record["device"], record["inode"]) for record in input_records}) != 27
+        or len({record["path"] for record in input_records}) != 28
+        or len({(record["device"], record["inode"]) for record in input_records}) != 28
     ):
         raise ValueError("semantic current input ordering/disjointness differs")
     if (
         input_records[1] != fault_raw["source"]
         or input_records[2] != fault_raw["validator"]
-        or input_records[8]
+        or input_records[9]
         != current["static_authority"]["validator"]
-        or input_records[26] != cargo["identity"]
-        or input_records[5]["sha256"]
+        or input_records[27] != cargo["identity"]
+        or input_records[6]["sha256"]
         != current.get("product_overlay_authority", {}).get("patch", {}).get(
             "sha256"
         )
     ):
         raise ValueError("semantic current input authority crosslink differs")
     base_tools = schema.parse_prepared_authority_json_object(
-        Path(input_records[22]["path"]).read_bytes(),
+        Path(input_records[23]["path"]).read_bytes(),
         "semantic current base tools manifest",
     )
     base_tool_values = base_tools.get("tools")
@@ -14501,6 +14502,7 @@ def profile_fields(track, finish_result, *, raw_point, control_events, authority
         current_dir / "validate_fault.py",
         current_dir / "lock_authority.py",
         current_tooling / "prepare_overlays.py",
+        current_tooling / "overlay_pins.py",
         current_dir / "product-test-overlay.patch",
         current_dir / "validate_product_test_overlay.py",
         current_dir / "rustc_workspace_wrapper.py",
@@ -18171,7 +18173,7 @@ def self_test() -> dict[str, Any]:
         ) -> None:
             replacement = copy.deepcopy(current["inputs"][2])
             current["static_authority"]["validator"] = replacement
-            current["inputs"][8] = replacement
+            current["inputs"][9] = replacement
 
         check(
             "mutation-semantic-current-static-validator-input-coordinated-rebind",
@@ -18247,7 +18249,7 @@ def self_test() -> dict[str, Any]:
 
         def final_tools_inheritance_rejected() -> bool:
             base = schema.parse_canonical_json_object(
-                Path(current_children_fixture["inputs"][22]["path"]).read_bytes(),
+                Path(current_children_fixture["inputs"][23]["path"]).read_bytes(),
                 "hostile base tools",
             )
             final = schema.parse_canonical_json_object(
@@ -18528,7 +18530,7 @@ def self_test() -> dict[str, Any]:
                     placements=construction["kinds"]["children"]["placements"],
                     root=current_root / "materialized" / "children",
                     patch_payload=Path(
-                        current_children_fixture["inputs"][5]["path"]
+                        current_children_fixture["inputs"][6]["path"]
                     ).read_bytes(),
                     overlay=True,
                     context="hostile current materialization replay",

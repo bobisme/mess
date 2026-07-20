@@ -189,6 +189,14 @@ FROZEN_CARGO_ENV_FIELDS = {
 }
 FROZEN_RUNTIME_ENV_FIELDS = {"HOME", "LANG", "LC_ALL", "PATH", "TZ"}
 HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+from overlay_pins import (  # noqa: E402
+    PINNED_SHARED_OVERLAY_SHA256,
+    validate_pinned_shared_overlay_payload as validate_raw_shared_overlay_payload,
+    validate_pinned_shared_overlay_set,
+)
+
 PLAN_PATH = HERE / "source-plan.json"
 SHARED_SOURCE = HERE / "overlay" / "shared"
 PUBLIC_SOURCE = HERE / "overlay" / "public"
@@ -2458,6 +2466,212 @@ def retained_git_run(
             os.close(descriptor)
 
 
+def _rust_literal_end(source: str, offset: int, context: str) -> int | None:
+    """Return the end of one Rust string/character literal, if present."""
+
+    character = source[offset]
+    if character == "r":
+        hashes = 0
+        raw_quote = offset + 1
+        while raw_quote < len(source) and source[raw_quote] == "#":
+            hashes += 1
+            raw_quote += 1
+        if raw_quote < len(source) and source[raw_quote] == '"':
+            closing = '"' + "#" * hashes
+            end = source.find(closing, raw_quote + 1)
+            if end < 0:
+                raise PreparationError(f"{context} has an unterminated raw string")
+            return end + len(closing)
+    if character == '"':
+        cursor = offset + 1
+        while cursor < len(source):
+            if source[cursor] == "\\":
+                cursor += 2
+            elif source[cursor] == '"':
+                return cursor + 1
+            else:
+                cursor += 1
+        raise PreparationError(f"{context} has an unterminated string")
+    if character == "'":
+        lifetime = (
+            offset + 1 < len(source)
+            and (source[offset + 1].isalnum() or source[offset + 1] == "_")
+            and (offset + 2 >= len(source) or source[offset + 2] != "'")
+        )
+        if lifetime:
+            return None
+        cursor = offset + 1
+        while cursor < len(source):
+            if source[cursor] == "\\":
+                cursor += 2
+            elif source[cursor] == "'":
+                return cursor + 1
+            else:
+                cursor += 1
+        raise PreparationError(f"{context} has an unterminated character literal")
+    return None
+
+
+def strip_rust_comments(source: str, context: str) -> str:
+    """Blank Rust comments while preserving literals, newlines, and offsets."""
+
+    stripped = list(source)
+    offset = 0
+    while offset < len(source):
+        literal_end = _rust_literal_end(source, offset, context)
+        if literal_end is not None:
+            offset = literal_end
+            continue
+        if source.startswith("//", offset):
+            end = source.find("\n", offset + 2)
+            end = len(source) if end < 0 else end
+            for index in range(offset, end):
+                stripped[index] = " "
+            offset = end
+            continue
+        if source.startswith("/*", offset):
+            comment_depth = 1
+            stripped[offset] = stripped[offset + 1] = " "
+            cursor = offset + 2
+            while cursor < len(source) and comment_depth:
+                if source.startswith("/*", cursor):
+                    comment_depth += 1
+                    stripped[cursor] = stripped[cursor + 1] = " "
+                    cursor += 2
+                elif source.startswith("*/", cursor):
+                    comment_depth -= 1
+                    stripped[cursor] = stripped[cursor + 1] = " "
+                    cursor += 2
+                else:
+                    if source[cursor] != "\n":
+                        stripped[cursor] = " "
+                    cursor += 1
+            if comment_depth:
+                raise PreparationError(f"{context} has an unterminated comment")
+            offset = cursor
+            continue
+        offset += 1
+    return "".join(stripped)
+
+
+def blank_rust_literals(source: str, context: str) -> str:
+    """Blank Rust literals while preserving newlines and source offsets."""
+
+    blanked = list(source)
+    offset = 0
+    while offset < len(source):
+        literal_end = _rust_literal_end(source, offset, context)
+        if literal_end is None:
+            offset += 1
+            continue
+        for index in range(offset, literal_end):
+            if source[index] != "\n":
+                blanked[index] = " "
+        offset = literal_end
+    return "".join(blanked)
+
+
+def blank_exact_fragments(
+    source: str, fragments: tuple[str, ...], context: str
+) -> str:
+    """Blank unique required fragments while preserving newlines and offsets."""
+
+    blanked = list(source)
+    occupied: set[int] = set()
+    for fragment in fragments:
+        require_exact_fragment(source, fragment, context)
+        start = source.index(fragment)
+        for index in range(start, start + len(fragment)):
+            if index in occupied:
+                raise PreparationError(f"{context} fragments overlap")
+            occupied.add(index)
+            if source[index] != "\n":
+                blanked[index] = " "
+    return "".join(blanked)
+
+
+def reject_rust_unprovable_conditionals(source: str, context: str) -> None:
+    """Reject constant or compile-time conditionals in one attested Rust item."""
+
+    for pattern in (
+        r"\bif\s*(?:\(\s*)?(?:false|true)\b",
+        r"\bif\s+cfg!\s*\(",
+        r"#\s*\[\s*cfg(?:_attr)?\s*\(",
+    ):
+        if re.search(pattern, source):
+            raise PreparationError(f"{context} contains an unprovable conditional")
+
+
+def reject_rust_control_transfers(source: str, context: str) -> None:
+    """Reject transfers forbidden by a straight-line attested Rust flow."""
+
+    for pattern in (
+        r"\b(?:return|break|continue)\b",
+        r"\b(?:panic|unreachable|todo|unimplemented)\s*!",
+        r"\bexit\s*\(",
+    ):
+        if re.search(pattern, source):
+            raise PreparationError(f"{context} contains a control-flow transfer")
+
+
+def reject_rust_shadowing_and_macros(
+    source: str,
+    context: str,
+    *,
+    allowed_ack_fragments: tuple[str, ...] = (),
+) -> None:
+    """Reject silent shadowing and non-whitelisted macros in attested Rust."""
+
+    literal_blanked = blank_rust_literals(source, context)
+    if re.search(r"\b(?:const|static)\b", literal_blanked):
+        raise PreparationError(f"{context} contains a local const/static item")
+    observed_macros = set(
+        re.findall(
+            r"\b([A-Za-z_][A-Za-z0-9_]*)\s*!\s*[({\[]",
+            literal_blanked,
+        )
+    )
+    unexpected_macros = observed_macros - {"assert", "assert_eq", "vec"}
+    if unexpected_macros:
+        raise PreparationError(
+            f"{context} contains unapproved macros: {sorted(unexpected_macros)}"
+        )
+    ack_blanked = blank_exact_fragments(
+        source,
+        allowed_ack_fragments,
+        f"{context} PERF_ACK_WIRE allowance",
+    )
+    ack_blanked = blank_rust_literals(ack_blanked, context)
+    if re.search(r"\bPERF_ACK_WIRE\b", ack_blanked):
+        raise PreparationError(f"{context} shadows or smuggles PERF_ACK_WIRE")
+
+
+def rust_brace_depth_at(source: str, offset: int, context: str) -> int:
+    """Return Rust brace depth at one code offset, ignoring literals."""
+
+    if not 0 <= offset <= len(source):
+        raise PreparationError(f"{context} offset is outside the source")
+    depth = 0
+    cursor = 0
+    while cursor < offset:
+        literal_end = _rust_literal_end(source, cursor, context)
+        if literal_end is not None:
+            if literal_end > offset:
+                raise PreparationError(f"{context} target is inside a literal")
+            cursor = literal_end
+            continue
+        if source.startswith("//", cursor) or source.startswith("/*", cursor):
+            raise PreparationError(f"{context} source retains a comment")
+        if source[cursor] == "{":
+            depth += 1
+        elif source[cursor] == "}":
+            depth -= 1
+            if depth < 0:
+                raise PreparationError(f"{context} braces are unbalanced")
+        cursor += 1
+    return depth
+
+
 def rust_item(source: str, marker: str, context: str) -> str:
     """Extract one brace-delimited Rust item for a fail-closed static proof."""
 
@@ -2573,8 +2787,128 @@ def replace_exact_once(
     return source.replace(old, new, 1)
 
 
-def validate_shared_control_child_source(control: str) -> None:
-    """Bind the shared ordinary-child wire phases to runner v3 fields."""
+def validate_pinned_shared_overlay_payload(
+    name: str, payload: bytes, expected_sha256: str | None = None
+) -> None:
+    """Re-export exact raw shared-overlay binding with local error semantics."""
+
+    validate_raw_shared_overlay_payload(
+        name,
+        payload,
+        expected_sha256,
+        error_type=PreparationError,
+    )
+
+
+def validate_shared_control_child_source(
+    control: bytes | str,
+    *,
+    expected_sha256: str | None = None,
+) -> None:
+    """Hash-bind shared control bytes, then run diagnostic source checks."""
+
+    payload = control if isinstance(control, bytes) else control.encode("utf-8")
+    validate_pinned_shared_overlay_payload(
+        "control.rs",
+        payload,
+        expected_sha256
+        if expected_sha256 is not None
+        else PINNED_SHARED_OVERLAY_SHA256["control.rs"],
+    )
+    try:
+        control = payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise PreparationError("shared control source is not UTF-8") from error
+    # Everything below is diagnostic. The exact raw-byte hash above is the
+    # binding layer; fragment checks cannot model Rust name resolution. The
+    # residual rebinding limits are documented by Seal review cr-8evico.
+    control = strip_rust_comments(control, "shared control source")
+    control_without_literals = blank_rust_literals(control, "shared control source")
+    if re.search(r"\bmacro_rules\s*!", control_without_literals):
+        raise PreparationError("shared control source defines a local macro")
+    for fragment, context in (
+        ('const PERF_ACK_WIRE: &[u8; 5] = b"ack\\n\\0";', "perf ACK wire"),
+        (
+            'const PERF_ACK_LEDGER_ENTRY: &[u8; 4] = b"ack\\n";',
+            "perf ACK ledger entry",
+        ),
+    ):
+        require_exact_fragment(control, fragment, context)
+        if rust_brace_depth_at(control, control.index(fragment), context) != 0:
+            raise PreparationError(f"{context} is not a top-level binding")
+
+    disable = rust_item(
+        control, "fn disable_after_t1(", "shared perf disable control"
+    )
+    require_exact_signature(
+        disable,
+        "fn disable_after_t1(&mut self, nonce: &Nonce, t1_monotonic_ns: u64) {",
+        "shared perf disable control",
+    )
+    available_else = """        let Self::Available { pipes, disable, .. } = self else {
+            return;
+        };"""
+    require_exact_fragment(
+        disable,
+        available_else,
+        "shared perf disable availability binding",
+    )
+    if rust_brace_depth_at(
+        disable,
+        disable.index(available_else),
+        "shared perf disable availability binding",
+    ) != 1:
+        raise PreparationError("shared perf disable availability binding is nested")
+    ack_array_fragment = "let mut ack = [0_u8; PERF_ACK_WIRE.len()];"
+    ack_assert_fragment = (
+        'assert_eq!(&ack, PERF_ACK_WIRE, "perf disable ACK differs");'
+    )
+    disable_order = (
+        "let sent_monotonic_ns = monotonic_ns();",
+        'pipes.command.write_all(b"disable\\n")',
+        'pipes.command.flush().expect("flush perf disable")',
+        ack_array_fragment,
+        "pipes.ack.read_exact(&mut ack)",
+        ack_assert_fragment,
+        "let ack_received_monotonic_ns = monotonic_ns();",
+        "ack_received_monotonic_ns > sent_monotonic_ns",
+        ".write_all(PERF_ACK_LEDGER_ENTRY)",
+        'pipes.ledger.flush().expect("flush perf disable ACK ledger")',
+    )
+    for marker in disable_order:
+        if disable.count(marker) != 1:
+            raise PreparationError(f"shared perf disable control differs: {marker}")
+        if rust_brace_depth_at(disable, disable.index(marker), marker) != 1:
+            raise PreparationError(
+                f"shared perf disable control depth differs: {marker}"
+            )
+    if [disable.index(marker) for marker in disable_order] != sorted(
+        disable.index(marker) for marker in disable_order
+    ):
+        raise PreparationError("shared perf disable control is reordered")
+    disable_flow = list(
+        blank_rust_literals(disable, "shared perf disable control")
+    )
+    allowed_start = disable.index(available_else)
+    for index in range(allowed_start, allowed_start + len(available_else)):
+        if disable_flow[index] != "\n":
+            disable_flow[index] = " "
+    disable_flow_text = "".join(disable_flow)
+    # This attested function is straight-line except for the exact availability
+    # let-else above. Any new transfer requires a deliberate validator update.
+    reject_rust_unprovable_conditionals(
+        disable_flow_text, "shared perf disable control"
+    )
+    reject_rust_control_transfers(disable_flow_text, "shared perf disable control")
+    # Infinite loops, aborts, and opaque diverging calls are accepted-by-failure:
+    # the runner timeout/nonzero-exit/output-cardinality guards expose them.
+    # Shadowing and macro smuggling can complete with silently wrong evidence,
+    # so they are rejected here after blanking only the two required ACK uses.
+    reject_rust_shadowing_and_macros(
+        disable,
+        "shared perf disable control",
+        allowed_ack_fragments=(ack_array_fragment, ack_assert_fragment),
+    )
 
     boot = rust_item(control, "pub fn boot(", "shared control boot")
     require_exact_signature(
@@ -2698,7 +3032,7 @@ def validate_shared_control_child_source(control: str) -> None:
     ) {""",
         "shared control measured/release",
     )
-    measured_fields = """        let mut fields = vec![
+    measured_prefix = """        let mut fields = vec![
             ("allocated_bytes_end", json_u64(markers.allocated_bytes_end)),
             ("allocation_calls_end", json_u64(markers.allocation_calls_end)),
             (
@@ -2710,6 +3044,11 @@ def validate_shared_control_child_source(control: str) -> None:
                 json_u64(markers.last_completion_monotonic_ns),
             ),
             ("nonce", json_string(nonce.as_str())),
+        ];"""
+    perf_disable_insert = """        if let Some(perf_disable) = self.perf.measured_value(nonce) {
+            fields.push(("perf_disable", perf_disable));
+        }"""
+    measured_suffix = """        fields.extend([
             ("phase", json_string("measured")),
             (
                 "process_system_cpu_end_ns",
@@ -2722,18 +3061,34 @@ def validate_shared_control_child_source(control: str) -> None:
             ("release_monotonic_ns", json_u64(markers.release_monotonic_ns)),
             ("t0_monotonic_ns", json_u64(markers.t0_monotonic_ns)),
             ("t1_monotonic_ns", json_u64(markers.t1_monotonic_ns)),
-        ];"""
-    require_exact_fragment(
-        measured,
-        measured_fields,
-        "shared measured field/expression tuple",
-    )
-    for marker in (
+        ]);"""
+    measured_order = (
+        measured_prefix,
+        perf_disable_insert,
+        measured_suffix,
+        "self.send(&canonical_object(&fields));",
         'command(&self.receive(), "release")',
         'assert_eq!(released, *nonce, "release nonce mismatch")',
+    )
+    measured_flow = blank_rust_literals(measured, "shared measured control")
+    # This attested function has no legitimate transfer tokens. Any future
+    # return/break/continue/panic/exit requires a deliberate validator update.
+    reject_rust_unprovable_conditionals(measured_flow, "shared measured control")
+    reject_rust_control_transfers(measured_flow, "shared measured control")
+    # Loop/abort/opaque-call divergence fails loudly at the runner boundary.
+    # ACK binding shadowing and macros are rejected because they can silently
+    # alter exact bindings or return while preserving an apparently valid exit.
+    reject_rust_shadowing_and_macros(measured, "shared measured control")
+    for fragment in measured_order:
+        require_exact_fragment(measured, fragment, "shared measured lexical flow")
+        if rust_brace_depth_at(measured, measured.index(fragment), fragment) != 1:
+            raise PreparationError(
+                "shared measured lexical flow has nested required code"
+            )
+    if [measured.index(fragment) for fragment in measured_order] != sorted(
+        measured.index(fragment) for fragment in measured_order
     ):
-        if measured.count(marker) != 1:
-            raise PreparationError(f"shared measured release differs: {marker}")
+        raise PreparationError("shared measured lexical flow is reordered")
 
 
 def validate_correctness_oracle_control_source(public: str) -> None:
@@ -2969,7 +3324,7 @@ def validate_current_correctness_construction() -> None:
         str(CURRENT_PREPARE_CHILDREN), "self-test"
     )
     if child_self_test != {
-        "hostile_mutations_rejected": 36,
+        "hostile_mutations_rejected": 37,
         "schema": "bn-2k0f-prepare-children-self-test-v1",
         "status": "ok",
     }:
@@ -3437,9 +3792,29 @@ def copy_new(source: Path, destination: Path) -> dict[str, Any]:
 
 
 def shared_manifest() -> dict[str, Any]:
+    sources = sorted(SHARED_SOURCE.glob("*.rs"))
+    validate_pinned_shared_overlay_set(
+        (source.name for source in sources),
+        error_type=PreparationError,
+    )
     entries = []
-    for source in sorted(SHARED_SOURCE.glob("*.rs")):
-        entries.append({"name": source.name, "sha256": hash_file(source), "size": source.stat().st_size})
+    for source in sources:
+        payload = source.read_bytes()
+        if source.name == "control.rs":
+            validate_shared_control_child_source(payload)
+        else:
+            validate_pinned_shared_overlay_payload(
+                source.name,
+                payload,
+                PINNED_SHARED_OVERLAY_SHA256[source.name],
+            )
+        entries.append(
+            {
+                "name": source.name,
+                "sha256": hash_bytes(payload),
+                "size": len(payload),
+            }
+        )
     return {"schema": "asterism-rebaseline-shared-v3", "entries": entries}
 
 
@@ -9875,13 +10250,226 @@ def static_self_test() -> None:
     assert "assert_eq!(payload_bytes(24), PAYLOAD_24);" in workload
     assert "assert_eq!(payload_bytes(250), PAYLOAD_250);" in workload
     contract = (SHARED_SOURCE / "contract.rs").read_text()
-    control = (SHARED_SOURCE / "control.rs").read_text()
-    validate_shared_control_child_source(control)
+    comment_fixture = """const WIRE: &[u8] = b"// literal /* bytes */"; // decoy
+const WORDS: &str = r#"return break continue panic! exit("#;
+/* outer comment
+   /* nested comment */
+*/
+const LIVE: usize = 5;
+"""
+    stripped_fixture = strip_rust_comments(comment_fixture, "Rust comment fixture")
+    assert len(stripped_fixture) == len(comment_fixture)
+    assert stripped_fixture.count("\n") == comment_fixture.count("\n")
+    assert 'b"// literal /* bytes */"' in stripped_fixture
+    assert "decoy" not in stripped_fixture and "outer comment" not in stripped_fixture
+    assert "const LIVE: usize = 5;" in stripped_fixture
+    literal_blanked_fixture = blank_rust_literals(
+        stripped_fixture, "Rust literal fixture"
+    )
+    reject_rust_control_transfers(literal_blanked_fixture, "Rust literal fixture")
+    pinned_manifest = shared_manifest()
+    assert {
+        entry["name"]: entry["sha256"] for entry in pinned_manifest["entries"]
+    } == PINNED_SHARED_OVERLAY_SHA256
+    control_payload = (SHARED_SOURCE / "control.rs").read_bytes()
+    validate_shared_control_child_source(control_payload)
+    try:
+        validate_shared_control_child_source(
+            control_payload,
+            expected_sha256="0" * 64,
+        )
+    except PreparationError:
+        pass
+    else:
+        raise AssertionError("wrong shared control pin was accepted")
+    control = control_payload.decode("utf-8")
+    measured_signature = """pub fn measured_and_wait_release(
+        &mut self,
+        nonce: &Nonce,
+        markers: MeasuredMarkers,
+    ) {"""
+    perf_disable_block = """        if let Some(perf_disable) = self.perf.measured_value(nonce) {
+            fields.push(("perf_disable", perf_disable));
+        }"""
+    disable_ack_block = """        let mut ack = [0_u8; PERF_ACK_WIRE.len()];
+        pipes.ack.read_exact(&mut ack).expect("read exact perf disable ACK");
+        assert_eq!(&ack, PERF_ACK_WIRE, "perf disable ACK differs");"""
+    relocated_disable = replace_exact_once(
+        control,
+        disable_ack_block,
+        "",
+        "remove live perf ACK block for dead relocation",
+    )
+    relocated_disable = replace_exact_once(
+        relocated_disable,
+        """        pipes.command.flush().expect("flush perf disable");
+
+        let ack_received_monotonic_ns = monotonic_ns();""",
+        f"""        pipes.command.flush().expect("flush perf disable");
+        if true {{ return; }}
+{disable_ack_block}
+        let ack_received_monotonic_ns = monotonic_ns();""",
+        "relocate sole perf ACK block after return",
+    )
+    hidden_macro_control = replace_exact_once(
+        control,
+        disable_ack_block,
+        "        review_early_return!();\n" + disable_ack_block,
+        "invoke hidden-return macro before perf ACK",
+    )
+    hidden_macro_control = (
+        "macro_rules! review_early_return { () => { return; }; }\n"
+        + hidden_macro_control
+    )
+    custom_read_exact_control = replace_exact_once(
+        control,
+        "use std::io::{BufRead as _, BufReader, Read as _, Write as _};",
+        """use std::io::{BufRead as _, BufReader, Write as _};
+trait ReviewReadExact {
+    fn read_exact(&mut self, buffer: &mut [u8]) -> std::io::Result<()>;
+}
+impl ReviewReadExact for File {
+    fn read_exact(&mut self, buffer: &mut [u8]) -> std::io::Result<()> {
+        buffer.copy_from_slice(PERF_ACK_WIRE);
+        Ok(())
+    }
+}""",
+        "shared perf custom read_exact rebinding",
+    )
+    assert_alias_control = replace_exact_once(
+        control,
+        "use std::fmt::Write as _;",
+        """use std::fmt::Write as _;
+use std::debug_assert_eq as assert_eq;""",
+        "shared perf assert_eq macro alias",
+    )
+    fabricated_clock_control = replace_exact_once(
+        control,
+        "        let sent_monotonic_ns = monotonic_ns();",
+        """        let mut fabricated = t1_monotonic_ns;
+        let mut monotonic_ns = || {
+            fabricated += 1;
+            fabricated
+        };
+        let sent_monotonic_ns = monotonic_ns();""",
+        "shared perf monotonic clock closure shadow",
+    )
     hostile_control_sources = (
         control.replace(
             '("context_sha256", json_string(&self.context_sha256)),\n',
             "",
             1,
+        ),
+        custom_read_exact_control,
+        assert_alias_control,
+        fabricated_clock_control,
+        replace_exact_once(
+            control,
+            measured_signature,
+            measured_signature + "\n        return;",
+            "shared measured function-start return",
+        ),
+        replace_exact_once(
+            control,
+            measured_signature,
+            measured_signature + "\n        if true { return; }",
+            "shared measured constant-true return",
+        ),
+        replace_exact_once(
+            control,
+            '        pipes.command.write_all(b"disable\\n")',
+            '        return;\n        pipes.command.write_all(b"disable\\n")',
+            "shared perf disable mid-body return",
+        ),
+        replace_exact_once(
+            control,
+            perf_disable_block,
+            "        return;\n" + perf_disable_block,
+            "shared measured return before perf-disable insertion",
+        ),
+        relocated_disable,
+        replace_exact_once(
+            control,
+            disable_ack_block,
+            """        const PERF_ACK_WIRE: &[u8; 4] = b"ack\\n";
+"""
+            + disable_ack_block,
+            "shared perf local-const ACK shadow",
+        ),
+        replace_exact_once(
+            control,
+            disable_ack_block,
+            """        let PERF_ACK_WIRE: &[u8; 4] = b"ack\\n";
+"""
+            + disable_ack_block,
+            "shared perf local-let ACK shadow",
+        ),
+        hidden_macro_control,
+        replace_exact_once(
+            control,
+            'const PERF_ACK_WIRE: &[u8; 5] = b"ack\\n\\0";',
+            'const PERF_ACK_WIRE: &[u8; 4] = b"ack\\n";',
+            "shared perf four-byte ACK wire",
+        ),
+        replace_exact_once(
+            control,
+            'const PERF_ACK_WIRE: &[u8; 5] = b"ack\\n\\0";',
+            """const PERF_ACK_WIRE: &[u8; 4] = b"ack\\n";
+// const PERF_ACK_WIRE: &[u8; 5] = b"ack\\n\\0";""",
+            "shared perf comment-only five-byte ACK decoy",
+        ),
+        replace_exact_once(
+            control,
+            """        let mut ack = [0_u8; PERF_ACK_WIRE.len()];
+        pipes.ack.read_exact(&mut ack).expect("read exact perf disable ACK");
+        assert_eq!(&ack, PERF_ACK_WIRE, "perf disable ACK differs");""",
+            """        let _ack = PERF_ACK_WIRE;
+        // let mut ack = [0_u8; PERF_ACK_WIRE.len()];
+        // pipes.ack.read_exact(&mut ack).expect("read exact perf disable ACK");
+        // assert_eq!(&ack, PERF_ACK_WIRE, "perf disable ACK differs");""",
+            "shared perf comment-only read/assert decoy",
+        ),
+        replace_exact_once(
+            control,
+            """        if let Some(perf_disable) = self.perf.measured_value(nonce) {
+            fields.push(("perf_disable", perf_disable));
+        }""",
+            """        if false {
+        if let Some(perf_disable) = self.perf.measured_value(nonce) {
+            fields.push(("perf_disable", perf_disable));
+        }
+        }""",
+            "shared perf-disable if-false wrapper",
+        ),
+        replace_exact_once(
+            control,
+            ".write_all(PERF_ACK_LEDGER_ENTRY)",
+            ".write_all(&ack)",
+            "shared perf wire ACK ledger leak",
+        ),
+        replace_exact_once(
+            control,
+            """        pipes.command.write_all(b"disable\\n").expect("write perf disable");
+        pipes.command.flush().expect("flush perf disable");
+        let mut ack = [0_u8; PERF_ACK_WIRE.len()];
+        pipes.ack.read_exact(&mut ack).expect("read exact perf disable ACK");""",
+            """        let mut ack = [0_u8; PERF_ACK_WIRE.len()];
+        pipes.ack.read_exact(&mut ack).expect("read exact perf disable ACK");
+        pipes.command.write_all(b"disable\\n").expect("write perf disable");
+        pipes.command.flush().expect("flush perf disable");""",
+            "shared perf disable command/ACK reorder",
+        ),
+        replace_exact_once(
+            control,
+            "let ack_received_monotonic_ns = monotonic_ns();",
+            "let ack_received_monotonic_ns = sent_monotonic_ns + 1;",
+            "shared perf fabricated ACK timestamp",
+        ),
+        replace_exact_once(
+            control,
+            'fields.push(("perf_disable", perf_disable));',
+            'fields.insert(0, ("perf_disable", perf_disable));',
+            "shared perf-disable nonlexical insertion",
         ),
         control.replace(
             '("phase", json_string("opened"))',
@@ -10062,11 +10650,14 @@ async fn append_batch() {
         'mode == "smoke"',
         'std::env::var("ASTERISM_REBASELINE_SMOKE_TARGET")',
         '== "cpu_profiles")',
+        'const PERF_ACK_WIRE: &[u8; 5] = b"ack\\n\\0";',
+        'const PERF_ACK_LEDGER_ENTRY: &[u8; 4] = b"ack\\n";',
         'pipes.command.write_all(b"disable\\n")',
+        "let mut ack = [0_u8; PERF_ACK_WIRE.len()]",
         "pipes.ack.read_exact(&mut ack)",
-        'assert_eq!(&ack, b"ack\\n"',
-        "pipes.ledger.write_all(&ack)",
-        '("perf_disable", perf_disable)',
+        'assert_eq!(&ack, PERF_ACK_WIRE, "perf disable ACK differs")',
+        ".write_all(PERF_ACK_LEDGER_ENTRY)",
+        'fields.push(("perf_disable", perf_disable));',
     ):
         assert marker in control, f"perf child integration marker absent: {marker}"
     assert 'json_string("bn-2l3n-c-role-lifetime-v3")' in contract

@@ -93,8 +93,9 @@ CPU-profile children, including the exact `smoke`/`cpu_profiles` pairing,
 receive the exact preflight permission result. Only an available CPU row may
 additionally inherit the reviewed perf command-write,
 ACK-read, and shared-offset ACK-ledger descriptors. At `t1` the child writes
-`disable`, reads exactly `ack\n`, appends those bytes through the inherited
-ledger description, and includes that exact nonce/timestamp event in
+`disable`, reads the pinned perf wire frame exactly as `ack\n\0`, strips only
+the asserted trailing NUL, appends `ack\n` through the inherited ledger
+description, and includes that exact nonce/timestamp event in
 `measured` before the final counter snapshot is serialized. An unavailable CPU
 row receives no perf descriptors and emits `perf_disable: null`; every non-CPU
 mode rejects all four perf environment bindings and omits that field.

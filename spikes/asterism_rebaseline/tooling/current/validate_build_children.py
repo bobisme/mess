@@ -218,6 +218,7 @@ def validate_builder(source: str) -> list[str]:
         'self._drain_mutation_events("matching manifest")',
         '"watch_count": len(self.watch_descriptors)',
         "chunk = os.pread(",
+        "*inject_shared(root),",
     }
     for marker in (
         'LOCK_AUTHORITY_SCHEMA = "bn-31gp-current-lock-authority-v1"',
@@ -225,7 +226,13 @@ def validate_builder(source: str) -> list[str]:
         'FAULT_VALIDATOR_SCHEMA = "bn-20be-current-fault-validator-v1"',
         'LOCK_AUTHORITY_VALIDATOR = HERE / "lock_authority.py"',
         'PREPARE_OVERLAYS = TOOLING / "prepare_overlays.py"',
-        "LOCK_AUTHORITY_VALIDATOR,\n        PREPARE_OVERLAYS,",
+        'OVERLAY_PINS = TOOLING / "overlay_pins.py"',
+        "LOCK_AUTHORITY_VALIDATOR,\n        PREPARE_OVERLAYS,\n        OVERLAY_PINS,",
+        "def pinned_shared_entries() -> list[dict[str, Any]]:",
+        "validate_pinned_shared_overlay_set(SHARED_NAMES, error_type=BuildError)",
+        "validate_pinned_shared_overlay_payload(\n            name,\n            payload,\n            error_type=BuildError,",
+        "*inject_shared(root),",
+        "def self_test_shared_overlay_pins() -> dict[str, Any]:",
         'FAULT_SOURCE = HERE / "fault.rs"',
         'FAULT_VALIDATOR = HERE / "validate_fault.py"',
         'validate_authority = getattr(module, "validate_authority", None)',

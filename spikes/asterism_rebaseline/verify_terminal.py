@@ -2013,10 +2013,10 @@ def terminal_validate_current_construction(
     ):
         raise ValueError(f"{context} lock/overlay crosslink differs")
     inputs = current.get("inputs")
-    if not isinstance(inputs, list) or len(inputs) != 27:
+    if not isinstance(inputs, list) or len(inputs) != 28:
         raise ValueError(f"{context} input authority differs")
     patch_identity = _terminal_current_file_identity(
-        inputs[5], context + " product overlay input"
+        inputs[6], context + " product overlay input"
     )
     if patch_identity["sha256"] != value["product_overlay_sha256"]:
         raise ValueError(f"{context} product overlay input differs")
@@ -2054,13 +2054,13 @@ def terminal_validate_current_construction(
             (
                 inputs[0]["path"],
                 inputs[1]["path"],
-                *(inputs[index]["path"] for index in range(11, 19)),
+                *(inputs[index]["path"] for index in range(12, 20)),
             )
             if name == "children"
             else (
-                inputs[9]["path"],
                 inputs[10]["path"],
-                *(inputs[index]["path"] for index in range(11, 19)),
+                inputs[11]["path"],
+                *(inputs[index]["path"] for index in range(12, 20)),
             )
         )
         lineage_placements: list[Mapping[str, Any]] = []
@@ -2120,7 +2120,7 @@ def _terminal_validate_current_inputs(
     current: Mapping[str, Any], current_root: Path, context: str
 ) -> list[Mapping[str, Any]]:
     values = current.get("inputs")
-    if not isinstance(values, list) or len(values) != 27:
+    if not isinstance(values, list) or len(values) != 28:
         raise ValueError(f"{context} exact input cardinality differs")
     records = [
         _terminal_current_file_identity(value, context + f" input {ordinal}")
@@ -2128,7 +2128,7 @@ def _terminal_validate_current_inputs(
     ]
     paths = [record["path"] for record in records]
     physical = [(record["device"], record["inode"]) for record in records]
-    if len(set(paths)) != 27 or len(set(physical)) != 27:
+    if len(set(paths)) != 28 or len(set(physical)) != 28:
         raise ValueError(f"{context} inputs alias")
     expected_suffixes = (
         "tooling/current/correctness.rs",
@@ -2136,6 +2136,7 @@ def _terminal_validate_current_inputs(
         "tooling/current/validate_fault.py",
         "tooling/current/lock_authority.py",
         "tooling/prepare_overlays.py",
+        "tooling/overlay_pins.py",
         "tooling/current/product-test-overlay.patch",
         "tooling/current/validate_product_test_overlay.py",
         "tooling/current/rustc_workspace_wrapper.py",
@@ -2145,7 +2146,7 @@ def _terminal_validate_current_inputs(
         *(f"tooling/overlay/shared/{name}" for name in CURRENT_SHARED_NAMES),
     )
     try:
-        repository = Path(records[8]["path"]).parents[4].resolve(strict=True)
+        repository = Path(records[9]["path"]).parents[4].resolve(strict=True)
     except (IndexError, OSError) as error:
         raise ValueError(f"{context} repository topology differs") from error
     expected_paths = [
@@ -2153,12 +2154,12 @@ def _terminal_validate_current_inputs(
         for suffix in expected_suffixes
     ]
     if (
-        records[8]["path"]
+        records[9]["path"]
         != str(
             repository
             / "spikes/asterism_rebaseline/tooling/current/validate_build_children.py"
         )
-        or [record["path"] for record in records[:19]] != expected_paths
+        or [record["path"] for record in records[:20]] != expected_paths
     ):
         raise ValueError(f"{context} producer input order differs")
     authority_inputs = current.get("lock_authority_inputs")
@@ -2176,21 +2177,21 @@ def _terminal_validate_current_inputs(
     )
     if (
         not isinstance(authority_inputs, Mapping)
-        or [records[index]["path"] for index in range(19, 22)]
+        or [records[index]["path"] for index in range(20, 23)]
         != [
             authority_inputs.get(name, {}).get("path")
             for name in ("lock_manifest", "authority", "review_bundle")
         ]
         or not isinstance(locks, Mapping)
-        or [records[index]["path"] for index in range(23, 26)]
+        or [records[index]["path"] for index in range(24, 27)]
         != [locks.get(name, {}).get("path") for name in ("A", "C", "D")]
         or not isinstance(cargo, Mapping)
-        or records[26]["path"] != cargo.get("identity", {}).get("path")
+        or records[27]["path"] != cargo.get("identity", {}).get("path")
     ):
         raise ValueError(f"{context} reviewed input crosslinks differ")
     if (
         not terminal_is_sha256(patch["sha256"])
-        or records[5]["sha256"] != patch["sha256"]
+        or records[6]["sha256"] != patch["sha256"]
     ):
         raise ValueError(f"{context} product overlay input digest differs")
     fault = current.get("fault_authority")
@@ -2200,7 +2201,7 @@ def _terminal_validate_current_inputs(
         or fault.get("source") != records[1]
         or fault.get("validator") != records[2]
         or not isinstance(static, Mapping)
-        or static.get("validator") != records[8]
+        or static.get("validator") != records[9]
     ):
         raise ValueError(f"{context} validator input equality differs")
     return records
@@ -2576,10 +2577,10 @@ def _terminal_validate_current_tools(
     snapshot = schema.snapshot_regular_file(path, expected_mode=0o444)
     value = schema.parse_prepared_authority_json_object(snapshot.data, context)
     inputs = current.get("inputs")
-    if not isinstance(inputs, list) or len(inputs) != 27:
+    if not isinstance(inputs, list) or len(inputs) != 28:
         raise ValueError(f"{context} base input topology differs")
     base_identity = _terminal_current_file_identity(
-        inputs[22], context + " base manifest input"
+        inputs[23], context + " base manifest input"
     )
     base_path = Path(base_identity["path"])
     base = schema.parse_prepared_authority_json_object(
@@ -8280,6 +8281,7 @@ def build_terminal_fixture_v3(
         current_dir / "validate_fault.py",
         current_dir / "lock_authority.py",
         current_tooling / "prepare_overlays.py",
+        current_tooling / "overlay_pins.py",
         current_dir / "product-test-overlay.patch",
         current_dir / "validate_product_test_overlay.py",
         current_dir / "rustc_workspace_wrapper.py",
@@ -8298,11 +8300,11 @@ def build_terminal_fixture_v3(
         current_file_identity(path) for path in tracked_input_paths
     ]
     if (
-        len(input_identities) != 27
-        or len({item["path"] for item in input_identities}) != 27
+        len(input_identities) != 28
+        or len({item["path"] for item in input_identities}) != 28
         or len({
             (item["device"], item["inode"]) for item in input_identities
-        }) != 27
+        }) != 28
     ):
         raise AssertionError("terminal fixture input authority aliases")
 
@@ -10771,7 +10773,7 @@ def self_test() -> dict[str, Any]:
 
         def terminal_product_overlay_input_digest_inequality_rejected() -> bool:
             hostile = json.loads(json.dumps(current_children_fixture))
-            input_sha256 = hostile["inputs"][5]["sha256"]
+            input_sha256 = hostile["inputs"][6]["sha256"]
             patch_sha256 = "0" * 64 if input_sha256 != "0" * 64 else "1" * 64
             hostile["product_overlay_authority"] = {
                 "patch": {"sha256": patch_sha256}
@@ -11046,7 +11048,7 @@ def self_test() -> dict[str, Any]:
         def terminal_final_tool_inheritance_rejected() -> bool:
             hostile = json.loads(json.dumps(current_children_fixture))
             base = schema.parse_canonical_json_object(
-                Path(hostile["inputs"][22]["path"]).read_bytes(),
+                Path(hostile["inputs"][23]["path"]).read_bytes(),
                 "terminal hostile base tools",
             )
             final = schema.parse_canonical_json_object(
@@ -11073,7 +11075,7 @@ def self_test() -> dict[str, Any]:
         def terminal_final_support_inheritance_rejected() -> bool:
             hostile = json.loads(json.dumps(current_children_fixture))
             base = schema.parse_canonical_json_object(
-                Path(hostile["inputs"][22]["path"]).read_bytes(),
+                Path(hostile["inputs"][23]["path"]).read_bytes(),
                 "terminal hostile base support",
             )
             final = schema.parse_canonical_json_object(
@@ -11304,7 +11306,7 @@ def self_test() -> dict[str, Any]:
                 ).read_bytes(),
                 placements=placements,
                 patch_payload=Path(
-                    current_children_fixture["inputs"][5]["path"]
+                    current_children_fixture["inputs"][6]["path"]
                 ).read_bytes(),
                 apply_overlay=directory in {"children", "hooked-release"},
                 context=f"terminal hostile {directory} lineage",

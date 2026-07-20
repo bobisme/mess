@@ -144,6 +144,8 @@ CSV_FILENAMES = {
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 GIT_OBJECT_RE = re.compile(r"[0-9a-f]{40}")
 PERF_EVENTS = ("cycles:u", "instructions:u", "task-clock:u", "context-switches:u")
+PERF_ACK_WIRE = b"ack\n\0"
+PERF_ACK_LEDGER_ENTRY = b"ack\n"
 PERF_CHILD_FD_ENVIRONMENT = (
     "ASTERISM_REBASELINE_PERF_COMMAND_FD",
     "ASTERISM_REBASELINE_PERF_ACK_FD",
@@ -4606,18 +4608,22 @@ def _wait_exact_process(
 
 
 def _read_ack_line(descriptor: int, timeout: float = 5.0) -> bytes:
-    ready, _, _ = select.select([descriptor], [], [], timeout)
-    if not ready:
-        raise RunnerFailure("perf control acknowledgement timed out")
+    """Read one exact ACK frame emitted by the pinned perf binary."""
+
+    deadline = time.monotonic() + timeout
     payload = bytearray()
-    while not payload.endswith(b"\n"):
-        chunk = os.read(descriptor, 1)
+    while len(payload) < len(PERF_ACK_WIRE):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RunnerFailure("perf control acknowledgement timed out")
+        ready, _, _ = select.select([descriptor], [], [], remaining)
+        if not ready:
+            raise RunnerFailure("perf control acknowledgement timed out")
+        chunk = os.read(descriptor, len(PERF_ACK_WIRE) - len(payload))
         if not chunk:
             raise RunnerFailure("perf control acknowledgement closed early")
         payload.extend(chunk)
-        if len(payload) > 16:
-            raise RunnerFailure("perf control acknowledgement is oversized")
-    if bytes(payload) != b"ack\n":
+    if bytes(payload) != PERF_ACK_WIRE:
         raise RunnerFailure(f"perf control acknowledgement differs: {bytes(payload)!r}")
     return bytes(payload)
 
@@ -5017,16 +5023,21 @@ class RunnerOwnedProfileSession:
                 raise RunnerFailure("perf control descriptors are absent")
             sent = time.monotonic_ns()
             _write_all(self.control_write, b"enable\n", "perf enable command")
-            ack = _read_ack_line(self.ack_read)
+            wire_ack = _read_ack_line(self.ack_read)
             received = time.monotonic_ns()
-            _write_all(self.ack_ledger_fd, ack, "perf runner ACK ledger")
+            # The pinned perf wire frame includes a trailing NUL.  The reviewed
+            # shared-offset ledger format intentionally stores only ``ack\n``.
+            ledger_ack = wire_ack[:-1]
+            if ledger_ack != PERF_ACK_LEDGER_ENTRY:
+                raise RunnerFailure("perf ledger acknowledgement differs")
+            _write_all(self.ack_ledger_fd, ledger_ack, "perf runner ACK ledger")
             os.fsync(self.ack_ledger_fd)
             self.perf_control_events.append(
                 {
                     "command": "enable",
                     "nonce": start_nonce,
                     "sent_monotonic_ns": sent,
-                    "ack": ack.rstrip(b"\n").decode("ascii"),
+                    "ack": ledger_ack.rstrip(b"\n").decode("ascii"),
                     "ack_received_monotonic_ns": received,
                 }
             )
@@ -13775,6 +13786,54 @@ def run_self_test(root: Path) -> int:
     details: dict[str, Any] = {}
     checks.update(semantic_checks)
     details.update(semantic_details)
+
+    ack_read, ack_write = os.pipe()
+    try:
+        _write_all(
+            ack_write,
+            PERF_ACK_WIRE + PERF_ACK_WIRE,
+            "self-test perf ACK frames",
+        )
+        first_ack = _read_ack_line(ack_read, timeout=0.1)
+        second_ack = _read_ack_line(ack_read, timeout=0.1)
+        os.set_blocking(ack_read, False)
+        try:
+            os.read(ack_read, 1)
+        except BlockingIOError:
+            ack_pipe_empty = True
+        else:
+            ack_pipe_empty = False
+        checks["perf_ack_exact_five_byte_frames_consumed"] = (
+            first_ack == PERF_ACK_WIRE
+            and second_ack == PERF_ACK_WIRE
+            and ack_pipe_empty
+        )
+    finally:
+        os.close(ack_read)
+        os.close(ack_write)
+
+    def perf_ack_rejected(payload: bytes) -> bool:
+        read_descriptor, write_descriptor = os.pipe()
+        try:
+            _write_all(write_descriptor, payload, "hostile self-test perf ACK")
+            os.close(write_descriptor)
+            write_descriptor = -1
+            try:
+                _read_ack_line(read_descriptor, timeout=0.1)
+            except RunnerFailure:
+                return True
+            return False
+        finally:
+            os.close(read_descriptor)
+            if write_descriptor >= 0:
+                os.close(write_descriptor)
+
+    checks["perf_ack_four_byte_frame_rejected"] = perf_ack_rejected(
+        PERF_ACK_LEDGER_ENTRY
+    )
+    checks["perf_ack_malformed_five_byte_frame_rejected"] = perf_ack_rejected(
+        b"ack\nX"
+    )
 
     def comm_identities(name: str) -> set[tuple[int, int]]:
         identities: set[tuple[int, int]] = set()

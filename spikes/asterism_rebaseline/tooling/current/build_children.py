@@ -77,6 +77,14 @@ PREAPPROVAL_SOURCE_SENTINEL = (
 
 HERE = Path(__file__).resolve().parent
 TOOLING = HERE.parent
+if str(TOOLING) not in sys.path:
+    sys.path.insert(0, str(TOOLING))
+from overlay_pins import (  # noqa: E402
+    PINNED_SHARED_OVERLAY_SHA256,
+    validate_pinned_shared_overlay_payload,
+    validate_pinned_shared_overlay_set,
+)
+
 SHARED = TOOLING / "overlay" / "shared"
 PUBLIC = TOOLING / "overlay" / "public"
 CORRECTNESS_SOURCE = HERE / "correctness.rs"
@@ -84,6 +92,7 @@ FAULT_SOURCE = HERE / "fault.rs"
 FAULT_VALIDATOR = HERE / "validate_fault.py"
 LOCK_AUTHORITY_VALIDATOR = HERE / "lock_authority.py"
 PREPARE_OVERLAYS = TOOLING / "prepare_overlays.py"
+OVERLAY_PINS = TOOLING / "overlay_pins.py"
 PRODUCT_OVERLAY = HERE / "product-test-overlay.patch"
 PRODUCT_OVERLAY_VALIDATOR = HERE / "validate_product_test_overlay.py"
 WORKSPACE_WRAPPER = HERE / "rustc_workspace_wrapper.py"
@@ -1974,24 +1983,51 @@ def install_lock(root: Path, lock_payload: bytes) -> None:
         raise BuildError("materialized Cargo.lock differs")
 
 
+def pinned_shared_entries() -> list[dict[str, Any]]:
+    """Validate the exact shared bytes used by every current-child build kind."""
+
+    validate_pinned_shared_overlay_set(SHARED_NAMES, error_type=BuildError)
+    entries = []
+    for name in SHARED_NAMES:
+        payload = (SHARED / name).read_bytes()
+        validate_pinned_shared_overlay_payload(
+            name,
+            payload,
+            error_type=BuildError,
+        )
+        entries.append(
+            {"name": name, "sha256": sha256_bytes(payload), "size": len(payload)}
+        )
+    return entries
+
+
+def inject_shared(root: Path) -> list[dict[str, Any]]:
+    placements = []
+    for entry in pinned_shared_entries():
+        placement = copy_new(
+            SHARED / entry["name"],
+            root / SHARED_DESTINATION / entry["name"],
+        )
+        if placement["sha256"] != entry["sha256"]:
+            raise BuildError(f"copied shared overlay changed: {entry['name']}")
+        placements.append(placement)
+    return placements
+
+
 def inject_children(root: Path) -> list[dict[str, Any]]:
-    placements = [
+    return [
         copy_new(CORRECTNESS_SOURCE, root / CORRECTNESS_DESTINATION),
         copy_new(FAULT_SOURCE, root / FAULT_DESTINATION),
+        *inject_shared(root),
     ]
-    for name in SHARED_NAMES:
-        placements.append(copy_new(SHARED / name, root / SHARED_DESTINATION / name))
-    return placements
 
 
 def inject_public(root: Path) -> list[dict[str, Any]]:
-    placements = [
+    return [
         copy_new(PUBLIC / "main.rs", root / PUBLIC_DESTINATION),
         copy_new(PUBLIC / "adapters" / "current.rs", root / ADAPTER_DESTINATION),
+        *inject_shared(root),
     ]
-    for name in SHARED_NAMES:
-        placements.append(copy_new(SHARED / name, root / SHARED_DESTINATION / name))
-    return placements
 
 
 def apply_product_overlay(
@@ -2240,14 +2276,7 @@ def release_contract_environment(
 
 def shared_manifest_sha256() -> str:
     value = {
-        "entries": [
-            {
-                "name": name,
-                "sha256": sha256_file(SHARED / name),
-                "size": (SHARED / name).stat().st_size,
-            }
-            for name in SHARED_NAMES
-        ],
+        "entries": pinned_shared_entries(),
         "schema": "asterism-rebaseline-shared-v3",
     }
     return sha256_bytes(canonical_bytes(value))
@@ -4958,6 +4987,7 @@ def input_paths(
         FAULT_VALIDATOR,
         LOCK_AUTHORITY_VALIDATOR,
         PREPARE_OVERLAYS,
+        OVERLAY_PINS,
         PRODUCT_OVERLAY,
         PRODUCT_OVERLAY_VALIDATOR,
         WORKSPACE_WRAPPER,
@@ -6119,6 +6149,45 @@ def self_test_validated_lock_records(
     }
 
 
+def self_test_shared_overlay_pins() -> dict[str, Any]:
+    """Exercise real and hostile shared injection without compiling children."""
+
+    global SHARED
+    original_shared = SHARED
+    with tempfile.TemporaryDirectory(prefix="asterism-shared-pin-") as directory:
+        scratch = Path(directory)
+        shared = scratch / "shared"
+        shared.mkdir()
+        for name in SHARED_NAMES:
+            write_new(shared / name, (original_shared / name).read_bytes(), 0o444)
+        try:
+            SHARED = shared
+            accepted_root = scratch / "accepted"
+            (accepted_root / SHARED_DESTINATION).mkdir(parents=True)
+            accepted = inject_shared(accepted_root)
+            if len(accepted) != len(SHARED_NAMES):
+                raise BuildError("pinned shared injection cardinality differs")
+            (shared / "control.rs").chmod(0o644)
+            with (shared / "control.rs").open("ab") as output:
+                output.write(b"\n// hostile shared mutation\n")
+            (shared / "control.rs").chmod(0o444)
+            hostile_root = scratch / "hostile"
+            (hostile_root / SHARED_DESTINATION).mkdir(parents=True)
+            try:
+                inject_shared(hostile_root)
+            except BuildError:
+                hostile_rejected = True
+            else:
+                raise BuildError("mutated shared injection was accepted")
+        finally:
+            SHARED = original_shared
+    return {
+        "accepted_placements": len(accepted),
+        "hostile_rejected": hostile_rejected,
+        "status": "ok",
+    }
+
+
 def self_test_cargo_environment() -> dict[str, Any]:
     """Exercise the exact guest-root environment before any real build."""
 
@@ -6166,6 +6235,7 @@ def self_test(repository: Path) -> None:
         repository, lock_module
     )
     cargo_artifact_hardlinks = self_test_cargo_example_hardlinks()
+    shared_overlay_pins = self_test_shared_overlay_pins()
     cargo_environment_self_test = self_test_cargo_environment()
     cargo_config_guard = self_test_cargo_config_guard()
     external_canonical_utf8 = self_test_external_canonical_utf8()
@@ -6199,6 +6269,7 @@ def self_test(repository: Path) -> None:
                 ],
                 "schema": SELF_TEST_SCHEMA,
                 "semantic_runtime_authority": semantic_runtime,
+                "shared_overlay_pins": shared_overlay_pins,
                 "static_hostile_mutations_rejected": static["self_test"][
                     "hostile_mutations_rejected"
                 ],

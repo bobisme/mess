@@ -210,6 +210,8 @@ fn lower_hex(value: &str, length: usize) -> bool {
 
 const PERF_PERMISSION_RESULT: &str =
     "ASTERISM_REBASELINE_PERF_PERMISSION_RESULT";
+const PERF_ACK_WIRE: &[u8; 5] = b"ack\n\0";
+const PERF_ACK_LEDGER_ENTRY: &[u8; 4] = b"ack\n";
 const PERF_COMMAND_FD: &str = "ASTERISM_REBASELINE_PERF_COMMAND_FD";
 const PERF_ACK_FD: &str = "ASTERISM_REBASELINE_PERF_ACK_FD";
 const PERF_ACK_LEDGER_FD: &str = "ASTERISM_REBASELINE_PERF_ACK_LEDGER_FD";
@@ -355,15 +357,20 @@ impl PerfControl {
         );
         pipes.command.write_all(b"disable\n").expect("write perf disable");
         pipes.command.flush().expect("flush perf disable");
-        let mut ack = [0_u8; 4];
+        let mut ack = [0_u8; PERF_ACK_WIRE.len()];
         pipes.ack.read_exact(&mut ack).expect("read exact perf disable ACK");
-        assert_eq!(&ack, b"ack\n", "perf disable ACK differs");
+        assert_eq!(&ack, PERF_ACK_WIRE, "perf disable ACK differs");
         let ack_received_monotonic_ns = monotonic_ns();
         assert!(
             ack_received_monotonic_ns > sent_monotonic_ns,
             "perf disable ACK timestamp is not later than send"
         );
-        pipes.ledger.write_all(&ack).expect("append perf disable ACK ledger");
+        // The pinned perf wire frame includes a trailing NUL.  Preserve the
+        // reviewed shared-offset ledger entry as exactly `ack\n`.
+        pipes
+            .ledger
+            .write_all(PERF_ACK_LEDGER_ENTRY)
+            .expect("append perf disable ACK ledger");
         pipes.ledger.flush().expect("flush perf disable ACK ledger");
         *disable = Some(PerfDisableEvent {
             nonce: *nonce,
@@ -587,6 +594,11 @@ impl Control {
                 json_u64(markers.last_completion_monotonic_ns),
             ),
             ("nonce", json_string(nonce.as_str())),
+        ];
+        if let Some(perf_disable) = self.perf.measured_value(nonce) {
+            fields.push(("perf_disable", perf_disable));
+        }
+        fields.extend([
             ("phase", json_string("measured")),
             (
                 "process_system_cpu_end_ns",
@@ -599,10 +611,7 @@ impl Control {
             ("release_monotonic_ns", json_u64(markers.release_monotonic_ns)),
             ("t0_monotonic_ns", json_u64(markers.t0_monotonic_ns)),
             ("t1_monotonic_ns", json_u64(markers.t1_monotonic_ns)),
-        ];
-        if let Some(perf_disable) = self.perf.measured_value(nonce) {
-            fields.push(("perf_disable", perf_disable));
-        }
+        ]);
         self.send(&canonical_object(&fields));
         let released = command(&self.receive(), "release");
         assert_eq!(released, *nonce, "release nonce mismatch");

@@ -15,6 +15,7 @@ import os
 import re
 import stat
 import sys
+import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -107,6 +108,15 @@ class SourceSnapshot:
 
 HERE = Path(__file__).resolve().parent
 TOOLING = HERE.parent
+if str(TOOLING) not in sys.path:
+    sys.path.insert(0, str(TOOLING))
+from overlay_pins import (  # noqa: E402
+    PINNED_SHARED_OVERLAY_SHA256,
+    validate_pinned_shared_overlay_payload,
+)
+
+if not set(SHARED_NAMES).issubset(PINNED_SHARED_OVERLAY_SHA256):
+    raise RuntimeError("current child shared source set is not pinned")
 SHARED = TOOLING / "overlay" / "shared"
 PUBLIC_MAIN = TOOLING / "overlay" / "public" / "main.rs"
 CORRECTNESS = HERE / "correctness.rs"
@@ -199,7 +209,7 @@ def capture_sources(product_overlay: Path) -> tuple[SourceSnapshot, ...]:
             CORRECTNESS_DESTINATION,
         )
     ]
-    snapshots.extend(
+    shared_snapshots = tuple(
         snapshot_source(
             name,
             SHARED / name,
@@ -207,6 +217,13 @@ def capture_sources(product_overlay: Path) -> tuple[SourceSnapshot, ...]:
         )
         for name in SHARED_NAMES
     )
+    for snapshot in shared_snapshots:
+        validate_pinned_shared_overlay_payload(
+            snapshot.name,
+            snapshot.payload,
+            error_type=PreparationError,
+        )
+    snapshots.extend(shared_snapshots)
     snapshots.extend(
         (
             snapshot_source(
@@ -853,8 +870,34 @@ def expect_preparation_error(action: Any, context: str) -> None:
     raise AssertionError(f"hostile construction was accepted: {context}")
 
 
+def self_test_shared_overlay_pins() -> None:
+    """Exercise shared capture against real and mutated scratch sources."""
+
+    global SHARED
+    original_shared = SHARED
+    with tempfile.TemporaryDirectory(prefix="asterism-prepare-pin-") as directory:
+        shared = Path(directory) / "shared"
+        shared.mkdir()
+        for name in SHARED_NAMES:
+            write_new(shared / name, (original_shared / name).read_bytes(), 0o444)
+        try:
+            SHARED = shared
+            capture_sources(PRODUCT_OVERLAY)
+            (shared / "control.rs").chmod(0o644)
+            with (shared / "control.rs").open("ab") as output:
+                output.write(b"\n// hostile shared mutation\n")
+            (shared / "control.rs").chmod(0o444)
+            expect_preparation_error(
+                lambda: capture_sources(PRODUCT_OVERLAY),
+                "mutated shared source snapshot",
+            )
+        finally:
+            SHARED = original_shared
+
+
 def self_test() -> None:
     snapshots = capture_sources(PRODUCT_OVERLAY)
+    self_test_shared_overlay_pins()
     manifest = construction_manifest(
         EXACT_PRODUCT_COMMIT,
         EXACT_PRODUCT_TREE,
@@ -1156,7 +1199,7 @@ def self_test() -> None:
     print(
         canonical_bytes(
             {
-                "hostile_mutations_rejected": 36,
+                "hostile_mutations_rejected": 37,
                 "schema": "bn-2k0f-prepare-children-self-test-v1",
                 "status": "ok",
             }
