@@ -1,0 +1,18 @@
+{
+  "schema": "bn-2l3n-protocol-supersedes-v1",
+  "superseded_protocol": "bn-2l3n-asterism-rebaseline-v3",
+  "superseded_document_sha256": "d9ee10b2cccdaf6428bf1419a8c2ee74d272e987dc3617a80b64ad2e9d7a18dd",
+  "superseded_copy_location": "bn-znj5-prepared-v3-r8/BN-2L3N-PROTOCOL.md",
+  "superseding_protocol": "bn-2l3n-asterism-rebaseline-v4",
+  "decision": "User decision 2026-07-20: keep measurement science, drop custody ceremony. v3 terminal attempts r1-r8 produced zero accepted timing rows; majority of failures were custody machinery self-disagreement.",
+  "v3_terminal_attempts": [
+    {"attempt": "r1", "failure": "invoked trunk runner instead of frozen support copy", "claim_consumed": false},
+    {"attempt": "r2", "failure": "superseded-authority rejector rejected its own pinned schema", "claim_consumed": false},
+    {"attempt": "r3", "failure": "recursive manifest path-order convention mismatch", "claim_consumed": false},
+    {"attempt": "r4", "failure": "variant-B sandbox descriptor expectation + ASCII/UTF-8 runtime digest split", "claim_consumed": false},
+    {"attempt": "r5", "failure": "runner executed under system python, not pinned interpreter", "claim_consumed": false},
+    {"attempt": "r6", "failure": "runner expected 1 cargo-config data binding, reviewed producer emits 4", "claim_consumed": false},
+    {"attempt": "r7", "failure": "MESS_BENCH_COORDINATION_CONFIRMED attestation absent", "claim_consumed": false},
+    {"attempt": "r8", "failure": "perf control ACK framing: pinned perf writes ack\\n\\0 (5 bytes), readers assumed 4; poisoned pipe panicked variant child at first cpu_profiles smoke", "claim_consumed": true}
+  ]
+}
