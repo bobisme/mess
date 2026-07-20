@@ -2188,7 +2188,7 @@ def _current_build_expected_passed_file_descriptors(
     # CargoConfigSearchGuard retains the unbound source .cargo root, the direct
     # Cargo-home overlay source, and every preserved Cargo-home child.
     # run_capture then adds the separately retained bwrap execution lease. This
-    # preserves the intentional 15/17 release/child base plus one descriptor for
+    # preserves the intentional 18/20 release/child base plus one descriptor for
     # every additional retained Cargo-home child.
     return (
         argv_descriptor_bindings
@@ -2751,6 +2751,20 @@ def retain_prepared_semantic_manifests(
     records: list[
         tuple[str, str, str, str, str, str, dict[str, Any]]
     ] = []
+    runtime_component_names = (
+        "cargo_home",
+        "toolchain",
+        "trusted_system_closure",
+    )
+    runtime_content_hasher = getattr(
+        prepared.schema, "semantic_runtime_content_sha256", None
+    )
+    if not callable(runtime_content_hasher):
+        raise RunnerFailure(
+            "shared schema omits normalized semantic runtime hasher", exit_code=2
+        )
+    runtime_authorities: list[tuple[dict[str, Any], str]] = []
+    runtime_manifest_bindings: dict[str, tuple[int, str]] = {}
     runtime_digests: set[str] = set()
 
     def add(
@@ -2760,13 +2774,12 @@ def retain_prepared_semantic_manifests(
         *,
         source_role: str = "source",
     ) -> None:
-        if isinstance(authority, dict) and isinstance(
-            authority.get("runtime_sha256"), str
-        ):
-            runtime_digests.add(authority["runtime_sha256"])
-        for path, digest, schema, role, component, binding in _semantic_authority_bindings(
+        authority_bindings = _semantic_authority_bindings(
             authority, context, source_role=source_role
-        ):
+        )
+        authority_index = len(runtime_authorities)
+        runtime_authorities.append((authority, context))
+        for path, digest, schema, role, component, binding in authority_bindings:
             records.append(
                 (
                     section,
@@ -2778,6 +2791,8 @@ def retain_prepared_semantic_manifests(
                     binding,
                 )
             )
+            if component in runtime_component_names:
+                runtime_manifest_bindings[path] = (authority_index, component)
 
     current_file = prepared.source_review_files.get("current_children_attestation")
     if current_file is None:
@@ -2849,9 +2864,7 @@ def retain_prepared_semantic_manifests(
                 if name == "children"
                 else {"/asterism/target"}
             ),
-            expected_data_destinations={
-                "/asterism/source/.cargo/config.toml"
-            },
+            expected_data_destinations=set(SEMANTIC_CONFIG_DESTINATIONS),
             execution_tools=build.get("execution_tools"),
             execution_tools_kind="current",
             toolchain=toolchain,
@@ -3057,19 +3070,15 @@ def retain_prepared_semantic_manifests(
         section: sum(record[0] == section for record in records)
         for section in SEMANTIC_MANIFEST_COUNTS
     }
-    if (
-        counts != SEMANTIC_MANIFEST_COUNTS
-        or len(records) != SEMANTIC_MANIFEST_TOTAL
-        or len(runtime_digests) != 1
-    ):
+    if counts != SEMANTIC_MANIFEST_COUNTS or len(records) != SEMANTIC_MANIFEST_TOTAL:
         raise RunnerFailure(
-            f"semantic manifest topology differs: counts={counts} "
-            f"runtime_digests={len(runtime_digests)}",
-            exit_code=2,
+            f"semantic manifest topology differs: counts={counts}", exit_code=2
         )
     retained: list[RetainedSemanticManifest] = []
     seen_paths: dict[str, str] = {}
     seen_identities: dict[tuple[int, int], str] = {}
+    runtime_manifests: dict[int, dict[str, dict[str, Any]]] = {}
+    completed_runtime_authorities = 0
     try:
         for _section, path, digest, _schema, _role, _context, _binding in records:
             prior = seen_paths.get(path)
@@ -3166,7 +3175,52 @@ def retain_prepared_semantic_manifests(
                     raise RunnerFailure(
                         f"{context} closure cardinality differs", exit_code=2
                     )
+            runtime_binding = runtime_manifest_bindings.get(path)
+            if runtime_binding is not None:
+                authority_index, component = runtime_binding
+                manifests = runtime_manifests.setdefault(authority_index, {})
+                if component in manifests:
+                    raise RunnerFailure(
+                        f"{context} semantic runtime component aliases", exit_code=2
+                    )
+                manifests[component] = snapshot.value
+                if set(manifests) == set(runtime_component_names):
+                    authority, authority_context = runtime_authorities[authority_index]
+                    components = {
+                        name: authority[name] for name in runtime_component_names
+                    }
+                    try:
+                        content_digest = runtime_content_hasher(components, manifests)
+                    except Exception as error:
+                        raise RunnerFailure(
+                            f"{authority_context} normalized semantic runtime "
+                            f"validation failed: {error.__class__.__name__}: {error}",
+                            exit_code=2,
+                        ) from error
+                    if (
+                        not isinstance(content_digest, str)
+                        or not SHA256_RE.fullmatch(content_digest)
+                    ):
+                        raise RunnerFailure(
+                            f"{authority_context} normalized semantic runtime "
+                            "digest differs",
+                            exit_code=2,
+                        )
+                    runtime_digests.add(content_digest)
+                    del runtime_manifests[authority_index]
+                    completed_runtime_authorities += 1
             snapshot.value = None
+        if (
+            runtime_manifests
+            or completed_runtime_authorities != len(runtime_authorities)
+            or len(runtime_digests) != 1
+        ):
+            raise RunnerFailure(
+                "semantic runtime content topology differs: "
+                f"authorities={completed_runtime_authorities}/"
+                f"{len(runtime_authorities)} runtime_digests={len(runtime_digests)}",
+                exit_code=2,
+            )
         if (
             len(retained) != SEMANTIC_MANIFEST_TOTAL
             or len(seen_identities) != SEMANTIC_MANIFEST_TOTAL
@@ -11195,26 +11249,52 @@ raise SystemExit(9 if row_ordinal == 3 else 0)
     atomic_write(path, payload.encode(), mode=0o755)
 
 
-def _fixture_semantic_tree(role: str, seed: int, *, trusted: bool = False) -> dict[str, Any]:
-    return {
-        "entries": [
+def _fixture_semantic_tree(
+    role: str,
+    seed: int,
+    *,
+    trusted: bool = False,
+    non_ascii_entry: bool = False,
+) -> dict[str, Any]:
+    entries = [
+        {
+            "changed_ns": seed,
+            "device": 100 + seed,
+            "file_type": "directory",
+            "gid": 0,
+            "inode": 1_000 + seed,
+            "link_count": 2,
+            "modified_ns": seed,
+            "path": ".",
+            "permissions": 0o555 if trusted else 0o755,
+            "sha256": None,
+            "size": 0,
+            "symlink_scope": None,
+            "symlink_target": None,
+            "uid": 0 if trusted else os.getuid(),
+        }
+    ]
+    if non_ascii_entry:
+        entries.append(
             {
-                "changed_ns": seed,
+                "changed_ns": seed + 1,
                 "device": 100 + seed,
-                "file_type": "directory",
+                "file_type": "regular",
                 "gid": 0,
-                "inode": 1_000 + seed,
-                "link_count": 2,
-                "modified_ns": seed,
-                "path": ".",
-                "permissions": 0o555 if trusted else 0o755,
-                "sha256": None,
-                "size": 0,
+                "inode": 2_000 + seed,
+                "link_count": 1,
+                "modified_ns": seed + 1,
+                "path": "Þfoo.go",
+                "permissions": 0o444,
+                "sha256": "f" * 64,
+                "size": 1,
                 "symlink_scope": None,
                 "symlink_target": None,
                 "uid": 0 if trusted else os.getuid(),
             }
-        ],
+        )
+    return {
+        "entries": entries,
         "role": role,
         "schema": RECURSIVE_TREE_AUTHORITY_SCHEMA,
     }
@@ -11226,7 +11306,13 @@ def _fixture_semantic_authority(
     seed: int,
     *,
     source_role: str = "source",
+    prepared_authority: bool = False,
 ) -> dict[str, Any]:
+    canonicalizer = (
+        reviewed_authority_canonical_json_bytes
+        if prepared_authority
+        else canonical_json_bytes
+    )
     bindings: dict[str, dict[str, Any]] = {}
     for offset, (component, role) in enumerate(
         (
@@ -11236,12 +11322,16 @@ def _fixture_semantic_authority(
         )
     ):
         component_seed = seed if component == "source" else 500 + offset
-        value = _fixture_semantic_tree(role, component_seed)
+        value = _fixture_semantic_tree(
+            role,
+            component_seed,
+            non_ascii_entry=component == "cargo_home",
+        )
         path = root / f"{label}-{component}.json"
-        atomic_json(path, value)
+        atomic_write(path, canonicalizer(value))
         path.chmod(0o444)
         bindings[component] = {
-            "entry_count": 1,
+            "entry_count": len(value["entries"]),
             "equal_pre_post": True,
             "manifest_path": str(path.resolve()),
             "manifest_sha256": sha256(path),
@@ -11282,7 +11372,7 @@ def _fixture_semantic_authority(
         "schema": TRUSTED_SYSTEM_CLOSURE_SCHEMA,
     }
     closure_path = root / f"{label}-trusted-system-closure.json"
-    atomic_json(closure_path, closure_value)
+    atomic_write(closure_path, canonicalizer(closure_value))
     closure_path.chmod(0o444)
     closure = {
         "entry_count": 3,
@@ -11400,6 +11490,26 @@ def _fixture_sandbox_argv(
         ]
         descriptor = 10
         remaining_bindings = bindings
+    source_data_destinations = tuple(
+        destination
+        for destination in SEMANTIC_CONFIG_DESTINATIONS[:2]
+        if destination in data_destinations
+    )
+    cargo_home_data_destinations = tuple(
+        destination
+        for destination in SEMANTIC_CONFIG_DESTINATIONS[2:]
+        if destination in data_destinations
+    )
+    other_data_destinations = tuple(
+        sorted(data_destinations - set(SEMANTIC_CONFIG_DESTINATIONS))
+    )
+
+    def append_data_bindings(destinations: tuple[str, ...]) -> None:
+        nonlocal descriptor
+        for destination in destinations:
+            argv.extend(["--ro-bind-data", str(descriptor), destination])
+            descriptor += 1
+
     overlay_inserted = False
     for option, destination in remaining_bindings:
         argv.extend(
@@ -11416,6 +11526,7 @@ def _fixture_sandbox_argv(
             else "/asterism/toolchain/bin/rustc"
         )
         if not overlay_inserted and destination == overlay_anchor:
+            append_data_bindings(source_data_destinations)
             argv.extend(
                 [
                     "--overlay-src",
@@ -11425,8 +11536,10 @@ def _fixture_sandbox_argv(
                 ]
             )
             descriptor += 1
+            append_data_bindings(cargo_home_data_destinations)
             overlay_inserted = True
     if not overlay_inserted:
+        append_data_bindings(source_data_destinations)
         argv.extend(
             [
                 "--overlay-src",
@@ -11436,9 +11549,8 @@ def _fixture_sandbox_argv(
             ]
         )
         descriptor += 1
-    for destination in sorted(data_destinations):
-        argv.extend(["--ro-bind-data", str(descriptor), destination])
-        descriptor += 1
+        append_data_bindings(cargo_home_data_destinations)
+    append_data_bindings(other_data_destinations)
     argv.extend(
         [
             "--remount-ro",
@@ -11802,7 +11914,10 @@ def _fixture_prepared(root: Path, executable: Path) -> Prepared:
         "release-overlay-A",
     ):
         authorities[label] = _fixture_semantic_authority(
-            semantic_root, label, seed
+            semantic_root,
+            label,
+            seed,
+            prepared_authority=label.startswith("release-"),
         )
         seed += 10
     for variant in ("C", "D"):
@@ -11813,6 +11928,7 @@ def _fixture_prepared(root: Path, executable: Path) -> Prepared:
                 label,
                 seed,
                 source_role="resolution_source_without_cargo_lock",
+                prepared_authority=True,
             )
             seed += 10
     current_builds = {}
@@ -11827,28 +11943,28 @@ def _fixture_prepared(root: Path, executable: Path) -> Prepared:
             current_build_destinations
             | {"/asterism/rustc_workspace_wrapper.py", "/asterism/receipt"},
             {"/asterism/target", "/asterism/receipt"},
-            17,
+            20,
         ),
         (
             "hooked_release",
             "current-hooked-release",
             current_build_destinations,
             {"/asterism/target"},
-            15,
+            18,
         ),
         (
             "pristine_release",
             "current-pristine-release",
             current_build_destinations,
             {"/asterism/target"},
-            15,
+            18,
         ),
     ):
         current_builds[name] = _fixture_build_sandbox(
             authorities[label],
             destinations,
             writable_destinations=writable,
-            data_destinations={"/asterism/source/.cargo/config.toml"},
+            data_destinations=set(SEMANTIC_CONFIG_DESTINATIONS),
             passed_file_descriptors=passed,
             execution_tools=fixture_current_execution_tools(),
             toolchain=toolchain,
@@ -12048,8 +12164,12 @@ def _fixture_prepared(root: Path, executable: Path) -> Prepared:
             name: {"attestation": release_attestations[name]} for name in VARIANTS
         },
     }
+    fixture_schema = _FakeSchema()
+    fixture_schema.semantic_runtime_content_sha256 = (
+        load_schema().semantic_runtime_content_sha256
+    )
     return Prepared(
-        schema=_FakeSchema(),
+        schema=fixture_schema,
         path=manifest,
         digest=sha256(manifest),
         value=prepared_value,
@@ -12281,9 +12401,9 @@ def _semantic_authority_static_checks(
             ]
             for name in ("children", "hooked_release", "pristine_release")
         } == {
-            "children": 17,
-            "hooked_release": 15,
-            "pristine_release": 15,
+            "children": 20,
+            "hooked_release": 18,
+            "pristine_release": 18,
         }
         resolver_records = [
             prepared.source_approval_value["variants"][variant][field]
@@ -13378,12 +13498,12 @@ def _semantic_authority_static_checks(
     finally:
         for snapshot in preserved_snapshots:
             snapshot.close()
-    checks["current_dynamic_fd_formula_base_15_17_plus_preserved"] = (
+    checks["current_dynamic_fd_formula_base_18_20_plus_preserved"] = (
         checks["current_child_preserved_cargo_home_fd_count_accepted"]
-        and preserved_build["execution"]["passed_file_descriptors"] == 18
+        and preserved_build["execution"]["passed_file_descriptors"] == 21
     )
-    details["current_dynamic_fd_formula_base_15_17_plus_preserved"] = (
-        "release_base=15 child_base=17 preserved_children=1 child_passed=18"
+    details["current_dynamic_fd_formula_base_18_20_plus_preserved"] = (
+        "release_base=18 child_base=20 preserved_children=1 child_passed=21"
     )
 
     count_drift_current = _detached(current)
