@@ -3554,6 +3554,11 @@ def _validate_recursive_semantic_manifest(
     ):
         raise ValueError(f"{context} recursive manifest identity differs")
     paths: list[str] = []
+    # ``seen`` mirrors ``paths`` for O(1) duplicate detection; the ordered
+    # ``paths`` list is retained for the insertion-order check below.  A plain
+    # ``relative in paths`` membership test is O(N) per entry and quadratic over
+    # the 200k+ entry cargo-home manifests, which dominated load-time validation.
+    seen: set[str] = set()
     for index, entry_value in enumerate(entries):
         entry = _authority_object(
             entry_value,
@@ -3574,10 +3579,11 @@ def _validate_recursive_semantic_manifest(
                 )
             )
             or (index == 0) != (relative == ".")
-            or relative in paths
+            or relative in seen
         ):
             raise ValueError(f"{context} recursive path differs")
         paths.append(relative)
+        seen.add(relative)
         kind = entry["file_type"]
         integer_fields = (
             "changed_ns",
