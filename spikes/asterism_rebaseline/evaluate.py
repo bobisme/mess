@@ -4927,6 +4927,8 @@ def validate_config(
     for field, expected in exact.items():
         if config.get(field) != expected:
             problems.add(f"config {field} does not match frozen contract")
+    if config.get("rehearsal") not in (True, False):
+        problems.add("config rehearsal flag invalid")
     for field in ("tooling_commit", "tooling_tree"):
         if not is_git_id(config.get(field)):
             problems.add(f"config {field} is not a Git object id")
@@ -10243,10 +10245,25 @@ def validate_provenance(
         "evidence_mode": "correctness-only" if correctness_only else "admission",
         "attempt_nonce": config.get("attempt_nonce") if config else None,
         "output_dir": str(output_dir),
-        "output_dir_absent_before": True,
+        # Protocol v4: rehearsal outputs live in pre-declared directories,
+        # accepted outputs in operator-created ones — the runner records
+        # which applied; both self-consistency shapes are valid.
+        "output_dir_absent_before": bool(provenance.get("rehearsal")),
         "partial": False,
         "failure_absent": True,
     }
+    if provenance.get("rehearsal") not in (True, False):
+        problems.add("provenance rehearsal flag invalid")
+    if config is not None and provenance.get("rehearsal") != config.get("rehearsal"):
+        problems.add("provenance rehearsal flag differs from config")
+    # Protocol v4 §4: an accepted run carries the operator declaration hash;
+    # a rehearsal carries none.  The two are mutually exclusive.
+    declaration = provenance.get("declaration_sha256")
+    if provenance.get("rehearsal"):
+        if declaration is not None:
+            problems.add("rehearsal provenance carries a declaration hash")
+    elif not is_sha256(declaration):
+        problems.add("accepted provenance lacks a declaration hash")
     for field, expected in exact.items():
         if provenance.get(field) != expected:
             problems.add(f"provenance {field} mismatch")
@@ -12097,11 +12114,23 @@ def evaluate_directory(
         output_dir, problems, correctness_only=correctness_only
     )
     evidence_valid = not problems.errors and (matrix_complete or correctness_only)
+    rehearsal = bool(provenance.get("rehearsal")) if provenance is not None else False
     outcome = provisional if evidence_valid else "INCONCLUSIVE"
+    # Protocol v4 §3: rehearsal rows are non-evidence by construction.  A
+    # rehearsal can never yield an ADMIT/NARROW/REVERT decision no matter how
+    # clean its rows are; its terminal outcome is forced to INCONCLUSIVE so
+    # it cannot be laundered into an accepted result.
+    if rehearsal:
+        outcome = "INCONCLUSIVE"
     if not evidence_valid:
         summary = dict(summary)
         reasons = dict(summary.get("reasons", {}))
         reasons["INCONCLUSIVE"] = ["invalid-or-incomplete-evidence"]
+        summary["reasons"] = reasons
+    elif rehearsal:
+        summary = dict(summary)
+        reasons = dict(summary.get("reasons", {}))
+        reasons["INCONCLUSIVE"] = ["rehearsal-non-evidence"]
         summary["reasons"] = reasons
     exit_code = {
         "ADMIT": EXIT_ADMIT,
@@ -12120,6 +12149,7 @@ def evaluate_directory(
         ),
         "outcome": outcome,
         "exit_code": exit_code,
+        "rehearsal": rehearsal,
         "evidence_valid": evidence_valid,
         "matrix_complete": matrix_complete,
         "errors": problems.errors,
@@ -14798,6 +14828,7 @@ def profile_fields(track, finish_result, *, raw_point, control_events, authority
         "schema": schema.CONFIG_SCHEMA,
         "protocol": schema.PROTOCOL,
         "protocol_sha256": protocol_sha256,
+        "rehearsal": False,
         "approved": True,
         "review_id": "cr-synthetic",
         "tooling_commit": fake_commit,
@@ -16262,9 +16293,11 @@ def profile_fields(track, finish_result, *, raw_point, control_events, authority
         "protocol": schema.PROTOCOL,
         "protocol_sha256": protocol_sha256,
         "evidence_mode": "correctness-only" if correctness_only else "admission",
+        "rehearsal": False,
+        "declaration_sha256": "d" * 64,
         "attempt_nonce": nonce,
         "output_dir": str(output),
-        "output_dir_absent_before": True,
+        "output_dir_absent_before": False,
         "source_approval_path": str(approval_path),
         "source_approval_sha256": approval_sha256,
         "config_path": str(config_path),
@@ -19900,6 +19933,52 @@ def self_test() -> dict[str, Any]:
             "mutation-config-resource-floor",
             lambda: mutate_json(output / "config.json", lambda value: value["resource_limits"].__setitem__("free_bytes", 1)),
         )
+
+        def rehearsal_cannot_admit() -> bool:
+            # Protocol v4 §3: a fully consistent rehearsal bundle (clean rows,
+            # no structural errors) must still refuse to yield an ADMIT/NARROW/
+            # REVERT decision — its outcome is forced to INCONCLUSIVE so it can
+            # never be laundered into an accepted result.
+            config_path = output / "config.json"
+            provenance_path = output / "provenance.json"
+            originals = {p: p.read_bytes() for p in (config_path, provenance_path)}
+            modes = {p: stat.S_IMODE(p.stat().st_mode) for p in originals}
+            try:
+                config_value = json.loads(originals[config_path])
+                config_value["rehearsal"] = True
+                provenance_value = json.loads(originals[provenance_path])
+                provenance_value["rehearsal"] = True
+                provenance_value["declaration_sha256"] = None
+                provenance_value["output_dir_absent_before"] = True
+                for path, value in (
+                    (config_path, config_value),
+                    (provenance_path, provenance_value),
+                ):
+                    path.chmod(0o644)
+                    path.write_bytes(canonical_json_bytes(value))
+                    path.chmod(modes[path])
+                result, rc = evaluate_directory(
+                    output, synthetic=True, publish=False
+                )
+                # The post-hoc edit of config/provenance also breaks their
+                # recorded self-hashes, so evidence_valid is incidentally
+                # False here; the decisive property is that a rehearsal-marked
+                # bundle yields INCONCLUSIVE with the rehearsal flag surfaced,
+                # never ADMIT/NARROW/REVERT.  The terminal verifier's outright
+                # rejection of rehearsal results is the complementary guard.
+                return (
+                    rc == EXIT_INCONCLUSIVE
+                    and result["outcome"] == "INCONCLUSIVE"
+                    and result["rehearsal"] is True
+                    and result["outcome"] not in {"ADMIT", "NARROW", "REVERT"}
+                )
+            finally:
+                for path, original in originals.items():
+                    path.chmod(0o644)
+                    path.write_bytes(original)
+                    path.chmod(modes[path])
+
+        check("v4-rehearsal-evidence-cannot-admit", rehearsal_cannot_admit)
         check(
             "mutation-v2-config-schema-rejected",
             lambda: mutate_json(

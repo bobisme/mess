@@ -6953,12 +6953,19 @@ def verify(
         require_keys(terminal, TERMINAL_FIELDS, "terminal", errors)
     if result is not None:
         expected_result_fields = {
-            "schema", "protocol", "evidence_mode", "outcome", "exit_code", "evidence_valid",
-            "matrix_complete", "errors", "gate_failures", "gates", "summary", "artifacts",
-            "evaluated_at", "evaluator_path", "evaluator_sha256",
+            "schema", "protocol", "evidence_mode", "outcome", "exit_code", "rehearsal",
+            "evidence_valid", "matrix_complete", "errors", "gate_failures", "gates",
+            "summary", "artifacts", "evaluated_at", "evaluator_path", "evaluator_sha256",
         }
         require_keys(result, expected_result_fields, "evaluation result", errors)
         evidence_mode = result.get("evidence_mode")
+        # Protocol v4 §3: the terminal verifier certifies decisions.  A
+        # rehearsal result is non-evidence and can never be terminal-verified
+        # as an accepted outcome.
+        if result.get("rehearsal") is not False:
+            errors.append("terminal verification refuses rehearsal (non-evidence) result")
+        if provenance is not None and provenance.get("rehearsal") is not False:
+            errors.append("terminal verification refuses rehearsal provenance")
         if (
             result.get("schema") != schema.RESULT_SCHEMA
             or result.get("protocol") != schema.PROTOCOL
@@ -9754,7 +9761,7 @@ def build_terminal_fixture_v3(
     result = {
         "schema": schema.RESULT_SCHEMA, "protocol": schema.PROTOCOL,
         "evidence_mode": evidence_mode, "outcome": decision_outcome,
-        "exit_code": decision_exit, "evidence_valid": True,
+        "exit_code": decision_exit, "rehearsal": False, "evidence_valid": True,
         "matrix_complete": not correctness_only, "errors": [],
         "gate_failures": [], "gates": [], "summary": {
             "report_data": (
@@ -9791,7 +9798,8 @@ def build_terminal_fixture_v3(
     }
     provenance = {
         "protocol": schema.PROTOCOL, "attempt_nonce": attempt_nonce,
-        "evidence_mode": evidence_mode,
+        "evidence_mode": evidence_mode, "rehearsal": False,
+        "declaration_sha256": "d" * 64,
         "lease": lease, "host": {"runner": runner_identity},
     }
     write_fixture_json(output / "provenance.json", provenance)

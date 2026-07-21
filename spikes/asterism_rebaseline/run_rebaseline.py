@@ -3734,27 +3734,20 @@ def load_prepared(path: Path, schema: Any | None = None) -> Prepared:
                 f"prepared support {name} differs from source-approved claim",
                 exit_code=2,
             )
+    # Protocol v4: prepared artifacts are reusable across rehearsals and
+    # declared runs.  The v3 single-use claim binding is still parsed for
+    # structural compatibility with build-tool output, but the claim marker
+    # is recorded in the run's own output directory (see claim_prepared),
+    # never written into the prepared root, and a pre-existing v3 claims/
+    # directory or consumed claim no longer blocks a run.
     claim_binding = value["single_use_claim"]
     require_exact_keys(claim_binding, {"path"}, "single-use claim")
     claim_lexical = Path(str(claim_binding["path"]))
     if not claim_lexical.is_absolute():
         raise RunnerFailure("single-use claim path is not absolute", exit_code=2)
     claim_path = claim_lexical.resolve()
-    claims_directory = claim_path.parent
-    if (
-        claims_directory.name != "claims"
-        or claims_directory.parent != root
-        or not claims_directory.is_dir()
-        or stat.S_IMODE(claims_directory.stat().st_mode) != 0o700
-        or stat.S_IMODE(root.stat().st_mode) != 0o555
-        or root not in claim_path.parents
-        or claim_path.exists()
-        or claim_path.is_symlink()
-    ):
-        raise RunnerFailure(
-            "prepared claims/root layout differs or artifacts are already consumed",
-            exit_code=2,
-        )
+    if stat.S_IMODE(root.stat().st_mode) != 0o555:
+        raise RunnerFailure("prepared root is not read-only 0555", exit_code=2)
     if set(value["variants"]) != set(VARIANTS):
         raise RunnerFailure("prepared variant set differs from A/B/C/D", exit_code=2)
     variants: dict[str, Variant] = {}
@@ -4156,6 +4149,7 @@ def config_for(prepared: Prepared, schema: EvidenceSchema) -> dict[str, Any]:
         "schema": CONFIG_SCHEMA,
         "protocol": PROTOCOL,
         "protocol_sha256": PROTOCOL_SHA256,
+        "rehearsal": False,
         "approved": approval.get("status") == "approved",
         "review_id": approval.get("review_id"),
         "tooling_commit": prepared.value["tooling_commit"],
@@ -5410,6 +5404,13 @@ class RebaselineRunner:
         self.lease_handle: Any | None = None
         self.lease: dict[str, Any] | None = None
         self.claim: dict[str, Any] | None = None
+        self.run_claim_path: Path | None = None
+        self.declaration_sha256: str | None = None
+        # Protocol v4 §3: an output directory whose final component starts
+        # with "rehearsal-" marks a rehearsal run — rows are non-evidence,
+        # no DECLARED.txt or coordination attestation is required, and
+        # quiet-guard misses warn instead of fail-stopping.
+        self.rehearsal = output.name.startswith("rehearsal-")
         self.next_transition: dict[str, Any] | None = None
         self.guard_count = 0
         self.child_count = 0
@@ -5447,6 +5448,10 @@ class RebaselineRunner:
         self.frozen_files = self._frozen_file_bindings()
         self.config = config_for(self.prepared, self.schema)
         self.config["attempt_nonce"] = self.attempt_nonce
+        # Protocol v4 §3: the run mode is stamped into config (and mirrored
+        # into provenance) so every downstream consumer can distinguish
+        # rehearsal rows from evidence without consulting directory names.
+        self.config["rehearsal"] = self.rehearsal
         self.config_path = self.output / "config.json"
         self.provenance_path = self.output / "provenance.json"
         self.guard_manifest = self.output / "guard-manifest.jsonl"
@@ -6107,15 +6112,15 @@ class RebaselineRunner:
             path = Path(raw_path)
             if not path.is_file() or sha256(path) != expected:
                 raise RunnerFailure(f"frozen artifact changed: {path}")
-        if self.prepared.claim_path.is_file() and self.claim is not None:
-            metadata = self.prepared.claim_path.lstat()
+        if self.run_claim_path is not None and self.claim is not None:
+            metadata = self.run_claim_path.lstat()
             if (
                 stat.S_ISLNK(metadata.st_mode)
                 or not stat.S_ISREG(metadata.st_mode)
                 or stat.S_IMODE(metadata.st_mode) != 0o444
-                or load_canonical_json(self.prepared.claim_path) != self.claim
+                or load_canonical_json(self.run_claim_path) != self.claim
             ):
-                raise RunnerFailure("single-use claim changed")
+                raise RunnerFailure("run claim record changed")
 
     def verify_semantic_manifests(self) -> None:
         """Recheck the exact retained semantic set without unrelated I/O."""
@@ -6197,23 +6202,29 @@ class RebaselineRunner:
             if identity != observed_identity or metadata.st_nlink != 1:
                 raise RunnerFailure(f"{label} immutable identity changed")
         if self.prepared.inputs:
-            claims_directory = self.prepared.claim_path.parent
-            if (
-                stat.S_IMODE(self.prepared.root.stat().st_mode) != 0o555
-                or claims_directory.name != "claims"
-                or claims_directory.parent != self.prepared.root
-                or stat.S_IMODE(claims_directory.stat().st_mode) != 0o700
-            ):
-                raise RunnerFailure("prepared root/claims immutable layout changed")
+            # Protocol v4: the prepared root stays read-only and reusable; the
+            # v3 claims/ subdirectory is no longer required or written.
+            if stat.S_IMODE(self.prepared.root.stat().st_mode) != 0o555:
+                raise RunnerFailure("prepared root is not read-only 0555")
 
     def _prepared_tree_state(self) -> str:
         root = self.prepared.root.resolve(strict=True)
-        claims = self.prepared.claim_path.parent.resolve(strict=True)
+        # Protocol v4: a v3-built prepared root may still carry a writable
+        # 0700 claims/ directory; a v4-built root has none.  When present it
+        # is recorded by mode only (its contents are ignored), so a stray
+        # claim can neither perturb the tree hash nor trip the writable-entry
+        # guard.  When absent, the whole tree is ordinary read-only entries.
+        claims_parent = self.prepared.claim_path.parent
+        claims = (
+            claims_parent.resolve(strict=True)
+            if claims_parent.is_dir() and claims_parent.name == "claims"
+            else None
+        )
         entries: list[dict[str, Any]] = []
         paths = [root, *sorted(root.rglob("*"))]
         for path in paths:
             resolved = path.resolve(strict=False)
-            if path != claims and claims in resolved.parents:
+            if claims is not None and path != claims and claims in resolved.parents:
                 continue
             relative = "." if path == root else path.relative_to(root).as_posix()
             metadata = path.lstat()
@@ -6258,9 +6269,108 @@ class RebaselineRunner:
         if self._prepared_tree_state() != self.prepared_tree_snapshot:
             raise RunnerFailure("prepared immutable tree changed")
 
+    def _admit_run_mode(self) -> None:
+        """Protocol v4 §3-4: admit the output directory for its run mode.
+
+        Rehearsal (output name starts with "rehearsal-"): the directory must
+        be fresh; the runner creates it.  Accepted: the operator pre-creates
+        the directory containing exactly DECLARED.txt, a regular file whose
+        lines are exactly ``label=<64-hex sha256>`` for label ``runner`` and
+        one per variant (``A``..``D``), each hash matching this runner
+        script and that variant's reviewed binary.  The declaration is
+        parsed strictly (no substring matching, no comments, no extra
+        labels) and its exact bytes are frozen into the run's authority so a
+        post-admission edit — of a regular file or a symlink target — is
+        detected by verify_frozen.  Every declared run, including failures,
+        is reportable attempt history (§4), so the declaration is never
+        runner-created.
+        """
+
+        self.phase = "run_mode_admission"
+        if self.rehearsal:
+            self.output.mkdir(parents=False, exist_ok=False)
+            return
+        if not self.output.is_dir():
+            raise RunnerFailure(
+                "accepted run requires an operator-created output directory "
+                f"containing DECLARED.txt: {self.output}",
+                exit_code=2,
+            )
+        entries = sorted(entry.name for entry in self.output.iterdir())
+        if entries != ["DECLARED.txt"]:
+            raise RunnerFailure(
+                "accepted run output must contain exactly DECLARED.txt, "
+                f"found: {entries}",
+                exit_code=2,
+            )
+        declared_path = self.output / "DECLARED.txt"
+        metadata = declared_path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise RunnerFailure(
+                "DECLARED.txt must be a single-link regular file "
+                "(no symlink, no hardlink)",
+                exit_code=2,
+            )
+        declared_bytes = declared_path.read_bytes()
+        try:
+            declaration = declared_bytes.decode("ascii")
+        except UnicodeDecodeError as error:
+            raise RunnerFailure("DECLARED.txt is not ASCII", exit_code=2) from error
+        required_digests = {
+            "runner": sha256(Path(__file__).resolve()),
+            **{
+                name: variant.executable.sha256
+                for name, variant in self.prepared.variants.items()
+            },
+        }
+        declared_digests: dict[str, str] = {}
+        for lineno, raw_line in enumerate(declaration.splitlines(), start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            label, separator, value = line.partition("=")
+            label = label.strip()
+            value = value.strip()
+            if separator != "=" or label not in required_digests:
+                raise RunnerFailure(
+                    f"DECLARED.txt line {lineno} is not a recognized "
+                    "'<label>=<sha256>' declaration",
+                    exit_code=2,
+                )
+            if label in declared_digests:
+                raise RunnerFailure(
+                    f"DECLARED.txt declares {label!r} more than once",
+                    exit_code=2,
+                )
+            if not SHA256_RE.fullmatch(value):
+                raise RunnerFailure(
+                    f"DECLARED.txt {label!r} is not a 64-hex SHA-256",
+                    exit_code=2,
+                )
+            declared_digests[label] = value
+        if declared_digests != required_digests:
+            raise RunnerFailure(
+                "DECLARED.txt digests do not exactly match the runner and "
+                "reviewed variant binaries",
+                exit_code=2,
+            )
+        # Freeze the exact declaration bytes so any post-admission edit
+        # (regular file or symlink target) is caught before row zero.
+        self.declaration_sha256 = sha256_bytes(declared_bytes)
+        self.frozen_files[str(declared_path.resolve(strict=True))] = (
+            self.declaration_sha256
+        )
+
     def acquire_lease(self) -> None:
         self.phase = "lease_acquire"
-        if os.environ.get("MESS_BENCH_COORDINATION_CONFIRMED") != "true":
+        # Protocol v4 §3-4: rehearsal runs need no coordination attestation
+        # (their rows are non-evidence); accepted runs require the operator's
+        # explicit host-quiet confirmation.  Both modes take the lease so a
+        # rehearsal can never overlap an accepted run.
+        if (
+            not self.rehearsal
+            and os.environ.get("MESS_BENCH_COORDINATION_CONFIRMED") != "true"
+        ):
             raise RunnerFailure(
                 "MESS_BENCH_COORDINATION_CONFIRMED must be true after host coordination"
             )
@@ -6356,10 +6466,13 @@ class RebaselineRunner:
             "claimed_at": now(),
             "claimed_monotonic_ns": time.monotonic_ns(),
         }
-        atomic_create_json(self.prepared.claim_path, self.claim, mode=0o444)
-        self.frozen_files[str(self.prepared.claim_path.resolve(strict=True))] = sha256(
-            self.prepared.claim_path
-        )
+        # Protocol v4: the claim record lives in the run's own output
+        # directory.  The prepared root stays untouched and reusable; the
+        # lease (not the claim) provides mutual exclusion between runs.
+        claim_path = self.output / "run-claim.json"
+        atomic_create_json(claim_path, self.claim, mode=0o444)
+        self.run_claim_path = claim_path
+        self.frozen_files[str(claim_path.resolve(strict=True))] = sha256(claim_path)
 
     def wait_for_quiet(self) -> list[dict[str, Any]]:
         self.phase = "quiet_wait"
@@ -6371,6 +6484,22 @@ class RebaselineRunner:
             if load1 < self.maximum_load1:
                 return samples
             if self.monotonic() >= deadline:
+                if self.rehearsal:
+                    # Protocol v4 §3: rehearsal rows are non-evidence, so a
+                    # noisy host is recorded, warned about, and tolerated.
+                    samples.append(
+                        {
+                            "at": now(),
+                            "monotonic_ns": time.monotonic_ns(),
+                            "load1": load1,
+                            "rehearsal_quiet_waiver": True,
+                        }
+                    )
+                    self.log(
+                        f"rehearsal: load1={load1} stayed at or above "
+                        f"{self.maximum_load1}; continuing (non-evidence rows)"
+                    )
+                    return samples
                 raise RunnerFailure(
                     f"load1={load1} did not fall below {self.maximum_load1} "
                     f"within {self.quiet_timeout_seconds} seconds"
@@ -8261,9 +8390,11 @@ class RebaselineRunner:
             "protocol": PROTOCOL,
             "protocol_sha256": PROTOCOL_SHA256,
             "evidence_mode": "admission",
+            "rehearsal": self.rehearsal,
+            "declaration_sha256": self.declaration_sha256,
             "attempt_nonce": self.attempt_nonce,
             "output_dir": str(self.output.resolve()),
-            "output_dir_absent_before": True,
+            "output_dir_absent_before": self.rehearsal,
             "source_approval_path": str(
                 (self.output / "source-approval.json").resolve()
             ),
@@ -9388,10 +9519,16 @@ class RebaselineRunner:
             "runner": self.runner_identity,
             "active_child": self.active_child,
             "lease": self.lease,
-            "claim_path": str(self.prepared.claim_path) if self.claim else None,
+            "claim_path": (
+                str(self.run_claim_path)
+                if self.claim and self.run_claim_path is not None
+                else None
+            ),
             "claim_sha256": (
-                sha256(self.prepared.claim_path)
-                if self.claim and self.prepared.claim_path.is_file()
+                sha256(self.run_claim_path)
+                if self.claim
+                and self.run_claim_path is not None
+                and self.run_claim_path.is_file()
                 else None
             ),
             "failed_at": now(),
@@ -9511,10 +9648,15 @@ class RebaselineRunner:
         try:
             signal.signal(signal.SIGINT, interrupted)
             signal.signal(signal.SIGTERM, interrupted)
-            self.output.mkdir(parents=False, exist_ok=False)
+            self._admit_run_mode()
             self.scratch_root.mkdir(parents=True, exist_ok=True)
             self.attempt_scratch.mkdir(parents=True, exist_ok=False)
             self.runtime_home.mkdir(mode=0o700)
+            if self.rehearsal:
+                (self.output / "REHEARSAL").write_text(
+                    "rows in this directory are rehearsal output and are "
+                    "non-evidence by construction (protocol v4 §3)\n"
+                )
             self.acquire_lease()
             self.host_resource_preflight()
             self.publish_frozen_inputs()
@@ -15461,23 +15603,130 @@ def run_self_test(root: Path) -> int:
             atomic_write(destination, source.read_bytes(), mode=0o444)
             runner.frozen_files[str(destination.resolve())] = sha256(destination)
         runner.claim_prepared()
-        try:
-            atomic_create_json(prepared.claim_path, {"again": True})
-        except RunnerFailure:
-            checks["single_use_claim"] = (
-                stat.S_IMODE(prepared.claim_path.stat().st_mode) == 0o444
-                and load_canonical_json(prepared.claim_path).get(
-                    "prepared_artifacts_path"
-                )
-                == str(prepared.path)
-                and load_canonical_json(prepared.claim_path).get(
-                    "prepared_artifacts_sha256"
-                )
-                == prepared.digest
-            )
-        else:
-            checks["single_use_claim"] = False
+        # Protocol v4: the claim is recorded in the run's own output
+        # directory as run-claim.json (mode 0444) and the prepared root is
+        # never written to, so prepared artifacts stay reusable across
+        # rehearsals and declared runs.
+        run_claim = output / "run-claim.json"
+        checks["run_claim_in_output"] = (
+            runner.run_claim_path == run_claim
+            and run_claim.is_file()
+            and stat.S_IMODE(run_claim.stat().st_mode) == 0o444
+            and not prepared.claim_path.exists()
+            and load_canonical_json(run_claim).get("prepared_artifacts_path")
+            == str(prepared.path)
+            and load_canonical_json(run_claim).get("prepared_artifacts_sha256")
+            == prepared.digest
+        )
         runner.prepare_profile_preflight()
+
+        # Protocol v4 §3-4: exercise the run-mode admission gate in every
+        # mode without a full measurement run.
+        def _admission_runner(out: Path) -> "RebaselineRunner":
+            scratch = root / f"admit-scratch-{out.name}"
+            scratch.mkdir()
+            return RebaselineRunner(
+                prepared,
+                out,
+                _FakeSchema(),
+                lock_path=root / f"admit-{out.name}.lock",
+                scratch_root=scratch,
+                minimum_free_bytes=0,
+                minimum_free_inodes=0,
+                maximum_load1=6.0,
+                profile_factory=runner.profile_factory,
+                require_profile_factory=False,
+            )
+
+        runner_hash = sha256(Path(__file__).resolve())
+        variant_hashes = {
+            name: variant.executable.sha256
+            for name, variant in prepared.variants.items()
+        }
+
+        def _faithful_declaration() -> str:
+            return f"runner={runner_hash}\n" + "".join(
+                f"{name}={digest}\n"
+                for name, digest in sorted(variant_hashes.items())
+            )
+
+        def _declared_dir(name: str, text: str | None) -> Path:
+            out = root / name
+            out.mkdir()
+            if text is not None:
+                (out / "DECLARED.txt").write_text(text)
+            return out
+
+        def _rejects(out: Path) -> bool:
+            try:
+                _admission_runner(out)._admit_run_mode()
+            except RunnerFailure:
+                return True
+            return False
+
+        # Rehearsal: fresh dir is created, marked, and needs no coordination.
+        rehearsal_out = root / "rehearsal-admit"
+        rehearsal_runner = _admission_runner(rehearsal_out)
+        rehearsal_runner._admit_run_mode()
+        checks["v4_rehearsal_admits_and_marks"] = (
+            rehearsal_runner.rehearsal and rehearsal_out.is_dir()
+        )
+
+        checks["v4_accepted_requires_declared_dir"] = _rejects(
+            root / "accepted-missing"
+        )
+        accepted_stray = _declared_dir("accepted-stray", _faithful_declaration())
+        (accepted_stray / "stowaway").write_text("x")
+        checks["v4_accepted_rejects_stray_file"] = _rejects(accepted_stray)
+        checks["v4_accepted_rejects_wrong_digest"] = _rejects(
+            _declared_dir(
+                "accepted-wrong",
+                f"runner={runner_hash}\n"
+                + "".join(f"{n}={'0' * 64}\n" for n in sorted(variant_hashes)),
+            )
+        )
+        # New hostile classes from cr-1e7dil: a correct digest embedded in a
+        # larger token, a negating comment, and a symlinked declaration must
+        # all be rejected by strict per-line parsing and the regular-file
+        # requirement.
+        checks["v4_accepted_rejects_embedded_token"] = _rejects(
+            _declared_dir(
+                "accepted-embedded",
+                f"runner=X{runner_hash}\n"
+                + "".join(
+                    f"{n}={d}\n" for n, d in sorted(variant_hashes.items())
+                ),
+            )
+        )
+        checks["v4_accepted_rejects_negating_comment"] = _rejects(
+            _declared_dir(
+                "accepted-comment",
+                f"runner={'0' * 64}\n"
+                + "".join(f"{n}={'0' * 64}\n" for n in sorted(variant_hashes))
+                + f"# real runner={runner_hash}\n",
+            )
+        )
+        symlink_dir = root / "accepted-symlink"
+        symlink_dir.mkdir()
+        real_declaration = root / "outside-declaration.txt"
+        real_declaration.write_text(_faithful_declaration())
+        (symlink_dir / "DECLARED.txt").symlink_to(real_declaration)
+        checks["v4_accepted_rejects_symlink_declaration"] = _rejects(symlink_dir)
+
+        accepted_ok = _declared_dir("accepted-ok", _faithful_declaration())
+        ok_runner = _admission_runner(accepted_ok)
+        try:
+            ok_runner._admit_run_mode()
+        except RunnerFailure as error:
+            checks["v4_accepted_admits_faithful_declaration"] = False
+            details["v4_accepted_admits_faithful_declaration"] = error.reason
+        else:
+            checks["v4_accepted_admits_faithful_declaration"] = (
+                ok_runner.declaration_sha256 is not None
+                and bool(SHA256_RE.fullmatch(ok_runner.declaration_sha256))
+                and str((accepted_ok / "DECLARED.txt").resolve())
+                in ok_runner.frozen_files
+            )
 
         cleanup_output = root / "post-spawn-cleanup-attempt"
         cleanup_scratch = root / "post-spawn-cleanup-scratch"
@@ -16091,10 +16340,10 @@ def main(argv: list[str] | None = None) -> int:
         schema_path = Path(__file__).with_name("evidence_schema.py").resolve()
         schema = load_schema()
         prepared = load_prepared(args.prepared_artifacts, schema)
-        runtime = prepared.tools.get("runner_runtime")
-        if runtime is None:
-            raise RunnerFailure("prepared runner runtime is absent", exit_code=2)
-        verify_current_runtime(runtime, RUNNER_COMM)
+        # Protocol v4 §6: the executing script is bound by recording its
+        # hash in provenance (and, for accepted runs, matching DECLARED.txt)
+        # rather than by requiring a specific frozen inode and interpreter.
+        # verify_current_runtime's exe-identity fail-stop is retired.
         approval = prepared.source_approval_value
         if (
             approval.get("tooling_commit") != prepared.value["tooling_commit"]
@@ -16116,8 +16365,15 @@ def main(argv: list[str] | None = None) -> int:
             )
         output = args.output_dir.resolve()
         scratch = SCRATCH_ROOT.resolve()
-        if output.exists() or output.is_symlink():
-            raise RunnerFailure(f"output directory is not fresh: {output}", exit_code=2)
+        # Protocol v4 §3-4: rehearsal outputs must be fresh (runner-created);
+        # accepted outputs are operator-created and hold only DECLARED.txt.
+        # Full admission happens in RebaselineRunner._admit_run_mode.
+        if output.is_symlink():
+            raise RunnerFailure(f"output directory is a symlink: {output}", exit_code=2)
+        if output.name.startswith("rehearsal-") and output.exists():
+            raise RunnerFailure(
+                f"rehearsal output directory is not fresh: {output}", exit_code=2
+            )
         if output == prepared.root or prepared.root in output.parents:
             raise RunnerFailure("output is inside prepared artifacts", exit_code=2)
         try:
