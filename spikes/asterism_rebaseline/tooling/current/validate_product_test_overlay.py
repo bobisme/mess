@@ -20,7 +20,7 @@ from typing import Mapping
 
 SCHEMA = "bn-xfw3-product-test-overlay-validator-v1"
 ENGINE_PATH = Path("crates/mess-store/src/engine.rs")
-ENGINE_SHA256 = "c995c27d8fff3e1ddfffdb700dfc94160a99ea0c7fe731017d3f1db99d7b59e7"
+ENGINE_SHA256 = "fe559d6a5d973196023cb03988b75958e6dcbb35530718ddefb6d470c58b19f9"
 CORRECTNESS_CFG = "asterism_rebaseline_correctness"
 HERE = Path(__file__).resolve().parent
 REPOSITORY = HERE.parents[3]
@@ -28,87 +28,87 @@ PATCH_PATH = HERE / "product-test-overlay.patch"
 EXPECTED_TAIL_SHA256 = "b7b960944a39ae0274655a778884fca6ad1d477e7c5f84ad1a655971636a21b5"
 ALLOWED_RELEASE_LINE_REPLACEMENTS = {
     (
-        1348,
+        1364,
         "struct TestOwnerCohortGuard {",
         "pub struct TestOwnerCohortGuard {",
     ),
     (
-        1500,
+        1516,
         "struct FlatOwner {",
         "struct FlatOwner { #[cfg(not(test))]",
     ),
     (
-        1501,
+        1517,
         "    direct:                          DirectCommitter<RealRuntime, EngineFs>,",
         "    direct:                          DirectCommitter<RealRuntime, EngineFs>, #[cfg(test)] direct: DirectCommitter<RealRuntime, TestEngineFs>,",
     ),
     (
-        1511,
+        1527,
         "    cohort_gate:                     Arc<TestOwnerCohortGate>,",
         "    cohort_gate:                     Arc<TestOwnerCohortGate>, #[cfg(test)] test_hooks: Arc<TestEngineHooks>,",
     ),
     (
-        1798,
+        1814,
         "        let mut first_error: Option<EngineError> = None;",
         "        let mut first_error: Option<EngineError> = None; #[cfg(test)] let mut published = false;",
     ),
     (
-        1821,
+        1837,
         "                        );",
         "                        ); #[cfg(test)] { published = true; }",
     ),
     (
-        1894,
+        1910,
         "            );",
         "            ); #[cfg(test)] { published = true; }",
     ),
     (
-        1903,
+        1919,
         "        };",
         "        }; #[cfg(test)] if published { self.test_hooks.rendezvous(TestEngineHookPoint::PostPublicationPreCompletion); }",
     ),
     (
-        1992,
+        2008,
         "        );",
         "        ); #[cfg(test)] self.test_hooks.rendezvous(TestEngineHookPoint::PostPublicationPreCompletion);",
     ),
     (
-        2009,
+        2025,
         "            #[cfg(test)]",
         "            #[cfg(test)] self.test_hooks.rendezvous(TestEngineHookPoint::Admission); #[cfg(test)]",
     ),
     (
-        2116,
+        2132,
         "    rt:                   RealRuntime,",
         "    rt:                   RealRuntime, #[cfg(test)] test_hooks: Arc<TestEngineHooks>,",
     ),
     (
-        2193,
+        2209,
         "    fn drop(&mut self) {",
         "    fn drop(&mut self) { #[cfg(test)] self.test_hooks.disarm_all();",
     ),
     (
-        2550,
+        2566,
         "        let seg_path = segment_path(dir, active_seg_id);",
         "        let seg_path = segment_path(dir, active_seg_id); #[cfg(test)] let test_hooks = Arc::new(TestEngineHooks::default()); #[cfg(test)] let writer = test_segment_writer(&rt, plan, &seg_path, opts.segment_size, &test_hooks)?; #[cfg(not(test))]",
     ),
     (
-        2700,
+        2716,
         "            cohort_gate: Arc::clone(&owner_cohort_gate),",
         "            cohort_gate: Arc::clone(&owner_cohort_gate), #[cfg(test)] test_hooks: Arc::clone(&test_hooks),",
     ),
     (
-        2711,
+        2727,
         "                rt,",
         "                rt, #[cfg(test)] test_hooks,",
     ),
     (
-        4674,
+        4690,
         "#[cfg(all(test, not(miri)))]",
         "#[cfg(all(test, not(miri), not(asterism_rebaseline_correctness)))]",
     ),
     (
-        4677,
+        4693,
         "#[cfg(test)]",
         "#[cfg(all(test, not(asterism_rebaseline_correctness)))]",
     ),
@@ -153,7 +153,7 @@ def replace_once(text: str, old: str, new: str) -> str:
 
 def move_tail_hunk_first(patch_text: str) -> str:
     first_hunk = patch_text.index("@@ ")
-    tail_hunk = patch_text.index("@@ -4804,0 +4805,493 @@")
+    tail_hunk = patch_text.index("@@ -4820,0 +4821,493 @@")
     return (
         patch_text[:first_hunk]
         + patch_text[tail_hunk:]
@@ -794,8 +794,8 @@ def self_test(patch_text: str) -> list[str]:
             "inapplicable_context",
             replace_once(
                 patch_text,
-                "@@ -1347,3 +1347,3 @@",
-                "@@ -1348,3 +1347,3 @@",
+                "@@ -1363,3 +1363,3 @@",
+                "@@ -1364,3 +1363,3 @@",
             ),
             "compatibility",
         )
