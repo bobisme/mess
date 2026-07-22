@@ -827,7 +827,7 @@ _FORBIDDEN_RELEASE_HOOK_STRINGS = (
     "asterism_rebaseline_correctness",
 )
 _CURRENT_PRODUCT_OVERLAY_SHA256 = (
-    "db060c902d7d1a2664dcaea44525adac727b1bef1de32bb01b33be2561143a39"
+    "fe53ead58fce2ac411bf3d6f24b18920e1be38a14bfffcf8ea1e315e28dd40d9"
 )
 _AUTHORITY_FIELDS = frozenset(
     {

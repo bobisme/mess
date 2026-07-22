@@ -225,7 +225,7 @@ CURRENT_SHARED_NAMES = (
 CURRENT_CONSTRUCTION_SCHEMA = "bn-30fs-current-children-construction-v1"
 CURRENT_ENGINE_PATH = PurePosixPath("crates/mess-store/src/engine.rs")
 CURRENT_ENGINE_SHA256 = (
-    "c995c27d8fff3e1ddfffdb700dfc94160a99ea0c7fe731017d3f1db99d7b59e7"
+    "fe559d6a5d973196023cb03988b75958e6dcbb35530718ddefb6d470c58b19f9"
 )
 CURRENT_CHILD_PLACEHOLDER_BINDINGS = {
     "correctness": {

@@ -40,7 +40,7 @@ EXACT_PRODUCT_OVERLAY_REVIEWED_COMMIT = (
     "86027c98605d9ea01c3e385b0702741723d5a538"
 )
 EXACT_PRODUCT_OVERLAY_SHA256 = (
-    "db060c902d7d1a2664dcaea44525adac727b1bef1de32bb01b33be2561143a39"
+    "fe53ead58fce2ac411bf3d6f24b18920e1be38a14bfffcf8ea1e315e28dd40d9"
 )
 EXACT_CASES = (
     ("public-ordinary-append-command-cache-read-subscribe", "correctness"),
