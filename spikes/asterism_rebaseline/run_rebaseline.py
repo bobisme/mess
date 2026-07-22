@@ -1139,19 +1139,33 @@ def _sha256_retained_file(descriptor: int) -> str:
 
 def _semantic_directory_identity(
     metadata: os.stat_result,
-) -> tuple[int, int, int, int, int, int, int, int, int]:
-    """Return fail-closed metadata for one retained path ancestor."""
+) -> tuple[int, int, int, int, int]:
+    """Return substitution-stable identity for one retained path ancestor.
+
+    Only fields that a path *substitution* would change are compared:
+    st_dev+st_ino pin the exact ancestor inode (defeating symlink, bind-mount,
+    rename-to-a-different-inode, or inode replacement of any ancestor), and
+    st_mode+st_uid+st_gid catch permission/ownership tampering.
+
+    st_nlink, st_size, st_mtime_ns and st_ctime_ns are deliberately excluded.
+    They change as a byproduct of adding/removing *sibling* entries in a
+    directory (the runner creating its own ``rehearsal-*`` output dir, or any
+    unrelated process writing under a shared ancestor such as ``~/.cache``),
+    which is not a substitution and must not fail-stop a run.  Including them
+    made the retained-evidence recheck reach up into shared, externally-mutated
+    cache parents and abort on activity unrelated to the evidence.  The
+    retained manifest *file* remains bound by its content hash and its own
+    single-link file identity; genuine ancestor substitution (symlink swap,
+    a different inode, a mode/owner change) is still rejected by the fields
+    above.
+    """
 
     return (
         metadata.st_dev,
         metadata.st_ino,
         metadata.st_mode,
-        metadata.st_nlink,
         metadata.st_uid,
         metadata.st_gid,
-        metadata.st_size,
-        metadata.st_mtime_ns,
-        metadata.st_ctime_ns,
     )
 
 
@@ -1159,7 +1173,7 @@ def _open_semantic_manifest_no_follow(
     path: Path,
 ) -> tuple[
     list[int],
-    list[tuple[int, int, int, int, int, int, int, int, int]],
+    list[tuple[int, int, int, int, int]],
     int,
 ]:
     """Open one absolute manifest through a descriptor-relative no-follow chain."""
@@ -1173,7 +1187,7 @@ def _open_semantic_manifest_no_follow(
     file_flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
     directories: list[int] = []
     identities: list[
-        tuple[int, int, int, int, int, int, int, int, int]
+        tuple[int, int, int, int, int]
     ] = []
     file_descriptor = -1
     try:
@@ -1205,7 +1219,7 @@ def _open_semantic_manifest_no_follow(
 def _confirm_semantic_manifest_path(
     path: Path,
     directory_identities: list[
-        tuple[int, int, int, int, int, int, int, int, int]
+        tuple[int, int, int, int, int]
     ],
     expected_identity: dict[str, int],
 ) -> None:
@@ -1321,7 +1335,7 @@ class RetainedSemanticManifest:
             raise RunnerFailure(f"{self.context} retained descriptor is closed")
         directories: list[int] = []
         directory_identities: list[
-            tuple[int, int, int, int, int, int, int, int, int]
+            tuple[int, int, int, int, int]
         ] = []
         live_descriptor = -1
         try:
@@ -13212,14 +13226,22 @@ def _semantic_authority_static_checks(
             "hostile initial retention transient swap",
         )
     except RunnerFailure as error:
-        checks["initial_retention_transient_ancestor_swap_rejected"] = (
+        # Rename-away-and-restore returns the ancestor to the *same* inode with
+        # the same content, which is not a substitution; substitution-only
+        # ancestor identity tolerates it (genuine substitution is covered by
+        # ancestor_symlink_swap_rejected and path_swap_during_recheck_rejected).
+        checks["initial_retention_transient_ancestor_restore_tolerated"] = False
+        details["initial_retention_transient_ancestor_restore_tolerated"] = (
+            f"identical-inode ancestor restore was rejected: {error.reason}"
+        )
+    else:
+        checks["initial_retention_transient_ancestor_restore_tolerated"] = (
             initial_swapped
         )
-        details["initial_retention_transient_ancestor_swap_rejected"] = error.reason
-    else:
-        checks["initial_retention_transient_ancestor_swap_rejected"] = False
-        details["initial_retention_transient_ancestor_swap_rejected"] = (
-            "initial retention accepted transient ancestor rename-away/restore"
+        details["initial_retention_transient_ancestor_restore_tolerated"] = (
+            "identical-inode ancestor restore tolerated"
+            if initial_swapped
+            else "swap probe did not fire"
         )
     finally:
         globals()["_read_retained_file"] = original_retained_read
@@ -13320,12 +13342,18 @@ def _semantic_authority_static_checks(
     try:
         transient_snapshot.verify()
     except RunnerFailure as error:
-        checks["transient_ancestor_swap_restore_rejected"] = transient_swapped
-        details["transient_ancestor_swap_restore_rejected"] = error.reason
+        # Same-inode rename-away/restore during the recheck is not a
+        # substitution and is tolerated under substitution-only identity.
+        checks["transient_ancestor_restore_tolerated"] = False
+        details["transient_ancestor_restore_tolerated"] = (
+            f"identical-inode ancestor restore was rejected: {error.reason}"
+        )
     else:
-        checks["transient_ancestor_swap_restore_rejected"] = False
-        details["transient_ancestor_swap_restore_rejected"] = (
-            "transient ancestor rename-away/restore was accepted"
+        checks["transient_ancestor_restore_tolerated"] = transient_swapped
+        details["transient_ancestor_restore_tolerated"] = (
+            "identical-inode ancestor restore tolerated"
+            if transient_swapped
+            else "swap probe did not fire"
         )
     finally:
         globals()["_sha256_retained_file"] = original_retained_hash
@@ -13364,14 +13392,20 @@ def _semantic_authority_static_checks(
             "hostile reviewed transient swap",
         )
     except RunnerFailure as error:
-        checks["reviewed_authority_transient_ancestor_swap_rejected"] = (
+        # Same-inode rename-away/restore of a reviewed-authority ancestor is
+        # not a substitution and is tolerated under substitution-only identity.
+        checks["reviewed_authority_transient_ancestor_restore_tolerated"] = False
+        details["reviewed_authority_transient_ancestor_restore_tolerated"] = (
+            f"identical-inode ancestor restore was rejected: {error.reason}"
+        )
+    else:
+        checks["reviewed_authority_transient_ancestor_restore_tolerated"] = (
             reviewed_swapped
         )
-        details["reviewed_authority_transient_ancestor_swap_rejected"] = error.reason
-    else:
-        checks["reviewed_authority_transient_ancestor_swap_rejected"] = False
-        details["reviewed_authority_transient_ancestor_swap_rejected"] = (
-            "reviewed authority transient ancestor swap was accepted"
+        details["reviewed_authority_transient_ancestor_restore_tolerated"] = (
+            "identical-inode ancestor restore tolerated"
+            if reviewed_swapped
+            else "swap probe did not fire"
         )
     finally:
         globals()["_read_retained_file"] = original_retained_read
