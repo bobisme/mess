@@ -344,7 +344,7 @@ CURRENT_ADAPTER_DESTINATION = Path(
 )
 CURRENT_ENGINE_PATH = Path("crates/mess-store/src/engine.rs")
 CURRENT_PRODUCT_ENGINE_SHA256 = (
-    "fe559d6a5d973196023cb03988b75958e6dcbb35530718ddefb6d470c58b19f9"
+    "c995c27d8fff3e1ddfffdb700dfc94160a99ea0c7fe731017d3f1db99d7b59e7"
 )
 CURRENT_SHARED_DESTINATION = Path(
     "crates/mess-store/examples/asterism_rebaseline_shared"

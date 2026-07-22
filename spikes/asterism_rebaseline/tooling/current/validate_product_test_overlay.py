@@ -20,7 +20,7 @@ from typing import Mapping
 
 SCHEMA = "bn-xfw3-product-test-overlay-validator-v1"
 ENGINE_PATH = Path("crates/mess-store/src/engine.rs")
-ENGINE_SHA256 = "fe559d6a5d973196023cb03988b75958e6dcbb35530718ddefb6d470c58b19f9"
+ENGINE_SHA256 = "c995c27d8fff3e1ddfffdb700dfc94160a99ea0c7fe731017d3f1db99d7b59e7"
 CORRECTNESS_CFG = "asterism_rebaseline_correctness"
 HERE = Path(__file__).resolve().parent
 REPOSITORY = HERE.parents[3]
@@ -28,87 +28,122 @@ PATCH_PATH = HERE / "product-test-overlay.patch"
 EXPECTED_TAIL_SHA256 = "b7b960944a39ae0274655a778884fca6ad1d477e7c5f84ad1a655971636a21b5"
 ALLOWED_RELEASE_LINE_REPLACEMENTS = {
     (
-        1364,
+        1244,
+        "    armed:      Option<TestOwnerCohort>,",
+        "    armed:      Option<TestOwnerCohort>, admitted: usize,",
+    ),
+    (
+        1266,
+        "        state.armed = Some(TestOwnerCohort { expected, admitted: 0 });",
+        "        state.admitted = 0; state.armed = Some(TestOwnerCohort { expected, admitted: 0 });",
+    ),
+    (
+        1280,
+        "        self.ready.notify_all();",
+        "        state.admitted = state.admitted.saturating_add(1); self.ready.notify_all();",
+    ),
+    (
+        1301,
+        "                .armed",
+        "                .admitted",
+    ),
+    (
+        1302,
+        "                .as_ref()",
+        "                >=",
+    ),
+    (
+        1303,
+        "                .is_some_and(|cohort| cohort.admitted >= at_least),",
+        "                at_least,",
+    ),
+    (
+        1337,
+        "        let mut state = self.state.lock().expect(\"owner cohort gate lock\");",
+        "        let mut state = match self.state.lock() { Ok(guard) => guard, Err(poisoned) => poisoned.into_inner() };",
+    ),
+    (
+        1348,
         "struct TestOwnerCohortGuard {",
         "pub struct TestOwnerCohortGuard {",
     ),
     (
-        1516,
+        1500,
         "struct FlatOwner {",
         "struct FlatOwner { #[cfg(not(test))]",
     ),
     (
-        1517,
+        1501,
         "    direct:                          DirectCommitter<RealRuntime, EngineFs>,",
         "    direct:                          DirectCommitter<RealRuntime, EngineFs>, #[cfg(test)] direct: DirectCommitter<RealRuntime, TestEngineFs>,",
     ),
     (
-        1527,
+        1511,
         "    cohort_gate:                     Arc<TestOwnerCohortGate>,",
         "    cohort_gate:                     Arc<TestOwnerCohortGate>, #[cfg(test)] test_hooks: Arc<TestEngineHooks>,",
     ),
     (
-        1814,
+        1798,
         "        let mut first_error: Option<EngineError> = None;",
         "        let mut first_error: Option<EngineError> = None; #[cfg(test)] let mut published = false;",
     ),
     (
-        1837,
+        1821,
         "                        );",
         "                        ); #[cfg(test)] { published = true; }",
     ),
     (
-        1910,
+        1894,
         "            );",
         "            ); #[cfg(test)] { published = true; }",
     ),
     (
-        1919,
+        1903,
         "        };",
         "        }; #[cfg(test)] if published { self.test_hooks.rendezvous(TestEngineHookPoint::PostPublicationPreCompletion); }",
     ),
     (
-        2008,
+        1992,
         "        );",
         "        ); #[cfg(test)] self.test_hooks.rendezvous(TestEngineHookPoint::PostPublicationPreCompletion);",
     ),
     (
-        2025,
+        2009,
         "            #[cfg(test)]",
         "            #[cfg(test)] self.test_hooks.rendezvous(TestEngineHookPoint::Admission); #[cfg(test)]",
     ),
     (
-        2132,
+        2116,
         "    rt:                   RealRuntime,",
         "    rt:                   RealRuntime, #[cfg(test)] test_hooks: Arc<TestEngineHooks>,",
     ),
     (
-        2209,
+        2193,
         "    fn drop(&mut self) {",
         "    fn drop(&mut self) { #[cfg(test)] self.test_hooks.disarm_all();",
     ),
     (
-        2566,
+        2550,
         "        let seg_path = segment_path(dir, active_seg_id);",
         "        let seg_path = segment_path(dir, active_seg_id); #[cfg(test)] let test_hooks = Arc::new(TestEngineHooks::default()); #[cfg(test)] let writer = test_segment_writer(&rt, plan, &seg_path, opts.segment_size, &test_hooks)?; #[cfg(not(test))]",
     ),
     (
-        2716,
+        2700,
         "            cohort_gate: Arc::clone(&owner_cohort_gate),",
         "            cohort_gate: Arc::clone(&owner_cohort_gate), #[cfg(test)] test_hooks: Arc::clone(&test_hooks),",
     ),
     (
-        2727,
+        2711,
         "                rt,",
         "                rt, #[cfg(test)] test_hooks,",
     ),
     (
-        4690,
+        4674,
         "#[cfg(all(test, not(miri)))]",
         "#[cfg(all(test, not(miri), not(asterism_rebaseline_correctness)))]",
     ),
     (
-        4693,
+        4677,
         "#[cfg(test)]",
         "#[cfg(all(test, not(asterism_rebaseline_correctness)))]",
     ),
@@ -153,7 +188,7 @@ def replace_once(text: str, old: str, new: str) -> str:
 
 def move_tail_hunk_first(patch_text: str) -> str:
     first_hunk = patch_text.index("@@ ")
-    tail_hunk = patch_text.index("@@ -4820,0 +4821,493 @@")
+    tail_hunk = patch_text.index("@@ -4804,0 +4805,493 @@")
     return (
         patch_text[:first_hunk]
         + patch_text[tail_hunk:]
@@ -794,8 +829,8 @@ def self_test(patch_text: str) -> list[str]:
             "inapplicable_context",
             replace_once(
                 patch_text,
-                "@@ -1363,3 +1363,3 @@",
-                "@@ -1364,3 +1363,3 @@",
+                "@@ -1347,3 +1347,3 @@",
+                "@@ -1348,3 +1347,3 @@",
             ),
             "compatibility",
         )

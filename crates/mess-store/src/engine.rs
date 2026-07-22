@@ -1242,11 +1242,6 @@ type TestOwnerCohortMutex = Mutex<TestOwnerCohortState>;
 struct TestOwnerCohortState {
     generation: u64,
     armed:      Option<TestOwnerCohort>,
-    /// Admissions recorded for `generation`, retained after the cohort is
-    /// disarmed.  `wait_until_cohort_admitted` clears `armed` as its one-shot
-    /// success step, so a waiter woken by that very notification would
-    /// otherwise lose the evidence that its own admission had landed.
-    admitted:   usize,
 }
 
 #[cfg(test)]
@@ -1268,7 +1263,6 @@ impl TestOwnerCohortGate {
         assert!(state.armed.is_none(), "owner cohort gate already armed");
         state.generation = state.generation.wrapping_add(1);
         let generation = state.generation;
-        state.admitted = 0;
         state.armed = Some(TestOwnerCohort { expected, admitted: 0 });
         TestOwnerCohortGuard { gate: Arc::clone(self), generation }
     }
@@ -1283,7 +1277,6 @@ impl TestOwnerCohortGate {
             cohort.admitted <= cohort.expected,
             "more intents admitted than the armed test cohort"
         );
-        state.admitted = state.admitted.saturating_add(1);
         self.ready.notify_all();
     }
 
@@ -1296,20 +1289,18 @@ impl TestOwnerCohortGate {
                 .is_some_and(|cohort| at_least <= cohort.expected),
             "admission wait must target the armed cohort"
         );
-        // Wait on the generation's retained admission count rather than the
-        // armed cohort: `wait_until_cohort_admitted` disarms the cohort as its
-        // one-shot success step, and the waiter it wakes must still observe the
-        // admission that completed the cohort.  Abandonment (a disarm before
-        // `at_least` landed, or a re-arm) still fails the assertion below.
-        let generation = state.generation;
-        while state.generation == generation
-            && state.admitted < at_least
-            && state.armed.is_some()
+        while state
+            .armed
+            .as_ref()
+            .is_some_and(|cohort| cohort.admitted < at_least)
         {
             state = self.ready.wait(state).expect("owner cohort gate wait");
         }
         assert!(
-            state.generation == generation && state.admitted >= at_least,
+            state
+                .armed
+                .as_ref()
+                .is_some_and(|cohort| cohort.admitted >= at_least),
             "owner cohort was disarmed before the requested admission"
         );
     }
@@ -1343,14 +1334,7 @@ impl TestOwnerCohortGate {
     }
 
     fn disarm(&self, generation: u64) {
-        // Runs from `TestOwnerCohortGuard::drop`, including while unwinding a
-        // panic that poisoned this mutex.  Unwrapping a poisoned lock here
-        // would panic inside `Drop` and abort the process, destroying the
-        // original diagnostic, so recover the guard instead.
-        let mut state = match self.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut state = self.state.lock().expect("owner cohort gate lock");
         if state.generation == generation && state.armed.is_some() {
             state.armed = None;
             self.ready.notify_all();

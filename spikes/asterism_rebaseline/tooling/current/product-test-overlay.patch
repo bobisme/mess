@@ -2,74 +2,103 @@ diff --git a/crates/mess-store/src/engine.rs b/crates/mess-store/src/engine.rs
 index 5e03390..ee78104 100644
 --- a/crates/mess-store/src/engine.rs
 +++ b/crates/mess-store/src/engine.rs
-@@ -1363,3 +1363,3 @@
+@@ -1243,3 +1243,3 @@
+     generation: u64,
+-    armed:      Option<TestOwnerCohort>,
++    armed:      Option<TestOwnerCohort>, admitted: usize,
+ }
+@@ -1265,3 +1265,3 @@
+         let generation = state.generation;
+-        state.armed = Some(TestOwnerCohort { expected, admitted: 0 });
++        state.admitted = 0; state.armed = Some(TestOwnerCohort { expected, admitted: 0 });
+         TestOwnerCohortGuard { gate: Arc::clone(self), generation }
+@@ -1279,3 +1279,3 @@
+         );
+-        self.ready.notify_all();
++        state.admitted = state.admitted.saturating_add(1); self.ready.notify_all();
+     }
+@@ -1300,5 +1300,5 @@
+             state
+-                .armed
+-                .as_ref()
+-                .is_some_and(|cohort| cohort.admitted >= at_least),
++                .admitted
++                >=
++                at_least,
+             "owner cohort was disarmed before the requested admission"
+@@ -1336,3 +1336,3 @@
+     fn disarm(&self, generation: u64) {
+-        let mut state = self.state.lock().expect("owner cohort gate lock");
++        let mut state = match self.state.lock() { Ok(guard) => guard, Err(poisoned) => poisoned.into_inner() };
+         if state.generation == generation && state.armed.is_some() {
+@@ -1347,3 +1347,3 @@
  #[cfg(test)]
 -struct TestOwnerCohortGuard {
 +pub struct TestOwnerCohortGuard {
      gate:       Arc<TestOwnerCohortGate>,
-@@ -1516,3 +1516,3 @@
+@@ -1500,3 +1500,3 @@
 -struct FlatOwner {
 +struct FlatOwner { #[cfg(not(test))]
 -    direct:                          DirectCommitter<RealRuntime, EngineFs>,
 +    direct:                          DirectCommitter<RealRuntime, EngineFs>, #[cfg(test)] direct: DirectCommitter<RealRuntime, TestEngineFs>,
      publish:                         Arc<PublishState>,
-@@ -1527,2 +1527,2 @@
+@@ -1511,2 +1511,2 @@
 -    cohort_gate:                     Arc<TestOwnerCohortGate>,
 +    cohort_gate:                     Arc<TestOwnerCohortGate>, #[cfg(test)] test_hooks: Arc<TestEngineHooks>,
  }
-@@ -1814,2 +1814,2 @@
+@@ -1798,2 +1798,2 @@
 -        let mut first_error: Option<EngineError> = None;
 +        let mut first_error: Option<EngineError> = None; #[cfg(test)] let mut published = false;
          if let Some((first_version, count)) = reg_span {
-@@ -1837,2 +1837,2 @@
+@@ -1821,2 +1821,2 @@
 -                        );
 +                        ); #[cfg(test)] { published = true; }
                      }
-@@ -1910,2 +1910,2 @@
+@@ -1894,2 +1894,2 @@
 -            );
 +            ); #[cfg(test)] { published = true; }
              appended = Some(Appended {
-@@ -1919,2 +1919,2 @@
+@@ -1903,2 +1903,2 @@
 -        };
 +        }; #[cfg(test)] if published { self.test_hooks.rendezvous(TestEngineHookPoint::PostPublicationPreCompletion); }
          completion.finish(result);
-@@ -2008,2 +2008,2 @@
+@@ -1992,2 +1992,2 @@
 -        );
 +        ); #[cfg(test)] self.test_hooks.rendezvous(TestEngineHookPoint::PostPublicationPreCompletion);
          completion.finish(Ok(Appended {
-@@ -2025,2 +2025,2 @@
+@@ -2009,2 +2009,2 @@
 -            #[cfg(test)]
 +            #[cfg(test)] self.test_hooks.rendezvous(TestEngineHookPoint::Admission); #[cfg(test)]
              self.cohort_gate.wait_until_cohort_admitted();
-@@ -2132,2 +2132,2 @@
+@@ -2116,2 +2116,2 @@
 -    rt:                   RealRuntime,
 +    rt:                   RealRuntime, #[cfg(test)] test_hooks: Arc<TestEngineHooks>,
      /// The one flat-combined owner. Its thread owns the segment writer and
-@@ -2209,2 +2209,2 @@
+@@ -2193,2 +2193,2 @@
 -    fn drop(&mut self) {
 +    fn drop(&mut self) { #[cfg(test)] self.test_hooks.disarm_all();
          // Order is load-bearing (`bn-1vu`). 1) Close and join the owner: it
-@@ -2566,2 +2566,2 @@
+@@ -2550,2 +2550,2 @@
 -        let seg_path = segment_path(dir, active_seg_id);
 +        let seg_path = segment_path(dir, active_seg_id); #[cfg(test)] let test_hooks = Arc::new(TestEngineHooks::default()); #[cfg(test)] let writer = test_segment_writer(&rt, plan, &seg_path, opts.segment_size, &test_hooks)?; #[cfg(not(test))]
          let writer = match plan {
-@@ -2716,2 +2716,2 @@
+@@ -2700,2 +2700,2 @@
 -            cohort_gate: Arc::clone(&owner_cohort_gate),
 +            cohort_gate: Arc::clone(&owner_cohort_gate), #[cfg(test)] test_hooks: Arc::clone(&test_hooks),
          };
-@@ -2727,2 +2727,2 @@
+@@ -2711,2 +2711,2 @@
 -                rt,
 +                rt, #[cfg(test)] test_hooks,
                  owner: AppendOwner {
-@@ -4690,2 +4690,2 @@
+@@ -4674,2 +4674,2 @@
 -#[cfg(all(test, not(miri)))]
 +#[cfg(all(test, not(miri), not(asterism_rebaseline_correctness)))]
  mod append_gate_tests;
-@@ -4693,2 +4693,2 @@
+@@ -4677,2 +4677,2 @@
 -#[cfg(test)]
 +#[cfg(all(test, not(asterism_rebaseline_correctness)))]
  mod seal_skip_tests {
-@@ -4820,0 +4821,493 @@
+@@ -4804,0 +4805,493 @@
 +/// Exact one-shot append-engine phases exposed only to product tests.
 +#[cfg(test)]
 +#[derive(Debug, Clone, Copy, PartialEq, Eq)]
