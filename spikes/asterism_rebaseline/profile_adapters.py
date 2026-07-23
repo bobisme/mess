@@ -2619,11 +2619,28 @@ def _validate_release_compile_out_authority(
     ):
         raise ProfileEvidenceError("release proof contains a forbidden hook string")
 
+    # The nm tool is the live system linker tool (e.g. /usr/bin/nm), not a
+    # write-stripped pinned child binary, so its mode is whatever the
+    # preapproval authority recorded (0o555 is wrong for it; the system nm is
+    # 0o755).  evidence_schema.validate_preapproval_nm_authority binds the same
+    # mode to this preapproval record, so derive expected_mode from it here to
+    # keep the two validators from ever diverging (previously a stale 0o555).
+    preapproval_nm = _as_mapping(
+        preapproval.get("nm"), "preapproval nm authority"
+    )
+    preapproval_nm_identity = _as_mapping(
+        preapproval_nm.get("identity"), "preapproval nm authority identity"
+    )
+    preapproval_nm_mode = preapproval_nm_identity.get("mode")
+    if isinstance(preapproval_nm_mode, bool) or not isinstance(
+        preapproval_nm_mode, int
+    ):
+        raise ProfileEvidenceError("preapproval nm authority mode differs")
     nm = _exact_mapping(
         proof["nm"], ("tool", "ordinary_a", "overlay_a"), "release proof nm"
     )
     nm_tool = _release_file_snapshot(
-        nm["tool"], expected_mode=0o555, context="release proof nm tool"
+        nm["tool"], expected_mode=preapproval_nm_mode, context="release proof nm tool"
     )
     for name, inventory_payload in (
         ("ordinary_a", ordinary_inventory[1]),

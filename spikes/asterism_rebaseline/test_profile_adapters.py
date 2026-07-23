@@ -1104,6 +1104,10 @@ def live_authority(
     current_compile_out = {
         "binary_byte_identical": True,
         "forbidden_hook_strings": list(adapters._FORBIDDEN_RELEASE_HOOK_STRINGS),
+        # Preapproval nm authority: the mode of the (fake) system nm tool.  The
+        # release-proof nm-tool mode is validated against this preapproval mode,
+        # mirroring evidence_schema.validate_preapproval_nm_authority.
+        "nm": current_retained_file(nm_path, trusted=True),
         "overlay_release_sha256": "6" * 64,
         "pristine_sha256": "6" * 64,
         "symbol_absence_sha256": "7" * 64,
