@@ -3012,9 +3012,24 @@ def validate_profile_authority(
             ("path", "sha256", "executable_mode", "comm"),
             f"profile tool {name}",
         )
+        # prepare-build copies base tools into the pinned prepared root, so the
+        # source-approved tools manifest records each tool at its base-tools
+        # staging path while the runtime/prepared bindings use the prepared-root
+        # path.  The runner's own load_prepared reconciles this by matching the
+        # approved manifest on identity only (sha256, executable_mode, comm),
+        # NOT the relocatable path; do the same here.  The runtime tool binding
+        # is built from prepared.tools, so full equality with prepared_tools is
+        # still required (paths match there).
+        approved_tool = approved_tools.get(name)
         if (
-            tool != approved_tools.get(name)
-            or tool != prepared_tools.get(name)
+            tool != prepared_tools.get(name)
+            or not isinstance(approved_tool, dict)
+            or (tool["sha256"], tool["executable_mode"], tool["comm"])
+            != (
+                approved_tool.get("sha256"),
+                approved_tool.get("executable_mode"),
+                approved_tool.get("comm"),
+            )
             or tool["executable_mode"] != 0o555
         ):
             raise ProfileEvidenceError(f"profile tool {name} binding differs")

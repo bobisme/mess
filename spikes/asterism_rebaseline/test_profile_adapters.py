@@ -1844,7 +1844,15 @@ def live_authority(
                     "mode": 0o444,
                 }
             },
-            "tools": tools,
+            # Model the base->prepared relocation: prepare-build copies base
+            # tools into the prepared root, so the source-approved manifest
+            # records each tool at a *different* (base-tools) path with the same
+            # identity.  validate_profile_authority must match on identity, not
+            # path; a regression to path-equality fails here.
+            "tools": {
+                name: {**binding, "path": f"/source-approved/base-tools/{name}"}
+                for name, binding in tools.items()
+            },
         },
     }
     original_approval_path = bindings / "source-approval.json"
