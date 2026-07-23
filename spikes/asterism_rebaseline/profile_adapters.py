@@ -6772,24 +6772,41 @@ def validate_profile_authority(
         ("path",),
         "prepared single-use claim binding",
     )
-    claim_path, _claim_payload, prepared_claim = _unclaimed_local_canonical_json_snapshot(
-        claim_binding["path"], "prepared single-use claim"
-    )
+    # Protocol v4 (bn-2vih): the prepared root is read-only and reusable and no
+    # claim file is written under claims/.  The recorded v3 claim path is
+    # validated lexically only (to anchor the prepared root), and the live claim
+    # record is replayed from the run's own output directory
+    # (<output>/run-claim.json, written by claim_prepared before any child and
+    # re-verified by the runner every phase).  The prepared root itself is still
+    # content-hash grounded below, so a forged lexical path cannot pass.
+    claim_path_value = claim_binding["path"]
+    if not isinstance(claim_path_value, str):
+        raise ProfileEvidenceError("prepared single-use claim path is not text")
+    claim_path = Path(claim_path_value)
     if (
-        claim_path.name != "single-use-claim.json"
+        not claim_path.is_absolute()
+        or claim_path_value.startswith("//")
+        or ".." in claim_path.parts
+        or str(claim_path) != claim_path_value
+        or claim_path.name != "single-use-claim.json"
         or claim_path.parent.name != "claims"
     ):
         raise ProfileEvidenceError("prepared single-use claim path differs")
     prepared_root = claim_path.parent.parent
     try:
-        claim_directory_mode = stat.S_IMODE(claim_path.parent.stat().st_mode)
         prepared_root_mode = stat.S_IMODE(prepared_root.stat().st_mode)
     except OSError as error:
         raise ProfileEvidenceError(
-            f"cannot replay prepared root/claims modes: {error}"
+            f"cannot replay prepared root mode: {error}"
         ) from error
-    if claim_directory_mode != 0o700 or prepared_root_mode != 0o555:
-        raise ProfileEvidenceError("prepared root/claims mode authority differs")
+    if prepared_root_mode != 0o555:
+        raise ProfileEvidenceError("prepared root mode authority differs")
+    _run_claim_path, _run_claim_payload, prepared_claim = (
+        _unclaimed_local_canonical_json_snapshot(
+            str(attempt_prepared_path.with_name("run-claim.json")),
+            "run claim record",
+        )
+    )
     expected_claim_fields = (
         "schema",
         "protocol",
@@ -6802,7 +6819,7 @@ def validate_profile_authority(
         "claimed_monotonic_ns",
     )
     prepared_claim = _exact_mapping(
-        prepared_claim, expected_claim_fields, "prepared single-use claim"
+        prepared_claim, expected_claim_fields, "run claim record"
     )
     original_prepared_path = prepared_root / "prepared-artifacts.json"
     if (
@@ -6826,7 +6843,7 @@ def validate_profile_authority(
         or not isinstance(prepared_claim["claimed_monotonic_ns"], int)
         or prepared_claim["claimed_monotonic_ns"] <= 0
     ):
-        raise ProfileEvidenceError("prepared single-use claim authority differs")
+        raise ProfileEvidenceError("run claim record authority differs")
     (
         original_prepared_path,
         original_prepared_payload,

@@ -2037,8 +2037,11 @@ def live_authority(
         "claimed_at": "2026-07-16T00:00:00+00:00",
         "claimed_monotonic_ns": 1,
     }
-    write_canonical(claim_path, claim, 0o444)
-    claim_path.parent.chmod(0o700)
+    # Protocol v4: the claim record lives in the run's output directory
+    # (run-claim.json), not under the prepared root's claims/.  A v4-built
+    # prepared root still carries an empty read-only claims/ directory.
+    write_canonical(attempt_root / "run-claim.json", claim, 0o444)
+    claim_path.parent.mkdir(mode=0o700)
     bindings.chmod(0o555)
     artifacts.chmod(0o555)
     release_compile_out_path.parent.chmod(0o555)
@@ -2498,7 +2501,8 @@ class AuthorityMutationTests(unittest.TestCase):
         attempt_prepared = Path(str(self.authority["prepared_artifacts_path"]))
         attempt_approval = Path(str(self.authority["source_approval_path"]))
         prepared = json.loads(attempt_prepared.read_bytes())
-        claim = Path(str(prepared["single_use_claim"]["path"]))
+        # Protocol v4: the live claim is the run-local run-claim.json.
+        claim = attempt_prepared.parent / "run-claim.json"
         claim_value = json.loads(claim.read_bytes())
         original_prepared = Path(str(claim_value["prepared_artifacts_path"]))
         original = json.loads(original_prepared.read_bytes())
@@ -3941,6 +3945,15 @@ class AuthorityMutationTests(unittest.TestCase):
         claim["prepared_artifacts_path"] = str(paths["attempt_prepared"])
         paths["claim"].chmod(0o644)
         write_canonical(paths["claim"], claim, 0o444)
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            self.construct()
+
+    def test_missing_run_claim_record_fails(self) -> None:
+        # Protocol v4: the run-local claim record must exist; a missing
+        # run-claim.json cannot establish profile authority.
+        paths = self.authority_paths()
+        paths["claim"].chmod(0o644)
+        paths["claim"].unlink()
         with self.assertRaises(adapters.ProfileEvidenceError):
             self.construct()
 
