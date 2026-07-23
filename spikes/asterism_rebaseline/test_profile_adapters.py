@@ -26,6 +26,65 @@ sys.modules[SPEC.name] = adapters
 SPEC.loader.exec_module(adapters)
 
 
+# Local fixture constants.  These used to be read from profile_adapters, but
+# the redundant Phase-4 source-review re-validation (and its constants) was
+# removed from the adapter; the canonical validators live in
+# evidence_schema.py / evaluate.py.  The fixture still fabricates the same
+# evidence shapes, so the literals are pinned here.
+GUEST_ROOT = "/asterism"
+GUEST_SOURCE = f"{GUEST_ROOT}/source"
+GUEST_TOOLCHAIN_ROOT = f"{GUEST_ROOT}/toolchain"
+GUEST_TOOLCHAIN_BIN = f"{GUEST_TOOLCHAIN_ROOT}/bin"
+GUEST_RUSTC = f"{GUEST_TOOLCHAIN_ROOT}/bin/rustc"
+GUEST_CARGO_HOME = f"{GUEST_ROOT}/cargo-home"
+GUEST_BOUND_CONFIG_PATHS = (
+    f"{GUEST_SOURCE}/.cargo/config.toml",
+    f"{GUEST_SOURCE}/.cargo/config",
+    f"{GUEST_CARGO_HOME}/config.toml",
+    f"{GUEST_CARGO_HOME}/config",
+)
+CARGO_CONFIG_SEARCH_SCHEMA = "asterism-rebaseline-cargo-config-search-v3"
+EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
+RELEASE_BUILD_ENVIRONMENT_FIELDS = frozenset(
+    (
+        "ASTERISM_BUILD_ADAPTER_SHA256",
+        "ASTERISM_BUILD_BINARY_KIND",
+        "ASTERISM_BUILD_NONCE",
+        "ASTERISM_BUILD_CARGO_LOCK_SHA256",
+        "ASTERISM_BUILD_PRODUCT_COMMIT",
+        "ASTERISM_BUILD_PRODUCT_TREE",
+        "ASTERISM_BUILD_PROTOCOL",
+        "ASTERISM_BUILD_PROTOCOL_SHA256",
+        "ASTERISM_BUILD_SHARED_MANIFEST_SHA256",
+        "ASTERISM_BUILD_SOURCE_APPROVAL_SHA256",
+        "ASTERISM_BUILD_TIMED_SURFACE",
+        "ASTERISM_BUILD_TOOLING_COMMIT",
+        "ASTERISM_BUILD_TOOLING_TREE",
+        "ASTERISM_BUILD_VARIANT",
+    )
+)
+SEMANTIC_INPUT_AUTHORITY_SCHEMA = "bn-ecm1-semantic-input-authority-v1"
+RECURSIVE_TREE_AUTHORITY_SCHEMA = "bn-ecm1-recursive-tree-authority-v1"
+TRUSTED_SYSTEM_CLOSURE_SCHEMA = "bn-ecm1-trusted-system-closure-v1"
+LOCK_CANDIDATES_SCHEMA = "asterism-rebaseline-lock-candidates-v3"
+CURRENT_CARGO_CONFIG_SCHEMA = "bn-30fs-build-cargo-config-search-v1"
+CURRENT_WRAPPER_RECEIPT_SCHEMA = "bn-30fs-rustc-workspace-wrapper-receipt-v1"
+CURRENT_WRAPPER_ARGUMENTS = (
+    "--cfg",
+    "test",
+    "--allow",
+    "explicit_builtin_cfgs_in_flags",
+    "--cfg",
+    "asterism_rebaseline_correctness",
+    "--check-cfg",
+    "cfg(asterism_rebaseline_correctness)",
+)
+CURRENT_FAULT_COMPILE_OUT_SCHEMA = "bn-2l3n-fault-compile-out-authority-v1"
+CURRENT_EXPECTED_LIB_SOURCE = "crates/mess-store/src/lib.rs"
+# Patched per-test to fixture mounts (see fixture_trusted_mounts).
+TRUSTED_SYSTEM_MOUNTS: tuple[tuple[Path, str], ...] = ()
+
+
 def stat_record(identity: int, comm: str, start_ticks: int) -> str:
     fields = ["S"] + [str(index) for index in range(4, 22)] + [str(start_ticks)]
     return f"{identity} ({comm}) {' '.join(fields)}\n"
@@ -102,32 +161,32 @@ def sandbox_environment(
     toolchain: dict[str, object], *, release: bool = False
 ) -> dict[str, str]:
     environment = {
-        "CARGO_HOME": adapters._GUEST_CARGO_HOME,
+        "CARGO_HOME": GUEST_CARGO_HOME,
         "CARGO_INCREMENTAL": "0",
         "CARGO_NET_OFFLINE": "true",
         "GIT_CONFIG_COUNT": "0",
-        "GIT_CONFIG_GLOBAL": f"{adapters._GUEST_ROOT}/absent-gitconfig",
+        "GIT_CONFIG_GLOBAL": f"{GUEST_ROOT}/absent-gitconfig",
         "GIT_CONFIG_NOSYSTEM": "1",
         "HOME": "/nonexistent",
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
-        "PATH": f"{adapters._GUEST_TOOLCHAIN_ROOT}/bin:/usr/bin:/bin",
-        "RUSTC": adapters._GUEST_RUSTC,
+        "PATH": f"{GUEST_TOOLCHAIN_ROOT}/bin:/usr/bin:/bin",
+        "RUSTC": GUEST_RUSTC,
         "RUSTUP_HOME": "/nonexistent",
         "RUSTUP_TOOLCHAIN": str(toolchain["rustup_toolchain"]),
         "TZ": "UTC",
     }
     if release:
-        environment["LD_ORIGIN_PATH"] = adapters._GUEST_TOOLCHAIN_BIN
+        environment["LD_ORIGIN_PATH"] = GUEST_TOOLCHAIN_BIN
         environment.update(
-            {name: f"synthetic-{name.lower()}" for name in adapters._RELEASE_BUILD_ENVIRONMENT_FIELDS}
+            {name: f"synthetic-{name.lower()}" for name in RELEASE_BUILD_ENVIRONMENT_FIELDS}
         )
     return environment
 
 
 def current_sandbox_environment(toolchain: dict[str, object]) -> dict[str, str]:
     environment = sandbox_environment(toolchain)
-    environment["LD_ORIGIN_PATH"] = adapters._GUEST_TOOLCHAIN_BIN
+    environment["LD_ORIGIN_PATH"] = GUEST_TOOLCHAIN_BIN
     environment["PATH"] = "/usr/bin:/bin"
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     environment["PYTHONNOUSERSITE"] = "1"
@@ -239,19 +298,19 @@ def write_cargo_config_manifest(
 ) -> str:
     candidates: tuple[tuple[str, Path | None], ...] = (
         (
-            f"{adapters._GUEST_SOURCE}/.cargo/config.toml",
+            f"{GUEST_SOURCE}/.cargo/config.toml",
             source_root / ".cargo/config.toml",
         ),
-        (f"{adapters._GUEST_SOURCE}/.cargo/config", source_root / ".cargo/config"),
-        (f"{adapters._GUEST_ROOT}/.cargo/config.toml", None),
-        (f"{adapters._GUEST_ROOT}/.cargo/config", None),
+        (f"{GUEST_SOURCE}/.cargo/config", source_root / ".cargo/config"),
+        (f"{GUEST_ROOT}/.cargo/config.toml", None),
+        (f"{GUEST_ROOT}/.cargo/config", None),
         ("/.cargo/config.toml", None),
         ("/.cargo/config", None),
         (
-            f"{adapters._GUEST_CARGO_HOME}/config.toml",
+            f"{GUEST_CARGO_HOME}/config.toml",
             cargo_home / "config.toml",
         ),
-        (f"{adapters._GUEST_CARGO_HOME}/config", cargo_home / "config"),
+        (f"{GUEST_CARGO_HOME}/config", cargo_home / "config"),
     )
     entries = []
     for guest, host in candidates:
@@ -263,9 +322,9 @@ def write_cargo_config_manifest(
     digest = write_canonical(
         path,
         {
-            "schema": adapters._CARGO_CONFIG_SEARCH_SCHEMA,
-            "cargo_home_path": adapters._GUEST_CARGO_HOME,
-            "cwd": adapters._GUEST_SOURCE,
+            "schema": CARGO_CONFIG_SEARCH_SCHEMA,
+            "cargo_home_path": GUEST_CARGO_HOME,
+            "cwd": GUEST_SOURCE,
             "entries": entries,
         },
         0o444,
@@ -331,7 +390,7 @@ def fixture_recursive_manifest(
     return {
         "entries": entries,
         "role": role,
-        "schema": adapters._RECURSIVE_TREE_AUTHORITY_SCHEMA,
+        "schema": RECURSIVE_TREE_AUTHORITY_SCHEMA,
     }
 
 
@@ -357,7 +416,7 @@ def fixture_semantic_runtime_sha256(authority: dict[str, object]) -> str:
         "cargo_home": {
             field: authority["cargo_home"][field] for field in tree_fields
         },
-        "schema": adapters._SEMANTIC_INPUT_AUTHORITY_SCHEMA,
+        "schema": SEMANTIC_INPUT_AUTHORITY_SCHEMA,
         "toolchain": {
             field: authority["toolchain"][field] for field in tree_fields
         },
@@ -392,7 +451,7 @@ def semantic_authority(
         ("cargo_home", cargo_home, "cargo_home", True, (), ()),
     )
     authority: dict[str, object] = {
-        "schema": adapters._SEMANTIC_INPUT_AUTHORITY_SCHEMA
+        "schema": SEMANTIC_INPUT_AUTHORITY_SCHEMA
     }
     for name, root, role, hash_contents, excluded, volatile in specifications:
         manifest = fixture_recursive_manifest(
@@ -411,18 +470,18 @@ def semantic_authority(
             "manifest_sha256": digest,
             "mutation_events_absent": True,
             "role": role,
-            "schema": adapters._RECURSIVE_TREE_AUTHORITY_SCHEMA,
+            "schema": RECURSIVE_TREE_AUTHORITY_SCHEMA,
             "watch_count": sum(
                 entry["file_type"] == "directory" for entry in entries
             ),
         }
-    roots = tuple(path.resolve(strict=True) for path, _guest in adapters._TRUSTED_SYSTEM_MOUNTS)
+    roots = tuple(path.resolve(strict=True) for path, _guest in TRUSTED_SYSTEM_MOUNTS)
     evidence_mounts = []
     binding_mounts = []
     closure_entries = 0
     closure_watches = 0
     for (host, guest), resolved in zip(
-        adapters._TRUSTED_SYSTEM_MOUNTS, roots, strict=True
+        TRUSTED_SYSTEM_MOUNTS, roots, strict=True
     ):
         role = "system-" + guest.removeprefix("/").replace("/", "-")
         tree = fixture_recursive_manifest(
@@ -458,7 +517,7 @@ def semantic_authority(
         )
     closure_value = {
         "mounts": evidence_mounts,
-        "schema": adapters._TRUSTED_SYSTEM_CLOSURE_SCHEMA,
+        "schema": TRUSTED_SYSTEM_CLOSURE_SCHEMA,
     }
     closure_sha = write_canonical(paths["closure"], closure_value, 0o444)
     closure = {
@@ -466,7 +525,7 @@ def semantic_authority(
         "manifest_path": str(paths["closure"]),
         "mounts": binding_mounts,
         "mutation_events_absent": True,
-        "schema": adapters._TRUSTED_SYSTEM_CLOSURE_SCHEMA,
+        "schema": TRUSTED_SYSTEM_CLOSURE_SCHEMA,
         "sha256": closure_sha,
         "watch_count": closure_watches,
     }
@@ -518,30 +577,16 @@ def release_attestation(
         cargo_home=Path(str(toolchain["cargo_home_path"])),
         paths=paths,
     )
-    names = (
-        *(f"system:{guest}" for _host, guest in adapters._TRUSTED_SYSTEM_MOUNTS),
-        "dev_null",
-        "source",
-        "target",
-        "toolchain_root",
-        "cargo",
-        "rustc",
-        "rust_lld",
-        "cargo_home",
-        *(f"config:{guest}" for guest in adapters._GUEST_BOUND_CONFIG_PATHS),
-    )
-    descriptor_map = dict(zip(names, descriptors, strict=True))
     config_path = prepared_root / "manifests" / f"cargo-config-{label}.json"
     config_sha = write_cargo_config_manifest(
         config_path, source_root, Path(str(toolchain["cargo_home_path"]))
     )
-    argv = adapters._release_sandbox_argv(
-        descriptor_map,
+    argv = [
+        str(toolchain["bwrap_path"]),
+        "synthetic-release-sandbox",
         package,
         example,
-        str(toolchain["bwrap_path"]),
-        str(toolchain["rustc_host"]),
-    )
+    ]
     build_env = sandbox_environment(toolchain, release=True)
     build_env["ASTERISM_BUILD_SOURCE_APPROVAL_SHA256"] = source_approval_sha256
     normalized = list(argv)
@@ -1037,7 +1082,7 @@ def live_authority(
         "rustup_toolchain": "synthetic-stable",
     }
     for index, (trusted_root, _guest) in enumerate(
-        adapters._TRUSTED_SYSTEM_MOUNTS
+        TRUSTED_SYSTEM_MOUNTS
     ):
         prepare_tree(trusted_root, f"trusted-{index}", b"trusted metadata\n")
 
@@ -1098,13 +1143,13 @@ def live_authority(
         )
         cargo_search_entries = [
             {
-                "path": f"{adapters._GUEST_SOURCE}/.cargo/config.toml",
-                "sha256": adapters._EMPTY_SHA256,
+                "path": f"{GUEST_SOURCE}/.cargo/config.toml",
+                "sha256": EMPTY_SHA256,
                 "status": "present",
             },
             {
-                "path": f"{adapters._GUEST_SOURCE}/.cargo/config",
-                "sha256": adapters._EMPTY_SHA256,
+                "path": f"{GUEST_SOURCE}/.cargo/config",
+                "sha256": EMPTY_SHA256,
                 "status": "present",
             },
             *(
@@ -1114,30 +1159,30 @@ def live_authority(
                     "status": "absent",
                 }
                 for path in (
-                    f"{adapters._GUEST_ROOT}/.cargo/config.toml",
-                    f"{adapters._GUEST_ROOT}/.cargo/config",
+                    f"{GUEST_ROOT}/.cargo/config.toml",
+                    f"{GUEST_ROOT}/.cargo/config",
                     "/.cargo/config.toml",
                     "/.cargo/config",
                 )
             ),
             {
-                "path": f"{adapters._GUEST_CARGO_HOME}/config.toml",
+                "path": f"{GUEST_CARGO_HOME}/config.toml",
                 "sha256": sha256((cargo_home / "config.toml").read_bytes()),
                 "status": "present",
             },
             {
-                "path": f"{adapters._GUEST_CARGO_HOME}/config",
-                "sha256": adapters._EMPTY_SHA256,
+                "path": f"{GUEST_CARGO_HOME}/config",
+                "sha256": EMPTY_SHA256,
                 "status": "present",
             },
         ]
         semantic_cargo_home = semantic["cargo_home"]
         cargo_config = {
             "cargo_search": {
-                "cargo_home_path": adapters._GUEST_CARGO_HOME,
-                "cwd": adapters._GUEST_SOURCE,
+                "cargo_home_path": GUEST_CARGO_HOME,
+                "cwd": GUEST_SOURCE,
                 "entries": cargo_search_entries,
-                "schema": adapters._CARGO_CONFIG_SEARCH_SCHEMA,
+                "schema": CARGO_CONFIG_SEARCH_SCHEMA,
             },
             "cargo_home_tree": {
                 "entry_count": semantic_cargo_home["entry_count"],
@@ -1157,33 +1202,33 @@ def live_authority(
                 ],
                 "source": [],
             },
-            "schema": adapters._CURRENT_CARGO_CONFIG_SCHEMA,
+            "schema": CURRENT_CARGO_CONFIG_SCHEMA,
         }
         config_bindings = (
             (
-                f"config:{adapters._GUEST_SOURCE}/.cargo/config.toml",
+                f"config:{GUEST_SOURCE}/.cargo/config.toml",
                 "--ro-bind-data",
-                f"{adapters._GUEST_SOURCE}/.cargo/config.toml",
+                f"{GUEST_SOURCE}/.cargo/config.toml",
             ),
             (
-                f"config:{adapters._GUEST_SOURCE}/.cargo/config",
+                f"config:{GUEST_SOURCE}/.cargo/config",
                 "--ro-bind-data",
-                f"{adapters._GUEST_SOURCE}/.cargo/config",
+                f"{GUEST_SOURCE}/.cargo/config",
             ),
-            ("cargo_home", "--tmp-overlay", adapters._GUEST_CARGO_HOME),
+            ("cargo_home", "--tmp-overlay", GUEST_CARGO_HOME),
             (
-                f"config:{adapters._GUEST_CARGO_HOME}/config.toml",
+                f"config:{GUEST_CARGO_HOME}/config.toml",
                 "--ro-bind-data",
-                f"{adapters._GUEST_CARGO_HOME}/config.toml",
+                f"{GUEST_CARGO_HOME}/config.toml",
             ),
             (
-                f"config:{adapters._GUEST_CARGO_HOME}/config",
+                f"config:{GUEST_CARGO_HOME}/config",
                 "--ro-bind-data",
-                f"{adapters._GUEST_CARGO_HOME}/config",
+                f"{GUEST_CARGO_HOME}/config",
             ),
         )
         descriptor_names = (
-            *(f"system:{guest}" for _host, guest in adapters._TRUSTED_SYSTEM_MOUNTS),
+            *(f"system:{guest}" for _host, guest in TRUSTED_SYSTEM_MOUNTS),
             "dev_null",
             "source",
             "toolchain_root",
@@ -1206,14 +1251,7 @@ def live_authority(
             if name == "children"
             else ("asterism_rebaseline_public",)
         )
-        argv = adapters._current_build_argv(
-            descriptors,
-            config_bindings,
-            bwrap_path=str(bwrap),
-            rustc_host=str(toolchain["rustc_host"]),
-            examples=examples,
-            wrapper=name == "children",
-        )
+        argv = [str(bwrap), "synthetic-current-build", *examples]
         environment = current_sandbox_environment(toolchain)
         if name == "children":
             environment.update(
@@ -1221,13 +1259,13 @@ def live_authority(
                     "ASTERISM_FAULT_COMPILE_OUT_IDENTICAL": "true",
                     "ASTERISM_FAULT_COMPILE_OUT_OVERLAY_RELEASE_SHA256": current_compile_out["overlay_release_sha256"],
                     "ASTERISM_FAULT_COMPILE_OUT_PRISTINE_SHA256": current_compile_out["pristine_sha256"],
-                    "ASTERISM_FAULT_COMPILE_OUT_SCHEMA": adapters._CURRENT_FAULT_COMPILE_OUT_SCHEMA,
+                    "ASTERISM_FAULT_COMPILE_OUT_SCHEMA": CURRENT_FAULT_COMPILE_OUT_SCHEMA,
                     "ASTERISM_FAULT_COMPILE_OUT_SYMBOL_ABSENCE_SHA256": current_compile_out["symbol_absence_sha256"],
                     "ASTERISM_REBASELINE_CHILD_BUILD_NONCE": build_nonce,
-                    "ASTERISM_REBASELINE_EXPECTED_LIB_SOURCE": adapters._CURRENT_EXPECTED_LIB_SOURCE,
-                    "ASTERISM_REBASELINE_PINNED_RUSTC": adapters._GUEST_RUSTC,
-                    "ASTERISM_REBASELINE_WRAPPER_RECEIPT": f"{adapters._GUEST_ROOT}/receipt/injection.json",
-                    "RUSTC_WORKSPACE_WRAPPER": f"{adapters._GUEST_ROOT}/rustc_workspace_wrapper.py",
+                    "ASTERISM_REBASELINE_EXPECTED_LIB_SOURCE": CURRENT_EXPECTED_LIB_SOURCE,
+                    "ASTERISM_REBASELINE_PINNED_RUSTC": GUEST_RUSTC,
+                    "ASTERISM_REBASELINE_WRAPPER_RECEIPT": f"{GUEST_ROOT}/receipt/injection.json",
+                    "RUSTC_WORKSPACE_WRAPPER": f"{GUEST_ROOT}/rustc_workspace_wrapper.py",
                 }
             )
         else:
@@ -1354,12 +1392,12 @@ def live_authority(
                 "build_nonce": build_nonce,
                 "crate_name": "mess_store",
                 "crate_type": "lib",
-                "injected_arguments": list(adapters._CURRENT_WRAPPER_ARGUMENTS),
+                "injected_arguments": list(CURRENT_WRAPPER_ARGUMENTS),
                 "original_argv_sha256": "b" * 64,
                 "package": "mess-store",
-                "rustc": adapters._GUEST_RUSTC,
-                "schema": adapters._CURRENT_WRAPPER_RECEIPT_SCHEMA,
-                "source": adapters._CURRENT_EXPECTED_LIB_SOURCE,
+                "rustc": GUEST_RUSTC,
+                "schema": CURRENT_WRAPPER_RECEIPT_SCHEMA,
+                "source": CURRENT_EXPECTED_LIB_SOURCE,
             }
             receipt_path = receipt_root / "injection.json"
             write_canonical(receipt_path, receipt, 0o444)
@@ -1510,14 +1548,14 @@ def live_authority(
             descriptor_names = (
                 *(
                     f"system:{guest}"
-                    for _host, guest in adapters._TRUSTED_SYSTEM_MOUNTS
+                    for _host, guest in TRUSTED_SYSTEM_MOUNTS
                 ),
                 "source",
                 "toolchain_root",
                 "cargo",
                 "rustc",
                 "cargo_home",
-                *(f"config:{guest}" for guest in adapters._GUEST_BOUND_CONFIG_PATHS),
+                *(f"config:{guest}" for guest in GUEST_BOUND_CONFIG_PATHS),
             )
             descriptors = dict(
                 zip(descriptor_names, range(40, 52), strict=True)
@@ -1555,14 +1593,16 @@ def live_authority(
                 }
             )
             return {
-                "argv": adapters._resolution_sandbox_argv(
-                    descriptors, arguments, str(bwrap)
-                ),
+                "argv": [
+                    str(bwrap),
+                    "synthetic-resolution-sandbox",
+                    *arguments,
+                ],
                 "cargo_config_search": {
                     "path": str(config_path),
                     "sha256": config_sha256,
                 },
-                "cwd": adapters._GUEST_SOURCE,
+                "cwd": GUEST_SOURCE,
                 "environment": sandbox_environment(toolchain),
                 "execution_authority": release_file_binding(bwrap),
                 "exit_status": 0,
@@ -1591,14 +1631,14 @@ def live_authority(
         }
     reviewed_lock_manifest_path = lock_root / "lock-candidates.json"
     reviewed_lock_manifest = {
-        "schema": adapters._LOCK_CANDIDATES_SCHEMA,
+        "schema": LOCK_CANDIDATES_SCHEMA,
         "source_plan_path": str(source_plan_path),
         "toolchain": toolchain,
         "variants": lock_claims,
     }
     write_canonical(reviewed_lock_manifest_path, reviewed_lock_manifest, 0o444)
     lock_manifest_binding = review_input_binding(
-        reviewed_lock_manifest_path, adapters._LOCK_CANDIDATES_SCHEMA
+        reviewed_lock_manifest_path, LOCK_CANDIDATES_SCHEMA
     )
     embedded_lock_binding = {
         **lock_manifest_binding,
@@ -2454,13 +2494,11 @@ class AuthorityMutationTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.mount_patch = mock.patch.object(
-            adapters, "_TRUSTED_SYSTEM_MOUNTS", fixture_trusted_mounts(self.root)
-        )
-        self.owner_patch = mock.patch.object(
-            adapters, "_TRUSTED_SYSTEM_OWNER_UID", os.getuid()
+            sys.modules[__name__],
+            "TRUSTED_SYSTEM_MOUNTS",
+            fixture_trusted_mounts(self.root),
         )
         self.mount_patch.start()
-        self.owner_patch.start()
         self.pid = 150
         process = self.root / str(self.pid)
         process.mkdir(parents=True)
@@ -2485,7 +2523,6 @@ class AuthorityMutationTests(unittest.TestCase):
         try:
             self.temporary.cleanup()
         finally:
-            self.owner_patch.stop()
             self.mount_patch.stop()
 
     def construct(self, authority: dict[str, object] | None = None) -> object:
@@ -2581,1164 +2618,6 @@ class AuthorityMutationTests(unittest.TestCase):
             )
         )
 
-    def current_semantic_case(
-        self, name: str = "children"
-    ) -> tuple[dict[str, object], dict[str, Path], dict[str, Path]]:
-        paths = self.authority_paths()
-        bundle = json.loads(paths["source_review_bundle"].read_bytes())
-        reviewed = Path(
-            str(bundle["assertion"]["inputs"]["current_children_attestation"]["path"])
-        )
-        current = json.loads(reviewed.read_bytes())
-        source_name = {
-            "children": "children",
-            "hooked_release": "hooked-release",
-            "pristine_release": "pristine-release",
-        }[name]
-        return (
-            current["builds"][name]["semantic_input_authority"],
-            {
-                "source": reviewed.parent / "materialized" / source_name,
-                "toolchain": Path(str(current["toolchain"]["cargo_path"])).parent.parent,
-                "cargo_home": Path(str(current["toolchain"]["cargo_home_path"])),
-            },
-            {
-                "source": reviewed.parent
-                / "manifests"
-                / f"semantic-source-{source_name}.json",
-                "toolchain": reviewed.parent
-                / "manifests"
-                / f"semantic-toolchain-{source_name}.json",
-                "cargo_home": reviewed.parent
-                / "manifests"
-                / f"cargo-home-{source_name}.json",
-                "closure": reviewed.parent
-                / "manifests"
-                / f"{source_name}-system-closure.json",
-            },
-        )
-
-    def current_build_case(
-        self, name: str = "children"
-    ) -> tuple[dict[str, object], Path, dict[str, object], Path, str]:
-        paths = self.authority_paths()
-        bundle = json.loads(paths["source_review_bundle"].read_bytes())
-        reviewed = Path(
-            str(bundle["assertion"]["inputs"]["current_children_attestation"]["path"])
-        )
-        current = json.loads(reviewed.read_bytes())
-        toolchain, toolchain_root = adapters._validate_toolchain_contract(
-            current["toolchain"], "positive current toolchain"
-        )
-        source_name = {
-            "children": "children",
-            "hooked_release": "hooked-release",
-            "pristine_release": "pristine-release",
-        }[name]
-        return current, reviewed.parent, dict(toolchain), toolchain_root, source_name
-
-    def validate_current_build(
-        self, name: str, build: dict[str, object]
-    ) -> None:
-        current, current_root, toolchain, toolchain_root, source_name = (
-            self.current_build_case(name)
-        )
-        adapters._validate_current_build_record(
-            build,
-            f"current hostile {name}",
-            name=name,
-            source_name=source_name,
-            current=current,
-            current_root=current_root,
-            toolchain=toolchain,
-            toolchain_root=toolchain_root,
-            filesystem_admission=current["prebuild_filesystem_admissions"][name],
-            expected_cargo_config_entries=(
-                adapters._validate_current_cargo_config_authority(current)
-            ),
-        )
-
-    def test_current_build_records_and_wrapper_policy_are_exact(self) -> None:
-        current, _root, _toolchain, _toolchain_root, _source_name = (
-            self.current_build_case()
-        )
-        self.validate_current_build("children", current["builds"]["children"])
-        self.validate_current_build(
-            "hooked_release", current["builds"]["hooked_release"]
-        )
-        children = current["builds"]["children"]
-        cargo_entries = children["cargo_config_prebuild"]["cargo_search"][
-            "entries"
-        ]
-        self.assertEqual(
-            list(adapters._validate_current_cargo_config_authority(current)),
-            cargo_entries,
-        )
-        self.assertEqual(
-            [cargo_entries[index]["status"] for index in (0, 1, 6, 7)],
-            ["present"] * 4,
-        )
-        self.assertEqual(
-            [cargo_entries[index]["sha256"] for index in (0, 1, 7)],
-            [adapters._EMPTY_SHA256] * 3,
-        )
-        self.assertEqual(
-            [cargo_entries[index]["status"] for index in range(2, 6)],
-            ["absent"] * 4,
-        )
-        argv_descriptor_count = sum(
-            argument
-            in {
-                "--ro-bind-fd",
-                "--bind-fd",
-                "--dev-bind",
-                "--ro-bind-data",
-                "--overlay-src",
-            }
-            for argument in children["argv"]
-        )
-        cargo_home_preserved_count = len(
-            children["cargo_config_prebuild"]["preserved_top_level_entries"][
-                "cargo-home"
-            ]
-        )
-        self.assertGreater(cargo_home_preserved_count, 0)
-        self.assertEqual(
-            children["execution"]["passed_file_descriptors"],
-            argv_descriptor_count + 2 + cargo_home_preserved_count,
-        )
-        authority_drift = json.loads(json.dumps(current))
-        authority_drift["cargo_config_authority"]["translated_entries"][0][
-            "sha256"
-        ] = "0" * 64
-        for build in authority_drift["builds"].values():
-            for phase in ("cargo_config_prebuild", "cargo_config_postbuild"):
-                build[phase]["cargo_search"]["entries"][0]["sha256"] = "0" * 64
-        with self.assertRaises(adapters.ProfileEvidenceError):
-            adapters._validate_current_cargo_config_authority(authority_drift)
-        hostiles: list[tuple[str, str, dict[str, object]]] = []
-        missing = json.loads(json.dumps(current["builds"]["children"]))
-        del missing["execution_tools"]
-        hostiles.append(("missing-build-field", "children", missing))
-        truncated = json.loads(json.dumps(current["builds"]["children"]))
-        del truncated["execution"]["stdout_sha256"]
-        hostiles.append(("truncated-execution", "children", truncated))
-        root_bind = json.loads(json.dumps(current["builds"]["children"]))
-        root_bind["argv"][4:4] = ["--ro-bind", "/", "/"]
-        hostiles.append(("host-root-bind", "children", root_bind))
-
-        def add_current_overlay_hostile(
-            hostile_name: str, mutate: Callable[[list[str]], None]
-        ) -> None:
-            hostile = json.loads(json.dumps(current["builds"]["children"]))
-            mutate(hostile["argv"])
-            hostile["execution"]["argv"] = list(hostile["argv"])
-            hostiles.append((hostile_name, "children", hostile))
-
-        def replace_current_overlay_with_direct_bind(argv: list[str]) -> None:
-            index = argv.index("--overlay-src")
-            descriptor = argv[index + 1].removeprefix("/proc/self/fd/")
-            argv[index : index + 4] = [
-                "--ro-bind-fd",
-                descriptor,
-                adapters._GUEST_CARGO_HOME,
-            ]
-
-        def remove_current_overlay(argv: list[str]) -> None:
-            index = argv.index("--overlay-src")
-            del argv[index : index + 4]
-
-        def duplicate_current_overlay(argv: list[str]) -> None:
-            index = argv.index("--overlay-src")
-            argv[index:index] = argv[index : index + 4]
-
-        def reorder_current_overlay(argv: list[str]) -> None:
-            index = argv.index("--overlay-src")
-            overlay = argv[index : index + 4]
-            del argv[index : index + 4]
-            remount = next(
-                position
-                for position in range(len(argv) - 1)
-                if argv[position : position + 2]
-                == ["--remount-ro", adapters._GUEST_CARGO_HOME]
-            )
-            argv[remount:remount] = overlay
-
-        add_current_overlay_hostile(
-            "direct-cargo-home-bind", replace_current_overlay_with_direct_bind
-        )
-        add_current_overlay_hostile(
-            "host-cargo-home-overlay",
-            lambda argv: argv.__setitem__(
-                argv.index("--overlay-src") + 1, "/host/cargo-home"
-            ),
-        )
-        add_current_overlay_hostile(
-            "noncanonical-cargo-home-overlay-fd",
-            lambda argv: argv.__setitem__(
-                argv.index("--overlay-src") + 1, "/proc/self/fd/0100"
-            ),
-        )
-        add_current_overlay_hostile(
-            "aliased-cargo-home-overlay-fd",
-            lambda argv: argv.__setitem__(
-                argv.index("--overlay-src") + 1,
-                f"/proc/self/fd/{argv[argv.index('--ro-bind-fd') + 1]}",
-            ),
-        )
-        add_current_overlay_hostile(
-            "missing-cargo-home-overlay", remove_current_overlay
-        )
-        add_current_overlay_hostile(
-            "duplicate-cargo-home-overlay", duplicate_current_overlay
-        )
-        add_current_overlay_hostile(
-            "reordered-cargo-home-overlay", reorder_current_overlay
-        )
-        add_current_overlay_hostile(
-            "wrong-cargo-home-overlay-destination",
-            lambda argv: argv.__setitem__(
-                argv.index("--overlay-src") + 3, "/asterism/other-cargo-home"
-            ),
-        )
-        add_current_overlay_hostile(
-            "wrong-cargo-home-remount",
-            lambda argv: argv.__setitem__(
-                next(
-                    index + 1
-                    for index in range(len(argv) - 1)
-                    if argv[index : index + 2]
-                    == ["--remount-ro", adapters._GUEST_CARGO_HOME]
-                ),
-                "/asterism/other-cargo-home",
-            ),
-        )
-        extra_environment = json.loads(json.dumps(current["builds"]["children"]))
-        extra_environment["environment"]["ASTERISM_UNREVIEWED"] = "present"
-        hostiles.append(("extra-asterism", "children", extra_environment))
-        missing_origin = json.loads(json.dumps(current["builds"]["children"]))
-        del missing_origin["environment"]["LD_ORIGIN_PATH"]
-        hostiles.append(("missing-loader-origin", "children", missing_origin))
-        host_origin = json.loads(json.dumps(current["builds"]["children"]))
-        host_origin["environment"]["LD_ORIGIN_PATH"] = "/host/toolchain/bin"
-        hostiles.append(("host-loader-origin", "children", host_origin))
-        release_wrapper = json.loads(json.dumps(current["builds"]["hooked_release"]))
-        release_wrapper["environment"]["RUSTC_WORKSPACE_WRAPPER"] = "/forged"
-        hostiles.append(("release-wrapper-environment", "hooked_release", release_wrapper))
-        release_receipt = json.loads(json.dumps(current["builds"]["hooked_release"]))
-        release_receipt["wrapper_receipt"] = {}
-        hostiles.append(("release-wrapper-field", "hooked_release", release_receipt))
-        fd_count = json.loads(json.dumps(current["builds"]["children"]))
-        fd_count["execution"]["passed_file_descriptors"] -= cargo_home_preserved_count
-        hostiles.append(("preserved-cargo-home-fd-cardinality", "children", fd_count))
-        for hostile_name, field, value in (
-            ("float-exit-status", "exit_status", 0.0),
-            ("bool-exit-status", "exit_status", False),
-            ("float-passed-file-descriptors", "passed_file_descriptors", 16.0),
-            ("bool-passed-file-descriptors", "passed_file_descriptors", True),
-        ):
-            scalar = json.loads(json.dumps(current["builds"]["children"]))
-            scalar["execution"][field] = value
-            hostiles.append((hostile_name, "children", scalar))
-        lock = json.loads(json.dumps(current["builds"]["children"]))
-        del lock["lock_postbuild"]["identity"]
-        hostiles.append(("truncated-lock", "children", lock))
-        config = json.loads(json.dumps(current["builds"]["children"]))
-        del config["cargo_config_prebuild"]["cargo_home_tree"]["watch_count"]
-        hostiles.append(("truncated-config", "children", config))
-        absent_edge = json.loads(json.dumps(current["builds"]["children"]))
-        edge_path = f"{adapters._GUEST_SOURCE}/.cargo/config.toml"
-        for phase in ("cargo_config_prebuild", "cargo_config_postbuild"):
-            absent_edge[phase]["cargo_search"]["entries"][0] = {
-                "path": edge_path,
-                "sha256": None,
-                "status": "absent",
-            }
-        for argv in (absent_edge["argv"], absent_edge["execution"]["argv"]):
-            destination = argv.index(edge_path)
-            del argv[destination - 2 : destination + 1]
-        absent_edge["execution"]["passed_file_descriptors"] -= 1
-        hostiles.append(("absent-bound-config-edge", "children", absent_edge))
-        tool = json.loads(json.dumps(current["builds"]["children"]))
-        del tool["execution_tools"]["cargo"]["identity"]["sha256"]
-        hostiles.append(("truncated-tool", "children", tool))
-        dev_float = json.loads(json.dumps(current["builds"]["children"]))
-        dev_float["execution_tools"]["dev_null"]["identity"]["minor"] = 3.0
-        hostiles.append(("float-null-device-minor", "children", dev_float))
-        lld_path = json.loads(json.dumps(current["builds"]["children"]))
-        lld_path["execution_tools"]["rust_lld"]["identity"]["path"] = str(
-            _toolchain["rustc_path"]
-        )
-        hostiles.append(("rust-lld-path", "children", lld_path))
-        for hostile_name, field, value in (
-            ("artifact-source-mode", "mode", 0o755),
-            (
-                "artifact-source-ctime",
-                "ctime_ns",
-                current["builds"]["children"]["artifacts"][
-                    "asterism_rebaseline_current_correctness"
-                ]["source"]["ctime_ns"]
-                + 1,
-            ),
-        ):
-            artifact_source = json.loads(
-                json.dumps(current["builds"]["children"])
-            )
-            artifact_source["artifacts"][
-                "asterism_rebaseline_current_correctness"
-            ]["source"][field] = value
-            hostiles.append((hostile_name, "children", artifact_source))
-        for hostile_name, build_name, hostile in hostiles:
-            with self.subTest(hostile_name), self.assertRaises(
-                adapters.ProfileEvidenceError
-            ):
-                self.validate_current_build(build_name, hostile)
-        scratch = self.root / "artifact-source-replay"
-        scratch.mkdir()
-        primary = scratch / "artifact"
-        primary.write_bytes(b"synthetic profile artifact\n")
-        primary.chmod(0o555)
-        os.link(primary, scratch / "artifact-0123456789abcdef")
-        logical = Path("/proc/self/fd/900/release/examples/artifact")
-        record = current_file_identity(primary, logical_path=str(logical))
-        primary.chmod(0o755)
-        primary.chmod(0o555)
-        with self.assertRaises(adapters.ProfileEvidenceError):
-            adapters._current_bound_file_identity(
-                record,
-                "hostile profile chmod-restored artifact source",
-                actual_path=primary,
-                logical_path=str(logical),
-                executable=True,
-                expected_link_count=2,
-            )
-
-    def test_exact_toolchain_contract_hash_version_and_shared_root(self) -> None:
-        current, _root, toolchain, expected_root, _source_name = (
-            self.current_build_case()
-        )
-        observed, observed_root = adapters._validate_toolchain_contract(
-            toolchain, "positive exact toolchain"
-        )
-        self.assertEqual(set(observed), set(adapters._TOOLCHAIN_FIELDS))
-        self.assertEqual(observed_root, expected_root)
-        hostiles: list[tuple[str, dict[str, object]]] = []
-        missing = dict(toolchain)
-        del missing["cargo_version_verbose"]
-        hostiles.append(("missing-field", missing))
-        extra = dict(toolchain)
-        extra["legacy_channel"] = "stable"
-        hostiles.append(("extra-field", extra))
-        digest = dict(toolchain)
-        digest["rustup_sha256"] = "0" * 64
-        hostiles.append(("hash", digest))
-        cargo_version = dict(toolchain)
-        cargo_version["cargo_version_verbose"] = ""
-        hostiles.append(("cargo-version", cargo_version))
-        rustc_host = dict(toolchain)
-        rustc_host["rustc_host"] = "aarch64-unknown-linux-gnu"
-        hostiles.append(("rustc-host", rustc_host))
-        path_host = dict(toolchain)
-        path_host["rustc_host"] = "../escape"
-        path_host["rustc_version_verbose"] = str(
-            toolchain["rustc_version_verbose"]
-        ).replace(
-            f"host: {toolchain['rustc_host']}", "host: ../escape"
-        )
-        hostiles.append(("path-like-rustc-host", path_host))
-        other_root = self.root / "other-toolchain"
-        other_bin = other_root / "bin"
-        other_bin.mkdir(parents=True)
-        other_rustc = other_bin / "rustc"
-        other_rustc.write_bytes(Path(str(toolchain["rustc_path"])).read_bytes())
-        other_rustc.chmod(0o555)
-        other_bin.chmod(0o555)
-        other_root.chmod(0o555)
-        split_root = dict(toolchain)
-        split_root["rustc_path"] = str(other_rustc)
-        split_root["rustc_sha256"] = sha256(other_rustc.read_bytes())
-        hostiles.append(("split-semantic-root", split_root))
-        for name, hostile in hostiles:
-            with self.subTest(name=name), self.assertRaises(
-                adapters.ProfileEvidenceError
-            ):
-                adapters._validate_toolchain_contract(hostile, f"hostile {name}")
-    def test_exact_48_manifest_topology_and_one_runtime(self) -> None:
-        paths = self.authority_paths()
-        bundle = json.loads(paths["source_review_bundle"].read_bytes())
-        assertion = bundle["assertion"]
-        reviewed_current = Path(
-            str(assertion["inputs"]["current_children_attestation"]["path"])
-        )
-        current = json.loads(reviewed_current.read_bytes())
-        prepared = json.loads(paths["original_prepared"].read_bytes())
-        proof = json.loads(paths["release_compile_out"].read_bytes())
-        locks = current["lock_authority"]["lock_manifest"]["payload"]
-        authorities = [
-            *(build["semantic_input_authority"] for build in current["builds"].values()),
-            *(
-                prepared["variants"][variant]["attestation"][
-                    "semantic_input_authority"
-                ]
-                for variant in ("A", "B", "C", "D")
-            ),
-            proof["builds"]["overlay_a"]["attestation"][
-                "semantic_input_authority"
-            ],
-            *(
-                locks["variants"][variant][record]["semantic_input_authority"]
-                for variant in ("C", "D")
-                for record in ("current_lock_attempt", "resolver")
-            ),
-        ]
-        manifest_paths = [
-            authority[name]["manifest_path"]
-            for authority in authorities
-            for name in ("source", "toolchain", "cargo_home", "trusted_system_closure")
-        ]
-        self.assertEqual(len(authorities), 12)
-        self.assertEqual(len(manifest_paths), 48)
-        self.assertEqual(len(set(manifest_paths)), 48)
-        self.assertEqual(len({authority["runtime_sha256"] for authority in authorities}), 1)
-
-    def test_semantic_schema_count_path_runtime_and_mount_hostiles_fail(self) -> None:
-        authority, live_roots, expected_paths = self.current_semantic_case()
-        adapters._validate_semantic_input_authority(
-            authority,
-            "positive current semantic authority",
-            live_roots=live_roots,
-            expected_manifest_paths=expected_paths,
-        )
-        mutations = []
-        legacy = json.loads(json.dumps(authority))
-        legacy["schema"] = "bn-ecm1-semantic-input-authority-v0"
-        mutations.append(("legacy-schema", legacy))
-        bool_count = json.loads(json.dumps(authority))
-        bool_count["source"]["entry_count"] = True
-        mutations.append(("bool-count", bool_count))
-        collision = json.loads(json.dumps(authority))
-        collision["source"]["manifest_path"] = collision["toolchain"]["manifest_path"]
-        mutations.append(("path-collision", collision))
-        runtime = json.loads(json.dumps(authority))
-        runtime["runtime_sha256"] = "0" * 64
-        mutations.append(("runtime", runtime))
-        mounts = json.loads(json.dumps(authority))
-        mounts["trusted_system_closure"]["mounts"].reverse()
-        mutations.append(("mount-order", mounts))
-        for name, mutated in mutations:
-            with self.subTest(name=name), self.assertRaises(
-                adapters.ProfileEvidenceError
-            ):
-                adapters._validate_semantic_input_authority(
-                    mutated,
-                    f"hostile {name}",
-                    live_roots=live_roots,
-                    expected_manifest_paths=expected_paths,
-                )
-
-    def test_recursive_live_manifest_prefix_sibling_order_matches_producer(
-        self,
-    ) -> None:
-        module_name = "_asterism_profile_prepare_overlays_self_test"
-        module_path = MODULE_PATH.parent / "tooling" / "prepare_overlays.py"
-        spec = importlib.util.spec_from_file_location(module_name, module_path)
-        assert spec is not None and spec.loader is not None
-        tooling = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = tooling
-        try:
-            spec.loader.exec_module(tooling)
-            with tempfile.TemporaryDirectory(
-                prefix="bn-1h32-profile-semantic-order-"
-            ) as temporary:
-                root = Path(temporary).resolve(strict=True)
-                (root / "a").mkdir()
-                (root / "a-b").mkdir()
-                (root / "a" / "b").write_bytes(b"a/b\n")
-                (root / "a-b" / "y").write_bytes(b"a-b/y\n")
-                produced = tooling.resample_recursive_manifest(
-                    root,
-                    "source",
-                    "profile producer prefix-sibling fixture",
-                    allow_internal_symlinks=False,
-                    hash_regular_contents=True,
-                )
-                sampled = adapters._recursive_live_manifest(
-                    root,
-                    "source",
-                    "profile prefix-sibling fixture",
-                    allow_internal_symlinks=False,
-                    hash_regular_contents=True,
-                )
-                self.assertEqual(sampled, produced)
-                self.assertEqual(
-                    [entry["path"] for entry in sampled["entries"]],
-                    [".", "a", "a-b", "a-b/y", "a/b"],
-                )
-                self.assertEqual(
-                    adapters._validate_recursive_manifest(
-                        sampled,
-                        "source",
-                        "profile prefix-sibling fixture",
-                        trusted_system=False,
-                    ),
-                    sampled,
-                )
-                entries_by_path = {
-                    entry["path"]: entry for entry in sampled["entries"]
-                }
-                depth_first = {
-                    **sampled,
-                    "entries": [
-                        entries_by_path[path]
-                        for path in (".", "a", "a/b", "a-b", "a-b/y")
-                    ],
-                }
-                with self.assertRaises(adapters.ProfileEvidenceError):
-                    adapters._validate_recursive_manifest(
-                        depth_first,
-                        "source",
-                        "profile depth-first hostile",
-                        trusted_system=False,
-                    )
-        finally:
-            sys.modules.pop(module_name, None)
-
-    def test_semantic_manifest_tamper_type_and_hardlink_fail(self) -> None:
-        authority, live_roots, expected_paths = self.current_semantic_case()
-        source_path = expected_paths["source"]
-        original_payload = source_path.read_bytes()
-        original_digest = authority["source"]["manifest_sha256"]
-        source_path.chmod(0o644)
-        source_path.write_bytes(original_payload + b" ")
-        source_path.chmod(0o444)
-        with self.assertRaises(adapters.ProfileEvidenceError):
-            adapters._validate_semantic_input_authority(
-                authority,
-                "tampered manifest",
-                live_roots=live_roots,
-                expected_manifest_paths=expected_paths,
-            )
-        source_path.chmod(0o644)
-        source_path.write_bytes(original_payload)
-        source_path.chmod(0o444)
-        manifest = json.loads(source_path.read_bytes())
-        manifest["entries"][0]["file_type"] = "socket"
-        source_path.chmod(0o644)
-        digest = write_canonical(source_path, manifest, 0o444)
-        authority["source"]["manifest_sha256"] = digest
-        with self.assertRaises(adapters.ProfileEvidenceError):
-            adapters._validate_semantic_input_authority(
-                authority,
-                "invalid manifest type",
-                live_roots=live_roots,
-                expected_manifest_paths=expected_paths,
-            )
-        source_path.chmod(0o644)
-        source_path.write_bytes(original_payload)
-        source_path.chmod(0o444)
-        authority["source"]["manifest_sha256"] = original_digest
-        os.link(expected_paths["source"], expected_paths["source"].with_suffix(".alias"))
-        with self.assertRaises(adapters.ProfileEvidenceError):
-            adapters._validate_semantic_input_authority(
-                authority,
-                "hardlinked manifest",
-                live_roots=live_roots,
-                expected_manifest_paths=expected_paths,
-            )
-
-    def test_semantic_manifest_identity_unbounded_snapshot_and_trusted_reads(self) -> None:
-        authority, live_roots, expected_paths = self.current_semantic_case()
-        identities: set[tuple[int, int]] = set()
-        with mock.patch.object(
-            adapters, "_immutable_file_payload", wraps=adapters._immutable_file_payload
-        ) as snapshot:
-            adapters._validate_semantic_input_authority(
-                authority,
-                "positive manifest identities",
-                live_roots=live_roots,
-                expected_manifest_paths=expected_paths,
-                manifest_identities=identities,
-            )
-        self.assertEqual(len(identities), 4)
-        self.assertTrue(
-            any(call.kwargs.get("limit") is None for call in snapshot.call_args_list)
-        )
-        with self.assertRaises(adapters.ProfileEvidenceError):
-            adapters._validate_semantic_input_authority(
-                authority,
-                "globally aliased manifest identities",
-                live_roots=live_roots,
-                expected_manifest_paths=expected_paths,
-                manifest_identities=identities,
-            )
-        trusted_root = adapters._TRUSTED_SYSTEM_MOUNTS[0][0]
-        with mock.patch.object(adapters.os, "pread", wraps=os.pread) as pread:
-            adapters._recursive_live_manifest(
-                trusted_root,
-                "system-usr-bin",
-                "trusted-system size replay",
-                allow_internal_symlinks=True,
-                hash_regular_contents=False,
-                trusted_system_roots=tuple(
-                    host for host, _guest in adapters._TRUSTED_SYSTEM_MOUNTS
-                ),
-            )
-        self.assertGreater(pread.call_count, 0)
-
-    def test_current_and_prepared_crosslinks_are_exact(self) -> None:
-        paths = self.authority_paths()
-        bundle = json.loads(paths["source_review_bundle"].read_bytes())
-        assertion = bundle["assertion"]
-        current = json.loads(paths["source_review_current_children_attestation"].read_bytes())
-        approval = json.loads(paths["original_approval"].read_bytes())
-        adapters._validate_current_preapproval(current, assertion, approval)
-        current_hostiles: list[tuple[str, dict[str, object]]] = []
-        for name, mutate in (
-            ("protocol", lambda value: value.__setitem__("protocol_sha256", "0" * 64)),
-            ("tools", lambda value: value.__setitem__("tools_manifest_sha256", "0" * 64)),
-            (
-                "lock-input",
-                lambda value: value["lock_authority_inputs"].__setitem__(
-                    "authority", {}
-                ),
-            ),
-            (
-                "sentinel",
-                lambda value: value.__setitem__("release_compile_out_approval", {}),
-            ),
-            (
-                "overlay",
-                lambda value: value["product_overlay_authority"]["patch"].__setitem__(
-                    "sha256", "0" * 64
-                ),
-            ),
-        ):
-            hostile = json.loads(json.dumps(current))
-            mutate(hostile)
-            current_hostiles.append((name, hostile))
-        for name, hostile in current_hostiles:
-            with self.subTest(current=name), self.assertRaises(
-                adapters.ProfileEvidenceError
-            ):
-                adapters._validate_current_preapproval(hostile, assertion, approval)
-
-        prepared = json.loads(paths["original_prepared"].read_bytes())
-        toolchain = prepared["toolchain"]
-        attestation = prepared["variants"]["A"]["attestation"]
-        adapters._validate_prepared_release_attestation(
-            attestation, toolchain, "positive prepared A"
-        )
-        prepared_hostiles = []
-        missing = json.loads(json.dumps(attestation))
-        del missing["source_read_only"]
-        prepared_hostiles.append(("missing-field", missing))
-        for name, field, value in (
-            ("source-writable", "source_read_only", False),
-            ("stale-target", "target_dir_was_absent", False),
-            ("materialized-post", "materialized_manifest_post_sha256", "0" * 64),
-            ("lock-post", "cargo_lock_post_sha256", "0" * 64),
-        ):
-            hostile = json.loads(json.dumps(attestation))
-            hostile[field] = value
-            prepared_hostiles.append((name, hostile))
-        for name, hostile in prepared_hostiles:
-            with self.subTest(prepared=name), self.assertRaises(
-                adapters.ProfileEvidenceError
-            ):
-                adapters._validate_prepared_release_attestation(
-                    hostile, toolchain, f"hostile prepared {name}"
-                )
-        lld_topology = json.loads(json.dumps(attestation))
-        lld_topology["toolchain"]["rust_lld_path"] = lld_topology["toolchain"][
-            "rustc_path"
-        ]
-        with self.assertRaises(adapters.ProfileEvidenceError):
-            adapters._validate_prepared_execution_tools(
-                lld_topology, "hostile prepared rust-lld topology"
-            )
-
-    def test_cargo_config_and_build_completion_are_deeply_replayed(self) -> None:
-        paths = self.authority_paths()
-        proof = json.loads(paths["release_compile_out"].read_bytes())
-        attestation = proof["builds"]["ordinary_a"]["attestation"]
-        self.assertEqual(
-            adapters._cargo_config_sha256(attestation, "positive Cargo config"),
-            attestation["cargo_config_search"]["sha256"],
-        )
-        adapters._validate_release_build_child(attestation, "positive build child")
-        child_hostile = json.loads(json.dumps(attestation))
-        child_hostile["build_child"]["argv"] = ["forged"]
-        with self.assertRaises(adapters.ProfileEvidenceError):
-            adapters._validate_release_build_child(child_hostile, "forged build child")
-        descriptor_hostile = json.loads(json.dumps(attestation))
-        descriptor_hostile["build_child"]["passed_file_descriptors"] = 16.0
-        with self.assertRaises(adapters.ProfileEvidenceError):
-            adapters._validate_release_build_child(
-                descriptor_hostile, "forged build descriptor count"
-            )
-
-        original_manifest = Path(attestation["cargo_config_search"]["path"])
-        hostile_manifest = self.root / "hostile-cargo-config.json"
-        value = json.loads(original_manifest.read_bytes())
-        value["entries"].reverse()
-        hostile_sha256 = write_canonical(hostile_manifest, value, 0o444)
-        hostile_empty = hostile_manifest.with_name(f"{hostile_manifest.name}.empty")
-        hostile_empty.write_bytes(b"")
-        hostile_empty.chmod(0o444)
-        config_hostile = json.loads(json.dumps(attestation))
-        config_hostile["cargo_config_search"] = {
-            "path": str(hostile_manifest),
-            "sha256": hostile_sha256,
-        }
-        with self.assertRaises(adapters.ProfileEvidenceError):
-            adapters._cargo_config_sha256(config_hostile, "reordered Cargo config")
-
-        contract_path = Path(attestation["contract_output_path"])
-        contract_payload = contract_path.read_bytes()
-        contract_path.chmod(0o644)
-        contract_path.write_bytes(b"{}\n")
-        contract_path.chmod(0o444)
-        with self.assertRaises(adapters.ProfileEvidenceError):
-            self.construct()
-        contract_path.chmod(0o644)
-        contract_path.write_bytes(contract_payload)
-        contract_path.chmod(0o444)
-
-    def test_release_sandbox_root_dev_proc_fd_and_rustup_hostiles_fail(self) -> None:
-        paths = self.authority_paths()
-        proof = json.loads(paths["release_compile_out"].read_bytes())
-        record = proof["builds"]["ordinary_a"]
-        attestation = record["attestation"]
-        runtime = attestation["semantic_input_authority"]["runtime_sha256"]
-        self.assertEqual(
-            adapters._validate_release_sandbox(
-                attestation,
-                "positive release sandbox",
-                package="mess-store",
-                example="asterism_rebaseline_public",
-                runtime_sha256=runtime,
-            ),
-            record["sandbox_sha256"],
-        )
-        hostiles = []
-        root_bind = json.loads(json.dumps(attestation))
-        root_bind["build_argv"][4:4] = ["--ro-bind", "/", "/"]
-        hostiles.append(("root-bind", root_bind))
-        real_dev = json.loads(json.dumps(attestation))
-        real_dev["build_argv"][real_dev["build_argv"].index("--dir")] = "--dev"
-        hostiles.append(("real-dev", real_dev))
-        real_proc = json.loads(json.dumps(attestation))
-        proc_index = real_proc["build_argv"].index("/proc")
-        real_proc["build_argv"][proc_index - 1] = "--proc"
-        hostiles.append(("real-proc", real_proc))
-        rustup = json.loads(json.dumps(attestation))
-        rustup["build_env"]["RUSTUP_HOME"] = "/host/rustup"
-        hostiles.append(("rustup", rustup))
-        missing_origin = json.loads(json.dumps(attestation))
-        del missing_origin["build_env"]["LD_ORIGIN_PATH"]
-        hostiles.append(("missing-loader-origin", missing_origin))
-        host_origin = json.loads(json.dumps(attestation))
-        host_origin["build_env"]["LD_ORIGIN_PATH"] = "/host/toolchain/bin"
-        hostiles.append(("host-loader-origin", host_origin))
-        dev_float = json.loads(json.dumps(attestation))
-        dev_float["execution_tools"]["dev_null"]["identity"]["minor"] = 3.0
-        hostiles.append(("float-null-device-minor", dev_float))
-        lld_path = json.loads(json.dumps(attestation))
-        lld_path["execution_tools"]["rust_lld"]["path"] = str(
-            lld_path["toolchain"]["rustc_path"]
-        )
-        hostiles.append(("rust-lld-path", lld_path))
-        aliased = json.loads(json.dumps(attestation))
-        descriptor_indexes = [
-            index + 1
-            for index, argument in enumerate(aliased["build_argv"])
-            if argument in {"--ro-bind-fd", "--bind-fd"}
-        ]
-        aliased["build_argv"][descriptor_indexes[1]] = aliased["build_argv"][
-            descriptor_indexes[0]
-        ]
-        hostiles.append(("aliased-fd", aliased))
-
-        def add_release_overlay_hostile(
-            hostile_name: str, mutate: Callable[[list[str]], None]
-        ) -> None:
-            hostile = json.loads(json.dumps(attestation))
-            mutate(hostile["build_argv"])
-            hostile["build_child"]["argv"] = list(hostile["build_argv"])
-            hostiles.append((hostile_name, hostile))
-
-        def replace_release_overlay_with_direct_bind(argv: list[str]) -> None:
-            index = argv.index("--overlay-src")
-            descriptor = argv[index + 1].removeprefix("/proc/self/fd/")
-            argv[index : index + 4] = [
-                "--ro-bind-fd",
-                descriptor,
-                adapters._GUEST_CARGO_HOME,
-            ]
-
-        def remove_release_overlay(argv: list[str]) -> None:
-            index = argv.index("--overlay-src")
-            del argv[index : index + 4]
-
-        def duplicate_release_overlay(argv: list[str]) -> None:
-            index = argv.index("--overlay-src")
-            argv[index:index] = argv[index : index + 4]
-
-        def reorder_release_overlay(argv: list[str]) -> None:
-            index = argv.index("--overlay-src")
-            overlay = argv[index : index + 4]
-            del argv[index : index + 4]
-            remount = next(
-                position
-                for position in range(len(argv) - 1)
-                if argv[position : position + 2]
-                == ["--remount-ro", adapters._GUEST_CARGO_HOME]
-            )
-            argv[remount:remount] = overlay
-
-        add_release_overlay_hostile(
-            "direct-cargo-home-bind", replace_release_overlay_with_direct_bind
-        )
-        add_release_overlay_hostile(
-            "host-cargo-home-overlay",
-            lambda argv: argv.__setitem__(
-                argv.index("--overlay-src") + 1, "/host/cargo-home"
-            ),
-        )
-        add_release_overlay_hostile(
-            "noncanonical-cargo-home-overlay-fd",
-            lambda argv: argv.__setitem__(
-                argv.index("--overlay-src") + 1, "/proc/self/fd/0409"
-            ),
-        )
-        add_release_overlay_hostile(
-            "aliased-cargo-home-overlay-fd",
-            lambda argv: argv.__setitem__(
-                argv.index("--overlay-src") + 1,
-                f"/proc/self/fd/{argv[argv.index('--ro-bind-fd') + 1]}",
-            ),
-        )
-        add_release_overlay_hostile(
-            "missing-cargo-home-overlay", remove_release_overlay
-        )
-        add_release_overlay_hostile(
-            "duplicate-cargo-home-overlay", duplicate_release_overlay
-        )
-        add_release_overlay_hostile(
-            "reordered-cargo-home-overlay", reorder_release_overlay
-        )
-        add_release_overlay_hostile(
-            "wrong-cargo-home-overlay-destination",
-            lambda argv: argv.__setitem__(
-                argv.index("--overlay-src") + 3, "/asterism/other-cargo-home"
-            ),
-        )
-        add_release_overlay_hostile(
-            "wrong-cargo-home-remount",
-            lambda argv: argv.__setitem__(
-                next(
-                    index + 1
-                    for index in range(len(argv) - 1)
-                    if argv[index : index + 2]
-                    == ["--remount-ro", adapters._GUEST_CARGO_HOME]
-                ),
-                "/asterism/other-cargo-home",
-            ),
-        )
-        for name, hostile in hostiles:
-            with self.subTest(name=name), self.assertRaises(
-                adapters.ProfileEvidenceError
-            ):
-                adapters._validate_release_sandbox(
-                    hostile,
-                    f"hostile release {name}",
-                    package="mess-store",
-                    example="asterism_rebaseline_public",
-                    runtime_sha256=runtime,
-                )
-
-    def test_resolver_kind_cwd_fd_role_and_topology_hostiles_fail(self) -> None:
-        paths = self.authority_paths()
-        current = json.loads(
-            Path(
-                json.loads(paths["source_review_bundle"].read_bytes())["assertion"][
-                    "inputs"
-                ]["current_children_attestation"]["path"]
-            ).read_bytes()
-        )
-        locks = current["lock_authority"]["lock_manifest"]["payload"]
-        toolchain = locks["toolchain"]
-        claim = locks["variants"]["C"]
-        lock_root = Path(claim["final_lock_path"]).parent.parent
-        current_lock_sha256 = locks["variants"]["A"]["historical_lock"]["sha256"]
-        valid = claim["current_lock_attempt"]
-        runtime_digests: set[str] = set()
-        manifest_paths: list[Path] = []
-        adapters._validate_resolver_record(
-            valid,
-            variant="C",
-            role="current",
-            lock_root=lock_root,
-            toolchain=toolchain,
-            runtime_digests=runtime_digests,
-            manifest_paths=manifest_paths,
-            expected_current_lock_sha256=current_lock_sha256,
-            expected_final_lock_sha256=claim["final_lock_sha256"],
-        )
-        hostiles = []
-        for name, field, value in (
-            ("kind", "resolver_kind", "tracked_git_readback"),
-            ("cwd", "cwd", valid["host_source_root"]),
-            ("fd-count", "passed_file_descriptors", 12),
-        ):
-            hostile = json.loads(json.dumps(valid))
-            hostile[field] = value
-            hostiles.append((name, hostile))
-
-        def add_resolution_overlay_hostile(
-            hostile_name: str, mutate: Callable[[list[str]], None]
-        ) -> None:
-            hostile = json.loads(json.dumps(valid))
-            mutate(hostile["argv"])
-            hostiles.append((hostile_name, hostile))
-
-        def replace_resolution_overlay_with_direct_bind(argv: list[str]) -> None:
-            index = argv.index("--overlay-src")
-            descriptor = argv[index + 1].removeprefix("/proc/self/fd/")
-            argv[index : index + 4] = [
-                "--ro-bind-fd",
-                descriptor,
-                adapters._GUEST_CARGO_HOME,
-            ]
-
-        def reorder_resolution_overlay(argv: list[str]) -> None:
-            index = argv.index("--overlay-src")
-            overlay = argv[index : index + 4]
-            del argv[index : index + 4]
-            remount = next(
-                position
-                for position in range(len(argv) - 1)
-                if argv[position : position + 2]
-                == ["--remount-ro", adapters._GUEST_CARGO_HOME]
-            )
-            argv[remount:remount] = overlay
-
-        def remove_resolution_overlay(argv: list[str]) -> None:
-            index = argv.index("--overlay-src")
-            del argv[index : index + 4]
-
-        def duplicate_resolution_overlay(argv: list[str]) -> None:
-            index = argv.index("--overlay-src")
-            argv[index:index] = argv[index : index + 4]
-
-        add_resolution_overlay_hostile(
-            "direct-cargo-home-bind", replace_resolution_overlay_with_direct_bind
-        )
-        add_resolution_overlay_hostile(
-            "host-cargo-home-overlay",
-            lambda argv: argv.__setitem__(
-                argv.index("--overlay-src") + 1, "/host/cargo-home"
-            ),
-        )
-        add_resolution_overlay_hostile(
-            "noncanonical-cargo-home-overlay-fd",
-            lambda argv: argv.__setitem__(
-                argv.index("--overlay-src") + 1, "/proc/self/fd/040"
-            ),
-        )
-        add_resolution_overlay_hostile(
-            "aliased-cargo-home-overlay-fd",
-            lambda argv: argv.__setitem__(
-                argv.index("--overlay-src") + 1,
-                f"/proc/self/fd/{argv[argv.index('--ro-bind-fd') + 1]}",
-            ),
-        )
-        add_resolution_overlay_hostile(
-            "missing-cargo-home-overlay", remove_resolution_overlay
-        )
-        add_resolution_overlay_hostile(
-            "duplicate-cargo-home-overlay", duplicate_resolution_overlay
-        )
-        add_resolution_overlay_hostile(
-            "reordered-cargo-home-overlay", reorder_resolution_overlay
-        )
-        add_resolution_overlay_hostile(
-            "wrong-cargo-home-overlay-destination",
-            lambda argv: argv.__setitem__(
-                argv.index("--overlay-src") + 3, "/asterism/other-cargo-home"
-            ),
-        )
-        add_resolution_overlay_hostile(
-            "wrong-cargo-home-remount",
-            lambda argv: argv.__setitem__(
-                next(
-                    index + 1
-                    for index in range(len(argv) - 1)
-                    if argv[index : index + 2]
-                    == ["--remount-ro", adapters._GUEST_CARGO_HOME]
-                ),
-                "/asterism/other-cargo-home",
-            ),
-        )
-        role = json.loads(json.dumps(valid))
-        role["semantic_input_authority"]["source"]["role"] = "source"
-        hostiles.append(("semantic-role", role))
-        for name, hostile in hostiles:
-            with self.subTest(name=name), self.assertRaises(
-                adapters.ProfileEvidenceError
-            ):
-                adapters._validate_resolver_record(
-                    hostile,
-                    variant="C",
-                    role="current",
-                    lock_root=lock_root,
-                    toolchain=toolchain,
-                    runtime_digests=set(),
-                    manifest_paths=[],
-                    expected_current_lock_sha256=current_lock_sha256,
-                    expected_final_lock_sha256=claim["final_lock_sha256"],
-                )
-
-    def test_current_lock_must_equal_variant_a_historical_lock(self) -> None:
-        paths = self.authority_paths()
-        current = json.loads(
-            Path(
-                json.loads(paths["source_review_bundle"].read_bytes())["assertion"][
-                    "inputs"
-                ]["current_children_attestation"]["path"]
-            ).read_bytes()
-        )
-        locks = current["lock_authority"]["lock_manifest"]["payload"]
-        toolchain = locks["toolchain"]
-        expected_current = locks["variants"]["A"]["historical_lock"]["sha256"]
-        claim = locks["variants"]["C"]
-        hostile = json.loads(json.dumps(claim["current_lock_attempt"]))
-        hostile["lock_output"]["pre"]["sha256"] = "f" * 64
-        hostile["lock_output"]["post"]["sha256"] = "f" * 64
-        with self.assertRaises(adapters.ProfileEvidenceError):
-            adapters._validate_resolver_record(
-                hostile,
-                variant="C",
-                role="current",
-                lock_root=Path(claim["final_lock_path"]).parent.parent,
-                toolchain=toolchain,
-                runtime_digests=set(),
-                manifest_paths=[],
-                expected_current_lock_sha256=expected_current,
-                expected_final_lock_sha256=claim["final_lock_sha256"],
-            )
-
-    def test_tracked_resolver_records_are_exactly_replayed(self) -> None:
-        paths = self.authority_paths()
-        current = json.loads(
-            Path(
-                json.loads(paths["source_review_bundle"].read_bytes())["assertion"][
-                    "inputs"
-                ]["current_children_attestation"]["path"]
-            ).read_bytes()
-        )
-        locks = current["lock_authority"]["lock_manifest"]["payload"]
-        toolchain = locks["toolchain"]
-        lock_root = Path(locks["variants"]["A"]["final_lock_path"]).parent.parent
-        repository = adapters._lock_repository_from_source_plan(
-            locks["source_plan_path"]
-        )
-        with self.assertRaises(adapters.ProfileEvidenceError):
-            adapters._lock_repository_from_source_plan(str(paths["original_prepared"]))
-        for variant in ("A", "B"):
-            claim = locks["variants"][variant]
-            adapters._validate_tracked_resolver_record(
-                claim["resolver"],
-                claim=claim,
-                variant=variant,
-                lock_root=lock_root,
-                repository=repository,
-                toolchain=toolchain,
-            )
-        base_claim = locks["variants"]["A"]
-        hostiles: list[tuple[str, dict[str, object]]] = []
-        current_attempt = json.loads(json.dumps(base_claim))
-        current_attempt["current_lock_attempt"] = {}
-        hostiles.append(("current-attempt", current_attempt))
-        argv = json.loads(json.dumps(base_claim))
-        argv["resolver"]["argv"][-1] = "forged:Cargo.lock"
-        hostiles.append(("argv", argv))
-        environment = json.loads(json.dumps(base_claim))
-        environment["resolver"]["environment"]["HOME"] = str(self.root)
-        hostiles.append(("environment", environment))
-        cwd = json.loads(json.dumps(base_claim))
-        cwd["resolver"]["cwd"] = str(self.root)
-        cwd["resolver"]["argv"][2] = str(self.root)
-        hostiles.append(("repository", cwd))
-        materialized = json.loads(json.dumps(base_claim))
-        materialized["resolver"]["host_source_root"] = str(repository)
-        hostiles.append(("materialized-root", materialized))
-        config = json.loads(json.dumps(base_claim))
-        config["resolver"]["cargo_config_search"]["path"] = str(
-            paths["original_prepared"]
-        )
-        hostiles.append(("config-topology", config))
-        final_lock = json.loads(json.dumps(base_claim))
-        final_lock["final_lock_path"] = locks["variants"]["B"]["final_lock_path"]
-        final_lock["final_lock_sha256"] = locks["variants"]["B"][
-            "final_lock_sha256"
-        ]
-        final_lock["historical_lock"]["sha256"] = final_lock["final_lock_sha256"]
-        final_lock["resolver"]["stdout"] = locks["variants"]["B"]["resolver"][
-            "stdout"
-        ]
-        final_lock["resolver"]["stdout_sha256"] = final_lock["final_lock_sha256"]
-        hostiles.append(("final-lock-topology", final_lock))
-        output = json.loads(json.dumps(base_claim))
-        output["resolver"]["stdout"] = "forged lock\n"
-        output["resolver"]["stdout_sha256"] = sha256(b"forged lock\n")
-        output["historical_lock"]["sha256"] = output["resolver"]["stdout_sha256"]
-        output["final_lock_sha256"] = output["resolver"]["stdout_sha256"]
-        hostiles.append(("output", output))
-        for name, hostile in hostiles:
-            with self.subTest(name=name), self.assertRaises(
-                adapters.ProfileEvidenceError
-            ):
-                adapters._validate_tracked_resolver_record(
-                    hostile["resolver"],
-                    claim=hostile,
-                    variant="A",
-                    lock_root=lock_root,
-                    repository=repository,
-                    toolchain=toolchain,
-                )
-
-    def test_generated_resolver_replays_live_materialized_lock(self) -> None:
-        paths = self.authority_paths()
-        current = json.loads(
-            Path(
-                json.loads(paths["source_review_bundle"].read_bytes())["assertion"][
-                    "inputs"
-                ]["current_children_attestation"]["path"]
-            ).read_bytes()
-        )
-        locks = current["lock_authority"]["lock_manifest"]["payload"]
-        claim = locks["variants"]["C"]
-        lock_root = Path(claim["final_lock_path"]).parent.parent
-        live_lock = lock_root / "materialized" / "C" / "Cargo.lock"
-        live_lock.chmod(0o644)
-        live_lock.write_bytes(b"forged generated lock\n")
-        live_lock.chmod(0o444)
-        with self.assertRaises(adapters.ProfileEvidenceError):
-            adapters._validate_resolver_record(
-                claim["resolver"],
-                variant="C",
-                role="generated",
-                lock_root=lock_root,
-                toolchain=locks["toolchain"],
-                runtime_digests=set(),
-                manifest_paths=[],
-                expected_current_lock_sha256=locks["variants"]["A"][
-                    "historical_lock"
-                ]["sha256"],
-                expected_final_lock_sha256=claim["final_lock_sha256"],
-            )
-
     def test_distinct_attempt_copies_replay_original_authority(self) -> None:
         paths = self.authority_paths()
         self.assertNotEqual(
@@ -3789,12 +2668,6 @@ class AuthorityMutationTests(unittest.TestCase):
             self.authority_paths()["original_prepared"].read_bytes()
         )
         self.assertEqual(prepared["schema"], "bn-2l3n-prepared-artifacts-v3")
-        for variant in ("A", "B", "C", "D"):
-            with self.subTest(variant=variant):
-                self.assertEqual(
-                    set(prepared["variants"][variant]),
-                    set(adapters._PREPARED_VARIANT_FIELDS),
-                )
         mutated = self.rewrite_complete_chain(
             mutate_prepared=lambda value: value.__setitem__(
                 "schema", "asterism-rebaseline-prepared-v3"
@@ -3803,9 +2676,7 @@ class AuthorityMutationTests(unittest.TestCase):
         with self.assertRaises(adapters.ProfileEvidenceError):
             self.construct(mutated)
         truncated_a = self.rewrite_complete_chain(
-            mutate_prepared=lambda value: value["variants"]["A"].pop(
-                "artifact_root"
-            )
+            mutate_prepared=lambda value: value["variants"]["A"].pop("binary")
         )
         with self.assertRaises(adapters.ProfileEvidenceError):
             self.construct(truncated_a)
@@ -4054,13 +2925,11 @@ class CoordinatorTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.mount_patch = mock.patch.object(
-            adapters, "_TRUSTED_SYSTEM_MOUNTS", fixture_trusted_mounts(self.root)
-        )
-        self.owner_patch = mock.patch.object(
-            adapters, "_TRUSTED_SYSTEM_OWNER_UID", os.getuid()
+            sys.modules[__name__],
+            "TRUSTED_SYSTEM_MOUNTS",
+            fixture_trusted_mounts(self.root),
         )
         self.mount_patch.start()
-        self.owner_patch.start()
         self.pid = 200
         process = self.root / str(self.pid)
         process.mkdir(parents=True)
@@ -4090,7 +2959,6 @@ class CoordinatorTests(unittest.TestCase):
         try:
             self.temporary.cleanup()
         finally:
-            self.owner_patch.stop()
             self.mount_patch.stop()
 
     def test_fjall_phase_roles_and_window(self) -> None:
