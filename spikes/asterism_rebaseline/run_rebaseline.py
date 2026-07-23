@@ -5357,6 +5357,11 @@ class ChildPlan:
     environment_ordinal: int | None = None
     store_absent_before: bool = True
     allowed_exit_statuses: tuple[int, ...] = (0,)
+    # Whether the child speaks the control-socket handshake. Measured children
+    # (variant binaries, correctness/fault) do; the runtime-role tool smokes
+    # (evaluator/terminal_verifier), which only emit a canonical JSON line on
+    # stdout, do not, and must run uncontrolled like the contract smokes.
+    controlled: bool = True
 
 
 class RebaselineRunner:
@@ -7157,6 +7162,7 @@ class RebaselineRunner:
                     store_path=None,
                     require_store_after=False,
                     timeout_seconds=120,
+                    controlled=False,
                 )
             )
         return plans
@@ -8582,7 +8588,7 @@ class RebaselineRunner:
                 )
         self.phase = "transition_smoke"
         for plan in self.smoke_plans():
-            self.run_child(plan, controlled=True)
+            self.run_child(plan, controlled=plan.controlled)
         self.phase = "specialized_reopen_smoke"
         self._run_specialized_reopen_smokes()
 

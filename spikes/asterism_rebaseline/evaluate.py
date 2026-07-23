@@ -5817,6 +5817,7 @@ def reconstruct_transition_authority(
         argv: list[str] | None,
         context: Mapping[str, Any],
         store_path: Path | None,
+        controlled: bool = True,
     ) -> dict[str, Any]:
         value = binding if isinstance(binding, Mapping) else {}
         return {
@@ -5835,7 +5836,7 @@ def reconstruct_transition_authority(
                     context["smoke_target"]
                 ),
             },
-            "controlled": True,
+            "controlled": controlled,
             "store_path": store_path,
             "profile_track": None,
         }
@@ -5879,7 +5880,9 @@ def reconstruct_transition_authority(
             "durability": "Process",
         }
         plan.append(
-            binding_transition(f"{role}-A", runtime, argv, context, None)
+            binding_transition(
+                f"{role}-A", runtime, argv, context, None, controlled=False
+            )
         )
         next_smoke_ordinal += 1
 
@@ -13259,7 +13262,7 @@ def profile_fields(track, finish_result, *, raw_point, control_events, authority
                     "ASTERISM_REBASELINE_MODE": "smoke",
                     "ASTERISM_REBASELINE_SMOKE_TARGET": role,
                 },
-                "controlled": True,
+                "controlled": False,
                 "store_path": None,
                 "profile_track": None,
             }
