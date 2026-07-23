@@ -15,7 +15,7 @@ PINNED_SHARED_OVERLAY_SHA256 = {
     "schema.rs": "91676e539b32347466b423405536e49745e8dd307defdd9464de8f7a83127445",
     "semantic_oracle.rs": "4484a2e053ed081b7ed49d8614e86cef979d2f3031d0d49d8848f38daed2f3be",
     "timing.rs": "9e234a7240818b7740f3c3d5233dcafe31ac506ca617eb010909d06dc06458af",
-    "workload.rs": "9fe6fbbbefc3d4ccf72cfa877162ab5bd130f7e14efcd85ff8c96883be13e535",
+    "workload.rs": "b439810812d2c7257121329ed65bd25f6e5b1ec6f8d79a12dc20249b1066d49d",
 }
 
 

@@ -8,9 +8,13 @@ pub enum DurabilityKind {
 
 impl DurabilityKind {
     pub fn parse(value: &str) -> Self {
+        // Accept both the wire form ("process"/"group") and the canonical label
+        // form ("Process"/"Group") that the harness emits everywhere
+        // (run_rebaseline cell config, ASTERISM_DURABILITY env, evidence_schema,
+        // 32-cell identity, reporting).  See DurabilityKind::label.
         match value {
-            "process" => Self::Process,
-            "group" => Self::Group,
+            "process" | "Process" => Self::Process,
+            "group" | "Group" => Self::Group,
             _ => panic!("durability must be process or group"),
         }
     }
