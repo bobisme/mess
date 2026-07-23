@@ -1828,6 +1828,34 @@ def _semantic_path_chain(paths: list[Path]) -> list[dict[str, Any]]:
     return records
 
 
+# Directory ctime/mtime/size/nlink are volatile on a live system: /dev is
+# devtmpfs, so its timestamps, link count, and size change whenever any device
+# node appears or disappears while the machine is in use (routine during the
+# ~1.5h build).  A build-time chain record therefore legitimately diverges from
+# a run-time recompute.  Same fragility bn-1csq fixed for
+# _semantic_directory_identity.
+_VOLATILE_CHAIN_FIELDS = frozenset({"changed_ns", "modified_ns", "size", "link_count"})
+
+
+def _chain_structural(chain: Any) -> Any:
+    """Project a path chain onto its stable anti-swap identity for comparison.
+
+    Keeps device, inode, mode, uid, gid, type, and path (the fields that a
+    symlink/bind swap would change), dropping the volatile timestamp/size/nlink
+    fields.  File content integrity is covered by separate sha256 pins, and the
+    terminal /dev/null node identity is checked strictly by the caller.
+    """
+
+    if not isinstance(chain, list):
+        return chain
+    return [
+        {key: item[key] for key in item if key not in _VOLATILE_CHAIN_FIELDS}
+        if isinstance(item, dict)
+        else item
+        for item in chain
+    ]
+
+
 def _semantic_null_device(value: Any, context: str) -> dict[str, Any]:
     if (
         not isinstance(value, dict)
@@ -1868,8 +1896,8 @@ def _semantic_null_device(value: Any, context: str) -> dict[str, Any]:
         or metadata.st_nlink != 1
         or os.major(metadata.st_rdev) != 1
         or os.minor(metadata.st_rdev) != 3
-        or value.get("parent_path_chain")
-        != _semantic_path_chain([Path("/"), Path("/dev")])
+        or _chain_structural(value.get("parent_path_chain"))
+        != _chain_structural(_semantic_path_chain([Path("/"), Path("/dev")]))
     ):
         raise RunnerFailure(f"{context} live identity differs", exit_code=2)
     return value
@@ -1906,7 +1934,7 @@ def _semantic_current_tool(
     paths = [Path("/"), *list(expected_path.parents)[::-1][1:], expected_path]
     expected_chain = _semantic_path_chain(paths)
     if (
-        chain != expected_chain
+        _chain_structural(chain) != _chain_structural(expected_chain)
         or any(
             item["uid"] != 0 or item["mode"] & 0o022
             for item in expected_chain
