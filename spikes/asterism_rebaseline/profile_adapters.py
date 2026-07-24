@@ -3989,8 +3989,14 @@ def _validate_control_events(
         release_monotonic = _json_nonnegative_integer(
             measured["release_monotonic_ns"], "measured.release_monotonic_ns"
         )
-        if not start_sent <= release_monotonic <= t0:
-            raise ProfileEvidenceError("control start/release/t0 ordering differs")
+        # The child records t0 (main.rs) immediately before release_monotonic,
+        # then the writers complete: t0 <= release <= last_completion.  This
+        # matches the canonical monotone phase order in evidence_schema
+        # (ready <= counter_start <= t0 <= release <= last_completion <= t1).
+        # (The prior bound start_sent <= release <= t0 had release and t0
+        # swapped and fail-stopped every completed primary cell.)
+        if not t0 <= release_monotonic <= last_completion:
+            raise ProfileEvidenceError("control t0/release/completion ordering differs")
     else:
         opened = by_phase["opened"]
         open_start = _json_nonnegative_integer(
