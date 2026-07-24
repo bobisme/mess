@@ -1095,14 +1095,18 @@ def process_delta(before: ProcessCounters, after: ProcessCounters) -> ProcessDel
         after.io.cancelled_write_bytes - before.io.cancelled_write_bytes
     )
     io = ProcessIo(**io_values)
-    # VmHWM is a peak since process birth, not an interval counter.  Retain the
-    # post-window absolute peak and reject impossible rollback.
-    if after.vm_hwm_bytes < before.vm_hwm_bytes:
-        raise ProfileEvidenceError("VmHWM rolled back within one process identity")
+    # VmHWM (/proc/pid/status, mm->hiwater_rss) is a peak since process birth,
+    # not an interval counter.  It is NOT strictly monotonic: recent kernels can
+    # recompute hiwater_rss lower under heavy concurrent memory reclaim (observed
+    # with the fairness 64-writer cells on this host), and the process identity
+    # (pid+start_ticks) is already verified equal above, so an apparent rollback
+    # is kernel accounting, not PID reuse.  Keep the true peak as the max of the
+    # two observations.
+    vm_hwm_bytes = max(before.vm_hwm_bytes, after.vm_hwm_bytes)
     return ProcessDelta(
         pid=before.pid,
         start_ticks=before.start_ticks,
-        vm_hwm_bytes=after.vm_hwm_bytes,
+        vm_hwm_bytes=vm_hwm_bytes,
         voluntary_context_switches=_delta(
             before.voluntary_context_switches,
             after.voluntary_context_switches,

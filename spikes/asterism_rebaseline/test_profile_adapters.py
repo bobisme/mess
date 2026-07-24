@@ -2516,6 +2516,25 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(process_delta.voluntary_context_switches, 5)
         self.assertEqual(process_delta.nonvoluntary_context_switches, 2)
 
+    def test_process_delta_keeps_vmhwm_peak_on_kernel_rollback(self) -> None:
+        # VmHWM (peak RSS) can be recomputed lower by the kernel under heavy
+        # concurrent reclaim; process_delta must keep the max, not raise (bn-3hd8).
+        process = self.root / str(self.pid)
+        (process / "status").write_text(
+            "VmHWM: 512 kB\n"
+            "voluntary_ctxt_switches: 8\n"
+            "nonvoluntary_ctxt_switches: 3\n"
+        )
+        (process / "io").write_text(io_record(20))
+        before = self.reader.process_counters(self.pid)
+        (process / "status").write_text(
+            "VmHWM: 128 kB\n"  # kernel rolled the peak back
+            "voluntary_ctxt_switches: 8\n"
+            "nonvoluntary_ctxt_switches: 3\n"
+        )
+        delta = adapters.process_delta(before, self.reader.process_counters(self.pid))
+        self.assertEqual(delta.vm_hwm_bytes, 512 * 1024)
+
     def test_tid_reuse_is_rejected(self) -> None:
         identity = self.reader.tasks(self.pid)[0]
         path = self.root / str(self.pid) / "task" / str(self.tid) / "stat"
