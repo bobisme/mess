@@ -894,7 +894,9 @@ def control_events(
                 "phase": phase,
                 "process_system_cpu_end_ns": 20,
                 "process_user_cpu_end_ns": 30,
-                "release_monotonic_ns": 81,
+                # release is recorded AFTER t0 (bn-3f7n): t0 <= release <=
+                # last_completion, matching the child and evidence_schema.
+                "release_monotonic_ns": 83,
                 "t0_monotonic_ns": 82,
                 "t1_monotonic_ns": 85,
             }
@@ -973,9 +975,14 @@ def marker_line(authority: dict[str, object], event: dict[str, object]) -> str:
     wire = {
         key: value for key, value in event.items() if not key.startswith("_runner_")
     }
-    payload = adapters.canonical_json(wire).decode()
+    # Real producer: the child writes the canonical JSON and its trailing LF as
+    # two separate write(2) calls, so the marker write payload is JSON-only with
+    # NO trailing newline.  strace -yy renders the control socket fd with a
+    # UNIX-STREAM annotation that contains `->` between the inode numbers.
+    payload = adapters.canonical_json(wire).decode()[:-1]
     return (
-        f'{authority["child_pid"]} write({authority["control_fd"]}, '
+        f'{authority["child_pid"]} '
+        f"write({authority['control_fd']}<UNIX-STREAM:[12160409->12160410]>, "
         f"{json.dumps(payload)}, {len(payload.encode())}) = {len(payload.encode())}"
     )
 
@@ -2212,12 +2219,14 @@ class ParseTests(unittest.TestCase):
             adapters.parse_proc_io(io_record() + "extra: 9\n")
 
     def test_perf_parser_is_exact_and_integer_lossless(self) -> None:
+        # Real perf 7.1.4 emits 7 CSV fields per row: the trailing two
+        # (metric-value, metric-unit) are empty for these counters.
         payload = "\n".join(
             (
-                "9007199254740993,,cycles:u,5000,100.00,",
-                "2000,,instructions:u,5000,100.00,",
-                "3.5,msec,task-clock:u,5000,100.00,",
-                "4,,context-switches:u,5000,100.00,",
+                "9007199254740993,,cycles:u,5000,100.00,,",
+                "2000,,instructions:u,5000,100.00,,",
+                "3.5,msec,task-clock:u,5000,100.00,,",
+                "4,,context-switches:u,5000,100.00,,",
             )
         )
         counters = adapters.parse_perf_stat_csv(payload)
@@ -2229,8 +2238,11 @@ class ParseTests(unittest.TestCase):
             adapters.parse_perf_stat_csv(
                 payload.replace("4,,context-switches:u", "<not supported>,,context-switches:u")
             )
+        # A non-empty field beyond the running-percent (index 4) is rejected.
         with self.assertRaises(adapters.ProfileEvidenceError):
-            adapters.parse_perf_stat_csv(payload + "\n1,,cycles:u,1,100.00,")
+            adapters.parse_perf_stat_csv(payload.replace("cycles:u,5000,100.00,,", "cycles:u,5000,100.00,9,"))
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters.parse_perf_stat_csv(payload + "\n1,,cycles:u,1,100.00,,")
 
     def test_perf_ack_is_exact(self) -> None:
         adapters.validate_perf_control_ack("ack\nack\n", perf_control_events())
@@ -2248,10 +2260,10 @@ class ParseTests(unittest.TestCase):
         inputs = adapters.perf_profile_inputs(
             "\n".join(
                 (
-                    "1000,,cycles,5000,100.00,",
-                    "2000,,instructions:u,5000,100.00,",
-                    "3.5,msec,task-clock:u,5000,100.00,",
-                    "4,,context-switches:u,5000,100.00,",
+                    "1000,,cycles,5000,100.00,,",
+                    "2000,,instructions:u,5000,100.00,,",
+                    "3.5,msec,task-clock:u,5000,100.00,,",
+                    "4,,context-switches:u,5000,100.00,,",
                 )
             ).replace("cycles,", "cycles:u,"),
             "ack\nack\n",
@@ -2282,7 +2294,7 @@ class ParseTests(unittest.TestCase):
             adapters.perf_profile_inputs("", "ack\n", "permission-denied")
         with self.assertRaises(adapters.ProfileEvidenceError):
             adapters.perf_profile_inputs(
-                inputs["perf_counters"] and "1,,cycles:u,1,100,\n",
+                inputs["perf_counters"] and "1,,cycles:u,1,100,,\n",
                 "ack\nack\n",
                 "not_available;perf_event_paranoid=4;scope=user-only;exit_status=255",
             )
@@ -2311,11 +2323,22 @@ class ParseTests(unittest.TestCase):
         boundary = trace_boundary(authority, events)
         begin = marker_line(authority, boundary["begin_event"])
         end = marker_line(authority, boundary["end_event"])
+        # Real strace -f output: a futex resumed line whose <unfinished ...>
+        # began BEFORE the interval (crosses the begin edge) has no in-window
+        # match and must be skipped; an in-window <unfinished ...> still
+        # outstanding at the end marker (crosses the end edge) is counted once
+        # at its initial line and must not fail; SIGSTOP/SIGCONT stop frames of
+        # parked children appear inside the window and are not syscalls.
         payload = f"""{begin}
+[pid 103] 1.0 <... futex resumed>) = 0
 101 1.1 pwrite64(3, \"x\", 1, 0) = 1
+--- SIGSTOP {{si_signo=SIGSTOP, si_code=SI_USER, si_pid=1, si_uid=0}} ---
+--- stopped by SIGSTOP ---
 [pid 102] 1.2 futex(0x1, FUTEX_WAIT, 0, NULL <unfinished ...>
 [pid 102] 1.3 <... futex resumed>) = 0
+--- SIGCONT {{si_signo=SIGCONT, si_code=SI_USER, si_pid=1, si_uid=0}} ---
 101 1.4 fdatasync(3) = 0
+[pid 104] 1.5 futex(0x2, FUTEX_WAIT, 0, NULL <unfinished ...>
 {end}
 """
         counts = adapters.trace_interval_counts(
@@ -2323,7 +2346,7 @@ class ParseTests(unittest.TestCase):
             boundary,
             allowed_syscalls=("pwrite64", "futex", "fdatasync"),
         )
-        self.assertEqual(counts, {"fdatasync": 1, "futex": 1, "pwrite64": 1})
+        self.assertEqual(counts, {"fdatasync": 1, "futex": 2, "pwrite64": 1})
         with self.assertRaises(adapters.ProfileEvidenceError):
             adapters.trace_interval_counts(payload.replace(end, "101 write(9, \"missing\", 7) = 7"), boundary)
         with self.assertRaises(adapters.ProfileEvidenceError):

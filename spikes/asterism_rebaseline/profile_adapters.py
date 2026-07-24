@@ -794,11 +794,13 @@ def _immutable_file_snapshot(
     claimed_sha256: object,
     expected_mode: int | None,
     context: str,
+    *,
+    limit: int | None = 16 * 1024 * 1024,
 ) -> tuple[Path, bytes, tuple[int, int, int, int, int, int, int]]:
     if not isinstance(claimed_sha256, str) or not _SHA256_RE.fullmatch(claimed_sha256):
         raise ProfileEvidenceError(f"{context} SHA-256 is malformed")
     path, payload, identity = _immutable_file_payload(
-        path_value, expected_mode, context
+        path_value, expected_mode, context, limit=limit
     )
     if _sha256_bytes(payload) != claimed_sha256:
         raise ProfileEvidenceError(f"{context} SHA-256 differs")
@@ -838,7 +840,9 @@ def _unclaimed_local_canonical_json_snapshot(
     return path, payload, _local_canonical_json_payload(payload, context)
 
 
-def _raw_artifact_snapshot(value: object, context: str) -> tuple[Path, bytes]:
+def _raw_artifact_snapshot(
+    value: object, context: str, *, limit: int | None = 16 * 1024 * 1024
+) -> tuple[Path, bytes]:
     binding = _exact_mapping(
         value,
         ("path", "sha256", "bytes", "mode"),
@@ -847,7 +851,7 @@ def _raw_artifact_snapshot(value: object, context: str) -> tuple[Path, bytes]:
     if binding["mode"] != 0o444:
         raise ProfileEvidenceError(f"{context} mode authority differs")
     path, payload, _identity = _immutable_file_snapshot(
-        binding["path"], binding["sha256"], 0o444, context
+        binding["path"], binding["sha256"], 0o444, context, limit=limit
     )
     if _json_nonnegative_integer(binding["bytes"], f"{context} bytes") != len(payload):
         raise ProfileEvidenceError(f"{context} byte length differs")
@@ -1650,7 +1654,11 @@ def parse_perf_stat_csv(
         if not line or line.startswith("#"):
             continue
         fields = [part.strip() for part in line.split(",")]
-        if len(fields) not in {5, 6} or (len(fields) == 6 and fields[5]):
+        # Real perf 7.1.4 emits 7 CSV fields:
+        # value,unit,event,runtime,percent,metric-value,metric-unit — the last
+        # two are empty for these counters.  Accept 5-7 fields provided every
+        # field beyond index 4 (percent) is empty.
+        if len(fields) not in {5, 6, 7} or any(fields[5:]):
             raise ProfileEvidenceError(f"perf CSV row shape differs: {raw!r}")
         value_text, unit, raw_event = fields[:3]
         event = raw_event.removesuffix(":u")
@@ -1874,7 +1882,7 @@ _RAW_CALL = re.compile(
 )
 _TRACE_MARKER_WRITE = re.compile(
     r"^(?:\[pid\s+(?P<bracket_pid>\d+)\]\s+|(?P<pid>\d+)\s+)"
-    r"(?:\d+\.\d+\s+)?write\((?P<fd>\d+)(?:<[^>]*>)?,\s*"
+    r"(?:\d+\.\d+\s+)?write\((?P<fd>\d+)(?:<[^,]*>)?,\s*"
     r"(?P<payload>\"(?:\\.|[^\"\\])*\"),\s*(?P<count>\d+)\)\s*"
     r"=\s*(?P<result>\d+)$"
 )
@@ -1884,15 +1892,23 @@ _TRACE_RESUMED = re.compile(
 )
 _TRACE_SYNC_FD = re.compile(
     r"^(?:\[pid\s+\d+\]\s+|\d+\s+)?(?:\d+\.\d+\s+)?"
-    r"(?P<syscall>fsync|fdatasync)\(\d+<(?P<path>[^>]*)>\)\s*"
-    r"=\s*-?\d+(?:\s+.*)?$"
+    r"(?P<syscall>fsync|fdatasync)\(\d+<(?P<path>[^>]*)>"
+    # Two terminators: a complete single-line call, or an interleaved
+    # `<unfinished ...>` entry line (which carries the resolved -yy path but no
+    # closing paren / `= N`).  The entry line is the line the interval counter
+    # records, so accepting it lets the path family classify correctly.
+    r"(?:\)\s*=\s*-?\d+(?:\s+.*)?|\s+<unfinished \.\.\.>)$"
 )
 
 
 def _wire_event(event_value: object, context: str) -> bytes:
     event = _as_mapping(event_value, context)
     wire = {key: value for key, value in event.items() if not key.startswith("_runner_")}
-    return canonical_json(wire)
+    # The child writes the canonical JSON and its trailing LF as two separate
+    # write(2) calls, so the marker write payload is JSON-only WITHOUT the LF
+    # that canonical_json appends.  Strip it here so the exact-marker match can
+    # succeed; canonical_json itself is left intact for boundary sha256 binding.
+    return canonical_json(wire)[:-1]
 
 
 def _is_exact_trace_marker(
@@ -1967,7 +1983,11 @@ def _trace_interval_records(
             continue
         if end:
             ended += 1
-            if not active or ended != 1 or unfinished:
+            # Outstanding `unfinished` entries are allowed at the end marker:
+            # threads blocked in futex across the interval edge leave an
+            # in-window `<unfinished ...>` still outstanding.  It was already
+            # counted at its initial in-window line, so this is not an error.
+            if not active or ended != 1:
                 raise ProfileEvidenceError("trace end has invalid state/outstanding calls")
             active = False
             continue
@@ -1979,8 +1999,18 @@ def _trace_interval_records(
             pid_text = resumed.group("bracket_pid") or resumed.group("pid") or "unknown"
             key = (pid_text, resumed.group("syscall"))
             if unfinished[key] != 1:
-                raise ProfileEvidenceError(f"unpaired/resumed trace call: {raw!r}")
+                # A `<... resumed>` with no matching in-window `<unfinished ...>`
+                # began before the interval (e.g. a futex blocked across the
+                # begin marker).  It was never counted in-window, so skip it
+                # rather than treating it as an unpaired call.
+                continue
             del unfinished[key]
+            continue
+        # strace signal / stop frames (e.g. `--- SIGSTOP {...} ---`,
+        # `--- stopped by SIGSTOP ---`, `--- SIGCONT {...} ---`) appear inside
+        # the window when SIGSTOP-parked children are resumed.  They are not
+        # syscalls; skip them rather than failing the interval parse.
+        if stripped.startswith("---") and stripped.endswith("---"):
             continue
         match = _RAW_CALL.match(stripped)
         if match is None:
@@ -1995,7 +2025,10 @@ def _trace_interval_records(
                 (prefix.group(1) or prefix.group(2)) if prefix is not None else "unknown"
             )
             unfinished[(pid_text, syscall)] += 1
-    if began != 1 or ended != 1 or active or unfinished:
+    # Outstanding `unfinished` calls are permitted here (see the end-marker
+    # branch): they were counted at their in-window initial line and their
+    # resumed line lands after the interval.  Keep begin/end/active intact.
+    if began != 1 or ended != 1 or active:
         raise ProfileEvidenceError(
             f"trace exact boundary/state invalid: begin={began} end={ended} "
             f"active={active} unfinished={dict(unfinished)}"
@@ -2166,7 +2199,20 @@ def _trace_sync_path(raw: str, syscall: str) -> str:
 
 def _trace_path_matches(path: str, marker: tuple[str, str]) -> bool:
     kind, authority_path = marker
-    return path == authority_path if kind == "exact" else path.startswith(authority_path)
+    if kind == "exact":
+        return path == authority_path
+    if kind == "directory_prefix":
+        # Normal case: a file inside the directory subtree.  Directory-fd case:
+        # an fsync of the directory *itself* renders its -yy path with no
+        # trailing slash (e.g. `<store>/log`), which does not `startswith` the
+        # slash-terminated prefix; classify it into this family too.  This does
+        # not leak across families because the reviewed markers are proven
+        # non-overlapping (checked in trace_interval_metrics).
+        return path.startswith(authority_path) or path == authority_path.rstrip("/")
+    # file_prefix: files sharing the prefix, plus a barrier fsync of the parent
+    # directory that holds them (e.g. the log directory `<store>/log` for a
+    # `<store>/log/seg-` file prefix).
+    return path.startswith(authority_path) or path == str(Path(authority_path).parent)
 
 
 def _trace_markers_overlap(
@@ -3617,8 +3663,11 @@ def _replay_perf_inputs(inputs: Mapping[str, object]) -> dict[str, object]:
 def _replay_trace_inputs(
     inputs: Mapping[str, object], boundary: Mapping[str, object]
 ) -> dict[str, object]:
+    # The runner snapshots the trace with no size limit and a busy interval can
+    # exceed the default 16 MiB cap.  Lift the cap for the trace artifact only;
+    # the sha256/byte-length binding below remains the integrity authority.
     _, payload = _raw_artifact_snapshot(
-        inputs["trace_raw_artifact"], "strace raw artifact"
+        inputs["trace_raw_artifact"], "strace raw artifact", limit=None
     )
     try:
         text = payload.decode()
