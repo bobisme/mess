@@ -503,13 +503,20 @@ fn worker_args() -> Option<(KillPoint, PathBuf, PathBuf, String)> {
 
 fn write_ready_marker(path: &Path, point: KillPoint, nonce: &str) {
     let expected = format!("case={}\nnonce={}\n", point.id(), nonce);
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .expect("create fault worker ready marker");
-    file.write_all(expected.as_bytes()).expect("write fault worker marker");
-    file.sync_all().expect("sync fault worker marker");
+    // Publish atomically: the parent polls `path.is_file()` and immediately
+    // reads it, so it must never observe the marker after creation but before
+    // its contents land.  Write+fsync a temp file, then rename it into place.
+    let tmp = path.with_extension("marker-tmp");
+    {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .expect("create fault worker ready marker temp");
+        file.write_all(expected.as_bytes()).expect("write fault worker marker");
+        file.sync_all().expect("sync fault worker marker");
+    }
+    std::fs::rename(&tmp, path).expect("publish fault worker ready marker");
 }
 
 fn fault_worker(
