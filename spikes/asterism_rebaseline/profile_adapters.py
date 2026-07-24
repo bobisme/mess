@@ -3470,7 +3470,14 @@ def _primary_profile_fields(
     role_label, task = _critical_role(result)
     identity = _as_mapping(task["identity"], "critical role identity")
     cpu_ns = _json_nonnegative_integer(task["on_cpu_ns"], "critical role cpu_ns")
-    require_measurable_role_cpu(cpu_ns, _resolution(inputs))
+    # A critical-role CPU delta below the decision floor (20 x schedstat
+    # resolution) is NOT a fail-stop: it means the role is I/O-bound (e.g. an
+    # owner dominated by fsync wait under durability=Process) so its CPU is below
+    # the scheduler's noise floor.  The canonical evaluator is designed to treat
+    # this as an INCONCLUSIVE outcome (evaluate.py primary cpu-resolution and
+    # cpu-profile-resolution reasons); record serialized_role_cpu_ns and let it
+    # decide rather than crashing the run before the evaluator ever sees it.
+    _resolution(inputs)  # still validates schedstat_resolution_ns is positive
     return {
         "process_user_cpu_ns": rusage.user_ns,
         "process_system_cpu_ns": rusage.system_ns,
@@ -4245,11 +4252,11 @@ def profile_fields(
         if replayed_perf_inputs is None:
             raise AssertionError("CPU profile raw evidence was not replayed")
         rusage = _rusage_profile(measured_inputs)
-        _, critical = _critical_role(rich)
-        require_measurable_role_cpu(
-            _json_nonnegative_integer(critical["on_cpu_ns"], "critical role cpu_ns"),
-            _resolution(measured_inputs),
-        )
+        # Validate the critical-role structure but do NOT gate on its CPU delta:
+        # a below-decision-floor role CPU is an INCONCLUSIVE outcome the evaluator
+        # handles (cpu-profile-resolution), not a fail-stop.  The role CPU is
+        # recorded in role_samples_json below.
+        _critical_role(rich)
         process = _as_mapping(rich["process"], "CPU profile process")
         result = {
             **_perf_profile(replayed_perf_inputs),

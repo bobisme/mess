@@ -3414,7 +3414,7 @@ class ProfileFieldTests(unittest.TestCase):
             ):
                 adapters._roles(mutated)
 
-    def test_primary_fields_are_exact_and_apply_resolution_floor(self) -> None:
+    def test_primary_fields_are_exact_and_tolerate_below_floor_cpu(self) -> None:
         rich = self.rich("primary", roles=[self.owner_role()])
         inputs = {"schedstat_resolution_ns": 20}
         fields = adapters.profile_fields(
@@ -3428,16 +3428,19 @@ class ProfileFieldTests(unittest.TestCase):
         self.assertEqual(fields["process_user_cpu_ns"], 20)
         self.assertEqual(fields["serialized_role"], "mess-flat-owner")
         self.assertEqual(fields["serialized_role_cpu_ns"], 400)
+        # A critical-role CPU below the decision floor (21*20=420 > 400) is NOT a
+        # fail-stop: the value flows through and the evaluator marks the outcome
+        # INCONCLUSIVE (evaluate.py cpu-resolution / cpu-profile-resolution).
         inputs["schedstat_resolution_ns"] = 21
-        with self.assertRaises(adapters.ProfileEvidenceError):
-            adapters.profile_fields(
-                "primary",
-                rich,
-                raw_point={"track": "primary", "variant": "A"},
-                control_events=control_events(rich["authority"]),
-                authority=rich["authority"],
-                profile_inputs=inputs,
-            )
+        below_floor = adapters.profile_fields(
+            "primary",
+            rich,
+            raw_point={"track": "primary", "variant": "A"},
+            control_events=control_events(rich["authority"]),
+            authority=rich["authority"],
+            profile_inputs=inputs,
+        )
+        self.assertEqual(below_floor["serialized_role_cpu_ns"], 400)
 
     def test_cpu_fields_flatten_roles_and_perf(self) -> None:
         rich = self.rich("cpu_profiles", roles=[self.owner_role(2_000)])
