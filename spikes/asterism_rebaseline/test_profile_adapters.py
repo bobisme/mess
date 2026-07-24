@@ -3372,6 +3372,20 @@ class ProfileFieldTests(unittest.TestCase):
             "unattributed_births": [],
         }
 
+    def test_role_replay_tolerates_tokio_worker_caught_mid_rename(self) -> None:
+        # A producer-runtime tokio worker sampled before prctl renamed it keeps
+        # the process (executable) comm; the replay must tolerate that pre-rename
+        # state (bn-1gle).  The producer identity is shared between the role and
+        # every phase task, so one edit propagates.
+        rich = self.c_rich()
+        exe_comm = rich["authority"]["executable_comm"]
+        self.assertNotEqual(exe_comm, adapters.TOKIO_WORKER_COMM)
+        rich["roles"][1]["tasks"][0]["identity"]["comm"] = exe_comm
+        self.assertEqual(
+            [role["label"] for role in adapters._roles(rich)],
+            ["committer", "producer-runtime", "spawn_blocking-publication"],
+        )
+
     def test_role_replay_rejects_forged_births_and_hidden_tasks(self) -> None:
         rich = self.c_rich()
         self.assertEqual(

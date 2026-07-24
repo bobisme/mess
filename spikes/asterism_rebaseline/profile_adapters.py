@@ -1357,6 +1357,12 @@ class ProfileCoordinator:
         runtime = phases["runtime"]
         ready = phases["ready"]
         main_comm = require_main_task(boot).comm
+        # A newly-spawned tokio worker inherits the process comm (main_comm) and
+        # only renames itself to TOKIO_WORKER_COMM once it runs (prctl in-thread),
+        # so a birth snapshot can legitimately catch a worker mid-rename with
+        # main_comm.  Tolerate that pre-rename state in the tokio-worker birth
+        # groups below (and in end()).
+        self._main_comm = main_comm
         roles: list[RoleBinding] = []
         if self.track not in self.ROLE_TRACKS:
             pass
@@ -1404,7 +1410,7 @@ class ProfileCoordinator:
                             "producer-runtime",
                             boot.tasks,
                             runtime.tasks,
-                            allowed_comms=(TOKIO_WORKER_COMM,),
+                            allowed_comms=(TOKIO_WORKER_COMM, main_comm),
                         ),
                     ),
                 )
@@ -1462,7 +1468,7 @@ class ProfileCoordinator:
                 "spawn_blocking-publication",
                 start.ready.tasks,
                 terminal.tasks,
-                allowed_comms=(TOKIO_WORKER_COMM,),
+                allowed_comms=(TOKIO_WORKER_COMM, self._main_comm),
             )
             publication_deltas = tuple(
                 TaskDelta(
@@ -3381,14 +3387,17 @@ def _roles(result: Mapping[str, object]) -> list[Mapping[str, object]]:
             identity = task["identity"]
             key = (identity["tid"], identity["start_ticks"])
             label = role["label"]
-            expected_comm = (
-                "mess-flat-owner"
+            # tokio worker roles tolerate a member caught mid-rename, whose comm
+            # is still the process (executable) name before prctl renames it to
+            # TOKIO_WORKER_COMM (see ProfileCoordinator birth groups).
+            expected_comms = (
+                ("mess-flat-owner",)
                 if label == "owner"
-                else TOKIO_WORKER_COMM
+                else (TOKIO_WORKER_COMM, authority["executable_comm"])
                 if label in {"producer-runtime", "spawn_blocking-publication"}
-                else authority["executable_comm"]
+                else (authority["executable_comm"],)
             )
-            if identity["comm"] != expected_comm:
+            if identity["comm"] not in expected_comms:
                 raise ProfileEvidenceError(f"role {label} comm differs")
             if label == "spawn_blocking-publication":
                 if key in ready_tasks or key not in terminal_tasks:
@@ -3419,14 +3428,21 @@ def _roles(result: Mapping[str, object]) -> list[Mapping[str, object]]:
         raise ProfileEvidenceError("bare variant has unbound boot-to-runtime births")
     if variant == "C":
         producer_births = births("boot", "runtime")
+        tokio_worker_comms = {TOKIO_WORKER_COMM, authority["executable_comm"]}
         if (
             set(producer_births) != role_task_keys["producer-runtime"]
-            or any(task["comm"] != TOKIO_WORKER_COMM for task in producer_births.values())
+            or any(
+                task["comm"] not in tokio_worker_comms
+                for task in producer_births.values()
+            )
         ):
             raise ProfileEvidenceError("producer boot-to-runtime birth replay differs")
         if (
             set(terminal_births) != role_task_keys["spawn_blocking-publication"]
-            or any(task["comm"] != TOKIO_WORKER_COMM for task in terminal_births.values())
+            or any(
+                task["comm"] not in tokio_worker_comms
+                for task in terminal_births.values()
+            )
         ):
             raise ProfileEvidenceError("publication ready-to-measured birth replay differs")
         expected_terminal_births = role_task_keys["spawn_blocking-publication"]
