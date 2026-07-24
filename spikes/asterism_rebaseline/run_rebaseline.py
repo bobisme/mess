@@ -78,6 +78,33 @@ MAX_LOAD1 = 6.0
 QUIET_TIMEOUT_SECONDS = 120
 QUIET_POLL_SECONDS = 1
 ROW_TIMEOUT_SECONDS = 1_800
+
+# Tracks whose per-row store is a fresh, independent, single-use measurement
+# store (self._fresh_store, store_absent_before=True) that is never reopened
+# after its evidence row is recorded — safe to reclaim to bound peak disk on
+# long full-matrix runs.  Deliberately excludes reopen/structural_traces
+# (materialized from a shared corpus) and correctness/fault (store reused across
+# pre/post), whose stores must persist.
+_RECLAIMABLE_MEASUREMENT_TRACKS = frozenset(
+    {"primary", "cpu_profiles", "syscall_profiles", "fairness"}
+)
+
+
+def _reclaim_store_tree(path: Path) -> None:
+    """Best-effort removal of a completed single-use scratch store, tolerating
+    read-only entries the store engine may have created.  Failures are ignored:
+    reclaiming disk is an optimization, never a correctness requirement."""
+
+    try:
+        for root, dirs, files in os.walk(path):
+            for name in dirs + files:
+                try:
+                    os.chmod(os.path.join(root, name), 0o700)
+                except OSError:
+                    pass
+        shutil.rmtree(path, ignore_errors=True)
+    except OSError:
+        pass
 C_PROFILE_CHILD_TIMEOUT_SECONDS = 120
 C_ROLE_LIFETIME_CONTRACT = {
     "schema": "bn-2l3n-c-role-lifetime-v3",
@@ -10853,6 +10880,21 @@ class RebaselineRunner:
         publish_child_record()
         self.child_count += 1
         self._settle(plan.context.get("durability"), f"{ordinal:05d}-{plan.kind}")
+        # Reclaim the completed single-use measurement-row store to bound peak
+        # disk on long full-matrix runs.  Safe: its evidence row is already
+        # recorded, the store id is a name (not a content hash), require_store_
+        # after was a per-cell check, and nothing re-reads the stores dir.  Only
+        # fresh (store_absent_before) pure-measurement tracks are reclaimed;
+        # correctness/fault (reused across pre/post) and corpus-backed reopen
+        # stores are retained.
+        if (
+            plan.store_path is not None
+            and plan.require_store_after
+            and plan.store_absent_before
+            and plan.kind not in {"correctness", "fault"}
+            and plan.track in _RECLAIMABLE_MEASUREMENT_TRACKS
+        ):
+            _reclaim_store_tree(plan.store_path)
         return record
 
 
