@@ -1411,7 +1411,7 @@ PROFILE_OPEN_HELPER_COMMS: Final = (
     "mess-engine-rol",
     "mess-sealer",
 )
-PROFILE_TOKIO_WORKER_COMM: Final = "tokio-runtime-w"
+PROFILE_TOKIO_WORKER_COMM: Final = "tokio-rt-worker"
 PROFILE_C_ROLE_LIFETIME_CONTRACT: Final = {
     "schema": "bn-2l3n-c-role-lifetime-v3",
     "blocking_thread_keep_alive_ns": 3_600_000_000_000,

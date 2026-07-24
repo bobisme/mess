@@ -3008,7 +3008,7 @@ class CoordinatorTests(unittest.TestCase):
             proc_root=self.root,
         )
         coordinator.capture_phase("boot")
-        write_task(self.root, self.pid, 201, "tokio-runtime-w", 1001, on_cpu_ns=50)
+        write_task(self.root, self.pid, 201, "tokio-rt-worker", 1001, on_cpu_ns=50)
         coordinator.capture_phase("runtime")
         write_task(self.root, self.pid, 202, "public-bench", 1002, on_cpu_ns=100)
         coordinator.capture_phase("opened")
@@ -3020,7 +3020,7 @@ class CoordinatorTests(unittest.TestCase):
             self.root,
             self.pid,
             201,
-            "tokio-runtime-w",
+            "tokio-rt-worker",
             1001,
             on_cpu_ns=550,
             voluntary=3,
@@ -3038,7 +3038,7 @@ class CoordinatorTests(unittest.TestCase):
             self.root,
             self.pid,
             203,
-            "tokio-runtime-w",
+            "tokio-rt-worker",
             1003,
             on_cpu_ns=300,
             voluntary=1,

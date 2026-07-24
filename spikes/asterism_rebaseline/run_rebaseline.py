@@ -11196,8 +11196,8 @@ class _FakeSchema:
                 "B": ["committer:runtime-to-opened-unique-unnamed-birth"],
                 "C": [
                     "committer:runtime-to-opened-unique-unnamed-birth",
-                    "producer-runtime:boot-to-runtime-births:comm=tokio-runtime-w",
-                    "spawn_blocking-publication:ready-to-measured-births:comm=tokio-runtime-w",
+                    "producer-runtime:boot-to-runtime-births:comm=tokio-rt-worker",
+                    "spawn_blocking-publication:ready-to-measured-births:comm=tokio-rt-worker",
                 ],
                 "D": ["owner:comm=mess-flat-owner"],
             },

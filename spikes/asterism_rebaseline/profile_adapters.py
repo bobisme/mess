@@ -62,7 +62,7 @@ VARIANT_SOURCE_BINDINGS = {
 # Linux exposes only 15 comm bytes. These are the exact reviewed helper names
 # that may be born while the historical public engine opens.
 OPEN_HELPER_COMMS = frozenset(("fjall:worker", "mess-sealer", "mess-engine-rol"))
-TOKIO_WORKER_COMM = "tokio-runtime-w"
+TOKIO_WORKER_COMM = "tokio-rt-worker"
 SYSCALL_EVENTS = (
     "write",
     "pwrite64",
