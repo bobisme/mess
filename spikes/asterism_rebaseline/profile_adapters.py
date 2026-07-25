@@ -87,6 +87,10 @@ SYSCALL_EVENTS = (
     "getdents64",
     "read",
     "pread64",
+    # The ready/measured trace boundary markers are UnixStream writes, which
+    # Rust std lowers to sendto(.., MSG_NOSIGNAL, ..) on Linux.  Approve sendto
+    # so the markers are recognised; no domain sendto occurs inside the interval.
+    "sendto",
 )
 
 
@@ -1938,9 +1942,15 @@ _RAW_CALL = re.compile(
     r"^(?:\[pid\s+\d+\]\s+|\d+\s+)?(?:\d+\.\d+\s+)?([A-Za-z0-9_]+)\("
 )
 _TRACE_MARKER_WRITE = re.compile(
+    # The child emits markers over a UnixStream, so Rust std lowers each write
+    # to sendto(fd, payload, len, MSG_NOSIGNAL, NULL, 0) on Linux.  Accept both
+    # sendto and write(2); tolerate sendto's trailing flags/addr args after the
+    # byte count.  The fd + exact-payload check in _is_exact_trace_marker keeps
+    # a same-payload domain write on another fd from matching.
     r"^(?:\[pid\s+(?P<bracket_pid>\d+)\]\s+|(?P<pid>\d+)\s+)"
-    r"(?:\d+\.\d+\s+)?write\((?P<fd>\d+)(?:<[^,]*>)?,\s*"
-    r"(?P<payload>\"(?:\\.|[^\"\\])*\"),\s*(?P<count>\d+)\)\s*"
+    r"(?:\d+\.\d+\s+)?(?:write|sendto)\((?P<fd>\d+)(?:<[^,]*>)?,\s*"
+    r"(?P<payload>\"(?:\\.|[^\"\\])*\"),\s*(?P<count>\d+)"
+    r"(?:,\s*[^)]*)?\)\s*"
     r"=\s*(?P<result>\d+)$"
 )
 _TRACE_RESUMED = re.compile(
@@ -1961,10 +1971,11 @@ _TRACE_SYNC_FD = re.compile(
 def _wire_event(event_value: object, context: str) -> bytes:
     event = _as_mapping(event_value, context)
     wire = {key: value for key, value in event.items() if not key.startswith("_runner_")}
-    # The child writes the canonical JSON and its trailing LF as two separate
-    # write(2) calls, so the marker write payload is JSON-only WITHOUT the LF
-    # that canonical_json appends.  Strip it here so the exact-marker match can
-    # succeed; canonical_json itself is left intact for boundary sha256 binding.
+    # The child sends the canonical JSON and its trailing LF as two separate
+    # UnixStream writes (sendto on Linux), so the marker payload is JSON-only
+    # WITHOUT the LF that canonical_json appends.  Strip it here so the exact-
+    # marker match can succeed; canonical_json itself is left intact for the
+    # boundary sha256 binding.
     return canonical_json(wire)[:-1]
 
 

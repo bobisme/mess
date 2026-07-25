@@ -1405,6 +1405,10 @@ PROFILE_SYSCALL_EVENTS: Final = (
     "getdents64",
     "read",
     "pread64",
+    # Trace boundary markers are UnixStream writes (sendto on Linux); approve
+    # sendto so the syscall-event set stays identical across the runner,
+    # profile adapter, and schema.  No domain sendto occurs in the interval.
+    "sendto",
 )
 PROFILE_OPEN_HELPER_COMMS: Final = (
     "fjall:worker",

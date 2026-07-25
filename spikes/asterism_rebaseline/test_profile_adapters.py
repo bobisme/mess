@@ -975,15 +975,17 @@ def marker_line(authority: dict[str, object], event: dict[str, object]) -> str:
     wire = {
         key: value for key, value in event.items() if not key.startswith("_runner_")
     }
-    # Real producer: the child writes the canonical JSON and its trailing LF as
-    # two separate write(2) calls, so the marker write payload is JSON-only with
-    # NO trailing newline.  strace -yy renders the control socket fd with a
-    # UNIX-STREAM annotation that contains `->` between the inode numbers.
+    # Real producer: the child sends the canonical JSON and its trailing LF as
+    # two separate UnixStream writes, which Rust std lowers to
+    # sendto(fd, .., MSG_NOSIGNAL, NULL, 0) on Linux -- so the marker payload is
+    # JSON-only with NO trailing newline, and strace -yy renders it as a sendto
+    # on the control socket fd (UNIX-STREAM annotation with `->` between inodes).
     payload = adapters.canonical_json(wire).decode()[:-1]
+    length = len(payload.encode())
     return (
         f'{authority["child_pid"]} '
-        f"write({authority['control_fd']}<UNIX-STREAM:[12160409->12160410]>, "
-        f"{json.dumps(payload)}, {len(payload.encode())}) = {len(payload.encode())}"
+        f"sendto({authority['control_fd']}<UNIX-STREAM:[12160409->12160410]>, "
+        f"{json.dumps(payload)}, {length}, MSG_NOSIGNAL, NULL, 0) = {length}"
     )
 
 
@@ -2363,6 +2365,63 @@ class ParseTests(unittest.TestCase):
                 forged, boundary, allowed_syscalls=("pwrite64", "futex", "fdatasync")
             ),
             counts,
+        )
+
+    def test_trace_markers_accept_sendto_and_legacy_write(self) -> None:
+        # The child emits its ready/measured control markers over a UnixStream,
+        # which Rust std lowers to sendto(fd, .., MSG_NOSIGNAL, NULL, 0) on Linux
+        # rather than write(2) (bn-3nol).  The parser must recognise the real
+        # sendto form and stay backward compatible with a plain write(2) marker.
+        authority = synthetic_authority("A", "syscall_profiles", {}, pid=101)
+        events = control_events(authority)
+        boundary = trace_boundary(authority, events)
+
+        def payload_of(event: dict[str, object]) -> tuple[str, int]:
+            text = adapters.canonical_json(
+                {k: v for k, v in event.items() if not str(k).startswith("_runner_")}
+            ).decode()[:-1]
+            return text, len(text.encode())
+
+        def sendto_marker(event: dict[str, object]) -> str:
+            text, n = payload_of(event)
+            return (
+                f'{authority["child_pid"]} '
+                f"sendto({authority['control_fd']}<UNIX-STREAM:[7->8]>, "
+                f"{json.dumps(text)}, {n}, MSG_NOSIGNAL, NULL, 0) = {n}"
+            )
+
+        def write_marker(event: dict[str, object]) -> str:
+            text, n = payload_of(event)
+            return (
+                f'{authority["child_pid"]} '
+                f"write({authority['control_fd']}, {json.dumps(text)}, {n}) = {n}"
+            )
+
+        # sendto begin + legacy write end: both are accepted as exact boundaries.
+        payload = (
+            f"{sendto_marker(boundary['begin_event'])}\n"
+            f'101 pwrite64(3, "x", 1, 0) = 1\n'
+            f"{write_marker(boundary['end_event'])}\n"
+        )
+        self.assertEqual(
+            adapters.trace_interval_counts(
+                payload, boundary, allowed_syscalls=("pwrite64",)
+            ),
+            {"pwrite64": 1},
+        )
+        # A sendto to the control fd whose payload is NOT a boundary must not be
+        # mistaken for a marker; with sendto approved it is a normal in-interval
+        # call (it never occurs for real cells, but the set must tolerate it).
+        with_extra = (
+            f"{sendto_marker(boundary['begin_event'])}\n"
+            f'101 sendto({authority["control_fd"]}<UNIX-STREAM:[7->8]>, "hi", 2, MSG_NOSIGNAL, NULL, 0) = 2\n'
+            f"{write_marker(boundary['end_event'])}\n"
+        )
+        self.assertEqual(
+            adapters.trace_interval_counts(
+                with_extra, boundary, allowed_syscalls=("sendto",)
+            ),
+            {"sendto": 1},
         )
 
     def test_raw_trace_metrics_partition_sync_and_file_operations(self) -> None:

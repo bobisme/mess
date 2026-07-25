@@ -203,6 +203,12 @@ TRACE_SYSCALLS = (
     "getdents64",
     "read",
     "pread64",
+    # The child emits its ready/measured trace boundary markers over a
+    # UnixStream, which Rust std lowers to sendto(fd, .., MSG_NOSIGNAL, ..) on
+    # Linux -- NOT write(2).  strace must trace sendto or the interval markers
+    # are never captured (begin=0/end=0).  No domain sendto occurs inside the
+    # measured window, so this does not perturb the counted syscall profile.
+    "sendto",
 )
 CURRENT_CHILDREN_ATTESTATION_SCHEMA = "bn-ecm1-current-children-build-v2"
 CURRENT_BUILD_CARGO_CONFIG_SCHEMA = "bn-30fs-build-cargo-config-search-v1"
