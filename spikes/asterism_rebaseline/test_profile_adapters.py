@@ -3179,6 +3179,61 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(rendered["context"], {"cell": "group-b1"})
         self.assertEqual(result.process.io.read_bytes, 10)
 
+    def test_fairness_zero_publication_births_bind_empty(self) -> None:
+        # Fairness variant-C warmup (warm_rounds=4) invokes the injected
+        # spawn_blocking BEFORE `ready`, and thread_keep_alive parks that worker,
+        # so the in-window spawn_blocking reuses it and NO tokio worker is born
+        # ready->measured.  end() must bind an empty proof-only publication role
+        # rather than fail-stopping (bn-1pkm).  The deterministic C tracks
+        # (cpu_profiles, warm_rounds=0) keep raising -- covered by
+        # test_unreviewed_open_birth_and_transient_publication_fail.
+        context = {"cell": "fair-c1"}
+        authority = self.authority("C", "fairness", context)
+        coordinator = adapters.ProfileCoordinator.for_child(
+            self.pid,
+            "C",
+            "fairness",
+            authority=authority,
+            context=context,
+            proc_root=self.root,
+        )
+        coordinator.capture_phase("boot")
+        write_task(self.root, self.pid, 201, "tokio-rt-worker", 1001, on_cpu_ns=50)
+        coordinator.capture_phase("runtime")
+        write_task(self.root, self.pid, 202, "public-bench", 1002, on_cpu_ns=100)
+        coordinator.capture_phase("opened")
+        coordinator.capture_phase("ready")
+        start = coordinator.begin()
+        self.assertEqual(
+            [role.label for role in start.roles], ["committer", "producer-runtime"]
+        )
+        # Measured window: only update counters on the existing threads; the warm
+        # blocking worker is reused, so no fresh TID appears ready->measured.
+        write_task(
+            self.root, self.pid, 201, "tokio-rt-worker", 1001, on_cpu_ns=550, voluntary=3
+        )
+        write_task(
+            self.root, self.pid, 202, "public-bench", 1002, on_cpu_ns=900, nonvoluntary=2
+        )
+        process = self.root / str(self.pid)
+        (process / "status").write_text(
+            "VmHWM: 200 kB\n"
+            "voluntary_ctxt_switches: 14\n"
+            "nonvoluntary_ctxt_switches: 5\n"
+        )
+        (process / "io").write_text(io_record(110))
+        coordinator.end()
+        rendered = coordinator.finish()
+        roles = {role["label"]: role for role in rendered["roles"]}
+        self.assertEqual(
+            sorted(roles),
+            ["committer", "producer-runtime", "spawn_blocking-publication"],
+        )
+        publication = roles["spawn_blocking-publication"]
+        self.assertEqual(publication["tasks"], [])
+        self.assertEqual(publication["on_cpu_ns"], 0)
+        self.assertTrue(publication["born_in_window"])
+
     def test_phase_order_and_early_finish_fail(self) -> None:
         authority = self.authority("A", "primary", {})
         coordinator = adapters.ProfileCoordinator.for_child(
@@ -3504,6 +3559,34 @@ class ProfileFieldTests(unittest.TestCase):
             [role["label"] for role in adapters._roles(rich)],
             ["committer", "producer-runtime", "spawn_blocking-publication"],
         )
+
+    def test_role_replay_tolerates_fairness_zero_publication_births(self) -> None:
+        # On the fairness track the publication role can bind zero tasks (warm-
+        # pool reuse; bn-1pkm).  The replay must accept an empty proof-only
+        # publication when no ready->measured birth occurred -- but only on
+        # fairness; off fairness the empty role is still rejected.
+        rich = self.c_rich()
+        rich["track"] = "fairness"
+        rich["authority"] = synthetic_authority("C", "fairness", {})
+        publication = rich["roles"][2]
+        publication["tasks"] = []
+        publication["on_cpu_ns"] = 0
+        publication["voluntary_context_switches"] = 0
+        publication["nonvoluntary_context_switches"] = 0
+        for snapshot in rich["phase_snapshots"]:
+            if snapshot["phase"] == "measured":
+                snapshot["tasks"] = [
+                    task for task in snapshot["tasks"] if task["tid"] != 13
+                ]
+        self.assertEqual(
+            [role["label"] for role in adapters._roles(rich)],
+            ["committer", "producer-runtime", "spawn_blocking-publication"],
+        )
+        # Off the fairness track the same empty publication is rejected.
+        rich["track"] = "cpu_profiles"
+        rich["authority"] = synthetic_authority("C", "cpu_profiles", {})
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            adapters._roles(rich)
 
     def test_role_replay_rejects_forged_births_and_hidden_tasks(self) -> None:
         rich = self.c_rich()

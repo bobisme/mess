@@ -1276,6 +1276,7 @@ def bind_birth_group(
     after: Iterable[TaskIdentity],
     *,
     allowed_comms: Iterable[str] | None = None,
+    allow_empty: bool = False,
 ) -> tuple[TaskIdentity, ...]:
     births = task_births(before, after)
     if allowed_comms is not None:
@@ -1285,7 +1286,7 @@ def bind_birth_group(
             raise ProfileEvidenceError(
                 f"role {role} has unexpected births: {[item.to_json() for item in unexpected]}"
             )
-    if not births:
+    if not births and not allow_empty:
         raise ProfileEvidenceError(f"role {role} has no phase births")
     return births
 
@@ -1519,11 +1520,20 @@ class ProfileCoordinator:
             else ()
         )
         if start.track in self.ROLE_TRACKS and start.variant == "C":
+            # The fairness track runs warm_rounds=4 (public/main.rs) which invokes
+            # the injected spawn_blocking BEFORE the ready snapshot; with
+            # thread_keep_alive=3600s those warm blocking threads persist, so the
+            # in-window spawn_blocking legitimately REUSES one and no fresh TID is
+            # born ready->measured.  Tolerate zero births for fairness only; the
+            # other C tracks (warm_rounds=0) start with an empty pool and must
+            # still observe the birth.  The role stays present (born_in_window=True)
+            # so the variant-C role tuple and the birth replay (empty==empty) hold.
             publication = bind_birth_group(
                 "spawn_blocking-publication",
                 start.ready.tasks,
                 terminal.tasks,
                 allowed_comms=(TOKIO_WORKER_COMM, self._main_comm),
+                allow_empty=(start.track == "fairness"),
             )
             publication_deltas = tuple(
                 TaskDelta(
@@ -3350,7 +3360,19 @@ def _roles(result: Mapping[str, object]) -> list[Mapping[str, object]]:
         if not isinstance(role["born_in_window"], bool):
             raise ProfileEvidenceError(f"role[{index}] born flag is invalid")
         tasks = role["tasks"]
-        if not isinstance(tasks, list) or not tasks:
+        # The fairness spawn_blocking-publication role can legitimately bind zero
+        # tasks (warm-pool reuse; see ProfileCoordinator.end); it stays present as
+        # a proof-only role with born_in_window=True.  Scope the empty-task
+        # tolerance to that exact case (fairness track + publication label) so
+        # every other role -- and this role on the deterministic C tracks -- must
+        # still have at least one task.  The birth replay below independently
+        # requires role tasks to equal the re-derived ready->measured births, so
+        # an empty publication is only accepted when no birth truly occurred.
+        publication_may_be_empty = (
+            role["label"] == "spawn_blocking-publication"
+            and result.get("track") == "fairness"
+        )
+        if not isinstance(tasks, list) or (not tasks and not publication_may_be_empty):
             raise ProfileEvidenceError(f"role[{index}] has no tasks")
         sums = {
             "on_cpu_ns": 0,
