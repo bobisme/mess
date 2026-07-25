@@ -9228,6 +9228,17 @@ def validate_row_children(
             expected_context["batches_per_writer"] = schema.FAIRNESS_BPW[
                 (identity["durability"], identity["batch_size"])
             ]
+        elif (
+            track == "structural_traces"
+            and identity.get("trace_kind") == "new_names"
+        ):
+            # Mirror the runner's derived structural new_names context
+            # (run_rebaseline.evidence_plans) so the frozen context key set stays
+            # exact.  appends_per_writer is the batches_per_writer (batch=1);
+            # payload_size 250 / batch_size 1 are the canonical public values.
+            expected_context["payload_size"] = 250
+            expected_context["batch_size"] = 1
+            expected_context["batches_per_writer"] = identity["appends_per_writer"]
         if track in {"syscall_profiles", "structural_traces"}:
             if expected_store_path is None:
                 problems.add(f"{context} trace marker store authority is unavailable")
@@ -15663,6 +15674,15 @@ def profile_fields(track, finish_result, *, raw_point, control_events, authority
             )
             if "batches_per_writer" in row:
                 context_value["batches_per_writer"] = row["batches_per_writer"]
+            if (
+                track == "structural_traces"
+                and identity.get("trace_kind") == "new_names"
+            ):
+                # Mirror the runner's derived structural new_names context so the
+                # self-test fixture records the same keys the evaluator expects.
+                context_value["payload_size"] = 250
+                context_value["batch_size"] = 1
+                context_value["batches_per_writer"] = identity["appends_per_writer"]
             if track == "reopen":
                 context_value.update(
                     {

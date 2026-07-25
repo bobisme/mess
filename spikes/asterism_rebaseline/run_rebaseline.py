@@ -8058,6 +8058,22 @@ class RebaselineRunner:
                 context["batches_per_writer"] = FAIRNESS_BPW[
                     str(context["durability"])
                 ][int(context["batch_size"])]
+            elif (
+                track == "structural_traces"
+                and context.get("trace_kind") == "new_names"
+            ):
+                # structural_traces new_names runs the append workload (the child's
+                # configured_workload requires payload/batch/writers/bpw all > 0),
+                # unlike reopen which early-returns before configured_workload.
+                # These are derived context (not frozen identity), so the
+                # evaluator's expected_context mirrors them (evaluate.py) exactly
+                # as it does for batches_per_writer on the other tracks.
+                # appends_per_writer IS the batches_per_writer (one event per
+                # append with batch=1); payload_size 250 / batch_size 1 are the
+                # canonical public values and are neither emitted nor validated.
+                context["payload_size"] = 250
+                context["batch_size"] = 1
+                context["batches_per_writer"] = context["appends_per_writer"]
             variant = str(context["variant"])
             if track == "reopen":
                 store, corpus_context = self.materialize_corpus(
