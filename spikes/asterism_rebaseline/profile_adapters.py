@@ -1957,11 +1957,19 @@ _TRACE_MARKER_WRITE = re.compile(
     # sendto and write(2); tolerate sendto's trailing flags/addr args after the
     # byte count.  The fd + exact-payload check in _is_exact_trace_marker keeps
     # a same-payload domain write on another fd from matching.
+    #
+    # Under concurrency strace can interleave another thread's syscall and split
+    # the marker send into an `<unfinished ...>` entry line + a later
+    # `<... sendto resumed> ) = N`.  The entry line already carries fd, payload
+    # and the requested byte count -- everything needed to identify the boundary
+    # -- so accept that termination too; the resumed line's `= N` is optional
+    # (see _is_exact_trace_marker) and the interval simply closes where the send
+    # STARTED.  `[^)<]*` stops the flags/addr run before either `)` or `<`.
     r"^(?:\[pid\s+(?P<bracket_pid>\d+)\]\s+|(?P<pid>\d+)\s+)"
     r"(?:\d+\.\d+\s+)?(?:write|sendto)\((?P<fd>\d+)(?:<[^,]*>)?,\s*"
     r"(?P<payload>\"(?:\\.|[^\"\\])*\"),\s*(?P<count>\d+)"
-    r"(?:,\s*[^)]*)?\)\s*"
-    r"=\s*(?P<result>\d+)$"
+    r"(?:,\s*[^)<]*)?"
+    r"(?:\)\s*=\s*(?P<result>\d+)|\s*<unfinished \.\.\.>)$"
 )
 _TRACE_RESUMED = re.compile(
     r"^(?:\[pid\s+(?P<bracket_pid>\d+)\]\s+|(?P<pid>\d+)\s+)?"
@@ -2007,11 +2015,17 @@ def _is_exact_trace_marker(
     if not isinstance(rendered, str):
         raise ProfileEvidenceError("trace marker payload is not text")
     rendered_bytes = rendered.encode()
+    # When strace split the send (`<unfinished ...>`) the result byte count lives
+    # on the later resumed line, so `result` is absent here.  The entry line's
+    # fd + payload + requested count already identify the boundary uniquely; the
+    # interval closes where the send started.  When present, the result must
+    # equal the payload length (a complete, fully-sent marker).
+    result_text = match.group("result")
     return (
         int(pid_text) == child_pid
         and int(match.group("fd")) == control_fd
         and int(match.group("count")) == len(payload)
-        and int(match.group("result")) == len(payload)
+        and (result_text is None or int(result_text) == len(payload))
         and rendered_bytes == payload
     )
 

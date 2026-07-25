@@ -2424,6 +2424,43 @@ class ParseTests(unittest.TestCase):
             {"sendto": 1},
         )
 
+    def test_trace_end_marker_accepts_unfinished_sendto(self) -> None:
+        # Under concurrency strace interleaves another thread and splits the
+        # measured-marker send into an `<unfinished ...>` entry line + a later
+        # `<... sendto resumed> ) = N`.  The interval must still close at the
+        # entry line (fd + payload + count identify it); the resumed line lands
+        # after the interval and is ignored (bn-kyc6).
+        authority = synthetic_authority("A", "syscall_profiles", {}, pid=101)
+        events = control_events(authority)
+        boundary = trace_boundary(authority, events)
+        begin = marker_line(authority, boundary["begin_event"])
+        end_wire = adapters.canonical_json(
+            {
+                key: value
+                for key, value in boundary["end_event"].items()
+                if not str(key).startswith("_runner_")
+            }
+        ).decode()[:-1]
+        end_len = len(end_wire.encode())
+        end_unfinished = (
+            f'{authority["child_pid"]} '
+            f"sendto({authority['control_fd']}<UNIX-STREAM:[7->8]>, "
+            f"{json.dumps(end_wire)}, {end_len}, MSG_NOSIGNAL, NULL, 0 <unfinished ...>"
+        )
+        end_resumed = f'{authority["child_pid"]} <... sendto resumed> ) = {end_len}'
+        payload = (
+            f"{begin}\n"
+            f'101 pwrite64(3, "x", 1, 0) = 1\n'
+            f"{end_unfinished}\n"
+            f"{end_resumed}\n"
+        )
+        self.assertEqual(
+            adapters.trace_interval_counts(
+                payload, boundary, allowed_syscalls=("pwrite64",)
+            ),
+            {"pwrite64": 1},
+        )
+
     def test_raw_trace_metrics_partition_sync_and_file_operations(self) -> None:
         authority = synthetic_authority("A", "structural_traces", {}, pid=1)
         events = control_events(authority)
