@@ -94,6 +94,16 @@ class ProfileEvidenceError(ValueError):
     """An observation cannot enter evidence without ambiguity."""
 
 
+class ProcPathVanished(ProfileEvidenceError):
+    """A /proc path disappeared mid-read because its task/process exited.
+
+    A subclass of ProfileEvidenceError so existing catchers keep their
+    behaviour; only the task-set enumeration distinguishes it, to tolerate a
+    tokio worker that the runtime reaps between listing /proc/<pid>/task and
+    reading an individual thread.
+    """
+
+
 @dataclass(frozen=True, order=True)
 class TaskIdentity:
     pid: int
@@ -910,6 +920,10 @@ class ProcReader:
             return descriptor
         except OSError as error:
             os.close(descriptor)
+            if isinstance(error, (FileNotFoundError, ProcessLookupError)):
+                raise ProcPathVanished(
+                    f"proc path vanished mid-traversal {'/'.join(parts)}: {error}"
+                ) from error
             raise ProfileEvidenceError(
                 f"cannot traverse proc path {'/'.join(parts)}: {error}"
             ) from error
@@ -927,6 +941,10 @@ class ProcReader:
             payload = _read_exact_fd(descriptor, f"proc {'/'.join(parts)}", 1024 * 1024)
             after = os.fstat(descriptor)
         except OSError as error:
+            if isinstance(error, (FileNotFoundError, ProcessLookupError)):
+                raise ProcPathVanished(
+                    f"proc path vanished before read {'/'.join(parts)}: {error}"
+                ) from error
             raise ProfileEvidenceError(
                 f"cannot read proc path {'/'.join(parts)}: {error}"
             ) from error
@@ -955,20 +973,49 @@ class ProcReader:
         )
         return TaskIdentity(pid=pid, tid=observed, start_ticks=start_ticks, comm=comm)
 
-    def tasks(self, pid: int) -> tuple[TaskIdentity, ...]:
-        directory = self._open_directory(str(pid), "task")
-        try:
-            entries = os.listdir(directory)
-        except OSError as error:
-            raise ProfileEvidenceError(f"cannot enumerate task directory: {error}") from error
-        finally:
-            os.close(directory)
-        if any(not item.isdigit() for item in entries):
-            raise ProfileEvidenceError("task directory has a nonnumeric entry")
-        tids = sorted(int(item) for item in entries)
-        if not tids:
+    def tasks(self, pid: int, *, attempts: int = 8) -> tuple[TaskIdentity, ...]:
+        # A live tokio runtime spawns and reaps worker threads continuously
+        # (the fairness 64-writer cell on this host is the worst case), so a
+        # thread listed in /proc/<pid>/task can exit before we stat it.  Retry
+        # to obtain a clean pass where every listed thread resolved; if churn
+        # persists past `attempts`, keep the survivors from the final pass
+        # rather than fail-stop on a reaped worker -- the same scheduler reality
+        # already tolerated for tokio births and VmHWM elsewhere.  A vanished
+        # process itself (the whole task dir gone) still raises: that is the
+        # caller's stability guard, not a benign per-thread reap.
+        identities: tuple[TaskIdentity, ...] = ()
+        for attempt in range(attempts):
+            last_pass = attempt == attempts - 1
+            directory = self._open_directory(str(pid), "task")
+            try:
+                entries = os.listdir(directory)
+            except OSError as error:
+                raise ProfileEvidenceError(
+                    f"cannot enumerate task directory: {error}"
+                ) from error
+            finally:
+                os.close(directory)
+            if any(not item.isdigit() for item in entries):
+                raise ProfileEvidenceError("task directory has a nonnumeric entry")
+            tids = sorted(int(item) for item in entries)
+            if not tids:
+                raise ProfileEvidenceError(f"no task identities for pid {pid}")
+            collected: list[TaskIdentity] = []
+            churned = False
+            for tid in tids:
+                try:
+                    collected.append(self.task_identity(pid, tid))
+                except ProcPathVanished:
+                    churned = True
+                    if not last_pass:
+                        break
+                    # Final attempt: drop the reaped thread, keep the rest.
+            if churned and not last_pass:
+                continue
+            identities = tuple(collected)
+            break
+        if not identities:
             raise ProfileEvidenceError(f"no task identities for pid {pid}")
-        identities = tuple(self.task_identity(pid, tid) for tid in tids)
         if len({identity.tid for identity in identities}) != len(identities):
             raise ProfileEvidenceError("duplicate task identity")
         return identities

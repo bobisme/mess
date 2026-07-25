@@ -2542,6 +2542,47 @@ class SnapshotTests(unittest.TestCase):
         with self.assertRaises(adapters.ProfileEvidenceError):
             self.reader.task_counters(identity)
 
+    def test_tasks_retry_recovers_full_set_after_transient_reap(self) -> None:
+        # A worker that vanishes on one enumeration pass but is readable on the
+        # next must not be dropped: the clean retry keeps the full thread set so
+        # a benign tokio reap does not silently shrink the snapshot (bn-3qsa).
+        second = 102
+        task2 = self.root / str(self.pid) / "task" / str(second)
+        task2.mkdir(parents=True)
+        (task2 / "stat").write_text(stat_record(second, "tokio-rt-worker", 902))
+
+        real_task_identity = self.reader.task_identity
+        state = {"failures": 1}
+
+        def flaky(pid: int, tid: int):
+            if tid == second and state["failures"] > 0:
+                state["failures"] -= 1
+                raise adapters.ProcPathVanished(f"transient {pid}/task/{tid}")
+            return real_task_identity(pid, tid)
+
+        with mock.patch.object(self.reader, "task_identity", side_effect=flaky):
+            identities = self.reader.tasks(self.pid)
+        self.assertEqual({identity.tid for identity in identities}, {self.tid, second})
+
+    def test_tasks_tolerate_persistently_reaped_worker(self) -> None:
+        # A worker reaped between listdir and its stat read (the fairness
+        # 64-writer cell on this host) must not fail-stop the child; the
+        # enumeration keeps the survivors instead of raising (bn-3qsa).
+        second = 102
+        # The dir is listed by listdir, but with no stat file the per-tid read
+        # raises ProcPathVanished on every pass -- i.e. a thread that never
+        # reappears.
+        (self.root / str(self.pid) / "task" / str(second)).mkdir(parents=True)
+        identities = self.reader.tasks(self.pid)
+        self.assertEqual({identity.tid for identity in identities}, {self.tid})
+
+    def test_vanished_process_task_dir_still_raises(self) -> None:
+        # A benign per-thread reap is tolerated, but the whole task directory
+        # disappearing (the process itself gone) is a real stability failure and
+        # must still raise -- it is the caller's process-identity guard.
+        with self.assertRaises(adapters.ProfileEvidenceError):
+            self.reader.tasks(999)
+
 
 class AuthorityMutationTests(unittest.TestCase):
     def setUp(self) -> None:
