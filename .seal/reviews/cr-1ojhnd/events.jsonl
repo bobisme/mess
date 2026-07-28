@@ -1,0 +1,3 @@
+{"ts":"2026-07-28T22:00:27.420053233Z","author":"mess-dev","event":"ReviewCreated","data":{"review_id":"cr-1ojhnd","jj_change_id":"detached:77ac65268a24f74147d9a514a7e9af0fdef2c8a3","scm_kind":"git","scm_anchor":"detached:77ac65268a24f74147d9a514a7e9af0fdef2c8a3","initial_commit":"77ac65268a24f74147d9a514a7e9af0fdef2c8a3","title":"bn-1gn1: bound prepared construction memory against the owner ring"}}
+{"ts":"2026-07-28T22:00:33.834339286Z","author":"mess-dev","event":"ReviewersRequested","data":{"review_id":"cr-1ojhnd","reviewers":["mess-security"]}}
+{"ts":"2026-07-28T22:00:45.695223197Z","author":"mess-security","event":"ReviewApproved","data":{"review_id":"cr-1ojhnd"}}

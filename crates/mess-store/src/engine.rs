@@ -1162,6 +1162,59 @@ const OWNER_RING_BYTES: usize = 64 * 1024 * 1024;
 /// producer allocation per append.
 const PREPARE_MIN_ENCODED_BYTES: usize = 16 * 1024;
 
+/// Conservative per-frame build-peak overhead for producer preparation
+/// (`bn-1gn1`).
+///
+/// `OWNER_RING_BYTES` bounds what is *queued*; before this bone it did not
+/// bound what is *under construction*. `PreparedBatch::encode` materializes the
+/// whole framed copy on the producer task, and the permit was only acquired
+/// afterwards, so N concurrent producers could each hold a fully built batch
+/// (up to `MAX_BATCH_LEN`) entirely off the books.
+///
+/// The reservation below is taken *before* preparation and must therefore be an
+/// over-estimate, never an under-estimate. Per frame it covers the scratch that
+/// the final `cost` does not:
+///
+///   - `PreparedBatch::type_id_offsets`: one `u32`
+///   - `PreparedBatch::payload_ranges`:  one `(u32, u32)`
+///   - the caller's `subframes` vector:  one `Subframe`
+///   - `type_slots`:                     one `u32`
+///
+/// plus, on the borrowed path, the `&str -> u32` interning map, whose worst
+/// case is one entry per frame.
+const PREPARE_FRAME_SCRATCH_BYTES: usize = 4
+    + 8
+    + std::mem::size_of::<Subframe<'static>>()
+    + 4
+    + std::mem::size_of::<(&'static str, u32)>()
+    + std::mem::size_of::<usize>();
+
+/// Conservative build-peak reservation for preparing `frame_count` frames whose
+/// final framed size is `encoded_estimate`, submitted for `stream_id` with
+/// `type_name_bytes` of distinct event-type names.
+///
+/// MUST NOT under-estimate the admission `cost` computed after preparation.
+/// `reconcile_owner_bytes` can correct a shortfall, but only by releasing and
+/// re-acquiring; keeping this an over-estimate is what makes the common path a
+/// pure release. `type_name_bytes` is therefore counted in full even though the
+/// prepared path dedupes names — the caller passes an upper bound.
+///
+/// Deliberately ignores allocator slack and `Vec` growth doubling: both are
+/// bounded multiples of what is counted here, and the reservation is reconciled
+/// down to the exact `cost` the moment preparation completes, so a modest
+/// over-estimate costs only a brief hold on the shared ring.
+fn prepare_build_peak(
+    stream_id_len: usize,
+    frame_count: usize,
+    encoded_estimate: usize,
+    type_name_bytes: usize,
+) -> usize {
+    stream_id_len
+        .saturating_add(encoded_estimate)
+        .saturating_add(type_name_bytes)
+        .saturating_add(frame_count.saturating_mul(PREPARE_FRAME_SCRATCH_BYTES))
+}
+
 type OwnerResult = Result<Appended, AppendError<EngineError>>;
 
 enum OwnerIntentKind {
@@ -2364,11 +2417,20 @@ pub struct EngineMetrics {
     /// not a cumulative admission counter; callers must sample only after
     /// their append cohort has completed when using it as a leak check.
     pub owner_intent_slots_in_use: usize,
-    /// Byte-budget permits currently held by admitted append-owner intents.
+    /// Byte-budget permits currently held by admitted append-owner intents
+    /// **and by producer preparation still under construction** (`bn-1gn1`).
     ///
     /// A quiescent engine reports zero. Like
     /// [`owner_intent_slots_in_use`](Self::owner_intent_slots_in_use), this is
     /// an instantaneous occupancy intended for boundedness diagnostics.
+    ///
+    /// Since `bn-1gn1` this is the engine's whole prepared-memory high-water
+    /// mark, not just its queued footprint: a producer reserves its
+    /// conservative build peak against the same ring *before* materializing
+    /// the prepared copy, then reconciles down to the exact admission
+    /// cost. That makes the reading transiently larger than the queued
+    /// bytes while preparation is in flight, which is the intended meaning
+    /// — it is the number that is actually bounded by `OWNER_RING_BYTES`.
     pub owner_intent_bytes_in_use: usize,
     /// Cumulative sealed block-cache hits.
     pub cache_hits: u64,
@@ -3806,6 +3868,34 @@ impl LogEngine {
                 .iter()
                 .all(|payload| payload.len() <= u32::MAX as usize);
 
+        // bn-1gn1: reserve the conservative build peak BEFORE materializing the
+        // prepared copy, so engine-owned construction memory is bounded by the
+        // same ring that bounds queued intents. No new queue and no ordering
+        // change: this is the ring every append already passes through, taken
+        // a few statements earlier on the one path that allocates first.
+        let build_permit = if can_prepare {
+            let type_name_bytes = match &batch.types {
+                OwnedTypeLayout::Empty => 0,
+                OwnedTypeLayout::Homogeneous(name) => name.len(),
+                OwnedTypeLayout::Heterogeneous(types) => types
+                    .names
+                    .iter()
+                    .map(String::len)
+                    .fold(0usize, usize::saturating_add),
+            };
+            Some(
+                self.reserve_owner_bytes(prepare_build_peak(
+                    stream_id.len(),
+                    batch.len(),
+                    encoded_estimate,
+                    type_name_bytes,
+                ))
+                .await?,
+            )
+        } else {
+            None
+        };
+
         let (input, cost) = if can_prepare {
             let OwnedAppendBatch { payloads, types, .. } = batch;
             let frame_count = payloads.len();
@@ -3873,16 +3963,18 @@ impl LogEngine {
             (DomainInput::Owned(batch), cost)
         };
 
-        self.enqueue_owner(
-            OwnerIntentKind::Domain {
-                stream: stream_id.to_owned(),
-                expected,
-                input,
-            },
-            cost,
-            inflight,
-        )
-        .await
+        let kind = OwnerIntentKind::Domain {
+            stream: stream_id.to_owned(),
+            expected,
+            input,
+        };
+        match build_permit {
+            Some(permit) => {
+                self.enqueue_owner_with_permit(kind, cost, permit, inflight)
+                    .await
+            }
+            None => self.enqueue_owner(kind, cost, inflight).await,
+        }
     }
 
     /// Append to `$registry` (stream 0) through the [`Backend`] seam — spec
@@ -3945,24 +4037,87 @@ impl LogEngine {
         .await
     }
 
+    /// Acquire `bytes` worth of the owner ring, clamped into range.
+    ///
+    /// One oversized intent may occupy the whole byte budget; the direct
+    /// committer's preflight then returns the real typed encode error. It
+    /// never waits forever trying to acquire more permits than exist.
+    async fn reserve_owner_bytes(
+        &self,
+        bytes: usize,
+    ) -> Result<OwnedSemaphorePermit, AppendError<EngineError>> {
+        Arc::clone(&self.inner.owner.bytes)
+            .acquire_many_owned(bytes.clamp(1, OWNER_RING_BYTES) as u32)
+            .await
+            .map_err(|_| {
+                AppendError::Backend(EngineError::Append(
+                    "append owner is closed".into(),
+                ))
+            })
+    }
+
+    /// Reconcile a build-peak reservation down (or up) to the exact admission
+    /// `cost` of the intent that was actually produced (`bn-1gn1`).
+    ///
+    /// The reservation taken before preparation is a deliberate over-estimate,
+    /// so the common direction is *release*: the excess goes back to the ring
+    /// the instant the built size is known, rather than being held for the
+    /// lifetime of the queued intent. `merge` covers the theoretical shortfall
+    /// so accounting stays exact rather than merely conservative.
+    async fn reconcile_owner_bytes(
+        &self,
+        mut reserved: OwnedSemaphorePermit,
+        cost: usize,
+    ) -> Result<OwnedSemaphorePermit, AppendError<EngineError>> {
+        let want = cost.clamp(1, OWNER_RING_BYTES) as u32;
+        let held = reserved.num_permits() as u32;
+        match want.cmp(&held) {
+            std::cmp::Ordering::Equal => Ok(reserved),
+            std::cmp::Ordering::Less => {
+                // `split` hands back a permit holding `want`; dropping what
+                // remains in `reserved` releases exactly the over-estimate.
+                let exact = reserved
+                    .split(want as usize)
+                    .expect("split of a strictly smaller permit count");
+                drop(reserved);
+                Ok(exact)
+            }
+            std::cmp::Ordering::Greater => {
+                // Unreachable while `prepare_build_peak` over-estimates, which
+                // is the invariant the accounting tests pin. Correct it without
+                // holding: acquiring the shortfall while still holding
+                // `reserved` is hold-and-wait, and with the ring near capacity
+                // two producers doing it concurrently would deadlock the whole
+                // append path. Releasing first can only cost a re-queue.
+                debug_assert!(
+                    false,
+                    "build-peak reservation {held} under-estimated cost {want}"
+                );
+                drop(reserved);
+                self.reserve_owner_bytes(cost).await
+            }
+        }
+    }
+
     async fn enqueue_owner(
         &self,
         kind: OwnerIntentKind,
         cost: usize,
         inflight: InFlightGuard,
     ) -> OwnerResult {
-        // One oversized intent may occupy the whole byte budget; the direct
-        // committer's preflight then returns the real typed encode error. It
-        // never waits forever trying to acquire more permits than exist.
-        let permits = cost.clamp(1, OWNER_RING_BYTES) as u32;
-        let permit = Arc::clone(&self.inner.owner.bytes)
-            .acquire_many_owned(permits)
-            .await
-            .map_err(|_| {
-                AppendError::Backend(EngineError::Append(
-                    "append owner is closed".into(),
-                ))
-            })?;
+        let permit = self.reserve_owner_bytes(cost).await?;
+        self.enqueue_owner_with_permit(kind, cost, permit, inflight).await
+    }
+
+    /// `enqueue_owner` for callers that already hold a build-peak reservation.
+    async fn enqueue_owner_with_permit(
+        &self,
+        kind: OwnerIntentKind,
+        cost: usize,
+        permit: OwnedSemaphorePermit,
+        inflight: InFlightGuard,
+    ) -> OwnerResult {
+        let permit = self.reconcile_owner_bytes(permit, cost).await?;
         let (done, rx) = oneshot::channel();
         let intent = OwnerIntent {
             kind,
@@ -4521,6 +4676,32 @@ impl Backend for LogEngine {
                     .map(|record| record.data.len())
                     .fold(0usize, usize::saturating_add),
             );
+        let can_prepare = !records.is_empty()
+            && encoded_estimate >= PREPARE_MIN_ENCODED_BYTES
+            && (encoded_estimate as u64) <= MAX_BATCH_LEN
+            && records.len() <= u32::MAX as usize
+            && records
+                .iter()
+                .all(|record| record.data.len() <= u32::MAX as usize);
+        // bn-1gn1: see `enqueue_owned_domain` — the borrowed public path
+        // materializes the same prepared copy and is bounded the same way.
+        let build_permit = if can_prepare {
+            Some(
+                self.reserve_owner_bytes(prepare_build_peak(
+                    stream_id.len(),
+                    records.len(),
+                    encoded_estimate,
+                    records
+                        .iter()
+                        .map(|record| record.message_type.len())
+                        .fold(0usize, usize::saturating_add),
+                ))
+                .await?,
+            )
+        } else {
+            None
+        };
+
         let (input, cost) = if !records.is_empty()
             && encoded_estimate >= PREPARE_MIN_ENCODED_BYTES
             // Keep invalid-input error precedence unchanged: the owner first
@@ -4615,16 +4796,18 @@ impl Backend for LogEngine {
             );
             (DomainInput::Records(records.to_vec()), cost)
         };
-        self.enqueue_owner(
-            OwnerIntentKind::Domain {
-                stream: stream_id.to_owned(),
-                expected,
-                input,
-            },
-            cost,
-            inflight,
-        )
-        .await
+        let kind = OwnerIntentKind::Domain {
+            stream: stream_id.to_owned(),
+            expected,
+            input,
+        };
+        match build_permit {
+            Some(permit) => {
+                self.enqueue_owner_with_permit(kind, cost, permit, inflight)
+                    .await
+            }
+            None => self.enqueue_owner(kind, cost, inflight).await,
+        }
     }
 
     async fn append_batch_owned(
