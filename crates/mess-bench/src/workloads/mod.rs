@@ -10,6 +10,7 @@ pub mod durable_append;
 pub mod engine;
 pub mod fold_chain;
 pub mod load_verified;
+pub mod reader_contention;
 pub mod recovery;
 pub mod sealed_payload;
 pub mod sealed_pointer;

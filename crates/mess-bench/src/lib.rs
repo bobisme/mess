@@ -460,6 +460,11 @@ pub fn run_all(size: RunSize, scratch: &Path, settle_secs: u64) -> Vec<Metric> {
     step!("load_verified throughput", workloads::load_verified::run(size));
     settle(size, settle_secs);
     step!("recovery time", workloads::recovery::run(size, scratch));
+    settle(size, settle_secs);
+    step!(
+        "reader contention",
+        workloads::reader_contention::run(size, scratch)
+    );
 
     metrics
 }

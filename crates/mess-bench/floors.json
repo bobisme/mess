@@ -4,78 +4,99 @@
       "metric": "mess_log.buffered.ev_per_s",
       "direction": "min",
       "floor": 1000000.0,
-      "tolerance": 0.10,
+      "tolerance": 0.1,
       "source": "docs/perf/envelope.md mess_log.buffered.gate (bn-2m1 Phase 3 exit gate)"
     },
     {
       "metric": "mess_log.durable.ev_per_s",
       "direction": "min",
       "floor": 100000.0,
-      "tolerance": 0.10,
+      "tolerance": 0.1,
       "source": "docs/perf/envelope.md mess_log.durable.gate (bn-2m1 Phase 3 exit gate)"
     },
     {
       "metric": "sealed.global_scan.ev_per_s",
       "direction": "min",
       "floor": 25000000.0,
-      "tolerance": 0.10,
+      "tolerance": 0.1,
       "source": "bn-4pk acceptance criteria ('global >=25M'); origin spikes/perf_replay round-4 target (measured 95.1M global at the time; docs/perf/envelope.md's bn-1hx row records 1197M on the current corpus)"
     },
     {
       "metric": "sealed.stream_replay.ev_per_s",
       "direction": "min",
       "floor": 2500000.0,
-      "tolerance": 0.10,
+      "tolerance": 0.1,
       "source": "docs/perf/envelope.md sealed.stream_replay.floor (bn-1hx)"
     },
     {
       "metric": "phase5.sealed.bytes_per_event",
       "direction": "max",
       "floor": 35.0,
-      "tolerance": 0.10,
+      "tolerance": 0.1,
       "source": "docs/perf/envelope.md phase5.sealed.bytes_per_event.gate (bn-1l6 Phase 5 exit gate)"
     },
     {
       "metric": "phase5.sealed.columnar_replay.ev_per_s",
       "direction": "min",
       "floor": 2500000.0,
-      "tolerance": 0.10,
+      "tolerance": 0.1,
       "source": "docs/perf/envelope.md phase5.sealed.columnar_replay.gate (bn-1l6 Phase 5 exit gate)"
     },
     {
       "metric": "engine.buffered.ev_per_s",
       "direction": "min",
       "floor": 1000000.0,
-      "tolerance": 0.10,
+      "tolerance": 0.1,
       "source": "docs/perf/envelope.md engine.buffered.gate (bn-20b Phase 4 exit gate)"
     },
     {
       "metric": "engine.sealed_replay.ev_per_s",
       "direction": "min",
       "floor": 2500000.0,
-      "tolerance": 0.10,
+      "tolerance": 0.1,
       "source": "docs/perf/envelope.md engine.sealed_replay.gate (bn-20b Phase 4 exit gate)"
     },
     {
       "metric": "recovery.s_per_gib",
       "direction": "max",
       "floor": 0.5,
-      "tolerance": 0.10,
+      "tolerance": 0.1,
       "source": "bn-4pk acceptance criteria ('recovery <=0.5 s/GiB'); origin spikes/perf_replay round-4 target (0.32-0.38 s/GiB measured)"
     },
     {
       "metric": "phase5.foldchain.full_chain.ev_per_s",
       "direction": "min",
       "floor": 1949088.0,
-      "tolerance": 0.10,
+      "tolerance": 0.1,
       "source": "docs/perf/envelope.md phase5.foldchain.full_chain.ev_per_s (bn-1l6; no named acceptance gate in the original ledger, seeded here as a regression baseline from the last recorded measurement)"
     },
     {
       "metric": "phase5.verify.load_verified.ev_per_s",
       "direction": "min",
       "floor": 3590000.0,
-      "tolerance": 0.10,
+      "tolerance": 0.1,
       "source": "docs/perf/envelope.md phase5.verify.load_verified.ev_per_s (bn-1l6; no named acceptance gate in the original ledger, seeded here as a regression baseline from the last recorded measurement)"
+    },
+    {
+      "metric": "engine.reader_contention.writer_loaded.ev_per_s",
+      "direction": "min",
+      "floor": 10000000.0,
+      "source": "bn-1dlb first measurement on trunk 70d21095: 20.77M ev/s with 8 readers. Floor set at ~half measured, deliberately loose \u2014 this metric's run-to-run variance is not yet characterised, and a tight floor on a brand-new concurrent workload would flake CI before it caught anything. Tighten once several runs exist.",
+      "tolerance": 0.1
+    },
+    {
+      "metric": "engine.reader_contention.head_reads_per_s",
+      "direction": "min",
+      "floor": 1500000.0,
+      "source": "bn-1dlb first measurement on trunk 70d21095: 3.00M op/s. Floor at ~half measured; see the note on writer_loaded about variance.",
+      "tolerance": 0.1
+    },
+    {
+      "metric": "engine.reader_contention.resolve_per_s",
+      "direction": "min",
+      "floor": 1500000.0,
+      "source": "bn-1dlb first measurement on trunk 70d21095: 2.98M op/s. Floor at ~half measured; see the note on writer_loaded about variance.",
+      "tolerance": 0.1
     }
   ]
 }
