@@ -2,10 +2,14 @@
 //!
 //! Every other reference workload is a single-writer loop, so none of them
 //! touches the one lock every reader shares: `LogEngine` keeps all engine
-//! clones on one `Arc<Mutex<Book>>` (`mess-store/src/engine.rs:191`), and the
+//! clones on one `Arc<RwLock<Book>>` (`mess-store/src/engine.rs`), and the
 //! public read surface goes through it — `head` (4405), `stream_id_of` (3709),
 //! `event_type_id_of` (3717), and record decode (3816). A concurrent read load
-//! against an active writer was therefore completely unmeasured.
+//! against an active writer was therefore completely unmeasured. That gap hid
+//! a real cost: this workload measured 0.84/0.80 writer retention against the
+//! original `Mutex`, which `bn-18ab` then recovered to 0.95/0.98 by making the
+//! lock shared. Both numbers came from here, which is the point of keeping it
+//! in the reference set rather than as one-off apparatus.
 //!
 //! The two reader metrics are deliberately separated rather than summed.
 //! `head(name)` resolves the name to a stream id through `book.registry` and
@@ -116,7 +120,7 @@ pub fn run(size: RunSize, scratch: &Path) -> Vec<Metric> {
             "ratio",
             format!(
                 "writer_loaded / writer_solo; 1.0 = readers are free. Below \
-                 1.0 quantifies contention on the shared Arc<Mutex<Book>> \
+                 1.0 quantifies contention on the shared Arc<RwLock<Book>> \
                  with {readers} readers"
             ),
         ),

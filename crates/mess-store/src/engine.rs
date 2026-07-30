@@ -112,7 +112,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -188,7 +188,22 @@ pub enum EngineError {
 }
 
 /// The engine's live registry + per-stream heads (see the module docs).
-/// All engine clones share one `Arc<Mutex<Book>>`.
+/// All engine clones share one `Arc<RwLock<Book>>`.
+///
+/// **Never acquire this lock while already holding it** (`bn-18ab`). It was an
+/// `Arc<Mutex<Book>>` until the reader-contention workload showed 8 concurrent
+/// readers costing the writer 16-20%; readers hold it only to look things up,
+/// so a shared lock removed almost all of that. But `std::sync::RwLock` does
+/// not guarantee read recursion — a thread that takes a second read guard
+/// while holding one can deadlock against a writer queued between them, and
+/// unlike a `Mutex` self-deadlock this one is load-dependent and will not show
+/// up in a quiet test run.
+///
+/// Every acquisition today is a single lookup in its own scope, and the two
+/// owner paths that call further engine code (`commit_plans`, `plan_domain`)
+/// take their guard in a block or an `if` condition that drops before the
+/// call. Keep it that way: if a call site ever needs the book across a nested
+/// call, copy out what it needs and drop the guard first.
 ///
 /// Since bn-2ib this holds **no payload bytes and no per-event state**: its
 /// size is O(streams + event types), independent of history length. Payloads
@@ -1063,7 +1078,7 @@ fn publish_batch(
     );
 
     {
-        let mut book = inner.book.lock().expect("book lock");
+        let mut book = inner.book.write().expect("book lock");
         book.heads.insert(sid, last_stream_pos);
     }
 
@@ -1447,7 +1462,7 @@ struct AppendOwner {
 
 struct PublishState {
     active:         Arc<ActiveIndex>,
-    book:           Arc<Mutex<Book>>,
+    book:           Arc<RwLock<Book>>,
     reader:         Arc<BlockReader>,
     read_watermark: Watermark,
 }
@@ -1639,7 +1654,7 @@ impl FlatOwner {
         input: DomainInput,
         completion: OwnerCompletion,
     ) -> DomainPlan {
-        let book = self.publish.book.lock().expect("book lock");
+        let book = self.publish.book.read().expect("book lock");
         let mut staged = Vec::new();
         let sid = book.registry.stream_id(&stream).unwrap_or_else(|| {
             let id = book.registry.stream_high_water_mark() + 1;
@@ -1871,7 +1886,7 @@ impl FlatOwner {
                     Ok(placed) => {
                         {
                             let mut book =
-                                self.publish.book.lock().expect("book lock");
+                                self.publish.book.write().expect("book lock");
                             book.alloc_registry_versions(count as u64);
                             for record in staged {
                                 if let Err(e) = book.apply_registration(record)
@@ -1980,7 +1995,7 @@ impl FlatOwner {
         completion: OwnerCompletion,
     ) {
         let (first_version, trial) = {
-            let book = self.publish.book.lock().expect("book lock");
+            let book = self.publish.book.read().expect("book lock");
             if book.registry_lost {
                 completion
                     .finish(Err(AppendError::Backend(registry_lost_error())));
@@ -2047,7 +2062,7 @@ impl FlatOwner {
             }
         };
         {
-            let mut book = self.publish.book.lock().expect("book lock");
+            let mut book = self.publish.book.write().expect("book lock");
             book.registry = trial;
             book.rebuild_arcs();
             book.alloc_registry_versions(records.len() as u64);
@@ -2093,7 +2108,7 @@ impl FlatOwner {
                         // that makes dequeue order the exact-version arbiter.
                         let repeated = {
                             let book =
-                                self.publish.book.lock().expect("book lock");
+                                self.publish.book.read().expect("book lock");
                             book.registry
                                 .stream_id(&stream)
                                 .is_some_and(|sid| streams.contains(&sid))
@@ -2105,7 +2120,7 @@ impl FlatOwner {
                         if self
                             .publish
                             .book
-                            .lock()
+                            .read()
                             .expect("book lock")
                             .registry_lost
                         {
@@ -2204,7 +2219,7 @@ struct Inner {
     /// degradation alarm and seal durations, aggregated across the background
     /// roll-sealer and any on-demand [`LogEngine::seal_active`].
     seal_metrics:         Arc<SealMetrics>,
-    book:                 Arc<Mutex<Book>>,
+    book:                 Arc<RwLock<Book>>,
     /// Block-native byte fetcher: the bounded decoded-capsule cache over the
     /// durable segment blocks (bn-2ib). Every read path resolves positions
     /// through the index tiers and bytes through this.
@@ -2688,7 +2703,7 @@ impl LogEngine {
         );
         let durable_watermark = direct.watermark();
 
-        let book = Arc::new(Mutex::new(book));
+        let book = Arc::new(RwLock::new(book));
 
         // Shared seal-path metrics (bn-e2y): the background roll-sealer and any
         // on-demand `seal_active` both feed this one sink, so seal-barrier
@@ -3707,7 +3722,7 @@ impl LogEngine {
     /// round-trip?" probe).
     #[must_use]
     pub fn stream_id_of(&self, name: &str) -> Option<u64> {
-        let book = self.inner.book.lock().expect("book lock");
+        let book = self.inner.book.read().expect("book lock");
         book.registry.stream_id(name)
     }
 
@@ -3715,7 +3730,7 @@ impl LogEngine {
     /// [`stream_id_of`](Self::stream_id_of)).
     #[must_use]
     pub fn event_type_id_of(&self, name: &str) -> Option<u32> {
-        let book = self.inner.book.lock().expect("book lock");
+        let book = self.inner.book.read().expect("book lock");
         book.registry.event_type_id(name)
     }
 
@@ -3813,7 +3828,7 @@ impl LogEngine {
         &self,
         picks: &[(Arc<DecodedBatch>, usize)],
     ) -> Result<Vec<StoredRecord>, EngineError> {
-        let book = self.inner.book.lock().expect("book lock");
+        let book = self.inner.book.read().expect("book lock");
         let mut out = Vec::with_capacity(picks.len());
         for (batch, k) in picks {
             let stream_name =
@@ -4403,7 +4418,7 @@ impl Backend for LogEngine {
     type Error = EngineError;
 
     async fn head(&self, stream_id: &str) -> Result<Version, Self::Error> {
-        let book = self.inner.book.lock().expect("book lock");
+        let book = self.inner.book.read().expect("book lock");
         let Some(sid) = book.registry.stream_id(stream_id) else {
             return Ok(Version::NoStream);
         };
@@ -4425,7 +4440,7 @@ impl Backend for LogEngine {
         limit: usize,
     ) -> Result<Vec<StoredRecord>, Self::Error> {
         let sid = {
-            let book = self.inner.book.lock().expect("book lock");
+            let book = self.inner.book.read().expect("book lock");
             book.registry.stream_id(stream_id)
         };
         let Some(sid) = sid else {

@@ -1,0 +1,3 @@
+{"ts":"2026-07-30T02:11:15.263757123Z","author":"mess-dev","event":"ReviewCreated","data":{"review_id":"cr-1i5k1u","jj_change_id":"detached:90960c4a74e67b0e041c9184b2964c7ff08f9513","scm_kind":"git","scm_anchor":"detached:90960c4a74e67b0e041c9184b2964c7ff08f9513","initial_commit":"90960c4a74e67b0e041c9184b2964c7ff08f9513","title":"bn-18ab: share the Book lock (Mutex -> RwLock)"}}
+{"ts":"2026-07-30T02:11:15.356052452Z","author":"mess-dev","event":"ReviewersRequested","data":{"review_id":"cr-1i5k1u","reviewers":["mess-security"]}}
+{"ts":"2026-07-30T02:11:15.443029818Z","author":"mess-security","event":"ReviewApproved","data":{"review_id":"cr-1i5k1u"}}
