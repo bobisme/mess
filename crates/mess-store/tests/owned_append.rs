@@ -862,11 +862,72 @@ async fn aliases_are_revalidated_by_registry_state_in_every_mode() {
     }
 }
 
-fn poll_once_then_drop<F: Future>(future: F) -> bool {
+/// How many setup attempts [`drop_in_flight`] makes before giving up. Each
+/// attempt is one ordinary append, so the bound is cheap; exhausting it means
+/// the submit path stopped parking at all, which is a behaviour change worth
+/// failing loudly on rather than host-load noise worth retrying past.
+const MAX_DROP_ATTEMPTS: usize = 50;
+
+/// Poll `future` exactly once and then drop it. Returns `None` iff it was
+/// still `Pending` — it really was dropped in flight, after ownership transfer
+/// / submission but before completion — and `Some(output)` when the append
+/// instead resolved entirely inside that single poll, in which case nothing
+/// was cancelled and the caller must account for a plain successful append.
+///
+/// A no-op waker is fine: we never want the future re-scheduled, we drive
+/// exactly one poll and drop.
+fn poll_once_then_drop<F: Future>(future: F) -> Option<F::Output> {
     let waker = Waker::noop();
     let mut cx = Context::from_waker(waker);
     let mut future = pin!(future);
-    matches!(future.as_mut().poll(&mut cx), Poll::Pending)
+    match future.as_mut().poll(&mut cx) {
+        Poll::Pending => None,
+        Poll::Ready(output) => Some(output),
+    }
+}
+
+/// Repeat the cancellation setup until it provably *is* a cancellation, and
+/// return how many attempts that took (`>= 1`).
+///
+/// `bn-3c6a`: whether the owner finishes the unit before the caller's first
+/// poll observes completion is pure scheduling, so in-flight-ness has to be a
+/// retried precondition, not an asserted outcome — under host load a whole
+/// append (transfer, commit, publish) can resolve within poll 1 and there is
+/// nothing to cancel.
+///
+/// `mk_future(completed)` must build a FRESH append future for the next
+/// attempt, where `completed` counts the earlier attempts that resolved inside
+/// their first poll. Those attempts appended for real: they advanced the head,
+/// published their events, interned their names and counted their input
+/// metrics, so `mk_future` has to target the state they left behind and the
+/// caller has to derive every exact expectation from the returned count. On
+/// return, exactly one attempt — the last — was dropped while `Pending`.
+fn drop_in_flight<Mk, Fut, T, E>(mut mk_future: Mk) -> usize
+where
+    Mk: FnMut(usize) -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+    E: fmt::Debug,
+{
+    for completed in 0..MAX_DROP_ATTEMPTS {
+        match poll_once_then_drop(mk_future(completed)) {
+            None => return completed + 1,
+            // A completed attempt must be a clean append; anything else means
+            // the retry targets the wrong version or name, and swallowing it
+            // would surface as a confusing "never parked" panic below.
+            Some(Ok(_)) => {}
+            Some(Err(e)) => panic!(
+                "setup attempt {} finished inside its first poll with an \
+                 error instead of appending: {e:?}",
+                completed + 1
+            ),
+        }
+    }
+    panic!(
+        "append resolved inside its first poll on all {MAX_DROP_ATTEMPTS} \
+         setup attempts — the submit path no longer parks, so there is no \
+         in-flight window left to cancel (a real behaviour change, not \
+         host-load noise)"
+    )
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -879,21 +940,30 @@ async fn cancellation_after_owned_transfer_still_publishes() {
         .await
         .expect("prime");
 
+    // The first poll must transfer ownership and then await owner completion.
+    // An attempt that instead completes there appended its two events for
+    // real, so the next attempt expects a head two versions higher; the
+    // dropped attempt is always the last one.
     let events = [event("type.a", 1), event("type.a", 2)];
-    assert!(
-        poll_once_then_drop(store.append("stream", Version::At(0), &events)),
-        "first poll must transfer ownership then await owner completion",
-    );
+    let attempts = drop_in_flight(|completed| {
+        store.append("stream", Version::At(2 * completed as u64), &events)
+    });
+    // Prime plus two events per attempt: the completed ones published because
+    // they finished, the dropped one because cancellation cannot un-publish an
+    // owner-transferred unit.
+    let expected_len = 1 + 2 * attempts;
 
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let read = engine
-            .read_stream("stream", Version::NoStream, 10)
+            .read_stream("stream", Version::NoStream, expected_len + 8)
             .await
             .expect("read");
-        if read.len() == 3 {
-            assert_eq!(read[1].data, vec![1; 32]);
-            assert_eq!(read[2].data, vec![2; 32]);
+        if read.len() == expected_len {
+            for attempt in 0..attempts {
+                assert_eq!(read[1 + 2 * attempt].data, vec![1; 32]);
+                assert_eq!(read[2 + 2 * attempt].data, vec![2; 32]);
+            }
             break;
         }
         assert!(Instant::now() < deadline, "owned append never published");
@@ -923,26 +993,26 @@ async fn barriered_fallback_survives_cancellation_after_submission() {
             .await
             .expect("prime");
 
+        // The first poll must enqueue before cancellation; an attempt that
+        // completes there enqueued AND finished, appending its two events, so
+        // the next attempt expects a head two versions higher.
         let events = [event("type.a", 1), event("type.a", 2)];
-        let submitted = poll_once_then_drop(store.append(
-            "stream",
-            Version::At(0),
-            &events,
-        ));
-        assert!(
-            submitted,
-            "{label}: first poll must enqueue before cancellation",
-        );
+        let attempts = drop_in_flight(|completed| {
+            store.append("stream", Version::At(2 * completed as u64), &events)
+        });
+        let expected_len = 1 + 2 * attempts;
 
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let read = engine
-                .read_stream("stream", Version::NoStream, 10)
+                .read_stream("stream", Version::NoStream, expected_len + 8)
                 .await
                 .expect("read");
-            if read.len() == 3 {
-                assert_eq!(read[1].data, vec![1; 32]);
-                assert_eq!(read[2].data, vec![2; 32]);
+            if read.len() == expected_len {
+                for attempt in 0..attempts {
+                    assert_eq!(read[1 + 2 * attempt].data, vec![1; 32]);
+                    assert_eq!(read[2 + 2 * attempt].data, vec![2; 32]);
+                }
                 break;
             }
             assert!(
@@ -951,11 +1021,19 @@ async fn barriered_fallback_survives_cancellation_after_submission() {
             );
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
+        // Every call — the prime and each setup attempt, cancelled or not —
+        // is counted at the borrowed boundary the moment it is submitted, so
+        // these stay exact once parameterised on the attempt count.
         let input = engine.append_input_metrics();
         assert_eq!(input.owned_batches, 0, "{label}: fast path disabled");
-        assert_eq!(input.borrowed_batches, 2, "{label}: both calls fallback");
         assert_eq!(
-            input.borrowed_records, 3,
+            input.borrowed_batches,
+            1 + attempts as u64,
+            "{label}: prime plus every setup attempt falls back"
+        );
+        assert_eq!(
+            input.borrowed_records,
+            1 + 2 * attempts as u64,
             "{label}: exact fallback records"
         );
         let metrics = engine.metrics();
@@ -978,19 +1056,27 @@ async fn cancelled_new_name_owned_unit_publishes_reopens_and_conflicts() {
     let store = EventStore::new(engine.clone());
     let events = [event("type.b", 0xB2)];
 
-    assert!(
-        poll_once_then_drop(store.append(
-            "fresh-owned-stream",
-            Version::NoStream,
-            &events,
-        )),
-        "first poll must transfer the fresh-name unit to the owner",
-    );
+    // The unit under test is a NEW-name one: its first poll transfers the unit
+    // to the owner and parks on the registry persist. A setup attempt that
+    // instead completes has permanently interned the stream name it used, so
+    // retrying on that same name would no longer be a new-name unit — each
+    // attempt therefore gets its own fresh stream name, and the dropped
+    // attempt (always the last) is the one every assertion below is about.
+    fn attempt_stream(attempt: usize) -> String {
+        format!("fresh-owned-stream-{attempt}")
+    }
+    let store_ref = &store;
+    let events_ref = &events;
+    let attempts = drop_in_flight(|completed| {
+        let stream = attempt_stream(completed);
+        async move { store_ref.append(&stream, Version::NoStream, events_ref).await }
+    });
+    let dropped_stream = attempt_stream(attempts - 1);
 
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let records = engine
-            .read_stream("fresh-owned-stream", Version::NoStream, 10)
+            .read_stream(&dropped_stream, Version::NoStream, 10)
             .await
             .expect("live read");
         if records.len() == 1 {
@@ -1006,16 +1092,21 @@ async fn cancelled_new_name_owned_unit_publishes_reopens_and_conflicts() {
     drop(store);
     drop(engine);
     let reopened = LogEngine::open(&path).expect("reopen");
-    let records = reopened
-        .read_stream("fresh-owned-stream", Version::NoStream, 10)
-        .await
-        .expect("reopened read");
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].message_type, "type.b");
-    assert_eq!(records[0].data, vec![0xB2; 32]);
+    // Recovery must reproduce the dropped unit exactly — and any attempt that
+    // completed before it, which is an ordinary append and must survive too.
+    for attempt in 0..attempts {
+        let stream = attempt_stream(attempt);
+        let records = reopened
+            .read_stream(&stream, Version::NoStream, 10)
+            .await
+            .expect("reopened read");
+        assert_eq!(records.len(), 1, "{stream}: exactly one recovered record");
+        assert_eq!(records[0].message_type, "type.b");
+        assert_eq!(records[0].data, vec![0xB2; 32]);
+    }
 
     let retry = EventStore::new(reopened)
-        .append("fresh-owned-stream", Version::NoStream, &events)
+        .append(&dropped_stream, Version::NoStream, &events)
         .await
         .expect_err("stale retry must conflict after cancelled caller commit");
     assert!(matches!(
