@@ -56,8 +56,9 @@
 //! Sizes are overridable via env vars (`SEED_PROFILE_NEW`, `SEED_PROFILE_WARM`,
 //! `SEED_PROFILE_COLD`, `SEED_PROFILE_PLAIN`, `SEED_PROFILE_PIPE`,
 //! `SEED_PROFILE_PIPE_SEQ`, `SEED_PROFILE_K`). A tiny non-ignored smoke variant
-//! ([`seed_profile_smoke`]) runs in the normal suite and asserts only the
-//! *shape* (new-stream append ≫ warm append), never absolute timings.
+//! ([`seed_profile_smoke`]) runs in the normal suite; it asserts the countable
+//! *mechanism* the profile exists to attribute cost to — a new stream writes a
+//! `$registry` name record, a warm append writes none — never a timing.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -65,6 +66,7 @@ use std::time::{Duration, Instant};
 
 use mess_core::Decide;
 use mess_derive::{Aggregate, Event};
+use mess_store::registry::RESERVED_STREAM_NAME;
 use mess_store::{
     AppendError, Appended, Backend, EventStore, FjallSnapshotBackend,
     LogEngine, OwnedAppendBatch, RecordToAppend, SnapshotStore, Snapshottable,
@@ -200,6 +202,11 @@ struct ProfilingBackend<B> {
 
 impl<B> ProfilingBackend<B> {
     fn new(inner: B, hist: Hist) -> Self { Self { inner, hist } }
+
+    /// Borrow the wrapped backend, so a probe can reach the real engine
+    /// *around* the instrumentation — the registry count below must not land
+    /// in the latency histograms it is being compared against.
+    fn inner(&self) -> &B { &self.inner }
 }
 
 impl<B: Backend> Backend for ProfilingBackend<B> {
@@ -316,6 +323,31 @@ fn fresh_prof_backend(tag: &str) -> (ProfSnap, Hist, SweepingTempDir) {
 const CACHE_CAP: usize = 4096;
 
 fn stream_name(i: usize) -> String { format!("rel-{i:08x}") }
+
+/// How many `$registry` records the engine has written so far — the *mechanism*
+/// the new-stream workload pays for and the warm workload does not.
+///
+/// Since `bn-2di` a name is interned by writing a `RegistryEventV1` into the
+/// `$registry` log stream (spec `04-registry.md`), one record per stream name
+/// and one per event-type name, ever — never one per event (REG4). So this
+/// counter advances once per brand-new stream and stays put for every append to
+/// an already-interned one.
+///
+/// Read straight off the inner [`LogEngine`], bypassing the
+/// [`ProfilingBackend`] and the `FjallSnapshotBackend`, so the probe itself is
+/// invisible to the histograms and phases being measured.
+async fn registry_records(backend: &ProfSnap) -> usize {
+    let engine = backend.inner().inner();
+    // `total_events` counts the whole log — user events *and* the `$registry`
+    // records filtered out of application reads — so it is an exact upper
+    // bound on the page this read needs.
+    let limit = engine.total_events();
+    engine
+        .read_stream(RESERVED_STREAM_NAME, Version::NoStream, limit)
+        .await
+        .expect("read $registry")
+        .len()
+}
 
 // ===========================================================================
 // The instrumented command_cached cold-miss loop (METHOD §1.2).
@@ -462,36 +494,49 @@ fn backend_table(title: &str, hist: &Hist) {
 // ===========================================================================
 
 /// (a) all-new-streams, sequential: each command creates a brand-new stream.
-async fn run_new_streams_seq(n: usize) -> (Spans, Hist, Duration) {
+///
+/// The trailing `usize` is the number of `$registry` records the measured loop
+/// wrote (see [`registry_records`]) — the new-stream name persists.
+async fn run_new_streams_seq(n: usize) -> (Spans, Hist, Duration, usize) {
     let (backend, hist, _dir) = fresh_prof_backend("seedprof-new");
+    let probe = backend.clone();
     let store = EventStore::new(backend).with_cache_capacity(CACHE_CAP);
+    let before = registry_records(&probe).await;
     let mut spans = Spans::default();
     let wall = Instant::now();
     for i in 0..n {
         timed_command(&store, &stream_name(i), &mut spans).await;
     }
     let wall = wall.elapsed();
-    (spans, hist, wall)
+    let registry = registry_records(&probe).await - before;
+    (spans, hist, wall, registry)
 }
 
 /// (b) all-existing-streams warm, sequential: every command hits ONE cached
 /// stream (the hot-post-bench shape). First command primes the cache (not
 /// measured into the warm spans — a separate priming pass).
-async fn run_warm_one_stream(n: usize) -> (Spans, Hist, Duration) {
+///
+/// The trailing `usize` is the number of `$registry` records the measured loop
+/// wrote, counted from *after* the priming call so the one stream/type pair
+/// that priming interns is excluded: the warm loop must write zero.
+async fn run_warm_one_stream(n: usize) -> (Spans, Hist, Duration, usize) {
     let (backend, hist, _dir) = fresh_prof_backend("seedprof-warm");
+    let probe = backend.clone();
     let store = EventStore::new(backend).with_cache_capacity(CACHE_CAP);
     let stream = stream_name(0);
     // Prime: the first miss pays a full cold load + new-stream append.
     let mut prime = Spans::default();
     timed_command(&store, &stream, &mut prime).await;
     hist.reset(); // discard the priming call's backend samples
+    let before = registry_records(&probe).await;
     let mut spans = Spans::default();
     let wall = Instant::now();
     for _ in 0..n {
         timed_command(&store, &stream, &mut spans).await;
     }
     let wall = wall.elapsed();
-    (spans, hist, wall)
+    let registry = registry_records(&probe).await - before;
+    (spans, hist, wall, registry)
 }
 
 /// (c) all-existing-streams, cold cache: fill `n` streams (setup, not
@@ -619,6 +664,17 @@ fn throughput_line(label: &str, n: usize, wall: Duration) {
     );
 }
 
+/// The mechanism row: `$registry` records the measured loop wrote, per command.
+/// A new-stream workload reports ~1.0, a warm one 0.0 (see
+/// [`registry_records`]).
+fn registry_line(records: usize, n: usize) {
+    println!(
+        "  {:<34} {records} $registry records ({:.3}/cmd)",
+        "registry name persists",
+        records as f64 / n as f64,
+    );
+}
+
 // ===========================================================================
 // The full matrix (#[ignore]d).
 // ===========================================================================
@@ -645,16 +701,20 @@ async fn seed_profile() {
     println!("aggregate: Rel (one event/command), cache cap={CACHE_CAP}");
 
     // (a) all-new-streams (the seeder shape).
-    let (new_spans, new_hist, new_wall) = run_new_streams_seq(n_new).await;
+    let (new_spans, new_hist, new_wall, new_reg) =
+        run_new_streams_seq(n_new).await;
     println!("\n### (a) all-new-streams, sequential [seeder shape]");
     throughput_line("all-new-streams seq", n_new, new_wall);
+    registry_line(new_reg, n_new);
     phase_table("(a) all-new-streams", &new_spans);
     backend_table("(a) all-new-streams", &new_hist);
 
     // (b) warm one stream (the bench shape / control).
-    let (warm_spans, warm_hist, warm_wall) = run_warm_one_stream(n_warm).await;
+    let (warm_spans, warm_hist, warm_wall, warm_reg) =
+        run_warm_one_stream(n_warm).await;
     println!("\n### (b) all-existing warm, one stream [bench control]");
     throughput_line("warm one-stream", n_warm, warm_wall);
+    registry_line(warm_reg, n_warm);
     phase_table("(b) warm one-stream", &warm_spans);
     backend_table("(b) warm one-stream", &warm_hist);
 
@@ -689,35 +749,53 @@ async fn seed_profile() {
     );
     println!(
         "Read: compare (a).append_batch vs (b)/(c).append_batch — the delta \
-         is the per-new-stream registry-name durability flush. Compare \
-         (c).load vs (b) (cache hit) for the cold-load cost. (e) shows \
-         pipelining amortizes the same per-command latency into a lower \
-         wall/n."
+         is the per-new-stream registry-name persist the (a)/(b) registry \
+         rows count. Compare (c).load vs (b) (cache hit) for the cold-load \
+         cost. (e) shows pipelining amortizes the same per-command latency \
+         into a lower wall/n."
     );
     println!();
 }
 
-/// Non-ignored smoke: tiny sizes, runs in the normal suite, asserts only the
-/// *shape* (a new-stream append is materially costlier than a warm append) —
-/// never an absolute timing. Also gives clippy/coverage of the whole harness.
+/// Non-ignored smoke: tiny sizes, runs in the normal suite, and asserts the
+/// **mechanism** that makes the two workloads different — a brand-new stream
+/// persists a name, a warm append does not — by *counting* it. Also gives
+/// clippy/coverage of the whole harness.
+///
+/// It deliberately asserts nothing about latency (`bn-2cye`). The previous
+/// version compared the two `append` p50s directly, and on 2026-07-28 under
+/// full-suite parallel load it measured new=18.097 µs vs warm=19.118 µs and
+/// failed: a strict ordering with zero margin over a ~1 µs gap is inside this
+/// host's noise floor. The gap is also *expected* to be small now — since
+/// `bn-2di` a name persist is one extra `$registry` batch riding the append's
+/// own commit group, not the multi-millisecond `SyncAll` `bn-150` once paid, so
+/// there is no wide margin left to lean on. The count below is the same claim
+/// with none of the timing: exact, scheduling-independent, and it fails loudly
+/// if the registry write ever stops happening.
 #[tokio::test(flavor = "multi_thread")]
 async fn seed_profile_smoke() {
-    let (new_spans, new_hist, _) = run_new_streams_seq(64).await;
-    let (warm_spans, _warm_hist, _) = run_warm_one_stream(256).await;
+    const N_NEW: usize = 64;
+    const N_WARM: usize = 256;
 
-    let new_append = Stats::of(new_spans.append.clone()).expect("new append");
-    let warm_append =
-        Stats::of(warm_spans.append.clone()).expect("warm append");
+    let (_new_spans, new_hist, _, new_reg) = run_new_streams_seq(N_NEW).await;
+    let (_warm_spans, _warm_hist, _, warm_reg) =
+        run_warm_one_stream(N_WARM).await;
 
-    // A brand-new-stream append persists a new registry name; a warm append to
-    // an existing stream does not. The former must be the costlier phase. This
-    // holds by a wide margin (a durability flush vs an in-memory append), so it
-    // is a safe shape assertion, not an absolute-latency claim.
-    assert!(
-        new_append.p50 > warm_append.p50,
-        "new-stream append p50 ({:?}) should exceed warm append p50 ({:?})",
-        new_append.p50,
-        warm_append.p50,
+    // One `$registry` record per brand-new stream name, plus exactly one for
+    // the single event type (`rel-touch`) the first command interns — names are
+    // registered once ever, not once per event (REG4).
+    assert_eq!(
+        new_reg,
+        N_NEW + 1,
+        "{N_NEW} new-stream commands must write {N_NEW} stream-name records + \
+         1 event-type record into $registry"
+    );
+    // The warm loop touches one already-interned stream with an already-
+    // interned type: it registers nothing, however many times it appends.
+    assert_eq!(
+        warm_reg, 0,
+        "{N_WARM} warm appends to an interned stream must write ZERO \
+         $registry records"
     );
 
     // The ProfilingBackend must have observed the new-stream appends.
