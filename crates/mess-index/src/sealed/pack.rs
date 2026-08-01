@@ -103,7 +103,7 @@
 //! | 7 | `PAYLOAD_COLUMNS` | no | columnar `.pcol` bytes (reuses `payload`) |
 //! | 8 | `ROW_FALLBACK_BLOCKS` | no (reserved) | folded inside `PAYLOAD_COLUMNS` today |
 //! | 9 | `SEGMENT_EFFECT` | no (reserved) | Spike D effect image (§9.7) |
-//! | 10 | `REGISTRY_DELTA` | no (reserved) | §9.5 |
+//! | 10 | `REGISTRY_DELTA` | no | §9.5; the `.reg` body verbatim (bn-3h64) |
 //! | 11 | `STATS` | no | informational summary |
 //!
 //! Unknown section kinds are skipped by readers (forward compat, D-FMT-3).
@@ -126,6 +126,14 @@
 //!   directory-committed checksums as it is read. `PAYLOAD_COLUMNS` and
 //!   `EVENT_TYPE_IDS`, the two sections that scale with the segment's *content*
 //!   rather than its stream count, stay on disk behind the retained file handle.
+//!   So does `REGISTRY_DELTA` (bn-3h64) — but for the opposite reason: it has
+//!   exactly one consumer, recovery's `$registry` fold, which asks for it at
+//!   most once per open and never again, so reading it at open would charge
+//!   every segment for bytes most opens never look at. See
+//!   [`SealedSegmentIndex::read_registry_delta`].
+//!
+//! [`SealedSegmentIndex::read_registry_delta`]:
+//!     crate::sealed::segment::SealedSegmentIndex::read_registry_delta
 //!
 //! Reading the whole pack at open made reopen residency linear in total sealed
 //! bytes: bn-2u01 measured `open_pack` materializing the entire pack **plus** a
@@ -207,7 +215,9 @@ pub const KIND_PAYLOAD_COLUMNS: u16 = 7;
 pub const KIND_ROW_FALLBACK_BLOCKS: u16 = 8;
 /// Algebraic segment effect (Spike D). Reserved.
 pub const KIND_SEGMENT_EFFECT: u16 = 9;
-/// Registry delta. Reserved.
+/// The segment's `$registry` batches — the `.reg` sidecar's byte image carried
+/// inside the pack (bn-3h64). Optional; emitted only when the segment holds a
+/// registration. See [`crate::sealed::regdelta`].
 pub const KIND_REGISTRY_DELTA: u16 = 10;
 /// Informational stats summary. Optional.
 pub const KIND_STATS: u16 = 11;
@@ -397,6 +407,22 @@ pub struct PackInput<'a> {
     /// Pre-encoded, already verify-on-seal columnar payload bytes (the `.pcol`
     /// image), or `None` to omit `PAYLOAD_COLUMNS`.
     pub payload_bytes:  Option<&'a [u8]>,
+    /// Pre-encoded registry-delta bytes — the **`.reg` file image verbatim**,
+    /// straight from
+    /// [`encode_registry_delta`](crate::sealed::regdelta::encode_registry_delta)
+    /// — or `None` to omit `REGISTRY_DELTA` (bn-3h64).
+    ///
+    /// The format is deliberately *not* forked for the pack: the reader on the
+    /// other side is
+    /// [`RegistryDelta::from_bytes`](crate::sealed::regdelta::RegistryDelta::from_bytes),
+    /// the same parser the sibling `.reg` goes through, so a pack-sealed and a
+    /// loose-sealed segment hand recovery byte-identical input and there is
+    /// one encoder, one parser, and one set of corruption tests to keep
+    /// honest. The body keeps its own `crc32c` + magic footer even though
+    /// the section directory commits a `crc32c` and a
+    /// `content_hash_prefix` over the same bytes; that redundancy is what
+    /// makes the image portable between the two containers.
+    pub registry_delta: Option<&'a [u8]>,
 }
 
 /// One section staged for the directory + body layout.
@@ -508,6 +534,21 @@ pub fn encode_pack(input: &PackInput) -> Vec<u8> {
             version:  1,
             codec_id: 0,
             bytes:    f.to_bytes(),
+        });
+    }
+    // bn-3h64: the registry delta sits with the other stream-count-sized
+    // sections, ahead of the two content-sized ones. It is read exactly once —
+    // at the next open, by recovery's `$registry` fold — and that read is a
+    // cold one, so keeping it inside the same front-of-file region the open
+    // already touches (header, directory, pointers, filter) is what makes it
+    // land in readahead rather than as a fresh seek past a few hundred MiB of
+    // payload columns.
+    if let Some(r) = input.registry_delta {
+        staged.push(StagedSection {
+            kind:     KIND_REGISTRY_DELTA,
+            version:  1,
+            codec_id: 0,
+            bytes:    r.to_vec(),
         });
     }
     if !input.event_type_ids.is_empty() {
@@ -1892,6 +1933,7 @@ mod tests {
                     event_type_ids: &[],
                     filter:         None,
                     payload_bytes:  None,
+                    registry_delta: None,
                 };
                 let a = encode_pack(&mk());
                 let b = encode_pack(&mk());
@@ -1928,6 +1970,7 @@ mod tests {
             event_type_ids: &type_ids,
             filter:         None,
             payload_bytes:  None,
+            registry_delta: None,
         };
         let bytes = encode_pack(&input);
         let parsed = parse_pack(&bytes).unwrap();
@@ -1964,6 +2007,7 @@ mod tests {
             event_type_ids: &type_ids,
             filter:         None,
             payload_bytes:  None,
+            registry_delta: None,
         };
         let good = encode_pack(&input);
         let parsed = parse_pack(&good).unwrap();
@@ -2278,6 +2322,7 @@ mod identity_tests {
             event_type_ids: type_ids,
             filter: None,
             payload_bytes: None,
+            registry_delta: None,
         })
     }
 

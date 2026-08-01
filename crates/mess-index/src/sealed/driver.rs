@@ -489,6 +489,22 @@ impl SealDriver {
         // at the next open and dropped. Holding it here would make a
         // long-running writer carry every registration it ever sealed in RSS,
         // for a structure no read path consults (unlike the `.filter`).
+        //
+        // bn-3h64 — THE RULE: this is the LOOSE-SIDECAR path's delta, and a
+        // pack-sealed segment never gets one. `seal` returned into
+        // `seal_consolidated` above before reaching this line when `self.pack`
+        // is set, and that function puts the identical bytes (same
+        // `encode_registry_delta` call, same `.reg` image) into the pack's
+        // `REGISTRY_DELTA` section instead. Writing both would be strictly
+        // worse: one more file per segment in the artifact whose entire point
+        // is one file per segment, one more install to keep crash-consistent,
+        // and a second copy that could disagree with the first. Nothing else
+        // consumes a `.reg` — `sealed_candidate`'s `PIDX_SIBLING_EXTENSIONS`
+        // lists it under the `.pidx` family only (a `.seal`'s quarantine family
+        // is the pack alone), the CLI's layout map files it the same way, and
+        // engine recovery reaches for `reg_path` only after the pack section
+        // came back `None`. If that ever changes — a tool that rebuilds `.reg`
+        // for pack stores, say — it must be taught the section first.
         let reg_delta = encode_registry_delta(&input, REGISTRY_STREAM_ID);
         debug_assert!(
             reg_delta
@@ -659,6 +675,29 @@ impl SealDriver {
 
         let type_ids: &[u32] = input.event_type_ids.as_deref().unwrap_or(&[]);
 
+        // bn-3h64: the segment's `$registry` records as a `REGISTRY_DELTA`
+        // section, so a pack-sealed store's open folds them sequentially
+        // instead of paying `O(#names)` random `pread`s — the win bn-26pp got
+        // loose-sidecar stores (38.5x cold open at 250k streams) and the pack
+        // path was reserving a section id for without ever emitting one.
+        //
+        // Same encoder, same bytes, same parser as the `.reg` file: the section
+        // body IS a `.reg` image. Forking the format would have bought nothing
+        // (the pack directory's `crc32c` does not replace the body's own — the
+        // body has to stay portable between the two containers) and cost a
+        // second corruption-test surface. `None` — no payloads in hand, or no
+        // registration in this segment, the common case once a store's names
+        // are established — emits no section, exactly as it writes no file on
+        // the loose path. NO sibling `.reg` is written here; see the rule
+        // documented at that emission site in `seal`.
+        let reg_delta = encode_registry_delta(&input, REGISTRY_STREAM_ID);
+        debug_assert!(
+            reg_delta
+                .as_ref()
+                .is_none_or(|b| RegistryDelta::from_bytes(b.clone()).is_ok()),
+            "bn-3h64: an encoded registry delta must parse back"
+        );
+
         let bytes = pack::encode_pack(&pack::PackInput {
             segment_id,
             base_pos: input.base_pos,
@@ -666,12 +705,14 @@ impl SealDriver {
             event_type_ids: type_ids,
             filter: filter.as_ref(),
             payload_bytes: payload_bytes.as_deref(),
+            registry_delta: reg_delta.as_deref(),
         });
 
         // Parse the pack back and VERIFY it against the input before publishing
         // (design §11.3 step 2). Nothing is written until this succeeds.
         let verified = SealedSegmentIndex::from_pack(bytes.clone())?;
-        Self::verify_pack(&verified, &input)?;
+        Self::verify_pack(&verified, &input, reg_delta.is_some())?;
+        drop(reg_delta);
 
         // The identity of the pack we are about to install: the trailer hash
         // `from_pack` just recomputed over these exact bytes (bn-11g). Taken
@@ -749,6 +790,7 @@ impl SealDriver {
     fn verify_pack(
         index: &SealedSegmentIndex,
         input: &SealInput,
+        expect_registry_delta: bool,
     ) -> Result<(), SealError> {
         for s in &input.streams {
             for b in &s.batches {
@@ -785,6 +827,21 @@ impl SealDriver {
                     )));
                 }
             }
+        }
+        // bn-3h64: when a `REGISTRY_DELTA` was staged, the pack must hand it
+        // back through the exact path recovery takes — section located, section
+        // checksums verified, `.reg` body parsed, and the batch layout
+        // cross-checked against the pack's own pointer directory. That is a
+        // handful of microseconds (the section is O(registrations in this
+        // segment)) and it makes an embedding bug — a wrong offset, a section
+        // staged against the wrong stream, a layout the directory disagrees
+        // with — a seal failure here instead of a silent fallback to the
+        // `pread` path at every future open, which is exactly the kind of
+        // regression a performance section can hide.
+        if expect_registry_delta && index.read_registry_delta().is_none() {
+            return Err(SealError::Sidecar(SidecarError::Corrupt(
+                "pack registry-delta verify mismatch",
+            )));
         }
         Ok(())
     }
@@ -1416,6 +1473,210 @@ mod tests {
             ),
             "short layout refused"
         );
+    }
+
+    // -- bn-3h64: the same delta, carried as a pack section ------------------
+
+    /// The records an index hands recovery from its pack's `REGISTRY_DELTA`
+    /// section — the pack twin of [`delta_records`].
+    fn section_records(
+        idx: &SealedSegmentIndex,
+    ) -> Option<Vec<(u64, Vec<Vec<u8>>)>> {
+        Some(
+            idx.read_registry_delta()?
+                .batches()
+                .map(|b| {
+                    (
+                        b.first_global_pos(),
+                        b.payloads().map(<[u8]>::to_vec).collect(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// bn-3h64: a pack-sealed segment carries its `$registry` records in the
+    /// pack's `REGISTRY_DELTA` section — identical records to the ones the
+    /// loose path writes into a `.reg` — through the just-sealed index, a lazy
+    /// reopen, and an eager reopen alike. And it writes NO sibling `.reg`: the
+    /// section replaces the file, it does not duplicate it.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn pack_seal_carries_the_registry_delta_as_a_section() {
+        let dir = mess_testkit::sweeping_temp_dir("idx-driver-pack-regdelta");
+        let store = Arc::new(SealedStore::new());
+        let driver = SealDriver::new(store.clone(), dir.path()).with_pack(true);
+
+        let idx = driver.seal(input_with_registry(7), |_| Ok(())).unwrap();
+        assert!(driver.seal_pack_path(7).exists(), ".seal written");
+        assert!(
+            !driver.regdelta_path(7).exists(),
+            "bn-3h64: a pack-sealed segment gets no sibling .reg"
+        );
+        assert!(idx.has_registry_delta(), "section located at open");
+        assert_eq!(section_records(&idx), Some(expected_records()));
+
+        let lazy = SealedSegmentIndex::open_pack(&driver.seal_pack_path(7))
+            .expect("lazy reopen");
+        assert_eq!(section_records(&lazy), Some(expected_records()));
+        let eager =
+            SealedSegmentIndex::open_pack_eager(&driver.seal_pack_path(7))
+                .expect("eager reopen");
+        assert_eq!(section_records(&eager), Some(expected_records()));
+
+        // The very bytes the loose path would have written to `.reg`.
+        let loose = mess_testkit::sweeping_temp_dir("idx-driver-pack-vs-loose");
+        let loose_driver =
+            SealDriver::new(Arc::new(SealedStore::new()), loose.path());
+        let loose_idx =
+            loose_driver.seal(input_with_registry(7), |_| Ok(())).unwrap();
+        assert_eq!(
+            section_records(&idx),
+            delta_records(&loose_driver, &loose_idx, 7),
+            "pack section and .reg carry the identical records"
+        );
+    }
+
+    /// A pack-sealed segment with no `$registry` batch carries no section (and
+    /// still no `.reg`) — the same "nothing to accelerate, emit nothing" rule
+    /// the loose path follows.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn pack_seal_without_registrations_emits_no_section() {
+        let dir =
+            mess_testkit::sweeping_temp_dir("idx-driver-pack-regdelta-none");
+        let store = Arc::new(SealedStore::new());
+        let driver = SealDriver::new(store.clone(), dir.path()).with_pack(true);
+
+        let mut i = input(7);
+        i.payloads = Some(vec![vec![1], vec![2], vec![3]]);
+        let idx = driver.seal(i, |_| Ok(())).unwrap();
+
+        assert!(!idx.has_registry_delta());
+        assert!(section_records(&idx).is_none());
+        assert!(!driver.regdelta_path(7).exists());
+    }
+
+    /// I5/D1 for the section, exactly as for the file: a damaged
+    /// `REGISTRY_DELTA` body is refused and the pack keeps serving. The
+    /// trailer hash covers only header + directory (review F1), so a flipped
+    /// section byte does NOT change the pack's identity — the pack still opens,
+    /// still resolves every pointer, and only this one accelerator drops. That
+    /// is the local degradation the narrow hash scope was chosen for, and it is
+    /// what makes "no section" and "bad section" the same cost to recovery: the
+    /// `pread` path.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_damaged_registry_delta_section_degrades_locally() {
+        let dir =
+            mess_testkit::sweeping_temp_dir("idx-driver-pack-regdelta-bad");
+        let store = Arc::new(SealedStore::new());
+        let driver = SealDriver::new(store.clone(), dir.path()).with_pack(true);
+        driver.seal(input_with_registry(7), |_| Ok(())).unwrap();
+
+        let path = driver.seal_pack_path(7);
+        let good = std::fs::read(&path).unwrap();
+        let identity = SealedSegmentIndex::open_pack(&path)
+            .unwrap()
+            .pack_identity()
+            .expect("pack identity");
+
+        // Locate the section body and flip a byte inside it. Walking the
+        // directory (rather than guessing an offset) keeps the test honest if
+        // the section order ever changes.
+        let (off, len) = registry_delta_span(&good);
+        for at in [off, off + len / 2, off + len - 1] {
+            let mut bad = good.clone();
+            bad[at] ^= 0xFF;
+            std::fs::write(&path, &bad).unwrap();
+            let idx = SealedSegmentIndex::open_pack(&path)
+                .expect("pack still opens with a damaged optional section");
+            assert_eq!(
+                idx.pack_identity(),
+                Some(identity),
+                "a section-body flip cannot change pack identity"
+            );
+            assert_eq!(
+                idx.resolve(10, 1).unwrap().unwrap().offset,
+                6000,
+                "pointers stay exact"
+            );
+            assert!(
+                section_records(&idx).is_none(),
+                "byte {at}: damaged section must be refused"
+            );
+        }
+
+        // Truncating the section's LENGTH in the directory is a directory
+        // change, so the pack fails its trailer hash outright — the reader
+        // raw-scans, which is the documented whole-pack failure, not a silent
+        // wrong answer.
+        std::fs::write(&path, &good).unwrap();
+        assert_eq!(
+            section_records(&SealedSegmentIndex::open_pack(&path).unwrap()),
+            Some(expected_records()),
+            "the checks are not vacuous"
+        );
+    }
+
+    /// A CRC-valid section whose batch layout disagrees with the pack's own
+    /// pointer directory is refused — the pack-side twin of
+    /// [`a_layout_mismatch_is_refused`]. Built by re-encoding the pack with a
+    /// deliberately-wrong delta so every checksum in the file is consistent and
+    /// only the cross-check can catch it.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_pack_section_layout_mismatch_is_refused() {
+        use crate::sealed::pack;
+
+        let truth = input_with_registry(7);
+        let mut moved = input_with_registry(7);
+        moved.streams[0].batches[1].first_global_pos = 4;
+        let wrong =
+            encode_registry_delta(&moved, REGISTRY_STREAM_ID).expect("encode");
+
+        // Same pointers, same identity inputs — only the delta body differs.
+        let bytes = pack::encode_pack(&pack::PackInput {
+            segment_id:     truth.segment_id,
+            base_pos:       truth.base_pos,
+            streams:        &truth.streams,
+            event_type_ids: &[],
+            filter:         None,
+            payload_bytes:  None,
+            registry_delta: Some(&wrong),
+        });
+        let idx = SealedSegmentIndex::from_pack(bytes).expect("pack parses");
+        assert!(idx.has_registry_delta(), "section is present and CRC-valid");
+        assert!(
+            idx.read_registry_delta().is_none(),
+            "layout mismatch refused by the pack's own directory"
+        );
+        assert_eq!(idx.resolve(10, 1).unwrap().unwrap().offset, 6000);
+    }
+
+    /// The `(offset, length)` of a pack's `REGISTRY_DELTA` section body, read
+    /// out of the section directory the same way a reader would.
+    fn registry_delta_span(pack_bytes: &[u8]) -> (usize, usize) {
+        use crate::sealed::pack::{
+            HEADER_LEN, KIND_REGISTRY_DELTA, SECTION_REF_LEN,
+        };
+        let n_sections =
+            u32::from_le_bytes(pack_bytes[36..40].try_into().unwrap()) as usize;
+        for i in 0..n_sections {
+            let b = HEADER_LEN + i * SECTION_REF_LEN;
+            if u16::from_le_bytes(pack_bytes[b..b + 2].try_into().unwrap())
+                == KIND_REGISTRY_DELTA
+            {
+                let off = u64::from_le_bytes(
+                    pack_bytes[b + 8..b + 16].try_into().unwrap(),
+                ) as usize;
+                let len = u64::from_le_bytes(
+                    pack_bytes[b + 16..b + 24].try_into().unwrap(),
+                ) as usize;
+                return (off, len);
+            }
+        }
+        panic!("no REGISTRY_DELTA section in this pack");
     }
 
     /// bn-1i7: `seal` builds and durably writes a `.filter` file alongside the

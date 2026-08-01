@@ -191,6 +191,7 @@ fn a_mismatched_identity_reports_expected_and_observed() {
             event_type_ids: &[],
             filter:         None,
             payload_bytes:  None,
+            registry_delta: None,
         });
     std::fs::write(store::seal_path(d.path(), SEG_ID), &forged).expect("plant");
     let observed = pack_identity(d.path());

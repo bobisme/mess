@@ -25,6 +25,18 @@
 //! 3. **Fallback.** Deleted, truncated, bit-flipped, foreign (a valid delta
 //!    from another segment), and mixed (only some segments carry one) all open
 //!    cleanly and yield that same state.
+//!
+//! bn-3h64 adds the **pack-sealed arm**. A store sealed with
+//! [`EngineOptions::seal_pack`] carries each segment's delta as the
+//! `REGISTRY_DELTA` section of its `.seal` pack instead of as a sibling `.reg`
+//! file — same encoder, same bytes, same parser — so the three claims above are
+//! restated for it and, crucially, *across* it: a pack-sealed store, a
+//! loose-sealed store, and a raw-log fold of either must produce one registry.
+//! The section arm also gets the corruption ladder its container makes possible
+//! (a flipped body byte drops the section without touching pack identity, so
+//! recovery falls back per segment) and the mixed-container shape a real
+//! migration produces (`.pidx`+`.reg` segments and `.seal` segments in one
+//! store).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -56,12 +68,19 @@ impl Rng {
     fn below(&mut self, n: u64) -> u64 { self.next() % n.max(1) }
 }
 
-fn opts() -> EngineOptions {
+fn opts() -> EngineOptions { opts_with(false) }
+
+/// The same options with the consolidated-SealPack path on or off (bn-3h64).
+/// `seal_pack` changes only which sealed artifact a roll writes — the log bytes
+/// a given history produces are identical either way, which is what lets the
+/// cross-container tests below compare two stores built from one seed.
+fn opts_with(seal_pack: bool) -> EngineOptions {
     EngineOptions {
         durability: Durability::Process,
         // Tiny segments so a short history still rolls and seals many
         // segments — the delta only exists for sealed ones.
         segment_size: 96 * 1024,
+        seal_pack,
         ..Default::default()
     }
 }
@@ -71,12 +90,21 @@ fn opts() -> EngineOptions {
 /// interleaved with ordinary events throughout the log rather than all landing
 /// in segment 0.
 async fn build_history(dir: &Path, seed: u64) -> Vec<String> {
+    build_history_with(dir, seed, false).await
+}
+
+/// [`build_history`], sealing into consolidated packs when `seal_pack`.
+async fn build_history_with(
+    dir: &Path,
+    seed: u64,
+    seal_pack: bool,
+) -> Vec<String> {
     let mut rng = Rng(seed | 1);
     let n_streams = 8 + rng.below(40) as usize;
     let n_types = 1 + rng.below(6) as usize;
     let steps = 120 + rng.below(240) as usize;
 
-    let engine = LogEngine::open_with(dir, opts()).expect("open");
+    let engine = LogEngine::open_with(dir, opts_with(seal_pack)).expect("open");
     let mut versions: BTreeMap<usize, Version> = BTreeMap::new();
     let mut order: Vec<String> = Vec::new();
     let mut seen = vec![false; n_streams];
@@ -256,7 +284,20 @@ async fn fingerprint_engine(
 }
 
 async fn open_and_fingerprint(dir: &Path, oracle: &RegistryState) -> String {
-    let engine = LogEngine::open_with(dir, opts()).expect("reopen");
+    open_and_fingerprint_with(dir, oracle, false).await
+}
+
+/// [`open_and_fingerprint`] against a store whose seals use (or do not use) the
+/// consolidated pack. Reopening in the mode the store was built in matters
+/// because dropping the engine drains a roll-seal of the live head, and a seal
+/// in the other mode would quietly change the store's shape between arms.
+async fn open_and_fingerprint_with(
+    dir: &Path,
+    oracle: &RegistryState,
+    seal_pack: bool,
+) -> String {
+    let engine =
+        LogEngine::open_with(dir, opts_with(seal_pack)).expect("reopen");
     let fp = fingerprint_engine(&engine, oracle).await;
     drop(engine);
     fp
@@ -489,4 +530,294 @@ async fn a_legacy_store_upgrades_in_place() {
     }
     let all_log = open_and_fingerprint(&dir, &oracle2).await;
     assert_eq!(after, all_log, "mixed store differs from the all-log fold");
+}
+
+// ---------------------------------------------------------------------------
+// bn-3h64: the pack-sealed arm
+// ---------------------------------------------------------------------------
+
+/// Every `.seal` pack under `<dir>/sealed`, ascending by segment id.
+fn seal_paths(dir: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = std::fs::read_dir(dir.join("sealed"))
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|e| e == "seal"))
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
+/// The `(offset, length)` of a pack's `REGISTRY_DELTA` section body, walked out
+/// of the section directory the way any reader locates a section — so this
+/// helper keeps working if the encoder ever reorders its sections.
+fn registry_delta_span(pack: &[u8]) -> Option<(usize, usize)> {
+    use mess_index::sealed::pack::{
+        HEADER_LEN, KIND_REGISTRY_DELTA, SECTION_REF_LEN,
+    };
+    let n_sections = u32::from_le_bytes(pack[36..40].try_into().unwrap());
+    (0..n_sections as usize).find_map(|i| {
+        let b = HEADER_LEN + i * SECTION_REF_LEN;
+        (u16::from_le_bytes(pack[b..b + 2].try_into().unwrap())
+            == KIND_REGISTRY_DELTA)
+            .then(|| {
+                (
+                    u64::from_le_bytes(pack[b + 8..b + 16].try_into().unwrap())
+                        as usize,
+                    u64::from_le_bytes(pack[b + 16..b + 24].try_into().unwrap())
+                        as usize,
+                )
+            })
+    })
+}
+
+/// Flip a byte in the middle of a pack's `REGISTRY_DELTA` body, in place.
+///
+/// This is the pack's analogue of deleting a `.reg`, and a *better* control
+/// than deleting the file would be: the pack's trailer hash covers only the
+/// header + section directory, so a section-body flip leaves pack identity
+/// (and therefore the footer's name for it, bn-11g) untouched. The pack opens,
+/// serves every pointer, and drops exactly this one accelerator — which is
+/// precisely the "no usable delta" state a pre-bn-3h64 pack is in.
+fn corrupt_registry_delta_section(path: &Path) -> bool {
+    let mut bytes = std::fs::read(path).expect("read pack");
+    let Some((off, len)) = registry_delta_span(&bytes) else {
+        return false;
+    };
+    bytes[off + len / 2] ^= 0xFF;
+    std::fs::write(path, &bytes).expect("write pack");
+    true
+}
+
+/// The `(first_global_pos, payloads)` list a pack's `REGISTRY_DELTA` section
+/// yields through the exact call recovery makes — including the cross-check
+/// against the pack's own pointer directory.
+fn section_records(path: &Path) -> Option<Vec<(u64, Vec<Vec<u8>>)>> {
+    let idx = mess_index::sealed::SealedSegmentIndex::open_pack(path).ok()?;
+    Some(
+        idx.read_registry_delta()?
+            .batches()
+            .map(|b| {
+                (
+                    b.first_global_pos(),
+                    b.payloads().map(<[u8]>::to_vec).collect(),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn segment_id_of_seal(p: &Path) -> u64 {
+    p.file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.strip_prefix("seg-"))
+        .and_then(|s| s.parse::<u64>().ok())
+        .expect("sealed pack naming")
+}
+
+/// 1 (pack arm). The `REGISTRY_DELTA` section of every pack carries *exactly*
+/// the stream-0 batches a raw scan of that segment's log yields — same batches,
+/// same order, same bytes — and a pack-sealed store writes **no** `.reg` at all
+/// (the rule: the section replaces the sibling, it does not duplicate it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pack_sections_are_byte_identical_to_the_log() {
+    for seed in [1u64, 7, 12345, 0xDEAD_BEEF, 0x5EED, 99_991] {
+        let tmp =
+            mess_testkit::sweeping_temp_dir(&format!("regdelta-pack-{seed}"));
+        let dir = tmp.path().join("store");
+        build_history_with(&dir, seed, true).await;
+
+        let seals = seal_paths(&dir);
+        assert!(!seals.is_empty(), "seed {seed}: history sealed no pack");
+        assert!(
+            reg_paths(&dir).is_empty(),
+            "seed {seed}: a pack-sealed store must not also write .reg files"
+        );
+
+        let mut with_section = 0usize;
+        let mut covered = 0usize;
+        for p in &seals {
+            let seg = segment_id_of_seal(p);
+            let from_log = registry_batches_from_log(&dir, seg);
+            match section_records(p) {
+                Some(from_section) => {
+                    with_section += 1;
+                    covered += from_log.len();
+                    assert_eq!(
+                        from_section, from_log,
+                        "seed {seed}, segment {seg}: pack section differs \
+                         from the log's records"
+                    );
+                }
+                None => assert!(
+                    from_log.is_empty(),
+                    "seed {seed}, segment {seg}: log carries {} registry \
+                     batches but the pack has no usable section",
+                    from_log.len()
+                ),
+            }
+        }
+        assert!(
+            with_section > 0 && covered > 0,
+            "seed {seed}: no pack carried a registry delta — the corpus is \
+             not exercising the section"
+        );
+    }
+}
+
+/// 2 + 3 (pack arm). With the sections, with every section damaged, and with
+/// half of them damaged, a pack-sealed store recovers the registry its raw log
+/// folds to — and so does the loose-sealed store built from the same history.
+/// This is the differential the bone asks for: one registry from the pack
+/// section, from the `.reg`, and from the log-only `pread` path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pack_section_reg_file_and_log_all_fold_one_registry() {
+    for seed in [3u64, 42, 777, 0xC0FFEE, 0xABC_DEF, 31_337] {
+        let tmp = mess_testkit::sweeping_temp_dir(&format!(
+            "regdelta-pack-state-{seed}"
+        ));
+        let packed = tmp.path().join("packed");
+        let loose = tmp.path().join("loose");
+        build_history_with(&packed, seed, true).await;
+        build_history_with(&loose, seed, false).await;
+
+        // The two stores' logs must agree before anything else is meaningful:
+        // `seal_pack` changes the sealed artifact, never the log.
+        let oracle = fold_from_log(&packed);
+        let oracle_fp = fingerprint_state(&oracle);
+        assert_eq!(
+            oracle_fp,
+            fingerprint_state(&fold_from_log(&loose)),
+            "seed {seed}: the two containers' logs disagree"
+        );
+
+        let seals = seal_paths(&packed);
+        assert!(!seals.is_empty(), "seed {seed}: no pack to exercise");
+        assert!(!reg_paths(&loose).is_empty(), "seed {seed}: no .reg either");
+        let saved: Vec<(PathBuf, Vec<u8>)> = seals
+            .iter()
+            .map(|p| (p.clone(), std::fs::read(p).expect("read")))
+            .collect();
+
+        // (a) the accelerated pack path...
+        let via_section =
+            open_and_fingerprint_with(&packed, &oracle, true).await;
+        // ...equals the accelerated `.reg` path on the same history...
+        let via_reg = open_and_fingerprint_with(&loose, &oracle, false).await;
+        assert_eq!(
+            via_section, via_reg,
+            "seed {seed}: pack section and .reg recovered different registries"
+        );
+
+        // (b) every section damaged: the pack still opens (identity untouched)
+        // and every segment falls back to the `pread` path.
+        let mut damaged_any = false;
+        for (p, _) in &saved {
+            damaged_any |= corrupt_registry_delta_section(p);
+        }
+        assert!(damaged_any, "seed {seed}: nothing to damage");
+        let via_preads =
+            open_and_fingerprint_with(&packed, &oracle, true).await;
+        assert_eq!(
+            via_section, via_preads,
+            "seed {seed}: damaging every section changed the recovered \
+             registry"
+        );
+
+        // (c) mixed: restore every other pack, so some segments use the
+        // section and the rest the `pread` path within one open.
+        for (i, (p, bytes)) in saved.iter().enumerate() {
+            if i % 2 == 0 {
+                std::fs::write(p, bytes).expect("restore");
+            }
+        }
+        let mixed = open_and_fingerprint_with(&packed, &oracle, true).await;
+        assert_eq!(via_section, mixed, "seed {seed}: mixed pack store differs");
+
+        // ...and reopening never changed what the log itself folds to.
+        for (p, bytes) in &saved {
+            std::fs::write(p, bytes).expect("restore");
+        }
+        assert_eq!(
+            fingerprint_state(&fold_from_log(&packed)),
+            oracle_fp,
+            "seed {seed}: reopening changed what the log folds to"
+        );
+    }
+}
+
+/// The migration shape: a store sealed loose (`.pidx` + `.reg`), then reopened
+/// with `seal_pack` on so its *new* segments seal as packs carrying sections.
+/// One open then folds `$registry` from `.reg` files, pack sections, and raw
+/// `pread`s at once — and must produce the log's registry exactly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_store_with_both_containers_folds_one_registry() {
+    let tmp = mess_testkit::sweeping_temp_dir("regdelta-mixed-containers");
+    let dir = tmp.path().join("store");
+    build_history_with(&dir, 0x1234_5678, false).await;
+    let loose_regs = reg_paths(&dir);
+    assert!(!loose_regs.is_empty(), "the loose phase wrote no .reg");
+    assert!(seal_paths(&dir).is_empty(), "the loose phase wrote a pack");
+
+    // Phase 2: same store, pack seals from here on.
+    let engine = LogEngine::open_with(&dir, opts_with(true)).expect("reopen");
+    for s in 0..600u64 {
+        let batch = vec![RecordToAppend {
+            message_type: "evt.after".to_string(),
+            data:         vec![7u8; 500],
+        }];
+        engine
+            .append_batch(&format!("packed-{s:04}"), Version::NoStream, &batch)
+            .await
+            .expect("append");
+    }
+    drop(engine);
+
+    let seals = seal_paths(&dir);
+    assert!(!seals.is_empty(), "the pack phase sealed no pack");
+    assert_eq!(
+        reg_paths(&dir).len(),
+        loose_regs.len(),
+        "the pack phase must not add .reg files"
+    );
+
+    let oracle = fold_from_log(&dir);
+    let all_accel = open_and_fingerprint_with(&dir, &oracle, true).await;
+
+    // Now degrade each container independently and re-check: every combination
+    // of {.reg present/absent} × {section valid/damaged} folds the same thing.
+    let saved_regs: Vec<(PathBuf, Vec<u8>)> = reg_paths(&dir)
+        .iter()
+        .map(|p| (p.clone(), std::fs::read(p).expect("read")))
+        .collect();
+    let saved_seals: Vec<(PathBuf, Vec<u8>)> = seals
+        .iter()
+        .map(|p| (p.clone(), std::fs::read(p).expect("read")))
+        .collect();
+
+    for (drop_regs, damage_sections) in
+        [(true, false), (false, true), (true, true)]
+    {
+        for (p, bytes) in &saved_regs {
+            if drop_regs {
+                let _ = std::fs::remove_file(p);
+            } else {
+                std::fs::write(p, bytes).expect("restore .reg");
+            }
+        }
+        for (p, bytes) in &saved_seals {
+            std::fs::write(p, bytes).expect("restore pack");
+            if damage_sections {
+                corrupt_registry_delta_section(p);
+            }
+        }
+        let fp = open_and_fingerprint_with(&dir, &oracle, true).await;
+        assert_eq!(
+            all_accel, fp,
+            "mixed store differs with drop_regs={drop_regs} \
+             damage_sections={damage_sections}"
+        );
+    }
 }

@@ -29,10 +29,12 @@
 //! - [`block_cache`] — a bounded-bytes LRU of decoded pointer blocks wired into
 //!   stream replay and bypassed for point reads ([`BlockCache`]).
 //! - [`regdelta`] — the seal-time **registry delta** (bn-26pp): the `$registry`
-//!   records a sealed segment contains, copied into a sibling `.reg` file so
-//!   engine open folds them sequentially instead of chasing one random `pread`
-//!   per registration. Derived acceleration only: missing/corrupt/stale falls
-//!   back to the log-fold path (I5/D1).
+//!   records a sealed segment contains, copied out at seal so engine open folds
+//!   them sequentially instead of chasing one random `pread` per registration.
+//!   Lands in a sibling `.reg` file on the loose-sidecar path and — the same
+//!   bytes, same encoder, same parser — in the pack's `REGISTRY_DELTA` section
+//!   on the [`pack`] path (bn-3h64); never both. Derived acceleration only:
+//!   missing/corrupt/stale falls back to the log-fold path (I5/D1).
 //! - [`filter`] — the seal-time `BinaryFuse16` membership filter over a
 //!   segment's `stream_id`s (bn-1i7): consulted before the pointer index so a
 //!   segment definitely lacking a stream is skipped without a directory lookup.

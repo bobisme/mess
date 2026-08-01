@@ -243,6 +243,7 @@ fn forged_same_coverage_pack(store: &Path, seg: u64) -> Vec<u8> {
         event_type_ids: &[],
         filter:         None,
         payload_bytes:  None,
+        registry_delta: None,
     })
 }
 

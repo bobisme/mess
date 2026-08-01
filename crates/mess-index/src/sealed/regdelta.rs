@@ -71,6 +71,27 @@
 //!
 //! [`SealedSegmentIndex`]: crate::sealed::segment::SealedSegmentIndex
 //!
+//! # One delta per segment, in whichever container sealed it (bn-3h64)
+//!
+//! A segment is sealed either as a legacy `.pidx` trio or as a consolidated
+//! [`SealPack`](crate::sealed::pack), and its delta rides in whichever one that
+//! was: a sibling `.reg` file for the former, the pack's `REGISTRY_DELTA`
+//! section for the latter — **never both**. The bytes are identical either way
+//! ([`encode_registry_delta`] is the only producer and
+//! [`RegistryDelta::from_bytes`] the only parser), so recovery folds the same
+//! records from the same image regardless of which container it found; only the
+//! `open`-vs-`pread`-a-section step differs. That is deliberate: forking a
+//! "pack-native" layout would have bought nothing (the section's body needs its
+//! own `crc32c` regardless, because the pack directory's checksums cannot
+//! travel with a body that is also a standalone file format) and would have
+//! doubled the corruption-test surface for one accelerator.
+//!
+//! Everything below about trust, fallback, and non-retention applies verbatim
+//! to the section; see
+//! [`SealedSegmentIndex::read_registry_delta`](crate::sealed::segment::SealedSegmentIndex::read_registry_delta)
+//! for how the layout cross-check adapts when the sidecar that vouches for the
+//! delta and the container that carries it are the same file.
+//!
 //! # Why a sibling file rather than a `.pidx` section
 //!
 //! Same argument [`crate::sealed::filter`] makes one level down: the `.pidx`
@@ -82,9 +103,12 @@
 //! temp → fsync → rename → dir-fsync discipline, and costs a pre-existing store
 //! nothing: it simply has no `.reg` and keeps the old path.
 //!
-//! The consolidated [`SealPack`](crate::sealed::pack) reserves section kind
-//! `REGISTRY_DELTA` for the same payload; that path is off by default
-//! (`seal_pack`), so it is not what an on-by-default store reads today.
+//! None of that applies to the consolidated [`SealPack`](crate::sealed::pack),
+//! which is versioned as a whole and whose section directory is variable-length
+//! by construction — so there the delta simply *is* a section
+//! (`KIND_REGISTRY_DELTA`), added without disturbing a single existing reader
+//! (unknown kinds are skipped; a pack without the section reads exactly as
+//! before). See "One delta per segment" above.
 //!
 //! # Only segments that carry registrations get a file
 //!

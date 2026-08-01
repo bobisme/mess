@@ -3116,8 +3116,10 @@ impl LogEngine {
             })
             .collect::<Result<_, _>>()?;
         let head_id = *segment_ids.last().expect("non-empty");
-        // bn-26pp: where the sidecar-trusted branch below looks for a segment's
-        // `.reg` registry delta.
+        // bn-26pp: where the sidecar-trusted branch below looks for a
+        // loose-sealed segment's `.reg` registry delta. (bn-3h64: a pack-sealed
+        // segment's delta is a section inside its `.seal`, reached through the
+        // index rather than by path.)
         let sealed_dir = dir.join("sealed");
 
         let mut hot_entries: Vec<BatchEntry> = Vec::new();
@@ -3163,10 +3165,10 @@ impl LogEngine {
                 // reads nothing at all. If it does, we `pread` exactly those
                 // batches and no others.
                 //
-                // `bn-26pp`: ...unless the segment's seal also left a `.reg`
-                // registry delta, in which case those same batches are read
-                // sequentially as one small file instead. That is the whole
-                // point of the format: one random read per registration is
+                // `bn-26pp`: ...unless the segment's seal also left a registry
+                // delta, in which case those same batches are read sequentially
+                // as one small contiguous run instead. That is the whole point
+                // of the format: one random read per registration is
                 // `O(#names)` and cost 89.9% of a 10.5 s cold open at 250k
                 // streams (bn-2u01); the delta makes it `O(#segments)`
                 // sequential. It is used only after `accepts_registry_delta`
@@ -3174,17 +3176,42 @@ impl LogEngine {
                 // directory, it is dropped as soon as the fold has its bytes,
                 // and a segment without one takes the `pread` path below
                 // unchanged — so a store sealed before this bone, a store with
-                // only some segments sealed since, and a store whose `.reg`
-                // files were deleted or damaged all recover the identical
-                // registry.
+                // only some segments sealed since, and a store whose deltas
+                // were deleted or damaged all recover the identical registry.
+                //
+                // `bn-3h64`: the delta comes from one of two places, and a
+                // segment has at most one of them. A **pack-sealed** segment
+                // carries it as the pack's own `REGISTRY_DELTA` section — one
+                // bounded `pread` through the directory the open already
+                // verified (bn-dbz), cross-checked against that same pack's
+                // pointer directory — and `SealDriver` writes no sibling `.reg`
+                // for it. A **loose-sidecar** segment has the `.reg` file. Ask
+                // the index first and fall through to the file, so a mixed
+                // store (pack segments, `.pidx` segments, either kind with or
+                // without a delta) folds the identical registry however its
+                // segments were sealed. Both branches end in the same
+                // `RegistryDelta`, drained into the same fold and dropped.
                 if sref.stream_ids().contains(&registry::REGISTRY_STREAM_ID) {
-                    let delta =
-                        RegistryDelta::open(&reg_path(&sealed_dir, seg_id))
-                            .ok()
-                            .filter(|d| {
-                                d.stream_id() == registry::REGISTRY_STREAM_ID
-                                    && sref.accepts_registry_delta(d)
-                            });
+                    // REG1's `$registry` stream id is mess-store's fact, so the
+                    // check that a delta is really the registry's belongs here
+                    // whichever container produced it. The *layout* check is
+                    // the sidecar's, and `read_registry_delta` has already run
+                    // it against the pack's own directory — so it is applied
+                    // once, on the branch that has not had it.
+                    let is_registry = |d: &RegistryDelta| {
+                        d.stream_id() == registry::REGISTRY_STREAM_ID
+                    };
+                    let delta = sref
+                        .read_registry_delta()
+                        .filter(&is_registry)
+                        .or_else(|| {
+                            RegistryDelta::open(&reg_path(&sealed_dir, seg_id))
+                                .ok()
+                                .filter(|d| {
+                                    is_registry(d)
+                                        && sref.accepts_registry_delta(d)
+                                })
+                        });
                     match delta {
                         Some(delta) => {
                             for b in delta.batches() {

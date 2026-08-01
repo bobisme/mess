@@ -87,7 +87,7 @@ use std::sync::Arc;
 
 use crate::active::{EventPtr, GlobalEntry, StreamEntry};
 use crate::sealed::filter::SegmentFilter;
-use crate::sealed::pack::{EventTypeColumn, PackIdentity};
+use crate::sealed::pack::{EventTypeColumn, PackIdentity, SectionRef};
 use crate::sealed::payload::{DictResolver, PayloadError, SealedPayloadIndex};
 use crate::sealed::ptr_block::{
     self, BatchPtr, DecodeError, SkipEntry, encode_ptr_block, encode_skips,
@@ -498,6 +498,31 @@ struct DirEntry {
 /// latency; 39/39 real segments clear the +20% admission bar.
 type DirMap = HashMap<u64, DirEntry, foldhash::fast::RandomState>;
 
+/// A pack's `REGISTRY_DELTA` section, located but **not read** (bn-3h64): the
+/// section's directory-committed span and checksums, plus where its bytes can
+/// be fetched from when — and only when — recovery asks for them.
+///
+/// Locating without reading is the whole point. The section is the pack-sealed
+/// twin of the `.reg` sidecar, and `.reg` is a *recovery* input: read once,
+/// drained into the `$registry` fold, dropped (see [`crate::sealed::regdelta`]
+/// "Read once, never retained"). At 250k names the deltas are ~12 MiB across a
+/// store and would be ~0.5 GiB at 10M; holding them for the life of the process
+/// would trade a cold-open win for a permanent RSS loss, and most opens — every
+/// one whose segments the scan path covers anyway — never ask at all.
+#[derive(Debug)]
+enum RegDeltaSection {
+    /// The whole pack image is resident ([`SealedSegmentIndex::from_pack`] /
+    /// [`SealedSegmentIndex::open_pack_eager`]) and that eager parse already
+    /// verified this section's `crc32c` + `content_hash_prefix`, so the body is
+    /// simply the recorded span of `SealedSegmentIndex::bytes`.
+    Image { offset: usize, length: usize },
+    /// The pack was opened lazily ([`SealedSegmentIndex::open_pack`]): the body
+    /// is one bounded `pread` behind the handle the pack's other file-backed
+    /// sections already share, checked against the directory-committed
+    /// checksums carried here when — and only when — it is read.
+    File { file: Arc<File>, sec: SectionRef },
+}
+
 /// The read-only sealed pointer index for one segment. Owns the sidecar bytes
 /// in memory; every query is a slice + decode with no further I/O.
 #[derive(Debug)]
@@ -548,6 +573,11 @@ pub struct SealedSegmentIndex {
     /// which has no such identity to offer and therefore can never satisfy a
     /// footer that names a pack (spec 01 §3.3.3 reader rule 3).
     pack:        Option<(PackIdentity, u16)>,
+    /// The pack's `REGISTRY_DELTA` section, located but unread (bn-3h64) — see
+    /// [`RegDeltaSection`] and [`Self::read_registry_delta`]. `None` for a
+    /// legacy sidecar trio (whose delta is the sibling `.reg` file) and for a
+    /// pack that carries no registration.
+    reg_delta:   Option<RegDeltaSection>,
 }
 
 impl SealedSegmentIndex {
@@ -690,6 +720,10 @@ impl SealedSegmentIndex {
             // (56-byte records, ascending) — see [`dir_codec_of`].
             dir_codec: crate::sealed::pack::DIRCODEC_SORTED,
             pack: None,
+            // A legacy sidecar's registry delta is the sibling `.reg` file,
+            // which engine recovery opens by path — there is nothing to locate
+            // inside these bytes.
+            reg_delta: None,
         })
     }
 
@@ -784,6 +818,13 @@ impl SealedSegmentIndex {
                 .ok()
                 .filter(|c| c.event_count() == parsed.event_count)
             });
+        // bn-3h64: `parse_pack` already checked this section's committed
+        // `crc32c` + `content_hash_prefix` (that is what `crc_ok` means), so
+        // recording the span is all the eager path needs. It is still not
+        // *parsed* here: the fold that wants it may never run.
+        let reg_delta = parsed.section(pack::KIND_REGISTRY_DELTA).map(|s| {
+            RegDeltaSection::Image { offset: s.offset, length: s.length }
+        });
 
         Ok(SealedSegmentIndex {
             segment_id: parsed.segment_id,
@@ -797,6 +838,7 @@ impl SealedSegmentIndex {
             event_types,
             dir_codec: dir_sec.codec_id,
             pack: Some((parsed.identity, parsed.format_version)),
+            reg_delta,
         })
     }
 
@@ -965,6 +1007,14 @@ impl SealedSegmentIndex {
                     .ok()
                     .filter(|c| c.event_count() == parsed.event_count)
             });
+        // bn-3h64: located, not read — one `SectionRef` (48 bytes) per segment
+        // instead of the delta's bytes. The `Arc<File>` is the same handle the
+        // payload columns and type ids already hold, so this costs no extra fd
+        // in the shape that produces a delta at all (a registration implies
+        // payloads, and payloads imply `PAYLOAD_COLUMNS`).
+        let reg_delta = parsed
+            .section(pack::KIND_REGISTRY_DELTA)
+            .map(|sec| RegDeltaSection::File { file: Arc::clone(&file), sec });
 
         Ok(SealedSegmentIndex {
             segment_id: parsed.segment_id,
@@ -978,6 +1028,7 @@ impl SealedSegmentIndex {
             event_types,
             dir_codec: dir_sec.codec_id,
             pack: Some((parsed.identity, parsed.format_version)),
+            reg_delta,
         })
     }
 
@@ -1166,6 +1217,66 @@ impl SealedSegmentIndex {
             .collect();
         want.sort_unstable();
         delta.layout().eq(want)
+    }
+
+    /// Whether the pack behind this index carries a `REGISTRY_DELTA` section
+    /// (bn-3h64) — located at open, read at most once, by
+    /// [`Self::read_registry_delta`]. Always `false` for a legacy sidecar trio
+    /// and for a pack sealed from a segment with no registration.
+    #[must_use]
+    #[inline]
+    pub fn has_registry_delta(&self) -> bool { self.reg_delta.is_some() }
+
+    /// This segment's `$registry` batches, read out of the pack's
+    /// `REGISTRY_DELTA` section (bn-3h64) — the pack-sealed twin of opening the
+    /// sibling `.reg` file, for recovery's `$registry` fold.
+    ///
+    /// `None` means "use the other path", never "something is wrong": no
+    /// section (a legacy sidecar, or a segment that registered nothing), a read
+    /// that failed, bytes that do not match the section's directory-committed
+    /// `crc32c` + `content_hash_prefix`, a body this crate's own parser
+    /// rejects, or a delta [`Self::accepts_registry_delta`] refuses. The
+    /// caller then point-reads the `$registry` batches from the log exactly
+    /// as it did before this section existed, which is always right (D1:
+    /// the log is the authority, the delta is discardable acceleration).
+    ///
+    /// # Why the cross-check is the same one the `.reg` gets
+    ///
+    /// [`Self::accepts_registry_delta`] compares the delta's
+    /// `(first_global_pos, frame_count)` list against **this index's own
+    /// directory** — for a pack that is the pack's `STREAM_DIRECTORY` +
+    /// `POINTER_BLOCKS`, read and verified against their directory-committed
+    /// checksums at open, under a trailer hash the footer names (bn-11g). So
+    /// the delta can still only ever supply the *payload bytes* of batches the
+    /// same artifact already agrees exist at the positions it agrees they
+    /// occupy; the pack simply plays both roles the `.reg` split between a
+    /// sidecar and its sibling. The section's own `crc32c` (twice over: the
+    /// directory's, and the `.reg` body's internal one) is checked before a
+    /// single byte reaches the parser.
+    ///
+    /// The bytes are **not** retained: the delta is moved to the caller,
+    /// drained into the fold, and dropped. See [`crate::sealed::regdelta`].
+    #[must_use]
+    pub fn read_registry_delta(&self) -> Option<RegistryDelta> {
+        let delta = match self.reg_delta.as_ref()? {
+            // Already verified by the eager `parse_pack`; copy the span out so
+            // the parsed delta owns its image like the `.reg` path's does.
+            RegDeltaSection::Image { offset, length } => {
+                RegistryDelta::from_bytes(
+                    self.bytes.get(*offset..offset + length)?.to_vec(),
+                )
+                .ok()?
+            }
+            RegDeltaSection::File { file, sec } => {
+                let mut body = vec![0u8; sec.length];
+                file.read_exact_at(&mut body, sec.offset as u64).ok()?;
+                if !sec.verify(&body) {
+                    return None;
+                }
+                RegistryDelta::from_bytes(body).ok()?
+            }
+        };
+        self.accepts_registry_delta(&delta).then_some(delta)
     }
 
     /// Reassemble the payload of the event at **segment-local** stored index
@@ -1503,6 +1614,7 @@ mod tests {
             event_type_ids: &type_ids,
             filter:         filter.as_ref(),
             payload_bytes:  None,
+            registry_delta: None,
         });
         let packed = SealedSegmentIndex::from_pack(pack_bytes).unwrap();
 
@@ -1593,6 +1705,7 @@ mod tests {
                 event_type_ids: &[],
                 filter:         None,
                 payload_bytes:  None,
+                registry_delta: None,
             });
             // The four strides really do straddle the chooser (U = 63*stride
             // + 1 against a break-even of 3904) — otherwise the comment above
@@ -1617,6 +1730,7 @@ mod tests {
                     event_type_ids: &[],
                     filter:         None,
                     payload_bytes:  None,
+                    registry_delta: None,
                 }),
                 pack_bytes
             );
@@ -1708,6 +1822,7 @@ mod tests {
             event_type_ids: &[],
             filter:         filter.as_ref(),
             payload_bytes:  None,
+            registry_delta: None,
         });
 
         // Flip ONE byte in the middle of the filter section body. Nothing
@@ -1836,6 +1951,7 @@ mod tests {
             event_type_ids: &type_ids,
             filter: filter.as_ref(),
             payload_bytes: Some(&pcol),
+            registry_delta: None,
         });
         (bytes, payloads, type_ids)
     }
@@ -1887,6 +2003,7 @@ mod tests {
                 event_type_ids: &[],
                 filter:         None,
                 payload_bytes:  None,
+                registry_delta: None,
             });
             let path = write_pack(dir.path(), seg, &bytes);
             let want_name = dircodec_name(want);
@@ -2194,6 +2311,7 @@ mod tests {
             event_type_ids: &type_ids,
             filter:         filter.as_ref(),
             payload_bytes:  Some(&pcol),
+            registry_delta: None,
         });
         let dir = mess_testkit::sweeping_temp_dir("seg-pack-read-bench");
         let path = write_pack(dir.path(), seg, &bytes);
