@@ -687,9 +687,21 @@ impl SealedSegmentIndex {
         // sidecar. Like the filter, this is best-effort at open — a missing,
         // corrupt, or wrong-segment `.pcol` is silently dropped and the sealed
         // read path simply reports no columnar payload for this segment (the
-        // raw log remains the payload authority, D1). The driver attaches the
-        // in-memory index directly at seal, so this path matters only for a
-        // fresh reopen from disk.
+        // raw log remains the payload authority, D1).
+        //
+        // bn-bka2: the attach is LAZY. `SealedPayloadIndex::open` reads the
+        // sidecar's header, footer, and block index — bytes proportional to the
+        // block count, not to the payload — and keeps the file handle; block
+        // bytes are read on the first columnar read that touches them. Reading
+        // whole `.pcol`s here was 98.5% of warm engine-open time and ~all of
+        // post-open RSS at 8 GiB (bn-2u01). The identity cross-check below is
+        // unchanged, and so is the drop-on-anything-wrong contract; what shifts
+        // is that damage inside the DATA region surfaces at the first read of
+        // the affected block (as a typed error the read path degrades on)
+        // rather than at open. A sidecar sealed before bn-bka2 carries no
+        // per-block checksums and so still attaches eagerly and whole-image
+        // CRC-verified — nothing an existing store checks today is lost. See
+        // the `payload` module docs.
         if let Ok(Ok(payload)) =
             SealedPayloadIndex::open(&payload_path_for(path))
             && payload.segment_id() == index.segment_id

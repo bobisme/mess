@@ -39,11 +39,12 @@
 //! Header (32 bytes):
 //!   0   u32  magic = PCOL_MAGIC
 //!   4   u16  format_version = 1
-//!   6   u16  flags = 0
+//!   6   u16  flags                (bit0 FLAG_SPLIT_CRC — see below)
 //!   8   u64  segment_id
 //!   16  u64  event_count          (Σ block n_events)
 //!   24  u32  n_blocks
-//!   28  u32  reserved = 0
+//!   28  u32  index_crc            (crc32c over the INDEX region; 0 unless
+//!                                  FLAG_SPLIT_CRC — was `reserved`)
 //!
 //! DATA region:  encoded blocks, back to back
 //! INDEX region: n_blocks x BlockEntry (32 bytes), ascending by first_event
@@ -56,7 +57,8 @@
 //!   24  u8   kind                 (0 = row image, 1 = columnar) — the 1-bit flag
 //!   25  u8   reserved = 0
 //!   26  u16  dict_id              (0 = none; nonzero only legal for kind = row)
-//!   28  u32  reserved2 = 0
+//!   28  u32  block_crc            (crc32c over the block's stored bytes; 0
+//!                                  unless FLAG_SPLIT_CRC — was `reserved2`)
 //!
 //! Footer (24 bytes, at EOF):
 //!   0   u64  index_off
@@ -65,8 +67,69 @@
 //!   16  u32  reserved = 0
 //!   20  u32  magic = PCOL_MAGIC
 //! ```
+//!
+//! # Lazy attach and where integrity is checked (bn-bka2)
+//!
+//! A sidecar is opened one of two ways, and the difference is *when* its bytes
+//! are read, never *what* they decode to:
+//!
+//! - [`SealedPayloadIndex::from_bytes`] — the **eager** form. The whole image
+//!   is already in memory (verify-on-seal, a `SealPack` payload section, the
+//!   offline re-block), so it verifies `content_crc` over the entire image up
+//!   front. Block reads are slices; nothing else is checked.
+//! - [`SealedPayloadIndex::open`] — the **lazy** form used when a sealed
+//!   segment re-attaches its sibling `.pcol` at engine open. It reads only the
+//!   32-byte header, the 24-byte footer, and the `n_blocks × 32`-byte block
+//!   index — O(events/128) bytes, ~0.4% of a typical sidecar — and retains the
+//!   file handle. A block's bytes are `pread` on the first read that touches it
+//!   and dropped when that read is done. Eager attach made engine open linear
+//!   in total sidecar size (bn-2u01 measured it at 98.5% of warm open and ~all
+//!   of post-open RSS on an 8 GiB corpus); lazy attach makes it linear in
+//!   *block count* instead.
+//!
+//! **Lazy attach requires [`FLAG_SPLIT_CRC`]**: a sidecar written before
+//! bn-bka2 (`flags == 0`) carries no `index_crc` and no per-block `block_crc`,
+//! so [`SealedPayloadIndex::open`] falls back to the eager path for it — whole
+//! image, `content_crc` verified, bytes resident, exactly what an open did
+//! before this change. Attaching such a file lazily would leave it with *no*
+//! checksum at all, which is why the fallback is not optional. Every new seal
+//! sets the flag, so the lazy win applies to every segment sealed from here on,
+//! and an offline [`archive_reblock`] rewrites an old sidecar into the new
+//! format.
+//!
+//! **The corruption-detection timing shifts with it.** Eager open verified
+//! every byte of the sidecar before attaching, so a torn `.pcol` was dropped at
+//! open (D1: the raw log stays the payload authority). A lazy open cannot —
+//! `content_crc` covers the whole image, and reading it all is precisely the
+//! cost being removed. Instead:
+//!
+//! 1. **At open** the header, footer, and block index are fully validated
+//!    (magic ×2, `format_version`, `n_blocks` header/footer agreement, index
+//!    region sizing, every block span inside DATA, contiguous `first_event`
+//!    coverage summing to `event_count`, kind/`dict_id` legality) and — for a
+//!    sidecar written with [`FLAG_SPLIT_CRC`] — the block index is
+//!    **checksummed** against `index_crc`. A failure drops the sidecar at open
+//!    exactly as before.
+//! 2. **At first read** of a block, a [`FLAG_SPLIT_CRC`] sidecar verifies that
+//!    block's `block_crc` before decoding it. A mismatch is a
+//!    [`PayloadError::Corrupt`], which every caller already treats like a
+//!    missing sidecar: the read degrades to the raw log (mess-store's
+//!    `decode_capsule` falls back to the raw frames, D1/I5). So a damaged block
+//!    is still never *served* — it is merely discovered when it is read rather
+//!    than when the segment is attached, and only that block degrades instead
+//!    of the whole sidecar.
+//! 3. `index_crc`/`block_crc` live in fields the round-4 format reserved, and
+//!    the flag says whether they are meaningful. A sidecar written before
+//!    bn-bka2 has `flags == 0` and therefore attaches **eagerly** (above), so
+//!    it is still whole-image `content_crc`-verified at open and a torn one is
+//!    still dropped there — no store loses a check it has today. New seals
+//!    always set the flag, and `content_crc` is still written and still
+//!    verified by every eager path, so no integrity is removed from the format.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use crate::columnar::{self, Block, CodecError, EncodeOpts, FLAG_COLUMNAR};
@@ -81,6 +144,14 @@ pub const BLOCK_ENTRY_LEN: usize = 32;
 pub const FOOTER_LEN: usize = 24;
 /// Current sidecar `format_version`.
 pub const FORMAT_VERSION: u16 = 1;
+/// Header `flags` bit 0 (bn-bka2): the header's `index_crc` and every
+/// [`BlockEntry`]'s `block_crc` are meaningful, so a lazily attached sidecar
+/// ([`SealedPayloadIndex::open`]) can checksum the block index at open and each
+/// block before it decodes it — the split-coverage stand-in for the whole-image
+/// `content_crc` an eager open verifies. Clear on sidecars written before
+/// bn-bka2 (both fields are then the format's original zero `reserved`s), which
+/// read exactly as they always did, minus the pre-decode checksum.
+pub const FLAG_SPLIT_CRC: u16 = 0x0001;
 
 /// Default events per payload block (round-4 D6 default).
 pub const DEFAULT_BLOCK_EVENTS: usize = 128;
@@ -169,6 +240,12 @@ pub enum PayloadError {
     /// The requested event index is past the segment's event count.
     #[error("event index out of range")]
     IndexOutOfRange,
+    /// Reading a block's bytes from a **lazily attached** sidecar failed — the
+    /// file was removed, truncated, or the `pread` itself errored (bn-bka2).
+    /// Callers treat this exactly like a missing sidecar: the read degrades to
+    /// the raw log, which is always the payload authority (D1/I5).
+    #[error("payload sidecar read: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 // ---------------------------------------------------------------------------
@@ -456,8 +533,13 @@ pub fn archive_reblock(
     }
 
     let path = pcol_path(dir, segment_id);
-    let old = SealedPayloadIndex::open(&path)??;
-    let old_bytes = old.bytes.len() as u64;
+    // Eager (whole-image, `content_crc`-verified) open: the re-block is about
+    // to reassemble every block anyway, so it pays nothing for the strongest
+    // check the format offers, and it must never rewrite a file it has not
+    // fully validated. Engine open takes the lazy path instead (bn-bka2).
+    let old_image = std::fs::read(&path)?;
+    let old_bytes = old_image.len() as u64;
+    let old = SealedPayloadIndex::from_bytes(old_image)?;
     let old_blocks = old.block_count();
 
     // Reassemble the OLD `.pcol`'s payloads (the re-block's source of truth),
@@ -505,7 +587,7 @@ pub fn archive_reblock(
 
     let new_blocks = new_idx.block_count();
     let event_count = new_idx.event_count();
-    let bytes = new_idx.into_bytes();
+    let bytes = new_idx.into_bytes()?;
     let new_bytes = bytes.len() as u64;
 
     // Crash-atomic replace, same seal-commit discipline as the sealer: temp →
@@ -605,7 +687,7 @@ pub fn encode_payload_sidecar(
     let index = SealedPayloadIndex::from_bytes(bytes)?;
     let resolver = SealResolver { dict: opts.row_dict.as_ref() };
     verify_reassembly(&index, events, &resolver)?;
-    Ok(index.into_bytes())
+    index.into_bytes()
 }
 
 /// The verify-on-seal gate: reassemble every event in `index` through the read
@@ -661,14 +743,14 @@ fn serialize(
     let mut buf = Vec::with_capacity(
         HEADER_LEN + data_len + encs.len() * BLOCK_ENTRY_LEN + FOOTER_LEN,
     );
-    // Header.
+    // Header. `index_crc` is backpatched below, once the INDEX region exists.
     buf.extend_from_slice(&PCOL_MAGIC.to_le_bytes());
     buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-    buf.extend_from_slice(&0u16.to_le_bytes()); // flags
+    buf.extend_from_slice(&FLAG_SPLIT_CRC.to_le_bytes()); // flags
     buf.extend_from_slice(&segment_id.to_le_bytes());
     buf.extend_from_slice(&event_count.to_le_bytes());
     buf.extend_from_slice(&(encs.len() as u32).to_le_bytes());
-    buf.extend_from_slice(&0u32.to_le_bytes()); // reserved
+    buf.extend_from_slice(&0u32.to_le_bytes()); // index_crc placeholder
     debug_assert_eq!(buf.len(), HEADER_LEN);
 
     // DATA region, recording each block's absolute offset.
@@ -678,7 +760,9 @@ fn serialize(
         buf.extend_from_slice(&e.bytes);
     }
     let index_off = buf.len() as u64;
-    // INDEX region.
+    // INDEX region. Each entry carries its block's crc32c (FLAG_SPLIT_CRC) so
+    // a lazily attached reader can checksum a block before decoding it without
+    // reading the rest of the file.
     for (i, e) in encs.iter().enumerate() {
         buf.extend_from_slice(&e.first_event.to_le_bytes());
         buf.extend_from_slice(&e.n_events.to_le_bytes());
@@ -687,8 +771,14 @@ fn serialize(
         buf.push(e.kind.to_byte());
         buf.push(0); // reserved
         buf.extend_from_slice(&e.dict_id.to_le_bytes());
-        buf.extend_from_slice(&0u32.to_le_bytes()); // reserved2
+        buf.extend_from_slice(&crc32c::crc32c(&e.bytes).to_le_bytes());
     }
+    // The block index's own checksum, so a lazy open validates the table it
+    // just read (the whole-image `content_crc` below still covers everything
+    // for an eager open).
+    let index_crc = crc32c::crc32c(&buf[index_off as usize..]);
+    buf[28..32].copy_from_slice(&index_crc.to_le_bytes());
+
     // Footer.
     let content_crc = crc32c::crc32c(&buf);
     buf.extend_from_slice(&index_off.to_le_bytes());
@@ -716,15 +806,43 @@ pub struct BlockEntry {
     pub dict_id:     u16,
     byte_off:        u64,
     byte_len:        u32,
+    /// crc32c over the block's stored bytes, or `None` on a
+    /// pre-[`FLAG_SPLIT_CRC`] sidecar (bn-bka2).
+    crc:             Option<u32>,
 }
 
-/// The read-only sealed payload index for one segment. Owns the sidecar bytes
-/// in memory; a point read is a block lookup + one block decode.
+/// Where a [`SealedPayloadIndex`]'s block bytes come from (bn-bka2).
+///
+/// The block *table* is always resident — it is small (32 B per ~128 events)
+/// and every read needs it. The block *bytes* are either already in memory or
+/// read from the file on demand, which is the whole difference between an
+/// eager and a lazy attach.
+#[derive(Debug)]
+enum BlockSource {
+    /// The whole sidecar image, resident. Block bytes are slices of it.
+    Memory(Vec<u8>),
+    /// A retained handle on the `.pcol`. Block bytes are `pread` per read and
+    /// dropped after it; residency is the kernel page cache's business, and
+    /// mess-store's decoded-block cache keeps the *decoded* form hot.
+    File(File),
+}
+
+/// The read-only sealed payload index for one segment: the block table plus a
+/// source for the block bytes ([`BlockSource`]). A point read is a block lookup
+/// + (for a lazily attached sidecar) one `pread` + one block decode.
+///
+/// `&self` throughout and `Sync` with no interior locking — the lazy form adds
+/// only a `File`, and positioned reads (`pread`) do not touch the shared file
+/// offset, so concurrent readers of one `Arc<SealedSegmentIndex>` never
+/// serialise.
 #[derive(Debug)]
 pub struct SealedPayloadIndex {
     segment_id:  u64,
     event_count: u64,
-    bytes:       Vec<u8>,
+    src:         BlockSource,
+    /// End of the DATA region = start of the INDEX region. Block spans are
+    /// validated against it.
+    index_off:   u64,
     /// Block entries ascending by `first_event`.
     blocks:      Vec<BlockEntry>,
 }
@@ -742,96 +860,148 @@ impl SealedPayloadIndex {
     /// The block index entries (ascending by `first_event`).
     pub fn blocks(&self) -> &[BlockEntry] { &self.blocks }
 
-    fn into_bytes(self) -> Vec<u8> { self.bytes }
+    /// Whether this index holds the whole sidecar image in memory rather than
+    /// reading blocks on demand from the file — the bn-bka2 laziness
+    /// observable. `true` for [`Self::from_bytes`]/[`Self::open_eager`], and
+    /// for [`Self::open`] of a pre-[`FLAG_SPLIT_CRC`] sidecar (which attaches
+    /// eagerly so it keeps its whole-image `content_crc` check).
+    pub fn is_resident(&self) -> bool {
+        matches!(self.src, BlockSource::Memory(_))
+    }
+
+    /// The whole sidecar image, consuming the index. Only the eager form owns
+    /// one; a lazily attached index reads the file back.
+    fn into_bytes(self) -> Result<Vec<u8>, PayloadError> {
+        match self.src {
+            BlockSource::Memory(b) => Ok(b),
+            BlockSource::File(f) => {
+                let total = self.index_off as usize
+                    + self.blocks.len() * BLOCK_ENTRY_LEN
+                    + FOOTER_LEN;
+                let mut buf = vec![0u8; total];
+                f.read_exact_at(&mut buf, 0)?;
+                Ok(buf)
+            }
+        }
+    }
 
     /// Parse a sidecar byte image, validating magic, version, CRC, and every
-    /// block span. The bytes are moved in and retained.
+    /// block span. The bytes are moved in and retained — this is the **eager**
+    /// form (verify-on-seal, a `SealPack` payload section, the offline
+    /// re-block); [`Self::open`] is the lazy one.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, PayloadError> {
         if bytes.len() < HEADER_LEN + FOOTER_LEN {
             return Err(PayloadError::Corrupt("shorter than header + footer"));
         }
-        if rd32(&bytes, 0) != PCOL_MAGIC {
-            return Err(PayloadError::Corrupt("bad header magic"));
-        }
-        if rd16(&bytes, 4) != FORMAT_VERSION {
-            return Err(PayloadError::Corrupt("unknown format_version"));
-        }
-        let segment_id = rd64(&bytes, 8);
-        let event_count = rd64(&bytes, 16);
-        let n_blocks = rd32(&bytes, 24) as usize;
-
+        let head = Header::parse(&bytes[..HEADER_LEN])?;
         let footer_start = bytes.len() - FOOTER_LEN;
-        let foot = &bytes[footer_start..];
-        if rd32(foot, 20) != PCOL_MAGIC {
-            return Err(PayloadError::Corrupt("bad footer magic"));
-        }
-        if rd32(foot, 12) as usize != n_blocks {
-            return Err(PayloadError::Corrupt(
-                "footer/header n_blocks disagree",
-            ));
-        }
-        let index_off = rd64(foot, 0) as usize;
-        let stored_crc = rd32(foot, 8);
+        let index_off =
+            parse_footer(&bytes[footer_start..], &head, footer_start as u64)?;
+        let stored_crc = rd32(&bytes[footer_start..], 8);
         if crc32c::crc32c(&bytes[..footer_start]) != stored_crc {
             return Err(PayloadError::Corrupt("content CRC mismatch"));
         }
+        // The whole image is checksummed above, so the block index needs no
+        // separate `index_crc` pass here.
+        let blocks = parse_blocks(
+            &bytes[index_off as usize..footer_start],
+            &head,
+            index_off,
+        )?;
 
-        let index_len = n_blocks
-            .checked_mul(BLOCK_ENTRY_LEN)
-            .ok_or(PayloadError::Corrupt("index length overflow"))?;
-        if index_off > footer_start || footer_start - index_off != index_len {
-            return Err(PayloadError::Corrupt("index region size mismatch"));
-        }
-        if index_off < HEADER_LEN {
-            return Err(PayloadError::Corrupt("index overlaps header"));
-        }
-
-        let mut blocks = Vec::with_capacity(n_blocks);
-        let mut expect_first = 0u64;
-        for i in 0..n_blocks {
-            let b = index_off + i * BLOCK_ENTRY_LEN;
-            let first_event = rd64(&bytes, b);
-            let n_events = rd32(&bytes, b + 8);
-            let byte_len = rd32(&bytes, b + 12);
-            let byte_off = rd64(&bytes, b + 16);
-            let kind = BlockKind::from_byte(bytes[b + 24])?;
-            let dict_id = rd16(&bytes, b + 26);
-            // Structural invariants so later slicing/reassembly cannot panic.
-            let end = byte_off as usize + byte_len as usize;
-            if byte_off < HEADER_LEN as u64 || end > index_off {
-                return Err(PayloadError::Corrupt("block span out of range"));
-            }
-            if first_event != expect_first {
-                return Err(PayloadError::Corrupt(
-                    "block first_event not contiguous",
-                ));
-            }
-            if kind == BlockKind::Columnar && dict_id != 0 {
-                return Err(PayloadError::Corrupt(
-                    "columnar block carries a dict_id",
-                ));
-            }
-            expect_first += u64::from(n_events);
-            blocks.push(BlockEntry {
-                first_event,
-                n_events,
-                kind,
-                dict_id,
-                byte_off,
-                byte_len,
-            });
-        }
-        if expect_first != event_count {
-            return Err(PayloadError::Corrupt(
-                "block event counts != event_count",
-            ));
-        }
-
-        Ok(SealedPayloadIndex { segment_id, event_count, bytes, blocks })
+        Ok(SealedPayloadIndex {
+            segment_id: head.segment_id,
+            event_count: head.event_count,
+            src: BlockSource::Memory(bytes),
+            index_off,
+            blocks,
+        })
     }
 
-    /// Read and parse a sidecar from `path`.
+    /// **Lazily** attach the sidecar at `path` (bn-bka2): read and validate the
+    /// header, footer, and block index — `HEADER_LEN + FOOTER_LEN +
+    /// n_blocks × BLOCK_ENTRY_LEN` bytes, independent of how much payload the
+    /// segment holds — and retain the file handle. Block bytes are read on the
+    /// first read that touches them, never at open.
+    ///
+    /// **Except for a pre-[`FLAG_SPLIT_CRC`] sidecar**, which has no
+    /// index/block checksums to attach lazily against and so takes the eager
+    /// path ([`Self::from_bytes`]: whole image, `content_crc` verified,
+    /// resident) — trunk-identical behaviour for segments sealed before
+    /// bn-bka2. See the module docs.
+    ///
+    /// The outer `io::Result` is a filesystem failure (no such file, no
+    /// permission); the inner `Result` is a malformed sidecar. Callers
+    /// ([`crate::sealed::segment::SealedSegmentIndex::open`]) treat both the
+    /// same way: drop the sidecar, serve payloads from the raw log (D1).
+    ///
+    /// See the module docs for what this does *not* check that an eager
+    /// [`Self::from_bytes`] does — the whole-image `content_crc` — and how a
+    /// [`FLAG_SPLIT_CRC`] sidecar covers the same ground at read time.
     pub fn open(
+        path: &std::path::Path,
+    ) -> std::io::Result<Result<Self, PayloadError>> {
+        let file = File::open(path)?;
+        let len = file.metadata()?.len();
+        Ok(Self::attach(file, len))
+    }
+
+    /// The lazy attach proper, split out so tests can hand in a handle.
+    fn attach(file: File, len: u64) -> Result<Self, PayloadError> {
+        if len < (HEADER_LEN + FOOTER_LEN) as u64 {
+            return Err(PayloadError::Corrupt("shorter than header + footer"));
+        }
+        let mut hbuf = [0u8; HEADER_LEN];
+        file.read_exact_at(&mut hbuf, 0)?;
+        let head = Header::parse(&hbuf)?;
+
+        // LEGACY SIDECARS ATTACH EAGERLY (bn-bka2 review). Without
+        // `FLAG_SPLIT_CRC` there is no `index_crc` and no per-block
+        // `block_crc`, so a lazy attach would run with NO checksum at all —
+        // weaker than the whole-image `content_crc` an eager open verifies
+        // today, and a raw (`dict_id == 0`) block whose zstd frame survives a
+        // flipped byte could decode into plausible-but-wrong payload bytes.
+        // Read the whole image and verify `content_crc` exactly as
+        // `from_bytes` does: pre-bn-bka2 segments keep trunk-identical
+        // behaviour, every new seal sets the flag and gets the lazy win, and
+        // `archive_reblock` upgrades an old sidecar's format when it runs.
+        if head.flags & FLAG_SPLIT_CRC == 0 {
+            let mut bytes = vec![0u8; len as usize];
+            file.read_exact_at(&mut bytes, 0)?;
+            return Self::from_bytes(bytes);
+        }
+
+        let footer_start = len - FOOTER_LEN as u64;
+        let mut fbuf = [0u8; FOOTER_LEN];
+        file.read_exact_at(&mut fbuf, footer_start)?;
+        let index_off = parse_footer(&fbuf, &head, footer_start)?;
+
+        // The one length-bounded allocation: the block table, whose size the
+        // footer just proved equals `footer_start - index_off`.
+        let mut ibuf = vec![0u8; (footer_start - index_off) as usize];
+        file.read_exact_at(&mut ibuf, index_off)?;
+        if head.flags & FLAG_SPLIT_CRC != 0
+            && crc32c::crc32c(&ibuf) != head.index_crc
+        {
+            return Err(PayloadError::Corrupt("block index CRC mismatch"));
+        }
+        let blocks = parse_blocks(&ibuf, &head, index_off)?;
+
+        Ok(SealedPayloadIndex {
+            segment_id: head.segment_id,
+            event_count: head.event_count,
+            src: BlockSource::File(file),
+            index_off,
+            blocks,
+        })
+    }
+
+    /// Read and parse a sidecar from `path` **eagerly**: the whole image is
+    /// pulled into memory and its `content_crc` verified before anything else
+    /// happens. The offline archive re-block uses this — it is about to
+    /// reassemble every block anyway, so it pays nothing for the strongest
+    /// check the format offers. Engine open uses [`Self::open`] instead.
+    pub fn open_eager(
         path: &std::path::Path,
     ) -> std::io::Result<Result<Self, PayloadError>> {
         let bytes = std::fs::read(path)?;
@@ -863,10 +1033,33 @@ impl SealedPayloadIndex {
         Ok(())
     }
 
+    /// One block's stored bytes: a slice of the resident image, or a `pread` of
+    /// exactly that block from the retained handle (bn-bka2). A lazily read
+    /// block is checksummed against its [`BlockEntry`] `crc` before the caller
+    /// decodes it, so a torn block is a typed [`PayloadError::Corrupt`] — the
+    /// same degradation a missing sidecar produces — instead of bytes the codec
+    /// might mis-decode into a plausible payload.
     #[inline]
-    fn block_bytes(&self, e: &BlockEntry) -> &[u8] {
-        &self.bytes
-            [e.byte_off as usize..e.byte_off as usize + e.byte_len as usize]
+    fn block_bytes(
+        &self,
+        e: &BlockEntry,
+    ) -> Result<Cow<'_, [u8]>, PayloadError> {
+        let (off, len) = (e.byte_off as usize, e.byte_len as usize);
+        match &self.src {
+            BlockSource::Memory(bytes) => {
+                Ok(Cow::Borrowed(&bytes[off..off + len]))
+            }
+            BlockSource::File(f) => {
+                let mut buf = vec![0u8; len];
+                f.read_exact_at(&mut buf, e.byte_off)?;
+                if let Some(crc) = e.crc
+                    && crc32c::crc32c(&buf) != crc
+                {
+                    return Err(PayloadError::Corrupt("block CRC mismatch"));
+                }
+                Ok(Cow::Owned(buf))
+            }
+        }
     }
 
     /// The index of the block containing stored-order event `idx`, or `None`.
@@ -901,15 +1094,15 @@ impl SealedPayloadIndex {
         let bi = self.locate(idx).ok_or(PayloadError::IndexOutOfRange)?;
         let e = &self.blocks[bi];
         let row = (idx - e.first_event) as usize;
-        let raw = self.block_bytes(e);
+        let raw = self.block_bytes(e)?;
         if e.dict_id == 0 {
             // Columnar or codec-raw block: the codec decodes both.
-            Ok(Block::decode(raw)?.reassemble_one(row)?)
+            Ok(Block::decode(&raw)?.reassemble_one(row)?)
         } else {
             let dict = resolver
                 .dict_bytes(e.dict_id)
                 .ok_or(PayloadError::UnregisteredDict(e.dict_id))?;
-            let img = decode_row_dict(raw, dict)?;
+            let img = decode_row_dict(&raw, dict)?;
             if row >= img.len() {
                 return Err(PayloadError::IndexOutOfRange);
             }
@@ -939,15 +1132,15 @@ impl SealedPayloadIndex {
         out.clear();
         offs.clear();
         let e = self.blocks.get(bi).ok_or(PayloadError::IndexOutOfRange)?;
-        let raw = self.block_bytes(e);
+        let raw = self.block_bytes(e)?;
         if e.dict_id == 0 {
-            let block = Block::decode(raw)?;
+            let block = Block::decode(&raw)?;
             block.reassemble_all(out, offs)?;
         } else {
             let dict = resolver
                 .dict_bytes(e.dict_id)
                 .ok_or(PayloadError::UnregisteredDict(e.dict_id))?;
-            let img = decode_row_dict(raw, dict)?;
+            let img = decode_row_dict(&raw, dict)?;
             for i in 0..img.len() {
                 offs.push(out.len() as u32);
                 out.extend_from_slice(img.event(i));
@@ -988,13 +1181,13 @@ impl SealedPayloadIndex {
         while next < hi {
             let e = &self.blocks[bi];
             debug_assert!(next >= e.first_event);
-            let raw = self.block_bytes(e);
+            let raw = self.block_bytes(e)?;
             let block_lo = (next - e.first_event) as usize;
             let block_hi = (hi.min(e.first_event + u64::from(e.n_events))
                 - e.first_event) as usize;
             if e.dict_id == 0 {
                 // Columnar or codec-raw block: decode once, take the rows.
-                let block = Block::decode(raw)?;
+                let block = Block::decode(&raw)?;
                 for row in block_lo..block_hi {
                     offs.push(out.len() as u32);
                     out.extend_from_slice(&block.reassemble_one(row)?);
@@ -1003,7 +1196,7 @@ impl SealedPayloadIndex {
                 let dict = resolver
                     .dict_bytes(e.dict_id)
                     .ok_or(PayloadError::UnregisteredDict(e.dict_id))?;
-                let img = decode_row_dict(raw, dict)?;
+                let img = decode_row_dict(&raw, dict)?;
                 if block_hi > img.len() {
                     return Err(PayloadError::IndexOutOfRange);
                 }
@@ -1029,9 +1222,9 @@ impl SealedPayloadIndex {
         offs: &mut Vec<u32>,
     ) -> Result<(), PayloadError> {
         for e in &self.blocks {
-            let raw = self.block_bytes(e);
+            let raw = self.block_bytes(e)?;
             if e.dict_id == 0 {
-                let block = Block::decode(raw)?;
+                let block = Block::decode(&raw)?;
                 block.reassemble_all(out, offs)?;
                 // reassemble_all pushes n+1 offsets; drop the trailing dup so
                 // blocks concatenate into one contiguous offset list.
@@ -1040,7 +1233,7 @@ impl SealedPayloadIndex {
                 let dict = resolver
                     .dict_bytes(e.dict_id)
                     .ok_or(PayloadError::UnregisteredDict(e.dict_id))?;
-                let img = decode_row_dict(raw, dict)?;
+                let img = decode_row_dict(&raw, dict)?;
                 for i in 0..img.len() {
                     offs.push(out.len() as u32);
                     out.extend_from_slice(img.event(i));
@@ -1050,6 +1243,121 @@ impl SealedPayloadIndex {
         offs.push(out.len() as u32);
         Ok(())
     }
+}
+
+/// The parsed 32-byte header. Shared by the eager
+/// ([`SealedPayloadIndex::from_bytes`]) and lazy ([`SealedPayloadIndex::open`])
+/// paths so the two can never validate different things.
+struct Header {
+    flags:       u16,
+    segment_id:  u64,
+    event_count: u64,
+    n_blocks:    usize,
+    index_crc:   u32,
+}
+
+impl Header {
+    fn parse(h: &[u8]) -> Result<Self, PayloadError> {
+        debug_assert_eq!(h.len(), HEADER_LEN);
+        if rd32(h, 0) != PCOL_MAGIC {
+            return Err(PayloadError::Corrupt("bad header magic"));
+        }
+        if rd16(h, 4) != FORMAT_VERSION {
+            return Err(PayloadError::Corrupt("unknown format_version"));
+        }
+        Ok(Header {
+            flags:       rd16(h, 6),
+            segment_id:  rd64(h, 8),
+            event_count: rd64(h, 16),
+            n_blocks:    rd32(h, 24) as usize,
+            index_crc:   rd32(h, 28),
+        })
+    }
+}
+
+/// Validate the 24-byte footer against `head` and return `index_off` (the
+/// DATA/INDEX boundary), having proved the INDEX region is exactly
+/// `n_blocks × BLOCK_ENTRY_LEN` bytes ending at `footer_start`.
+fn parse_footer(
+    foot: &[u8],
+    head: &Header,
+    footer_start: u64,
+) -> Result<u64, PayloadError> {
+    debug_assert_eq!(foot.len(), FOOTER_LEN);
+    if rd32(foot, 20) != PCOL_MAGIC {
+        return Err(PayloadError::Corrupt("bad footer magic"));
+    }
+    if rd32(foot, 12) as usize != head.n_blocks {
+        return Err(PayloadError::Corrupt("footer/header n_blocks disagree"));
+    }
+    let index_off = rd64(foot, 0);
+    let index_len = head
+        .n_blocks
+        .checked_mul(BLOCK_ENTRY_LEN)
+        .ok_or(PayloadError::Corrupt("index length overflow"))?
+        as u64;
+    if index_off > footer_start || footer_start - index_off != index_len {
+        return Err(PayloadError::Corrupt("index region size mismatch"));
+    }
+    if index_off < HEADER_LEN as u64 {
+        return Err(PayloadError::Corrupt("index overlaps header"));
+    }
+    Ok(index_off)
+}
+
+/// Parse and fully validate the INDEX region (`idx` is exactly that region:
+/// `n_blocks × BLOCK_ENTRY_LEN` bytes, which started at `index_off` in the
+/// file). Every block span must lie inside DATA (`[HEADER_LEN, index_off)`)
+/// and the blocks must tile `[0, event_count)` contiguously, so no later slice
+/// or `pread` can escape the file.
+fn parse_blocks(
+    idx: &[u8],
+    head: &Header,
+    index_off: u64,
+) -> Result<Vec<BlockEntry>, PayloadError> {
+    debug_assert_eq!(idx.len(), head.n_blocks * BLOCK_ENTRY_LEN);
+    let split_crc = head.flags & FLAG_SPLIT_CRC != 0;
+    let mut blocks = Vec::with_capacity(head.n_blocks);
+    let mut expect_first = 0u64;
+    for i in 0..head.n_blocks {
+        let b = i * BLOCK_ENTRY_LEN;
+        let first_event = rd64(idx, b);
+        let n_events = rd32(idx, b + 8);
+        let byte_len = rd32(idx, b + 12);
+        let byte_off = rd64(idx, b + 16);
+        let kind = BlockKind::from_byte(idx[b + 24])?;
+        let dict_id = rd16(idx, b + 26);
+        let crc = split_crc.then(|| rd32(idx, b + 28));
+        // Structural invariants so later slicing/reassembly cannot panic.
+        let end = byte_off.saturating_add(u64::from(byte_len));
+        if byte_off < HEADER_LEN as u64 || end > index_off {
+            return Err(PayloadError::Corrupt("block span out of range"));
+        }
+        if first_event != expect_first {
+            return Err(PayloadError::Corrupt(
+                "block first_event not contiguous",
+            ));
+        }
+        if kind == BlockKind::Columnar && dict_id != 0 {
+            return Err(PayloadError::Corrupt(
+                "columnar block carries a dict_id",
+            ));
+        }
+        expect_first += u64::from(n_events);
+        blocks.push(BlockEntry {
+            first_event,
+            n_events,
+            kind,
+            dict_id,
+            byte_off,
+            byte_len,
+            crc,
+        });
+    }
+    if expect_first != head.event_count {
+        return Err(PayloadError::Corrupt("block event counts != event_count"));
+    }
+    Ok(blocks)
 }
 
 fn rd16(d: &[u8], at: usize) -> u16 {
@@ -1345,7 +1653,7 @@ mod tests {
         let target = col.byte_off as usize + col.byte_len as usize - 1;
         let first_event = col.first_event;
 
-        let mut tampered = idx.into_bytes();
+        let mut tampered = idx.into_bytes().unwrap();
         tampered[target] ^= 0xFF;
         // Repair the content CRC so from_bytes accepts the tampered image.
         let footer_start = tampered.len() - FOOTER_LEN;
@@ -1488,6 +1796,360 @@ mod tests {
             SealedPayloadIndex::from_bytes(bad_magic),
             Err(PayloadError::Corrupt(_))
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // bn-bka2: lazy attach (`open`) — header/footer/block-index only at open,
+    // block bytes on demand, corruption discovered at read time.
+    // -----------------------------------------------------------------------
+
+    /// Write `bytes` as segment `seg`'s `.pcol` under `dir` and lazily attach
+    /// it, asserting the attach succeeded and is file-backed.
+    fn attach_lazy(
+        dir: &std::path::Path,
+        seg: u64,
+        bytes: &[u8],
+    ) -> SealedPayloadIndex {
+        std::fs::write(pcol_path(dir, seg), bytes).unwrap();
+        let idx = SealedPayloadIndex::open(&pcol_path(dir, seg))
+            .expect("io")
+            .expect("parse");
+        assert!(!idx.is_resident(), "open must attach lazily, not slurp");
+        idx
+    }
+
+    /// Rewrite `image` into the pre-bn-bka2 shape: `flags == 0`, no
+    /// `index_crc`, no per-block `block_crc`, `content_crc` repaired — exactly
+    /// what a sidecar sealed before this change looks like on disk.
+    fn strip_split_crcs(mut image: Vec<u8>) -> Vec<u8> {
+        let footer_start = image.len() - FOOTER_LEN;
+        let index_off = rd64(&image[footer_start..], 0) as usize;
+        let n_blocks = rd32(&image, 24) as usize;
+        image[6..8].copy_from_slice(&0u16.to_le_bytes()); // flags
+        image[28..32].copy_from_slice(&0u32.to_le_bytes()); // index_crc
+        for i in 0..n_blocks {
+            let b = index_off + i * BLOCK_ENTRY_LEN + 28;
+            image[b..b + 4].copy_from_slice(&0u32.to_le_bytes());
+        }
+        let crc = crc32c::crc32c(&image[..footer_start]);
+        image[footer_start + 8..footer_start + 12]
+            .copy_from_slice(&crc.to_le_bytes());
+        image
+    }
+
+    /// The heart of bn-bka2: `open` must not read the DATA region. Proof by
+    /// construction — a sidecar whose payload bytes are destroyed but whose
+    /// header/footer/block index are intact **opens fine** (an eager
+    /// `from_bytes` of the same image rejects it on `content_crc`), reads of
+    /// untouched blocks stay byte-exact, and the torn block is caught when it
+    /// is read, as the typed error the sealed read path degrades on (D1 — the
+    /// raw log remains the payload authority).
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn lazy_open_skips_payload_bytes_and_tears_surface_at_read() {
+        let dir =
+            mess_testkit::sweeping_temp_dir("idx-payload-lazy-open-skips");
+        let seg = 11u64;
+        let evs = mixed_corpus();
+        let good = encode_payload_sidecar(seg, &refs(&evs), &opts()).unwrap();
+
+        // Destroy the second block's stored bytes; touch nothing else.
+        let victim = 1usize;
+        let e = SealedPayloadIndex::from_bytes(good.clone()).unwrap().blocks()
+            [victim];
+        let (vlo, vhi) = (e.first_event, e.first_event + u64::from(e.n_events));
+        let mut torn = good.clone();
+        let span =
+            e.byte_off as usize..(e.byte_off as usize + e.byte_len as usize);
+        for b in &mut torn[span] {
+            *b ^= 0xFF;
+        }
+
+        // An eager open reads every byte, so it rejects the image outright —
+        // this is the check the lazy path provably does not run.
+        assert!(matches!(
+            SealedPayloadIndex::from_bytes(torn.clone()),
+            Err(PayloadError::Corrupt(_))
+        ));
+
+        // The lazy open attaches: identity and geometry come from the bounded
+        // header/footer/index read, and the DATA region is never looked at.
+        let lazy = attach_lazy(dir.path(), seg, &torn);
+        assert_eq!(lazy.segment_id(), seg);
+        assert_eq!(lazy.event_count() as usize, evs.len());
+        assert_eq!(
+            lazy.block_count(),
+            SealedPayloadIndex::from_bytes(good).unwrap().block_count()
+        );
+
+        // Reading the torn block is a typed Corrupt error (its `block_crc`
+        // fails before the codec ever sees the bytes), for every read shape.
+        let mut out = Vec::new();
+        let mut offs = Vec::new();
+        assert!(matches!(
+            lazy.reassemble_event(vlo, &NoDicts),
+            Err(PayloadError::Corrupt(_))
+        ));
+        assert!(matches!(
+            lazy.reassemble_block(victim, &NoDicts, &mut out, &mut offs),
+            Err(PayloadError::Corrupt(_))
+        ));
+        assert!(matches!(
+            lazy.reassemble_range(vlo, vhi, &NoDicts, &mut out, &mut offs),
+            Err(PayloadError::Corrupt(_))
+        ));
+        assert!(matches!(
+            lazy.reassemble_all(&NoDicts, &mut out, &mut offs),
+            Err(PayloadError::Corrupt(_))
+        ));
+
+        // Every OTHER block still reassembles byte-exact through the lazy
+        // path: one torn block degrades one read, not the whole sidecar.
+        for (i, ev) in evs.iter().enumerate() {
+            let gi = i as u64;
+            if (vlo..vhi).contains(&gi) {
+                continue;
+            }
+            assert_eq!(
+                &lazy.reassemble_event(gi, &NoDicts).unwrap(),
+                ev,
+                "point {i}"
+            );
+        }
+        lazy.reassemble_range(0, vlo, &NoDicts, &mut out, &mut offs).unwrap();
+        for (i, w) in offs.windows(2).enumerate() {
+            assert_eq!(&out[w[0] as usize..w[1] as usize], evs[i].as_slice());
+        }
+    }
+
+    /// A lazily attached sidecar agrees byte-for-byte with the eager one on
+    /// every read shape, across mixed columnar / row-fallback blocks.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn lazy_and_eager_reads_agree_byte_for_byte() {
+        let dir = mess_testkit::sweeping_temp_dir("idx-payload-lazy-agrees");
+        let seg = 3u64;
+        let evs = mixed_corpus();
+        let image = encode_payload_sidecar(seg, &refs(&evs), &opts()).unwrap();
+        let eager = SealedPayloadIndex::from_bytes(image.clone()).unwrap();
+        assert!(eager.is_resident());
+        let lazy = attach_lazy(dir.path(), seg, &image);
+
+        assert_eq!(lazy.block_count(), eager.block_count());
+        assert_eq!(lazy.event_count(), eager.event_count());
+
+        let n = evs.len() as u64;
+        for gi in 0..n {
+            assert_eq!(
+                lazy.reassemble_event(gi, &NoDicts).unwrap(),
+                eager.reassemble_event(gi, &NoDicts).unwrap(),
+                "point {gi}"
+            );
+        }
+        let (mut lo_o, mut lo_f) = (Vec::new(), Vec::new());
+        let (mut eo, mut ef) = (Vec::new(), Vec::new());
+        for (lo, hi) in
+            [(0, n), (0, 1), (3, 9), (30, 35), (28, 100), (n - 5, n), (17, 17)]
+        {
+            lazy.reassemble_range(lo, hi, &NoDicts, &mut lo_o, &mut lo_f)
+                .unwrap();
+            eager.reassemble_range(lo, hi, &NoDicts, &mut eo, &mut ef).unwrap();
+            assert_eq!((&lo_o, &lo_f), (&eo, &ef), "range [{lo},{hi})");
+        }
+        for bi in 0..lazy.block_count() {
+            lazy.reassemble_block(bi, &NoDicts, &mut lo_o, &mut lo_f).unwrap();
+            eager.reassemble_block(bi, &NoDicts, &mut eo, &mut ef).unwrap();
+            assert_eq!((&lo_o, &lo_f), (&eo, &ef), "block {bi}");
+        }
+        lazy.reassemble_all(&NoDicts, &mut lo_o, &mut lo_f).unwrap();
+        eager.reassemble_all(&NoDicts, &mut eo, &mut ef).unwrap();
+        assert_eq!((lo_o, lo_f), (eo, ef), "full scan");
+    }
+
+    /// Structural damage is still caught **at open**, so the sidecar is
+    /// dropped before it is ever attached: a torn block index (caught by
+    /// `index_crc`), a torn footer, a truncated file, and a bad magic.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn lazy_open_rejects_structural_damage() {
+        let dir =
+            mess_testkit::sweeping_temp_dir("idx-payload-lazy-open-rejects");
+        let seg = 4u64;
+        let evs = mixed_corpus();
+        let good = encode_payload_sidecar(seg, &refs(&evs), &opts()).unwrap();
+        let footer_start = good.len() - FOOTER_LEN;
+        let index_off = rd64(&good[footer_start..], 0) as usize;
+
+        let open_at = |name: &str, bytes: &[u8]| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, bytes).unwrap();
+            SealedPayloadIndex::open(&p).unwrap()
+        };
+
+        // Block index flipped: the entry table's own crc32c catches it.
+        let mut bad_index = good.clone();
+        bad_index[index_off + 9] ^= 0xFF;
+        assert!(matches!(
+            open_at("bad-index.pcol", &bad_index),
+            Err(PayloadError::Corrupt("block index CRC mismatch"))
+        ));
+
+        // A block span pointed outside DATA is refused even without the CRC
+        // (the legacy shape): structural validation is unconditional.
+        let mut oob = good.clone();
+        oob[index_off + 16..index_off + 24]
+            .copy_from_slice(&(index_off as u64).to_le_bytes());
+        let oob = strip_split_crcs(oob);
+        assert!(matches!(
+            open_at("oob.pcol", &oob),
+            Err(PayloadError::Corrupt("block span out of range"))
+        ));
+
+        // Footer magic gone (e.g. a partially rewritten file).
+        let mut bad_footer = good.clone();
+        bad_footer[footer_start + 20] ^= 0xFF;
+        assert!(matches!(
+            open_at("bad-footer.pcol", &bad_footer),
+            Err(PayloadError::Corrupt("bad footer magic"))
+        ));
+
+        // Truncated to a husk (the sealer crashed mid-write, or the file was
+        // clipped): the footer read lands in the middle of DATA.
+        assert!(matches!(
+            open_at("husk.pcol", &good[..good.len() / 3]),
+            Err(PayloadError::Corrupt(_))
+        ));
+        assert!(matches!(
+            open_at("tiny.pcol", &good[..HEADER_LEN + FOOTER_LEN - 1]),
+            Err(PayloadError::Corrupt("shorter than header + footer"))
+        ));
+
+        // Not a `.pcol` at all.
+        let mut bad_magic = good.clone();
+        bad_magic[0] ^= 0x01;
+        assert!(matches!(
+            open_at("bad-magic.pcol", &bad_magic),
+            Err(PayloadError::Corrupt("bad header magic"))
+        ));
+
+        // A missing file is an io error, not a parse error — the caller drops
+        // the sidecar either way.
+        assert!(
+            SealedPayloadIndex::open(&dir.path().join("absent.pcol")).is_err()
+        );
+    }
+
+    /// Backward compatibility: a sidecar sealed before bn-bka2 (`flags == 0`,
+    /// no split CRCs) opens and reads byte-exact — and, having no per-block
+    /// checksum to attach lazily against, it takes the **eager** path so it
+    /// keeps the whole-image `content_crc` check an open performs today.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn legacy_sidecar_without_split_crcs_attaches_eagerly_and_reads() {
+        let dir = mess_testkit::sweeping_temp_dir("idx-payload-lazy-legacy");
+        let seg = 8u64;
+        let evs = mixed_corpus();
+        let legacy = strip_split_crcs(
+            encode_payload_sidecar(seg, &refs(&evs), &opts()).unwrap(),
+        );
+        // The stripped image is still a valid v1 sidecar to the eager reader.
+        SealedPayloadIndex::from_bytes(legacy.clone()).unwrap();
+
+        std::fs::write(pcol_path(dir.path(), seg), &legacy).unwrap();
+        let idx = SealedPayloadIndex::open(&pcol_path(dir.path(), seg))
+            .expect("io")
+            .expect("parse");
+        assert!(
+            idx.is_resident(),
+            "a flags==0 sidecar must attach eagerly: lazily it would carry no \
+             checksum at all"
+        );
+        assert!(idx.blocks().iter().all(|b| b.crc.is_none()));
+        for (i, ev) in evs.iter().enumerate() {
+            assert_eq!(&idx.reassemble_event(i as u64, &NoDicts).unwrap(), ev);
+        }
+        let mut out = Vec::new();
+        let mut offs = Vec::new();
+        idx.reassemble_all(&NoDicts, &mut out, &mut offs).unwrap();
+        for (i, w) in offs.windows(2).enumerate() {
+            assert_eq!(&out[w[0] as usize..w[1] as usize], evs[i].as_slice());
+        }
+    }
+
+    /// bn-bka2 review: the legacy path must not lose integrity. A torn byte in
+    /// a pre-`FLAG_SPLIT_CRC` sidecar's DATA region — invisible to the
+    /// structural checks and, on a raw block, potentially decodable into
+    /// plausible-but-wrong bytes — is caught by `content_crc` and the sidecar
+    /// is **dropped at open**, byte-for-byte what trunk does. The same tear in
+    /// a `FLAG_SPLIT_CRC` sidecar attaches and degrades at read
+    /// (`lazy_open_skips_payload_bytes_and_tears_surface_at_read`): both
+    /// refuse to serve the block, they just discover it at different moments.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn torn_legacy_sidecar_is_dropped_at_open_like_trunk() {
+        let dir =
+            mess_testkit::sweeping_temp_dir("idx-payload-legacy-torn-open");
+        let seg = 21u64;
+        let evs = mixed_corpus();
+        let good = encode_payload_sidecar(seg, &refs(&evs), &opts()).unwrap();
+
+        // Build the legacy image first (stripping recomputes `content_crc`
+        // over the clean bytes, so the file is exactly a valid pre-bn-bka2
+        // sidecar), THEN tear a byte in the DATA region — real media damage
+        // after the fact, which only `content_crc` can see.
+        let mut torn = strip_split_crcs(good.clone());
+        torn[HEADER_LEN + 4] ^= 0xFF;
+        std::fs::write(pcol_path(dir.path(), seg), &torn).unwrap();
+
+        match SealedPayloadIndex::open(&pcol_path(dir.path(), seg)).unwrap() {
+            Err(PayloadError::Corrupt("content CRC mismatch")) => {}
+            other => panic!(
+                "torn legacy sidecar must be dropped at open, got {other:?}"
+            ),
+        }
+
+        // Control: the same file with the tear reverted attaches and serves.
+        let clean = strip_split_crcs(good);
+        std::fs::write(pcol_path(dir.path(), seg), &clean).unwrap();
+        let idx = SealedPayloadIndex::open(&pcol_path(dir.path(), seg))
+            .unwrap()
+            .unwrap();
+        assert_eq!(idx.reassemble_event(0, &NoDicts).unwrap(), evs[0]);
+    }
+
+    /// Concurrent readers share one lazily attached index by `&self` with no
+    /// lock on the read path (positioned `pread`s do not touch a shared file
+    /// offset), so parallel point reads are byte-exact and do not serialise.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn lazy_index_serves_concurrent_readers() {
+        let dir =
+            mess_testkit::sweeping_temp_dir("idx-payload-lazy-concurrent");
+        let seg = 12u64;
+        let evs = mixed_corpus();
+        let image = encode_payload_sidecar(seg, &refs(&evs), &opts()).unwrap();
+        let idx = attach_lazy(dir.path(), seg, &image);
+
+        std::thread::scope(|s| {
+            for t in 0..4u64 {
+                let idx = &idx;
+                let evs = &evs;
+                s.spawn(move || {
+                    for round in 0..3u64 {
+                        for (i, ev) in evs.iter().enumerate() {
+                            let gi =
+                                (i as u64 + t * 37 + round) % evs.len() as u64;
+                            let want = &evs[gi as usize];
+                            assert_eq!(
+                                &idx.reassemble_event(gi, &NoDicts).unwrap(),
+                                want
+                            );
+                            let _ = ev;
+                        }
+                    }
+                });
+            }
+        });
     }
 
     // -----------------------------------------------------------------------

@@ -323,7 +323,11 @@ fn verify_pidx(report: &mut Report, segment_id: u64, path: &Path) {
 /// Validate a payload sidecar's CRC (always) and, under `--full`, reassemble
 /// every block to prove byte-integrity of the columnar tier.
 fn verify_pcol(report: &mut Report, segment_id: u64, path: &Path, full: bool) {
-    let parsed = match SealedPayloadIndex::open(path) {
+    // `open_eager`, not `open`: engine open attaches `.pcol`s lazily (bn-bka2)
+    // and so validates structure + the block index rather than the whole-image
+    // `content_crc`. An offline verifier has the opposite trade — it exists to
+    // read every byte — so it keeps the strongest check the format offers.
+    let parsed = match SealedPayloadIndex::open_eager(path) {
         Ok(inner) => inner,
         Err(e) => {
             report.push_finding(

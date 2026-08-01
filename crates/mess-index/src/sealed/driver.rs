@@ -1231,6 +1231,103 @@ mod tests {
         );
     }
 
+    /// bn-bka2 / I5: the attach is lazy but the identity cross-check is not.
+    /// A `.pcol` sitting at segment 5's path that was sealed for a DIFFERENT
+    /// segment is dropped **at open** — the reopened segment reports no
+    /// columnar payload and the raw log stays the payload authority (D1) —
+    /// and a torn-but-structurally-intact `.pcol` attaches at open yet
+    /// degrades per read, never serving bytes.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn wrong_segment_pcol_dropped_at_open_torn_one_degrades_at_read() {
+        use crate::columnar::{emit_int, emit_str};
+        use crate::sealed::payload::{
+            NoDicts, PayloadError, SealedPayloadIndex, encode_payload_sidecar,
+        };
+        use crate::sealed::segment::SealStream;
+
+        let dir =
+            mess_testkit::sweeping_temp_dir("idx-driver-wrong-segment-pcol");
+        let store = Arc::new(SealedStore::new());
+        let driver = SealDriver::new(store.clone(), dir.path());
+
+        let payloads: Vec<Vec<u8>> = (0..300u64)
+            .map(|i| {
+                let mut m = vec![0x82];
+                emit_str(&mut m, b"seq");
+                emit_int(&mut m, i as i64);
+                emit_str(&mut m, b"kind");
+                emit_str(&mut m, b"demo");
+                m
+            })
+            .collect();
+        let input = SealInput {
+            segment_id:     5,
+            base_pos:       0,
+            streams:        vec![SealStream {
+                stream_id: 1,
+                batches:   vec![SealBatch {
+                    first_version:    0,
+                    frame_count:      payloads.len() as u32,
+                    first_global_pos: 0,
+                    offset:           4096,
+                }],
+            }],
+            payloads:       Some(payloads.clone()),
+            event_type_ids: None,
+        };
+        driver.seal(input, || Ok(())).unwrap();
+
+        // Control: the healthy sibling attaches on reopen.
+        let ok = SealedSegmentIndex::open(&driver.sidecar_path(5)).unwrap();
+        assert!(ok.has_payload(), "healthy .pcol attaches");
+
+        // Swap in a `.pcol` sealed for segment 9. It is a perfectly valid
+        // sidecar — only its `segment_id` is wrong — so only the cross-check
+        // can reject it, and it must still do so at open.
+        let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
+        let foreign =
+            encode_payload_sidecar(9, &refs, &PayloadSealOpts::default())
+                .unwrap();
+        std::fs::write(driver.payload_sidecar_path(5), &foreign).unwrap();
+        let idx = SealedSegmentIndex::open(&driver.sidecar_path(5)).unwrap();
+        assert!(!idx.has_payload(), "wrong-segment .pcol dropped at open");
+        assert!(
+            idx.reassemble_payload(0, &NoDicts).unwrap().is_none(),
+            "no columnar payload: the caller reads the raw log (D1)"
+        );
+
+        // Now a same-segment `.pcol` whose DATA region is torn but whose
+        // header/index/footer are intact: the lazy open cannot see the damage
+        // (it never reads those bytes), so it attaches — and the read of the
+        // torn block returns a typed error the sealed read path degrades on,
+        // instead of serving anything.
+        let mut torn =
+            encode_payload_sidecar(5, &refs, &PayloadSealOpts::default())
+                .unwrap();
+        let victim =
+            SealedPayloadIndex::from_bytes(torn.clone()).unwrap().blocks()[0];
+        // The DATA region starts right after the header, so block 0's bytes
+        // begin at `HEADER_LEN` — flip one of them.
+        torn[payload::HEADER_LEN + 4] ^= 0xFF;
+        std::fs::write(driver.payload_sidecar_path(5), &torn).unwrap();
+        let idx = SealedSegmentIndex::open(&driver.sidecar_path(5)).unwrap();
+        assert!(idx.has_payload(), "structurally intact .pcol attaches");
+        assert!(
+            matches!(
+                idx.reassemble_payload(0, &NoDicts),
+                Err(PayloadError::Corrupt(_))
+            ),
+            "torn block is caught at read time"
+        );
+        // A block the tear did not touch still serves byte-exact.
+        let untouched = u64::from(victim.n_events);
+        assert_eq!(
+            idx.reassemble_payload(untouched, &NoDicts).unwrap().as_deref(),
+            Some(payloads[untouched as usize].as_slice()),
+        );
+    }
+
     /// A pointer-only seal (no payloads) emits no `.pcol` and attaches none —
     /// the additive nature of the payload sidecar.
     #[test]
