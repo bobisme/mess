@@ -206,12 +206,25 @@ pub const KIND_STATS: u16 = 11;
 // -- Directory codecs (STREAM_DIRECTORY.codec_id) -------------------------
 
 /// Sorted 56-byte records, ascending by stream id (the always-correct
-/// fallback).
+/// fallback, and the tie-break winner — see [`should_use_bitrank`]).
 pub const DIRCODEC_SORTED: u16 = 0;
 /// Bitvector + rank over the shifted `[min, max]` universe (§12.2, Spike H).
-/// Selected when the universe is dense (`U <= 8n`); the bit position IS the
-/// stream id, so no key copy is stored.
+/// The bit position IS the stream id, so no key copy is stored; selected when
+/// that trade is strictly smaller on disk (see [`should_use_bitrank`]).
 pub const DIRCODEC_BITRANK: u16 = 1;
+
+/// The short name of a `STREAM_DIRECTORY` codec id, for operator-facing
+/// reports (`mess inspect`'s per-segment `dir_codec`). Unknown ids render as
+/// `"unknown"` rather than panicking — a future codec must still be
+/// *describable* by an older tool.
+#[must_use]
+pub const fn dircodec_name(codec_id: u16) -> &'static str {
+    match codec_id {
+        DIRCODEC_SORTED => "sorted",
+        DIRCODEC_BITRANK => "bitrank",
+        _ => "unknown",
+    }
+}
 
 /// A sorted-directory record: 56 bytes. Offsets are **relative** to the start
 /// of the `POINTER_BLOCKS` / `POINTER_SKIPS` sections.
@@ -523,20 +536,74 @@ fn encode_stream_directory(entries: &[DirEntryRaw]) -> (u16, Vec<u8>) {
     }
 }
 
-/// The §12.6 density chooser: bitrank when the stream-id universe is dense
-/// enough (`U <= 8n`) and large enough to matter (`n >= 8`), else sorted. The
-/// `U <= 8n` cap bounds the bitvector at `n/8` bytes, so bitrank never blows up
-/// memory relative to the always-present entry column.
+/// On-disk length of the `DIRCODEC_SORTED` image for `n` entries.
+const fn dir_sorted_len(n: usize) -> u64 {
+    (n as u64).saturating_mul(DIR_SORTED_REC_LEN as u64)
+}
+
+/// On-disk length of the `DIRCODEC_BITRANK` image for `n` entries spanning a
+/// universe of `u` stream ids: `min | n_words | words[ceil(u/64)] |
+/// entries[n]`.
+const fn dir_bitrank_len(n: usize, u: u64) -> u64 {
+    16u64
+        .saturating_add(u.div_ceil(64).saturating_mul(8))
+        .saturating_add((n as u64).saturating_mul(DIR_BITRANK_REC_LEN as u64))
+}
+
+/// The §12.6 representation chooser, as a **deterministic byte-cost
+/// comparison**: emit whichever directory image is strictly smaller, and
+/// `DIRCODEC_SORTED` on a tie.
+///
+/// # Why byte cost and not a density ratio (bn-we9x)
+///
+/// The rule used to be `n >= 8 && U <= 8n` — Spike H's *lookup* crossover,
+/// carried over from a tournament that compared in-memory directory layouts.
+/// `bn-dcr` corrected that premise: `STREAM_DIRECTORY` is a **serialization
+/// codec only**. Both codecs rehydrate into the identical
+/// `HashMap<u64, DirEntry>`, so the codec cannot affect lookup speed at all;
+/// what it does affect is bytes on disk (and the `pread` + decode that reads
+/// them). The only defensible criterion left is therefore the one design.md
+/// §12.6 actually prescribes — compare the encodings' byte costs — and the
+/// old ratio was measurably too conservative for it: 8 of 39 real
+/// engine-written segment directories (`U/n` 9.3–19.1) were paying 6–14%
+/// more directory bytes than necessary.
+///
+/// # The trade, stated exactly
+///
+/// Bitrank drops the 8-byte `stream_id` from every record (56 → 48 B) and
+/// spends the savings on a `ceil(U/64)`-word bitvector plus a 16-byte header.
+/// So it wins **exactly** when the bitvector costs less than the key column it
+/// replaced, i.e. `16 + 8*ceil(U/64) < 8n`, i.e. `U <= 64*(n - 3)`. That
+/// makes the size bound self-evident and strictly stronger than any ratio cap:
+/// **the chosen image is never larger than the sorted image**, so the
+/// bitvector can never blow up relative to the always-present entry column.
+///
+/// Cost of the extra region, measured on the same 39 real directories
+/// (ABBA-ordered paired decode, median of 41): total directory decode
+/// 273.2 µs → 277.0 µs — **+3.8 µs across the whole corpus** — for
+/// −48,880 bytes. Bitrank decode is 1.14–1.38× sorted's, and it buys back far
+/// more than that in bytes not read.
+///
+/// # Determinism
+///
+/// A pure function of `(n, min, max)` with an integer comparison and no
+/// floating point, no tie ambiguity (`<`, so equal cost picks sorted), and no
+/// dependence on hasher seed, iteration order, or wall clock. Identical
+/// directory content therefore always yields the identical codec and the
+/// identical bytes, which is what re-seal byte-stability (and so pack
+/// identity) rests on.
 fn should_use_bitrank(entries: &[DirEntryRaw]) -> bool {
     let n = entries.len();
-    if n < 8 {
+    if n == 0 {
+        // Empty segment: there is no `[min, max]`, and the sorted image is the
+        // empty body. The deterministic simple fallback.
         return false;
     }
     // Entries are ascending by stream_id (encoder invariant).
     let min = entries[0].stream_id;
     let max = entries[n - 1].stream_id;
     let u = (max - min).saturating_add(1);
-    u <= 8u64.saturating_mul(n as u64)
+    dir_bitrank_len(n, u) < dir_sorted_len(n)
 }
 
 fn encode_dir_sorted(entries: &[DirEntryRaw]) -> Vec<u8> {
@@ -557,6 +624,11 @@ fn encode_dir_sorted(entries: &[DirEntryRaw]) -> Vec<u8> {
 
 /// Bitrank image: `min u64 | n_words u64 | words[n_words] u64 | entries[n]×48`.
 /// The rank directories are derived on open with one popcount pass (§12.2).
+///
+/// The production call site is [`encode_stream_directory`], which reaches here
+/// only after [`should_use_bitrank`] has proved this image is smaller than the
+/// sorted one — so `U <= 64*(n-3)` and the `as usize` / `vec![0u64; n_words]`
+/// below are bounded by `n`, never by the raw stream-id span.
 fn encode_dir_bitrank(entries: &[DirEntryRaw]) -> Vec<u8> {
     let n = entries.len();
     let min = entries[0].stream_id;
@@ -1507,6 +1579,238 @@ mod tests {
         let back =
             decode_stream_directory(codec, &bytes, entries.len()).unwrap();
         assert_eq!(back, entries);
+    }
+
+    // -- §12.6 chooser: byte-optimality, exactness, determinism (bn-we9x) ---
+
+    /// `n` distinct ascending ids spanning **exactly** `[base, base + u - 1]`,
+    /// clustered by a seeded splitmix64 rather than evenly spread — real
+    /// interned stream-id sets arrive in bursts, and clustering is what moves
+    /// the bitvector's word occupancy around without moving `U`.
+    fn ids_spanning(n: usize, u: u64, base: u64, seed: u64) -> Vec<u64> {
+        assert!(u >= n as u64, "universe too small for n distinct ids");
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut next = || {
+            s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = s;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        // Both endpoints are pinned so the span is exactly `u`; the interior is
+        // drawn (and de-duplicated) from the open interval.
+        let mut set = std::collections::BTreeSet::new();
+        set.insert(0u64);
+        if n > 1 {
+            set.insert(u - 1);
+        }
+        while set.len() < n {
+            set.insert(next() % u);
+        }
+        set.into_iter().take(n).map(|v| base + v).collect()
+    }
+
+    fn entries_for(ids: &[u64]) -> Vec<DirEntryRaw> {
+        ids.iter()
+            .enumerate()
+            .map(|(i, &id)| DirEntryRaw {
+                stream_id:     id,
+                first_version: i as u64,
+                last_version:  i as u64 + 3,
+                ptr_off:       (i * 64) as u64,
+                ptr_len:       64,
+                n_batches:     2,
+                skip_off:      (i * 8) as u64,
+                skip_len:      8,
+            })
+            .collect()
+    }
+
+    /// The shapes every chooser test sweeps: the four real-corpus stream
+    /// counts (`n` = 109 / 994 / 2022 / 8056 came off engine-written
+    /// segments), the small-`n` tail, and `U/n` ratios walking from fully
+    /// dense through the byte break-even (~64) out to the sparsest real
+    /// segment (93.3).
+    fn chooser_shapes() -> Vec<(usize, u64)> {
+        let mut out = Vec::new();
+        for n in [1usize, 2, 3, 4, 5, 7, 8, 9, 16, 63, 64, 65, 109, 994, 2022] {
+            for ratio in [1u64, 2, 4, 8, 10, 13, 19, 32, 48, 61, 64, 67, 93] {
+                out.push((n, (n as u64) * ratio));
+            }
+        }
+        out
+    }
+
+    /// The AC's exactness clause on the shapes that matter: on every real and
+    /// threshold-edge shape, **both** codecs round-trip
+    /// `decode(encode(x)) == x` — including the one the chooser declined, so a
+    /// future rule change cannot silently ship an inexact encoder.
+    #[test]
+    fn both_directory_codecs_are_exact_on_every_shape() {
+        for (n, u) in chooser_shapes() {
+            for (base, seed) in [(0u64, 1u64), (1 << 40, 7)] {
+                let ids = ids_spanning(n, u, base, seed);
+                // A single id spans 1 whatever `u` asked for.
+                let span = ids[n - 1] - ids[0] + 1;
+                let e = entries_for(&ids);
+                let sorted = encode_dir_sorted(&e);
+                assert_eq!(sorted.len() as u64, dir_sorted_len(n));
+                assert_eq!(
+                    decode_stream_directory(DIRCODEC_SORTED, &sorted, n)
+                        .unwrap(),
+                    e,
+                    "sorted inexact at n={n} u={u}"
+                );
+                let bitrank = encode_dir_bitrank(&e);
+                assert_eq!(bitrank.len() as u64, dir_bitrank_len(n, span));
+                assert_eq!(
+                    decode_stream_directory(DIRCODEC_BITRANK, &bitrank, n)
+                        .unwrap(),
+                    e,
+                    "bitrank inexact at n={n} u={u}"
+                );
+            }
+        }
+    }
+
+    /// The chooser's whole contract in one assertion: the emitted image is
+    /// **never larger than the alternative**. Checked against both encoders
+    /// materialized, so this is the measured product and not a restatement of
+    /// the cost formulas.
+    #[test]
+    fn chooser_always_emits_the_smaller_image() {
+        for (n, u) in chooser_shapes() {
+            let e = entries_for(&ids_spanning(n, u, 0, 3));
+            let (codec, bytes) = encode_stream_directory(&e);
+            let sorted = encode_dir_sorted(&e);
+            let bitrank = encode_dir_bitrank(&e);
+            let best = sorted.len().min(bitrank.len());
+            assert_eq!(
+                bytes.len(),
+                best,
+                "chooser picked {codec} ({} B) over {best} B at n={n} u={u}",
+                bytes.len()
+            );
+            // Ties go to sorted: the simpler codec, and the faster to decode.
+            if sorted.len() == bitrank.len() {
+                assert_eq!(codec, DIRCODEC_SORTED, "tie at n={n} u={u}");
+            }
+            assert_eq!(
+                decode_stream_directory(codec, &bytes, n).unwrap(),
+                e,
+                "chosen codec inexact at n={n} u={u}"
+            );
+        }
+        // The empty segment: the deterministic simple fallback, empty body.
+        let (codec, bytes) = encode_stream_directory(&[]);
+        assert_eq!(codec, DIRCODEC_SORTED);
+        assert!(bytes.is_empty());
+        assert_eq!(
+            decode_stream_directory(codec, &bytes, 0).unwrap(),
+            Vec::<DirEntryRaw>::new()
+        );
+    }
+
+    /// Walk `U` one id at a time across the byte break-even and pin that the
+    /// codec flips **exactly once, in one direction, at `U == 64*(n-3)`**.
+    ///
+    /// This is the pathological-flip check the re-seal story needs: near the
+    /// threshold the decision must be a clean monotone step, not an
+    /// oscillation that would make two near-identical segments (or two
+    /// re-seals of drifting content) alternate representations — and, because
+    /// the rule is "emit the smaller image", even the flip itself never costs
+    /// more than the 8-byte tie.
+    #[test]
+    fn chooser_flips_once_at_the_byte_break_even() {
+        for n in [8usize, 64, 109, 994] {
+            let break_even = 64 * (n as u64 - 3);
+            let mut prev_bitrank = true;
+            for u in (break_even - 130)..=(break_even + 130) {
+                let e = entries_for(&ids_spanning(n, u, 0, u));
+                let (codec, bytes) = encode_stream_directory(&e);
+                let is_bitrank = codec == DIRCODEC_BITRANK;
+                assert_eq!(
+                    is_bitrank,
+                    u <= break_even,
+                    "codec at n={n} u={u} (break-even {break_even})"
+                );
+                assert!(
+                    prev_bitrank || !is_bitrank,
+                    "codec oscillated back to bitrank at n={n} u={u}"
+                );
+                prev_bitrank = is_bitrank;
+                assert_eq!(
+                    decode_stream_directory(codec, &bytes, n).unwrap(),
+                    e,
+                    "inexact at the threshold, n={n} u={u}"
+                );
+            }
+            assert!(!prev_bitrank, "never left bitrank at n={n}");
+        }
+    }
+
+    /// Re-seal byte stability: the chooser is a pure function of
+    /// `(n, min, max)`, so identical directory content must yield the
+    /// identical codec **and** byte-identical section bytes — every time,
+    /// from independently built inputs. Pack identity (the trailer hash over
+    /// header + directory, which commits every section's `crc32c` +
+    /// `content_hash_prefix`) rests on exactly this.
+    #[test]
+    fn chooser_is_deterministic_and_re_encode_is_byte_identical() {
+        for (n, u) in chooser_shapes() {
+            let ids = ids_spanning(n, u, 0, 11);
+            let (codec, bytes) = encode_stream_directory(&entries_for(&ids));
+            for _ in 0..3 {
+                // Rebuild the entries from scratch each round so nothing can
+                // be carried over in an allocation or a cached layout.
+                let (c, b) = encode_stream_directory(&entries_for(&ids));
+                assert_eq!(c, codec, "codec drifted at n={n} u={u}");
+                assert_eq!(b, bytes, "bytes drifted at n={n} u={u}");
+            }
+        }
+    }
+
+    /// The same determinism claim at whole-pack scale, on threshold-edge
+    /// shapes: two `encode_pack` calls over equal input are byte-identical,
+    /// which is what makes a re-seal of unchanged content produce the same
+    /// pack identity.
+    #[test]
+    fn pack_bytes_are_stable_across_threshold_edge_reseals() {
+        for n in [8usize, 64, 200] {
+            let break_even = 64 * (n as u64 - 3);
+            for u in [break_even - 1, break_even, break_even + 1] {
+                let streams: Vec<SealStream> = ids_spanning(n, u, 0, 5)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, id)| stream(id, &[(0, 2, 1000 + i as u64, 4096)]))
+                    .collect();
+                let mk = || PackInput {
+                    segment_id:     3,
+                    base_pos:       0,
+                    streams:        &streams,
+                    event_type_ids: &[],
+                    filter:         None,
+                    payload_bytes:  None,
+                };
+                let a = encode_pack(&mk());
+                let b = encode_pack(&mk());
+                assert_eq!(a, b, "pack bytes drifted at n={n} u={u}");
+                let idx = parse_pack(&a).unwrap();
+                let sec = idx.section(KIND_STREAM_DIRECTORY).unwrap();
+                assert_eq!(
+                    sec.codec_id == DIRCODEC_BITRANK,
+                    u <= break_even,
+                    "pack-level codec at n={n} u={u}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dircodec_names_are_stable() {
+        assert_eq!(dircodec_name(DIRCODEC_SORTED), "sorted");
+        assert_eq!(dircodec_name(DIRCODEC_BITRANK), "bitrank");
+        assert_eq!(dircodec_name(9999), "unknown");
     }
 
     #[test]

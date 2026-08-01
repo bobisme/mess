@@ -378,7 +378,7 @@ Against the **large** store, this exercises `inspect`'s stream-head pagination
 
 ```
 $ mess inspect /path/to/large
-{"base_pos":0,"batch_count":54680,"epoch":1,"event_count":54680,"has_pcol":false,"has_pidx":false,"next_pos":54680,"safe_offset":6851995,"sealed":false,"segment_id":1,"size_bytes":54680-batch}
+{"base_pos":0,"batch_count":54680,"dir_codec":null,"epoch":1,"event_count":54680,"has_pcol":false,"has_pidx":false,"next_pos":54680,"safe_offset":6851995,"sealed":false,"segment_id":1,"size_bytes":54680-batch}
 …
 registry:
   available: true

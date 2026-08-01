@@ -289,3 +289,66 @@ async fn json_field_names_are_lock_state_independent() {
     let free_heads = free["stream_heads"].as_array().unwrap();
     assert!(free_heads.iter().all(|h| h["name"].is_string()));
 }
+
+// ---------------------------------------------------------------------------
+// bn-we9x: the §12.6 directory chooser's decision is visible per segment
+// ---------------------------------------------------------------------------
+
+/// Seal a real store and report which `STREAM_DIRECTORY` codec each segment's
+/// directory used. The chooser emits whichever image is smaller, so a store
+/// with many interned (hence dense) stream ids seals `bitrank` while a
+/// single-stream segment seals `sorted` — and `inspect` must show the
+/// difference, because "which representation did this segment get" is exactly
+/// the question an operator cannot otherwise answer about a sealed artifact.
+#[tokio::test(flavor = "multi_thread")]
+async fn dir_codec_is_reported_per_sealed_segment() {
+    use mess_store::engine::EngineOptions;
+
+    async fn seal_store(dir: &std::path::Path, n_streams: usize) {
+        let opts = EngineOptions {
+            segment_size: 1 << 20,
+            // bn-3of consolidated `.seal` pack — the path the §12.6 chooser
+            // actually runs on.
+            seal_pack: true,
+            ..EngineOptions::default()
+        };
+        let engine = LogEngine::open_with(dir, opts).expect("open");
+        for i in 0..n_streams {
+            engine
+                .append_batch(
+                    &format!("user-{i}"),
+                    Version::NoStream,
+                    &[rec("Created", format!("u{i}").as_bytes())],
+                )
+                .await
+                .unwrap();
+        }
+        engine.seal_active().expect("seal");
+    }
+
+    fn codec_of(dir: &std::path::Path) -> Value {
+        let json = json_of(&inspect::run(dir, &opts()));
+        let rows = json["segments"].as_array().expect("segments rows");
+        assert_eq!(rows.len(), 1, "expected one segment: {rows:?}");
+        rows[0]["dir_codec"].clone()
+    }
+
+    // Many streams -> a dense interned id universe -> the bitvector beats the
+    // 8-byte-per-key column it replaces.
+    let dense = mess_testkit::sweeping_temp_dir("cli-inspect-dir-codec-dense");
+    seal_store(dense.path(), 64).await;
+    assert_eq!(codec_of(dense.path()), "bitrank");
+
+    // One user stream (plus `$registry`) -> the bitvector cannot pay for its
+    // own 16-byte header -> the always-correct sorted fallback.
+    let tiny = mess_testkit::sweeping_temp_dir("cli-inspect-dir-codec-tiny");
+    seal_store(tiny.path(), 1).await;
+    assert_eq!(codec_of(tiny.path()), "sorted");
+
+    // An unsealed segment has no directory at all: `null`, not a guess.
+    let live = mess_testkit::sweeping_temp_dir("cli-inspect-dir-codec-live");
+    build_named_corpus(live.path(), 3).await;
+    let json = json_of(&inspect::run(live.path(), &opts()));
+    let rows = json["segments"].as_array().unwrap();
+    assert!(rows.iter().all(|r| r["dir_codec"].is_null()), "{rows:?}");
+}

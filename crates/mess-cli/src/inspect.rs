@@ -122,6 +122,7 @@ pub fn run(dir: &Path, opts: &InspectOptions) -> Report {
                     "event_count": scan.event_count(),
                     "has_pidx": seg.has_pidx,
                     "has_pcol": seg.has_pcol,
+                    "dir_codec": dir_codec(dir, seg.segment_id, &seg.pidx_path),
                     "safe_offset": scan.recovery.safe_offset,
                     "next_pos": scan.recovery.next_pos,
                 }));
@@ -297,6 +298,28 @@ pub fn run(dir: &Path, opts: &InspectOptions) -> Report {
     }
 
     report
+}
+
+/// Which `STREAM_DIRECTORY` codec this segment's sealed artifact used
+/// (bn-we9x): `"bitrank"` or `"sorted"`, or `null` when the segment has no
+/// sealed artifact (or it is unreadable — `doctor` is the surface that
+/// *judges* a sealed artifact; `inspect` only describes one).
+///
+/// The consolidated `.seal` pack wins over a legacy `.pidx` when a store
+/// carries both, matching the engine's own dual-read preference. Reads only
+/// the artifact's header + section directory + trailer, never a section body,
+/// so this stays far cheaper than the full log scan the row already paid for.
+fn dir_codec(
+    dir: &Path,
+    segment_id: u64,
+    pidx_path: &Path,
+) -> Option<&'static str> {
+    let seal =
+        mess_index::sealed::seal_pack_path(&dir.join("sealed"), segment_id);
+    [seal.as_path(), pidx_path]
+        .into_iter()
+        .find_map(|p| mess_index::sealed::dir_codec_of(p).ok())
+        .map(mess_index::sealed::dircodec_name)
 }
 
 /// Seconds since a file was last modified, or `None` if the mtime is

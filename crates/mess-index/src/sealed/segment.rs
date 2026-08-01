@@ -284,6 +284,56 @@ pub fn payload_path_for(sidecar_path: &Path) -> std::path::PathBuf {
     sidecar_path.with_extension("pcol")
 }
 
+/// The `STREAM_DIRECTORY` codec a sealed artifact on disk used (bn-we9x) —
+/// [`crate::sealed::pack::DIRCODEC_SORTED`] or
+/// [`crate::sealed::pack::DIRCODEC_BITRANK`], nameable with
+/// [`crate::sealed::pack::dircodec_name`].
+///
+/// Reads the header, the section directory, and the trailer — **no section
+/// body**, no directory decode, no map rebuild — so an operator tool can
+/// report the chooser's decision for every segment without paying an open.
+/// The pack's header/directory hash is still verified, so the answer is never
+/// read out of unvalidated bytes.
+///
+/// Accepts either sealed shape: a `.seal` pack, or a legacy `.pidx` sidecar —
+/// which reports `DIRCODEC_SORTED`, because its fixed DIR region is exactly
+/// the sorted codec's 56-byte-record layout (it predates the chooser, so
+/// "sorted" is a description of its bytes, not a decision it made).
+pub fn dir_codec_of(path: &Path) -> Result<u16, SidecarError> {
+    use crate::sealed::pack;
+    let corrupt = |pack::PackError::Corrupt(m)| SidecarError::Corrupt(m);
+
+    let file = File::open(path)?;
+    let len = file.metadata()?.len();
+    let mut magic = [0u8; 4];
+    file.read_exact_at(&mut magic, 0)?;
+    match u32::from_le_bytes(magic) {
+        SIDECAR_MAGIC => Ok(pack::DIRCODEC_SORTED),
+        pack::PACK_MAGIC => {
+            if len < (pack::HEADER_LEN + pack::TRAILER_LEN) as u64 {
+                return Err(SidecarError::Corrupt(
+                    "shorter than header + trailer",
+                ));
+            }
+            let mut head = [0u8; pack::HEADER_LEN];
+            file.read_exact_at(&mut head, 0)?;
+            let h = pack::parse_pack_header(&head).map_err(corrupt)?;
+            let mut dirbuf = vec![0u8; h.dir_len()];
+            file.read_exact_at(&mut dirbuf, pack::HEADER_LEN as u64)?;
+            let mut trailer = [0u8; pack::TRAILER_LEN];
+            file.read_exact_at(&mut trailer, len - pack::TRAILER_LEN as u64)?;
+            let parsed =
+                pack::parse_pack_directory(&head, &dirbuf, &trailer, len)
+                    .map_err(corrupt)?;
+            parsed
+                .section(pack::KIND_STREAM_DIRECTORY)
+                .map(|s| s.codec_id)
+                .ok_or(SidecarError::Corrupt("missing stream directory"))
+        }
+        _ => Err(SidecarError::Corrupt("not a sealed pack or sidecar")),
+    }
+}
+
 fn put_u32(buf: &mut Vec<u8>, v: u32) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
@@ -483,6 +533,10 @@ pub struct SealedSegmentIndex {
     /// resident part is the type dictionary plus one `u32` per 4096 events —
     /// where it used to be a `Vec<u32>` per event (~1.5 GB at 385M events).
     event_types: Option<EventTypeColumn>,
+    /// Which `STREAM_DIRECTORY` codec the bytes this index was built from used
+    /// (bn-we9x) — the §12.6 chooser's decision, made observable. See
+    /// [`Self::dir_codec`].
+    dir_codec:   u16,
 }
 
 impl SealedSegmentIndex {
@@ -497,6 +551,19 @@ impl SealedSegmentIndex {
 
     /// Number of streams present in this segment.
     pub fn stream_count(&self) -> usize { self.stream_ids.len() }
+
+    /// Which `STREAM_DIRECTORY` codec this segment's directory was serialized
+    /// with (bn-we9x) — [`crate::sealed::pack::DIRCODEC_SORTED`] or
+    /// [`crate::sealed::pack::DIRCODEC_BITRANK`], nameable with
+    /// [`crate::sealed::pack::dircodec_name`].
+    ///
+    /// Purely informational: the codec is a **serialization** choice, so both
+    /// values rehydrate into the identical in-memory directory and no read
+    /// path branches on this. It exists so the §12.6 chooser's decision is
+    /// explainable operationally — `mess inspect` reports it per segment, and
+    /// [`dir_codec_of`] answers the same question straight off disk without an
+    /// open.
+    pub fn dir_codec(&self) -> u16 { self.dir_codec }
 
     /// The stream ids present in this segment, ascending (bn-2ug's retention
     /// rule walks these to build a segment's per-stream frame spans).
@@ -589,6 +656,9 @@ impl SealedSegmentIndex {
             filter: None,
             payload: None,
             event_types: None,
+            // A legacy sidecar's DIR region IS the sorted codec's layout
+            // (56-byte records, ascending) — see [`dir_codec_of`].
+            dir_codec: crate::sealed::pack::DIRCODEC_SORTED,
         })
     }
 
@@ -694,6 +764,7 @@ impl SealedSegmentIndex {
             filter,
             payload,
             event_types,
+            dir_codec: dir_sec.codec_id,
         })
     }
 
@@ -873,6 +944,7 @@ impl SealedSegmentIndex {
             filter,
             payload,
             event_types,
+            dir_codec: dir_sec.codec_id,
         })
     }
 
@@ -1440,9 +1512,14 @@ mod tests {
     fn directory_products_are_hasher_independent() {
         use crate::sealed::pack::{self, PackInput};
 
-        // Two key shapes: dense (U/n = 1, bitrank codec) and sparse
-        // (U/n ~ 1000, sorted codec) — the two arms of the §12.6 chooser.
-        for stride in [1u64, 1013] {
+        // Four key shapes over the §12.6 chooser's two arms. bn-we9x added
+        // the middle pair: at n = 64 the byte break-even is U = 64*(n-3) =
+        // 3904, so stride 61 (U = 3844) is the last bitrank win and stride 62
+        // (U = 3907) the first sorted one — i.e. two directories that differ
+        // by one id of span yet serialize through different codecs, which is
+        // exactly where a hasher-order leak would show up as a flapping
+        // re-encode.
+        for stride in [1u64, 61, 62, 1013] {
             let streams: Vec<SealStream> = (0..64u64)
                 .map(|i| {
                     let id = 5 + i * stride;
@@ -1471,6 +1548,18 @@ mod tests {
                 filter:         None,
                 payload_bytes:  None,
             });
+            // The four strides really do straddle the chooser (U = 63*stride
+            // + 1 against a break-even of 3904) — otherwise the comment above
+            // would be an unchecked claim.
+            assert_eq!(
+                SealedSegmentIndex::from_pack(pack_bytes.clone())
+                    .unwrap()
+                    .dir_codec()
+                    == pack::DIRCODEC_BITRANK,
+                stride <= 61,
+                "chooser arm for stride {stride}"
+            );
+
             // Serialization is built from the ascending input, never from the
             // map — re-encoding must be byte-identical.
             assert_eq!(encode_sidecar(&input), sidecar_bytes);
@@ -1709,6 +1798,99 @@ mod tests {
         let p = crate::sealed::pack::seal_pack_path(dir, seg);
         std::fs::write(&p, bytes).unwrap();
         p
+    }
+
+    /// bn-we9x: the §12.6 chooser's decision is observable — the same answer
+    /// from every reader (eager pack, lazy pack, legacy sidecar) and from
+    /// [`dir_codec_of`], which reads it straight off disk without an open.
+    ///
+    /// Swept across the byte break-even (`U == 64*(n-3)`) so the assertion is
+    /// not just "some pack says bitrank" but "the reported codec tracks the
+    /// chooser exactly, on both sides of the threshold and at the tie".
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn dir_codec_is_reported_by_every_reader_and_off_disk() {
+        use crate::sealed::pack::{
+            self, DIRCODEC_BITRANK, DIRCODEC_SORTED, PackInput, dircodec_name,
+        };
+        let dir = mess_testkit::sweeping_temp_dir("seg-dir-codec");
+        let n = 64usize;
+        let break_even = 64 * (n as u64 - 3);
+        for (seg, span, want) in [
+            (1u64, n as u64, DIRCODEC_BITRANK), // fully dense (U/n = 1)
+            (2, break_even, DIRCODEC_BITRANK),  // last bitrank win
+            (3, break_even + 1, DIRCODEC_SORTED), // first sorted win
+            (4, 64 * n as u64 * 4, DIRCODEC_SORTED), // sparse
+        ] {
+            // n ids spanning exactly `span`, endpoints pinned.
+            let step = (span - 1) / (n as u64 - 1);
+            let mut ids: Vec<u64> =
+                (0..n as u64).map(|i| 100 + i * step).collect();
+            *ids.last_mut().unwrap() = 100 + span - 1;
+            let streams: Vec<SealStream> = ids
+                .iter()
+                .enumerate()
+                .map(|(i, &id)| {
+                    seal_stream(id, &[(0, 2, 1000 + i as u64 * 2, 4096)])
+                })
+                .collect();
+            let bytes = pack::encode_pack(&PackInput {
+                segment_id:     seg,
+                base_pos:       1000,
+                streams:        &streams,
+                event_type_ids: &[],
+                filter:         None,
+                payload_bytes:  None,
+            });
+            let path = write_pack(dir.path(), seg, &bytes);
+            let want_name = dircodec_name(want);
+
+            assert_eq!(
+                SealedSegmentIndex::from_pack(bytes.clone())
+                    .unwrap()
+                    .dir_codec(),
+                want,
+                "from_pack at span={span} (want {want_name})"
+            );
+            assert_eq!(
+                SealedSegmentIndex::open_pack(&path).unwrap().dir_codec(),
+                want,
+                "open_pack at span={span} (want {want_name})"
+            );
+            assert_eq!(
+                SealedSegmentIndex::open_pack_eager(&path).unwrap().dir_codec(),
+                want,
+                "open_pack_eager at span={span} (want {want_name})"
+            );
+            assert_eq!(
+                dir_codec_of(&path).unwrap(),
+                want,
+                "dir_codec_of at span={span} (want {want_name})"
+            );
+
+            // A legacy sidecar has no chooser: its DIR region is always the
+            // sorted layout, and both the reader and the off-disk probe say so.
+            let side_path = dir.path().join(format!("seg-{seg}.pidx"));
+            let side = encode_sidecar(&SealInput {
+                segment_id:     seg,
+                base_pos:       1000,
+                streams:        streams.clone(),
+                payloads:       None,
+                event_type_ids: None,
+            });
+            std::fs::write(&side_path, &side).unwrap();
+            assert_eq!(
+                SealedSegmentIndex::from_bytes(side).unwrap().dir_codec(),
+                DIRCODEC_SORTED
+            );
+            assert_eq!(dir_codec_of(&side_path).unwrap(), DIRCODEC_SORTED);
+        }
+
+        // Neither shape: a refusal, not a guess.
+        let junk = dir.path().join("junk.pidx");
+        std::fs::write(&junk, b"not a sealed artifact at all").unwrap();
+        assert!(dir_codec_of(&junk).is_err());
+        assert!(dir_codec_of(&dir.path().join("absent.seal")).is_err());
     }
 
     /// A lazily opened pack answers every query — pointers, heads, replay,
