@@ -40,6 +40,16 @@ pub const REGISTRY_CODEC_ID: u16 = 0;
 /// not route this through the upcaster" sentinel).
 pub const REGISTRY_SCHEMA_VERSION: u16 = 0;
 
+// bn-26pp: the sealed registry-delta sidecar (`.reg`) lives in `mess-index`,
+// which sits below this crate and cannot name the constant above, so it
+// restates it. This is the seam where the two must agree: a `.reg` written for
+// the wrong stream would simply never cross-check and every open would silently
+// fall back to the `pread` path — a performance cliff with no test failure
+// anywhere. Fail the build instead.
+const _: () = assert!(
+    mess_index::sealed::regdelta::REGISTRY_STREAM_ID == REGISTRY_STREAM_ID
+);
+
 /// The `codec_id` the engine declares for the event types **it** mints.
 ///
 /// REG9 forbids `0` here (that value is reserved to `$registry`'s own frames),

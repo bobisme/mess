@@ -61,6 +61,9 @@ use crate::sealed::parity::{self, ParityConfig};
 use crate::sealed::payload::{
     self, PayloadError, PayloadSealOpts, SealedPayloadIndex,
 };
+use crate::sealed::regdelta::{
+    REGISTRY_STREAM_ID, RegistryDelta, encode_registry_delta, reg_path,
+};
 use crate::sealed::segment::{
     SealInput, SealedSegmentIndex, SealedSegmentRef, SidecarError,
     encode_sidecar, filter_path_for,
@@ -356,6 +359,15 @@ impl SealDriver {
         filter_path_for(&self.sidecar_path(segment_id))
     }
 
+    /// The registry-delta sidecar path for `segment_id` (bn-26pp):
+    /// `<dir>/seg-<id>.reg`, a sibling of [`Self::sidecar_path`]. Delegates to
+    /// [`reg_path`] — the single source of truth for the naming, shared with
+    /// engine recovery so the writer and the reader can never target different
+    /// files.
+    pub fn regdelta_path(&self, segment_id: u64) -> PathBuf {
+        reg_path(&self.dir, segment_id)
+    }
+
     /// The payload-block sidecar path for `segment_id` (bn-zge / D6):
     /// `<dir>/seg-<id>.pcol`, a sibling of [`Self::sidecar_path`]. Delegates to
     /// [`payload::pcol_path`] — the single source of truth for the `.pcol`
@@ -452,6 +464,34 @@ impl SealDriver {
             let _ = write_durable_metered(
                 &self.filter_path(segment_id),
                 &f.to_bytes(),
+                self.metrics.as_deref(),
+            );
+        }
+
+        // bn-26pp: emit this segment's `$registry` records into a sibling
+        // `.reg` so engine open folds them sequentially instead of chasing one
+        // random `pread` per registration (bn-2u01 measured that at 89.9% of a
+        // 10.5 s cold open at 250k streams). `None` — no payloads in hand, or
+        // no registration in this segment, which is the common case — writes no
+        // file at all. Best-effort exactly like the `.filter`: a write failure
+        // must never fail the seal, because the log remains the sole registry
+        // authority and open falls back to reading it (D1/I5).
+        //
+        // Nothing is retained in memory: a delta is a RECOVERY input, read once
+        // at the next open and dropped. Holding it here would make a
+        // long-running writer carry every registration it ever sealed in RSS,
+        // for a structure no read path consults (unlike the `.filter`).
+        let reg_delta = encode_registry_delta(&input, REGISTRY_STREAM_ID);
+        debug_assert!(
+            reg_delta
+                .as_ref()
+                .is_none_or(|b| RegistryDelta::from_bytes(b.clone()).is_ok()),
+            "bn-26pp: an encoded registry delta must parse back"
+        );
+        if let Some(bytes) = &reg_delta {
+            let _ = write_durable_metered(
+                &self.regdelta_path(segment_id),
+                bytes,
                 self.metrics.as_deref(),
             );
         }
@@ -916,6 +956,224 @@ mod tests {
         let reopened =
             SealedSegmentIndex::open(&driver.sidecar_path(7)).unwrap();
         assert_eq!(reopened.resolve(10, 2).unwrap().unwrap().offset, 4096);
+    }
+
+    /// A seal input carrying `$registry` batches (stream 0) plus a domain
+    /// stream, with payloads in stored order — the shape the engine's
+    /// `seal_input_from_segment` produces.
+    fn input_with_registry(segment_id: u64) -> SealInput {
+        // 6 events at global positions 0..6: reg@0 (2), domain@2 (3), reg@5
+        // (1).
+        let payloads: Vec<Vec<u8>> =
+            (0..6u8).map(|i| vec![i; usize::from(i) + 1]).collect();
+        SealInput {
+            segment_id,
+            base_pos: 0,
+            streams: vec![
+                SealStream {
+                    stream_id: REGISTRY_STREAM_ID,
+                    batches:   vec![
+                        SealBatch {
+                            first_version:    0,
+                            frame_count:      2,
+                            first_global_pos: 0,
+                            offset:           4096,
+                        },
+                        SealBatch {
+                            first_version:    2,
+                            frame_count:      1,
+                            first_global_pos: 5,
+                            offset:           9000,
+                        },
+                    ],
+                },
+                SealStream {
+                    stream_id: 10,
+                    batches:   vec![SealBatch {
+                        first_version:    0,
+                        frame_count:      3,
+                        first_global_pos: 2,
+                        offset:           6000,
+                    }],
+                },
+            ],
+            payloads: Some(payloads),
+            event_type_ids: None,
+        }
+    }
+
+    /// The delta a recovery would use for this segment: read the file, take it
+    /// only if the sidecar vouches for it, and dump its records.
+    fn delta_records(
+        driver: &SealDriver,
+        idx: &SealedSegmentIndex,
+        seg: u64,
+    ) -> Option<Vec<(u64, Vec<Vec<u8>>)>> {
+        let delta = RegistryDelta::open(&driver.regdelta_path(seg)).ok()?;
+        if !idx.accepts_registry_delta(&delta) {
+            return None;
+        }
+        Some(
+            delta
+                .batches()
+                .map(|b| {
+                    (
+                        b.first_global_pos(),
+                        b.payloads().map(<[u8]>::to_vec).collect(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn expected_records() -> Vec<(u64, Vec<Vec<u8>>)> {
+        vec![(0, vec![vec![0u8; 1], vec![1u8; 2]]), (5, vec![vec![5u8; 6]])]
+    }
+
+    /// bn-26pp: `seal` writes the `$registry` records into a `.reg` sibling
+    /// that the freshly-sealed index and a fresh `open` from disk both vouch
+    /// for, carrying the identical records.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn seal_writes_and_reopens_the_registry_delta() {
+        let dir = mess_testkit::sweeping_temp_dir("idx-driver-regdelta");
+        let store = Arc::new(SealedStore::new());
+        let driver = SealDriver::new(store.clone(), dir.path());
+
+        let idx = driver.seal(input_with_registry(7), || Ok(())).unwrap();
+        assert!(driver.regdelta_path(7).exists(), ".reg written");
+        assert_eq!(
+            delta_records(&driver, &idx, 7),
+            Some(expected_records()),
+            "the just-sealed index vouches for the delta it wrote"
+        );
+
+        let reopened =
+            SealedSegmentIndex::open(&driver.sidecar_path(7)).unwrap();
+        assert_eq!(
+            delta_records(&driver, &reopened, 7),
+            Some(expected_records())
+        );
+        assert_eq!(
+            RegistryDelta::open(&driver.regdelta_path(7)).unwrap().stream_id(),
+            REGISTRY_STREAM_ID
+        );
+    }
+
+    /// A segment with no `$registry` batch (the common case) writes no `.reg`
+    /// at all — the old path already costs nothing there.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn no_registry_batches_writes_no_reg_file() {
+        let dir = mess_testkit::sweeping_temp_dir("idx-driver-regdelta-none");
+        let store = Arc::new(SealedStore::new());
+        let driver = SealDriver::new(store.clone(), dir.path());
+
+        let mut i = input(7);
+        i.payloads = Some(vec![vec![1], vec![2], vec![3]]);
+        let idx = driver.seal(i, || Ok(())).unwrap();
+
+        assert!(!driver.regdelta_path(7).exists(), "no .reg for no registry");
+        assert!(delta_records(&driver, &idx, 7).is_none());
+    }
+
+    /// I5/D1: every way a `.reg` can be wrong — missing, truncated,
+    /// bit-flipped, or a *valid* delta belonging to a different segment — is
+    /// refused. The sidecar still opens, pointers are still exact, and the
+    /// engine falls back to reading `$registry` from the log.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_wrong_reg_is_refused_and_never_replaces_the_pointer_truth() {
+        let dir = mess_testkit::sweeping_temp_dir("idx-driver-regdelta-bad");
+        let store = Arc::new(SealedStore::new());
+        let driver = SealDriver::new(store.clone(), dir.path());
+        driver.seal(input_with_registry(7), || Ok(())).unwrap();
+        // A second segment with a DIFFERENT registry layout, to swap in.
+        let mut other = input_with_registry(8);
+        other.streams[0].batches.pop();
+        other.streams[0].batches[0].frame_count = 1;
+        driver.seal(other, || Ok(())).unwrap();
+
+        let good = std::fs::read(driver.regdelta_path(7)).unwrap();
+        let reopen = || SealedSegmentIndex::open(&driver.sidecar_path(7));
+
+        // (a) missing
+        std::fs::remove_file(driver.regdelta_path(7)).unwrap();
+        let idx = reopen().unwrap();
+        assert!(delta_records(&driver, &idx, 7).is_none(), "missing .reg");
+        assert_eq!(idx.resolve(10, 1).unwrap().unwrap().offset, 6000);
+
+        // (b) truncated
+        std::fs::write(driver.regdelta_path(7), &good[..good.len() - 3])
+            .unwrap();
+        assert!(
+            delta_records(&driver, &reopen().unwrap(), 7).is_none(),
+            "truncated .reg"
+        );
+
+        // (c) bit-flipped payload byte
+        let mut flipped = good.clone();
+        let mid = flipped.len() / 2;
+        flipped[mid] ^= 0xFF;
+        std::fs::write(driver.regdelta_path(7), &flipped).unwrap();
+        assert!(
+            delta_records(&driver, &reopen().unwrap(), 7).is_none(),
+            "corrupt .reg"
+        );
+
+        // (d) a perfectly valid delta — for the WRONG segment.
+        let foreign = std::fs::read(driver.regdelta_path(8)).unwrap();
+        std::fs::write(driver.regdelta_path(7), &foreign).unwrap();
+        assert!(
+            delta_records(&driver, &reopen().unwrap(), 7).is_none(),
+            "foreign .reg"
+        );
+
+        // ...and the good one is still accepted, so the checks are not vacuous.
+        std::fs::write(driver.regdelta_path(7), &good).unwrap();
+        assert_eq!(
+            delta_records(&driver, &reopen().unwrap(), 7),
+            Some(expected_records())
+        );
+    }
+
+    /// The cross-check is against the *pointer sidecar's own directory*, so a
+    /// CRC-valid delta whose batch layout disagrees with it — right segment,
+    /// right span, wrong batches — is refused too. This is the check that keeps
+    /// a stale re-seal from feeding the fold a different set of records.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_layout_mismatch_is_refused() {
+        let dir = mess_testkit::sweeping_temp_dir("idx-driver-regdelta-layout");
+        let store = Arc::new(SealedStore::new());
+        let driver = SealDriver::new(store.clone(), dir.path());
+        let sealed = driver.seal(input_with_registry(7), || Ok(())).unwrap();
+
+        // Same segment_id / base_pos / event_count, but the delta claims the
+        // second registry batch sits at position 4 instead of 5.
+        let mut moved = input_with_registry(7);
+        moved.streams[0].batches[1].first_global_pos = 4;
+        let bytes =
+            encode_registry_delta(&moved, REGISTRY_STREAM_ID).expect("encode");
+        let delta = RegistryDelta::from_bytes(bytes).expect("parses fine");
+        assert_eq!(delta.segment_id(), sealed.segment_id());
+        assert_eq!(delta.event_count(), sealed.event_count());
+        assert!(
+            !sealed.accepts_registry_delta(&delta),
+            "layout mismatch refused"
+        );
+
+        // A delta with one batch too few is refused for the same reason.
+        let mut short = input_with_registry(7);
+        short.streams[0].batches.pop();
+        let bytes =
+            encode_registry_delta(&short, REGISTRY_STREAM_ID).expect("encode");
+        assert!(
+            !sealed.accepts_registry_delta(
+                &RegistryDelta::from_bytes(bytes).unwrap()
+            ),
+            "short layout refused"
+        );
     }
 
     /// bn-1i7: `seal` builds and durably writes a `.filter` file alongside the

@@ -117,6 +117,7 @@ use std::sync::{Mutex, OnceLock, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use mess_index::sealed::regdelta::{RegistryDelta, reg_path};
 use mess_index::sealed::{
     BlockCache, NoDicts, ReplaySet, SealBatch, SealDriver, SealInput,
     SealMetrics, SealStream, SealedSegmentIndex, SealedSegmentRef, SealedStore,
@@ -2952,6 +2953,9 @@ impl LogEngine {
             })
             .collect::<Result<_, _>>()?;
         let head_id = *segment_ids.last().expect("non-empty");
+        // bn-26pp: where the sidecar-trusted branch below looks for a segment's
+        // `.reg` registry delta.
+        let sealed_dir = dir.join("sealed");
 
         let mut hot_entries: Vec<BatchEntry> = Vec::new();
         let mut last_headed: Option<ResumeInfo> = None;
@@ -2995,17 +2999,51 @@ impl LogEngine {
                 // name ever, not one per event) this costs one hash lookup and
                 // reads nothing at all. If it does, we `pread` exactly those
                 // batches and no others.
+                //
+                // `bn-26pp`: ...unless the segment's seal also left a `.reg`
+                // registry delta, in which case those same batches are read
+                // sequentially as one small file instead. That is the whole
+                // point of the format: one random read per registration is
+                // `O(#names)` and cost 89.9% of a 10.5 s cold open at 250k
+                // streams (bn-2u01); the delta makes it `O(#segments)`
+                // sequential. It is used only after `accepts_registry_delta`
+                // cross-checks its batch layout against this very sidecar's
+                // directory, it is dropped as soon as the fold has its bytes,
+                // and a segment without one takes the `pread` path below
+                // unchanged — so a store sealed before this bone, a store with
+                // only some segments sealed since, and a store whose `.reg`
+                // files were deleted or damaged all recover the identical
+                // registry.
                 if sref.stream_ids().contains(&registry::REGISTRY_STREAM_ID) {
-                    let entries = sref
-                        .stream_entries(registry::REGISTRY_STREAM_ID)
-                        .map_err(|e| {
-                            EngineError::Open(format!(
-                                "recover: $registry entries of sealed seg \
-                                 {seg_id}: {e}"
-                            ))
-                        })?;
-                    for e in entries {
-                        scan.registry_ptrs.push(e.ptr);
+                    let delta =
+                        RegistryDelta::open(&reg_path(&sealed_dir, seg_id))
+                            .ok()
+                            .filter(|d| {
+                                d.stream_id() == registry::REGISTRY_STREAM_ID
+                                    && sref.accepts_registry_delta(d)
+                            });
+                    match delta {
+                        Some(delta) => {
+                            for b in delta.batches() {
+                                scan.registry_batches.push((
+                                    b.first_global_pos(),
+                                    b.payloads().map(<[u8]>::to_vec).collect(),
+                                ));
+                            }
+                        }
+                        None => {
+                            let entries = sref
+                                .stream_entries(registry::REGISTRY_STREAM_ID)
+                                .map_err(|e| {
+                                    EngineError::Open(format!(
+                                        "recover: $registry entries of sealed \
+                                         seg {seg_id}: {e}"
+                                    ))
+                                })?;
+                            for e in entries {
+                                scan.registry_ptrs.push(e.ptr);
+                            }
+                        }
                     }
                 }
                 watermark += sref.event_count();

@@ -89,6 +89,7 @@ use crate::sealed::payload::{DictResolver, PayloadError, SealedPayloadIndex};
 use crate::sealed::ptr_block::{
     self, BatchPtr, DecodeError, SkipEntry, encode_ptr_block, encode_skips,
 };
+use crate::sealed::regdelta::RegistryDelta;
 
 /// Sidecar magic (`"SXI1"` little-endian-ish): identifies a sealed pointer
 /// index and its byte order.
@@ -739,6 +740,51 @@ impl SealedSegmentIndex {
     #[inline]
     pub fn payload_index(&self) -> Option<&SealedPayloadIndex> {
         self.payload.as_ref()
+    }
+
+    /// Whether `delta` is a registry delta this sidecar vouches for (bn-26pp).
+    ///
+    /// The delta only ever supplies payload *bytes*; the batch layout it
+    /// describes must already be one this pointer sidecar agrees with. Four
+    /// things are checked, and any failure means the caller must ignore the
+    /// delta and read the `$registry` batches from the log instead (which is
+    /// always right — D1):
+    ///
+    /// 1. `segment_id` — it is this segment's delta, not a neighbour's;
+    /// 2. `base_pos` and `event_count` — it was built from the same seal of the
+    ///    same span, not an earlier partial (`seal_active`) one;
+    /// 3. the delta's stream is present in this sidecar at all; and
+    /// 4. its `(first_global_pos, frame_count)` list is **exactly** the list
+    ///    this sidecar's directory yields for that stream, in the same order —
+    ///    so a delta can neither invent a batch, drop one, nor move one.
+    ///
+    /// This is a `&self` predicate and the delta is **not** retained: it is a
+    /// recovery input, read once and dropped, so a store with hundreds of
+    /// thousands of names does not carry its registrations in RSS forever
+    /// (unlike the `.filter`, which every read consults).
+    #[must_use]
+    pub fn accepts_registry_delta(&self, delta: &RegistryDelta) -> bool {
+        if delta.segment_id() != self.segment_id
+            || delta.base_pos() != self.base_pos
+            || delta.event_count() != self.event_count
+        {
+            return false;
+        }
+        let Ok(entries) = self.stream_entries(delta.stream_id()) else {
+            return false;
+        };
+        if entries.is_empty() || entries.len() != delta.batch_count() {
+            return false;
+        }
+        // `stream_entries` is version-ordered; for a single stream that is
+        // global-position order too, but sort defensively rather than rely on
+        // it — the delta is written strictly position-ascending.
+        let mut want: Vec<(u64, u32)> = entries
+            .iter()
+            .map(|e| (e.first_global_pos, e.frame_count))
+            .collect();
+        want.sort_unstable();
+        delta.layout().eq(want)
     }
 
     /// Reassemble the payload of the event at **segment-local** stored index
