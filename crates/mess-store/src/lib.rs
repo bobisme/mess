@@ -50,6 +50,7 @@ pub mod engine;
 pub mod fjall_snapshot;
 #[cfg(feature = "mock")]
 pub mod mock;
+pub mod pack_snapshot;
 pub mod registry;
 pub mod retry;
 pub mod snapshot;
@@ -84,6 +85,9 @@ pub use mess_core::{Actor, BoxedStoreError, CommandError};
 pub use mess_log::committer::Durability;
 #[cfg(feature = "mock")]
 pub use mock::MockBackend;
+pub use pack_snapshot::{
+    PackBackendError, PackSnapshotBackend, SaveMode, Sidecar, SidecarOptions,
+};
 pub use retry::{DEFAULT_MAX_ATTEMPTS, RetryPolicy};
 pub use snapshot::{
     BlobPtr, Hash256, SnapshotPolicy, SnapshotRef, SnapshotStore,
