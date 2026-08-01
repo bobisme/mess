@@ -62,6 +62,14 @@ pub mod subscription;
 // bn-9mw (Spike E): the v4 commit-capsule format — atomic control+event
 // capsules. Non-normative spike code; v4 write is OFF by default (the engine
 // keeps writing v3). See `spikes/capsule_v4_prelude/REPORT.md`.
+//
+// bn-1ojm: v4 was DECLINED at its product-admission gate — see
+// `docs/adr/0003-v4-admission.md`. This module is retained deliberately, as a
+// frozen and tested artifact that keeps the option cheap to re-exercise. It is
+// not a work in progress: nothing in `mess-store/src` references it. The one
+// cross-crate dependent is the spike's D4 retry test,
+// `crates/mess-store/tests/v4_d4_retry.rs`, which must be removed alongside
+// this module if it is ever deleted.
 pub mod v4;
 pub mod watermark;
 pub mod writer;

@@ -459,10 +459,13 @@ an explicit scan frontier so a registry-only range can advance the cursor even
 when no domain record is returned; [06-subscriptions.md](06-subscriptions.md)
 defines that contract.
 
-The v4 control-prelude design is a later, separately gated alternative that can
-avoid spending domain positions on control-only capsules. It does not change
-the accepted v3 behavior specified here and MUST NOT be read as adopted by this
-document.
+The v4 control-prelude design would have avoided spending domain positions on
+control-only capsules. It was **declined** at its product-admission gate —
+[ADR 0003](../adr/0003-v4-admission.md) — so the behavior specified here is not
+provisional: registry records consuming canonical positions, and the resulting
+gaps in application-visible positions, are the normative and settled v3
+contract. ADR 0003 §9 records the narrow conditions under which v4 could be
+reopened; until one of them is met, no alternative encoding is pending.
 
 ## 5. Name resolution and aliasing
 

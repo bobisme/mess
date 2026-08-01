@@ -464,6 +464,15 @@ applies.
 
 ### 4. V3 positions, opaque cursors, and v4
 
+> **Resolved 2026-08-01 by [ADR 0003](0003-v4-admission.md).** This section was
+> the interim v3/v4 control contract; `bn-1ojm` has now run the v4
+> product-admission gate and **DECLINED** v4. The v3 half below stands
+> unchanged and is now frozen rather than interim: `$registry` is the sole and
+> final v3 control encoding, positions remain opaque ordered cursors, and gaps
+> remain legal. The v4 half is superseded — v4 is not admitted, so there is
+> nothing to pull forward. ADR 0003 §9 carries the amendment/escape-hatch rule
+> stated in the last paragraph here.
+
 This ADR itself adds no canonical v3 control records. `$registry` remains the
 sole control-like v3 encoding: its events consume real global positions and
 are filtered from application reads, so visible positions contain gaps.

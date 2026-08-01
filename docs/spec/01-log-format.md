@@ -548,9 +548,12 @@ events between them. Cursor/frontier semantics for a filtered global scan are
 specified in [06-subscriptions.md](06-subscriptions.md); registry visibility is
 specified in [04-registry.md](04-registry.md).
 
-The Asterism v4 control-prelude format sketches a later alternative in which
-control-only capsules do not consume domain positions. It is not the normative
-format here and is not adopted by this v3 rule.
+The Asterism v4 control-prelude format sketched an alternative in which
+control-only capsules do not consume domain positions. It was **declined** at
+its product-admission gate — [ADR 0003](../adr/0003-v4-admission.md) — so this
+v3 rule is the normative and settled one, not an interim step toward a
+different format. ADR 0003 §9 records the narrow conditions under which v4
+could be reopened.
 
 > ### Decision D-FMT-5 — `batch_id` is per-segment
 >

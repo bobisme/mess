@@ -7,11 +7,17 @@
 //! events and consume no global position. It preserves every v3 A1–A12
 //! guarantee; the crash story is meant to stay as boring and absolute as v3's.
 //!
-//! Non-normative until the exhaustive + randomized gates pass
-//! (`spikes/capsule_v4_prelude/REPORT.md`). **v4 write is OFF by default**: the
-//! production engine keeps writing v3 ([`crate::writer::SegmentWriter`]); the
-//! v4 [`writer::CapsuleWriter`] is opt-in, used by tests and (eventually) the
-//! migration boundary.
+//! The exhaustive + randomized gates passed
+//! (`spikes/capsule_v4_prelude/REPORT.md`), but v4 was then **DECLINED** as a
+//! product at its admission gate — see `docs/adr/0003-v4-admission.md`. This
+//! module is therefore permanently non-normative: **v4 write is OFF and stays
+//! off**, the production engine writes v3 ([`crate::writer::SegmentWriter`]),
+//! and the v4 [`writer::CapsuleWriter`] is used only by tests and fuzz targets
+//! — this crate's own, plus the spike's D4 retry test
+//! (`crates/mess-store/tests/v4_d4_retry.rs`), the one cross-crate dependent,
+//! which must be removed alongside this module if it is ever deleted. It is
+//! retained deliberately, as the frozen artifact that keeps ADR 0003 §9's
+//! reopening paths cheap — not as work in progress.
 //!
 //! Module map:
 //! - [`format`] — byte constants/offsets, the §23 open decisions resolved.
