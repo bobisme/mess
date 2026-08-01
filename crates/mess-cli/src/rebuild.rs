@@ -8,6 +8,17 @@
 //! payload (`.pcol`) and filter (`.filter`) siblings are advisory and left to
 //! the sealer.
 //!
+//! # bn-1w4h: pack-sealed segments are skipped, not rebuilt
+//!
+//! This command emits the **legacy sidecar shape only**. There is no offline
+//! encoder for a consolidated `.seal` pack (bn-3of), and a `.pidx` written for
+//! a pack-sealed segment is not merely redundant: bn-3of's dual read prefers
+//! the pack and never opens the sidecar, and bn-11g's footer identity makes a
+//! legacy sidecar offered in a named pack's place a `PackIdentityMismatch`
+//! refutation — the next open would quarantine the very file this command
+//! wrote. So those segments are reported and left alone; regenerating a pack is
+//! the engine's re-seal path. That is a documented gap, not a silent one.
+//!
 //! # bn-fj34: `--meta` is gone
 //!
 //! This command used to take a `--meta` flag that additionally opened a
@@ -121,6 +132,37 @@ pub fn run(dir: &Path, opts: &RebuildOptions) -> Report {
                 continue;
             }
         };
+        // bn-1w4h: a pack-sealed segment gets no rebuilt `.pidx`. Writing one
+        // would be inert at best (bn-3of's dual read prefers the `.seal`, so
+        // the sidecar is never even opened for judgement) and actively
+        // refutable at worst: when the footer NAMES a SealPack (bn-11g), a
+        // legacy `.pidx` offered in its place is exactly the
+        // `PackIdentityMismatch` refutation, so the next open would quarantine
+        // the file this command just wrote. Rebuilding the pack shape is
+        // engine work (the pack encoder is not exposed as an offline rebuild),
+        // so the honest answer is to say so and touch nothing.
+        if seg.has_seal
+            || scan.trailer.as_ref().is_some_and(|t| t.names_seal_pack())
+        {
+            report.push_finding(
+                Finding::new(
+                    Severity::Warn,
+                    "rebuild",
+                    "pack-sealed-segment-skipped",
+                    format!(
+                        "segment {}: pack-sealed (bn-3of), so no .pidx is \
+                         rebuilt — a legacy sidecar would be shadowed by the \
+                         .seal, and refuted outright if the footer names one. \
+                         Re-seal through the engine to regenerate its pack.",
+                        seg.segment_id
+                    ),
+                )
+                .with("segment_id", seg.segment_id)
+                .with("path", seg.seal_path.display().to_string()),
+            );
+            continue;
+        }
+
         let Some(header) = &scan.recovery.header else {
             report.push_finding(
                 Finding::new(

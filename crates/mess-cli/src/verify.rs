@@ -22,7 +22,7 @@ use std::path::Path;
 
 use mess_index::sealed::parity::{ParityError, ParitySidecar};
 use mess_index::sealed::payload::{NoDicts, SealedPayloadIndex};
-use mess_index::sealed::segment::SealedSegmentIndex;
+use mess_index::sealed::segment::{SealedSegmentIndex, SidecarError};
 use mess_log::fold_chain::{self, Hash as ChainHash};
 use mess_log::footer_ext::{SealPackIdentity, decode_extension};
 use mess_log::format::{CHAIN_LEN, HEADER_LEN};
@@ -102,11 +102,11 @@ pub fn run(dir: &Path, opts: &VerifyOptions) -> Report {
         };
         verify_segment(&mut report, &scan);
 
-        // bn-11g: does the segment footer NAME a SealPack, and is the pack on
-        // disk that exact one? Runs for every segment with a trailer, because
-        // the interesting failures are (a) a footer that names a pack with no
-        // pack present and (b) a pack present that the footer does not name.
-        verify_seal_identity(&mut report, seg, &scan);
+        // bn-3of/bn-11g: the consolidated `.seal` pack — its own trailer hash
+        // and mandatory-section checksums, then whether the segment footer
+        // NAMES it and the pack on disk is that exact one. One open feeds both
+        // checks.
+        verify_seal_pack(&mut report, seg, &scan);
 
         // Sidecar integrity for sealed segments (or any segment with sidecars).
         if seg.has_pidx {
@@ -144,6 +144,81 @@ pub fn run(dir: &Path, opts: &VerifyOptions) -> Report {
             );
             verify_pidx(&mut report, u64::MAX, &path);
         }
+    }
+
+    // The same sweep for consolidated packs (bn-3of): a `.seal` whose `.log`
+    // is gone is the pack-shaped orphan, and the engine refutes it as
+    // `orphan` at the next open.
+    for path in store::discover_seal_packs(dir) {
+        if segments.iter().any(|s| s.seal_path == path) {
+            continue;
+        }
+        report.push_finding(
+            Finding::new(
+                Severity::Warn,
+                "seal-pack",
+                "orphan-seal-pack",
+                format!(
+                    "SealPack {} has no matching .log segment",
+                    path.display()
+                ),
+            )
+            .with("path", path.display().to_string()),
+        );
+        match SealedSegmentIndex::open_pack_eager(&path) {
+            Ok(idx) => report.push_finding(
+                Finding::new(
+                    Severity::Ok,
+                    "seal-pack",
+                    "seal-pack-verified",
+                    format!(
+                        "SealPack {} verified ({} stream(s))",
+                        path.display(),
+                        idx.stream_count()
+                    ),
+                )
+                .with("segment_id", idx.segment_id()),
+            ),
+            Err(e) => report.push_finding(
+                Finding::new(
+                    Severity::Error,
+                    "seal-pack",
+                    "seal-pack-corrupt",
+                    format!("SealPack {} failed to open: {e}", path.display()),
+                )
+                .with("path", path.display().to_string()),
+            ),
+        }
+    }
+
+    // bn-30u: quarantined candidates are neither orphans nor unknown files.
+    // `verify` names them because a thrown-away seal is exactly the kind of
+    // evidence this command exists to surface; `mess doctor` reports their
+    // re-seal state. Never an error — the raw log is authority and nothing
+    // committed is at risk (D1).
+    for q in store::discover_quarantined(dir) {
+        if !q.is_primary {
+            continue; // a derived sibling dragged along; doctor accounts for it
+        }
+        let mut f = Finding::new(
+            Severity::Info,
+            "quarantine",
+            "quarantined-candidate",
+            format!(
+                "{} is a quarantined .{} candidate a store open refuted \
+                 (bn-30u); its segment is served from the raw log and is owed \
+                 a re-seal. Preserved evidence — do not delete it.",
+                q.path.display(),
+                q.original_ext
+            ),
+        )
+        .with("path", q.path.display().to_string())
+        .with("artifact", q.original_ext.clone())
+        .with("fallback", "raw-segment-scan");
+        if let Some(id) = q.segment_id {
+            f = f.with("segment_id", id);
+        }
+        report.push_finding(f);
     }
 
     let clean = report.worst() < Severity::Error;
@@ -277,6 +352,104 @@ fn verify_segment(report: &mut Report, scan: &SegmentScan) {
     }
 }
 
+/// The consolidated `.seal` pack (bn-3of): its own integrity, then bn-11g's
+/// footer-identity binding — both off **one** open.
+///
+/// Two independent questions, in the order an operator needs them answered:
+///
+/// 1. *Are these bytes a readable pack?* `open_pack_eager` recomputes the
+///    whole-image trailer hash and every section checksum, so a corrupt pack is
+///    named here whether or not any footer points at it. This is the check that
+///    was entirely missing before bn-1w4h: a `.seal`-sealed store had no pack
+///    integrity check at all, because `verify` only ever opened `.pidx`es.
+/// 2. *Is it the pack this segment was sealed with?* —
+///    [`verify_seal_identity`], spec 01 §3.3.3.
+///
+/// The findings are mutually exclusive by construction: a pack that fails to
+/// open reports `seal-pack-unreadable` when the footer names one (bn-11g's
+/// finding, carrying the expected identity) and `seal-pack-corrupt` when it
+/// does not, never both.
+fn verify_seal_pack(
+    report: &mut Report,
+    seg: &store::SegmentFile,
+    scan: &SegmentScan,
+) {
+    let id = seg.segment_id;
+    // `open_pack_eager`, not `open_pack`: engine open attaches the
+    // payload/event-type sections lazily (bn-dbz), but an offline verifier
+    // wants the strongest check the format offers and is not latency- or
+    // residency-bound. The identity is identical either way — it is the
+    // header+directory hash both paths recompute.
+    let opened = seg
+        .has_seal
+        .then(|| SealedSegmentIndex::open_pack_eager(&seg.seal_path));
+
+    let names_pack =
+        scan.trailer.as_ref().is_some_and(SegmentCatalogEntry::names_seal_pack);
+
+    match &opened {
+        Some(Ok(idx)) if idx.segment_id() != id => {
+            report.push_finding(
+                Finding::new(
+                    Severity::Error,
+                    "seal-pack",
+                    "seal-pack-segment-mismatch",
+                    format!(
+                        "segment {id}: {} claims segment {} — a pack from a \
+                         different segment cannot serve this one",
+                        seg.seal_path.display(),
+                        idx.segment_id()
+                    ),
+                )
+                .with("segment_id", id)
+                .with("pack_segment_id", idx.segment_id())
+                .with("fallback", "raw-segment-scan")
+                .with("path", seg.seal_path.display().to_string()),
+            );
+        }
+        Some(Ok(idx)) => {
+            report.push_finding(
+                Finding::new(
+                    Severity::Ok,
+                    "seal-pack",
+                    "seal-pack-verified",
+                    format!(
+                        "segment {id}: {} verified — trailer hash and every \
+                         section checksum ({} stream(s))",
+                        seg.seal_path.display(),
+                        idx.stream_count()
+                    ),
+                )
+                .with("segment_id", id)
+                .with("streams", idx.stream_count() as u64),
+            );
+        }
+        Some(Err(e)) if !names_pack => {
+            report.push_finding(
+                Finding::new(
+                    Severity::Error,
+                    "seal-pack",
+                    "seal-pack-corrupt",
+                    format!(
+                        "segment {id}: {} failed to open: {e}. The next open \
+                         refutes and quarantines it (bn-30u); the segment is \
+                         served from the raw log, the only authority (D1)",
+                        seg.seal_path.display()
+                    ),
+                )
+                .with("segment_id", id)
+                .with("fallback", "raw-segment-scan")
+                .with("path", seg.seal_path.display().to_string()),
+            );
+        }
+        // A named-but-unreadable pack is bn-11g's `seal-pack-unreadable`,
+        // reported below with the identity the footer expected.
+        Some(Err(_)) | None => {}
+    }
+
+    verify_seal_identity(report, seg, scan, opened.as_ref());
+}
+
 /// bn-11g: check the segment footer's **SealPack identity** binding
 /// (spec 01 §3.3.3) — expected (what the footer names) against observed (what
 /// the pack on disk hashes to), plus the reason a reader would fall back to the
@@ -290,15 +463,14 @@ fn verify_segment(report: &mut Report, scan: &SegmentScan) {
 /// instead, which is always the same thing — read the canonical raw segment
 /// bytes, the only authority (D1). No finding here means data loss.
 ///
-/// The pack is opened with `open_pack_eager`, not `open_pack`: engine open
-/// attaches the payload/event-type sections lazily (bn-dbz), but an offline
-/// verifier wants the strongest check the format offers and is not latency- or
-/// residency-bound. The identity itself is identical either way — it is the
-/// header+directory hash both paths recompute.
+/// `opened` is the pack open [`verify_seal_pack`] already performed (`None`
+/// when no `.seal` exists), so the identity check re-uses those bytes instead
+/// of hashing the pack a second time.
 fn verify_seal_identity(
     report: &mut Report,
     seg: &store::SegmentFile,
     scan: &SegmentScan,
+    opened: Option<&Result<SealedSegmentIndex, SidecarError>>,
 ) {
     let id = seg.segment_id;
     let Some(trailer) = &scan.trailer else {
@@ -376,7 +548,7 @@ fn verify_seal_identity(
         return;
     }
 
-    let index = match SealedSegmentIndex::open_pack_eager(&seg.seal_path) {
+    let index = match opened.expect("has_seal implies an open attempt") {
         Ok(index) => index,
         Err(e) => {
             report.push_finding(

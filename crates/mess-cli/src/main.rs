@@ -59,8 +59,9 @@ struct Common {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Health checks: lock, epoch, footer/trailer, sidecar, fsync,
-    /// fold-version, registry.
+    /// Health checks: lock, epoch, footer/trailer, sealed index (`.seal` pack
+    /// or `.pidx` sidecar), quarantined candidates, fsync, fold-version,
+    /// registry.
     ///
     /// Every check but one is safe against a live writer. The $registry fold
     /// is the exception: it opens the engine, which a live writer holds under
@@ -116,7 +117,13 @@ enum Command {
         #[command(flatten)]
         common: Common,
     },
-    /// Rebuild the sealed pointer sidecars (byte-equal) from the log segments.
+    /// Rebuild the legacy `.pidx` pointer sidecars (byte-equal) from the log
+    /// segments.
+    ///
+    /// Pack-sealed segments (bn-3of `.seal`) are skipped: this command emits
+    /// only the legacy sidecar shape, which a pack-sealed segment either
+    /// shadows or — when its footer names a SealPack (bn-11g) — refuses
+    /// outright. Re-sealing is the engine's job for those.
     RebuildIndex {
         /// The store directory.
         dir:     PathBuf,

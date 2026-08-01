@@ -7,6 +7,17 @@
 //! `SnapshotAnchor` (Path C) discharges the requirement. The verdict here is
 //! exactly `decide_segment`'s — this command is a read-only explainer over the
 //! same function a retention executor would call.
+//!
+//! # Which segments are "sealed" (bn-3of, bn-30u)
+//!
+//! A sealed segment carries a consolidated `.seal` pack **or** a legacy `.pidx`
+//! sidecar, and [`store::SegmentFile::sealed_artifact`] picks the one a reader
+//! would use. Both shapes get a verdict, from the same `decide_segment` fed the
+//! same live set — the sealed index is an index either way, and retention is a
+//! statement about the segment, not about the file format its index happens to
+//! use. A segment whose only candidate is quarantined (`*.refuted`) has no
+//! sealed index at all and therefore no verdict; that is reported explicitly,
+//! because a missing row must never be read as "deletable".
 
 use std::path::Path;
 
@@ -157,14 +168,55 @@ pub fn run(dir: &Path) -> Report {
         ),
     );
 
+    let quarantined_ids: Vec<u64> = store::discover_quarantined(dir)
+        .iter()
+        .filter(|q| q.is_primary)
+        .filter_map(|q| q.segment_id)
+        .collect();
+
     let segments = store::discover_segments(dir);
     let mut sealed_seen = 0usize;
     for seg in &segments {
-        if !seg.has_pidx {
-            continue; // retention is a whole-*sealed*-segment decision
-        }
+        // Retention is a whole-*sealed*-segment decision, and a segment is
+        // sealed in EITHER shape (bn-3of): a consolidated `.seal` pack or a
+        // legacy `.pidx`. Asking `has_pidx` skipped every segment of a
+        // `seal_pack` store, so `retention explain` reported "no sealed
+        // segments to evaluate" over a store full of them — an explainer that
+        // fronts a destructive operation, silently vacuous.
+        let artifact = seg.sealed_artifact();
+        let Some(path) = seg.sealed_artifact_path() else {
+            // bn-30u: a segment whose only candidate was refuted has no sealed
+            // index to decide over, so it gets NO verdict — and an operator
+            // reading a verdict list must not read the absence as "deletable".
+            if quarantined_ids.contains(&seg.segment_id) {
+                report.push_finding(
+                    Finding::new(
+                        Severity::Info,
+                        "retention",
+                        "quarantined-no-verdict",
+                        format!(
+                            "segment {}: its sealed candidate is quarantined \
+                             (*.refuted, pending re-seal), so there is no \
+                             sealed index to decide retention over and this \
+                             segment gets no verdict — absence here is NOT \
+                             deletability",
+                            seg.segment_id
+                        ),
+                    )
+                    .with("segment_id", seg.segment_id),
+                );
+            }
+            continue;
+        };
         sealed_seen += 1;
-        let idx = match SealedSegmentIndex::open(&seg.pidx_path) {
+        // The pack is opened the way engine open opens it (`open_pack`,
+        // bn-dbz): the decision reads the stream directory and per-stream
+        // version spans, which the lazy attach fully materialises and verifies.
+        let opened = match artifact {
+            store::SealedArtifact::Pack => SealedSegmentIndex::open_pack(path),
+            _ => SealedSegmentIndex::open(path),
+        };
+        let idx = match opened {
             Ok(i) => i,
             Err(e) => {
                 report.push_finding(
@@ -173,12 +225,15 @@ pub fn run(dir: &Path) -> Report {
                         "retention",
                         "sidecar-unreadable",
                         format!(
-                            "segment {}: sidecar unreadable, cannot decide \
-                             retention: {e}",
-                            seg.segment_id
+                            "segment {}: sealed index ({}) unreadable, cannot \
+                             decide retention: {e}",
+                            seg.segment_id,
+                            path.display()
                         ),
                     )
-                    .with("segment_id", seg.segment_id),
+                    .with("segment_id", seg.segment_id)
+                    .with("artifact", artifact.as_str())
+                    .with("path", path.display().to_string()),
                 );
                 continue;
             }
@@ -199,6 +254,7 @@ pub fn run(dir: &Path) -> Report {
 
         report.push_row(json!({
             "segment_id": idx.segment_id(),
+            "artifact": artifact.as_str(),
             "base_pos": idx.base_pos(),
             "streams": idx.stream_count(),
             "event_count": idx.event_count(),

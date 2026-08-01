@@ -352,3 +352,60 @@ async fn dir_codec_is_reported_per_sealed_segment() {
     let rows = json["segments"].as_array().unwrap();
     assert!(rows.iter().all(|r| r["dir_codec"].is_null()), "{rows:?}");
 }
+
+// ---------------------------------------------------------------------------
+// bn-1w4h: which sealed artifact actually serves a segment
+// ---------------------------------------------------------------------------
+
+/// `has_pidx`/`has_seal` are raw presence bits; `sealed_artifact` names the one
+/// a READER would use, applying bn-3of's dual-read preference. An operator
+/// staring at a mid-migration store needs that answer, and `inspect` is the
+/// surface that describes on-disk shape.
+#[tokio::test(flavor = "multi_thread")]
+async fn sealed_artifact_names_the_serving_shape() {
+    use mess_store::engine::EngineOptions;
+
+    async fn seal_store(dir: &std::path::Path, pack: bool) {
+        let opts = EngineOptions {
+            segment_size: 1 << 20,
+            seal_pack: pack,
+            ..EngineOptions::default()
+        };
+        let engine = LogEngine::open_with(dir, opts).expect("open");
+        engine
+            .append_batch("acct-1", Version::NoStream, &[rec("Created", b"a")])
+            .await
+            .unwrap();
+        engine.seal_active().expect("seal");
+    }
+
+    fn artifact_of(dir: &std::path::Path) -> Value {
+        let json = json_of(&inspect::run(dir, &opts()));
+        let rows = json["segments"].as_array().expect("segments rows");
+        assert_eq!(rows.len(), 1, "expected one segment: {rows:?}");
+        rows[0]["sealed_artifact"].clone()
+    }
+
+    let packed = mess_testkit::sweeping_temp_dir("cli-inspect-artifact-pack");
+    seal_store(packed.path(), true).await;
+    assert_eq!(artifact_of(packed.path()), "seal-pack");
+
+    let loose = mess_testkit::sweeping_temp_dir("cli-inspect-artifact-pidx");
+    seal_store(loose.path(), false).await;
+    assert_eq!(artifact_of(loose.path()), "pidx");
+
+    // A `.pidx` planted next to the pack is shadowed: the pack still serves.
+    std::fs::copy(
+        mess_cli::store::pidx_path(loose.path(), 1),
+        mess_cli::store::pidx_path(packed.path(), 1),
+    )
+    .expect("plant .pidx");
+    assert_eq!(artifact_of(packed.path()), "seal-pack");
+
+    // An unsealed head has no sealed artifact at all.
+    let live = mess_testkit::sweeping_temp_dir("cli-inspect-artifact-live");
+    build_named_corpus(live.path(), 2).await;
+    let json = json_of(&inspect::run(live.path(), &opts()));
+    let rows = json["segments"].as_array().unwrap();
+    assert!(rows.iter().all(|r| r["sealed_artifact"] == "none"), "{rows:?}");
+}

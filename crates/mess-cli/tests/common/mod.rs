@@ -79,6 +79,113 @@ pub fn build_corpus(dir: &Path, n_batches: u64) {
     // Engine dropped here → lock released.
 }
 
+/// Build a **pack-sealed** corpus at `dir` (bn-3of): the same appends as
+/// [`build_corpus`], but with [`EngineOptions::seal_pack`] on, so the seal
+/// emits one consolidated `sealed/seg-<id>.seal` and none of the
+/// `.pidx`/`.pcol`/ `.filter` trio. Leaves the segment footerless —
+/// [`seal_pack_footer`] writes the footer, which is the knob these tests need.
+pub fn build_pack_corpus(dir: &Path, n_batches: u64) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let opts = EngineOptions {
+            segment_size: 1 << 20,
+            seal_pack: true,
+            ..EngineOptions::default()
+        };
+        let engine = LogEngine::open_with(dir, opts).expect("open engine");
+        for i in 0..n_batches {
+            let expected =
+                if i == 0 { Version::NoStream } else { Version::At(i - 1) };
+            let payload = format!("event-{i}").into_bytes();
+            engine
+                .append_batch(
+                    "acct-1",
+                    expected,
+                    &[rec("account.happened", &payload)],
+                )
+                .await
+                .expect("append");
+        }
+        // Real seal, pack shape: writes sealed/seg-*.seal and nothing else.
+        engine.seal_active().expect("seal");
+    });
+}
+
+/// The consolidated SealPack path for the corpus segment.
+pub fn seal(dir: &Path) -> std::path::PathBuf { store::seal_path(dir, SEG_ID) }
+
+/// The identity the pack on disk hashes to — what any reader derives.
+pub fn pack_identity(dir: &Path) -> [u8; 32] {
+    *mess_index::sealed::SealedSegmentIndex::open_pack_eager(&seal(dir))
+        .expect("pack opens")
+        .pack_identity()
+        .expect("a pack carries an identity")
+        .as_bytes()
+}
+
+/// After [`build_pack_corpus`], write the segment footer the production sealer
+/// writes: the §3.3.1 fixed trailer plus (bn-11g) the extension naming the
+/// SealPack on disk, so the segment is bound to its exact pack.
+///
+/// `pack` names the identity to bind, defaulting to the real one via
+/// [`seal_pack_footer`]; [`seal_pack_footer_unnamed`] writes the legacy
+/// (pre-bn-11g, D-FMT-10) footer that names nothing.
+fn write_pack_footer(dir: &Path, pack: Option<[u8; 32]>) {
+    use mess_log::footer_ext::{
+        SealPackIdentity, SealSummary, encode_sealed_footer,
+    };
+    use mess_log::format::SEAL_PACK_IDENTITY_HDRDIR_BLAKE3;
+
+    let log = store::log_path(dir, SEG_ID);
+    let s = scan_segment(SEG_ID, &log).expect("scan");
+    let content_len = s.recovery.safe_offset;
+    let summary = SealSummary {
+        segment_id: SEG_ID,
+        epoch: s.epoch().expect("epoch"),
+        base_pos: s.base_pos().expect("base_pos"),
+        batch_count: s.batch_count() as u64,
+        event_count: s.event_count(),
+        content_len,
+    };
+    let identity = pack.map(|identity| SealPackIdentity {
+        identity_kind: SEAL_PACK_IDENTITY_HDRDIR_BLAKE3,
+        pack_format_version: mess_index::sealed::PACK_FORMAT_VERSION,
+        segment_id: SEG_ID,
+        identity,
+    });
+    let (footer, _) =
+        encode_sealed_footer(&summary, &[], &[], identity.as_ref());
+
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&log)
+        .expect("open log");
+    f.set_len(content_len).expect("truncate to content");
+    f.seek(SeekFrom::Start(content_len)).expect("seek");
+    f.write_all(&footer).expect("write footer");
+    f.sync_all().expect("sync");
+}
+
+/// Seal the corpus segment's footer, binding it to the pack now on disk.
+pub fn seal_pack_footer(dir: &Path) {
+    write_pack_footer(dir, Some(pack_identity(dir)));
+}
+
+/// Seal the corpus segment's footer WITHOUT naming a pack — the legacy
+/// coverage-only policy (D-FMT-10).
+pub fn seal_pack_footer_unnamed(dir: &Path) { write_pack_footer(dir, None); }
+
+/// A ready-to-inspect pack-sealed store: a real `.seal` pack plus the footer
+/// that names it. The shape a healthy `seal_pack` store has on disk.
+pub fn build_sealed_pack_store(dir: &Path, n_batches: u64) {
+    build_pack_corpus(dir, n_batches);
+    seal_pack_footer(dir);
+}
+
 /// After [`build_corpus`], turn the active `.log` into a sealed segment by
 /// writing its checksummed trailer (§3.3.1) at the recovered content length.
 /// This gives `verify` the ground truth (batch/event counts, content length)

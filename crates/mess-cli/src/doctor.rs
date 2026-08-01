@@ -1,10 +1,23 @@
 //! `mess doctor <dir>` — operational health checks.
 //!
 //! Checks: lock state, epoch sanity across the segment chain, footer/trailer
-//! presence per sealed segment, sidecar presence/CRC, an fsync health probe
-//! (writable + `fdatasync` on a probe file), and `fold_version` drift across
-//! the snapshot set. Read-only w.r.t. committed data; reports the lock holder
-//! instead of failing when a live writer holds the store.
+//! presence per sealed segment, sealed-index presence/integrity, quarantined
+//! candidates, an fsync health probe (writable + `fdatasync` on a probe file),
+//! and `fold_version` drift across the snapshot set. Read-only w.r.t. committed
+//! data; reports the lock holder instead of failing when a live writer holds
+//! the store.
+//!
+//! # What "sealed" looks like on disk (bn-3of, bn-30u)
+//!
+//! A sealed segment carries a consolidated `.seal` pack OR the legacy
+//! `.pidx`+`.pcol`+`.filter` trio; [`store::SegmentFile::sealed_artifact`]
+//! answers which, using the engine's own dual-read preference. A pack-sealed
+//! segment is **healthy** and is reported as such — before bn-1w4h this check
+//! knew only `.pidx` and so warned "sealed but no .pidx sidecar" for every
+//! healthy segment of a `seal_pack` store, i.e. it misdiagnosed the entire
+//! store. A refuted candidate quarantined as `*.refuted` (bn-30u) is reported
+//! as quarantined-with-state, never deleted or repaired: it is preserved
+//! evidence and the durable trigger for the segment's re-seal.
 //!
 //! # What the fold-version check sees
 //!
@@ -64,6 +77,7 @@ pub fn run(dir: &Path, opts: &DoctorOptions) -> Report {
     let lock = lockprobe::probe(dir);
     check_lock(&mut report, &lock);
     check_segments(&mut report, dir);
+    check_quarantine(&mut report, dir);
     check_fsync(&mut report, dir);
     check_fold_version(&mut report, dir, opts);
     check_registry(&mut report, dir, &lock);
@@ -357,22 +371,26 @@ fn check_segments(report: &mut Report, dir: &Path) {
                         .with("segment_id", seg.segment_id),
                     );
                 }
-                // A sealed segment SHOULD have a pointer sidecar.
-                if !seg.has_pidx {
-                    report.push_finding(
+                // A sealed segment SHOULD have a sealed index — in EITHER
+                // shape (bn-3of): a consolidated `.seal` pack or the legacy
+                // `.pidx`. Missing means missing both.
+                match seg.sealed_artifact() {
+                    store::SealedArtifact::None => report.push_finding(
                         Finding::new(
                             Severity::Warn,
                             "sidecar",
                             "sidecar-missing",
                             format!(
-                                "segment {}: sealed but no .pidx sidecar",
+                                "segment {}: sealed but no sealed index \
+                                 artifact (neither a .seal pack nor a .pidx \
+                                 sidecar); the segment is served from the raw \
+                                 log and is owed a re-seal",
                                 seg.segment_id
                             ),
                         )
                         .with("segment_id", seg.segment_id),
-                    );
-                } else {
-                    check_sidecar_crc(report, seg.segment_id, &seg.pidx_path);
+                    ),
+                    artifact => check_sealed_artifact(report, seg, artifact),
                 }
             }
             None => {
@@ -395,11 +413,12 @@ fn check_segments(report: &mut Report, dir: &Path) {
             }
         }
 
-        // Validate any pointer sidecar that is present regardless of whether
-        // the `.log` itself carries a trailer (the composed engine seals the
-        // index sidecar while keeping the segment live for appends).
-        if seg.has_pidx && scan.trailer.is_none() {
-            check_sidecar_crc(report, seg.segment_id, &seg.pidx_path);
+        // Validate any sealed index that is present regardless of whether the
+        // `.log` itself carries a trailer (the composed engine seals the index
+        // while keeping the segment live for appends — `seal_active` writes a
+        // `.seal`/`.pidx` over a footerless head).
+        if scan.trailer.is_none() && seg.sealed_artifact().is_present() {
+            check_sealed_artifact(report, seg, seg.sealed_artifact());
         }
     }
 
@@ -407,6 +426,100 @@ fn check_segments(report: &mut Report, dir: &Path) {
         "epochs_seen",
         json!(epochs_seen.iter().copied().collect::<Vec<_>>()),
     );
+}
+
+/// Integrity of the segment's load-bearing sealed index, whichever shape it is
+/// (bn-3of).
+///
+/// A pack-sealed segment is **healthy**: `doctor` says so with a `seal-pack-ok`
+/// finding rather than the historical "sealed but no .pidx sidecar" warning,
+/// which on a `seal_pack` store fired for every single healthy segment. Only a
+/// segment with neither artifact is missing one.
+///
+/// The pack is opened with `open_pack` — the same lazy attach engine open uses
+/// (bn-dbz) — so `doctor` verifies exactly what a reopen would: header, section
+/// directory, trailer hash, and every mandatory section's checksum. `verify` is
+/// the surface that additionally pulls the optional sections and re-hashes the
+/// whole image (`open_pack_eager`); `doctor` is the operational health check,
+/// and its job is to answer "would the next open install this?".
+fn check_sealed_artifact(
+    report: &mut Report,
+    seg: &store::SegmentFile,
+    artifact: store::SealedArtifact,
+) {
+    let segment_id = seg.segment_id;
+    if seg.pidx_shadowed_by_pack() {
+        // bn-3of dual read: the pack wins and the `.pidx` is never even opened
+        // for judgement. Worth one line, because "this segment has a .pidx" is
+        // a fact an operator will otherwise misread as the serving artifact.
+        report.push_finding(
+            Finding::new(
+                Severity::Info,
+                "sidecar",
+                "pidx-shadowed-by-pack",
+                format!(
+                    "segment {segment_id}: both a .seal pack and a legacy \
+                     .pidx are present; the pack serves and the sidecar is \
+                     inert (bn-3of dual read)"
+                ),
+            )
+            .with("segment_id", segment_id)
+            .with("path", seg.pidx_path.display().to_string()),
+        );
+    }
+    match artifact {
+        store::SealedArtifact::Pack => {
+            match SealedSegmentIndex::open_pack(&seg.seal_path) {
+                Ok(idx) if idx.segment_id() != segment_id => report
+                    .push_finding(
+                        Finding::new(
+                            Severity::Error,
+                            "sidecar",
+                            "seal-pack-segment-mismatch",
+                            format!(
+                                "segment {segment_id}: .seal pack claims \
+                                 segment {}",
+                                idx.segment_id()
+                            ),
+                        )
+                        .with("segment_id", segment_id)
+                        .with("pack_segment_id", idx.segment_id()),
+                    ),
+                Ok(idx) => report.push_finding(
+                    Finding::new(
+                        Severity::Ok,
+                        "sidecar",
+                        "seal-pack-ok",
+                        format!(
+                            "segment {segment_id}: .seal pack verified ({} \
+                             stream(s))",
+                            idx.stream_count()
+                        ),
+                    )
+                    .with("segment_id", segment_id)
+                    .with("streams", idx.stream_count() as u64),
+                ),
+                Err(e) => report.push_finding(
+                    Finding::new(
+                        Severity::Error,
+                        "sidecar",
+                        "seal-pack-corrupt",
+                        format!(
+                            "segment {segment_id}: .seal pack failed to open: \
+                             {e}. The next open will refute and quarantine \
+                             it; the segment is served from the raw log (D1)"
+                        ),
+                    )
+                    .with("segment_id", segment_id)
+                    .with("path", seg.seal_path.display().to_string()),
+                ),
+            }
+        }
+        store::SealedArtifact::Sidecar => {
+            check_sidecar_crc(report, segment_id, &seg.pidx_path);
+        }
+        store::SealedArtifact::None => {}
+    }
 }
 
 fn check_sidecar_crc(report: &mut Report, segment_id: u64, path: &Path) {
@@ -429,6 +542,115 @@ fn check_sidecar_crc(report: &mut Report, segment_id: u64, path: &Path) {
             )
             .with("segment_id", segment_id),
         ),
+    }
+}
+
+/// bn-30u quarantine surface: every `sealed/*.refuted` artifact, what it was,
+/// and whether its segment has since regained a sealed index.
+///
+/// **Diagnosis only — `doctor` never touches these files.** A quarantine marker
+/// is the preserved evidence of a seal that was thrown away *and* the durable
+/// trigger that re-queues the segment for a fresh seal at the next open; the
+/// engine converges the store, not the CLI. Deleting one here would destroy the
+/// only witness of a possible sealer bug and cancel the pending re-seal.
+///
+/// The refutation *reason* is not durable — it is logged loudly by the open
+/// that made it (`SealedCandidateHealth::refute`) — so this check reports the
+/// one reason class it can honestly re-derive offline: whether the quarantined
+/// bytes parse at all. Bytes that do not parse were refuted as `unparsable`;
+/// bytes that do parse were refuted for a coverage or identity reason
+/// (`coverage-unproven`, `identity-mismatch`, `pack-identity-mismatch`,
+/// `pack-identity-unresolvable`, `orphan`), which `mess verify` names exactly.
+fn check_quarantine(report: &mut Report, dir: &Path) {
+    let quarantined = store::discover_quarantined(dir);
+    report.set("quarantined", json!(quarantined.len() as u64));
+    if quarantined.is_empty() {
+        report.push_finding(Finding::new(
+            Severity::Ok,
+            "quarantine",
+            "no-quarantined-artifacts",
+            "no refuted sealed-index candidates are quarantined under sealed/",
+        ));
+        return;
+    }
+
+    // A segment whose quarantined candidate has NOT been replaced is owed a
+    // re-seal; one that has been is a marker left behind as evidence.
+    let segments = store::discover_segments(dir);
+    for q in &quarantined {
+        if !q.is_primary {
+            // A derived sibling (`.filter`/`.pcol`/`.reg`) dragged along by a
+            // `.pidx` quarantine. Reported at info so the file is accounted
+            // for, never as a problem of its own.
+            report.push_finding(
+                Finding::new(
+                    Severity::Info,
+                    "quarantine",
+                    "quarantined-sibling",
+                    format!(
+                        "{}: a derived .{} sibling moved with its quarantined \
+                         .pidx (bn-30u)",
+                        q.path.display(),
+                        q.original_ext
+                    ),
+                )
+                .with("path", q.path.display().to_string())
+                .with("artifact", q.original_ext.clone()),
+            );
+            continue;
+        }
+        let resealed = q.segment_id.is_some_and(|id| {
+            segments
+                .iter()
+                .any(|s| s.segment_id == id && s.sealed_artifact().is_present())
+        });
+        let parses = quarantined_parses(q);
+        let state = if resealed { "resealed" } else { "pending-reseal" };
+        let mut f = Finding::new(
+            Severity::Warn,
+            "quarantine",
+            "quarantined-candidate",
+            format!(
+                "segment {}: a refuted .{} candidate is quarantined at {} \
+                 ({}). It is preserved evidence and the durable re-seal \
+                 trigger — do not delete it; the segment is served from the \
+                 raw log (D1) and {}",
+                q.segment_id
+                    .map_or_else(|| "?".to_string(), |id| id.to_string()),
+                q.original_ext,
+                q.path.display(),
+                if parses {
+                    "the bytes still parse, so it was refuted on coverage or \
+                     identity — `mess verify` names which"
+                } else {
+                    "the bytes do not parse (refuted as unparsable)"
+                },
+                if resealed {
+                    "has since regained a sealed index"
+                } else {
+                    "is queued for a fresh seal at the next open"
+                },
+            ),
+        )
+        .with("path", q.path.display().to_string())
+        .with("artifact", q.original_ext.clone())
+        .with("state", state)
+        .with("parses", parses);
+        if let Some(id) = q.segment_id {
+            f = f.with("segment_id", id);
+        }
+        report.push_finding(f);
+    }
+}
+
+/// Whether a quarantined candidate's bytes still parse — the one refutation
+/// class re-derivable from the file alone. Read-only: opens the `*.refuted`
+/// path itself, never the candidate name it used to hold.
+fn quarantined_parses(q: &store::QuarantinedArtifact) -> bool {
+    match q.original_ext.as_str() {
+        "seal" => SealedSegmentIndex::open_pack(&q.path).is_ok(),
+        "pidx" => SealedSegmentIndex::open(&q.path).is_ok(),
+        _ => false,
     }
 }
 

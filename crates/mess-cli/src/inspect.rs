@@ -127,6 +127,12 @@ pub fn run(dir: &Path, opts: &InspectOptions) -> Report {
                     "has_pcol": seg.has_pcol,
                     "dir_codec": dir_codec(dir, seg.segment_id, &seg.pidx_path),
                     "has_seal": seg.has_seal,
+                    // bn-3of dual read: which sealed artifact a reader would
+                    // actually use for this segment (`seal-pack` wins over a
+                    // shadowed `pidx`; `none` for the unsealed head or a
+                    // segment whose candidate was quarantined). `has_pidx` /
+                    // `has_seal` remain the raw presence bits.
+                    "sealed_artifact": seg.sealed_artifact().as_str(),
                     // bn-11g: the SealPack identity this segment's footer
                     // NAMES (spec 01 §3.3.3), lowercase hex, or null for a
                     // legacy/unsealed footer that names none. `mess verify`
@@ -169,6 +175,26 @@ pub fn run(dir: &Path, opts: &InspectOptions) -> Report {
             "active_segment_age_secs": active_age_secs,
         }),
     );
+    // bn-30u: quarantined candidates (`sealed/*.refuted`). Always present (an
+    // empty array on a healthy store), so the JSON schema does not change shape
+    // with the store's health — the same lock-state-independence rule bn-1yz
+    // established for `registry`. `inspect` DESCRIBES them; `doctor` judges
+    // their re-seal state and `verify` names the refutation class.
+    report.set(
+        "quarantined",
+        json!(
+            store::discover_quarantined(dir)
+                .iter()
+                .map(|q| json!({
+                    "segment_id": q.segment_id,
+                    "artifact": q.original_ext,
+                    "primary": q.is_primary,
+                    "path": q.path.display().to_string(),
+                }))
+                .collect::<Vec<_>>()
+        ),
+    );
+
     report.advise(
         "metrics-scope",
         "runtime metrics (fdatasync p50/p95/p99, degradation flag, \

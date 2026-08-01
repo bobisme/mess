@@ -105,6 +105,45 @@ fn deletable_matches_decision_function() {
     assert_eq!(report.exit_code(), 0);
 }
 
+/// bn-1w4h: the same two facts over a **pack-sealed** store (bn-3of). The
+/// decision is a statement about the segment, not about the file format its
+/// sealed index happens to use, so a `.seal`-sealed segment must be blocked by
+/// exactly the same live snapshot — and before this bone it was not evaluated
+/// at all, which reported the store as having no sealed segments while a
+/// retention executor would have been free to delete one.
+#[test]
+fn blocked_matches_decision_function_on_a_pack_sealed_store() {
+    let d = mess_testkit::sweeping_temp_dir("cli-retention-pack");
+    common::build_sealed_pack_store(d.path(), 5); // versions 0..=4, .seal
+    assert!(common::seal(d.path()).exists(), "the fixture is pack-sealed");
+    assert!(!common::pidx(d.path()).exists(), "and carries no .pidx");
+
+    inject_snapshot(d.path(), 2);
+
+    let sid = stream_id_of(d.path(), "acct-1");
+    let report = retention::run(d.path());
+    let row = report
+        .collection
+        .iter()
+        .find(|r| r["segment_id"] == common::SEG_ID)
+        .unwrap_or_else(|| panic!("a verdict row: {:#?}", report.collection));
+    assert_eq!(row["verdict"], "blocked", "report: {:#?}", report.findings);
+    assert_eq!(row["artifact"], "seal-pack");
+
+    // The same decision, computed directly against the PACK the CLI opened.
+    let idx = SealedSegmentIndex::open_pack(&common::seal(d.path()))
+        .expect("open pack");
+    let live = [mess_index::sealed::retention::LiveSnapshotRef {
+        stream_id: sid,
+        version:   2,
+    }];
+    assert!(decide_segment(&idx, &live, &[]).is_blocked());
+
+    let blockers = row["blockers"].as_array().expect("blockers array");
+    assert!(blockers.iter().any(|b| b["version"] == 2 && b["frame"] == "v"));
+    assert!(blockers.iter().any(|b| b["version"] == 2 && b["frame"] == "v+1"));
+}
+
 /// A live snapshot at v=2 whose certification frames (v and v+1) live in the
 /// sealed segment blocks it — and the CLI verdict + blockers match
 /// `decide_segment` fed the same live set.

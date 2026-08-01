@@ -59,3 +59,36 @@ fn rebuild_is_deterministic() {
 
     assert_eq!(first, second, "two rebuilds must produce identical bytes");
 }
+
+/// bn-1w4h: a pack-sealed segment is skipped, not "rebuilt" into a legacy
+/// sidecar the engine would shadow — or, once its footer names the pack
+/// (bn-11g), refute and quarantine. The command reports the gap and writes
+/// nothing.
+#[test]
+fn rebuild_index_skips_pack_sealed_segments() {
+    let d = mess_testkit::sweeping_temp_dir("cli-rebuild-pack-skip");
+    common::build_sealed_pack_store(d.path(), 6);
+    let seal_before = std::fs::read(common::seal(d.path())).expect("pack");
+
+    let report = rebuild::run(d.path(), &RebuildOptions { dry_run: false });
+    let f = report
+        .findings
+        .iter()
+        .find(|f| f.kind == "pack-sealed-segment-skipped")
+        .expect("the skip is reported");
+    assert!(
+        f.message.contains("Re-seal"),
+        "the finding must name the remedy: {}",
+        f.message
+    );
+    assert!(
+        !common::pidx(d.path()).exists(),
+        "no legacy sidecar may be written for a pack-sealed segment"
+    );
+    assert_eq!(
+        std::fs::read(common::seal(d.path())).expect("pack"),
+        seal_before,
+        "the pack itself is untouched"
+    );
+    assert!(report.collection.is_empty(), "nothing was rebuilt");
+}

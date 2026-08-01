@@ -1,13 +1,19 @@
 //! `mess backup <dir> --to <dest> [--incremental]` — copy a consistent cut of
 //! a live store (doc 07 §2).
 //!
-//! The cut ([`compute_cut`]) is: every sealed segment whole + the active
-//! segment's committed prefix `[0, safe_offset)` + a `BACKUP_MANIFEST` written
-//! **last** (its presence proves completeness, doc 07 §4). A retention lease
+//! The cut ([`compute_cut`]) is: every sealed segment whole (with its sealed
+//! index — a `.seal` pack or the legacy `.pidx` family) + the active segment's
+//! committed prefix `[0, safe_offset)` + a `BACKUP_MANIFEST` written **last**
+//! (its presence proves completeness, doc 07 §4). A retention lease
 //! ([`crate::lease`]) is held for the copy so compaction cannot delete a
 //! sealed segment mid-run. Every file is copied temp + fsync + rename so a
 //! crashed backup leaves no half-file — only a missing manifest, which restore
 //! detects.
+//!
+//! What is in the cut and what is deliberately not is documented inline in
+//! [`compute_cut`]; the short version is that the cut carries the log and
+//! everything a footer *names*, and nothing that is merely derived
+//! acceleration.
 
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -45,6 +51,10 @@ pub struct BackupFileEntry {
     /// CRC32C over exactly those `len` bytes.
     pub crc32c:     u32,
     /// `sealed` | `active` | `sidecar` (bn-fj34 retired the `meta` role).
+    /// Every derived per-segment artifact travels under `sidecar`, whichever
+    /// shape it is: a consolidated `.seal` pack or a legacy `.pidx`/`.pcol`/
+    /// `.filter` (bn-1w4h keeps the role token stable so an existing manifest
+    /// consumer needs no change).
     pub role:       String,
     /// Bytes copied from the source (for the active segment, the cut
     /// `safe_offset`; for a whole file, equal to `len`).
@@ -76,6 +86,10 @@ pub struct CutFile {
     /// Bytes to copy (whole file, or the active prefix `safe_offset`).
     pub copied_len:     u64,
     /// `sealed` | `active` | `sidecar` (bn-fj34 retired the `meta` role).
+    /// Every derived per-segment artifact travels under `sidecar`, whichever
+    /// shape it is: a consolidated `.seal` pack or a legacy `.pidx`/`.pcol`/
+    /// `.filter` (bn-1w4h keeps the role token stable so an existing manifest
+    /// consumer needs no change).
     pub role:           &'static str,
     /// Content-stable (immutable) files can be skipped on an incremental run;
     /// the active prefix cannot.
@@ -165,8 +179,12 @@ pub fn compute_cut(dir: &Path) -> Cut {
             }
         }
 
-        // Sidecars (content-stable) travel with their segment when present.
+        // The segment's sealed index (content-stable) travels with it, in
+        // whichever shape it exists on disk — the consolidated `.seal` pack
+        // (bn-3of) or the legacy `.pidx`+`.pcol`+`.filter` family. See the
+        // policy note below on why the pack rides the cut.
         for (path, present) in [
+            (&seg.seal_path, seg.has_seal),
             (&seg.pidx_path, seg.has_pidx),
             (&seg.pcol_path, seg.has_pcol),
             (&seg.filter_path, seg.filter_path.exists()),
@@ -200,6 +218,34 @@ pub fn compute_cut(dir: &Path) -> Cut {
     // the leftover directory. A restored store folds `$registry` out of the
     // very segments this cut copies — the last non-rebuildable metadata
     // artifact is gone, so the cut is now the log and nothing else.
+
+    // bn-1w4h, deliberate INCLUSION: the consolidated `.seal` pack rides the
+    // cut, exactly as the `.pidx` family always has, and for a reason stronger
+    // than symmetry. A sealed index is derived-from-the-log and in that sense
+    // discardable — but bn-11g binds the segment FOOTER to the exact pack that
+    // sealed it (spec 01 §3.3.3), and the footer is inside the `.log` bytes the
+    // cut copies whole. Leave the pack behind and the restored store carries a
+    // footer naming a SealPack that does not exist: `mess verify` reports
+    // `seal-pack-missing` as an Error, `mess restore`'s own verify gate fails
+    // the restore, and the segment silently loses its cold tier. The `.pidx`
+    // family has no such binding, which is why its exclusion was never noticed;
+    // the pack's does, so the cut must be identity-complete, not merely
+    // data-complete.
+    //
+    // Two things under `sealed/` deliberately do NOT ride the cut:
+    //
+    // - `*.refuted` quarantine markers (bn-30u). They are evidence of a seal
+    //   the SOURCE store threw away, plus that store's durable re-seal trigger.
+    //   Copying one would import an anomaly the destination never had and
+    //   re-queue a seal for a segment the restore just wrote clean. An operator
+    //   investigating a refutation reads the source store, not a copy of it.
+    // - `.par` (bn-2za) and `.reg` (bn-26pp). Neither is in the cut today; the
+    //   `.reg` policy is bn-w5my's to settle and is left untouched here.
+    //   Restoring without them costs the restored store parity-repair
+    //   acceleration and a registry-delta fast path, never a committed byte —
+    //   both are recomputable from the `.log` bytes the cut carries — and
+    //   neither is named by a footer, so neither can produce the identity gap
+    //   the `.seal` exclusion did.
 
     // bn-3l8n, deliberate exclusion: the app snapshot sidecar
     // (`store::snapshot_pack_dir`) is NOT in the cut. It is discardable
