@@ -54,6 +54,7 @@ pub mod mock;
 pub mod pack_snapshot;
 pub mod registry;
 pub mod retry;
+pub mod sealed_candidate;
 pub mod snapshot;
 pub mod store;
 pub mod subscription;
@@ -89,6 +90,9 @@ pub use pack_snapshot::{
     PackBackendError, PackSnapshotBackend, SaveMode, Sidecar, SidecarOptions,
 };
 pub use retry::{DEFAULT_MAX_ATTEMPTS, RetryPolicy};
+pub use sealed_candidate::{
+    QUARANTINE_SUFFIX, Refutation, RefutationReason, SealedCandidateHealth,
+};
 pub use snapshot::{
     BlobPtr, Hash256, SnapshotPolicy, SnapshotRef, SnapshotStore,
     Snapshottable, StateCodecError, StoredSnapshot, interim_stream_id,

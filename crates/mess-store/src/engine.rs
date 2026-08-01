@@ -154,6 +154,7 @@ use crate::backend::{
     OwnedTypeLayout, RecordToAppend, StoredRecord, SubscribeBackend,
 };
 use crate::registry::{self, RegistryRecord};
+use crate::sealed_candidate::{self, RefutationReason, SealedCandidateHealth};
 use crate::version::Version;
 
 /// Category id stamped on every batch. The facade does not model categories,
@@ -1131,6 +1132,45 @@ struct Recovered {
     /// open (the bn-2ib gate observable,
     /// [`LogEngine::recover_payload_decodes`]).
     decodes:     u64,
+    /// bn-30u: every segment recovery **scanned** (so: every segment not
+    /// already served from a footer-verified sidecar) that carries a valid
+    /// header and at least one event, with the roll summary a fresh seal would
+    /// need — read straight off the scan that just proved those bytes durable.
+    ///
+    /// This is the *candidate* set, not the enqueue set:
+    /// [`open_with`](LogEngine::open_with) narrows it to the segments actually
+    /// owed a re-seal (a durable `*.refuted` quarantine marker, and no
+    /// footer-verified sidecar) and excludes the live head, which must never
+    /// be footer-finalized while it is still being appended to.
+    resealable:  Vec<SegmentSummary>,
+}
+
+/// A sealed-index candidate that parsed but is not yet admitted: the parsed
+/// index plus the **path it came from**, which the refutation path needs in
+/// order to quarantine it (bn-30u).
+struct PendingCandidate {
+    index: SealedSegmentRef,
+    /// The primary candidate file (`sealed/seg-<id>.pidx` or `…​.seal`).
+    path:  PathBuf,
+}
+
+/// Everything [`LogEngine::load_sealed`] hands back.
+struct LoadedSealed {
+    /// The cold tier, pre-loaded with every footer-verified sidecar.
+    store:       SealedStore,
+    /// Footer-verified segment ids — the ones recovery may trust-skip.
+    ids:         HashSet<u64>,
+    /// Parsed-but-unproven candidates, keyed by segment id; recovery either
+    /// confirms (installs) or refutes (quarantines) each one.
+    pending:     HashMap<u64, PendingCandidate>,
+    /// bn-30u: segment ids carrying a `*.refuted` quarantine marker from an
+    /// EARLIER open. The marker is the durable record that a refutation
+    /// happened, and it is what makes the re-seal survive a crash between the
+    /// quarantine and the enqueue.
+    quarantined: HashSet<u64>,
+    /// Candidates already refuted at load (they did not parse), and the
+    /// running observability record the recovery pass appends to.
+    health:      SealedCandidateHealth,
 }
 
 /// Recovery step 1's output (spec 04 §7.1), held until the `$registry` fold
@@ -2280,6 +2320,12 @@ struct Inner {
     /// trio ([`EngineOptions::seal_pack`]). The background roll-sealer
     /// captures the same flag directly in its `SealDriver`.
     seal_pack:            bool,
+    /// bn-30u: what this open learned about its sealed-index candidates —
+    /// which were refuted and why, whether each was quarantined, and which
+    /// segments were re-queued for sealing as a result. Fixed at open (the
+    /// classification runs once, before any reader exists) and read back via
+    /// [`LogEngine::sealed_candidate_health`].
+    candidate_health:     SealedCandidateHealth,
 }
 
 impl Drop for Inner {
@@ -2496,6 +2542,29 @@ pub struct EngineMetrics {
     /// or the store reopens — but an operator MUST be able to see it happened;
     /// see `mess_index::sealed::SealMetrics::record_seal_skipped`.
     pub seals_skipped: u64,
+    /// Sealed-index candidates this open refuted (bn-30u): a sidecar found on
+    /// disk that could not be admitted — it did not parse, it named a
+    /// different segment, its coverage was not durable, or its segment is
+    /// gone. Non-zero is not data loss (the raw log is authority and served
+    /// the segment throughout) but it IS a crash window or a sealer bug that
+    /// an operator should see. The reason per candidate is in
+    /// [`LogEngine::sealed_candidate_health`].
+    pub sealed_candidates_refuted: u64,
+    /// Refuted candidates successfully renamed out of the candidate namespace
+    /// (bn-30u). Equal to
+    /// [`sealed_candidates_refuted`](Self::sealed_candidates_refuted) in the
+    /// healthy case.
+    pub sealed_candidates_quarantined: u64,
+    /// Refuted candidates whose quarantine rename FAILED (bn-30u) — a
+    /// read-only or full filesystem. The store is still correct, but those
+    /// candidates will be re-evaluated at the next reopen: it has not
+    /// converged.
+    pub sealed_candidate_quarantine_failures: u64,
+    /// Rolled segments re-queued for sealing at this open (bn-30u) — the
+    /// *pending re-seal* set. Zero for a healthy store; non-zero means the
+    /// background sealer is working through segments that lost (or never
+    /// had) an admissible sidecar.
+    pub sealed_reseals_enqueued: u64,
 }
 
 /// Monotonic in-process counters for the append-input path selected by
@@ -2617,8 +2686,13 @@ impl LogEngine {
         // would silently fall back to hot replay instead of the sealed tier.
         // The returned `sealed_ids` are the segments already served cold, so
         // recovery does not re-seed the hot index with their batches (bn-1vu).
-        let (sealed, sealed_ids, pending_sidecars) =
-            Self::load_sealed(dir, &rt.fs());
+        let LoadedSealed {
+            store: sealed,
+            ids: sealed_ids,
+            pending: pending_sidecars,
+            quarantined: mut owed_reseal,
+            health: mut candidate_health,
+        } = Self::load_sealed(dir, &rt.fs());
         let sealed = Arc::new(sealed);
 
         // Recovery on open (F6 + bn-1vu + bn-2ib): reload the interners from
@@ -2635,10 +2709,17 @@ impl LogEngine {
             &sealed,
             &sealed_ids,
             &pending_sidecars,
+            &mut candidate_health,
             opts.chain,
         )?;
-        let Recovered { book, plan, chain_heads, watermark, decodes } =
-            recovered;
+        let Recovered {
+            book,
+            plan,
+            chain_heads,
+            watermark,
+            decodes,
+            resealable,
+        } = recovered;
         // The active segment is the highest-id `seg-*.log`; on a fresh store it
         // is `ACTIVE_SEGMENT_ID`. A roll numbers the next one `+1` from here.
         let active_seg_id = match &plan {
@@ -2686,6 +2767,14 @@ impl LogEngine {
         // channel; the seal thread turns it into durable sidecars + a footer
         // off the append path.
         let (roll_tx, roll_rx) = mpsc::channel::<SegmentSummary>();
+        // bn-30u: the re-seal enqueue RIDES this same channel — a re-seal of a
+        // rolled segment is byte-for-byte the job the sealer already does for
+        // a live roll (re-read the durable prefix, write the sidecars,
+        // finalize the footer, install), so there is no second scheduler, no
+        // second code path, and no second set of failure semantics. The clone
+        // is dropped as soon as the backlog is queued so the sealer thread
+        // still exits when the committer drops its `Roller`.
+        let reseal_tx = roll_tx.clone();
         let dir_for_paths = dir.to_path_buf();
         let roller =
             Roller::new(move |id| segment_path(&dir_for_paths, id), roll_tx);
@@ -2759,6 +2848,57 @@ impl LogEngine {
                 })
                 .map_err(|e| EngineError::Open(format!("spawn sealer: {e}")))?
         };
+
+        // bn-30u: re-queue a fresh seal for every rolled segment that is OWED
+        // one — that is, one whose candidate was refuted (now, or by an
+        // earlier open that left the `*.refuted` quarantine marker) and that
+        // is not already being served from a footer-verified sidecar.
+        //
+        // The trigger is the DURABLE quarantine marker, not the in-memory fact
+        // that this open refuted something. That is what makes the crash
+        // windows converge: the quarantine erases the candidate, so a trigger
+        // keyed on "a candidate was refuted this open" would strand the
+        // segment forever if the process died between the rename and the
+        // enqueue. Keyed on the marker, every one of these states makes
+        // progress and none oscillates:
+        //
+        //   crash before the quarantine → same candidate, refuted again
+        //   crash after the quarantine  → marker present, re-seal enqueued
+        //   crash after the new sidecar, before the footer
+        //                               → candidate confirmed by the scan and
+        //                                 served cold, and (still not
+        //                                 footer-verified) enqueued once more
+        //                                 so the footer finally lands
+        //   after the footer            → admitted; the marker is inert
+        //
+        // The marker deliberately outlives the repair: it is the forensic
+        // evidence quarantine exists to preserve, and once the segment is
+        // admitted it costs one `HashSet` entry at open and nothing else.
+        //
+        // The live head is excluded unconditionally: it is still being
+        // appended to, and the sealer's finalize step writes the segment
+        // footer. A refuted candidate over the head (from `seal_active`) is
+        // still quarantined; the next roll seals that segment normally.
+        //
+        // At most one job per segment per open, so the queue is bounded by the
+        // segment count and cannot grow across reopens.
+        owed_reseal
+            .extend(candidate_health.refutations.iter().map(|r| r.segment_id));
+        let mut pending_reseal = Vec::new();
+        for summary in resealable {
+            let seg_id = summary.segment_id;
+            if seg_id == active_seg_id
+                || sealed_ids.contains(&seg_id)
+                || !owed_reseal.contains(&seg_id)
+            {
+                continue;
+            }
+            if reseal_tx.send(summary).is_ok() {
+                pending_reseal.push(seg_id);
+            }
+        }
+        drop(reseal_tx);
+        candidate_health.pending_reseal = pending_reseal;
 
         let rt_fs = rt.fs();
         let reader = Arc::new(BlockReader::new(
@@ -2846,6 +2986,7 @@ impl LogEngine {
                 seal_pack: opts.seal_pack,
                 shutdown_deadline,
                 shutdown_seal_budget: opts.shutdown_seal_budget,
+                candidate_health,
             }),
         })
     }
@@ -2895,7 +3036,8 @@ impl LogEngine {
         active: &ActiveIndex,
         sealed: &SealedStore,
         sealed_ids: &HashSet<u64>,
-        pending_sidecars: &HashMap<u64, SealedSegmentRef>,
+        pending_sidecars: &HashMap<u64, PendingCandidate>,
+        health: &mut SealedCandidateHealth,
         chain: bool,
     ) -> Result<Recovered, EngineError> {
         // `bn-2di` — the interner is no longer loaded up front.
@@ -2924,18 +3066,31 @@ impl LogEngine {
         // Step-1 output, held until the fold has run (step 2).
         let mut scan = ScanOutput::default();
 
+        // bn-30u: pending candidates this pass has resolved (installed or
+        // refuted). Whatever is left over at the end named a segment recovery
+        // never saw — an ORPHAN — and is refuted too, so a sidecar whose
+        // `.log` was deleted or never headed cannot sit in the candidate
+        // namespace being re-parsed forever.
+        let mut resolved: HashSet<u64> = HashSet::new();
+        // bn-30u: the roll summaries a fresh seal of each scanned segment
+        // would need (see `Recovered::resealable`).
+        let mut resealable: Vec<SegmentSummary> = Vec::new();
+
         // Enumerate the segment chain in ascending id order.
         let segment_ids = enumerate_segment_ids(dir);
         if segment_ids.is_empty() {
             // A fresh store: no log, so nothing to fold and nothing to name.
             // It is `LogDerived` from birth — the very first append will write
-            // its `$registry` batch.
+            // its `$registry` batch. Any candidate under `sealed/` is an
+            // orphan by construction.
+            Self::refute_orphans(health, pending_sidecars, &resolved);
             return Ok(Recovered {
                 book: Book::new(),
                 plan: ResumePlan::Fresh,
                 chain_heads,
                 watermark: 0,
                 decodes,
+                resealable,
             });
         }
 
@@ -3076,24 +3231,62 @@ impl LogEngine {
             // batches past it must stay hot-served).
             let sealed_end = if sealed_ids.contains(&seg_id) {
                 // Footer-verified at load (F2): already installed.
+                resolved.insert(seg_id);
                 sealed.get(seg_id).map(|s| s.base_pos() + s.event_count())
             } else if let Some(cand) = pending_sidecars.get(&seg_id) {
                 // A footerless sidecar (an on-demand `seal_active` of the
                 // live head, or a roll-seal whose footer fsync a crash
                 // preceded — review F2): install it only now that THIS scan
                 // has proven the durable committed prefix reaches its
-                // coverage end. A refuted candidate is not installed — the
-                // segment is served from the log, losing nothing.
-                let end = cand.base_pos() + cand.event_count();
-                if header.base_pos == cand.base_pos() && rec.next_pos >= end {
-                    sealed.install(cand.clone());
-                    Some(end)
-                } else {
+                // coverage end.
+                //
+                // bn-30u: a candidate this scan REFUTES is not merely left
+                // uninstalled — it is quarantined, so the identical judgement
+                // is not re-run on every future open, and its segment is
+                // re-queued for a fresh seal below. Either way the segment is
+                // served from the raw log meanwhile, losing nothing.
+                resolved.insert(seg_id);
+                let end = cand.index.base_pos() + cand.index.event_count();
+                if header.base_pos != cand.index.base_pos() {
+                    health.refute(
+                        seg_id,
+                        RefutationReason::IdentityMismatch,
+                        &cand.path,
+                    );
                     None
+                } else if rec.next_pos < end {
+                    health.refute(
+                        seg_id,
+                        RefutationReason::CoverageUnproven,
+                        &cand.path,
+                    );
+                    None
+                } else {
+                    sealed.install(Arc::clone(&cand.index));
+                    Some(end)
                 }
             } else {
                 None
             };
+
+            // bn-30u: this segment was scanned, which means it is NOT being
+            // served from a footer-verified sidecar. Record what a fresh seal
+            // of it would need; `open_with` drops the live head and the
+            // already-admitted ids and enqueues the rest. `header.segment_id`
+            // is required to agree with the file name — the sealer addresses
+            // the segment by summary id, so a disagreeing header must not
+            // steer it at another file.
+            if header.segment_id == seg_id && rec.next_pos > header.base_pos {
+                resealable.push(SegmentSummary {
+                    segment_id:  seg_id,
+                    epoch:       header.epoch,
+                    base_pos:    header.base_pos,
+                    end_pos:     rec.next_pos,
+                    batch_count: rec.accepted.len() as u64,
+                    event_count: rec.next_pos - header.base_pos,
+                    content_len: rec.safe_offset,
+                });
+            }
 
             let mut order: Vec<&AcceptedBatch> = rec.accepted.iter().collect();
             order.sort_by_key(|b| b.first_global_pos);
@@ -3219,6 +3412,11 @@ impl LogEngine {
 
         active.apply_committed(watermark, &hot_entries);
 
+        // bn-30u: any pending candidate this pass never reached names a
+        // segment recovery could not see at all — the `.log` is gone, or it
+        // carries no valid header, so nothing will ever confirm the candidate.
+        Self::refute_orphans(health, pending_sidecars, &resolved);
+
         // Steps 2 and 3 (spec 04 §7.1): fold `$registry`, then — and only then
         // — resolve names.
         let book = Self::finish_recovery(&fs, dir, scan)?;
@@ -3227,7 +3425,35 @@ impl LogEngine {
             Some(info) => ResumePlan::Resume(info),
             None => ResumePlan::Fresh,
         };
-        Ok(Recovered { book, plan, chain_heads, watermark, decodes })
+        Ok(Recovered {
+            book,
+            plan,
+            chain_heads,
+            watermark,
+            decodes,
+            resealable,
+        })
+    }
+
+    /// Refute every pending candidate the recovery pass never resolved
+    /// (bn-30u): its segment has no `.log`, or one with no valid header, so no
+    /// future scan can ever confirm it. Deterministic order (ascending segment
+    /// id) so the loud log lines and the health record are reproducible.
+    fn refute_orphans(
+        health: &mut SealedCandidateHealth,
+        pending: &HashMap<u64, PendingCandidate>,
+        resolved: &HashSet<u64>,
+    ) {
+        let mut orphans: Vec<u64> = pending
+            .keys()
+            .copied()
+            .filter(|id| !resolved.contains(id))
+            .collect();
+        orphans.sort_unstable();
+        for seg_id in orphans {
+            let cand = &pending[&seg_id];
+            health.refute(seg_id, RefutationReason::Orphan, &cand.path);
+        }
     }
 
     /// Recovery steps 2 and 3 (spec 04 §7.1), `bn-2di`: materialize `$registry`
@@ -3509,23 +3735,36 @@ impl LogEngine {
     /// head, which never has a footer) is returned as a **pending candidate**
     /// instead: [`recover`](LogEngine::recover) scans those segments anyway
     /// and installs a candidate only after the scan proves the durable
-    /// committed prefix reaches the sidecar's coverage end. A candidate the
-    /// scan refutes is simply not installed — the segment is served from the
-    /// log, losing nothing.
+    /// committed prefix reaches the sidecar's coverage end.
     ///
-    /// Returns `(store, footer_verified_ids, pending)`: recovery trust-skips
-    /// only the footer-verified ids and scan-verifies the pending ones.
-    fn load_sealed(
-        dir: &Path,
-        fs: &EngineFs,
-    ) -> (SealedStore, HashSet<u64>, HashMap<u64, SealedSegmentRef>) {
+    /// **Refuted candidates (bn-30u).** A candidate that does not parse at all
+    /// is refuted right here and
+    /// [quarantined](crate::sealed_candidate::quarantine) — renamed out of the
+    /// candidate namespace — so it is never re-read on a later open. Before
+    /// bn-30u it stayed on disk and was re-parsed and re-refuted on *every*
+    /// reopen while its segment was never re-queued for sealing. The segment
+    /// is served from the raw log either way (the log is authority and this
+    /// path loses nothing); what changes is that the store now converges back
+    /// to a sealed segment instead of degrading permanently. See
+    /// [`crate::sealed_candidate`] for the whole lifecycle.
+    ///
+    /// Returns [`LoadedSealed`]: recovery trust-skips only the footer-verified
+    /// ids and scan-verifies the pending ones.
+    fn load_sealed(dir: &Path, fs: &EngineFs) -> LoadedSealed {
         let store = SealedStore::new();
         let mut ids = HashSet::new();
-        let mut pending: HashMap<u64, SealedSegmentRef> = HashMap::new();
+        let mut pending: HashMap<u64, PendingCandidate> = HashMap::new();
+        let mut health = SealedCandidateHealth::default();
         let sealed_dir = dir.join("sealed");
         let Ok(entries) = std::fs::read_dir(&sealed_dir) else {
             // No sealed directory yet: nothing has been sealed.
-            return (store, ids, pending);
+            return LoadedSealed {
+                store,
+                ids,
+                pending,
+                quarantined: HashSet::new(),
+                health,
+            };
         };
 
         // bn-3of DUAL-READ. A segment may have a consolidated `.seal` pack
@@ -3533,45 +3772,89 @@ impl LogEngine {
         // during a format migration — both. The `.seal` is preferred: parse
         // every `.seal` first and remember which segment ids it covers, then
         // fold in `.pidx`es only for segments the pack path did not.
-        let mut opened: HashMap<u64, SealedSegmentRef> = HashMap::new();
+        let mut opened: HashMap<u64, PendingCandidate> = HashMap::new();
         let mut from_pack: HashSet<u64> = HashSet::new();
-        let mut sidecars: Vec<(u64, std::path::PathBuf)> = Vec::new();
+        let mut packs: Vec<std::path::PathBuf> = Vec::new();
+        let mut sidecars: Vec<std::path::PathBuf> = Vec::new();
+        let mut quarantined: HashSet<u64> = HashSet::new();
+        // Collect the whole directory listing BEFORE touching anything.
+        // Refuting a candidate renames it, and `readdir` over a directory
+        // being mutated may skip or repeat entries — so the classification
+        // (which renames) may not run inside the enumeration.
         for entry in entries.flatten() {
             let path = entry.path();
             match path.extension().and_then(|e| e.to_str()) {
-                Some("seal") => {
-                    // A complete `.seal` is crash-atomic (temp → fsync →
-                    // rename); a torn `*.seal.tmp` husk is a different
-                    // extension and ignored here. A pack that fails to parse
-                    // (whole-pack hash / mandatory-section CRC) is skipped —
-                    // the log stays authority and the segment is served from
-                    // the log until re-sealed.
-                    if let Ok(index) = SealedSegmentIndex::open_pack(&path) {
-                        let seg_id = index.segment_id();
-                        from_pack.insert(seg_id);
-                        opened.insert(seg_id, Arc::new(index));
+                Some("seal") => packs.push(path),
+                Some("pidx") => sidecars.push(path),
+                // bn-30u: a quarantine marker left by an earlier open. Its
+                // segment lost a candidate to refutation and — unless it has
+                // since been re-sealed and admitted — is owed a fresh seal.
+                // This is the DURABLE re-seal intent: it is written before the
+                // enqueue, so a crash in between still converges.
+                Some("refuted") => {
+                    if let Some(id) =
+                        sealed_candidate::segment_id_from_name(&path)
+                    {
+                        quarantined.insert(id);
                     }
                 }
-                Some("pidx") => sidecars.push((0, path)),
                 // `.pidx.tmp`/`.seal.tmp` husks, `.pcol`/`.filter` siblings
                 // (re-attached by `open`), `.par`, and anything else.
                 _ => {}
             }
         }
-        for (_, path) in sidecars {
-            let Ok(index) = SealedSegmentIndex::open(&path) else {
-                continue;
+        for path in packs {
+            // A complete `.seal` is crash-atomic (temp → fsync → rename); a
+            // torn `*.seal.tmp` husk is a different extension and was ignored
+            // above. A pack that fails to parse (whole-pack hash /
+            // mandatory-section CRC) is REFUTED — the log stays authority and
+            // the segment is served from the log — and quarantined so it is
+            // not re-parsed on every later open (bn-30u).
+            match SealedSegmentIndex::open_pack(&path) {
+                Ok(index) => {
+                    let seg_id = index.segment_id();
+                    from_pack.insert(seg_id);
+                    opened.insert(
+                        seg_id,
+                        PendingCandidate { index: Arc::new(index), path },
+                    );
+                }
+                Err(_) => Self::refute_unparsable(&mut health, &path),
+            }
+        }
+        for path in sidecars {
+            let index = match SealedSegmentIndex::open(&path) {
+                Ok(index) => index,
+                Err(_) => {
+                    // bn-30u: a `.pidx` that fails its CRC / is truncated is
+                    // refuted and quarantined, exactly like an unparsable
+                    // pack. Its derived `.filter`/`.pcol`/`.reg` siblings move
+                    // with it — they were built from the very index being
+                    // thrown away, and a stale `.filter` re-attached to a
+                    // LATER re-seal of the same segment could wrongly exclude
+                    // a stream.
+                    Self::refute_unparsable(&mut health, &path);
+                    continue;
+                }
             };
             let seg_id = index.segment_id();
-            // A `.seal` for this segment wins over its legacy sidecars.
+            // A `.seal` for this segment wins over its legacy sidecars. The
+            // `.pidx` is left entirely unclassified in that case (not opened
+            // for judgement, so never refuted): it is inert while the pack
+            // serves, and becomes the primary candidate only if the pack is
+            // ever refuted and quarantined — which makes that a two-open
+            // convergence, not a loop.
             if from_pack.contains(&seg_id) {
                 continue;
             }
-            opened.insert(seg_id, Arc::new(index));
+            opened.insert(
+                seg_id,
+                PendingCandidate { index: Arc::new(index), path },
+            );
         }
 
-        for (seg_id, index) in opened {
-            let coverage_end = index.base_pos() + index.event_count();
+        for (seg_id, cand) in opened {
+            let coverage_end = cand.index.base_pos() + cand.index.event_count();
             // F2 (unchanged trust semantics): only a valid, cross-checking
             // footer proves the covered bytes are durable — install trust-free;
             // everything else is a pending candidate the recovery scan must
@@ -3581,17 +3864,28 @@ impl LogEngine {
                 .flatten()
                 .is_some_and(|t| {
                     t.segment_id == seg_id
-                        && t.base_pos == index.base_pos()
+                        && t.base_pos == cand.index.base_pos()
                         && t.end_pos == coverage_end
                 });
             if footer_ok {
                 ids.insert(seg_id);
-                store.install(index);
+                store.install(cand.index);
             } else {
-                pending.insert(seg_id, index);
+                pending.insert(seg_id, cand);
             }
         }
-        (store, ids, pending)
+        LoadedSealed { store, ids, pending, quarantined, health }
+    }
+
+    /// Refute a candidate whose bytes did not parse (bn-30u). The segment id
+    /// comes from the file name by structural parse — the header is exactly
+    /// what could not be trusted — falling back to `u64::MAX` for a name that
+    /// does not follow the scheme (an operator-dropped file), which is only
+    /// ever used to label the log line.
+    fn refute_unparsable(health: &mut SealedCandidateHealth, path: &Path) {
+        let seg_id =
+            sealed_candidate::segment_id_from_name(path).unwrap_or(u64::MAX);
+        health.refute(seg_id, RefutationReason::Unparsable, path);
     }
 
     /// Test/diagnostic: total canonical v3 events committed and published —
@@ -3680,7 +3974,33 @@ impl LogEngine {
             seal_duration: seal.seal_duration,
             seals: seal.seals,
             seals_skipped: seal.seals_skipped,
+            sealed_candidates_refuted: self.inner.candidate_health.refuted(),
+            sealed_candidates_quarantined: self
+                .inner
+                .candidate_health
+                .quarantined(),
+            sealed_candidate_quarantine_failures: self
+                .inner
+                .candidate_health
+                .quarantine_fails,
+            sealed_reseals_enqueued: self
+                .inner
+                .candidate_health
+                .reseals_enqueued(),
         }
+    }
+
+    /// What this open learned about its sealed-index candidates (bn-30u): the
+    /// per-candidate refutation reason, whether each was quarantined, and the
+    /// segments re-queued for a fresh seal as a result.
+    ///
+    /// The counters are also on the `Copy` [`EngineMetrics`]; this is the
+    /// surface that carries the *reason strings* and the pending-re-seal
+    /// segment ids. Fixed for the lifetime of the engine handle — candidate
+    /// classification happens exactly once, during open.
+    #[must_use]
+    pub fn sealed_candidate_health(&self) -> &SealedCandidateHealth {
+        &self.inner.candidate_health
     }
 
     /// Ownership-transfer and defensive-copy counters for append submissions
