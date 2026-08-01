@@ -1038,6 +1038,19 @@ impl SealedSegmentIndex {
             && self.event_types.as_ref().is_none_or(|c| c.is_resident())
     }
 
+    /// How many bytes of the artifact this index holds in memory to resolve
+    /// pointers from — the size observable [`Self::sections_resident`] cannot
+    /// express (bn-2t2e).
+    ///
+    /// The whole image for the eager paths
+    /// ([`Self::from_bytes`]/[`Self::from_pack`]/[`Self::open_pack_eager`]);
+    /// just the two pointer sections (`POINTER_BLOCKS` + `POINTER_SKIPS`, sized
+    /// by the segment's stream/batch count, not its payload bytes) for a pack
+    /// opened by [`Self::open_pack`]. Excludes whatever the lazily attached
+    /// sections have paged in behind their file handle — that is
+    /// [`Self::sections_resident`]'s territory — and the directory map.
+    pub fn resident_bytes(&self) -> usize { self.bytes.len() }
+
     /// Read and parse a sidecar from `path`, opportunistically attaching the
     /// sibling `.filter` file ([`filter_path_for`]) if one exists, parses,
     /// and cross-checks by `segment_id` (bn-1i7). A missing, corrupt, or

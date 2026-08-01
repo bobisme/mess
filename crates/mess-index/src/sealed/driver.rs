@@ -567,11 +567,36 @@ impl SealDriver {
     ///    pack embedding preserved them);
     /// 3. durably write it (temp → `fdatasync` → rename → directory `fsync`,
     ///    via [`write_durable_metered`]);
-    /// 4. finalize the segment footer (caller closure), handing it the pack's
+    /// 4. re-open the now-durable file **lazily**
+    ///    ([`SealedSegmentIndex::open_pack`]) — the index readers will hold
+    ///    (bn-2t2e), so an in-process seal costs the same residency as a reopen
+    ///    instead of pinning the whole pack;
+    /// 5. finalize the segment footer (caller closure), handing it the pack's
     ///    [`PackIdentity`] so the footer **names** the pack it accepted;
-    /// 5. install then evict — the same gapless handoff as the sidecar path.
+    /// 6. install then evict — the same gapless handoff as the sidecar path.
     ///
     /// A verify mismatch aborts before any publish and writes nothing.
+    ///
+    /// # Why the installed index is the re-opened one (bn-2t2e)
+    ///
+    /// The verified parse-back of step 2 is a *verification* artifact: it holds
+    /// the entire pack image, and its payload columns a second time. Installing
+    /// it kept every byte a segment ever sealed resident for the life of that
+    /// segment — the same whole-pack residency bn-dbz removed from the reopen
+    /// path, so an in-process seal was strictly worse than a restart. Step 4
+    /// therefore installs what `open_pack` gives reopen: pointer sections
+    /// resident, payload columns and event-type ids file-backed. The verified
+    /// image is dropped as soon as the re-open agrees with it.
+    ///
+    /// The re-open is not a second source of truth. It re-derives the identity
+    /// from the durable bytes and must produce the one step 2 verified, so the
+    /// name step 5 writes into the footer is one the file on disk is now
+    /// observed to yield — a check trunk did not make. If the re-open fails
+    /// (fd pressure) or disagrees, the seal proceeds with the verified
+    /// in-memory image exactly as before: the bytes are verified and
+    /// durable either way, and a genuine disagreement is caught again — and
+    /// converged — by the reopen path's own identity check (bn-11g reader
+    /// rule 3, bn-30u re-seal).
     ///
     /// # Why the footer may name the pack (bn-11g, spec 01 §3.3.3 writer rule 2)
     ///
@@ -580,14 +605,15 @@ impl SealDriver {
     /// over header + directory was recomputed and verified there — and step 3
     /// has already run its `write_durable_metered` to completion: temp file
     /// written, `fsync`ed, renamed onto the final name, parent directory
-    /// `fsync`ed. So by the time step 4 writes a footer naming that identity,
-    /// a pack hashing to it is complete and durable on disk. The two crash
-    /// windows both fail safe:
+    /// `fsync`ed. So by the time step 5 writes a footer naming that identity,
+    /// a pack hashing to it is complete and durable on disk. (Step 4 only
+    /// reads that file back; it moves nothing, and cannot change which bytes
+    /// the name refers to.) The two crash windows both fail safe:
     ///
-    /// - crash between 3 and 4 → a durable pack, no footer naming it. The
+    /// - crash between 3 and 5 → a durable pack, no footer naming it. The
     ///   segment reopens footerless, its candidate is scan-confirmed exactly as
     ///   before, and the segment is re-queued so the footer lands (bn-30u).
-    /// - crash during 4 → a torn footer fails `footer_crc`, so §8.3 treats the
+    /// - crash during 5 → a torn footer fails `footer_crc`, so §8.3 treats the
     ///   segment as unsealed and it is fully scanned. Same as above.
     ///
     /// What cannot happen is the inverse — a footer naming a pack that is
@@ -643,16 +669,15 @@ impl SealDriver {
         });
 
         // Parse the pack back and VERIFY it against the input before publishing
-        // (design §11.3 step 2). The reader owns these exact bytes afterward
-        // without a re-read.
-        let index = SealedSegmentIndex::from_pack(bytes.clone())?;
-        Self::verify_pack(&index, &input)?;
+        // (design §11.3 step 2). Nothing is written until this succeeds.
+        let verified = SealedSegmentIndex::from_pack(bytes.clone())?;
+        Self::verify_pack(&verified, &input)?;
 
         // The identity of the pack we are about to install: the trailer hash
         // `from_pack` just recomputed over these exact bytes (bn-11g). Taken
         // from the verified parse-back, never from the buffer, so it cannot
         // name anything the reader would not also derive.
-        let identity = index.pack_identity();
+        let identity = verified.pack_identity();
         debug_assert!(
             identity.is_some(),
             "bn-11g: a pack-path index must carry an identity to name"
@@ -663,6 +688,33 @@ impl SealDriver {
         let path = self.seal_pack_path(segment_id);
         write_durable_metered(&path, &bytes, self.metrics.as_deref())
             .map_err(SealError::Write)?;
+        drop(bytes);
+
+        // bn-2t2e: install the pack the way REOPEN installs it — lazily, from
+        // the file that the line above just made durable. The verified image
+        // proved the bytes; keeping it as the installed index would then hold
+        // the whole pack resident (plus a second copy of its payload columns)
+        // for as long as the segment stays sealed, which is precisely the
+        // residency bn-dbz removed from `open_pack`. A long-running writer paid
+        // it per sealed segment.
+        //
+        // `open_pack` re-derives the identity from the durable file — a blake3
+        // over the header + directory it reads back, plus the mandatory
+        // sections' committed CRCs — so requiring it to equal `identity` makes
+        // the footer's name one that the durable bytes are now OBSERVED to
+        // produce, not merely one the in-memory buffer did. A re-open that
+        // fails or disagrees is not a reason to fail a seal whose bytes are
+        // verified and durable: fall back to the in-memory image, i.e. exactly
+        // the pre-bn-2t2e behaviour, and let the reopen path's own identity
+        // check refute + re-seal the segment if the disagreement is real
+        // (bn-30u).
+        let index = match SealedSegmentIndex::open_pack(&path) {
+            Ok(lazy) if lazy.pack_identity() == identity => {
+                drop(verified);
+                lazy
+            }
+            _ => verified,
+        };
 
         // Finalize the footer (mess-log's single seal fsync), naming the
         // now-durable pack. This footer IS the accepted installation record.
@@ -980,6 +1032,143 @@ mod tests {
             reopened.reassemble_payload(2, &NoDicts).unwrap().as_deref(),
             Some(payloads[2].as_slice())
         );
+    }
+
+    /// bn-2t2e: a segment sealed IN-PROCESS installs its pack the way reopen
+    /// installs it — lazily — so it does not retain pack-sized bytes. Before
+    /// this, `seal_consolidated` installed the eager verification parse-back,
+    /// and a long-running writer kept every byte it ever sealed resident (plus
+    /// a second copy of each segment's payload columns): strictly worse than
+    /// restarting the process, once bn-dbz made the reopen path lazy.
+    ///
+    /// The residency claim is made against the two observables bn-dbz's proofs
+    /// use — [`SealedSegmentIndex::sections_resident`] per section, and
+    /// [`SealedSegmentIndex::resident_bytes`] for the eagerly held image —
+    /// pinned to `open_pack_eager` as the "pack-sized" reference so the
+    /// assertion cannot silently become vacuous.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn seal_consolidated_installs_the_pack_lazily() {
+        use crate::sealed::payload::NoDicts;
+
+        let dir = mess_testkit::sweeping_temp_dir("idx-driver-seal-pack-lazy");
+        let store = Arc::new(SealedStore::new());
+        let driver = SealDriver::new(store.clone(), dir.path()).with_pack(true);
+
+        // Payload-heavy segment — 2048 events of 512 poorly-compressible bytes
+        // across 8 batches — so "pack-sized" and "pointer-sized" are orders of
+        // magnitude apart and a whole-pack retention cannot hide in the noise.
+        const EVENTS: u64 = 2048;
+        const BATCHES: u64 = 8;
+        const PER: u64 = EVENTS / BATCHES;
+        let payloads: Vec<Vec<u8>> = (0..EVENTS)
+            .map(|i| {
+                // A cheap xorshift fill: real payloads the columnar codec
+                // cannot shrink to nothing.
+                let mut s = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+                (0..512u32)
+                    .map(|_| {
+                        s ^= s << 13;
+                        s ^= s >> 7;
+                        s ^= s << 17;
+                        (s >> 24) as u8
+                    })
+                    .collect()
+            })
+            .collect();
+        let type_ids: Vec<u32> =
+            (0..EVENTS).map(|i| (i % 3) as u32 + 1).collect();
+        let batches: Vec<SealBatch> = (0..BATCHES)
+            .map(|b| SealBatch {
+                first_version:    b * PER,
+                frame_count:      PER as u32,
+                first_global_pos: b * PER,
+                offset:           4096 + b * 8192,
+            })
+            .collect();
+        let input = SealInput {
+            segment_id:     9,
+            base_pos:       0,
+            streams:        vec![SealStream { stream_id: 10, batches }],
+            payloads:       Some(payloads.clone()),
+            event_type_ids: Some(type_ids.clone()),
+        };
+
+        // Capture the identity the footer was told to name.
+        let named: Arc<Mutex<Option<Option<PackIdentity>>>> =
+            Arc::new(Mutex::new(None));
+        let n = named.clone();
+        let idx = driver
+            .seal(input, move |id| {
+                *n.lock().unwrap() = Some(id);
+                Ok(())
+            })
+            .unwrap();
+
+        let path = driver.seal_pack_path(9);
+        let pack_len = std::fs::metadata(&path).unwrap().len();
+        assert!(pack_len > 512 * 1024, "payload-heavy pack, got {pack_len} B");
+
+        // What "pack-sized" means, measured rather than assumed: the eager read
+        // of the same file holds the whole image and every section in memory.
+        let eager = SealedSegmentIndex::open_pack_eager(&path).unwrap();
+        assert!(
+            eager.sections_resident(),
+            "the eager path is the resident one"
+        );
+        assert_eq!(eager.resident_bytes() as u64, pack_len);
+
+        // The just-sealed index is NOT that. Its payload / event-type sections
+        // are file-backed, and the bytes it holds are the pointer sections
+        // only — the same residency a reopen of this very file pays.
+        assert!(
+            !idx.sections_resident(),
+            "a just-sealed pack must attach its sections lazily"
+        );
+        let reopened = SealedSegmentIndex::open_pack(&path).unwrap();
+        assert_eq!(
+            idx.resident_bytes(),
+            reopened.resident_bytes(),
+            "an in-process seal must retain exactly what a reopen retains"
+        );
+        assert!(
+            idx.resident_bytes() as u64 * 20 < pack_len,
+            "retained {} B of a {pack_len} B pack",
+            idx.resident_bytes()
+        );
+
+        // And it is the index readers actually get.
+        let installed = store.get(9).unwrap();
+        assert!(Arc::ptr_eq(&installed, &idx), "installed the lazy index");
+
+        // Identity: still the one derived from the VERIFIED parse-back, still
+        // what the footer was handed, and the durable file re-derives it.
+        let named = named.lock().unwrap().expect("finalize ran");
+        assert!(named.is_some(), "the footer was handed an identity to name");
+        assert_eq!(idx.pack_identity(), named, "installed index carries it");
+        assert_eq!(
+            reopened.pack_identity(),
+            named,
+            "the durable file yields it"
+        );
+        assert_eq!(eager.pack_identity(), named);
+
+        // Laziness is not a read regression: pointers, type ids and payloads
+        // all still answer exactly.
+        for b in 0..BATCHES {
+            assert_eq!(
+                idx.resolve(10, b * PER + 3).unwrap().unwrap().offset,
+                4096 + b * 8192
+            );
+        }
+        assert_eq!(idx.event_type_ids_range(0, EVENTS), Some(type_ids));
+        for i in (0..EVENTS).step_by(97) {
+            assert_eq!(
+                idx.reassemble_payload(i, &NoDicts).unwrap().as_deref(),
+                Some(payloads[i as usize].as_slice()),
+                "payload {i} from the file-backed columns"
+            );
+        }
     }
 
     #[test]
