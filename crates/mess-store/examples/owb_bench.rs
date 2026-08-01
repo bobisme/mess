@@ -95,9 +95,11 @@ fn msgpack_payload(i: u64, bytes: usize) -> Vec<u8> {
 
 fn stream_name(s: u64) -> String { format!("acct-{s:06}") }
 
-/// Spike I (bn-3of): `EngineOptions::seal_pack` is OFF by default. Set
-/// `OWB_SEAL_PACK=1` to seed/reopen the SAME corpus shape through the
-/// consolidated `.seal` pack instead of the `.pidx`/`.filter`/`.pcol` sidecar
+/// Spike I (bn-3of): which sealed shape this run seeds/reopens. The engine's
+/// own `EngineOptions::seal_pack` is ON by default since bn-ccx1, but this
+/// example pins the flag explicitly in BOTH arms so a measurement never
+/// depends on the current default: `OWB_SEAL_PACK=1` selects the consolidated
+/// `.seal` pack, anything else the legacy `.pidx`/`.filter`/`.pcol` sidecar
 /// trio, so Spike J can measure reopen wall + peak RSS both ways with one
 /// binary (bn-2gu).
 fn seal_pack() -> bool {

@@ -2436,12 +2436,29 @@ pub struct EngineOptions {
     /// --repair` can reconstruct latent-sector / bit-rot damage offline.
     pub parity:                     mess_index::sealed::parity::ParityConfig,
     /// bn-3of (Spike I): emit ONE consolidated SealPack (`.seal`) per sealed
-    /// segment instead of the `.pidx`/`.filter`/`.pcol` sidecar trio. **Off by
-    /// default** — the sealer writes the legacy sidecars and reopen dual-reads
-    /// (a `.seal` is preferred when present, else the sidecars). When `true`,
-    /// the background roll-sealer and [`seal_active`](LogEngine::seal_active)
-    /// both write a single `.seal` per segment (install protocol: build →
-    /// verify vs raw → fdatasync → rename → dir fsync → footer → publish).
+    /// segment instead of the `.pidx`/`.filter`/`.pcol` sidecar trio. **On by
+    /// default** (bn-ccx1) — the background roll-sealer and
+    /// [`seal_active`](LogEngine::seal_active) both write a single `.seal` per
+    /// segment (install protocol: build → verify vs raw → fdatasync → rename
+    /// → dir fsync → footer → publish), and the footer names
+    /// `blake3(header ++ directory)` so a stand-in pack is refutable
+    /// (bn-11g).
+    ///
+    /// Set to `false` for the **compatibility mode**: the sealer writes the
+    /// legacy loose sidecar trio and a short unnamed footer, exactly as
+    /// pre-bn-ccx1 stores did. Loose sidecars are a permanently supported
+    /// shape in both directions — reopen dual-reads (a `.seal` is preferred
+    /// when present, else the sidecars), the two families coexist in one
+    /// store, and a legacy segment is never spontaneously re-sealed, so
+    /// existing stores stay loose until natural re-rolls convert their tail.
+    ///
+    /// Known gap under the default: `mess rebuild-index` has no offline pack
+    /// encoder, so it reports `pack-sealed-segment-skipped` and writes nothing
+    /// for pack-sealed segments (bn-3qh0). The engine's re-seal path is the
+    /// replacement.
+    ///
+    /// Decision record: bn-1yor (default-on scale and fault matrix) / bn-ccx1
+    /// (the flip).
     pub seal_pack:                  bool,
     /// The TOTAL bound on how long [`LogEngine`]'s `Drop` will wait for the
     /// background seal thread to drain queued rolls (`bn-u6o`). Only matters
@@ -2656,8 +2673,12 @@ impl Default for EngineOptions {
             // bn-2za: parity is opt-in / evidence-gated — off by default.
             parity:
                 mess_index::sealed::parity::ParityConfig::default(),
-            // bn-3of: consolidated SealPack off by default (Spike I flag).
-            seal_pack:                  false,
+            // bn-3of/bn-ccx1: consolidated SealPack ON by default. The
+            // bn-1yor matrix admitted the flip: 3.88 -> 1.00 files per sealed
+            // segment, 155x lower reopen residency, ~4x fewer seal fsync
+            // barriers, cold-open parity, floors 14/14, for +0.26% store
+            // bytes. `false` selects the loose-sidecar compatibility mode.
+            seal_pack:                  true,
             // bn-u6o: bound total shutdown drain latency, not correctness — a
             // skipped seal at shutdown is safe (served from the log on
             // reopen). 2s is comfortably above a healthy drain (near-instant)

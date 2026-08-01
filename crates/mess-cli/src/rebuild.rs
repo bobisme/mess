@@ -19,6 +19,16 @@
 //! wrote. So those segments are reported and left alone; regenerating a pack is
 //! the engine's re-seal path. That is a documented gap, not a silent one.
 //!
+//! **bn-ccx1 widened that gap deliberately.** With `EngineOptions::seal_pack`
+//! now ON by default, every segment a current engine seals is pack-sealed, so
+//! `rebuild-index` is a no-op on freshly written stores — it reports
+//! `pack-sealed-segment-skipped` for each and writes nothing. It remains fully
+//! functional for legacy loose-sidecar stores and for stores run in the
+//! compatibility mode (`seal_pack: false`). bn-1yor's default-on matrix called
+//! this the one real capability regression of the flip and admitted it;
+//! bn-3qh0 tracks the offline pack encoder (plus the footer-refinalize
+//! question bn-11g's identity rule raises) that would close it.
+//!
 //! # bn-fj34: `--meta` is gone
 //!
 //! This command used to take a `--meta` flag that additionally opened a

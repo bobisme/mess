@@ -70,6 +70,9 @@ fn opts(segment_size: u64, capsule_budget: u64) -> EngineOptions {
         durability: Durability::Process,
         segment_size,
         capsule_cache_budget_bytes: capsule_budget,
+        // loose-sidecar coverage — this mode must keep working forever;
+        // bn-ccx1
+        seal_pack: false,
         ..Default::default()
     }
 }

@@ -47,6 +47,10 @@ fn rec(message_type: &str, data: &[u8]) -> RecordToAppend {
 /// Build a corpus at `dir`: append `n_batches` single-event batches to one
 /// stream, then seal (writing the durable sidecars). Leaves the store closed
 /// (lock released). Returns nothing; the caller inspects the files.
+///
+/// This is the **loose-sidecar** builder and pins `seal_pack: false` to stay
+/// that way now that pack sealing is the engine default (bn-ccx1);
+/// [`build_pack_corpus`] is its pack sibling.
 pub fn build_corpus(dir: &Path, n_batches: u64) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -57,6 +61,9 @@ pub fn build_corpus(dir: &Path, n_batches: u64) {
             // Small segments keep the preallocated file tiny; all our batches
             // fit inside one segment (they are a handful of bytes each).
             segment_size: 1 << 20,
+            // loose-sidecar coverage — this mode must keep working forever;
+            // bn-ccx1
+            seal_pack: false,
             ..EngineOptions::default()
         };
         let engine = LogEngine::open_with(dir, opts).expect("open engine");

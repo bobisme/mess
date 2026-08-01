@@ -65,7 +65,7 @@ from building it.
 | `mess-core` | The trait vocabulary: `Event`, `Aggregate`, `Decide`, typed `CommandError`, `Actor` |
 | `mess-derive` | `#[derive(Event)]` / `#[derive(Aggregate)]` — wire names, codecs, fold wiring |
 | `mess-log` | The durable log: segmented append, group commit, background sealing, recovery, watermarks |
-| `mess-index` | Hot + sealed indexes: active pointer index, sealed pointer/payload sidecars (BinaryFuse16 membership, columnar payloads), Reed-Solomon parity |
+| `mess-index` | Hot + sealed indexes: active pointer index, sealed pointer/payload artifacts (BinaryFuse16 membership, columnar payloads) — one consolidated `.seal` SealPack per sealed segment by default, legacy loose `.pidx`/`.pcol`/`.filter` sidecars still read and writable — Reed-Solomon parity |
 | `mess-store` | `EventStore` facade over a `Backend`: `load` / `append` / `command` / `command_cached`, state cache, snapshots, subscriptions; `LogEngine` composes log + index into the production backend |
 | `mess-cli` | `mess inspect / doctor / verify (--repair) / backup / restore / retention` against a store directory |
 | `mess-testkit` | Given-When-Then aggregate testing, self-sweeping real-fs temp dirs |

@@ -124,6 +124,13 @@ enum Command {
     /// only the legacy sidecar shape, which a pack-sealed segment either
     /// shadows or — when its footer names a SealPack (bn-11g) — refuses
     /// outright. Re-sealing is the engine's job for those.
+    ///
+    /// KNOWN GAP since bn-ccx1 made pack sealing the engine default: every
+    /// newly sealed segment is pack-sealed, so on a store written by a current
+    /// engine this command rebuilds nothing and reports
+    /// `pack-sealed-segment-skipped` per segment. It still rebuilds legacy
+    /// loose-sidecar stores (and any store run with `seal_pack: false`). An
+    /// offline pack encoder is tracked as bn-3qh0.
     RebuildIndex {
         /// The store directory.
         dir:     PathBuf,

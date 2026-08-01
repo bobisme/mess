@@ -61,7 +61,13 @@ fn rec(message_type: &str, data: &[u8]) -> RecordToAppend {
 /// A tiny active segment so a few hundred small batches span several segments
 /// and the background sealer produces real rolled+sealed segments.
 fn rolling_opts() -> EngineOptions {
-    EngineOptions { segment_size: 16 * 1024, ..EngineOptions::default() }
+    EngineOptions {
+        segment_size: 16 * 1024,
+        // loose-sidecar coverage — this mode must keep working forever;
+        // bn-ccx1
+        seal_pack: false,
+        ..EngineOptions::default()
+    }
 }
 
 fn payload(s: usize, i: usize) -> Vec<u8> {

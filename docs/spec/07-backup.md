@@ -28,10 +28,21 @@ after a crash at the instant of the cut. The cut is the disjoint union of:
    `SegmentFooter` trailer is durable ([01 §3.3](01-log-format.md)); its bytes
    never change again, so copying the whole file — concurrently with a live
    writer — is safe and its content is **stable by name** (the `segment_id` and
-   the trailer's `footer_crc` never change). Sealed sidecars
-   (`.pidx`/`.pcol`/`.filter`) are copied alongside when present; they are
-   rebuildable caches (D1/I5) but content-stable, so copying them is a
-   restore-speed optimisation, not a correctness requirement.
+   the trailer's `footer_crc` never change). The segment's derived sealed
+   index is copied alongside when present, in whichever shape it exists on
+   disk — the consolidated `.seal` SealPack ([01 §3.3.3](01-log-format.md)),
+   which is what a current engine writes, or the legacy loose sidecars
+   (`.pidx`/`.pcol`/`.filter`) a store sealed before the pack default or with
+   `seal_pack: false`. Both shapes may appear in one store. They are
+   rebuildable caches (D1/I5) but content-stable, so copying the **loose**
+   sidecars is a restore-speed optimisation, not a correctness requirement.
+   Copying a **named pack** is neither optional nor merely symmetric: the
+   footer binds the segment to the exact pack that sealed it
+   ([01 §3.3.3](01-log-format.md)) and that footer rides inside the `.log`
+   bytes the cut already copies whole, so a cut that leaves the pack behind
+   produces a restored store whose footer names a SealPack that does not
+   exist — an Error (`seal-pack-missing`), not a slow path. The cut MUST be
+   identity-complete, not merely data-complete.
 
 2. **The active segment up to the durable watermark.** The active (unsealed)
    segment is the only file a live writer mutates, and it only ever *grows*
@@ -168,7 +179,8 @@ A correct backup can be taken with `rsync` alone **if the ordering rules hold**:
   BACKUP_MANIFEST            # JSON, written LAST; presence ⇒ complete backup
   seg-00000001.log          # sealed + active .log files (active = prefix)
   sealed/
-    seg-...pidx / .pcol / .filter
+    seg-....seal                    # SealPack (the default shape)
+    seg-...pidx / .pcol / .filter   # legacy loose sidecars
 ```
 
 There is no `meta/`: since `bn-fj34` the store has none (§1.2).
@@ -189,7 +201,10 @@ There is no `meta/`: since `bn-fj34` the store has none (§1.2).
 ```
 
 `role` is `sealed` | `active` | `sidecar` (the `meta` role was retired with
-the metadata directory in `bn-fj34`). `copied_len` is the number
+the metadata directory in `bn-fj34`). Every derived per-segment artifact
+travels under `sidecar` whichever shape it is — a `.seal` pack or a legacy
+`.pidx`/`.pcol`/`.filter` — so the token stays stable across the pack default
+(`bn-1w4h`). `copied_len` is the number
 of bytes copied for that file (for the active segment, the cut `safe_offset`;
 for a sealed file, its whole length). Restore verifies every listed file's
 length + CRC before running recovery (§4).
