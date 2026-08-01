@@ -291,6 +291,7 @@ fn stale_manifest_entry_is_rejected_and_falls_back() {
     // header cross-check MUST reject it, so recovery falls back to the trailer
     // and still produces the authoritative prefix.
     let stale = Manifest::new(vec![SegmentCatalogEntry {
+        flags:       0,
         segment_id:  2,
         epoch:       999,  // wrong generation
         base_pos:    7777, // wrong position

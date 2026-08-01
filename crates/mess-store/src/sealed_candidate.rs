@@ -11,7 +11,14 @@
 //! 2. the segment bytes it claims to cover are actually durable — either
 //!    because the segment carries a cross-checking **footer trailer** (the
 //!    footer `fsync` is what proves it), or because the recovery scan of that
-//!    segment reached the candidate's coverage end.
+//!    segment reached the candidate's coverage end; and
+//! 3. (bn-11g) if that footer **names** a SealPack (spec 01 §3.3.3), this
+//!    candidate is that exact pack — its own verified
+//!    [`PackIdentity`](mess_index::sealed::PackIdentity) equals the named one.
+//!    Facts 1 and 2 are both satisfied by a stale pack from an earlier seal of
+//!    the same range, or by a pack copied in from another store; fact 3 is what
+//!    makes the installed pack cryptographically specific instead of merely
+//!    plausible for the segment.
 //!
 //! Before this bone a candidate that failed either test was simply *not
 //! installed*. Nothing on disk changed. The segment was served correctly from
@@ -30,6 +37,10 @@
 //!      ▲                                                                 │
 //!      │                                                     parses? ────┤ no ──▶ REFUTED (Unparsable)
 //!      │                                                                 │ yes
+//!      │                       footer names a pack (bn-11g)? ────────────┤
+//!      │                          resolvable? ──── no ──────────────────▶├──────▶ REFUTED (PackIdentityUnresolvable)
+//!      │                          matches this candidate? ── no ────────▶├──────▶ REFUTED (PackIdentityMismatch)
+//!      │                                                                 │ yes / footer names none
 //!      │                                        footer cross-checks? ────┤ yes ─▶ ADMITTED   (installed, trust-skipped)
 //!      │                                                                 │ no
 //!      │                                                            PENDING
@@ -158,6 +169,27 @@ pub enum RefutationReason {
     /// The candidate names a segment recovery never saw — no `seg-<id>.log` at
     /// all, or one with no valid header.
     Orphan,
+    /// bn-11g: the segment's footer **names** a SealPack (spec 01 §3.3.3) and
+    /// this candidate is not it — a different identity, or no identity at all
+    /// (a legacy `.pidx` offered where a named pack is required).
+    ///
+    /// This is the refutation that coverage alone could never make: a stale
+    /// pack from an earlier seal of the same range, a pack copied in from
+    /// another store, and any same-coverage substitute all pass the
+    /// `segment_id`/`base_pos`/`end_pos` cross-check and fail here.
+    PackIdentityMismatch,
+    /// bn-11g: the segment's footer names a SealPack but the name cannot be
+    /// resolved — the extension region failed its `ext_crc`, carried no (or
+    /// more than one) `SealPackIdentity` section, named a different segment,
+    /// or used an `identity_kind` this build does not know.
+    ///
+    /// Distinct from [`Self::PackIdentityMismatch`] because the operator
+    /// action differs: a mismatch means the pack on disk is the wrong one, an
+    /// unresolvable identity means the *footer* is damaged and the pack may
+    /// well be fine. Both refuse to install, per §3.3.3 reader rule 2 — an
+    /// unreadable identity must never be read as "no pack was named", which is
+    /// the legacy coverage-only state.
+    PackIdentityUnresolvable,
 }
 
 impl RefutationReason {
@@ -169,6 +201,10 @@ impl RefutationReason {
             RefutationReason::IdentityMismatch => "identity-mismatch",
             RefutationReason::CoverageUnproven => "coverage-unproven",
             RefutationReason::Orphan => "orphan",
+            RefutationReason::PackIdentityMismatch => "pack-identity-mismatch",
+            RefutationReason::PackIdentityUnresolvable => {
+                "pack-identity-unresolvable"
+            }
         }
     }
 }

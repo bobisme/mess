@@ -45,12 +45,16 @@ pub struct SegmentFile {
     pub filter_path: PathBuf,
     /// The Reed-Solomon parity sidecar path (bn-2za; may or may not exist).
     pub par_path:    PathBuf,
+    /// The consolidated SealPack path (bn-3of; may or may not exist).
+    pub seal_path:   PathBuf,
     /// Whether the `.pidx` sidecar exists on disk.
     pub has_pidx:    bool,
     /// Whether the `.pcol` sidecar exists on disk.
     pub has_pcol:    bool,
     /// Whether the `.par` parity sidecar exists on disk (bn-2za).
     pub has_par:     bool,
+    /// Whether the consolidated `.seal` pack exists on disk (bn-3of).
+    pub has_seal:    bool,
 }
 
 /// The `.log` path for a segment id (`seg-<id:08>.log`).
@@ -71,6 +75,15 @@ pub fn pidx_path(dir: &Path, segment_id: u64) -> PathBuf {
 #[must_use]
 pub fn par_path(dir: &Path, segment_id: u64) -> PathBuf {
     pidx_path(dir, segment_id).with_extension("par")
+}
+
+/// The consolidated SealPack path for a segment id
+/// (`sealed/seg-<id:020>.seal`, bn-3of) — the same naming
+/// [`mess_index::sealed::seal_pack_path`] owns, expressed in the CLI's layout
+/// module so `verify`/`inspect` resolve it exactly as the engine does.
+#[must_use]
+pub fn seal_path(dir: &Path, segment_id: u64) -> PathBuf {
+    pidx_path(dir, segment_id).with_extension("seal")
 }
 
 /// The lock-file path.
@@ -127,16 +140,19 @@ pub fn discover_segments(dir: &Path) -> Vec<SegmentFile> {
             let pcol = pidx.with_extension("pcol");
             let filter = pidx.with_extension("filter");
             let par = pidx.with_extension("par");
+            let seal = pidx.with_extension("seal");
             SegmentFile {
                 segment_id,
                 log_path: log_path(dir, segment_id),
                 has_pidx: pidx.exists(),
                 has_pcol: pcol.exists(),
                 has_par: par.exists(),
+                has_seal: seal.exists(),
                 pidx_path: pidx,
                 pcol_path: pcol,
                 filter_path: filter,
                 par_path: par,
+                seal_path: seal,
             }
         })
         .collect()

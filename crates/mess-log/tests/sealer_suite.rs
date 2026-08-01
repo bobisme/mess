@@ -488,3 +488,176 @@ fn sim_a9_chain_across_sealed_roll() {
         Path::new("/roll1"),
     );
 }
+
+// ---------------------------------------------------------------------------
+// bn-11g — reading back a footer that NAMES a SealPack (spec 01 §3.3.3)
+// ---------------------------------------------------------------------------
+
+/// Write `footer` (extension ++ trailer) at `content_len` over an already
+/// sealed segment, replacing whatever footer was there.
+fn rewrite_footer<F: Fs>(fs: &F, path: &Path, content_len: u64, footer: &[u8]) {
+    let f = fs.open(path, OpenOpts::create_rw()).unwrap();
+    let mut off = content_len;
+    let mut rest = footer;
+    while !rest.is_empty() {
+        let n = f.pwrite(off, rest).unwrap();
+        off += n as u64;
+        rest = &rest[n..];
+    }
+    f.fdatasync().unwrap();
+}
+
+/// A named footer read back through the R2 surfaces: the flag arrives in the
+/// 100-byte pread-from-EOF, and `read_extension` returns exactly the region
+/// `ext_crc` covers, from which the identity decodes.
+fn named_footer_reads_back<R: Runtime>(rt: &R, path: &Path) {
+    use mess_log::footer_ext::{
+        SealPackIdentity, SealSummary, decode_extension, encode_sealed_footer,
+    };
+    use mess_log::sealer::read_extension;
+
+    let fs = rt.fs();
+    let mut w =
+        SegmentWriter::create(&fs, path, SegmentParams::new(3, 1000, 42, 7))
+            .unwrap();
+    append_three(&mut w);
+    let summary = w.seal().unwrap();
+
+    let id = SealPackIdentity {
+        identity_kind:       SEAL_PACK_IDENTITY_HDRDIR_BLAKE3,
+        pack_format_version: 1,
+        segment_id:          3,
+        identity:            [0x9E; 32],
+    };
+    let (footer, _) = encode_sealed_footer(
+        &SealSummary {
+            segment_id:  summary.segment_id,
+            epoch:       summary.epoch,
+            base_pos:    summary.base_pos,
+            batch_count: summary.batch_count,
+            event_count: summary.event_count,
+            content_len: summary.content_len,
+        },
+        &[],
+        &[],
+        Some(&id),
+    );
+    rewrite_footer(&fs, path, summary.content_len, &footer);
+
+    // R2 still works, and now carries the naming bit.
+    let cat = read_trailer(&fs, path).unwrap().expect("valid trailer");
+    assert!(cat.names_seal_pack(), "the 100-byte pread sees the flag");
+    assert_eq!(cat.ext_offset, summary.content_len);
+    assert_eq!(cat.ext_len as usize, EXT_SECTION_HDR_LEN + EXT_ENTRY_LEN);
+
+    let ext = read_extension(&fs, path, &cat)
+        .unwrap()
+        .expect("extension verifies against ext_crc");
+    assert_eq!(decode_extension(&ext).pack_identity, Some(id));
+
+    // §8.3: a non-empty extension does not disturb the fast path — the body is
+    // still trusted via the trailer with no scan.
+    assert!(matches!(
+        recover_fast(&fs, path).unwrap(),
+        FastRecovery::Sealed { .. }
+    ));
+}
+
+/// Damage inside the extension: `read_extension` refuses (partial reads are
+/// never trusted, §8.3) while the trailer — and therefore the *flag* — stays
+/// valid. A reader that treated `None` as "no pack was named" would silently
+/// drop back to coverage-only trust, which is the whole hole bn-11g closes.
+fn corrupt_extension_is_absent_but_the_flag_survives<R: Runtime>(
+    rt: &R,
+    path: &Path,
+) {
+    use mess_log::footer_ext::{
+        SealPackIdentity, SealSummary, encode_sealed_footer,
+    };
+    use mess_log::sealer::read_extension;
+
+    let fs = rt.fs();
+    let mut w =
+        SegmentWriter::create(&fs, path, SegmentParams::new(3, 1000, 42, 7))
+            .unwrap();
+    append_three(&mut w);
+    let summary = w.seal().unwrap();
+    let (footer, _) = encode_sealed_footer(
+        &SealSummary {
+            segment_id:  summary.segment_id,
+            epoch:       summary.epoch,
+            base_pos:    summary.base_pos,
+            batch_count: summary.batch_count,
+            event_count: summary.event_count,
+            content_len: summary.content_len,
+        },
+        &[],
+        &[],
+        Some(&SealPackIdentity {
+            identity_kind:       SEAL_PACK_IDENTITY_HDRDIR_BLAKE3,
+            pack_format_version: 1,
+            segment_id:          3,
+            identity:            [0x5A; 32],
+        }),
+    );
+    rewrite_footer(&fs, path, summary.content_len, &footer);
+
+    // Flip one bit of the stored identity, in the extension region only.
+    let f = fs.open(path, OpenOpts::create_rw()).unwrap();
+    let at = summary.content_len + EXT_SECTION_HDR_LEN as u64 + 16;
+    let mut b = [0u8; 1];
+    f.pread(at, &mut b).unwrap();
+    b[0] ^= 0x01;
+    f.pwrite(at, &b).unwrap();
+    f.fdatasync().unwrap();
+    drop(f);
+
+    let cat = read_trailer(&fs, path).unwrap().expect("trailer still valid");
+    assert!(
+        cat.names_seal_pack(),
+        "footer_crc covers the flag, so extension damage cannot clear it"
+    );
+    assert!(
+        read_extension(&fs, path, &cat).unwrap().is_none(),
+        "a failed ext_crc must read as absent, never as partially usable"
+    );
+
+    // A locator that runs past EOF (a torn/garbage `ext_len`) is the same
+    // answer, and must be bounded by the file BEFORE any buffer is allocated.
+    let mut absurd = cat;
+    absurd.ext_len = u64::MAX / 2;
+    assert!(read_extension(&fs, path, &absurd).unwrap().is_none());
+    let mut before_header = cat;
+    before_header.ext_offset = 0;
+    assert!(read_extension(&fs, path, &before_header).unwrap().is_none());
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn real_named_footer_reads_back() {
+    let dir = tmp("named-footer");
+    named_footer_reads_back(&RealRuntime::new(), &dir.path().join("s.seg"));
+}
+
+#[test]
+fn sim_named_footer_reads_back() {
+    named_footer_reads_back(&SimRuntime::new(1), Path::new("/named"));
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn real_corrupt_extension_is_absent_but_the_flag_survives() {
+    let dir = tmp("named-footer-corrupt");
+    corrupt_extension_is_absent_but_the_flag_survives(
+        &RealRuntime::new(),
+        &dir.path().join("s.seg"),
+    );
+}
+
+#[test]
+fn sim_corrupt_extension_is_absent_but_the_flag_survives() {
+    corrupt_extension_is_absent_but_the_flag_survives(
+        &SimRuntime::new(1),
+        Path::new("/named-corrupt"),
+    );
+}

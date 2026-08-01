@@ -147,6 +147,18 @@ pub const SEGMENT_SIZE: u64 = 256 * 1024 * 1024;
 // `ext_crc` so the fast path can validate and use the catalog fields without
 // reading the extension. In Phase 3 the extension is always empty
 // (`ext_len == 0`, `ext_crc == 0`); the `StreamHeadTable` is Phase 5.
+//
+// **Trailer `flags` (bn-11g).** The field was `reserved = 0`; v3 defines bit 0,
+// [`FOOTER_FLAG_SEAL_PACK_IDENTITY`], meaning "this footer's extension carries
+// a `SealPackIdentity` section" (§3.3.3). It lives in the fixed trailer rather
+// than being inferred from `ext_len > 0` because it must be covered by
+// `footer_crc`, NOT by `ext_crc`: a reader has to be able to tell "the footer
+// named a pack and I cannot read the name" (fail closed, install nothing) from
+// "the footer named no pack" (the legacy coverage-only policy) even when the
+// extension is corrupt. Inferring it from the extension would make a single
+// flipped bit a silent trust *downgrade*. A reader that predates the bit
+// ignores it, exactly as it ignored `reserved`, so nothing about a legacy
+// footer's parse changes.
 
 /// `SEGMENT_TRAILER_LEN` (§3.3.1): the fixed trailer occupies the final 100
 /// bytes of a sealed segment file (R2 pread-from-EOF).
@@ -155,6 +167,23 @@ pub const SEGMENT_TRAILER_LEN: usize = 100;
 /// Byte offset of the trailer's `footer_crc`; its coverage is the single range
 /// `[0, 96)` (nothing follows it — §5.2).
 pub const SEGMENT_FOOTER_CRC_OFF: usize = 96;
+
+/// Trailer `flags` bit 0 (§3.3.1, bn-11g): this footer's extension region
+/// carries exactly one [`EXT_KIND_SEAL_PACK_IDENTITY`] section naming the
+/// SealPack this seal installed (§3.3.3).
+///
+/// Set ⇒ a reader MUST resolve that identity before serving from ANY pack for
+/// the segment, and MUST install none if it cannot (spec 01 §3.3.3 reader rule
+/// 2). Clear ⇒ the footer names no pack and the legacy coverage-only policy
+/// applies (D-FMT-10). The bit is covered by `footer_crc`, so the distinction
+/// survives a corrupt extension — see this module's `SegmentFooter` header
+/// comment for why that is the whole point.
+pub const FOOTER_FLAG_SEAL_PACK_IDENTITY: u16 = 1 << 0;
+
+/// The mask of trailer `flags` bits defined in v3 (§3.3.1). A writer MUST NOT
+/// set a bit outside this mask; a reader ignores unknown bits (they were
+/// `reserved = 0` and stay forward-compatible).
+pub const FOOTER_FLAGS_KNOWN_MASK: u16 = FOOTER_FLAG_SEAL_PACK_IDENTITY;
 
 // SegmentFooter trailer field offsets, relative to the trailer's first byte
 // (§3.3.1 table).
@@ -210,5 +239,17 @@ pub const EXT_KIND_STREAM_HEAD_TABLE: u16 = 1;
 /// Extension section kind `2` — `SnapshotAnchorList` (§3.3.2). Not written in
 /// Phase 3 (Phase 5). Entry size is 48 bytes.
 pub const EXT_KIND_SNAPSHOT_ANCHOR_LIST: u16 = 2;
-/// Entry size (bytes) of both known extension section kinds (§3.3.2).
+/// Extension section kind `3` — `SealPackIdentity` (§3.3.3, bn-11g): the exact
+/// SealPack this seal installed, named by its stable header+directory hash.
+/// Exactly one entry (48 bytes); present iff the trailer's
+/// [`FOOTER_FLAG_SEAL_PACK_IDENTITY`] bit is set.
+pub const EXT_KIND_SEAL_PACK_IDENTITY: u16 = 3;
+/// Entry size (bytes) of every known extension section kind (§3.3.2/§3.3.3).
 pub const EXT_ENTRY_LEN: usize = 48;
+
+/// `SealPackIdentityEntry.identity_kind` value `1` (§3.3.3): `identity` is
+/// `blake3(pack_header ++ pack_section_directory)` — byte-for-byte the hash a
+/// SealPack stores in its own trailer and re-verifies at every open. The tag
+/// carries the hash **domain and version** together, so a future pack layout or
+/// hash is a new value here and an old footer never changes meaning.
+pub const SEAL_PACK_IDENTITY_HDRDIR_BLAKE3: u16 = 1;

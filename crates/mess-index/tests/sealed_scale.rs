@@ -109,7 +109,7 @@ fn full_scale_seal_is_off_path_and_reads_fast() {
 
     let sealer = BackgroundSealer::spawn(driver.clone());
     let seal_started = Instant::now();
-    let rx = sealer.submit(input, || Ok(()));
+    let rx = sealer.submit(input, |_| Ok(()));
 
     // Hammer the append hot path on the new segment while the seal runs; record
     // per-call latency. base_pos for segment 2 starts after segment 1's events.

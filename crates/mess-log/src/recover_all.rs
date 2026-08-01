@@ -607,6 +607,12 @@ pub fn manifest_entries(whole: &WholeLog) -> Vec<SegmentCatalogEntry> {
         .iter()
         .filter(|s| s.source == RecoverySource::Footer)
         .map(|s| SegmentCatalogEntry {
+            // The report does not carry the trailer's flag bits, so a rebuilt
+            // manifest entry is conservatively unflagged. Harmless because
+            // nothing decides SealPack trust from a manifest (spec 01 §3.3.3
+            // reads the trailer itself); see the `flags` note on
+            // `MANIFEST_ENTRY_LEN`.
+            flags:       0,
             segment_id:  s.segment_id,
             epoch:       s.epoch,
             base_pos:    s.base_pos,

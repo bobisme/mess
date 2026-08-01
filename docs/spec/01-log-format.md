@@ -215,7 +215,7 @@ segment-catalog summary (counts, epoch, positions) needed by the fast path
 |---|---|---|---|---|
 | 0  | 4 | u32 | `magic` | `0x5EA1_F007`. Identifies a SegmentFooter trailer. |
 | 4  | 2 | u16 | `format_version` | `3`. |
-| 6  | 2 | u16 | `flags` | Reserved; MUST be `0` in v3. |
+| 6  | 2 | u16 | `flags` | Trailer flags. Bit 0 = `SEAL_PACK_IDENTITY` (§3.3.3): this footer's extension region carries exactly one `SealPackIdentity` section (kind `3`). All other bits reserved and MUST be `0` in v3. |
 | 8  | 8 | u64 | `segment_id` | MUST equal the SegmentHeader's `segment_id`. |
 | 16 | 8 | u64 | `epoch` | **R3: the trailer carries the A9 epoch.** MUST equal the SegmentHeader's `epoch`. |
 | 24 | 8 | u64 | `base_pos` | MUST equal the SegmentHeader's `base_pos`. |
@@ -268,9 +268,12 @@ kinds are added without a format break.
 |---|---|---|---|
 | `1` | `StreamHeadTable` | 48 B | `entry_count` `StreamHeadEntry` records |
 | `2` | `SnapshotAnchorList` | 48 B | `entry_count` `SnapshotAnchor` records |
+| `3` | `SealPackIdentity` | 48 B | exactly one `SealPackIdentityEntry` record (§3.3.3) |
 
-At most one section of each known kind SHOULD appear in a segment's extension.
-For both known kinds `payload_len == entry_count * 48`.
+At most one section of each known kind SHOULD appear in a segment's extension
+(for `SealPackIdentity`, exactly one MUST appear when the trailer's
+`SEAL_PACK_IDENTITY` flag is set, and none otherwise). For every known kind
+`payload_len == entry_count * 48`.
 
 **`StreamHeadEntry` (48 bytes)** — one per stream with ≥1 committed event in
 this segment; the durable Tier-1 head anchor consumed by
@@ -297,6 +300,126 @@ This document owns the byte layout of these sections; their **semantics** (how
 [05-fold-certificates.md](05-fold-certificates.md); their **validation** on
 recovery (verifying `ext_crc`, behaviour on a corrupt extension) is owned by
 [02-recovery.md §8.3](02-recovery.md).
+
+#### 3.3.3 `SealPackIdentity` — naming the installed read accelerator
+
+A sealed segment MAY have a **SealPack** installed beside it: one immutable
+typed-section file (`sealed/seg-<id>.seal`) carrying the segment's rebuildable
+read accelerators. The pack is advisory for *acceptance* (D1: a missing or
+corrupt pack costs speed and nothing else, and the reader falls back to a raw
+segment scan), but *which* pack a reader may serve from is **not** advisory: a
+reader that installs a pack is trusting its pointers to dereference the
+segment's real byte offsets. Matching the segment's coverage
+(`segment_id`/`base_pos`/`end_pos`) does not establish that — a stale pack from
+an earlier seal of the same range, a pack copied in from another store, or any
+same-coverage substitute all match coverage. The footer therefore names the
+**exact** pack it accepts.
+
+**`SealPackIdentityEntry` (48 bytes)** — the payload of a kind-`3` section:
+
+| Offset | Size | Type | Name | Description |
+|---|---|---|---|---|
+| 0  | 2  | u16      | `identity_kind`       | The hash domain **and** version of `identity`. `1` = `SEALPACK_HDRDIR_BLAKE3` (below). `0` is reserved and MUST NOT be written. |
+| 2  | 2  | u16      | `pack_format_version` | The named pack's `format_version` (its own header field). Informational cross-check; a reader MAY report a disagreement, and MUST reject the pack when it disagrees. |
+| 4  | 4  | u32      | `reserved`            | MUST be `0` in v3. |
+| 8  | 8  | u64      | `segment_id`          | MUST equal the trailer's `segment_id`. |
+| 16 | 32 | [u8; 32] | `identity`            | The pack identity under `identity_kind`. |
+
+**`identity_kind = 1` (`SEALPACK_HDRDIR_BLAKE3`).** `identity` is
+`BLAKE3(pack[0 .. sections_off])` — the pack's fixed header concatenated with
+its complete section directory, and nothing else. This is byte-for-byte the
+value the pack stores in its own trailer and re-verifies on **every** open, so
+naming it costs a reader no extra hashing: the pack open already computes it.
+It is a *whole-pack* identity despite the narrow scope, because the directory
+commits to every section's `crc32c` and `content_hash_prefix` — a changed
+section body fails its directory-committed checksums, and a changed directory
+or header fails this hash. Two packs sharing an identity therefore agree on
+every byte a reader will ever use.
+
+**Writer rules.**
+
+1. A writer that installs a SealPack for a segment MUST emit exactly one
+   `SealPackIdentity` section in that segment's footer extension and MUST set
+   the trailer's `SEAL_PACK_IDENTITY` flag. This is not optional and not
+   version-gated: a v3 writer with a pack always names it.
+2. The named pack MUST be **complete and durable before the footer that names
+   it is written** — the pack's full byte image written, hash-verified by
+   parsing it back, `fsync`ed, renamed into place, and the containing directory
+   `fsync`ed — so a footer can never name bytes that are absent or partial.
+   The footer is the *accepted installation record*; there is no second record.
+3. A writer that installs no pack MUST leave the flag clear and MUST NOT emit a
+   kind-`3` section.
+
+**Reader rules.** Let `F` be the trailer's `SEAL_PACK_IDENTITY` flag (covered
+by `footer_crc`, so it is trustworthy whenever the trailer is).
+
+1. `F` **clear** — the footer names no pack. The reader MUST NOT require an
+   identity; a pack found on disk for this segment is admitted under whatever
+   pre-identity rule the implementation applies (coverage cross-check). This is
+   the **legacy-footer compatibility policy** (D-FMT-10), and it is the only
+   path on which a same-coverage substitute is still accepted.
+2. `F` **set** — the footer names a pack, and the reader MUST resolve the name
+   before serving from any pack:
+   a. read the extension region and verify `CRC32C(extension) == ext_crc`;
+   b. locate the single kind-`3` section and decode its entry;
+   c. require a known `identity_kind` and `segment_id == trailer.segment_id`.
+   If any of (a)–(c) fails, the identity is **unresolvable**, and the reader
+   MUST NOT install any pack for this segment — it falls back to the canonical
+   raw segment bytes. It MUST NOT downgrade to rule 1: an extension that exists
+   but does not verify is *not* the same as a footer that named no pack.
+3. With the identity resolved, the reader MUST install a pack only if the
+   pack's own open succeeds (its magic, version, trailer hash, structural
+   bounds, and mandatory-section checksums all verify) **and** the identity it
+   computes equals the named one. A missing, truncated, corrupt, or
+   non-matching pack — including one that matches the segment's coverage
+   exactly — MUST fall back to the raw segment bytes.
+4. Rules 2 and 3 fail *closed* in one direction only: they can cost a segment
+   its accelerator, never its data. Committed batches are unaffected — each is
+   independently CRC-validated by §5 and the raw log answers every read.
+
+**Forward/backward compatibility.** A reader that predates this section walks
+the extension, does not recognise `kind = 3`, and advisory-skips it (§3.3.2);
+it also ignores the trailer `flags` bit, which was `reserved = 0`. It therefore
+behaves exactly as it did before — coverage-only trust — which is the same
+posture rule 1 grants a legacy footer. Neither direction is a format break: no
+existing field moved, no length changed, and the whole binding rides fields
+that were already reserved.
+
+> ### Decision D-FMT-10 — the footer names the pack, and legacy footers stay trusted
+>
+> The identity is carried in the **footer** rather than in the pack, next to
+> the pack, or in a side file, because the footer is the segment's existing
+> *accepted installation record*: its `fsync` is already what proves the
+> covered bytes are durable, and it is already read (100 bytes from EOF) before
+> any pack is trusted. Binding the identity into that write adds an ordering
+> constraint that was already satisfied — pack durable, then footer — and
+> creates no second record that could disagree with the first. Rejected:
+> (a) a `.seal.accepted` marker file, which is a second record with its own
+> torn-write and ordering matrix for zero added guarantee; (b) putting the
+> segment's identity inside the pack, which is what the pack already does and
+> is exactly what a copied wrong pack also does — a self-attestation cannot
+> distinguish the pack the writer installed from one that merely claims the
+> same coverage.
+>
+> `identity_kind` is a combined domain-and-version tag rather than a bare hash,
+> so a future pack format (a new `format_version`, a different directory
+> layout, a different hash) is a new `identity_kind` value and old footers keep
+> their exact meaning. An **unknown** `identity_kind` is not advisory-skippable
+> the way an unknown *section* kind is: the section kind is known, the reader
+> simply cannot check the claim it makes, so it fails closed (reader rule 2c).
+>
+> A footer with the flag clear keeps coverage-only trust **by policy, not by
+> oversight**. Every footer written before this section exists is such a
+> footer, and demoting those stores to raw scans on upgrade would trade a real,
+> universal availability loss for a hypothetical one; the log is authority
+> either way, so the pack was never a correctness dependency. The policy is
+> bounded in time by rule 1 of the writer rules: a v3 writer with a pack always
+> names it, so a store converges to fully-named footers as its segments are
+> sealed or re-sealed, and an operator can see which segments are still
+> unnamed (`mess verify` reports them). A segment with **no** footer at all —
+> an on-demand seal over the still-live head — has no accepted installation
+> record to bind to; its candidate is confirmed by the recovery scan exactly as
+> before ([02-recovery.md §8.3](02-recovery.md)).
 
 > ### Decision D-FMT-3 — the OPTIONAL repair-sidecar reference
 >

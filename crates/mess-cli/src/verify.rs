@@ -24,12 +24,14 @@ use mess_index::sealed::parity::{ParityError, ParitySidecar};
 use mess_index::sealed::payload::{NoDicts, SealedPayloadIndex};
 use mess_index::sealed::segment::SealedSegmentIndex;
 use mess_log::fold_chain::{self, Hash as ChainHash};
+use mess_log::footer_ext::{SealPackIdentity, decode_extension};
 use mess_log::format::{CHAIN_LEN, HEADER_LEN};
 use mess_log::runtime::real::RealFs;
 use mess_log::scanner::{
     AcceptedBatch, ScanStop, recover_segment_with_image, scan_image,
 };
-use serde_json::json;
+use mess_log::sealer::{SegmentCatalogEntry, read_extension};
+use serde_json::{Value, json};
 
 use crate::lockprobe;
 use crate::report::{Finding, Report, Severity};
@@ -99,6 +101,12 @@ pub fn run(dir: &Path, opts: &VerifyOptions) -> Report {
             }
         };
         verify_segment(&mut report, &scan);
+
+        // bn-11g: does the segment footer NAME a SealPack, and is the pack on
+        // disk that exact one? Runs for every segment with a trailer, because
+        // the interesting failures are (a) a footer that names a pack with no
+        // pack present and (b) a pack present that the footer does not name.
+        verify_seal_identity(&mut report, seg, &scan);
 
         // Sidecar integrity for sealed segments (or any segment with sidecars).
         if seg.has_pidx {
@@ -267,6 +275,183 @@ fn verify_segment(report: &mut Report, scan: &SegmentScan) {
             );
         }
     }
+}
+
+/// bn-11g: check the segment footer's **SealPack identity** binding
+/// (spec 01 §3.3.3) — expected (what the footer names) against observed (what
+/// the pack on disk hashes to), plus the reason a reader would fall back to the
+/// raw segment.
+///
+/// This mirrors the engine's own admission decision in
+/// `LogEngine::load_sealed`, deliberately: `verify` exists so an operator can
+/// learn *offline, before a reopen*, that a segment is about to lose its cold
+/// tier and why. Every `Error` here corresponds to a candidate the next open
+/// would refuse (and quarantine); the `fallback` field names what a reader does
+/// instead, which is always the same thing — read the canonical raw segment
+/// bytes, the only authority (D1). No finding here means data loss.
+///
+/// The pack is opened with `open_pack_eager`, not `open_pack`: engine open
+/// attaches the payload/event-type sections lazily (bn-dbz), but an offline
+/// verifier wants the strongest check the format offers and is not latency- or
+/// residency-bound. The identity itself is identical either way — it is the
+/// header+directory hash both paths recompute.
+fn verify_seal_identity(
+    report: &mut Report,
+    seg: &store::SegmentFile,
+    scan: &SegmentScan,
+) {
+    let id = seg.segment_id;
+    let Some(trailer) = &scan.trailer else {
+        return; // unsealed: no footer, so no installation record to check.
+    };
+
+    if !trailer.names_seal_pack() {
+        // The documented legacy compatibility policy (D-FMT-10): a footer
+        // written before bn-11g, or by a sidecar-mode seal, names no pack. Only
+        // worth a line when a pack IS present and is therefore being trusted on
+        // coverage alone — that is the residual exposure an operator can close
+        // by re-sealing the segment.
+        if seg.has_seal {
+            report.push_finding(
+                Finding::new(
+                    Severity::Warn,
+                    "seal-pack",
+                    "seal-pack-unnamed",
+                    format!(
+                        "segment {id}: footer does not name a SealPack, so {} \
+                         is trusted on coverage alone (legacy footer policy, \
+                         spec 01 D-FMT-10); re-seal the segment to bind it",
+                        seg.seal_path.display()
+                    ),
+                )
+                .with("segment_id", id)
+                .with("path", seg.seal_path.display().to_string()),
+            );
+        }
+        return;
+    }
+
+    // The footer names a pack. Resolve the name.
+    let named = read_named_identity(seg, trailer);
+    let Some(named) = named else {
+        report.push_finding(
+            Finding::new(
+                Severity::Error,
+                "seal-pack",
+                "seal-pack-identity-unresolvable",
+                format!(
+                    "segment {id}: footer sets SEAL_PACK_IDENTITY but the \
+                     identity cannot be read (bad ext_crc, missing/duplicate \
+                     SealPackIdentity section, wrong segment, or an unknown \
+                     identity_kind); no pack may be installed"
+                ),
+            )
+            .with("segment_id", id)
+            .with("fallback", "raw-segment-scan")
+            .with("ext_offset", trailer.ext_offset)
+            .with("ext_len", trailer.ext_len),
+        );
+        return;
+    };
+    let expected = named.hex();
+
+    if !seg.has_seal {
+        report.push_finding(
+            Finding::new(
+                Severity::Error,
+                "seal-pack",
+                "seal-pack-missing",
+                format!(
+                    "segment {id}: footer names SealPack {expected} but {} \
+                     does not exist",
+                    seg.seal_path.display()
+                ),
+            )
+            .with("segment_id", id)
+            .with("expected_identity", expected.clone())
+            .with("observed_identity", Value::Null)
+            .with("fallback", "raw-segment-scan")
+            .with("path", seg.seal_path.display().to_string()),
+        );
+        return;
+    }
+
+    let index = match SealedSegmentIndex::open_pack_eager(&seg.seal_path) {
+        Ok(index) => index,
+        Err(e) => {
+            report.push_finding(
+                Finding::new(
+                    Severity::Error,
+                    "seal-pack",
+                    "seal-pack-unreadable",
+                    format!(
+                        "segment {id}: footer names SealPack {expected} but \
+                         {} failed to open: {e}",
+                        seg.seal_path.display()
+                    ),
+                )
+                .with("segment_id", id)
+                .with("expected_identity", expected)
+                .with("observed_identity", Value::Null)
+                .with("fallback", "raw-segment-scan")
+                .with("path", seg.seal_path.display().to_string()),
+            );
+            return;
+        }
+    };
+    let observed = index.pack_identity().map(|i| i.hex());
+
+    if observed.as_deref() != Some(expected.as_str()) {
+        report.push_finding(
+            Finding::new(
+                Severity::Error,
+                "seal-pack",
+                "seal-pack-identity-mismatch",
+                format!(
+                    "segment {id}: footer names SealPack {expected} but {} is \
+                     {} — a stale, copied, or substituted pack; it matches \
+                     the segment's coverage and is still NOT the accepted pack",
+                    seg.seal_path.display(),
+                    observed.clone().unwrap_or_else(|| "(none)".to_string()),
+                ),
+            )
+            .with("segment_id", id)
+            .with("expected_identity", expected)
+            .with(
+                "observed_identity",
+                observed.map_or(Value::Null, Value::from),
+            )
+            .with("fallback", "raw-segment-scan")
+            .with("path", seg.seal_path.display().to_string()),
+        );
+        return;
+    }
+
+    report.push_finding(
+        Finding::new(
+            Severity::Ok,
+            "seal-pack",
+            "seal-pack-identity-verified",
+            format!("segment {id}: footer names SealPack {expected}, matched"),
+        )
+        .with("segment_id", id)
+        .with("expected_identity", expected.clone())
+        .with("observed_identity", expected),
+    );
+}
+
+/// The `SealPackIdentity` a segment footer names, or `None` if it cannot be
+/// resolved — the same four rejections the engine makes (spec 01 §3.3.3 reader
+/// rule 2): the extension fails `ext_crc`, carries no (or more than one)
+/// kind-`3` section, names another segment, or uses an unknown `identity_kind`.
+fn read_named_identity(
+    seg: &store::SegmentFile,
+    trailer: &SegmentCatalogEntry,
+) -> Option<SealPackIdentity> {
+    let ext = read_extension(&RealFs, &seg.log_path, trailer).ok()??;
+    let named = decode_extension(&ext).pack_identity?;
+    (named.kind_is_known() && named.segment_id == trailer.segment_id)
+        .then_some(named)
 }
 
 /// Validate a sealed pointer sidecar's magic/version/CRC and structural spans.

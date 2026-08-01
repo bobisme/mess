@@ -49,9 +49,12 @@ pub const MANIFEST_VERSION: u16 = 1;
 /// entry_count(4) + reserved(4)`.
 pub const MANIFEST_HEADER_LEN: usize = 16;
 
-/// Per-entry length: the nine `SegmentCatalogEntry` fields (`segment_id`,
+/// Per-entry length: the `SegmentCatalogEntry` scalar fields (`segment_id`,
 /// `epoch`, `base_pos`, `end_pos`, `batch_count`, `event_count`, `ext_offset`,
-/// `ext_len` = 8 bytes each; `ext_crc` = 4) plus 4 bytes of padding = 72.
+/// `ext_len` = 8 bytes each; `ext_crc` = 4; `flags` = 2) plus 2 bytes of
+/// padding = 72. `flags` (bn-11g) occupies two of the four bytes that were
+/// reserved-and-zero, so the entry length and [`MANIFEST_VERSION`] are
+/// unchanged and a manifest written before bn-11g decodes with `flags == 0`.
 pub const MANIFEST_ENTRY_LEN: usize = 72;
 
 // Header field offsets.
@@ -71,7 +74,8 @@ const ME_EVENT_COUNT_OFF: usize = 40;
 const ME_EXT_OFFSET_OFF: usize = 48;
 const ME_EXT_LEN_OFF: usize = 56;
 const ME_EXT_CRC_OFF: usize = 64;
-// bytes [68, 72) reserved (MUST be 0).
+const ME_FLAGS_OFF: usize = 68;
+// bytes [70, 72) reserved (MUST be 0).
 
 /// A decoded advisory manifest: the cached sealed-segment catalog entries in
 /// the order they were written (the writer emits them in `segment_id` order).
@@ -127,7 +131,8 @@ pub fn build_manifest(entries: &[SegmentCatalogEntry]) -> Vec<u8> {
         put_u64(&mut b, o + ME_EXT_OFFSET_OFF, e.ext_offset);
         put_u64(&mut b, o + ME_EXT_LEN_OFF, e.ext_len);
         put_u32(&mut b, o + ME_EXT_CRC_OFF, e.ext_crc);
-        // bytes [o+68, o+72) reserved (already zero).
+        put_u16(&mut b, o + ME_FLAGS_OFF, e.flags);
+        // bytes [o+70, o+72) reserved (already zero).
     }
     let crc_off = b.len() - 4;
     let crc = crc32c::crc32c(&b[..crc_off]);
@@ -167,6 +172,7 @@ pub fn decode_manifest(bytes: &[u8]) -> Option<Manifest> {
     for i in 0..entry_count {
         let o = MANIFEST_HEADER_LEN + i * MANIFEST_ENTRY_LEN;
         entries.push(SegmentCatalogEntry {
+            flags:       rd_u16(bytes, o + ME_FLAGS_OFF),
             segment_id:  rd_u64(bytes, o + ME_SEGMENT_ID_OFF),
             epoch:       rd_u64(bytes, o + ME_EPOCH_OFF),
             base_pos:    rd_u64(bytes, o + ME_BASE_POS_OFF),
@@ -279,6 +285,7 @@ mod tests {
         batches: u64,
     ) -> SegmentCatalogEntry {
         SegmentCatalogEntry {
+            flags: 0,
             segment_id,
             epoch,
             base_pos,

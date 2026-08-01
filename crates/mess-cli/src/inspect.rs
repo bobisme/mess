@@ -4,13 +4,16 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use mess_log::footer_ext::decode_extension;
+use mess_log::runtime::real::RealFs;
+use mess_log::sealer::read_extension;
 use serde_json::json;
 
 use crate::lockprobe::{self, LockState};
 use crate::metaread;
 use crate::registryfold;
 use crate::report::{Finding, Report, Severity};
-use crate::scan::scan_segment;
+use crate::scan::{SegmentScan, scan_segment};
 use crate::store;
 
 /// Default cap on how many `stream_heads` rows `text`/`pretty` render before
@@ -123,6 +126,15 @@ pub fn run(dir: &Path, opts: &InspectOptions) -> Report {
                     "has_pidx": seg.has_pidx,
                     "has_pcol": seg.has_pcol,
                     "dir_codec": dir_codec(dir, seg.segment_id, &seg.pidx_path),
+                    "has_seal": seg.has_seal,
+                    // bn-11g: the SealPack identity this segment's footer
+                    // NAMES (spec 01 §3.3.3), lowercase hex, or null for a
+                    // legacy/unsealed footer that names none. `mess verify`
+                    // is what compares it against the pack on disk; inspect
+                    // reports the recorded fact so an operator can see, per
+                    // segment, which footers are bound and which are still on
+                    // the coverage-only compatibility policy.
+                    "named_seal_pack": named_seal_pack(seg, &scan),
                     "safe_offset": scan.recovery.safe_offset,
                     "next_pos": scan.recovery.next_pos,
                 }));
@@ -320,6 +332,33 @@ fn dir_codec(
         .into_iter()
         .find_map(|p| mess_index::sealed::dir_codec_of(p).ok())
         .map(mess_index::sealed::dircodec_name)
+}
+
+/// The SealPack identity this segment's footer **names** (spec 01 §3.3.3,
+/// bn-11g), as lowercase hex — or `null` when the footer names none (unsealed,
+/// or the legacy coverage-only compatibility policy, D-FMT-10).
+///
+/// Deliberately reports only what the footer *records*, never what the pack on
+/// disk hashes to: `mess inspect` is the cheap read-only survey, and confirming
+/// the two agree means opening and hashing every pack, which is `mess verify`'s
+/// job. A non-null value here plus a `seal-pack-*` error there is the pair that
+/// tells an operator "this segment is bound, and the binding is broken".
+fn named_seal_pack(
+    seg: &store::SegmentFile,
+    scan: &SegmentScan,
+) -> serde_json::Value {
+    let Some(trailer) = &scan.trailer else {
+        return serde_json::Value::Null;
+    };
+    if !trailer.names_seal_pack() {
+        return serde_json::Value::Null;
+    }
+    read_extension(&RealFs, &seg.log_path, trailer)
+        .ok()
+        .flatten()
+        .and_then(|ext| decode_extension(&ext).pack_identity)
+        .filter(|n| n.segment_id == trailer.segment_id)
+        .map_or(serde_json::Value::Null, |n| serde_json::Value::from(n.hex()))
 }
 
 /// Seconds since a file was last modified, or `None` if the mtime is

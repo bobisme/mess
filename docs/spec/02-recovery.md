@@ -424,6 +424,20 @@ itself invalidate the segment's committed batches.
 >   extension once rebuilt. This is the same forward-compat/advisory-skip
 >   posture as the repair sidecar, applied to the whole region on a hard CRC
 >   failure.
+>
+>   **Exception — a named SealPack ([01 §3.3.3](01-log-format.md)).** "Treat
+>   the extension as absent" restores an anchor by *rebuilding* it, which is
+>   always safe. It is NOT safe for the `SealPackIdentity` section, because
+>   "absent" there reads as "this footer named no pack", which grants any
+>   same-coverage pack the legacy coverage-only trust — so one flipped bit
+>   anywhere in the extension would *downgrade* the segment's trust rather than
+>   degrade it. The trailer's `SEAL_PACK_IDENTITY` flag is covered by
+>   `footer_crc`, not by `ext_crc`, exactly so this cannot happen: when the flag
+>   is set and the extension does not verify, the reader MUST install **no**
+>   pack for that segment and serve it from the raw bytes (01 §3.3.3 reader rule
+>   2). The anchors carried in the same corrupt extension are still handled by
+>   the paragraph above; the two rules are independent because they degrade in
+>   opposite directions.
 > - **Trailer itself invalid (`footer_crc` mismatch, wrong `magic`/version, or
 >   a short tail).** The segment is treated as **not sealed**: it MUST be
 >   fully scanned (§2) exactly as the active segment is, and its counts and

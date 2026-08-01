@@ -73,8 +73,9 @@ pub use driver::{
 };
 pub use filter::{FilterError, SegmentFilter};
 pub use pack::{
-    DIRCODEC_BITRANK, DIRCODEC_SORTED, PackError, PackInput, dircodec_name,
-    encode_event_types, encode_pack, seal_pack_path,
+    DIRCODEC_BITRANK, DIRCODEC_SORTED, FORMAT_VERSION as PACK_FORMAT_VERSION,
+    PackError, PackIdentity, PackInput, dircodec_name, encode_event_types,
+    encode_pack, seal_pack_path,
 };
 pub use parity::{
     ParityConfig, ParityError, ParitySidecar, RepairPlan,

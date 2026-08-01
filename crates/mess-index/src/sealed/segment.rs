@@ -87,7 +87,7 @@ use std::sync::Arc;
 
 use crate::active::{EventPtr, GlobalEntry, StreamEntry};
 use crate::sealed::filter::SegmentFilter;
-use crate::sealed::pack::EventTypeColumn;
+use crate::sealed::pack::{EventTypeColumn, PackIdentity};
 use crate::sealed::payload::{DictResolver, PayloadError, SealedPayloadIndex};
 use crate::sealed::ptr_block::{
     self, BatchPtr, DecodeError, SkipEntry, encode_ptr_block, encode_skips,
@@ -537,6 +537,17 @@ pub struct SealedSegmentIndex {
     /// (bn-we9x) — the §12.6 chooser's decision, made observable. See
     /// [`Self::dir_codec`].
     dir_codec:   u16,
+    /// The verified [`PackIdentity`] of the SealPack this index was built from
+    /// (bn-11g), and that pack's `format_version`.
+    ///
+    /// `Some` for every pack path ([`Self::from_pack`], [`Self::open_pack`],
+    /// [`Self::open_pack_eager`]) — the identity is the trailer hash those
+    /// paths already recomputed and verified, so holding one is proof the
+    /// bytes behind this index hash to it. `None` for a legacy
+    /// `.pidx`+`.filter`+`.pcol` trio ([`Self::from_bytes`]/[`Self::open`]),
+    /// which has no such identity to offer and therefore can never satisfy a
+    /// footer that names a pack (spec 01 §3.3.3 reader rule 3).
+    pack:        Option<(PackIdentity, u16)>,
 }
 
 impl SealedSegmentIndex {
@@ -564,6 +575,25 @@ impl SealedSegmentIndex {
     /// [`dir_codec_of`] answers the same question straight off disk without an
     /// open.
     pub fn dir_codec(&self) -> u16 { self.dir_codec }
+
+    /// The verified [`PackIdentity`] of the SealPack behind this index
+    /// (bn-11g), or `None` for a legacy sidecar trio.
+    ///
+    /// This is the value a segment footer's `SealPackIdentity` section must
+    /// equal before the index may be installed (spec 01 §3.3.3). It is derived
+    /// — the open recomputed the blake3 over the header + directory it read —
+    /// so comparing it to the footer compares two independently produced
+    /// values, which is exactly what a self-attesting pack cannot offer.
+    pub fn pack_identity(&self) -> Option<PackIdentity> {
+        self.pack.map(|(id, _)| id)
+    }
+
+    /// The `format_version` of the SealPack behind this index, or `None` for a
+    /// legacy sidecar trio (bn-11g). Cross-checked against the footer entry's
+    /// `pack_format_version`.
+    pub fn pack_format_version(&self) -> Option<u16> {
+        self.pack.map(|(_, v)| v)
+    }
 
     /// The stream ids present in this segment, ascending (bn-2ug's retention
     /// rule walks these to build a segment's per-stream frame spans).
@@ -659,6 +689,7 @@ impl SealedSegmentIndex {
             // A legacy sidecar's DIR region IS the sorted codec's layout
             // (56-byte records, ascending) — see [`dir_codec_of`].
             dir_codec: crate::sealed::pack::DIRCODEC_SORTED,
+            pack: None,
         })
     }
 
@@ -765,6 +796,7 @@ impl SealedSegmentIndex {
             payload,
             event_types,
             dir_codec: dir_sec.codec_id,
+            pack: Some((parsed.identity, parsed.format_version)),
         })
     }
 
@@ -945,6 +977,7 @@ impl SealedSegmentIndex {
             payload,
             event_types,
             dir_codec: dir_sec.codec_id,
+            pack: Some((parsed.identity, parsed.format_version)),
         })
     }
 

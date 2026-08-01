@@ -67,6 +67,15 @@
 //!   36  u32      magic = PACK_MAGIC
 //! ```
 //!
+//! The trailer's `pack_hash` is also this pack's stable **identity**
+//! ([`PackIdentity`], bn-11g): the value a sealed segment's footer records to
+//! name the exact pack it accepted (spec 01 §3.3.3). Naming it costs a reader
+//! nothing — `open_pack` recomputes and verifies this hash before it will serve
+//! a single pointer, so the identity a reader compares against the footer is
+//! always one it derived from the bytes in front of it, never one the pack
+//! asserted about itself. See [`PackIdentity`] for why the narrow hash scope is
+//! still a whole-pack identity.
+//!
 //! The pack hash deliberately covers **only the header + section directory**,
 //! NOT the section bodies (review F1). The directory already commits to every
 //! section's `crc32c` + `content_hash_prefix`, so the trailer hash still binds
@@ -232,6 +241,73 @@ const DIR_SORTED_REC_LEN: usize = 56;
 /// A bitrank-directory entry record: 48 bytes (no stream id — the bit position
 /// is the key).
 const DIR_BITRANK_REC_LEN: usize = 48;
+
+// -------------------------------------------------------------------------
+// Identity (bn-11g)
+// -------------------------------------------------------------------------
+
+/// A SealPack's **stable identity**: `blake3(header ++ section directory)` —
+/// the exact 32 bytes the pack carries in its trailer and that every open
+/// (eager [`parse_pack`] or lazy [`parse_pack_directory`]) recomputes and
+/// verifies before the pack may answer anything.
+///
+/// # Why this is a whole-pack identity
+///
+/// The hash covers 64 + `n_sections × 48` bytes and no section body, yet two
+/// packs with equal identities agree on every byte a reader can use. The
+/// directory commits each section's `crc32c` **and** `content_hash_prefix`, and
+/// every read path checks a section's bytes against those before using them
+/// (eagerly at open for the mandatory sections, at first touch for the
+/// file-backed ones). So a changed body fails its directory-committed
+/// checksums, and a changed directory or header fails this hash. Identity is
+/// transitive through the directory, exactly as the trailer's integrity
+/// guarantee is (review F1).
+///
+/// # Why it is the right thing for a footer to name
+///
+/// It is *stable*: it depends only on the pack's content, not on where the file
+/// sits, when it was written, or what it is called. It is *free*: the open path
+/// already computes it. And it is *specific* in the way coverage is not — a
+/// stale pack from an earlier seal of the same segment range, a pack copied
+/// from another store, and a same-coverage substitute all have different
+/// identities, while all three match `segment_id`/`base_pos`/`event_count`.
+/// See spec 01 §3.3.3 / D-FMT-10.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PackIdentity([u8; 32]);
+
+impl PackIdentity {
+    /// Wrap raw identity bytes (e.g. decoded from a segment footer).
+    #[must_use]
+    pub fn from_bytes(bytes: [u8; 32]) -> Self { PackIdentity(bytes) }
+
+    /// The raw identity bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8; 32] { &self.0 }
+
+    /// Lowercase hex — the operator-facing rendering (`mess verify`, the
+    /// refutation log lines).
+    #[must_use]
+    pub fn hex(&self) -> String {
+        use std::fmt::Write as _;
+        let mut s = String::with_capacity(64);
+        for b in &self.0 {
+            let _ = write!(s, "{b:02x}");
+        }
+        s
+    }
+}
+
+impl std::fmt::Debug for PackIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PackIdentity({})", self.hex())
+    }
+}
+
+impl std::fmt::Display for PackIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.hex())
+    }
+}
 
 // -------------------------------------------------------------------------
 // Errors
@@ -969,11 +1045,16 @@ pub(crate) struct ValidSection {
 /// (`STREAM_DIRECTORY`, `POINTER_BLOCKS`, `POINTER_SKIPS`) are guaranteed
 /// present and CRC-valid on `Ok`.
 pub(crate) struct ParsedPack {
-    pub segment_id:  u64,
-    pub base_pos:    u64,
-    pub event_count: u64,
-    pub n_streams:   u32,
-    pub sections:    Vec<ValidSection>,
+    pub segment_id:     u64,
+    pub base_pos:       u64,
+    pub event_count:    u64,
+    pub n_streams:      u32,
+    /// This pack's verified [`PackIdentity`] (bn-11g) — the trailer hash that
+    /// [`parse_pack_directory`] just recomputed over the header + directory.
+    pub identity:       PackIdentity,
+    /// The pack's own `format_version` (bn-11g), for the footer cross-check.
+    pub format_version: u16,
+    pub sections:       Vec<ValidSection>,
 }
 
 impl ParsedPack {
@@ -1013,11 +1094,18 @@ impl SectionRef {
 /// trailer's blake3 hash — everything a reader needs to *locate* and *check*
 /// any section without having read one (bn-dbz).
 pub(crate) struct PackDirectory {
-    pub segment_id:  u64,
-    pub base_pos:    u64,
-    pub event_count: u64,
-    pub n_streams:   u32,
-    pub sections:    Vec<SectionRef>,
+    pub segment_id:     u64,
+    pub base_pos:       u64,
+    pub event_count:    u64,
+    pub n_streams:      u32,
+    /// This pack's verified [`PackIdentity`] (bn-11g). Set only after the
+    /// trailer hash matched, so holding one is proof the header + directory
+    /// are exactly the bytes the identity names.
+    pub identity:       PackIdentity,
+    /// The pack's own `format_version`, for the footer's cross-check
+    /// (spec 01 §3.3.3: a pack whose header disagrees is not the named pack).
+    pub format_version: u16,
+    pub sections:       Vec<SectionRef>,
 }
 
 impl PackDirectory {
@@ -1030,13 +1118,16 @@ impl PackDirectory {
 /// The header fields a reader needs before it can even size the directory.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PackHeader {
-    pub segment_id:   u64,
-    pub base_pos:     u64,
-    pub event_count:  u64,
-    pub n_streams:    u32,
-    pub n_sections:   usize,
+    pub segment_id:     u64,
+    pub base_pos:       u64,
+    pub event_count:    u64,
+    pub n_streams:      u32,
+    pub n_sections:     usize,
     /// First byte after the directory = first section body byte.
-    pub sections_off: usize,
+    pub sections_off:   usize,
+    /// The pack's `format_version` (always [`FORMAT_VERSION`] today; carried
+    /// so the footer's identity cross-check can compare it — bn-11g).
+    pub format_version: u16,
 }
 
 impl PackHeader {
@@ -1079,6 +1170,7 @@ pub(crate) fn parse_pack_header(head: &[u8]) -> Result<PackHeader, PackError> {
         n_streams: rd_u32(head, 32),
         n_sections,
         sections_off,
+        format_version: rd_u16(head, 4),
     })
 }
 
@@ -1118,9 +1210,14 @@ pub(crate) fn parse_pack_directory(
     let mut hasher = blake3::Hasher::new();
     hasher.update(&head[..HEADER_LEN]);
     hasher.update(dir);
-    if hasher.finalize().as_bytes() != &trailer[0..32] {
+    let computed = *hasher.finalize().as_bytes();
+    if computed != trailer[0..32] {
         return Err(PackError::Corrupt("pack header/directory hash mismatch"));
     }
+    // bn-11g: the identity is the value just RECOMPUTED, never the stored one.
+    // They are equal here by construction, and taking the computed side keeps
+    // that true by construction rather than by reading order.
+    let identity = PackIdentity::from_bytes(computed);
 
     let mut sections = Vec::with_capacity(h.n_sections);
     for i in 0..h.n_sections {
@@ -1147,6 +1244,8 @@ pub(crate) fn parse_pack_directory(
         base_pos: h.base_pos,
         event_count: h.event_count,
         n_streams: h.n_streams,
+        identity,
+        format_version: h.format_version,
         sections,
     })
 }
@@ -1201,6 +1300,8 @@ pub(crate) fn parse_pack(bytes: &[u8]) -> Result<ParsedPack, PackError> {
         base_pos: dir.base_pos,
         event_count: dir.event_count,
         n_streams: dir.n_streams,
+        identity: dir.identity,
+        format_version: dir.format_version,
         sections,
     })
 }
@@ -2136,5 +2237,144 @@ mod tests {
             EventTypeColumn::attach(&file, &sec).unwrap_err(),
             PackError::Corrupt("event-type body/section mismatch")
         );
+    }
+}
+
+// -------------------------------------------------------------------------
+// bn-11g — the pack identity (spec 01 §3.3.3)
+// -------------------------------------------------------------------------
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use crate::sealed::segment::{SealBatch, SealStream};
+
+    fn streams(
+        stream_id: u64,
+        frame_count: u32,
+        offset: u64,
+    ) -> Vec<SealStream> {
+        vec![SealStream {
+            stream_id,
+            batches: vec![SealBatch {
+                first_version: 0,
+                frame_count,
+                first_global_pos: 0,
+                offset,
+            }],
+        }]
+    }
+
+    fn build(
+        segment_id: u64,
+        base_pos: u64,
+        s: &[SealStream],
+        type_ids: &[u32],
+    ) -> Vec<u8> {
+        encode_pack(&PackInput {
+            segment_id,
+            base_pos,
+            streams: s,
+            event_type_ids: type_ids,
+            filter: None,
+            payload_bytes: None,
+        })
+    }
+
+    fn identity_of(bytes: &[u8]) -> PackIdentity {
+        parse_pack(bytes).expect("valid pack").identity
+    }
+
+    /// The identity a reader derives is exactly the pack's own trailer hash —
+    /// the value `open_pack` already recomputes. Naming it in the footer
+    /// therefore costs a reader nothing beyond the comparison.
+    #[test]
+    fn identity_is_the_trailer_hash_over_header_and_directory() {
+        let s = streams(10, 4, 4096);
+        let bytes = build(7, 1000, &s, &[]);
+        let id = identity_of(&bytes);
+
+        let trailer = &bytes[bytes.len() - TRAILER_LEN..];
+        assert_eq!(id.as_bytes(), &trailer[..32], "the stored trailer hash");
+
+        let h = parse_pack_header(&bytes).unwrap();
+        let recomputed = blake3::hash(&bytes[..h.sections_off]);
+        assert_eq!(
+            id.as_bytes(),
+            recomputed.as_bytes(),
+            "blake3(header ++ directory), nothing else"
+        );
+        assert_eq!(id.hex().len(), 64);
+    }
+
+    /// Deterministic: the same input yields the same identity, so a re-seal of
+    /// identical content is not spuriously refuted.
+    #[test]
+    fn identical_input_yields_an_identical_identity() {
+        let s = streams(10, 4, 4096);
+        assert_eq!(
+            identity_of(&build(7, 1000, &s, &[])),
+            identity_of(&build(7, 1000, &s, &[]))
+        );
+    }
+
+    /// The three substitutions coverage cannot see. Each of these packs
+    /// matches — or can be made to match — a segment's `segment_id`/`base_pos`
+    /// coverage, and each has a different identity.
+    #[test]
+    fn different_content_yields_a_different_identity() {
+        let base = build(7, 1000, &streams(10, 4, 4096), &[]);
+        let base_id = identity_of(&base);
+
+        // A "stale replacement": same segment, same coverage, different
+        // pointer content (an earlier seal of the same range at other offsets).
+        let stale = build(7, 1000, &streams(10, 4, 8192), &[]);
+        assert_eq!(
+            parse_pack(&stale).unwrap().segment_id,
+            parse_pack(&base).unwrap().segment_id,
+            "coverage is identical..."
+        );
+        assert_eq!(
+            parse_pack(&stale).unwrap().event_count,
+            parse_pack(&base).unwrap().event_count
+        );
+        assert_ne!(identity_of(&stale), base_id, "...the identity is not");
+
+        // A "copied wrong pack": a different segment's pack.
+        assert_ne!(
+            identity_of(&build(8, 1000, &streams(10, 4, 4096), &[])),
+            base_id
+        );
+        // An extra optional section changes the directory, hence the identity.
+        assert_ne!(
+            identity_of(&build(7, 1000, &streams(10, 4, 4096), &[1, 1, 2, 3])),
+            base_id
+        );
+    }
+
+    /// A flipped bit anywhere in the header or directory fails the trailer hash
+    /// outright — there is no "wrong but parseable" identity to compare.
+    #[test]
+    fn a_flipped_header_or_directory_bit_fails_the_hash_not_the_compare() {
+        let s = streams(10, 4, 4096);
+        for at in [8usize, 24, HEADER_LEN + 8, HEADER_LEN + 32] {
+            let mut bytes = build(7, 1000, &s, &[]);
+            bytes[at] ^= 0x01;
+            assert!(
+                matches!(
+                    parse_pack(&bytes).err(),
+                    Some(PackError::Corrupt(
+                        "pack header/directory hash mismatch"
+                    ))
+                ),
+                "byte {at} must fail the trailer hash"
+            );
+        }
+        // And flipping the STORED identity itself is caught the same way: the
+        // recomputed hash no longer matches, so no pack is produced at all.
+        let mut bytes = build(7, 1000, &s, &[]);
+        let at = bytes.len() - TRAILER_LEN;
+        bytes[at] ^= 0x80;
+        assert!(parse_pack(&bytes).is_err());
     }
 }

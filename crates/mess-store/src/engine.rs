@@ -119,8 +119,9 @@ use std::time::{Duration, Instant};
 
 use mess_index::sealed::regdelta::{RegistryDelta, reg_path};
 use mess_index::sealed::{
-    BlockCache, NoDicts, ReplaySet, SealBatch, SealDriver, SealInput,
-    SealMetrics, SealStream, SealedSegmentIndex, SealedSegmentRef, SealedStore,
+    BlockCache, NoDicts, PACK_FORMAT_VERSION, PackIdentity, ReplaySet,
+    SealBatch, SealDriver, SealInput, SealMetrics, SealStream,
+    SealedSegmentIndex, SealedSegmentRef, SealedStore,
 };
 use mess_index::{ActiveIndex, BatchEntry, EventPtr, GlobalEntry, StreamEntry};
 use mess_log::committer::{
@@ -130,15 +131,19 @@ use mess_log::committer::{
 };
 use mess_log::encode::{BatchInput, PreparedBatch, Subframe};
 use mess_log::fold_chain::ChainHead;
+use mess_log::footer_ext::{
+    SealPackIdentity, SealSummary, decode_extension, encode_sealed_footer,
+};
 use mess_log::format::{
-    CHAIN_LEN, HEADER_LEN, MARKER_LEN, MAX_BATCH_LEN, SUBFRAME_HDR_LEN,
+    CHAIN_LEN, HEADER_LEN, MARKER_LEN, MAX_BATCH_LEN,
+    SEAL_PACK_IDENTITY_HDRDIR_BLAKE3, SUBFRAME_HDR_LEN,
 };
 use mess_log::lock::StoreLock;
 use mess_log::runtime::{
     FileHandle, Fs as LogFs, OpenOpts, RealRuntime, Runtime,
 };
 use mess_log::scanner::{self, AcceptedBatch};
-use mess_log::sealer::{TrailerFields, encode_trailer, read_trailer};
+use mess_log::sealer::{read_extension, read_trailer};
 use mess_log::watermark::Watermark;
 use mess_log::writer::{
     ResumeParams, SegmentParams, SegmentSummary, SegmentWriter,
@@ -3694,7 +3699,8 @@ impl LogEngine {
             // the segment R2-trusted, only after the sidecars are durable.
             let seg_path_for_parity = seg_path.clone();
             let sum = summary;
-            let finalize = move || finalize_footer(&seg_path, &sum);
+            let finalize =
+                move |identity| finalize_footer(&seg_path, &sum, identity);
             // Best-effort: on failure the segment stays unsealed + recoverable.
             if driver.seal(input, finalize).is_ok() {
                 // bn-2za: once the footer is finalized the `.log` bytes are
@@ -3858,18 +3864,39 @@ impl LogEngine {
 
         for (seg_id, cand) in opened {
             let coverage_end = cand.index.base_pos() + cand.index.event_count();
+            let seg_path = segment_path(dir, seg_id);
+            let trailer = read_trailer(fs, &seg_path).ok().flatten();
+
+            // bn-11g: if the footer NAMES a SealPack, resolve the name before
+            // anything else. Coverage cannot distinguish the pack this segment
+            // was sealed with from a stale one, a copied one, or any
+            // same-coverage substitute — the identity can, and a footer that
+            // names one is an instruction to require it (spec 01 §3.3.3 reader
+            // rules 2 and 3). A failure here refutes and quarantines, so the
+            // segment converges to a fresh, correctly-named seal (bn-30u)
+            // rather than serving unnamed bytes forever.
+            if let Some(t) = &trailer
+                && t.segment_id == seg_id
+                && t.names_seal_pack()
+            {
+                match Self::check_named_pack(fs, &seg_path, t, &cand) {
+                    Ok(()) => {}
+                    Err(reason) => {
+                        health.refute(seg_id, reason, &cand.path);
+                        continue;
+                    }
+                }
+            }
+
             // F2 (unchanged trust semantics): only a valid, cross-checking
             // footer proves the covered bytes are durable — install trust-free;
             // everything else is a pending candidate the recovery scan must
             // confirm reaches the coverage end before installing.
-            let footer_ok = read_trailer(fs, &segment_path(dir, seg_id))
-                .ok()
-                .flatten()
-                .is_some_and(|t| {
-                    t.segment_id == seg_id
-                        && t.base_pos == cand.index.base_pos()
-                        && t.end_pos == coverage_end
-                });
+            let footer_ok = trailer.is_some_and(|t| {
+                t.segment_id == seg_id
+                    && t.base_pos == cand.index.base_pos()
+                    && t.end_pos == coverage_end
+            });
             if footer_ok {
                 ids.insert(seg_id);
                 store.install(cand.index);
@@ -3878,6 +3905,69 @@ impl LogEngine {
             }
         }
         LoadedSealed { store, ids, pending, quarantined, health }
+    }
+
+    /// Resolve a footer's `SealPackIdentity` and check `cand` **is** the pack
+    /// it names (bn-11g, spec 01 §3.3.3 reader rules 2–3). `Ok(())` means the
+    /// candidate may proceed to the ordinary coverage cross-check; `Err` is the
+    /// refutation reason.
+    ///
+    /// Called only when the trailer's `SEAL_PACK_IDENTITY` flag is set — a bit
+    /// covered by `footer_crc`, not by `ext_crc`, so this function is reached
+    /// even when the extension itself is damaged. That is the whole point: an
+    /// unreadable identity MUST fail closed here rather than read as "the
+    /// footer named no pack", which is the legacy coverage-only state a
+    /// substituted pack would sail through. Every path below therefore refuses
+    /// to install; none of them can fall back to coverage-only trust.
+    ///
+    /// The candidate is not installed on `Err`, so the segment is served from
+    /// the raw log — the canonical bytes, and the only authority (D1). Nothing
+    /// here can lose a committed batch.
+    fn check_named_pack(
+        fs: &EngineFs,
+        seg_path: &Path,
+        trailer: &mess_log::sealer::SegmentCatalogEntry,
+        cand: &PendingCandidate,
+    ) -> Result<(), RefutationReason> {
+        // (a) the extension region, verified against `ext_crc`. `None` covers
+        // an empty region, a malformed locator, a short read, and a CRC
+        // mismatch — all "the name is not readable".
+        let Ok(Some(ext)) = read_extension(fs, seg_path, trailer) else {
+            return Err(RefutationReason::PackIdentityUnresolvable);
+        };
+        // (b) exactly one well-formed kind-3 section, and (c) a kind this
+        // build can check, naming this segment.
+        let Some(named) = decode_extension(&ext).pack_identity else {
+            return Err(RefutationReason::PackIdentityUnresolvable);
+        };
+        if !named.kind_is_known() || named.segment_id != trailer.segment_id {
+            return Err(RefutationReason::PackIdentityUnresolvable);
+        }
+
+        // Rule 3: the candidate must BE that pack. A legacy `.pidx` has no
+        // identity to offer and is therefore not the named pack — it is a
+        // same-coverage artifact, which is exactly the substitution the
+        // identity exists to reject.
+        let observed = cand
+            .index
+            .pack_identity()
+            .ok_or(RefutationReason::PackIdentityMismatch)?;
+        if observed.as_bytes() != &named.identity {
+            eprintln!(
+                "!!! mess SEALED PACK IDENTITY MISMATCH: segment {} footer \
+                 names {} but {} is {} — pack not installed; segment served \
+                 from the raw log (authority)",
+                trailer.segment_id,
+                named.hex(),
+                cand.path.display(),
+                observed.hex(),
+            );
+            return Err(RefutationReason::PackIdentityMismatch);
+        }
+        if cand.index.pack_format_version() != Some(named.pack_format_version) {
+            return Err(RefutationReason::PackIdentityMismatch);
+        }
+        Ok(())
     }
 
     /// Refute a candidate whose bytes did not parse (bn-30u). The segment id
@@ -4150,8 +4240,17 @@ impl LogEngine {
         // The finalize step would seal the mess-log segment footer; the engine
         // keeps the segment live for continued appends, so this is a no-op here
         // (the sealed *index* sidecar is what the cold read path consumes).
+        //
+        // bn-11g: writing no footer means writing no accepted installation
+        // record, so the pack identity is deliberately dropped here rather
+        // than recorded somewhere else. A live head has no footer at all and
+        // its candidate is confirmed by the recovery scan, exactly as before
+        // (spec 01 §3.3.3 / D-FMT-10, last paragraph); inventing a second
+        // record for it is the thing that decision explicitly rejects. The
+        // segment's next real roll-seal writes a footer that DOES name its
+        // pack.
         driver
-            .seal(input, || Ok(()))
+            .seal(input, |_identity| Ok(()))
             .map_err(|e| EngineError::SealedRead(format!("seal: {e}")))?;
         Ok(())
     }
@@ -4753,28 +4852,63 @@ fn seal_input_from_segment(
     .with_event_type_ids(event_type_ids))
 }
 
-/// Finalize a rolled segment's footer (bn-1vu): write the fixed 100-byte
-/// trailer (§3.3.1) at `content_len` and `fsync`, so recovery's R2 fast path
-/// can trust the segment. Called from the background sealer's finalize step,
-/// only after the sidecars are durable — a crash before this leaves the segment
-/// unsealed (fully scanned by recovery), losing nothing.
+/// Finalize a rolled segment's footer (bn-1vu, bn-11g): write the footer at
+/// `content_len` and `fsync`, so recovery's R2 fast path can trust the segment.
+/// Called from the background sealer's finalize step, only after the sidecars
+/// are durable — a crash before this leaves the segment unsealed (fully scanned
+/// by recovery), losing nothing.
+///
+/// When `pack` is `Some`, this footer becomes the **accepted installation
+/// record** for that exact SealPack (spec 01 §3.3.3): the extension region
+/// carries a `SealPackIdentity` section naming it and the trailer sets
+/// `SEAL_PACK_IDENTITY`. The driver has already made the named pack durable —
+/// written, hash-verified by parse-back, `fsync`ed, renamed, parent directory
+/// `fsync`ed — before handing the identity here, so this write can never name
+/// bytes that are absent or partial (see `SealDriver::seal_consolidated`).
+///
+/// `None` writes the pre-bn-11g footer byte-for-byte (empty extension, zero
+/// flags): a segment sealed without a pack names none, and its candidates keep
+/// the documented coverage-only trust (D-FMT-10).
+///
+/// The whole footer — extension **and** trailer — is one `write_all` followed
+/// by one `sync_all`, so the two coverage domains (`ext_crc`, `footer_crc`)
+/// become durable together and a torn write leaves a footer that fails
+/// `footer_crc`, i.e. an unsealed segment, not a half-named one.
 fn finalize_footer(
     seg_path: &Path,
     summary: &SegmentSummary,
+    pack: Option<PackIdentity>,
 ) -> std::io::Result<()> {
     use std::io::{Seek, SeekFrom, Write};
-    let fields = TrailerFields::phase3(
-        summary.segment_id,
-        summary.epoch,
-        summary.base_pos,
-        summary.batch_count,
-        summary.event_count,
-        summary.content_len,
-    );
-    let trailer = encode_trailer(&fields);
+    let identity = pack.map(|id| SealPackIdentity {
+        identity_kind:       SEAL_PACK_IDENTITY_HDRDIR_BLAKE3,
+        pack_format_version: PACK_FORMAT_VERSION,
+        segment_id:          summary.segment_id,
+        identity:            *id.as_bytes(),
+    });
+    let seal_summary = SealSummary {
+        segment_id:  summary.segment_id,
+        epoch:       summary.epoch,
+        base_pos:    summary.base_pos,
+        batch_count: summary.batch_count,
+        event_count: summary.event_count,
+        content_len: summary.content_len,
+    };
+    let (footer, _fields) =
+        encode_sealed_footer(&seal_summary, &[], &[], identity.as_ref());
     let mut f = std::fs::OpenOptions::new().write(true).open(seg_path)?;
     f.seek(SeekFrom::Start(summary.content_len))?;
-    f.write_all(&trailer)?;
+    f.write_all(&footer)?;
+    // The trailer MUST occupy the final `SEGMENT_TRAILER_LEN` bytes (§3.3.1,
+    // R2 pread-from-EOF). Before bn-11g every footer was exactly the trailer,
+    // so a re-seal always overwrote the previous one exactly and the length
+    // took care of itself. A footer can now SHRINK — a store re-sealed with
+    // `seal_pack` turned off writes a 100-byte unnamed footer over a longer
+    // named one — which would leave stale bytes past it and make the segment
+    // read as unsealed (a full scan: correct, but a silent, permanent
+    // regression). Truncating to exactly what was written keeps the trailer at
+    // EOF for every transition, in both directions.
+    f.set_len(summary.content_len + footer.len() as u64)?;
     f.sync_all()?;
     Ok(())
 }

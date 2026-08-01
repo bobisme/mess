@@ -16,7 +16,10 @@
 //!    so a crash leaves either no sidecar or a complete one (never a torn one).
 //! 3. **Finalize the footer**: call back into mess-log's `SegmentWriter::seal`
 //!    (the single seal `fdatasync`, §6) so recovery's R2 fast path can trust
-//!    the segment.
+//!    the segment. On the pack path the closure is handed the installed pack's
+//!    [`PackIdentity`](crate::sealed::pack::PackIdentity) so the footer can
+//!    **name** it (bn-11g, spec 01 §3.3.3) — see [`SealDriver::seal`] on why
+//!    step 2 preceding step 3 is what makes that name trustworthy.
 //! 4. **Install** the sealed index into the [`SealedStore`] (publish to
 //!    readers) and then **evict** the segment's active entries — in that order,
 //!    so the sealed-or-active invariant never gaps ([`crate::sealed::store`]).
@@ -57,6 +60,7 @@ use mess_log::metrics::{
 };
 
 use crate::sealed::filter::SegmentFilter;
+use crate::sealed::pack::PackIdentity;
 use crate::sealed::parity::{self, ParityConfig};
 use crate::sealed::payload::{
     self, PayloadError, PayloadSealOpts, SealedPayloadIndex,
@@ -428,13 +432,17 @@ impl SealDriver {
     /// evicted; returns the installed index. **Ordering guarantee:** install
     /// precedes eviction, so readers using [`crate::sealed::store::resolve`]
     /// never see a gap.
+    ///
+    /// `finalize` receives the installed pack's identity — `None` on this
+    /// legacy sidecar path, which installs no pack, so the footer it writes
+    /// names none (spec 01 §3.3.3 writer rule 3).
     pub fn seal<Fin>(
         &self,
         input: SealInput,
         finalize: Fin,
     ) -> Result<SealedSegmentRef, SealError>
     where
-        Fin: FnOnce() -> io::Result<()>,
+        Fin: FnOnce(Option<PackIdentity>) -> io::Result<()>,
     {
         if self.pack {
             return self.seal_consolidated(input, finalize);
@@ -517,8 +525,10 @@ impl SealDriver {
             None => None,
         };
 
-        // 3: finalize the footer (mess-log's single seal fsync).
-        finalize().map_err(SealError::Finalize)?;
+        // 3: finalize the footer (mess-log's single seal fsync). No pack on
+        // this path, so the footer names none (spec 01 §3.3.3 writer rule 3)
+        // and its candidates keep the documented coverage-only trust.
+        finalize(None).map_err(SealError::Finalize)?;
 
         // Parse back the bytes we just wrote (validates our own encoding; the
         // reader owns the same bytes without a re-read).
@@ -557,17 +567,41 @@ impl SealDriver {
     ///    pack embedding preserved them);
     /// 3. durably write it (temp → `fdatasync` → rename → directory `fsync`,
     ///    via [`write_durable_metered`]);
-    /// 4. finalize the segment footer (caller closure);
+    /// 4. finalize the segment footer (caller closure), handing it the pack's
+    ///    [`PackIdentity`] so the footer **names** the pack it accepted;
     /// 5. install then evict — the same gapless handoff as the sidecar path.
     ///
     /// A verify mismatch aborts before any publish and writes nothing.
+    ///
+    /// # Why the footer may name the pack (bn-11g, spec 01 §3.3.3 writer rule 2)
+    ///
+    /// The identity handed to `finalize` is taken from the index built in step
+    /// 2 — i.e. from a **parse-back of the exact bytes**, whose trailer blake3
+    /// over header + directory was recomputed and verified there — and step 3
+    /// has already run its `write_durable_metered` to completion: temp file
+    /// written, `fsync`ed, renamed onto the final name, parent directory
+    /// `fsync`ed. So by the time step 4 writes a footer naming that identity,
+    /// a pack hashing to it is complete and durable on disk. The two crash
+    /// windows both fail safe:
+    ///
+    /// - crash between 3 and 4 → a durable pack, no footer naming it. The
+    ///   segment reopens footerless, its candidate is scan-confirmed exactly as
+    ///   before, and the segment is re-queued so the footer lands (bn-30u).
+    /// - crash during 4 → a torn footer fails `footer_crc`, so §8.3 treats the
+    ///   segment as unsealed and it is fully scanned. Same as above.
+    ///
+    /// What cannot happen is the inverse — a footer naming a pack that is
+    /// absent or half-written — because nothing writes the footer until the
+    /// rename and the directory `fsync` have returned. Note also that the
+    /// footer is the **only** installation record: no marker file, no second
+    /// write, nothing that could disagree with it.
     fn seal_consolidated<Fin>(
         &self,
         input: SealInput,
         finalize: Fin,
     ) -> Result<SealedSegmentRef, SealError>
     where
-        Fin: FnOnce() -> io::Result<()>,
+        Fin: FnOnce(Option<PackIdentity>) -> io::Result<()>,
     {
         use crate::sealed::pack;
 
@@ -614,13 +648,25 @@ impl SealDriver {
         let index = SealedSegmentIndex::from_pack(bytes.clone())?;
         Self::verify_pack(&index, &input)?;
 
-        // Durable write: temp → fdatasync → rename → directory fsync.
+        // The identity of the pack we are about to install: the trailer hash
+        // `from_pack` just recomputed over these exact bytes (bn-11g). Taken
+        // from the verified parse-back, never from the buffer, so it cannot
+        // name anything the reader would not also derive.
+        let identity = index.pack_identity();
+        debug_assert!(
+            identity.is_some(),
+            "bn-11g: a pack-path index must carry an identity to name"
+        );
+
+        // Durable write: temp → fdatasync → rename → directory fsync. This
+        // must complete before the footer names the pack — see the fn docs.
         let path = self.seal_pack_path(segment_id);
         write_durable_metered(&path, &bytes, self.metrics.as_deref())
             .map_err(SealError::Write)?;
 
-        // Finalize the footer (mess-log's single seal fsync).
-        finalize().map_err(SealError::Finalize)?;
+        // Finalize the footer (mess-log's single seal fsync), naming the
+        // now-durable pack. This footer IS the accepted installation record.
+        finalize(identity).map_err(SealError::Finalize)?;
 
         let index: SealedSegmentRef = Arc::new(index);
         self.store.install(index.clone());
@@ -753,7 +799,14 @@ pub(crate) fn write_durable_metered(
 
 /// A finalize action shipped to the background thread. Boxed so callers can
 /// close over a `SegmentWriter`.
-pub type FinalizeFn = Box<dyn FnOnce() -> io::Result<()> + Send>;
+///
+/// The argument is the [`PackIdentity`] of the SealPack this seal made durable,
+/// or `None` when the seal installed no pack (the legacy sidecar path, and an
+/// on-demand seal of the still-live head). A footer written from a `Some` MUST
+/// name that identity (spec 01 §3.3.3 writer rule 1); a footer written from a
+/// `None` MUST leave the flag clear.
+pub type FinalizeFn =
+    Box<dyn FnOnce(Option<PackIdentity>) -> io::Result<()> + Send>;
 
 enum Msg {
     Seal {
@@ -791,7 +844,7 @@ impl BackgroundSealer {
         finalize: Fin,
     ) -> Receiver<Result<SealedSegmentRef, SealError>>
     where
-        Fin: FnOnce() -> io::Result<()> + Send + 'static,
+        Fin: FnOnce(Option<PackIdentity>) -> io::Result<()> + Send + 'static,
     {
         let (done, rx) = sync_channel(1);
         let msg = Msg::Seal { input, finalize: Box::new(finalize), done };
@@ -891,7 +944,7 @@ mod tests {
         let finalized = Arc::new(AtomicUsize::new(0));
         let f = finalized.clone();
         let idx = driver
-            .seal(input, move || {
+            .seal(input, move |_| {
                 f.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             })
@@ -940,7 +993,7 @@ mod tests {
 
         let finalized = Arc::new(AtomicUsize::new(0));
         let f = finalized.clone();
-        let idx = driver.seal(input(7), move || {
+        let idx = driver.seal(input(7), move |_| {
             f.fetch_add(1, Ordering::SeqCst);
             Ok(())
         });
@@ -1040,7 +1093,7 @@ mod tests {
         let store = Arc::new(SealedStore::new());
         let driver = SealDriver::new(store.clone(), dir.path());
 
-        let idx = driver.seal(input_with_registry(7), || Ok(())).unwrap();
+        let idx = driver.seal(input_with_registry(7), |_| Ok(())).unwrap();
         assert!(driver.regdelta_path(7).exists(), ".reg written");
         assert_eq!(
             delta_records(&driver, &idx, 7),
@@ -1071,7 +1124,7 @@ mod tests {
 
         let mut i = input(7);
         i.payloads = Some(vec![vec![1], vec![2], vec![3]]);
-        let idx = driver.seal(i, || Ok(())).unwrap();
+        let idx = driver.seal(i, |_| Ok(())).unwrap();
 
         assert!(!driver.regdelta_path(7).exists(), "no .reg for no registry");
         assert!(delta_records(&driver, &idx, 7).is_none());
@@ -1087,12 +1140,12 @@ mod tests {
         let dir = mess_testkit::sweeping_temp_dir("idx-driver-regdelta-bad");
         let store = Arc::new(SealedStore::new());
         let driver = SealDriver::new(store.clone(), dir.path());
-        driver.seal(input_with_registry(7), || Ok(())).unwrap();
+        driver.seal(input_with_registry(7), |_| Ok(())).unwrap();
         // A second segment with a DIFFERENT registry layout, to swap in.
         let mut other = input_with_registry(8);
         other.streams[0].batches.pop();
         other.streams[0].batches[0].frame_count = 1;
-        driver.seal(other, || Ok(())).unwrap();
+        driver.seal(other, |_| Ok(())).unwrap();
 
         let good = std::fs::read(driver.regdelta_path(7)).unwrap();
         let reopen = || SealedSegmentIndex::open(&driver.sidecar_path(7));
@@ -1147,7 +1200,7 @@ mod tests {
         let dir = mess_testkit::sweeping_temp_dir("idx-driver-regdelta-layout");
         let store = Arc::new(SealedStore::new());
         let driver = SealDriver::new(store.clone(), dir.path());
-        let sealed = driver.seal(input_with_registry(7), || Ok(())).unwrap();
+        let sealed = driver.seal(input_with_registry(7), |_| Ok(())).unwrap();
 
         // Same segment_id / base_pos / event_count, but the delta claims the
         // second registry batch sits at position 4 instead of 5.
@@ -1188,7 +1241,7 @@ mod tests {
         let store = Arc::new(SealedStore::new());
         let driver = SealDriver::new(store.clone(), dir.path());
 
-        let idx = driver.seal(input(7), || Ok(())).unwrap();
+        let idx = driver.seal(input(7), |_| Ok(())).unwrap();
 
         assert!(driver.filter_path(7).exists(), "filter file written");
         assert!(
@@ -1216,7 +1269,7 @@ mod tests {
         );
         let store = Arc::new(SealedStore::new());
         let driver = SealDriver::new(store.clone(), dir.path());
-        driver.seal(input(7), || Ok(())).unwrap();
+        driver.seal(input(7), |_| Ok(())).unwrap();
 
         // Missing filter file.
         std::fs::remove_file(driver.filter_path(7)).unwrap();
@@ -1238,7 +1291,7 @@ mod tests {
         );
 
         // Corrupt filter file (seal again to recreate it, then flip a byte).
-        driver.seal(input(8), || Ok(())).unwrap();
+        driver.seal(input(8), |_| Ok(())).unwrap();
         let fp = driver.filter_path(8);
         let mut bytes = std::fs::read(&fp).unwrap();
         bytes[0] ^= 0xFF;
@@ -1281,7 +1334,7 @@ mod tests {
         assert_eq!(s0.seal_duration.count, 0);
         assert!(!s0.fsync_degraded);
 
-        driver.seal(input(7), || Ok(())).unwrap();
+        driver.seal(input(7), |_| Ok(())).unwrap();
 
         let s = metrics.snapshot();
         assert_eq!(s.seals, 1, "one seal recorded");
@@ -1313,7 +1366,7 @@ mod tests {
         );
         let store = Arc::new(SealedStore::new());
         let driver = SealDriver::new(store.clone(), dir.path());
-        let idx = driver.seal(input(7), || Ok(())).unwrap();
+        let idx = driver.seal(input(7), |_| Ok(())).unwrap();
         assert_eq!(idx.resolve(10, 1).unwrap().unwrap().offset, 4096);
         assert!(store.get(7).is_some());
     }
@@ -1326,7 +1379,7 @@ mod tests {
         );
         let store = Arc::new(SealedStore::new());
         let driver = SealDriver::new(store.clone(), dir.path());
-        let r = driver.seal(input(7), || Err(io::Error::other("boom")));
+        let r = driver.seal(input(7), |_| Err(io::Error::other("boom")));
         assert!(matches!(r, Err(SealError::Finalize(_))));
         assert!(store.get(7).is_none(), "not installed on finalize failure");
         assert!(!store.is_evicted(7));
@@ -1448,7 +1501,7 @@ mod tests {
 
         // Seal through the normal live path (`driver.seal`, the same call
         // `BackgroundSealer::run` makes).
-        let idx = driver.seal(input, || Ok(())).unwrap();
+        let idx = driver.seal(input, |_| Ok(())).unwrap();
 
         // The `.pcol` sidecar was written next to the `.pidx`.
         assert!(
@@ -1534,7 +1587,7 @@ mod tests {
             payloads:       Some(payloads.clone()),
             event_type_ids: None,
         };
-        driver.seal(input, || Ok(())).unwrap();
+        driver.seal(input, |_| Ok(())).unwrap();
 
         // Control: the healthy sibling attaches on reopen.
         let ok = SealedSegmentIndex::open(&driver.sidecar_path(5)).unwrap();
@@ -1596,7 +1649,7 @@ mod tests {
         );
         let store = Arc::new(SealedStore::new());
         let driver = SealDriver::new(store.clone(), dir.path());
-        let idx = driver.seal(input(7), || Ok(())).unwrap();
+        let idx = driver.seal(input(7), |_| Ok(())).unwrap();
         assert!(
             !driver.payload_sidecar_path(7).exists(),
             "no .pcol for pointer-only seal"
@@ -1636,7 +1689,7 @@ mod tests {
             payloads:       Some(payloads.clone()),
             event_type_ids: None,
         };
-        let rx = sealer.submit(input, || Ok(()));
+        let rx = sealer.submit(input, |_| Ok(()));
         let idx = rx.recv().unwrap().unwrap();
         assert!(
             driver.payload_sidecar_path(4).exists(),
@@ -1661,10 +1714,144 @@ mod tests {
         let active = crate::ActiveIndex::new();
         let sealer = BackgroundSealer::spawn(driver);
 
-        let rx = sealer.submit(input(3), || Ok(()));
+        let rx = sealer.submit(input(3), |_| Ok(()));
         let idx = rx.recv().unwrap().unwrap();
         assert_eq!(idx.segment_id(), 3);
         assert_eq!(resolve(&active, &store, 10, 1).unwrap().offset, 4096);
         sealer.shutdown();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// bn-11g — the identity handed to `finalize`, and the ordering that makes it
+// trustworthy (spec 01 §3.3.3 writer rule 2)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod pack_identity_tests {
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::sealed::segment::{SealBatch, SealStream};
+
+    fn input(segment_id: u64, offset: u64) -> SealInput {
+        SealInput {
+            segment_id,
+            base_pos: 0,
+            streams: vec![SealStream {
+                stream_id: 10,
+                batches:   vec![SealBatch {
+                    first_version: 0,
+                    frame_count: 8,
+                    first_global_pos: 0,
+                    offset,
+                }],
+            }],
+            payloads: Some((0..8u8).map(|i| vec![0xAB, i]).collect()),
+            event_type_ids: Some((0..8u32).map(|i| (i % 2) + 1).collect()),
+        }
+    }
+
+    /// **The install-ordering guarantee.** When the footer-finalize step runs,
+    /// the pack it is about to name is already complete and durable under its
+    /// real name — so a footer can never name bytes that are absent or partial.
+    ///
+    /// Asserted from *inside* the finalize closure, which is the only place
+    /// that can observe the ordering: the closure re-reads the file from disk,
+    /// re-verifies it independently (`open_pack_eager`, full section
+    /// checksums), and checks the identity it derives equals the one it was
+    /// handed. If the driver ever wrote the footer first, or handed an identity
+    /// computed from a buffer rather than a verified parse, this fails.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn the_named_pack_is_durable_and_verified_before_finalize_runs() {
+        let dir = mess_testkit::sweeping_temp_dir("idx-driver-ident-order");
+        let store = Arc::new(SealedStore::new());
+        let driver = SealDriver::new(store.clone(), dir.path()).with_pack(true);
+        let path = driver.seal_pack_path(4);
+
+        let seen: Arc<Mutex<Option<PackIdentity>>> = Arc::new(Mutex::new(None));
+        let seen_w = Arc::clone(&seen);
+        let path_c = path.clone();
+        let idx = driver
+            .seal(input(4, 4096), move |identity| {
+                let identity = identity.expect("a pack seal names its pack");
+                // Durable, under its real name, before the footer exists.
+                assert!(
+                    path_c.exists(),
+                    "the pack must be renamed into place before finalize"
+                );
+                // Independently re-derived from the bytes on disk, with every
+                // section verified — not the buffer the driver had in hand.
+                let reread =
+                    SealedSegmentIndex::open_pack_eager(&path_c).unwrap();
+                assert_eq!(
+                    reread.pack_identity(),
+                    Some(identity),
+                    "the named identity must be what a reader derives"
+                );
+                *seen_w.lock().unwrap() = Some(identity);
+                Ok(())
+            })
+            .unwrap();
+
+        let named = seen.lock().unwrap().expect("finalize ran");
+        assert_eq!(idx.pack_identity(), Some(named), "installed index agrees");
+        // And a fresh lazy open — the engine's actual open path — derives the
+        // same identity as the eager one.
+        assert_eq!(
+            SealedSegmentIndex::open_pack(&path).unwrap().pack_identity(),
+            Some(named),
+        );
+        assert_eq!(
+            idx.pack_format_version(),
+            Some(crate::sealed::pack::FORMAT_VERSION)
+        );
+    }
+
+    /// A seal that installs no pack names none: the legacy sidecar path hands
+    /// `finalize` a `None`, so the footer it writes keeps the documented
+    /// coverage-only compatibility policy (spec 01 D-FMT-10) rather than
+    /// claiming a binding it cannot back.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn the_sidecar_path_names_no_pack() {
+        let dir = mess_testkit::sweeping_temp_dir("idx-driver-ident-sidecar");
+        let store = Arc::new(SealedStore::new());
+        let driver = SealDriver::new(store, dir.path()); // pack mode OFF
+        let saw = Arc::new(Mutex::new(Some(PackIdentity::from_bytes([9; 32]))));
+        let saw_w = Arc::clone(&saw);
+        let idx = driver
+            .seal(input(5, 4096), move |identity| {
+                *saw_w.lock().unwrap() = identity;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(*saw.lock().unwrap(), None);
+        assert_eq!(idx.pack_identity(), None, "a .pidx has no identity");
+    }
+
+    /// Two seals of *different* content produce different identities, and each
+    /// footer would name its own — the property that makes a stale replacement
+    /// detectable at all.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_reseal_with_different_content_names_a_different_pack() {
+        let dir = mess_testkit::sweeping_temp_dir("idx-driver-ident-reseal");
+        let seal = |offset: u64| {
+            let store = Arc::new(SealedStore::new());
+            let driver = SealDriver::new(store, dir.path()).with_pack(true);
+            driver
+                .seal(input(6, offset), |_| Ok(()))
+                .unwrap()
+                .pack_identity()
+                .unwrap()
+        };
+        let first = seal(4096);
+        let second = seal(8192); // same coverage, different pointer content
+        assert_ne!(
+            first, second,
+            "a re-seal over changed content must be a different pack"
+        );
     }
 }

@@ -206,6 +206,33 @@ fn forged_sidecar(segment_id: u64, base_pos: u64, frame_count: u32) -> Vec<u8> {
     })
 }
 
+/// bn-11g: the SealPack identity `seg`'s footer NAMES (spec 01 §3.3.3), or
+/// `None` for a footer that names none (unsealed, or the legacy policy).
+fn named_pack_identity(store: &Path, seg: u64) -> Option<[u8; 32]> {
+    use mess_log::footer_ext::decode_extension;
+    use mess_log::runtime::real::RealFs;
+    use mess_log::sealer::{read_extension, read_trailer};
+
+    let log = store.join(format!("seg-{seg:08}.log"));
+    let cat = read_trailer(&RealFs, &log).ok().flatten()?;
+    if !cat.names_seal_pack() {
+        return None;
+    }
+    let ext = read_extension(&RealFs, &log, &cat).ok().flatten()?;
+    decode_extension(&ext).pack_identity.map(|n| n.identity)
+}
+
+/// bn-11g: what the pack on disk actually hashes to — derived independently of
+/// the footer, which is the point of the comparison.
+fn pack_identity_on_disk(store: &Path, seg: u64) -> Option<[u8; 32]> {
+    mess_index::sealed::SealedSegmentIndex::open_pack_eager(&candidate_path(
+        store, seg, "seal",
+    ))
+    .ok()?
+    .pack_identity()
+    .map(|i| *i.as_bytes())
+}
+
 /// Wait for the background re-seal to put a fresh candidate back under its
 /// real name. Bounded; the sealer gate is already satisfied at open (recovery
 /// seeded both the hot index and the published watermark), so this normally
@@ -768,6 +795,15 @@ async fn a_refuted_head_candidate_is_quarantined_but_never_footer_finalized() {
 /// The consolidated **SealPack** (`.seal`) candidate takes the identical
 /// lifecycle — one self-contained file, so its quarantine family is just
 /// itself, and a `.seal` quarantine can never collide with a `.pidx` one.
+///
+/// **bn-11g extension.** The re-seal this lifecycle produces is a genuinely
+/// NEW pack (rebuilt from the log, not a copy of the refuted bytes), so the
+/// footer it writes must name *that* pack's identity — spec 01 §3.3.3. Without
+/// that, a converged store would carry a footer naming a pack that no longer
+/// exists and would refute itself on every subsequent open, turning bn-30u's
+/// convergence into a permanent loop. The assertions below pin the whole
+/// before/after: the original footer names the original pack, and the
+/// converged footer names the converged one.
 #[tokio::test]
 async fn a_corrupt_seal_pack_candidate_takes_the_same_lifecycle() {
     fn pack_opts() -> EngineOptions {
@@ -781,6 +817,16 @@ async fn a_corrupt_seal_pack_candidate_takes_the_same_lifecycle() {
 
     let victim = a_rolled_sealed_segment(&store, "seal");
     let packs_before = count_ext(&sealed_dir(&store), "seal");
+
+    // bn-11g: before the damage, the footer names exactly the pack on disk.
+    let named_before = named_pack_identity(&store, victim)
+        .expect("a pack-mode seal names its pack");
+    assert_eq!(
+        Some(named_before),
+        pack_identity_on_disk(&store, victim),
+        "the footer names the pack that is actually there"
+    );
+
     std::fs::write(
         candidate_path(&store, victim, "seal"),
         b"a pack whose whole-pack hash cannot possibly verify",
@@ -805,6 +851,21 @@ async fn a_corrupt_seal_pack_candidate_takes_the_same_lifecycle() {
     assert_eq!(engine.sealed_candidate_health().refuted(), 0);
     assert_eq!(engine.sealed_segment_count(), packs_before);
     assert_reads_match(&engine, &baseline).await;
+
+    // bn-11g: the converged footer names the CONVERGED pack. It is a different
+    // pack from the one that was refuted — rebuilt from the log — so a footer
+    // left pointing at the old identity would refute this store forever.
+    let named_after = named_pack_identity(&store, victim)
+        .expect("the re-seal names its pack");
+    assert_eq!(
+        Some(named_after),
+        pack_identity_on_disk(&store, victim),
+        "the re-sealed footer names the re-sealed pack"
+    );
+    assert_ne!(
+        named_after, named_before,
+        "the re-seal is a new pack, so the name had to be rewritten with it"
+    );
 }
 
 /// Several candidates refuted in one open: each is judged once, each is

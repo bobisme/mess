@@ -74,6 +74,11 @@ use crate::scanner::{self, Recovery};
 /// (`ext_offset == content_len`, `ext_len == 0`, `ext_crc == 0`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrailerFields {
+    /// Trailer `flags` (§3.3.1). `0` for a plain seal; bit 0
+    /// ([`FOOTER_FLAG_SEAL_PACK_IDENTITY`]) says the extension region names
+    /// the SealPack this seal installed (§3.3.3, bn-11g). Covered by
+    /// `footer_crc`.
+    pub flags:       u16,
     /// MUST equal the `SegmentHeader.segment_id` (§3.3.1).
     pub segment_id:  u64,
     /// R3: the trailer carries the A9 epoch; MUST equal the header's `epoch`.
@@ -107,6 +112,7 @@ impl TrailerFields {
         content_len: u64,
     ) -> Self {
         TrailerFields {
+            flags: 0,
             segment_id,
             epoch,
             base_pos,
@@ -116,6 +122,12 @@ impl TrailerFields {
             ext_len: 0,
             ext_crc: 0,
         }
+    }
+
+    /// Whether this trailer's extension names an installed SealPack (§3.3.3).
+    #[must_use]
+    pub fn names_seal_pack(&self) -> bool {
+        self.flags & FOOTER_FLAG_SEAL_PACK_IDENTITY != 0
     }
 
     /// `end_pos = base_pos + event_count`: the A1 seed handed across the
@@ -138,9 +150,14 @@ pub fn encode_trailer(t: &TrailerFields) -> [u8; SEGMENT_TRAILER_LEN] {
         "§3.3.1: ext_crc MUST be 0 when ext_len == 0"
     );
     let mut b = [0u8; SEGMENT_TRAILER_LEN];
+    debug_assert_eq!(
+        t.flags & !FOOTER_FLAGS_KNOWN_MASK,
+        0,
+        "§3.3.1: a v3 writer MUST NOT set a reserved trailer flag bit"
+    );
     put_u32(&mut b, FT_MAGIC_OFF, FOOTER_MAGIC);
     put_u16(&mut b, FT_FORMAT_VERSION_OFF, FORMAT_VERSION);
-    put_u16(&mut b, FT_FLAGS_OFF, 0); // reserved, MUST be 0
+    put_u16(&mut b, FT_FLAGS_OFF, t.flags);
     put_u64(&mut b, FT_SEGMENT_ID_OFF, t.segment_id);
     put_u64(&mut b, FT_EPOCH_OFF, t.epoch);
     put_u64(&mut b, FT_BASE_POS_OFF, t.base_pos);
@@ -164,6 +181,9 @@ pub fn encode_trailer(t: &TrailerFields) -> [u8; SEGMENT_TRAILER_LEN] {
 /// is the advisory, rebuildable seed (R2/D1) — never a commit authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentCatalogEntry {
+    /// Trailer `flags` (§3.3.1), covered by `footer_crc`. See
+    /// [`Self::names_seal_pack`]. Unknown bits are ignored (forward compat).
+    pub flags:       u16,
     pub segment_id:  u64,
     /// R3/A9 epoch, covered by `footer_crc`.
     pub epoch:       u64,
@@ -176,6 +196,24 @@ pub struct SegmentCatalogEntry {
     pub ext_offset:  u64,
     pub ext_len:     u64,
     pub ext_crc:     u32,
+}
+
+impl SegmentCatalogEntry {
+    /// Whether this footer **names** an installed SealPack (§3.3.3, bn-11g) —
+    /// the `SEAL_PACK_IDENTITY` flag bit, read from the same 100-byte
+    /// pread-from-EOF the fast path already does, and covered by the same
+    /// `footer_crc`.
+    ///
+    /// `true` obliges the caller to resolve the identity from the extension
+    /// region ([`read_extension`] + [`crate::footer_ext::decode_extension`])
+    /// and to install **no** SealPack for this segment if it cannot — a
+    /// corrupt extension must never be read as "no pack was named", which is
+    /// the legacy coverage-only state (§3.3.3 reader rule 2, and the
+    /// [`crate::footer_ext`] module docs on why the bit lives here).
+    #[must_use]
+    pub fn names_seal_pack(&self) -> bool {
+        self.flags & FOOTER_FLAG_SEAL_PACK_IDENTITY != 0
+    }
 }
 
 /// Decode + validate the fixed trailer from the final [`SEGMENT_TRAILER_LEN`]
@@ -200,6 +238,7 @@ pub fn decode_trailer(tail: &[u8]) -> Option<SegmentCatalogEntry> {
         return None;
     }
     Some(SegmentCatalogEntry {
+        flags:       rd_u16(t, FT_FLAGS_OFF),
         segment_id:  rd_u64(t, FT_SEGMENT_ID_OFF),
         epoch:       rd_u64(t, FT_EPOCH_OFF),
         base_pos:    rd_u64(t, FT_BASE_POS_OFF),
@@ -237,6 +276,57 @@ pub fn read_trailer<F: Fs>(
         filled += n;
     }
     Ok(decode_trailer(&buf))
+}
+
+/// Read the footer **extension region** a validated trailer locates, and check
+/// it against the trailer's `ext_crc` (§02 §8.3).
+///
+/// Returns `Ok(Some(bytes))` only when the region was read whole and its CRC
+/// matched; `Ok(None)` for every other outcome — an empty region
+/// (`ext_len == 0`), a locator that runs past the trailer, a short read, or a
+/// CRC mismatch. Collapsing those into one `None` is deliberate: §02 §8.3 says
+/// a reader MUST NOT trust a *partially* readable extension, so there is no
+/// caller-visible difference between "corrupt" and "absent" *for the region's
+/// contents*. The difference that does matter — whether a
+/// [`SealPackIdentity`](crate::footer_ext::SealPackIdentity) was written at all
+/// — is carried by [`SegmentCatalogEntry::names_seal_pack`] in the separately
+/// checksummed trailer, precisely so it survives this collapse.
+pub fn read_extension<F: Fs>(
+    fs: &F,
+    path: &Path,
+    cat: &SegmentCatalogEntry,
+) -> io::Result<Option<Vec<u8>>> {
+    if cat.ext_len == 0 {
+        return Ok(None);
+    }
+    // The region must lie strictly inside the file, ending exactly where the
+    // trailer begins (`sealed_len`); anything else is a malformed locator.
+    let file = fs.open(path, OpenOpts::read_only())?;
+    let len = file.len()?;
+    let Some(end) = cat.ext_offset.checked_add(cat.ext_len) else {
+        return Ok(None);
+    };
+    if end + SEGMENT_TRAILER_LEN as u64 > len
+        || cat.ext_offset < SEGMENT_HEADER_LEN as u64
+    {
+        return Ok(None);
+    }
+    // A hostile/garbage `ext_len` must not become an allocation, so it is
+    // bounded by the file itself before the buffer exists.
+    let mut buf = vec![0u8; cat.ext_len as usize];
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let n =
+            file.pread(cat.ext_offset + filled as u64, &mut buf[filled..])?;
+        if n == 0 {
+            return Ok(None); // short region: treat as absent (§8.3).
+        }
+        filled += n;
+    }
+    if crc32c::crc32c(&buf) != cat.ext_crc {
+        return Ok(None);
+    }
+    Ok(Some(buf))
 }
 
 /// The result of [`recover_fast`]: either the segment was trusted via its
