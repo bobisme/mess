@@ -1,8 +1,12 @@
 //! [`PackSnapshotBackend`]: the storage-neutral, pack-based snapshot sidecar —
-//! a drop-in [`SnapshotStore`] that replaces
-//! [`FjallSnapshotBackend`](crate::FjallSnapshotBackend)'s fjall head table
-//! and positional blob directory with **immutable self-describing packs plus a
-//! bounded discovery root** (ADR 0002 §1, bone `bn-ozi5`).
+//! the one [`SnapshotStore`] implementation. It stores snapshots as
+//! **immutable self-describing packs plus a bounded discovery root** (ADR 0002
+//! §1, bone `bn-ozi5`), built out of std alone.
+//!
+//! It replaced a key-value-store-backed head table plus a positional blob
+//! directory, which `bn-3l8n` stopped constructing and `bn-fj34` deleted along
+//! with the second storage engine underneath it — this crate now composes over
+//! exactly one durable authority, the log.
 //!
 //! # The one law everything else serves
 //!
@@ -58,10 +62,10 @@
 //! mode is a constructor option ([`SidecarOptions::mode`]) and a direct
 //! [`Sidecar::save_with_mode`] call:
 //!
-//! - [`SaveMode::Buffered`] (the default, matching today's Fjall semantics) is
-//!   a discardable cache write. It still validates the frame it wrote and still
-//!   installs the root by atomic rename, but issues no barrier and promises
-//!   nothing about power loss.
+//! - [`SaveMode::Buffered`] (the default, matching the journal-buffered
+//!   semantics the superseded head table had) is a discardable cache write. It
+//!   still validates the frame it wrote and still installs the root by atomic
+//!   rename, but issues no barrier and promises nothing about power loss.
 //! - [`SaveMode::Durable`] acknowledges only after the closure the new root
 //!   names is synced: the active pack through the highest referenced record end
 //!   (which sweeps in every inherited `Buffered`-only record for unrelated
@@ -112,8 +116,7 @@ use crate::version::Version;
 
 /// Failure of a [`PackSnapshotBackend`] operation.
 ///
-/// Mirrors [`SnapshotBackendError`](crate::SnapshotBackendError)'s shape: the
-/// wrapped log backend's error, plus the sidecar's own. Note what is *not*
+/// The wrapped log backend's error, plus the sidecar's own. Note what is *not*
 /// here — there is no "snapshot corrupt" variant, because corruption is never
 /// an error, only a miss.
 #[derive(Debug, thiserror::Error)]
@@ -304,7 +307,7 @@ impl<B: Backend> SnapshotStore for PackSnapshotBackend<B> {
     }
 }
 
-/// Pure delegation, exactly as the fjall backend does: the sidecar adds no
+/// Pure delegation: the sidecar adds no
 /// subscription state, so a live-tail subscription over
 /// `PackSnapshotBackend<B>` is a subscription over `B`.
 impl<B: SubscribeBackend> SubscribeBackend for PackSnapshotBackend<B> {

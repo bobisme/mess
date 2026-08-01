@@ -223,8 +223,10 @@ fn tail_expected_version(p: usize) -> Version {
 /// `fold(s0, all) == fold(snapshot.state, tail)` across thousands of random
 /// event sequences with the snapshot taken at a random prefix point.
 ///
-/// The iteration count defaults to 3000 real fjall+`LogEngine` fsync-bound
-/// iterations, which is ~62 minutes in `--release` on the reference host —
+/// The iteration count defaults to 3000 real-filesystem `LogEngine`
+/// fsync-bound iterations, which is ~62 minutes in `--release` on the
+/// reference host (the figure was measured pre-bn-fj34, when the snapshot
+/// sidecar was still a second storage engine) —
 /// well past most tool/CI timeouts. Override it for quick local runs or CI
 /// smoke passes with the `MESS_SNAPSHOT_LAW_ITERS` env var, e.g.
 /// `MESS_SNAPSHOT_LAW_ITERS=25 cargo test -p mess-store --test snapshot_law`.

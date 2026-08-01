@@ -44,7 +44,7 @@ pub struct BackupFileEntry {
     pub len:        u64,
     /// CRC32C over exactly those `len` bytes.
     pub crc32c:     u32,
-    /// `sealed` | `active` | `sidecar` | `meta`.
+    /// `sealed` | `active` | `sidecar` (bn-fj34 retired the `meta` role).
     pub role:       String,
     /// Bytes copied from the source (for the active segment, the cut
     /// `safe_offset`; for a whole file, equal to `len`).
@@ -75,7 +75,7 @@ pub struct CutFile {
     pub rel:            String,
     /// Bytes to copy (whole file, or the active prefix `safe_offset`).
     pub copied_len:     u64,
-    /// `sealed` | `active` | `sidecar` | `meta`.
+    /// `sealed` | `active` | `sidecar` (bn-fj34 retired the `meta` role).
     pub role:           &'static str,
     /// Content-stable (immutable) files can be skipped on an incremental run;
     /// the active prefix cannot.
@@ -190,15 +190,16 @@ pub fn compute_cut(dir: &Path) -> Cut {
         cut.files.push(active);
     }
 
-    // The `meta/` interner tables (`stream_names`/`type_names`) are the durable
-    // source of truth for the name↔id bijection and are NOT rebuildable from
-    // the log (bn-20b / bn-150; unlike every other meta table). A restored
-    // store cannot resolve stream/type names without them, so the whole `meta/`
-    // dir travels with the cut. bn-150 fsyncs a newly-interned name's row
-    // durable *before* its covering append becomes durable, so every stream in
-    // the committed cut already has its name durable in `meta/` at cut time
-    // (doc 07 §1.2). It is copied after the log cut to minimise skew.
-    collect_meta(dir, &mut cut.files);
+    // bn-fj34, deliberate exclusion: there is no `meta/` in the cut, because
+    // there is no `meta/` in the store. This used to recursively copy a
+    // `<dir>/meta` key-value store on the grounds that its `stream_names` /
+    // `type_names` interner tables were the sole durable copy of the name↔id
+    // bijection and were NOT rebuildable from the log (doc 07 §1.2). bn-2di
+    // moved that bijection INTO the log as the `$registry` stream, which the
+    // cut already carries, and bn-fj34 deleted the storage engine that held
+    // the leftover directory. A restored store folds `$registry` out of the
+    // very segments this cut copies — the last non-rebuildable metadata
+    // artifact is gone, so the cut is now the log and nothing else.
 
     // bn-3l8n, deliberate exclusion: the app snapshot sidecar
     // (`store::snapshot_pack_dir`) is NOT in the cut. It is discardable
@@ -213,38 +214,6 @@ pub fn compute_cut(dir: &Path) -> Cut {
     cut.min_segment_id = if min_seg == u64::MAX { 0 } else { min_seg };
     cut.max_segment_id = max_seg;
     cut
-}
-
-/// Recursively enumerate the `meta/` directory into cut files (role `meta`).
-/// Meta is small and its LSM files mutate, so it is never skipped on an
-/// incremental run.
-fn collect_meta(dir: &Path, files: &mut Vec<CutFile>) {
-    let meta_root = store::meta_dir(dir);
-    let mut stack = vec![meta_root.clone()];
-    while let Some(cur) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&cur) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(ft) = entry.file_type() else { continue };
-            if ft.is_dir() {
-                stack.push(path);
-            } else if ft.is_file()
-                && let Ok(meta) = std::fs::metadata(&path)
-                && let Ok(rel) = path.strip_prefix(dir)
-                && let Some(rel) = rel.to_str()
-            {
-                files.push(CutFile {
-                    src:            path.clone(),
-                    rel:            rel.replace('\\', "/"),
-                    copied_len:     meta.len(),
-                    role:           "meta",
-                    content_stable: false,
-                });
-            }
-        }
-    }
 }
 
 /// Read `[0, copied_len)` of `src`, returning the bytes and their CRC32C.

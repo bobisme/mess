@@ -41,24 +41,78 @@ pub fn run(dir: &Path) -> Report {
 
     // Live snapshots drive the decision. A §4.2 empty-prefix snapshot has no
     // certification frames, so it is filtered out before the decision.
-    let live: Vec<LiveSnapshotRef> = match metaread::read(dir) {
-        Ok(facts) => facts
+    //
+    // bn-fj34: `metaread::read` is the lock-free pack-sidecar reader and is
+    // infallible, so the old `snapshots-unavailable` advisory (a locked or
+    // unreadable metadata store => explain against an empty live set, flagged)
+    // is gone with the store that produced it. An empty set here means the
+    // store genuinely has no live snapshots.
+    //
+    // # The id spaces must be joined, not assumed equal
+    //
+    // `decide_segment` matches `LiveSnapshotRef::stream_id` against the SEALED
+    // INDEX's stream ids, which are the engine's **interned dense** ids (the
+    // sealer writes `AcceptedBatch::stream_id` straight into the sidecar).
+    // A snapshot's own `stream_id` is the **interim FNV** hash of its stream
+    // name — a different space entirely, which can only collide with a dense
+    // id by accident. Feeding FNV ids to `decide_segment` therefore matches
+    // nothing and reports every segment `deletable`: silently vacuous, in the
+    // dangerous direction, for an explainer that fronts a destructive
+    // operation.
+    //
+    // So resolve properly: the pack record is self-describing and carries its
+    // stream NAME (ADR 0002 §1), and the log's `$registry` is the authority for
+    // name -> dense id (`bn-2di`). `registryfold::fold` is the same offline,
+    // lock-free fold `inspect` uses, so this join needs no writer lock and no
+    // second metadata copy. A snapshot whose name the registry does not know
+    // cannot have certification frames in this log's segments, so it drops out.
+    let facts = metaread::read(dir);
+    let folded = crate::registryfold::fold(dir);
+    let mut unresolved = 0usize;
+    let live: Vec<LiveSnapshotRef> = match &folded {
+        Ok(state) => facts
             .snapshots
             .iter()
             .filter(|s| !s.covers_empty_prefix)
-            .map(|s| LiveSnapshotRef {
-                stream_id: s.stream_id,
-                version:   s.version,
+            .filter_map(|s| match state.stream_id(&s.stream) {
+                Some(dense) => Some(LiveSnapshotRef {
+                    stream_id: dense,
+                    version:   s.version,
+                }),
+                None => {
+                    unresolved += 1;
+                    None
+                }
             })
             .collect(),
         Err(reason) => {
-            // Without the live snapshot set we cannot compute blockers; report
-            // it as an advisory and treat the live set as empty (everything
-            // deletable), which is the safe-to-explain fallback but flagged.
-            report.advise("snapshots-unavailable", &reason);
+            // Without the bijection we cannot place any snapshot in the id
+            // space the decision function speaks. Explaining against an empty
+            // live set would under-report blockers, so say so loudly.
+            report.push_finding(Finding::new(
+                Severity::Warn,
+                "retention",
+                "registry-unfoldable",
+                format!(
+                    "the $registry does not fold out of this log, so snapshot \
+                     blockers cannot be resolved to stream ids and the \
+                     verdicts below account for LEASES ONLY — do not delete \
+                     on this report: {reason}"
+                ),
+            ));
             Vec::new()
         }
     };
+    if unresolved > 0 {
+        report.advise(
+            "snapshot-stream-unregistered",
+            &format!(
+                "{unresolved} live snapshot(s) name a stream this log's \
+                 $registry does not know; they cannot have certification \
+                 frames here and were not counted as blockers"
+            ),
+        );
+    }
     report.set(
         "live_snapshots",
         json!(

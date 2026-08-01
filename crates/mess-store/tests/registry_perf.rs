@@ -62,8 +62,8 @@ async fn new_stream_appends(
     )
     .expect("open");
 
-    // Warm: the first append pays one-time costs (segment prealloc, fjall
-    // memtable init) that are not what we are measuring.
+    // Warm: the first append pays one-time costs (segment prealloc, committer
+    // spin-up) that are not what we are measuring.
     engine
         .append_batch("warm", Version::NoStream, &[rec("warm.t", b"w")])
         .await

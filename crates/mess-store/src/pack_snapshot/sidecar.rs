@@ -48,14 +48,14 @@ pub enum PackSidecarError {
 }
 
 /// Tunables for a sidecar. Every default is chosen so a caller that passes
-/// [`Default::default`] gets today's Fjall-equivalent semantics (buffered,
+/// [`Default::default`] gets the superseded head table's semantics (buffered,
 /// discardable) with the new crash contract.
 #[derive(Debug, Clone, Copy)]
 pub struct SidecarOptions {
     /// Publication mode for saves. [`SaveMode::Buffered`] by default — a
-    /// discardable cache write, matching the Fjall backend's journal-buffered
-    /// head. [`SaveMode::Durable`] acknowledges only after the covering pack
-    /// frames and directory entries are synced.
+    /// discardable cache write, matching the superseded backend's
+    /// journal-buffered head. [`SaveMode::Durable`] acknowledges only
+    /// after the covering pack frames and directory entries are synced.
     pub mode:           SaveMode,
     /// Roll the active build pack once it would exceed this many bytes. A
     /// single record larger than the limit still gets its own pack rather
@@ -584,7 +584,7 @@ impl Sidecar {
     pub fn head_count(&self) -> usize { self.read_heads().len() }
 
     /// Every published head's stream name. Because a pack record is
-    /// self-describing, no reverse `id -> name` side map is needed (the Fjall
+    /// self-describing, no reverse `id -> name` side map is needed (the retired
     /// path required one).
     #[must_use]
     pub fn stream_names(&self) -> Vec<String> {

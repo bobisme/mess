@@ -19,7 +19,7 @@ async fn main() {
     // `EventStore` is the north-star facade: `load` / `append` / `command`
     // over any `Backend`. The default backend is now the composed production
     // engine (`LogEngine`): `mess-log` (durable append log + recovery) +
-    // `mess-index` (hot/sealed index + fjall meta tables). The interim
+    // `mess-index` (hot/sealed pointer index). The interim
     // in-memory backend is behind mess-store's `mock` feature. Nothing below
     // this line changes with the backend — that is the API-first payoff.
     //

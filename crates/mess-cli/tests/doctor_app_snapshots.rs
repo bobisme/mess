@@ -194,7 +194,7 @@ async fn doctor_fold_version_check_fires_on_a_real_app_store() {
 
     // The fold-version check's data source now SEES every app snapshot — the
     // id spaces are unified (sidecar heads joined to their stream names).
-    let facts = metaread::read(dir.path()).expect("read meta");
+    let facts = metaread::read(dir.path());
     assert_eq!(
         facts.snapshots.len(),
         STREAMS,
@@ -281,7 +281,7 @@ async fn default_policy_persists_nothing_and_check_stays_ok() {
         }
     }
 
-    let facts = metaread::read(dir.path()).expect("read meta");
+    let facts = metaread::read(dir.path());
     assert!(
         facts.snapshots.is_empty(),
         "default (never) policy must persist no snapshots"

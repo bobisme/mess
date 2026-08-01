@@ -1,17 +1,29 @@
 //! `mess rebuild-index <dir>` — I5 made executable.
 //!
-//! From bare `.log` segments, rebuild the sealed pointer sidecars (`.pidx`)
-//! and the derivable metadata tables (stream heads). The sidecar bytes are
+//! From bare `.log` segments, rebuild the sealed pointer sidecars (`.pidx`).
+//! The sidecar bytes are
 //! produced by the exact [`encode_sidecar`] the sealer uses, so a rebuild from
 //! an intact segment is **byte-equal** to the original sidecar (the acceptance
 //! test). The `.pidx` is the only authoritative artifact rebuilt here; the
 //! payload (`.pcol`) and filter (`.filter`) siblings are advisory and left to
 //! the sealer.
+//!
+//! # bn-fj34: `--meta` is gone
+//!
+//! This command used to take a `--meta` flag that additionally opened a
+//! `<dir>/meta` key-value store and wrote a derived `stream_heads` table into
+//! it. Nothing ever read that table: the engine's per-stream heads live in its
+//! resident `Book`, rebuilt on open from batch headers and sealed directory
+//! summaries, and it ignored `<dir>/meta` entirely even when the directory was
+//! deleted wholesale (`mess-store`'s `engine_name_durability` suite proves
+//! exactly that). Worse, the generic commit-group write advanced *snapshot* and
+//! *dedupe* high-water marks it had written nothing to. The flag created a
+//! store the product does not have, so it was removed with the storage engine
+//! behind it rather than kept as a no-op.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use mess_index::meta::{CommitGroup, Head, MetaStore, StreamId};
 use mess_index::sealed::segment::{
     SealBatch, SealInput, SealStream, encode_sidecar,
 };
@@ -27,9 +39,6 @@ use crate::store;
 pub struct RebuildOptions {
     /// Show what would be written without writing anything.
     pub dry_run: bool,
-    /// Also rebuild the derivable metadata tables (stream heads). Off by
-    /// default so a plain `rebuild-index` never touches the metadata store.
-    pub meta:    bool,
 }
 
 /// Build the byte-image of a segment's pointer sidecar from its recovered,
@@ -74,14 +83,13 @@ pub fn rebuild_sidecar_bytes(
     encode_sidecar(&input)
 }
 
-/// Rebuild the store's pointer sidecars (and, with `--meta`, the stream-head
-/// table) at `dir`.
+/// Rebuild the store's pointer sidecars at `dir`.
 pub fn run(dir: &Path, opts: &RebuildOptions) -> Report {
     let mut report = Report::new("rebuild-index", "rebuilt");
     report.set("dir", json!(dir.display().to_string()));
     report.set("dry_run", json!(opts.dry_run));
 
-    // Rebuilding mutates the sealed dir + metadata: require exclusive access.
+    // Rebuilding mutates the sealed dir: require exclusive access.
     let lock = lockprobe::probe(dir);
     if lock.is_held() && !opts.dry_run {
         report.push_finding(Finding::new(
@@ -96,11 +104,6 @@ pub fn run(dir: &Path, opts: &RebuildOptions) -> Report {
 
     let segments = store::discover_segments(dir);
     let sealed_dir = dir.join("sealed");
-
-    // Aggregate stream heads across all segments (max version per stream) for
-    // the optional metadata rebuild.
-    let mut stream_heads: BTreeMap<u64, Head> = BTreeMap::new();
-    let mut end_position: u64 = 0;
 
     for seg in &segments {
         let scan = match scan_segment(seg.segment_id, &seg.log_path) {
@@ -133,25 +136,6 @@ pub fn run(dir: &Path, opts: &RebuildOptions) -> Report {
             );
             continue;
         };
-        end_position = end_position.max(scan.recovery.next_pos);
-
-        // Track per-stream head version + head global position for meta.
-        for b in &scan.recovery.accepted {
-            let head_version = b.last_stream_version();
-            let head_gpos = b.first_global_pos + u64::from(b.frame_count) - 1;
-            stream_heads
-                .entry(b.stream_id)
-                .and_modify(|h| {
-                    if head_version >= h.version {
-                        h.version = head_version;
-                        h.global_position = head_gpos;
-                    }
-                })
-                .or_insert(Head {
-                    version:         head_version,
-                    global_position: head_gpos,
-                });
-        }
 
         // The rebuilt pointer sidecar image.
         let bytes = rebuild_sidecar_bytes(
@@ -201,50 +185,8 @@ pub fn run(dir: &Path, opts: &RebuildOptions) -> Report {
         }));
     }
 
-    if opts.meta && !opts.dry_run {
-        rebuild_meta(&mut report, dir, &stream_heads, end_position);
-    } else if opts.meta {
-        report
-            .set("meta_stream_heads_would_rebuild", json!(stream_heads.len()));
-    }
-
     report.set("segments", json!(segments.len()));
     report
-}
-
-/// Rebuild the stream-head metadata table from the recovered heads (idempotent
-/// per I5: rewriting the same group rewrites the same bytes).
-fn rebuild_meta(
-    report: &mut Report,
-    dir: &Path,
-    heads: &BTreeMap<u64, Head>,
-    end_position: u64,
-) {
-    let meta = match MetaStore::open(store::meta_dir(dir)) {
-        Ok(m) => m,
-        Err(e) => {
-            report.push_finding(Finding::new(
-                Severity::Warn,
-                "meta",
-                "meta-open",
-                format!("could not open metadata store to rebuild heads: {e}"),
-            ));
-            return;
-        }
-    };
-    let mut group = CommitGroup::new(end_position);
-    for (&id, &head) in heads {
-        group.stream_heads.push((StreamId(id), head));
-    }
-    match meta.apply_group(&group) {
-        Ok(()) => report.set("meta_stream_heads_rebuilt", json!(heads.len())),
-        Err(e) => report.push_finding(Finding::new(
-            Severity::Warn,
-            "meta",
-            "meta-apply",
-            format!("failed to rebuild stream heads: {e}"),
-        )),
-    }
 }
 
 /// Crash-safe sidecar write: temp file in the same dir, then rename (mirrors

@@ -27,8 +27,8 @@ pub struct InspectOptions {
     pub segment:     Option<u64>,
     /// Restrict the stream-head overview to one stream, by its interned
     /// numeric id (e.g. `"7"`) or its registered name (e.g. `"user-42"`).
-    /// Name matching requires the metadata registry to be readable (not
-    /// blocked by a live writer's lock); see the `registry.available` field.
+    /// Name matching requires the log's `$registry` to fold — which needs no
+    /// lock and so works against a live writer; see `registry.available`.
     pub stream:      Option<String>,
     /// Disable the default `text`/`pretty` truncation of `stream_heads` and
     /// show every entry. No effect on `--format json`, which is always
@@ -168,18 +168,18 @@ pub fn run(dir: &Path, opts: &InspectOptions) -> Report {
 
     // Stream heads, names, and snapshots.
     //
-    // `bn-2di`: NAMES NOW COME FROM THE LOG. Fjall has no name keyspace any
-    // more — the `id -> name` bijection is the `$registry` stream (spec
-    // `04-registry.md`), and `registryfold` decodes it straight out of the
-    // segment bytes. That is strictly better than what this used to do: the
-    // fold needs no lock, so a live writer no longer degrades the name report
-    // at all. Only SNAPSHOTS still need fjall (the app snapshot sidecar),
-    // and only that part degrades when a writer holds the lock.
+    // `bn-2di`: NAMES COME FROM THE LOG — the `id -> name` bijection is the
+    // `$registry` stream (spec `04-registry.md`), and `registryfold` decodes it
+    // straight out of the segment bytes, needing no lock.
+    //
+    // `bn-fj34`: and so does the SNAPSHOT half now. `metaread::read` is the
+    // lock-free pack-sidecar reader and is infallible, so neither half of this
+    // report degrades under a live writer any more.
     //
     // bn-1yz: the JSON schema here is LOCK-STATE-INDEPENDENT. `registry` is
     // always present with the same fields; `registry.available` signals whether
-    // the snapshot half could be read, and `snapshots` is `[]` (not missing)
-    // when it could not.
+    // the registry FOLD succeeded, and `snapshots` is `[]` (not missing) when
+    // the store has none.
     let folded = registryfold::fold(dir);
     let mut names: BTreeMap<u64, String> = BTreeMap::new();
     // `$registry` (stream 0) is named by SPEC TEXT, not by any record
@@ -204,32 +204,34 @@ pub fn run(dir: &Path, opts: &InspectOptions) -> Report {
         }
     };
 
-    let meta = metaread::read(dir);
-    let snapshots = match &meta {
-        Ok(facts) => facts
-            .snapshots
-            .iter()
-            .map(|s| {
-                json!({
-                    "stream_id": s.stream_id,
-                    "version": s.version,
-                    "fold_version": s.fold_version,
-                    "covers_empty_prefix": s.covers_empty_prefix,
-                })
+    let snapshots = metaread::read(dir)
+        .snapshots
+        .iter()
+        .map(|s| {
+            json!({
+                "stream_id": s.stream_id,
+                "version": s.version,
+                "fold_version": s.fold_version,
+                "covers_empty_prefix": s.covers_empty_prefix,
             })
-            .collect::<Vec<_>>(),
-        Err(reason) => {
-            report.advise("registry-unavailable", reason);
-            Vec::new()
-        }
-    };
+        })
+        .collect::<Vec<_>>();
     report.set(
         "registry",
         json!({
             "available": folded.is_ok(),
             "source": "log",
             "reason": folded.as_ref().err(),
-            "snapshots_available": meta.is_ok(),
+            // bn-fj34: pinned `true`, and kept only so the JSON schema this
+            // report has always emitted stays stable for existing consumers.
+            // The snapshot half used to be a fallible key-value-store open
+            // (locked by a live writer => `false` + a `registry-unavailable`
+            // advisory); it is now the lock-free pack sidecar, whose reader
+            // answers "no snapshots" instead of failing, so there is no longer
+            // a state in which snapshots are *unavailable* as opposed to
+            // absent. An empty `snapshots` array is the honest report of a
+            // store that has none.
+            "snapshots_available": true,
             "stream_names": stream_names.iter()
                 .map(|(id, n)| json!({ "stream_id": id, "name": n }))
                 .collect::<Vec<_>>(),
@@ -250,15 +252,20 @@ pub fn run(dir: &Path, opts: &InspectOptions) -> Report {
     }
 
     let filter = opts.stream.as_deref().map(StreamFilter::parse);
+    // bn-fj34: re-anchored on the registry FOLD. This advisory used to fire
+    // when the metadata store could not be opened; that store is gone, and
+    // since bn-2di the thing a `--stream <name>` lookup actually needs is the
+    // log's own `$registry` fold. A failed fold is the one remaining state in
+    // which no name can match, so that is what it reports now.
     if let Some(StreamFilter::Name(_)) = &filter
-        && meta.is_err()
+        && folded.is_err()
     {
         report.advise(
             "stream-name-lookup-unavailable",
-            "--stream named a non-numeric stream and the metadata registry \
-             could not be opened (see registry.available), so no name could \
-             match; pass the interned numeric stream id instead, or retry \
-             once the store is free",
+            "--stream named a non-numeric stream and the $registry could not \
+             be folded out of the log (see \
+             registry.available/registry.reason), so no name could match; \
+             pass the interned numeric stream id instead",
         );
     }
 

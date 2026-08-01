@@ -2,57 +2,78 @@
 //! on a constructed corpus — both for the trivially-deletable case and for a
 //! blocked case (a live snapshot whose certification frames live in the sealed
 //! segment).
+//!
+//! # bn-fj34: the blocked fixture is a real app snapshot now
+//!
+//! This suite used to inject its live snapshot straight into a legacy
+//! `<dir>/meta` `snapshot_heads` row, whose keys were the engine's interned
+//! **dense** stream ids — the same space the sealed sidecar uses, so the join
+//! worked by construction. That store is deleted, and the surviving source (the
+//! pack sidecar an app actually writes) keys its heads by **interim FNV** hash
+//! instead, which matches a dense id only by accident.
+//!
+//! So the fixture is now a genuine [`PackSnapshotBackend`] save — the exact
+//! artifact production writes — and it is what proves the id-space join
+//! `retention::run` performs (pack record's self-describing stream NAME ->
+//! `$registry` -> dense id) actually lands. Without that join this test reports
+//! `deletable` for a segment holding a live snapshot's certification frames:
+//! vacuous in the dangerous direction.
 
 mod common;
 
-use mess_cli::metaread;
 use mess_cli::retention;
-use mess_index::meta::{CommitGroup, MetaStore, SnapshotHead, StreamId};
 use mess_index::sealed::retention::{RetentionDecision, decide_segment};
 use mess_index::sealed::segment::SealedSegmentIndex;
+use mess_store::{
+    BlobPtr, LogEngine, PackSnapshotBackend, SnapshotRef, SnapshotStore,
+    StoredSnapshot, interim_stream_id,
+};
 
-/// The 14-byte snapshot-ref v1 image (tag||fold_version||flags||ptr) as a
-/// legacy `<dir>/meta` `snapshot_heads` row carries it, so `metaread` decodes
-/// it.
-fn ref_v1(fold_version: u32, covers_empty_prefix: bool) -> Vec<u8> {
-    let mut v = vec![0x01u8];
-    v.extend_from_slice(&fold_version.to_le_bytes());
-    v.push(u8::from(covers_empty_prefix));
-    v.extend_from_slice(&0u64.to_le_bytes());
-    v
+/// Publish a real app snapshot of `acct-1` covering exactly `version` into the
+/// store's pack sidecar — the same `<dir>/.snapshots.packs` location `metaread`
+/// reads and an app writes.
+///
+/// The head is written at the backend seam (as `tests/golden.rs` does) rather
+/// than through `EventStore::save_snapshot`, because the fixture needs a head
+/// at a *chosen* version — v2 of a 0..=4 stream — so the certification frames
+/// land inside the sealed segment. The state blob is irrelevant to retention,
+/// which decides on covered version alone.
+fn inject_snapshot(dir: &std::path::Path, version: u64) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let engine = LogEngine::open(dir).expect("open engine");
+        let snaps = PackSnapshotBackend::open(
+            engine,
+            mess_cli::store::snapshot_pack_dir(dir),
+        )
+        .expect("open snapshot sidecar");
+        snaps
+            .save_snapshot(
+                "acct-1",
+                StoredSnapshot {
+                    snapshot_ref: SnapshotRef {
+                        stream_id:           interim_stream_id("acct-1"),
+                        stream_version:      version,
+                        fold_version:        1,
+                        covers_empty_prefix: false,
+                        event_prefix_hash:   None,
+                        state_hash:          None,
+                        snapshot_ptr:        BlobPtr(0),
+                    },
+                    state_blob:   version.to_le_bytes().to_vec(),
+                },
+            )
+            .await
+            .expect("save snapshot");
+    });
+    // Engine + sidecar writer locks released here.
 }
 
-/// Write a snapshot head for `stream_id` at `version` into the (closed) meta
-/// store, so the store presents a live snapshot for the retention decision.
-///
-/// `bn-2di`: the snapshot-head join is keyed off the snapshot side map
-/// (`snapshot_stream_names`) — it can no longer piggy-back on the engine's name
-/// tables, because those are gone (names live in the log's `$registry` now). So
-/// the fixture writes the side-map row too.
-///
-/// `bn-3l8n`: this exercises `metaread`'s **legacy** source (1), the engine's
-/// own `<dir>/meta` `snapshot_heads`, which no production writer produces. The
-/// app sidecar is packs now and is read separately; keeping this fixture on the
-/// legacy table is what keeps the compatibility path covered.
-fn inject_snapshot(dir: &std::path::Path, stream_id: u64, version: u64) {
-    let meta =
-        MetaStore::open(mess_cli::store::meta_dir(dir)).expect("open meta");
-    meta.put_snapshot_stream_name(stream_id, "acct-1")
-        .expect("snapshot side map");
-    let mut group = CommitGroup::new(version + 2);
-    group.snapshot_heads.push((
-        StreamId(stream_id),
-        SnapshotHead {
-            covered_version: version,
-            global_position: version,
-            snapshot_ref:    ref_v1(1, false),
-        },
-    ));
-    meta.apply_group(&group).expect("apply snapshot head");
-    drop(meta);
-}
-
-/// bn-2di: names come from the log's $registry now, not from fjall.
+/// bn-2di: names come from the log's $registry, which is also what
+/// `retention::run` joins the snapshot's stream name against.
 fn stream_id_of(dir: &std::path::Path, name: &str) -> u64 {
     let state = mess_cli::registryfold::fold(dir).expect("fold $registry");
     mess_cli::registryfold::stream_names(&state)
@@ -92,8 +113,17 @@ fn blocked_matches_decision_function() {
     let d = mess_testkit::sweeping_temp_dir("cli-retention-d-1");
     common::build_corpus(d.path(), 5); // versions 0..=4 in segment 1
 
+    inject_snapshot(d.path(), 2);
+
+    // The engine's interned DENSE id — the space the sealed sidecar is keyed
+    // by, and the one the snapshot's interim-FNV id is emphatically not in.
     let sid = stream_id_of(d.path(), "acct-1");
-    inject_snapshot(d.path(), sid, 2);
+    assert_ne!(
+        sid,
+        interim_stream_id("acct-1"),
+        "the fixture is only meaningful while the two id spaces differ; if \
+         they ever coincide this test stops proving the join happens"
+    );
 
     // The CLI decision, read straight from the store's live snapshot set.
     let report = retention::run(d.path());
@@ -104,20 +134,24 @@ fn blocked_matches_decision_function() {
         .expect("segment row");
     assert_eq!(row["verdict"], "blocked", "report: {:#?}", report.findings);
 
+    // `retention::run` must have resolved the pack record's stream NAME to the
+    // dense id through the log's `$registry` — the reported live set is in the
+    // decision function's id space, not the snapshot subsystem's.
+    let reported = report.extra["live_snapshots"].as_array().expect("live");
+    assert_eq!(reported.len(), 1, "one live snapshot: {reported:?}");
+    assert_eq!(
+        reported[0]["stream_id"], sid,
+        "live snapshot must be reported in the sealed index's dense id space"
+    );
+
     // The same decision, computed directly against the sealed index with the
     // live set the store now carries.
     let idx = SealedSegmentIndex::open(&common::pidx(d.path()))
         .expect("open sidecar");
-    let live: Vec<_> = metaread::read(d.path())
-        .unwrap()
-        .snapshots
-        .iter()
-        .filter(|s| !s.covers_empty_prefix)
-        .map(|s| mess_index::sealed::retention::LiveSnapshotRef {
-            stream_id: s.stream_id,
-            version:   s.version,
-        })
-        .collect();
+    let live = [mess_index::sealed::retention::LiveSnapshotRef {
+        stream_id: sid,
+        version:   2,
+    }];
     let decision = decide_segment(&idx, &live, &[]);
     assert!(
         decision.is_blocked(),

@@ -56,8 +56,3 @@ pub use active::{
     ActiveIndex, BatchEntry, EventPtr, GlobalEntry, IndexSnapshot, StreamEntry,
 };
 pub use rebuild::{RebuildReport, rebuild, rebuild_into};
-
-// bn-1ku: exact-KV metadata tables (stream/snapshot heads, projection
-// checkpoints, recent-dedupe window) on fjall. See `meta` for the rebuild
-// story (I5) and per-table high-water / lag-detection contract.
-pub mod meta;

@@ -1,16 +1,29 @@
-//! Conformance + parity for [`PackSnapshotBackend`], the pack-based snapshot
-//! sidecar (`bn-ozi5`, ADR 0002 §1).
+//! Conformance for [`PackSnapshotBackend`], the pack-based snapshot sidecar
+//! (`bn-ozi5`, ADR 0002 §1) and — since `bn-fj34` — the *only* snapshot
+//! backend.
 //!
-//! This suite is deliberately the *same* suite `fjall_snapshot.rs` runs — the
-//! snapshot law, tail-only accelerated load, survival across a reopen, the I5
-//! self-heals, invalidation on deploy, and `SubscribeBackend` delegation — so
-//! "drop-in replacement behind the existing seam" is a claim with evidence
-//! rather than an assertion. On top of that it adds:
+//! It covers the snapshot law, tail-only accelerated load, survival across a
+//! reopen, the I5 self-heals, invalidation on deploy, and `SubscribeBackend`
+//! delegation, plus a **byte-compare of replay vs snapshot-accelerated load**
+//! over hundreds of random prefixes.
 //!
-//! - a **differential** test that runs one workload through both backends and
-//!   byte-compares every `StoredSnapshot` they hand back, and
-//! - a **byte-compare of replay vs snapshot-accelerated load** over hundreds of
-//!   random prefixes.
+//! # `bn-fj34`: what happened to the differential
+//!
+//! Until this bone a `pack_and_fjall_backends_return_byte_identical_snapshots`
+//! test ran one workload through both this backend and the retired
+//! key-value-backed one, byte-comparing every `StoredSnapshot`. That test
+//! existed to license the migration and it did its job: `bn-3l8n` moved every
+//! production, example, and tooling path onto packs, and `bn-fj34` deleted the
+//! other engine. With one implementation left there is nothing to difference
+//! *against*.
+//!
+//! The corpus did not die with it. `pack_snapshots_match_their_replay_derived_
+//! expectation` keeps the same seeded 120-iteration workload and every
+//! pack-side assertion, re-anchored on the only oracle that was ever
+//! authoritative: **the events themselves**. A backend-to-backend comparison
+//! can only ever prove two implementations agree — replay-derived expectations
+//! prove this one is *right*, which is strictly the stronger claim and the one
+//! [`snapshot_plus_tail_equals_full_replay_on_packs`] already makes at scale.
 //!
 //! Real filesystem, so `miri`-ignored.
 
@@ -21,13 +34,14 @@ use std::time::Duration;
 use mess_core::{Aggregate, CodecError, Event};
 use mess_store::pack_snapshot::{SaveMode, SidecarOptions};
 use mess_store::{
-    EventStore, FjallSnapshotBackend, Loaded, LogEngine, PackSnapshotBackend,
-    SnapshotStore, Snapshottable, StateCodecError, StoredSnapshot, Version,
+    EventStore, Loaded, LogEngine, PackSnapshotBackend, SnapshotStore,
+    Snapshottable, StateCodecError, StoredSnapshot, Version,
 };
 
 // ---------------------------------------------------------------------------
-// The same order-sensitive counter aggregate `fjall_snapshot.rs` uses, so the
-// two suites are comparing like with like.
+// An order-sensitive counter aggregate: `Scaled` after `Added` is not the same
+// state as the reverse, so a snapshot that folds the wrong prefix cannot pass
+// by luck.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,7 +131,6 @@ impl Snapshottable for CounterV2 {
 }
 
 type Store = EventStore<PackSnapshotBackend<LogEngine>>;
-type FjallStore = EventStore<FjallSnapshotBackend<LogEngine>>;
 
 fn fold(events: &[CounterEvent]) -> Counter {
     let mut s = Counter::default();
@@ -127,10 +140,9 @@ fn fold(events: &[CounterEvent]) -> Counter {
     s
 }
 
-/// Open a store whose event log is a *fresh* dir every time (matching
-/// `fjall_snapshot.rs`: this suite exercises snapshot persistence across a
-/// reopen while the log is rehydrated by hand) and whose sidecar lives at the
-/// fixed `root`.
+/// Open a store whose event log is a *fresh* dir every time (this suite
+/// exercises snapshot persistence across a reopen while the log is rehydrated
+/// by hand) and whose sidecar lives at the fixed `root`.
 fn open(root: &std::path::Path) -> Store { open_with(root, durable()) }
 
 fn open_with(root: &std::path::Path, options: SidecarOptions) -> Store {
@@ -146,13 +158,6 @@ fn open_with(root: &std::path::Path, options: SidecarOptions) -> Store {
 /// power-cut survivor would (no reliance on the page cache).
 fn durable() -> SidecarOptions {
     SidecarOptions { mode: SaveMode::Durable, ..Default::default() }
-}
-
-fn open_fjall(root: &std::path::Path) -> FjallStore {
-    let events = mess_testkit::sweeping_temp_dir("pack-snap-fjall-events");
-    let engine = LogEngine::open(events.path()).expect("open engine");
-    std::mem::forget(events);
-    EventStore::new(FjallSnapshotBackend::open(engine, root).expect("open"))
 }
 
 async fn rehydrate(store: &Store, stream: &str, events: &[CounterEvent]) {
@@ -245,21 +250,32 @@ async fn snapshot_plus_tail_equals_full_replay_on_packs() {
 }
 
 // ---------------------------------------------------------------------------
-// Differential parity against the backend this one replaces.
+// Self-consistency of the saved snapshot against replay (bn-fj34: the corpus
+// that used to be differenced against the retired backend).
 // ---------------------------------------------------------------------------
 
-/// One workload, two backends, byte-identical answers.
+/// The same seeded workload the pack-vs-fjall differential used to drive, now
+/// checked against **replay-derived expectations** instead of a second
+/// implementation's answers.
 ///
-/// Every `StoredSnapshot` the pack sidecar returns must equal — field for
-/// field, blob byte for blob byte — what `FjallSnapshotBackend` returns for
-/// the same call sequence. This is the concrete meaning of "same observable
-/// semantics its consumers rely on".
+/// Per iteration the corpus picks a random event sequence and a random split
+/// point `p`, appends the prefix, saves a snapshot, appends the tail, and then
+/// pins — from the events alone, with no reference to what the sidecar chose
+/// to write:
+///
+/// - the returned `SnapshotRef`'s covered version and empty-prefix flag;
+/// - that the persisted [`StoredSnapshot`]'s state blob decodes, byte for byte,
+///   to `fold(prefix)` — the blob is what a later load actually resumes from;
+/// - that the ref the load hands back equals the ref the save returned;
+/// - that the accelerated load reproduces `fold(all)` at the full-replay
+///   version, and folds **only** the `n - p` tail events to get there.
+///
+/// Every assertion here is one the differential also made, minus the arm that
+/// needed a second backend to state it.
 #[tokio::test]
-async fn pack_and_fjall_backends_return_byte_identical_snapshots() {
+async fn pack_snapshots_match_their_replay_derived_expectation() {
     let pack_dir = mess_testkit::sweeping_temp_dir("pack-snap-diff-pack");
-    let fjall_dir = mess_testkit::sweeping_temp_dir("pack-snap-diff-fjall");
     let pack = open(pack_dir.path());
-    let fjall = open_fjall(fjall_dir.path());
     let mut next = rng(0x0DDB_A11B_ADC0_FFEE);
 
     for iter in 0..120u32 {
@@ -270,27 +286,58 @@ async fn pack_and_fjall_backends_return_byte_identical_snapshots() {
         let p = (next() % (n as u64 + 1)) as usize;
         let stream = format!("diff-{iter}");
 
-        for store_events in [&events[..p]] {
-            if !store_events.is_empty() {
-                pack.append(&stream, Version::NoStream, store_events)
-                    .await
-                    .unwrap();
-                fjall
-                    .append(&stream, Version::NoStream, store_events)
-                    .await
-                    .unwrap();
-            }
+        if p > 0 {
+            pack.append(&stream, Version::NoStream, &events[..p])
+                .await
+                .unwrap();
         }
-        let a = pack.save_snapshot::<Counter>(&stream).await.unwrap();
-        let b = fjall.save_snapshot::<Counter>(&stream).await.unwrap();
-        assert_eq!(a, b, "iter {iter}: SnapshotRef differs");
 
-        let a: Option<StoredSnapshot> =
+        // 1. The save's own answer, against the prefix that produced it.
+        let saved = pack.save_snapshot::<Counter>(&stream).await.unwrap();
+        if p == 0 {
+            assert!(
+                saved.covers_empty_prefix,
+                "iter {iter}: a snapshot of an empty prefix must say so"
+            );
+        } else {
+            assert!(!saved.covers_empty_prefix, "iter {iter}: prefix is v0..");
+            assert_eq!(
+                saved.stream_version,
+                (p - 1) as u64,
+                "iter {iter}: snapshot must cover exactly the appended prefix"
+            );
+        }
+        assert_eq!(
+            saved.fold_version,
+            Counter::FOLD_VERSION,
+            "iter {iter}: snapshot carries the fold that produced it"
+        );
+
+        // 2. The PERSISTED blob — what a later load resumes from — must decode
+        //    to the prefix fold, byte for byte.
+        let stored: Option<StoredSnapshot> =
             pack.backend().load_snapshot(&stream).await.unwrap();
-        let b: Option<StoredSnapshot> =
-            fjall.backend().load_snapshot(&stream).await.unwrap();
-        assert_eq!(a, b, "iter {iter}: StoredSnapshot differs");
+        let stored = stored.unwrap_or_else(|| {
+            panic!("iter {iter}: a saved snapshot must load")
+        });
+        assert_eq!(
+            stored.snapshot_ref, saved,
+            "iter {iter}: loaded ref must equal the ref save returned"
+        );
+        let expected_prefix = fold(&events[..p]);
+        assert_eq!(
+            stored.state_blob,
+            expected_prefix.encode_state().unwrap(),
+            "iter {iter}: state blob must be the replay-derived prefix fold"
+        );
+        assert_eq!(
+            Counter::decode_state(&stored.state_blob).unwrap(),
+            expected_prefix,
+            "iter {iter}: state blob must decode back to the prefix state"
+        );
 
+        // 3. Append the tail; the accelerated load must equal full replay and
+        //    fold only the tail to get there.
         if p < n {
             let expect = if p == 0 {
                 Version::NoStream
@@ -298,15 +345,24 @@ async fn pack_and_fjall_backends_return_byte_identical_snapshots() {
                 Version::At((p - 1) as u64)
             };
             pack.append(&stream, expect, &events[p..]).await.unwrap();
-            fjall.append(&stream, expect, &events[p..]).await.unwrap();
         }
-        let la = pack.load_cached::<Counter>(&stream).await.unwrap();
-        let lb = fjall.load_cached::<Counter>(&stream).await.unwrap();
-        assert_eq!(la.state, lb.state, "iter {iter}: loaded state differs");
-        assert_eq!(la.version, lb.version, "iter {iter}: version differs");
+        let loaded = pack.load_cached::<Counter>(&stream).await.unwrap();
+        let full = pack.load::<Counter>(&stream).await.unwrap();
         assert_eq!(
-            la.events_replayed, lb.events_replayed,
-            "iter {iter}: tail length differs (acceleration must match)"
+            loaded.state,
+            fold(&events),
+            "iter {iter}: accelerated load must equal the replay-derived state"
+        );
+        assert_eq!(loaded.state, full.state, "iter {iter}: != full replay");
+        assert_eq!(loaded.version, full.version, "iter {iter}: version");
+        assert_eq!(
+            loaded.events_replayed,
+            n - p,
+            "iter {iter}: accelerated load must fold ONLY the tail"
+        );
+        assert_eq!(
+            full.events_replayed, n,
+            "iter {iter}: the unaccelerated load folds everything"
         );
     }
 }

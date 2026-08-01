@@ -5,11 +5,11 @@ edition = "2024"
 description = "mess v1: metadata and pointer index"
 
 [dependencies]
-# bn-1ku: exact-KV metadata tables (stream/snapshot heads, projection
-# checkpoints, recent-dedupe window) live on fjall — a pure-Rust LSM the
-# ptr_index spike selected. Journal-buffered durability is sufficient because
-# every table is rebuildable from the log (I5); see src/meta/mod.rs.
-fjall = "3.1.6"
+# bn-fj34: this crate has NO key-value store dependency. The `meta` module
+# (bn-1ku's fjall-backed stream/snapshot heads, projection checkpoints, and
+# recent-dedupe window) is deleted — the log is the single storage authority,
+# snapshot discovery is `mess_store::PackSnapshotBackend`'s self-describing
+# pack sidecar, and the name↔id bijection is the log's own `$registry` stream.
 mess-log = { workspace = true }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
@@ -57,8 +57,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)", "cfg(kani_slow)"] 
 
 [dev-dependencies]
 mess-log = { workspace = true }
-# bn-cxr/bn-2jr: the shared self-sweeping temp-dir helper for the fjall
-# round-trip / crash-lag / sealed-driver real-fs scratch dirs (replaces
+# bn-cxr/bn-2jr: the shared self-sweeping temp-dir helper for the sealed
+# read-path / sealed-scale / sealed-driver real-fs scratch dirs (replaces
 # hand-rolled `tempfile::tempdir()` call sites).
 mess-testkit = { workspace = true }
 # bn-1bn: the columnar codec's byte-exact corpus mirrors the perf_compress

@@ -323,7 +323,7 @@ pub const TRUST_UNVERIFIED_CACHE: u8 = 0;
 /// The decoded, self-describing snapshot record.
 ///
 /// It carries the stream **name**, which is what makes the sidecar
-/// self-joinable: unlike the Fjall path (which needed a separate
+/// self-joinable: unlike the retired head table (which needed a separate
 /// `snapshot_stream_names` side map to be enumerable at all), a pack record
 /// names its own stream.
 #[derive(Debug, Clone, PartialEq, Eq)]

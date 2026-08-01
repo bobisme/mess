@@ -14,9 +14,9 @@
 //! The facade sits on the [`Backend`] trait (`head` / `read_stream` /
 //! `read_global` / borrowed and owned append), distilled from how
 //! `spikes/dx_api` drove the original database actor. Production composes
-//! [`PackSnapshotBackend`] over [`LogEngine`] (bn-3l8n; the retiring
-//! [`FjallSnapshotBackend`] is the same seam over the old fjall head table);
-//! the optional in-memory
+//! [`PackSnapshotBackend`] over [`LogEngine`] — the one snapshot backend
+//! (bn-fj34 deleted the second storage engine that used to sit behind this
+//! same seam); the optional in-memory
 //! [`MockBackend`] enforces real expected-version conflict semantics under a
 //! lock so facade retry and concurrency behavior can also be tested without
 //! durable storage.
@@ -49,7 +49,6 @@ pub mod anomalies;
 pub mod backend;
 pub mod cache;
 pub mod engine;
-pub mod fjall_snapshot;
 #[cfg(feature = "mock")]
 pub mod mock;
 pub mod pack_snapshot;
@@ -73,7 +72,6 @@ pub use engine::{
     AppendInputMetrics, CommitterMetrics, EngineError, EngineMetrics,
     EngineOptions, LogEngine,
 };
-pub use fjall_snapshot::{FjallSnapshotBackend, SnapshotBackendError};
 // Re-export the core command error (with its store-erasure target and the
 // authored-command trait) the facade returns so callers need not depend on
 // `mess-core` directly just to match on a command outcome, erase the

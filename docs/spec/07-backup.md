@@ -58,29 +58,32 @@ no torn middle: batches are atomic (A4 CRC over the whole batch), so a
 partially-copied trailing batch fails recovery and is dropped, never
 half-accepted.
 
-### 1.2 What is rebuildable, and the one part of `meta/` that is not (I5)
+### 1.2 Everything outside the log is rebuildable (I5)
 
-The store's own advisory manifest ([02 R2](02-recovery.md)) and **most** of the
-`meta/` fjall tables (stream/snapshot heads, dedupe window, high-water marks)
-are **rebuildable** from the log alone (D1; I5, `mess rebuild-index --meta`). A
-backup does not need them for correctness: restore runs full recovery, which
-re-derives every index and catalog from the segment bytes.
+The store's own advisory manifest ([02 R2](02-recovery.md)) and every derived
+index (active pointers, sealed directory summaries, per-stream heads) are
+**rebuildable** from the log alone (D1; I5, `mess rebuild-index`). A backup does
+not need them for correctness: restore runs full recovery, which re-derives
+every index and catalog from the segment bytes.
 
-**The one exception is the name↔id interner** (`stream_names` / `type_names`,
-`bn-20b` / `bn-150`). The log stores only interned numeric ids (a `stream_id`
-per batch, an `event_type_id` per event) — never their names — so these two
-tables are the **durable source of truth** for the bijection and are **NOT
-rebuildable from the log**. A restored store cannot resolve any stream/type
-name without them. The cut therefore **MUST** include `meta/`. This is safe
-even under a live writer: `bn-150` fsyncs a newly-interned name's row durable
-**before** its covering append can become durable, so every stream present in
-the committed cut already has its name durable in `meta/` at cut time; a `meta/`
-copy that skews slightly ahead of or behind the log cut can only differ by
-names for streams whose events are themselves beyond the cut (harmless), and
-fjall's own recovery handles a torn LSM copy the same way it handles a crash.
-`meta/` is copied **after** the log cut to minimise that skew. The rest of
-`meta/` riding along is a restore-speed bonus (recovery would rebuild it
-anyway); the interner is the load-bearing part.
+**There is no exception.** There used to be one: the name↔id interner lived in
+`stream_names` / `type_names` tables under a `<dir>/meta` key-value directory
+(`bn-20b` / `bn-150`), because the log stored only interned numeric ids. Those
+tables were the durable source of truth for the bijection, were **not**
+rebuildable, and the cut therefore had to carry `meta/` verbatim — with all the
+skew and torn-LSM-copy reasoning that implied.
+
+`bn-2di` moved the bijection **into the log** as the `$registry` stream
+([04](04-registry.md)): a `StreamRegistered` / `EventTypeRegistered` record is
+an ordinary event, written in the same commit group as the append that first
+uses the name, so it is inside any cut that contains that append by
+construction. `bn-fj34` then deleted the leftover directory and the storage
+engine behind it. A restored store folds `$registry` out of the very segments
+the cut already copies.
+
+The cut is therefore **the log and nothing else**: sealed segments, the active
+segment's committed prefix, the derived sealed sidecars, and the manifest. No
+metadata directory is copied, because none exists.
 
 `BACKUP_MANIFEST` is a *separate* artifact — it describes the backup, not the
 store — and it is the only file whose presence gates a restore (§4).
@@ -166,8 +169,9 @@ A correct backup can be taken with `rsync` alone **if the ordering rules hold**:
   seg-00000001.log          # sealed + active .log files (active = prefix)
   sealed/
     seg-...pidx / .pcol / .filter
-  meta/                      # REQUIRED for the name interner (§1.2); rest is bonus
 ```
+
+There is no `meta/`: since `bn-fj34` the store has none (§1.2).
 
 `BACKUP_MANIFEST` is JSON (stable field names):
 
@@ -184,7 +188,8 @@ A correct backup can be taken with `rsync` alone **if the ordering rules hold**:
 }
 ```
 
-`role` is `sealed` | `active` | `sidecar` | `meta`. `copied_len` is the number
+`role` is `sealed` | `active` | `sidecar` (the `meta` role was retired with
+the metadata directory in `bn-fj34`). `copied_len` is the number
 of bytes copied for that file (for the active segment, the cut `safe_offset`;
 for a sealed file, its whole length). Restore verifies every listed file's
 length + CRC before running recovery (§4).
@@ -212,10 +217,10 @@ length + CRC before running recovery (§4).
 6. **Report** what was restored (file count, bytes) and the **recovered
    watermark** (§1.3), which MUST equal the manifest's `watermark`.
 
-Restore relies on the backed-up `meta/` for the name interner (§1.2): the
-derived tables are re-derived by recovery, but the `stream_names`/`type_names`
-bijection is the durable source of truth and is restored verbatim. Every
-`meta/` file is verified against the manifest (size + CRC) like any other file.
+Restore needs nothing outside the log (§1.2): recovery re-derives every index
+from the segment bytes and folds the name↔id bijection out of the restored
+`$registry` stream. Every file listed in the manifest is verified against it
+(size + CRC) before recovery runs.
 
 Exit codes: a clean restore exits `0`; a refusal (non-empty target, torn/absent
 manifest, a backup file that fails its size/CRC check, a failed `verify --full`,

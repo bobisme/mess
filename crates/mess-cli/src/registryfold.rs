@@ -7,7 +7,7 @@
 //! (spec `04-registry.md`).
 //!
 //! This is deliberately **offline and lock-free**: it opens the segment files
-//! read-only and never touches fjall or the store lock, so `mess inspect` keeps
+//! read-only and never takes the store lock, so `mess inspect` keeps
 //! working against a store held by a live writer — which was the whole reason
 //! it was a separate code path from the engine in the first place. It is also
 //! the most direct possible demonstration of the bone's claim: names come out

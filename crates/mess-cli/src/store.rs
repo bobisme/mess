@@ -10,8 +10,13 @@
 //!     seg-00000000000000000001.pidx   # pointer sidecar (id, 20-wide)
 //!     seg-...........................pcol   # payload sidecar
 //!     seg-...........................filter # membership filter
-//!   meta/                      # fjall metadata (stream/snapshot heads, ...)
 //! ```
+//!
+//! That is the whole engine layout: **log segments and their derived sealed
+//! sidecars, and nothing else.** There is no metadata directory. `bn-2di` moved
+//! the name↔id bijection into the log as the `$registry` stream and `bn-fj34`
+//! deleted the leftover `<dir>/meta` key-value store, so every durable fact
+//! about a store is now in the segment bytes or derived from them.
 //!
 //! An **application** may additionally co-locate a discardable snapshot sidecar
 //! at `<dir>/.snapshots.packs/` ([`snapshot_pack_dir`]). It is not part of the
@@ -72,10 +77,6 @@ pub fn par_path(dir: &Path, segment_id: u64) -> PathBuf {
 #[must_use]
 pub fn lock_path(dir: &Path) -> PathBuf { dir.join(LOCK_FILE_NAME) }
 
-/// The metadata directory.
-#[must_use]
-pub fn meta_dir(dir: &Path) -> PathBuf { dir.join("meta") }
-
 /// The **app snapshot sidecar** directory: `<dir>/.snapshots.packs`.
 ///
 /// An app that wraps its [`LogEngine`](mess_store::LogEngine) in a
@@ -84,10 +85,9 @@ pub fn meta_dir(dir: &Path) -> PathBuf { dir.join("meta") }
 /// store uses, so a single `--dir` names the whole store). The sidecar is a
 /// flat directory of immutable packs plus a discovery root — self-describing
 /// records that carry the stream *name*, so no reverse `id -> name` side map is
-/// needed. `doctor`'s fold-version check reads this location — not the engine's
-/// `<dir>/meta`, whose `snapshot_heads` table an app never writes — so the
-/// check can actually see app-persisted snapshots. Absent (a store with no
-/// snapshot sidecar) is normal and simply means "no app snapshots here".
+/// needed. `doctor`'s fold-version check reads this location, so the check can
+/// actually see app-persisted snapshots. Absent (a store with no snapshot
+/// sidecar) is normal and simply means "no app snapshots here".
 ///
 /// # Why `.snapshots.packs` and not `.snapshots`
 ///

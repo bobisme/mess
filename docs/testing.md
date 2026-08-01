@@ -6,8 +6,8 @@ spec — those live in `docs/spec/`).
 Most of `mess`'s test suite is pure/in-memory or runs against the
 deterministic-simulation `SimFs` (`mess-log`'s `runtime` module) and needs
 no special setup — plain `cargo test -p <crate>` is enough. This doc covers
-the minority that isn't: suites that open a **real** `LogEngine`/fjall store
-on a **real** filesystem, because the property under test only means
+the minority that isn't: suites that open a **real** `LogEngine` (and its
+pack snapshot sidecar) on a **real** filesystem, because the property under test only means
 something there (a durability barrier, a `fallocate`d segment, an actual
 crash/`SIGKILL`).
 

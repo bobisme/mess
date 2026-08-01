@@ -4,11 +4,11 @@
 //! run **unchanged** against the composed production engine.
 //!
 //! bn-3l8n: the snapshot half is the **pack sidecar**
-//! ([`PackSnapshotBackend`]), not the retired fjall head table — these types
-//! are infrastructure for testing the facade, so they follow the production
-//! composition. The fjall backend's own suite (`tests/fjall_snapshot.rs`) and
-//! the pack/fjall differential (`tests/pack_snapshot.rs`) still name it
-//! directly; they retire with it.
+//! ([`PackSnapshotBackend`]) — these types are infrastructure for testing the
+//! facade, so they follow the production composition. bn-fj34 deleted the
+//! head-table backend that used to sit behind the same seam along with its own
+//! suite, so the pack sidecar is now the only thing `tests/pack_snapshot.rs`
+//! names.
 //!
 //! The wrapper is [`Clone`] and shares one `Arc`-held temp dir + engine handle,
 //! matching the interim `MockBackend`'s reuse-the-handle semantics (a facade

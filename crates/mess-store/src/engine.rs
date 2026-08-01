@@ -1,6 +1,6 @@
 //! The composed production [`Backend`]: `mess-log` (durability, ordering,
-//! recovery) + `mess-index` (hot [`ActiveIndex`], sealed corpus, fjall meta
-//! tables) behind the [`EventStore`](crate::EventStore) facade.
+//! recovery) + `mess-index` (hot [`ActiveIndex`], sealed corpus) behind the
+//! [`EventStore`](crate::EventStore) facade.
 //!
 //! This is the Phase 4 "engine swap": the facade's default backend moves off
 //! the interim in-memory [`MockBackend`](crate::mock) onto the real log +
@@ -32,8 +32,9 @@
 //!   real sealed-replay path, with payload bytes reassembled from the columnar
 //!   `.pcol` sidecar where one exists.
 //! - **Derived state** — stream heads and active pointers are published in
-//!   memory after the covering write/barrier and rebuilt from the log on open;
-//!   the append path writes no Fjall metadata.
+//!   memory after the covering write/barrier and rebuilt from the log on open.
+//!   The append path writes no metadata anywhere: the log is the only durable
+//!   authority the engine has (bn-fj34).
 //! - **Recovery** — on open the engine enumerates segment files and runs
 //!   `mess-log` `recover_whole_log` (fast path + advisory manifest) and
 //!   `mess-index` `rebuild` (F6) to rehydrate the active index.
@@ -79,10 +80,10 @@
 //!   use, in the same commit group, under the same barrier. That ordering is
 //!   what makes the name durable "for free": recovery accepts a contiguous
 //!   prefix, so no crash can keep the reference and lose the registration, and
-//!   there is no second storage system to `fsync` (the fjall
-//!   `stream_names`/`type_names` tables, and the barrier bn-150 needed to keep
-//!   them co-durable, are **deleted**). These are ordinary v3 event frames, so
-//!   they consume canonical global positions.
+//!   there is no second storage system to `fsync` (the `stream_names` /
+//!   `type_names` key-value tables, and the barrier bn-150 needed to keep them
+//!   co-durable, are **deleted** — bn-2di, then bn-fj34). These are ordinary v3
+//!   event frames, so they consume canonical global positions.
 //!   [`read_global`](Backend::read_global) filters stream 0 from application
 //!   results in both hot and sealed tiers; later visible records keep their
 //!   assigned positions and can therefore have gaps. Public global positions
@@ -174,9 +175,16 @@ pub enum EngineError {
     /// A durable append could not be committed by `mess-log`.
     #[error("append: {0}")]
     Append(String),
-    /// The `mess-index` fjall metadata tables failed.
-    #[error("meta: {0}")]
-    Meta(String),
+    /// Registry (name↔id) integrity failed: the `$registry` fold rejected the
+    /// committed records, ids are not dense, or a committed batch references
+    /// a `stream_id`/`event_type_id` no registration in the log ever named.
+    ///
+    /// `bn-fj34` renamed this from `Meta`. It never meant "a metadata database
+    /// failed" — the engine has none, and since `bn-2di` the name↔id bijection
+    /// is the log's own `$registry` stream — but the old name and its `meta:`
+    /// display prefix said otherwise.
+    #[error("registry: {0}")]
+    Registry(String),
     /// A sealed-corpus read failed to decode.
     #[error("sealed read: {0}")]
     SealedRead(String),
@@ -285,18 +293,18 @@ impl Book {
     ) -> Result<Self, EngineError> {
         for id in 1..=state.stream_high_water_mark() {
             if state.stream_name(id).is_none() {
-                return Err(EngineError::Meta(format!(
-                    "registry: stream ids are not dense — no name for \
-                     stream_id {id} (high-water {})",
+                return Err(EngineError::Registry(format!(
+                    "stream ids are not dense — no name for stream_id {id} \
+                     (high-water {})",
                     state.stream_high_water_mark()
                 )));
             }
         }
         for id in 1..=state.event_type_high_water_mark() {
             if state.event_type_name(id).is_none() {
-                return Err(EngineError::Meta(format!(
-                    "registry: event-type ids are not dense — no name for \
-                     event_type_id {id} (high-water {})",
+                return Err(EngineError::Registry(format!(
+                    "event-type ids are not dense — no name for event_type_id \
+                     {id} (high-water {})",
                     state.event_type_high_water_mark()
                 )));
             }
@@ -1127,9 +1135,9 @@ struct Recovered {
 /// Recovery step 1's output (spec 04 §7.1), held until the `$registry` fold
 /// (step 2) has run and names can finally be resolved (step 3) — `bn-2di`.
 ///
-/// Before this bone the scan resolved names inline, because they came from
-/// fjall and were already loaded. They come from the log now, so the scan
-/// cannot resolve anything: it accumulates here instead.
+/// Before this bone the scan resolved names inline, because they came from a
+/// key-value store and were already loaded. They come from the log now, so the
+/// scan cannot resolve anything: it accumulates here instead.
 #[derive(Default)]
 struct ScanOutput {
     /// Stream-0 batches from a SCANNED segment, taken straight out of the
@@ -2345,8 +2353,6 @@ pub struct EngineOptions {
     pub durability:                 Durability,
     /// Active-segment size in bytes (preallocated at open).
     pub segment_size:               u64,
-    /// Reserved capacity for the derived dedupe cache.
-    pub dedupe_capacity:            usize,
     /// Sealed pointer-block cache budget in bytes (`bn-e2y` / bn-1hx). `0`
     /// disables the cache (every sealed replay decodes fresh); a non-zero
     /// budget caches decoded blocks so a repeated sealed-stream replay (a
@@ -2557,8 +2563,6 @@ impl Default for EngineOptions {
             // correctness here; benches override this with `Group`.
             durability:                 Durability::Process,
             segment_size:               256 * 1024 * 1024,
-            dedupe_capacity:
-                mess_index::meta::DEFAULT_DEDUPE_CAPACITY,
             // On by default (64 MiB): the sealed block cache is transparent to
             // results and pays for itself on repeat replay (perf_replay's 48%
             // hit rate), and a live cache is what makes the hit/miss runtime
@@ -3195,8 +3199,8 @@ impl LogEngine {
     ///
     /// The log is the **sole** source of truth for the `id → name` bijection.
     /// There is no second copy anywhere in the store to fall back on, and that
-    /// is the point: it is what makes every remaining fjall keyspace a derived
-    /// cache, and fjall itself deletable.
+    /// is the point: it is what made the whole metadata keyspace a derived
+    /// cache, and therefore deletable — which bn-fj34 did.
     ///
     /// A referenced id that the fold cannot name is therefore fatal, full stop.
     /// It should also be **unreachable**: the append path pushes a
@@ -3235,7 +3239,7 @@ impl LogEngine {
         let registry_events = fold.record_count();
         let state: registry::RegistryState = fold
             .finish::<std::convert::Infallible>()
-            .map_err(|e| EngineError::Meta(format!("registry fold: {e}")))?;
+            .map_err(|e| EngineError::Registry(format!("fold: {e}")))?;
 
         // Step 3: the book IS the fold.
         let mut book = Book::from_registry(state, registry_events)?;
@@ -3248,7 +3252,7 @@ impl LogEngine {
         // referencing it (REG12), or the store refuses to open.
         for sid in referenced_streams {
             if book.stream_name_opt(sid).is_none() {
-                return Err(EngineError::Meta(format!(
+                return Err(EngineError::Registry(format!(
                     "recover: no interned name for stream_id {sid} \
                      ({registry_events} $registry record(s) folded). The log \
                      is the sole source of truth for names; refusing to open \
@@ -3297,7 +3301,7 @@ impl LogEngine {
         if max_event_type_id != registry::REGISTRY_EVENT_TYPE_ID
             && book.type_name_opt(max_event_type_id).is_none()
         {
-            return Err(EngineError::Meta(format!(
+            return Err(EngineError::Registry(format!(
                 "recover: no interned name for event_type_id \
                  {max_event_type_id} ({registry_events} $registry record(s) \
                  folded, event-type high-water {}). The log is the sole \
@@ -3663,9 +3667,9 @@ impl LogEngine {
     ///
     /// This is the **verification** seam: it re-derives the registry from the
     /// log bytes exactly as `recover` does, with no reference to the in-memory
-    /// interner and none to fjall, so a caller can diff the result against
-    /// either. `mess doctor` uses it for the shadow-period equivalence check
-    /// and `mess migrate registry` uses it to prove an import re-folds to the
+    /// interner, so a caller can diff the result against it. `mess doctor` uses
+    /// it for the shadow-period equivalence check and `mess migrate
+    /// registry` uses it to prove an import re-folds to the
     /// rows it imported.
     ///
     /// Reads through the engine's own tiers (`$registry` has its own stream id,
@@ -3714,7 +3718,7 @@ impl LogEngine {
         }
 
         fold.finish::<std::convert::Infallible>()
-            .map_err(|e| EngineError::Meta(format!("registry fold: {e}")))
+            .map_err(|e| EngineError::Registry(format!("fold: {e}")))
     }
 
     /// Resolve a stream name back to its interned id, through the same interner
@@ -3833,7 +3837,7 @@ impl LogEngine {
         for (batch, k) in picks {
             let stream_name =
                 book.stream_name_opt(batch.stream_id).ok_or_else(|| {
-                    EngineError::Meta(format!(
+                    EngineError::Registry(format!(
                         "read: no interned name for stream_id {}",
                         batch.stream_id
                     ))
@@ -3841,7 +3845,7 @@ impl LogEngine {
             let type_id = batch.type_ids[*k];
             let message_type =
                 book.type_name_opt(type_id).ok_or_else(|| {
-                    EngineError::Meta(format!(
+                    EngineError::Registry(format!(
                         "read: no interned name for event_type_id {type_id}"
                     ))
                 })?;

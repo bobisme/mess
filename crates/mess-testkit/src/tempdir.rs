@@ -2,7 +2,7 @@
 //!
 //! # Background
 //!
-//! Real-fs suites (crash/SIGKILL harnesses, `LogEngine`/fjall reopen tests,
+//! Real-fs suites (crash/SIGKILL harnesses, `LogEngine`/sidecar reopen tests,
 //! …) must run on a real device, never `tmpfs` (`fdatasync`/`fallocate` are
 //! either a no-op or fail with `os error 122` there) — the convention is
 //! `TMPDIR=$HOME/.cache/mess-test-tmp`, a *persistent* directory, not the

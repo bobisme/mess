@@ -5,17 +5,20 @@
 //! (`--all-streams` shows everything, and `--format json` is always
 //! complete); `--stream` accepts a name as well as the interned numeric id;
 //! and the JSON schema's field names do not depend on whether a live writer
-//! holds the metadata store's lock — `registry` is always present with the
-//! same shape, degraded explicitly via `registry.available` rather than by
-//! omitting fields.
+//! holds the store — `registry` is always present with the same shape,
+//! degraded explicitly via `registry.available` rather than by omitting
+//! fields.
+//!
+//! bn-fj34: the locked case is now driven by the **real** D9 store lock (a live
+//! `LogEngine`), not by holding a second metadata store's directory lock. That
+//! store is deleted, and with it the last part of this report that a live
+//! writer could make unavailable — see the lock-state test below.
 #![cfg(not(miri))]
 
 use std::collections::BTreeSet;
 
 use mess_cli::format::{self, Format};
 use mess_cli::inspect::{self, InspectOptions};
-use mess_cli::store;
-use mess_index::meta::MetaStore;
 use mess_store::backend::{Backend, RecordToAppend};
 use mess_store::{LogEngine, Version};
 use serde_json::Value;
@@ -191,13 +194,10 @@ async fn stream_filter_accepts_name_or_id() {
 // ---------------------------------------------------------------------------
 
 /// The JSON schema's field names must not depend on whether a live writer
-/// holds the metadata store's lock. Simulate the locked case exactly as the
-/// bone suggests: hold the fjall metadata lock in-process. A second
-/// `MetaStore::open` on the same directory contends on the same OS advisory
-/// file lock (`std::fs::File::try_lock`, per-open-file-description, so it
-/// blocks even a second open from this same process) that a live writer
-/// would hold, so `inspect`'s internal `metaread::read` degrades exactly as
-/// it would against a real live-locked store.
+/// holds the store. bn-fj34: the locked case holds the **real** D9 store lock
+/// by keeping a `LogEngine` open, which is what a running app holds — the
+/// previous simulation (a second metadata-store open contending on that
+/// store's own directory lock) is not reproducible because the store is gone.
 #[tokio::test(flavor = "multi_thread")]
 async fn json_field_names_are_lock_state_independent() {
     let dir = mess_testkit::sweeping_temp_dir(
@@ -207,9 +207,8 @@ async fn json_field_names_are_lock_state_independent() {
 
     let free = json_of(&inspect::run(dir.path(), &opts()));
 
-    // Hold the metadata store's own lock, simulating a live writer.
-    let meta_dir = store::meta_dir(dir.path());
-    let _held = MetaStore::open(&meta_dir).expect("hold meta lock");
+    // Hold the store's own single-writer lock, exactly as a live app does.
+    let _held = LogEngine::open(dir.path()).expect("hold the store lock");
 
     let locked = json_of(&inspect::run(dir.path(), &opts()));
 
@@ -230,11 +229,8 @@ async fn json_field_names_are_lock_state_independent() {
 
     // `bn-2di`: the registry FOLD needs no lock — names come out of the log's
     // `$registry` stream, which `inspect` reads straight from the segment
-    // bytes. So a live writer no longer degrades the name report at all: it
-    // resolves identically locked and free. This is strictly better than
-    // what this test used to pin (names unavailable under a lock), and it
-    // is the most direct demonstration that fjall is not in the naming path
-    // any more.
+    // bytes. So a live writer does not degrade the name report at all: it
+    // resolves identically locked and free.
     assert_eq!(locked["registry"]["available"], true);
     assert_eq!(free["registry"]["available"], true);
     assert_eq!(
@@ -243,31 +239,39 @@ async fn json_field_names_are_lock_state_independent() {
     );
     assert!(!locked["registry"]["stream_names"].as_array().unwrap().is_empty());
 
-    // What DOES still need fjall is the app-snapshot side of the report.
-    assert_eq!(locked["registry"]["snapshots_available"], false);
+    // `bn-fj34`: and NEITHER does the snapshot half any more. It used to be
+    // the one part of this report a live writer could take away (the metadata
+    // store's exclusive open failed => `snapshots_available: false` plus a
+    // `registry-unavailable` advisory). The pack sidecar reader takes no lock
+    // and cannot fail, so both runs agree — this corpus persists no snapshots,
+    // so both report an empty set, and neither reports it as unavailable.
+    assert_eq!(locked["registry"]["snapshots_available"], true);
     assert_eq!(free["registry"]["snapshots_available"], true);
-    assert!(locked["registry"]["snapshots"].as_array().unwrap().is_empty());
-
-    let advice = locked["advice"].as_array().unwrap();
-    assert!(
-        advice.iter().any(|a| a["type"] == "registry-unavailable"),
-        "locked run must advise that the SNAPSHOT half is unavailable: \
-         {advice:?}"
+    assert_eq!(
+        locked["registry"]["snapshots"], free["registry"]["snapshots"],
+        "the snapshot half is lock-independent too"
     );
+    for (label, v) in [("free", &free), ("locked", &locked)] {
+        let advice = v["advice"].as_array().unwrap();
+        assert!(
+            !advice.iter().any(|a| a["type"] == "registry-unavailable"),
+            "the deleted degradation must never reappear ({label}): {advice:?}"
+        );
+    }
 
     // stream_heads are recovered straight from the log and stay available
-    // regardless of the meta lock — and, since bn-2di, so are their names.
+    // regardless of the store lock — and, since bn-2di, so are their names.
     let locked_heads = locked["stream_heads"].as_array().unwrap();
     assert_eq!(
         locked_heads.len(),
         4,
-        "stream heads recovered from the log even when meta is locked (3 user \
+        "stream heads recovered from the log even under a live writer (3 user \
          streams + $registry)"
     );
-    // `bn-2di`: EVERY name resolves, even with the meta store locked — the user
-    // streams' from the log's `$registry` (which `inspect` folds straight out
-    // of the segment bytes, needing no lock), and the reserved `$registry`
-    // stream itself from spec text (REG1: the reserved ids are named by the
+    // `bn-2di`: EVERY name resolves under a live writer — the user streams'
+    // from the log's `$registry` (which `inspect` folds straight out of the
+    // segment bytes, needing no lock), and the reserved `$registry` stream
+    // itself from spec text (REG1: the reserved ids are named by the
     // specification, not by any record, which is what makes bootstrap
     // non-circular).
     for h in locked_heads {

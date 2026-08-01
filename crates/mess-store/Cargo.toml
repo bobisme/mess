@@ -20,10 +20,10 @@ mess-core = { workspace = true }
 # bn-20b: the composed production backend is built on the log (durability,
 # ordering, recovery, sealing) ...
 mess-log = { workspace = true }
-# bn-fdv: the production snapshot path stores its snapshot *heads* in
-# mess-index's fjall-backed `meta::SnapshotHeads` table (O(1) point lookup,
-# rebuildable per I5). Blobs live in a plain content-addressed dir alongside,
-# so `mess-store` takes no direct fjall/serialization dep of its own.
+# bn-20b: the active/sealed pointer index the composed engine reads through.
+# bn-fj34: `mess-index` no longer carries a key-value store dependency either —
+# snapshot discovery is `pack_snapshot`'s self-describing sidecar, built out of
+# std alone, so nothing under `mess-store` pulls in a second storage engine.
 mess-index = { workspace = true }
 quick_cache = { workspace = true }
 smallvec = { workspace = true }

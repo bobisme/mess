@@ -23,8 +23,7 @@ fn rebuild_index_reproduces_pidx_byte_for_byte() {
     let _ = std::fs::remove_file(pidx.with_extension("filter"));
     assert!(!pidx.exists(), "sidecar deleted");
 
-    let report =
-        rebuild::run(d.path(), &RebuildOptions { dry_run: false, meta: false });
+    let report = rebuild::run(d.path(), &RebuildOptions { dry_run: false });
     assert_eq!(
         report.exit_code(),
         0,
@@ -49,14 +48,12 @@ fn rebuild_is_deterministic() {
     let pidx = common::pidx(d.path());
     let _ = std::fs::remove_file(&pidx);
 
-    let r1 =
-        rebuild::run(d.path(), &RebuildOptions { dry_run: false, meta: false });
+    let r1 = rebuild::run(d.path(), &RebuildOptions { dry_run: false });
     assert_eq!(r1.exit_code(), 0);
     let first = std::fs::read(&pidx).expect("rebuilt once");
 
     let _ = std::fs::remove_file(&pidx);
-    let r2 =
-        rebuild::run(d.path(), &RebuildOptions { dry_run: false, meta: false });
+    let r2 = rebuild::run(d.path(), &RebuildOptions { dry_run: false });
     assert_eq!(r2.exit_code(), 0);
     let second = std::fs::read(&pidx).expect("rebuilt twice");
 

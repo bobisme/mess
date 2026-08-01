@@ -60,16 +60,16 @@ struct Common {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Health checks: lock, epoch, footer/trailer, sidecar, fsync,
-    /// fold-version.
+    /// fold-version, registry.
     ///
-    /// Every check but one is safe against a live writer. The fold-version
-    /// check is the exception: it needs the metadata store (`meta/`), which
-    /// a live writer holds under its own exclusive lock, so against a
-    /// running app that one check can't run and degrades to an
-    /// info-severity "meta-store-locked" finding instead of failing the
-    /// whole command — expected behavior, not a bug. For the full check,
-    /// stop the writer first, or point `dir` at a `mess backup`/`mess
-    /// restore` copy instead of the live directory.
+    /// Every check but one is safe against a live writer. The $registry fold
+    /// is the exception: it opens the engine, which a live writer holds under
+    /// the store's single-writer lock, so against a running app that one
+    /// check can't run and degrades to an info-severity
+    /// "registry-store-locked" finding instead of failing the whole command
+    /// — expected behavior, not a bug. For the full check, stop the writer
+    /// first, or point `dir` at a `mess backup`/`mess restore` copy instead
+    /// of the live directory.
     Doctor {
         /// The store directory.
         dir:                 PathBuf,
@@ -116,16 +116,13 @@ enum Command {
         #[command(flatten)]
         common: Common,
     },
-    /// Rebuild pointer sidecars (byte-equal) and, with --meta, the meta tables.
+    /// Rebuild the sealed pointer sidecars (byte-equal) from the log segments.
     RebuildIndex {
         /// The store directory.
         dir:     PathBuf,
         /// Preview without writing anything.
         #[arg(long)]
         dry_run: bool,
-        /// Also rebuild the derivable metadata tables (stream heads).
-        #[arg(long)]
-        meta:    bool,
         #[command(flatten)]
         common:  Common,
     },
@@ -229,11 +226,11 @@ fn main() -> ExitCode {
             let report = verify::run(&dir, &VerifyOptions { full, repair });
             emit(&report, resolve_format(&common))
         }
-        Command::RebuildIndex { dir, dry_run, meta, common } => {
+        Command::RebuildIndex { dir, dry_run, common } => {
             if let Err(code) = require_dir(&dir) {
                 return code;
             }
-            let report = rebuild::run(&dir, &RebuildOptions { dry_run, meta });
+            let report = rebuild::run(&dir, &RebuildOptions { dry_run });
             emit(&report, resolve_format(&common))
         }
         Command::Retention { what } => match what {

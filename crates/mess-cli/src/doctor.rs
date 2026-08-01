@@ -10,8 +10,7 @@
 //!
 //! The persisted snapshots this check inspects are the app's, written by a
 //! [`PackSnapshotBackend`](mess_store::PackSnapshotBackend) into the snapshot
-//! sidecar (`<dir>/.snapshots.packs`) — NOT the engine's own `<dir>/meta`
-//! `snapshot_heads`, which an app never writes. [`metaread::read`] reads that
+//! sidecar (`<dir>/.snapshots.packs`). [`metaread::read`] reads that
 //! sidecar read-only, so the check is
 //! non-vacuous on any store that actually persists snapshots (an app opts into
 //! that with `mess_store::SnapshotPolicy`). A store that persists none — e.g.
@@ -23,21 +22,17 @@
 //! cannot resolve is simply not reported (a miss, which the app answers by
 //! replaying) — it is never repaired and never invented.
 //!
-//! # The fold-version check's live-writer caveat (legacy meta store only)
+//! # bn-fj34: every check is now live-writer safe
 //!
-//! Every other check here reads directly off the segment files or probes the
-//! D9 store lock — none of that needs exclusive access. The `fold_version`
-//! check is the one exception, and only for its *legacy* source: if a
-//! `<dir>/meta` fjall store exists, [`metaread::read`] opens it, and fjall's
-//! own directory lock is exclusive with no read-only/secondary mode (see that
-//! module's doc for why a read-only fallback was investigated and rejected).
-//! While a live writer holds *that* store, this one check cannot run and
-//! degrades to an `info`-severity `meta-store-locked` finding instead of
-//! failing the whole command — see [`check_fold_version`] for the exact
-//! wording. The app snapshot sidecar stopped being a fjall database in bn-3l8n,
-//! so app snapshots are now readable while the writer is live; the flat-append
-//! owner does not create `<dir>/meta` at all, which makes the degraded path
-//! rare in practice.
+//! `doctor` used to carry one exception. The `fold_version` check had a second,
+//! *legacy* source — a `<dir>/meta` key-value store whose open took an
+//! exclusive directory lock with no read-only mode — so against a live writer
+//! that one check could not run and degraded to an `info`-severity
+//! `meta-store-locked` finding (bn-ve0). `bn-3l8n` moved the app sidecar off
+//! that engine and `bn-fj34` deleted it, so [`metaread::read`] is now
+//! lock-free and infallible. Every check here reads off the segment files, the
+//! pack sidecar, or the D9 store-lock probe; none of them needs exclusive
+//! access, and the degraded finding is gone rather than merely unreachable.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -64,14 +59,13 @@ pub fn run(dir: &Path, opts: &DoctorOptions) -> Report {
     let mut report = Report::new("doctor", "checks");
     report.set("dir", json!(dir.display().to_string()));
 
-    // Probed once and shared: `check_fold_version` reuses the same lock
-    // state to explain *why* it degraded (a live writer likely holds this
-    // same lock) without a second probe.
+    // Probed once and shared: `check_registry` needs the engine (hence the
+    // store lock) and reuses this state rather than probing again.
     let lock = lockprobe::probe(dir);
     check_lock(&mut report, &lock);
     check_segments(&mut report, dir);
     check_fsync(&mut report, dir);
-    check_fold_version(&mut report, dir, opts, &lock);
+    check_fold_version(&mut report, dir, opts);
     check_registry(&mut report, dir, &lock);
 
     report
@@ -89,9 +83,10 @@ pub fn run(dir: &Path, opts: &DoctorOptions) -> Report {
 /// whose ids have no meaning, so an operator wants to hear about it from
 /// `doctor` rather than from a failed open.
 ///
-/// Needs the engine (hence the store lock), so against a live writer it
-/// degrades to an info finding rather than failing the command — the same
-/// degradation `check_fold_version` makes, for the same reason.
+/// Needs the engine (hence the D9 store lock), so against a live writer it
+/// degrades to an info finding rather than failing the command. bn-fj34: this
+/// is now the *only* check that degrades under a live writer — the
+/// fold-version check reads the lock-free pack sidecar and no longer does.
 fn check_registry(report: &mut Report, dir: &Path, lock: &LockState) {
     if matches!(lock, LockState::Held { .. }) {
         report.push_finding(Finding::new(
@@ -470,35 +465,18 @@ fn check_fsync(report: &mut Report, dir: &Path) {
 /// set spans more than one version (stale snapshots pending re-fold), or when
 /// any differs from an operator-supplied `--expect-fold-version`.
 ///
-/// This is the one doctor check that can touch a fjall metadata store — the
-/// *legacy* `<dir>/meta` source, which a live writer holds under its own
-/// exclusive lock (see the module doc; the app's pack sidecar is lock-free and
-/// cannot fail this read). When that lock is held, [`metaread::read`] fails and
-/// this function degrades to
-/// an `info`-severity finding — [`degraded_fold_version_finding`] picks
-/// between a specific "the writer has it locked, here's what to do about it"
-/// message and a generic "could not read metadata" message for every other
-/// failure (fresh/empty store, corruption, I/O error).
-fn check_fold_version(
-    report: &mut Report,
-    dir: &Path,
-    opts: &DoctorOptions,
-    lock: &LockState,
-) {
-    // Set before the fallible open so the JSON envelope's top-level keys
-    // don't depend on lock state (mirrors bn-1yz's fix for `inspect`'s
-    // `registry`): a degraded run still has a `fold_versions` key, just
-    // empty, instead of the key vanishing entirely when the meta store
-    // can't be opened.
+/// bn-fj34: [`metaread::read`] is infallible and lock-free, so this check runs
+/// identically against a live store and a stopped one. It has no degraded
+/// path — an empty live set is the honest `no-snapshots` OK finding, never a
+/// "could not read" advisory.
+fn check_fold_version(report: &mut Report, dir: &Path, opts: &DoctorOptions) {
+    // Set before the read so the JSON envelope's top-level keys are the same
+    // whatever the sidecar holds (mirrors bn-1yz's fix for `inspect`'s
+    // `registry`): `fold_versions` is always present, just empty when there
+    // are no snapshots.
     report.set("fold_versions", json!(Vec::<u32>::new()));
 
-    let facts = match metaread::read(dir) {
-        Ok(f) => f,
-        Err(reason) => {
-            report.push_finding(degraded_fold_version_finding(&reason, lock));
-            return;
-        }
-    };
+    let facts = metaread::read(dir);
     let folds: BTreeSet<u32> =
         facts.snapshots.iter().map(|s| s.fold_version).collect();
     report
@@ -573,54 +551,5 @@ fn check_fold_version(
                 folds.iter().next()
             ),
         ));
-    }
-}
-
-/// Build the finding for a `metaread::read` failure in the fold-version
-/// check. A live writer holding fjall's metadata-store lock is the expected,
-/// common case (dogfooded against the social example app, see
-/// `examples/social/README.md`'s ops tour) — it gets a specific message that
-/// says *why* (the lock, not a fault) and *what to do* (stop the writer, or
-/// point `dir` at a `mess backup`/`mess restore` copy), reusing the
-/// already-probed D9 store lock's pid when we have it as a best-effort
-/// diagnostic (it is a different lock than fjall's own, but in practice held
-/// by the same live-writer process). Any other failure (fresh store with no
-/// `meta/` yet, corruption, a plain I/O error) keeps the older generic
-/// message with the raw reason attached.
-fn degraded_fold_version_finding(reason: &str, lock: &LockState) -> Finding {
-    if metaread::is_locked_error(reason) {
-        let holder = match lock {
-            LockState::Held { pid: Some(p) } => format!(" (pid {p})"),
-            LockState::Held { pid: None } => " (pid unknown)".to_string(),
-            // The D9 store lock was free/unknown when probed, but fjall's own
-            // meta lock is still held — a narrow race (the writer opened meta
-            // between our two probes) or a stray fjall LOCK file left by a
-            // process that isn't mess's own writer. Say so rather than
-            // implying the D9 lock is the one at fault.
-            LockState::Free | LockState::Unknown { .. } => String::new(),
-        };
-        Finding::new(
-            Severity::Info,
-            "fold-version",
-            "meta-store-locked",
-            format!(
-                "fold-version check skipped: a live writer holds the metadata \
-                 store's lock{holder}. This is expected while the app is \
-                 running, not an error. For the full check, stop the writer \
-                 first, or run doctor against a `mess backup`/`mess restore` \
-                 copy instead of the live directory."
-            ),
-        )
-        .with("reason", reason)
-    } else {
-        Finding::new(
-            Severity::Info,
-            "fold-version",
-            "registry-unavailable",
-            format!(
-                "could not read snapshot metadata for fold-version check: \
-                 {reason}"
-            ),
-        )
     }
 }

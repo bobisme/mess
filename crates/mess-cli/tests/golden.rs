@@ -6,9 +6,9 @@
 //!   COMPLETE deterministic store with the production [`LogEngine`] — multiple
 //!   named streams, a tiny (16 KiB) active segment so the log genuinely rolls
 //!   and the background sealer produces sealed segments (columnar `.pcol` +
-//!   pointer `.pidx` + a finalized fixed trailer), the fjall meta name registry
-//!   (`stream_names`/`type_names`), and a snapshot carrying a `fold_version` in
-//!   a [`PackSnapshotBackend`] nested under the store dir. It records an
+//!   pointer `.pidx` + a finalized fixed trailer), the log-carried `$registry`
+//!   name bijection (bn-2di), and a snapshot carrying a `fold_version` in a
+//!   [`PackSnapshotBackend`] nested under the store dir. It records an
 //!   `expected-events.json` manifest and packs the store dir as `store.tar.zst`
 //!   under `tests/golden/v3/`.
 //!
@@ -41,10 +41,11 @@
 //! The corpus is fixed (no wall-clock in any payload; single-threaded,
 //! sequential appends), so the manifest — global order, per-stream versions,
 //! the snapshot blob, and every fold-chain hash — is reproducible byte-for-byte
-//! across regenerations. The STORE BYTES are not byte-compared: fjall embeds
-//! internal timestamps, so goldens are OPENED and verified, never diffed whole.
-//! Two generator runs therefore yield equivalent stores (identical manifest,
-//! both pass the check) even though their tarballs differ.
+//! across regenerations. The STORE BYTES are not byte-compared — the committed
+//! v3/v4 tarballs carry a legacy key-value `meta/` directory whose files embed
+//! internal timestamps — so goldens are OPENED and verified, never diffed
+//! whole. Two generator runs therefore yield equivalent stores (identical
+//! manifest, both pass the check) even though their tarballs differ.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -362,7 +363,7 @@ async fn generate(version: &str, chain: bool) {
             "golden": version,
             "on_disk_chain": chain,
             "generator": "bn-yvi crates/mess-cli/tests/golden.rs",
-            "note": "Open + verify only; store bytes are NOT byte-compared (fjall timestamps).",
+            "note": "Open + verify only; store bytes are NOT byte-compared (legacy meta timestamps).",
             "segment_size": SEGMENT_SIZE,
             "total_events": events.len(),
             "streams": (0..STREAMS).map(|s| format!("orders-{s}")).collect::<Vec<_>>(),
@@ -468,7 +469,19 @@ async fn check(version: &str, chain: bool) {
         scratch.path().display()
     ));
     let store = scratch.path().join("store");
-    assert!(store.join("meta").is_dir(), "unpacked store missing meta dir");
+    // bn-fj34: this is a statement about the committed TARBALL, not about the
+    // engine. v3/v4 were generated when a store carried a `meta/` key-value
+    // directory; goldens are immutable, so those bytes stay. The current engine
+    // creates no such directory and reads nothing from one — `mess-store`'s
+    // `engine_name_durability` suite proves a store opens, names, and serves
+    // with the whole thing deleted — so this asserts the fixture is the legacy
+    // shape it is supposed to be, exactly as step 6 does for the pre-pack
+    // snapshot sidecar. A future `vN` minted by `generate()` will not have it.
+    assert!(
+        store.join("meta").is_dir(),
+        "golden {version} is expected to carry the legacy engine meta \
+         directory (immutable fixture bytes; the current engine ignores it)"
+    );
 
     let manifest: Value = serde_json::from_slice(
         &std::fs::read(&manifest_path).expect("read manifest"),

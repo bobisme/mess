@@ -43,8 +43,9 @@ use differential_support::{
 
 const FAST_SEEDS: u64 = 500;
 const FAST_OPS: usize = 40;
-/// bn-20b: the composed engine opens a real committer thread + fjall stores per
-/// sequence, so the engine differential profile uses a representative seed
+/// bn-20b: the composed engine opens a real committer thread + a real
+/// on-disk store per sequence, so the engine differential profile uses a
+/// representative seed
 /// budget (still exercising CrashReopen / conflicts / snapshots across every
 /// op kind) rather than the full 500.
 const ENGINE_SEEDS: u64 = 96;

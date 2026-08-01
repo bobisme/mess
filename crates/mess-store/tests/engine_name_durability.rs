@@ -7,8 +7,9 @@
 //! name string, so *something* durable has to hold the `id → name` bijection:
 //! recovery hard-fails without it ("no interned name for stream_id …").
 //!
-//! Before bn-2di that something was **fjall** — `stream_names`/`type_names`,
-//! the one meta keyspace that was NOT a derived cache the log could rebuild
+//! Before bn-2di that something was a separate key-value store —
+//! `stream_names`/`type_names`, the one meta keyspace that was NOT a derived
+//! cache the log could rebuild
 //! (I5). Upholding the invariant therefore meant ordering two *separate*
 //! storage systems, and that cost a real barrier:
 //!
@@ -29,17 +30,25 @@
 //! the reference and lose the registration: the ordering is structural, and
 //! structure needs no fsync.
 //!
-//! The fjall name tables are **gone** — not shadowed, not optional: the
-//! keyspaces do not exist, `MetaStore` has no method to write one, and
-//! `mess-log`'s committer no longer has a `PreBarrier` hook to hang a name
-//! flush on. So the assertions here **invert**: where the old suite demanded a
-//! flush per new name, this one demands zero, in every durability mode, and
-//! pins the guarantee where it actually lives — in the bytes of the log.
+//! The name tables are **gone** — not shadowed, not optional: the keyspaces do
+//! not exist, and `mess-log`'s committer no longer has a `PreBarrier` hook to
+//! hang a name flush on. So the assertions here **invert**: where the old suite
+//! demanded a flush per new name, this one demands zero, in every durability
+//! mode, and pins the guarantee where it actually lives — in the bytes of the
+//! log.
+//!
+//! bn-fj34 finished the job: the second storage engine is deleted outright, so
+//! [`a_fresh_and_a_reopened_store_lay_down_only_the_log_layout`] can state the
+//! end of the story positively — a store's on-disk tree is log segments and
+//! their derived sealed sidecars, and there is nothing else in it to be wrong.
 
 use std::time::{Duration, Instant};
 
 use mess_store::backend::{Backend, RecordToAppend};
-use mess_store::{Durability, EngineOptions, LogEngine, Version};
+use mess_store::{
+    BlobPtr, Durability, EngineOptions, LogEngine, SnapshotRef, SnapshotStore,
+    StoredSnapshot, Version, interim_stream_id,
+};
 
 fn rec(message_type: &str, data: &[u8]) -> RecordToAppend {
     RecordToAppend {
@@ -63,19 +72,19 @@ const MODES: [Durability; 3] = [
 ];
 
 // ---------------------------------------------------------------------------
-// The headline: a store keeps NO names in fjall, at all, ever.
+// The headline: a store keeps names NOWHERE but the log, at all, ever.
 // ---------------------------------------------------------------------------
 
 /// The acceptance criterion for retiring the keyspace, in its strongest form:
-/// the fjall name tables are never created, so a store must open, resolve every
-/// name, and serve every read with **no name data in fjall in existence**.
+/// the name tables are never created, so a store must open, resolve every name,
+/// and serve every read with **no name data anywhere but the log**.
 ///
-/// This is not "deleted after a migration" — there is nothing to delete. The
-/// `MetaStore` has no name keyspace and no method to write one; the only place
-/// a name has ever been written is the log.
+/// This is not "deleted after a migration" — there is nothing to delete. No
+/// name keyspace exists and nothing can write one; the only place a name has
+/// ever been written is the log.
 #[tokio::test]
-async fn a_store_resolves_every_name_with_no_fjall_name_tables_in_existence() {
-    let dir = mess_testkit::sweeping_temp_dir("name-dur-no-fjall-names");
+async fn a_store_resolves_every_name_with_no_name_tables_in_existence() {
+    let dir = mess_testkit::sweeping_temp_dir("name-dur-no-name-tables");
     let store_path = dir.path().join("store");
 
     {
@@ -141,7 +150,7 @@ async fn a_store_resolves_every_name_with_no_fjall_name_tables_in_existence() {
 ///   engine paid ~the same two barriers for a new stream under `Os` (one log
 ///   `fdatasync` + at least one meta `SyncAll`). What changed is that both
 ///   barriers are now the LOG's own — there is no second storage system in the
-///   path, no shared-`MetaStore` serialization point that `N` concurrent new
+///   path, no shared metadata-store serialization point that `N` concurrent new
 ///   streams funnel through (spike bn-1jg's finding), and no phantom `SyncAll`
 ///   invisible to `commit.fsync` (Spike J's).
 #[tokio::test]
@@ -252,7 +261,7 @@ async fn process_new_stream_appends_do_not_block_on_any_fsync() {
 // ---------------------------------------------------------------------------
 
 /// A burst of 32 concurrent brand-new streams — the shape that used to
-/// serialize on the shared `MetaStore`'s fsync — must reopen with every name
+/// serialize on the shared metadata store's fsync — must reopen with every name
 /// resolved, in every durability mode. Concurrency is the interesting part: two
 /// appenders on different streams race, and each must get its registration into
 /// the log ahead of any batch that references the id it minted.
@@ -491,27 +500,83 @@ async fn registry_stream_takes_only_valid_registry_records() {
 }
 
 // ---------------------------------------------------------------------------
-// How close is fjall to deletable? (the lead's question, answered by test)
+// bn-fj34: the store's whole on-disk tree, enumerated
 // ---------------------------------------------------------------------------
 
-/// **The engine reads NOTHING from fjall on open.**
+/// Recursively list every path under `root`, relative and slash-normalised.
+fn tree(root: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(cur) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&cur) else { continue };
+        for e in entries.flatten() {
+            let path = e.path();
+            let rel = path
+                .strip_prefix(root)
+                .expect("under root")
+                .to_string_lossy()
+                .replace('\\', "/");
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                out.push(format!("{rel}/"));
+                stack.push(path);
+            } else {
+                out.push(rel);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// **A store lays down the log layout and nothing else.**
 ///
-/// Delete the entire `meta/` directory — every keyspace, not just the names —
-/// and the store must still open, resolve every name, serve every read, and
-/// keep appending. Because it does, fjall is now a pure write-behind derived
-/// cache for the engine: `stream_heads` is the only thing the append path still
-/// writes there, heads are re-derived from the log scan on every open, and
-/// nothing on the open path consults fjall at all (`recover` does not even take
-/// a `&MetaStore` any more).
+/// This is the `bn-fj34` exit criterion stated positively. The predecessor of
+/// this test deleted the whole `meta/` directory and proved the engine did not
+/// care; that could only ever show the directory was *ignorable*. Now it cannot
+/// exist, so the assertion is the stronger one: enumerate the entire on-disk
+/// tree of a fresh store and of the same store reopened, and require every
+/// single entry to be a documented part of the log layout —
+/// `LOCK`, `seg-<id>.log`, `sealed/` and its `.pidx`/`.pcol`/`.filter`/`.par`
+/// sidecars. No `meta/`, and no key-value-store artifact of any kind, on either
+/// pass.
 ///
-/// This is the test that says how close we are to deleting fjall outright: for
-/// the ENGINE, the answer is "it already is". The app's snapshot sidecar — the
-/// last place a live path reached for fjall — moved to `PackSnapshotBackend`
-/// in bn-3l8n, so nothing outside fjall's own retiring suite consumes it now.
+/// A reopen is checked separately from a fresh open because recovery is the
+/// other place that historically wrote metadata: it used to rebuild derived
+/// tables on the way up.
+///
+/// The store still has to *work* while laying down nothing extra, so the reads,
+/// heads, and a fresh append are all asserted after the reopen — the behaviour
+/// the old test proved survives a deletion is here proved to need no deletion.
 #[tokio::test]
-async fn the_engine_opens_and_serves_with_the_whole_meta_directory_deleted() {
+async fn a_fresh_and_a_reopened_store_lay_down_only_the_log_layout() {
     let dir = mess_testkit::sweeping_temp_dir("name-dur-no-meta-dir");
     let store_path = dir.path().join("store");
+
+    /// Every entry must be one of these, or the store grew something new.
+    fn assert_log_layout_only(paths: &[String], phase: &str) {
+        for p in paths {
+            let ok = p == "LOCK"
+                || p == "sealed/"
+                || (p.starts_with("seg-") && p.ends_with(".log"))
+                || (p.starts_with("sealed/seg-")
+                    && [".pidx", ".pcol", ".filter", ".par"]
+                        .iter()
+                        .any(|ext| p.ends_with(ext)));
+            assert!(
+                ok,
+                "{phase}: unexpected on-disk artifact {p:?} — a store is log \
+                 segments and their derived sealed sidecars, nothing else \
+                 (full tree: {paths:?})"
+            );
+        }
+        // The specific thing bn-fj34 deleted, called out by name so a
+        // regression reads unambiguously.
+        assert!(
+            !paths.iter().any(|p| p == "meta/" || p.starts_with("meta/")),
+            "{phase}: a `meta/` directory must never be created (tree: \
+             {paths:?})"
+        );
+    }
 
     {
         let engine = open_with(&store_path, Durability::Process);
@@ -530,17 +595,18 @@ async fn the_engine_opens_and_serves_with_the_whole_meta_directory_deleted() {
             .append_batch("acct-0", Version::At(0), &[rec("evt-0", b"second")])
             .await
             .expect("append");
+
+        assert_log_layout_only(&tree(&store_path), "fresh store, live");
     }
 
-    // Nuke the ENTIRE fjall metadata store — every keyspace it has. The flat
-    // owner no longer writes the derived stream-head cache, so an append-only
-    // fixture may legitimately never create this directory at all.
-    let meta_dir = store_path.join("meta");
-    if meta_dir.exists() {
-        std::fs::remove_dir_all(&meta_dir).expect("delete the meta directory");
-    }
+    let after_close = tree(&store_path);
+    assert_log_layout_only(&after_close, "fresh store, closed");
 
+    // ---- Reopen: recovery must not lay anything down either. ----
     let engine = open_with(&store_path, Durability::Process);
+    assert_log_layout_only(&tree(&store_path), "reopened store");
+
+    // ...and it works, reading every name and head straight out of the log.
     for i in 0..6u64 {
         let s = engine
             .read_stream(&format!("acct-{i}"), Version::NoStream, 10)
@@ -553,13 +619,88 @@ async fn the_engine_opens_and_serves_with_the_whole_meta_directory_deleted() {
     assert_eq!(
         engine.head("acct-0").await.unwrap(),
         Version::At(1),
-        "heads are re-derived from the log, not from fjall"
+        "heads are re-derived from the log"
     );
 
-    // And it keeps working: a new append (minting a new name) still commits.
+    // A new append (minting a new name) still commits, and still adds nothing.
     engine
         .append_batch("acct-new", Version::NoStream, &[rec("evt.new", b"x")])
         .await
-        .expect("append after the meta store was deleted");
+        .expect("append after reopen");
     assert_eq!(engine.head("acct-new").await.unwrap(), Version::At(0));
+    assert_log_layout_only(&tree(&store_path), "after a post-reopen append");
+}
+
+/// The same exit criterion for an **app** store: wrapping the engine in a
+/// `PackSnapshotBackend` and persisting snapshots adds the pack sidecar and
+/// nothing else — in particular no `meta/` anywhere, in the store root or
+/// inside the sidecar (the pre-bn-3l8n sidecar layout was itself
+/// `<root>/{meta,blobs}`, so the sidecar root is the second place a key-value
+/// store could reappear).
+#[tokio::test]
+async fn an_app_store_with_snapshots_adds_the_pack_sidecar_and_nothing_else() {
+    let dir = mess_testkit::sweeping_temp_dir("name-dur-app-no-meta");
+    let store_path = dir.path().join("store");
+    let sidecar = store_path.join(".snapshots.packs");
+
+    for pass in ["fresh", "reopened"] {
+        let engine = open_with(&store_path, Durability::Process);
+        let backend = mess_store::PackSnapshotBackend::open(engine, &sidecar)
+            .expect("open sidecar");
+        let expect = backend.head("acct-1").await.expect("head");
+        backend
+            .append_batch("acct-1", expect, &[rec("noted", pass.as_bytes())])
+            .await
+            .expect("append");
+        // Publish a head at the backend seam: this test is about what lands on
+        // disk, so it needs a real save without an aggregate's ceremony.
+        let version = match backend.head("acct-1").await.expect("head") {
+            Version::At(v) => v,
+            other => panic!("{pass}: expected a head, got {other:?}"),
+        };
+        backend
+            .save_snapshot(
+                "acct-1",
+                StoredSnapshot {
+                    snapshot_ref: SnapshotRef {
+                        stream_id:           interim_stream_id("acct-1"),
+                        stream_version:      version,
+                        fold_version:        1,
+                        covers_empty_prefix: false,
+                        event_prefix_hash:   None,
+                        state_hash:          None,
+                        snapshot_ptr:        BlobPtr(0),
+                    },
+                    state_blob:   pass.as_bytes().to_vec(),
+                },
+            )
+            .await
+            .expect("snapshot");
+        drop(backend);
+
+        let paths = tree(&store_path);
+        assert!(
+            !paths.iter().any(|p| p == "meta/" || p.contains("/meta")),
+            "{pass}: no `meta/` may appear in the store or its sidecar: \
+             {paths:?}"
+        );
+        // The sidecar's own contents are packs, roots, and its two control
+        // files — the documented ADR 0002 §1 shape.
+        for p in paths
+            .iter()
+            .filter(|p| p.starts_with(".snapshots.packs/") && !p.ends_with('/'))
+        {
+            let name = p.trim_start_matches(".snapshots.packs/");
+            let ok = name == "LOCK"
+                || name == "IDENTITY"
+                || name.ends_with(".pack")
+                || name.ends_with(".open")
+                || name.ends_with(".root");
+            assert!(ok, "{pass}: unexpected sidecar artifact {p:?}");
+        }
+        assert!(
+            paths.iter().any(|p| p.ends_with(".root")),
+            "{pass}: the snapshot really was published: {paths:?}"
+        );
+    }
 }
