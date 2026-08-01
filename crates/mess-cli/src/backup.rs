@@ -200,6 +200,16 @@ pub fn compute_cut(dir: &Path) -> Cut {
     // (doc 07 §1.2). It is copied after the log cut to minimise skew.
     collect_meta(dir, &mut cut.files);
 
+    // bn-3l8n, deliberate exclusion: the app snapshot sidecar
+    // (`store::snapshot_pack_dir`) is NOT in the cut. It is discardable
+    // acceleration — every entry in it is recomputable by replaying the events
+    // the cut already carries, it is never an authority for retention, and it
+    // is UUID-scoped so copying it into a restored store would import an
+    // identity minted elsewhere. A restored store therefore opens with no
+    // sidecar, mints its own, and warms by replay-on-miss. (An operator who
+    // wants the warm cache too can copy the directory by hand while the writer
+    // is stopped; nothing here depends on it.)
+
     cut.min_segment_id = if min_seg == u64::MAX { 0 } else { min_seg };
     cut.max_segment_id = max_seg;
     cut

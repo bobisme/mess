@@ -97,7 +97,7 @@ async fn differential_fast_profile() {
 }
 
 /// bn-20b engine swap: the identical differential suite driven against the
-/// **composed production engine** (`FjallSnapshotBackend<LogEngine>`), proving
+/// **composed production engine** (`PackSnapshotBackend<LogEngine>`), proving
 /// the engine matches the same Model oracle — the payoff of API-first. Every
 /// op kind (including `CrashReopen`, stale-`AppendRaw` conflicts, and
 /// `SaveSnapshot`) is exercised across `ENGINE_SEEDS` seeds x 2 cache configs.

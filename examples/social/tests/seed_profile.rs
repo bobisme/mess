@@ -9,7 +9,7 @@
 //! own stream), so nearly every command is a *cold miss that creates a new
 //! stream*; the hot-post bench hammers ONE warm stream. This harness reproduces
 //! both shapes over the real production backend
-//! (`EventStore<FjallSnapshotBackend<LogEngine>>`, `Durability::Process`, the
+//! (`EventStore<PackSnapshotBackend<LogEngine>>`, `Durability::Process`, the
 //! seeder's exact construction) and decomposes the per-command latency into its
 //! phases so the dominant cost is *measured*, not argued.
 //!
@@ -38,7 +38,7 @@
 //!   (no new-stream registry write). Separates first-touch load cost from the
 //!   new-stream cost.
 //! - **(d) all-new-streams over plain `LogEngine`** — H3: the same new-stream
-//!   append over `EventStore<LogEngine>` (no `FjallSnapshotBackend` wrapper),
+//!   append over `EventStore<LogEngine>` (no `PackSnapshotBackend` wrapper),
 //!   via the base `command` path (the plain engine is not a `SnapshotStore`).
 //! - **(e) all-new-streams sequential vs pipelined** — H4: wall-clock/n and the
 //!   per-command latency *inside* the k=32 pipeline.
@@ -68,8 +68,8 @@ use mess_core::Decide;
 use mess_derive::{Aggregate, Event};
 use mess_store::registry::RESERVED_STREAM_NAME;
 use mess_store::{
-    AppendError, Appended, Backend, EventStore, FjallSnapshotBackend,
-    LogEngine, OwnedAppendBatch, RecordToAppend, SnapshotStore, Snapshottable,
+    AppendError, Appended, Backend, EventStore, LogEngine, OwnedAppendBatch,
+    PackSnapshotBackend, RecordToAppend, SnapshotStore, Snapshottable,
     StateCodecError, StoredRecord, StoredSnapshot, SubscribeBackend, Version,
 };
 use mess_testkit::{SweepingTempDir, sweeping_temp_dir};
@@ -304,17 +304,17 @@ impl<B: SubscribeBackend> SubscribeBackend for ProfilingBackend<B> {
 // Store construction — the seeder's exact production shape.
 // ===========================================================================
 
-type SnapBackend = FjallSnapshotBackend<LogEngine>;
+type SnapBackend = PackSnapshotBackend<LogEngine>;
 type ProfSnap = ProfilingBackend<SnapBackend>;
 
-/// Open a fresh `FjallSnapshotBackend<LogEngine>` on a self-sweeping temp dir
+/// Open a fresh `PackSnapshotBackend<LogEngine>` on a self-sweeping temp dir
 /// (the real-fs TMPDIR rule), wrapped in a [`ProfilingBackend`]. `Durability`
 /// is the engine default (`Process`) — the seeder's exact construction
 /// (`open_store` → `LogEngine::open` → default options).
 fn fresh_prof_backend(tag: &str) -> (ProfSnap, Hist, SweepingTempDir) {
     let dir = sweeping_temp_dir(tag);
     let engine = LogEngine::open(dir.path().join("log")).expect("open engine");
-    let backend = FjallSnapshotBackend::open(engine, dir.path().join("snap"))
+    let backend = PackSnapshotBackend::open(engine, dir.path().join("snap"))
         .expect("open snapshot backend");
     let hist = Hist::default();
     (ProfilingBackend::new(backend, hist.clone()), hist, dir)
@@ -334,7 +334,7 @@ fn stream_name(i: usize) -> String { format!("rel-{i:08x}") }
 /// an already-interned one.
 ///
 /// Read straight off the inner [`LogEngine`], bypassing the
-/// [`ProfilingBackend`] and the `FjallSnapshotBackend`, so the probe itself is
+/// [`ProfilingBackend`] and the `PackSnapshotBackend`, so the probe itself is
 /// invisible to the histograms and phases being measured.
 async fn registry_records(backend: &ProfSnap) -> usize {
     let engine = backend.inner().inner();
@@ -569,7 +569,7 @@ async fn run_cold_existing(n: usize) -> (Spans, Hist, Duration) {
 }
 
 /// (d) all-new-streams over plain `LogEngine` (H3): same new-stream append with
-/// NO `FjallSnapshotBackend` wrapper, via the base `command` path (the plain
+/// NO `PackSnapshotBackend` wrapper, via the base `command` path (the plain
 /// engine is not a `SnapshotStore`, so `command_cached` is unavailable). Times
 /// each command's wall latency and the backend calls.
 async fn run_new_streams_plain(n: usize) -> (Vec<Duration>, Hist, Duration) {
@@ -695,7 +695,7 @@ async fn seed_profile() {
         "\n================ seed-throughput profile (bn-1jg) ================"
     );
     println!(
-        "store: EventStore<FjallSnapshotBackend<LogEngine>>, \
+        "store: EventStore<PackSnapshotBackend<LogEngine>>, \
          Durability::Process, real fs"
     );
     println!("aggregate: Rel (one event/command), cache cap={CACHE_CAP}");

@@ -9,28 +9,35 @@
 //! # What the fold-version check sees
 //!
 //! The persisted snapshots this check inspects are the app's, written by a
-//! [`FjallSnapshotBackend`](mess_store::FjallSnapshotBackend) into the snapshot
-//! sidecar (`<dir>/.snapshots/meta`) — NOT the engine's own `<dir>/meta`
+//! [`PackSnapshotBackend`](mess_store::PackSnapshotBackend) into the snapshot
+//! sidecar (`<dir>/.snapshots.packs`) — NOT the engine's own `<dir>/meta`
 //! `snapshot_heads`, which an app never writes. [`metaread::read`] reads that
-//! sidecar and joins its heads back to stream names, so the check is
+//! sidecar read-only, so the check is
 //! non-vacuous on any store that actually persists snapshots (an app opts into
 //! that with `mess_store::SnapshotPolicy`). A store that persists none — e.g.
 //! one whose warm path is a pure in-memory cache — correctly reports the
 //! `no-snapshots` OK finding: there is genuinely nothing to drift.
 //!
-//! # The fold-version check's live-writer caveat
+//! `doctor` never writes to the sidecar and never repairs it: the reader takes
+//! no lock and creates, truncates, renames, and deletes nothing. A head it
+//! cannot resolve is simply not reported (a miss, which the app answers by
+//! replaying) — it is never repaired and never invented.
+//!
+//! # The fold-version check's live-writer caveat (legacy meta store only)
 //!
 //! Every other check here reads directly off the segment files or probes the
 //! D9 store lock — none of that needs exclusive access. The `fold_version`
-//! check is the one exception: it opens the fjall metadata store(s) via
-//! [`metaread::read`], and fjall's own directory lock is exclusive with no
-//! read-only/secondary mode (see that module's doc for why a read-only
-//! fallback was investigated and rejected). While a live writer holds the
-//! store, this one check cannot run and degrades to an `info`-severity
-//! `meta-store-locked` finding instead of failing the whole command — see
-//! [`check_fold_version`] for the exact wording. This is expected, correct
-//! behavior, not a bug: run `doctor` against a stopped writer, or against a
-//! `mess backup`/`mess restore` copy, to get the full check.
+//! check is the one exception, and only for its *legacy* source: if a
+//! `<dir>/meta` fjall store exists, [`metaread::read`] opens it, and fjall's
+//! own directory lock is exclusive with no read-only/secondary mode (see that
+//! module's doc for why a read-only fallback was investigated and rejected).
+//! While a live writer holds *that* store, this one check cannot run and
+//! degrades to an `info`-severity `meta-store-locked` finding instead of
+//! failing the whole command — see [`check_fold_version`] for the exact
+//! wording. The app snapshot sidecar stopped being a fjall database in bn-3l8n,
+//! so app snapshots are now readable while the writer is live; the flat-append
+//! owner does not create `<dir>/meta` at all, which makes the degraded path
+//! rare in practice.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -463,9 +470,11 @@ fn check_fsync(report: &mut Report, dir: &Path) {
 /// set spans more than one version (stale snapshots pending re-fold), or when
 /// any differs from an operator-supplied `--expect-fold-version`.
 ///
-/// This is the one doctor check that needs the fjall metadata store, which a
-/// live writer holds under its own exclusive lock (see the module doc). When
-/// that lock is held, [`metaread::read`] fails and this function degrades to
+/// This is the one doctor check that can touch a fjall metadata store — the
+/// *legacy* `<dir>/meta` source, which a live writer holds under its own
+/// exclusive lock (see the module doc; the app's pack sidecar is lock-free and
+/// cannot fail this read). When that lock is held, [`metaread::read`] fails and
+/// this function degrades to
 /// an `info`-severity finding — [`degraded_fold_version_finding`] picks
 /// between a specific "the writer has it locked, here's what to do about it"
 /// message and a generic "could not read metadata" message for every other

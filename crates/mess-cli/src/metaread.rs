@@ -4,7 +4,9 @@
 //!
 //! Opening the fjall metadata store takes fjall's own directory lock, so under
 //! a live writer this open fails — every caller treats that as best-effort and
-//! degrades to an advisory rather than a hard error.
+//! degrades to an advisory rather than a hard error. That caveat applies to the
+//! *engine* meta store only; the app snapshot sidecar (2 below) is lock-free on
+//! the read path since bn-3l8n.
 //!
 //! # Two snapshot id spaces, unified here
 //!
@@ -15,20 +17,37 @@
 //!    flat append owner does not create this store, so in practice this set is
 //!    absent — reading it is for compatibility and tests that inject heads
 //!    directly.
-//! 2. the **app snapshot sidecar** `<dir>/.snapshots/meta`
-//!    ([`store::snapshot_meta_dir`](crate::store::snapshot_meta_dir)), where a
-//!    [`FjallSnapshotBackend`](mess_store::FjallSnapshotBackend) actually
-//!    persists app snapshots — keyed by the *interim FNV* `stream_id` and now
-//!    (post-bone) carrying the stream name as a side map so the heads can be
-//!    joined back to names.
+//! 2. the **app snapshot sidecar** `<dir>/.snapshots.packs`
+//!    ([`store::snapshot_pack_dir`](crate::store::snapshot_pack_dir)), where a
+//!    [`PackSnapshotBackend`](mess_store::PackSnapshotBackend) actually
+//!    persists app snapshots — a flat directory of immutable packs plus a
+//!    discovery root, whose records are self-describing and carry the stream
+//!    *name*.
 //!
 //! Historically `doctor` read only (1) and correlated by registry id, while
 //! apps wrote only (2) under FNV ids: the id spaces never intersected, so the
-//! fold-version drift check was structurally vacuous. Reading (2) here and
-//! joining each store's `snapshot_heads` against its own `stream_names` is what
+//! fold-version drift check was structurally vacuous. Reading (2) here is what
 //! makes the check fire on a real app store.
 //!
-//! # bn-ve0: why there is no read-only fallback
+//! # bn-3l8n: how the pack sidecar is read
+//!
+//! [`mess_store::Sidecar::open_reader`] takes **no lock**, never creates,
+//! truncates, repairs, renames, or deletes anything, and cannot fail: a missing
+//! directory, a foreign/unknown layout (including a pre-bn-3l8n
+//! `<dir>/.snapshots` fjall sidecar, which lives at a different path anyway), a
+//! truncated root, or a deleted pack all resolve to *zero heads*. So this
+//! module's snapshot read is now infallible for the app sidecar and enumerates
+//! through the already-resolved discovery root
+//! ([`stream_names`](mess_store::Sidecar::stream_names) +
+//! [`load`](mess_store::Sidecar::load)) — bounded by the published head count,
+//! O(1) per head, with no repair and no writer interference.
+//!
+//! `LiveSnapshot::stream_id` keeps the *interim FNV* id
+//! ([`mess_store::interim_stream_id`] of the record's stream name) so the
+//! reported identity is byte-identical to what the fjall sidecar surfaced; the
+//! pack record is what makes recovering it from a name free.
+//!
+//! # bn-ve0: why there is no read-only fallback (engine meta store)
 //!
 //! The obvious fix for the fjall-lock failure mode is "open read-only /
 //! secondary instead of falling over" — investigated for `doctor`'s
@@ -64,9 +83,13 @@
 //! Given both, `doctor` keeps the existing "try exclusive, degrade to an
 //! advisory finding on failure" shape (item 1/2 of bn-ve0: better wording +
 //! docs for the caveat) rather than a forced read-only path. If fjall ever
-//! ships a documented read-only/secondary mode, revisit this.
+//! ships a documented read-only/secondary mode, revisit this. Note this now
+//! affects only source (1) — the app sidecar never had the problem to begin
+//! with once it stopped being a fjall database.
 
 use mess_index::meta::{MetaStore, StreamId};
+use mess_store::interim_stream_id;
+use mess_store::pack_snapshot::Sidecar;
 
 /// One live snapshot decoded from the `snapshot_heads` table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,7 +110,9 @@ pub struct MetaFacts {
     pub snapshots: Vec<LiveSnapshot>,
 }
 
-/// The opaque snapshot-ref v1 layout (mirrors `mess_store::fjall_snapshot`):
+/// The opaque snapshot-ref v1 layout carried by a legacy `<dir>/meta`
+/// `snapshot_heads` row (source (1) only — the pack sidecar's records are
+/// self-describing and need no ref decode):
 /// `tag(1) || fold_version(4 LE) || flags(1) || snapshot_ptr(8 LE)`; flags bit
 /// 0 = `covers_empty_prefix`. Returns `None` for any record this binary does
 /// not understand (legacy / future / garbled) — treated as no usable snapshot.
@@ -139,19 +164,18 @@ pub fn read(dir: &std::path::Path) -> Result<MetaFacts, String> {
     //
     // Unify the two snapshot id spaces (see the module doc): the engine's own
     // `<dir>/meta` heads (historically empty) PLUS the app snapshot sidecar's
-    // heads, each joined against its own side map.
-    if let Some(app) = open_snapshot_sidecar(dir)? {
-        snapshots.extend(snapshots_of(&app));
-    }
+    // published heads. The sidecar read is infallible and lock-free, so it
+    // cannot make this function fail.
+    snapshots.extend(pack_snapshots(dir));
     snapshots.sort_by_key(|s| s.stream_id);
     Ok(MetaFacts { snapshots })
 }
 
-/// Join a meta store's `snapshot_heads` against its `stream_names` interner:
-/// one [`LiveSnapshot`] per stream that has both a persisted name and a
-/// snapshot head. A head is only surfaced once a name is on record for its id,
-/// which the engine interner and (post-bone) the snapshot sidecar both
-/// guarantee — so this same join serves both id spaces.
+/// Join the legacy engine meta store's `snapshot_heads` against its
+/// `snapshot_stream_names` side map: one [`LiveSnapshot`] per stream that has
+/// both a persisted name and a snapshot head. A head is only surfaced once a
+/// name is on record for its id. This serves source (1) alone — the app sidecar
+/// (source (2)) needs no side map, because a pack record names its own stream.
 fn snapshots_of(meta: &MetaStore) -> Vec<LiveSnapshot> {
     let Ok(names) = meta.snapshot_stream_names() else {
         return Vec::new();
@@ -172,23 +196,34 @@ fn snapshots_of(meta: &MetaStore) -> Vec<LiveSnapshot> {
     out
 }
 
-/// Open the app snapshot sidecar meta store
-/// ([`store::snapshot_meta_dir`](crate::store::snapshot_meta_dir)) if it
-/// exists.
+/// Enumerate the app snapshot sidecar
+/// ([`store::snapshot_pack_dir`](crate::store::snapshot_pack_dir)) read-only.
 ///
-/// `Ok(None)` means there is no sidecar — a store with no app snapshots, which
-/// is normal and never an error. A sidecar that EXISTS but cannot be opened
-/// (locked by a live writer, or corrupt) is a hard `Err(reason)`, so `doctor`
-/// degrades to an honest "could not read" advisory rather than silently
-/// reporting `no snapshots` while real drift sits unread behind the lock — the
-/// same reasoning bn-ve0 applies to the engine meta lock. The `exists` guard
-/// also avoids *creating* an empty sidecar during a read-only run.
-fn open_snapshot_sidecar(
-    dir: &std::path::Path,
-) -> Result<Option<MetaStore>, String> {
-    let path = crate::store::snapshot_meta_dir(dir);
-    if !path.exists() {
-        return Ok(None);
-    }
-    MetaStore::open(&path).map(Some).map_err(|e| e.to_string())
+/// [`Sidecar::open_reader`] takes no writer lock, creates nothing, and never
+/// fails: an absent directory, an unknown layout, or an unresolvable root all
+/// yield zero heads, which is exactly "this store has no app snapshots". So —
+/// unlike the fjall sidecar this replaced — there is no lock-contention failure
+/// mode to degrade from, and running `doctor` against a *live* store now gets
+/// the full fold-version check for app snapshots instead of an advisory.
+///
+/// Enumeration walks the already-resolved discovery root, so it is bounded by
+/// the published head count and does no repair. A head that cannot be resolved
+/// to a valid record (deleted pack, corrupt frame, format the reader does not
+/// understand) is silently skipped — a miss, never an error, never a fabricated
+/// entry.
+fn pack_snapshots(dir: &std::path::Path) -> Vec<LiveSnapshot> {
+    let sidecar = Sidecar::open_reader(crate::store::snapshot_pack_dir(dir));
+    sidecar
+        .stream_names()
+        .iter()
+        .filter_map(|name| {
+            let rec = sidecar.load(name)?;
+            Some(LiveSnapshot {
+                stream_id:           interim_stream_id(name),
+                version:             rec.stream_version,
+                fold_version:        rec.fold_version,
+                covers_empty_prefix: rec.covers_empty_prefix,
+            })
+        })
+        .collect()
 }

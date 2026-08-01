@@ -505,10 +505,9 @@ async fn registry_stream_takes_only_valid_registry_records() {
 /// a `&MetaStore` any more).
 ///
 /// This is the test that says how close we are to deleting fjall outright: for
-/// the ENGINE, the answer is "it already is". What still needs it is the
-/// separate, opt-in `FjallSnapshotBackend` (the app's snapshot sidecar, its own
-/// database under `.snapshots/`), which is a different component with a
-/// different lifecycle.
+/// the ENGINE, the answer is "it already is". The app's snapshot sidecar — the
+/// last place a live path reached for fjall — moved to `PackSnapshotBackend`
+/// in bn-3l8n, so nothing outside fjall's own retiring suite consumes it now.
 #[tokio::test]
 async fn the_engine_opens_and_serves_with_the_whole_meta_directory_deleted() {
     let dir = mess_testkit::sweeping_temp_dir("name-dur-no-meta-dir");

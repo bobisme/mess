@@ -16,7 +16,7 @@
 //! [`WriteOps`](social::contracts::WriteOps) (warm-path `command_cached`) calls
 //! against a real on-disk warm-write [`Store`](social::store_backend::Store) —
 //! a [`mess_store::LogEngine`] wrapped in a
-//! [`mess_store::FjallSnapshotBackend`]. See [`social::seed`] for the
+//! [`mess_store::PackSnapshotBackend`]. See [`social::seed`] for the
 //! generator.
 
 use std::path::{Path, PathBuf};

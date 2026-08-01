@@ -49,8 +49,8 @@ use std::time::{Duration, Instant};
 use mess_core::Decide;
 use mess_derive::{Aggregate, Event};
 use mess_store::{
-    EventStore, FjallSnapshotBackend, LogEngine, Snapshottable,
-    StateCodecError, Version,
+    EventStore, LogEngine, PackSnapshotBackend, Snapshottable, StateCodecError,
+    Version,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -196,7 +196,7 @@ impl Snapshottable for MegaPost {
 /// A snapshot-capable real-fs store, plus the temp dir it lives in (dropped
 /// last so the store closes before its files are swept).
 struct BenchStore {
-    backend: FjallSnapshotBackend<LogEngine>,
+    backend: PackSnapshotBackend<LogEngine>,
     _dir:    mess_testkit::SweepingTempDir,
 }
 
@@ -207,13 +207,13 @@ impl BenchStore {
         let engine =
             LogEngine::open(dir.path().join("log")).expect("open engine");
         let backend =
-            FjallSnapshotBackend::open(engine, dir.path().join("snap"))
+            PackSnapshotBackend::open(engine, dir.path().join("snap"))
                 .expect("open snapshot backend");
         BenchStore { backend, _dir: dir }
     }
 
     /// A cache-off store over the shared backend (the "cold" path).
-    fn cold(&self) -> EventStore<FjallSnapshotBackend<LogEngine>> {
+    fn cold(&self) -> EventStore<PackSnapshotBackend<LogEngine>> {
         EventStore::new(self.backend.clone())
     }
 
@@ -221,7 +221,7 @@ impl BenchStore {
     fn warm(
         &self,
         capacity: usize,
-    ) -> EventStore<FjallSnapshotBackend<LogEngine>> {
+    ) -> EventStore<PackSnapshotBackend<LogEngine>> {
         EventStore::new(self.backend.clone()).with_cache_capacity(capacity)
     }
 }
@@ -442,9 +442,7 @@ fn print_report(p: &Params, r: &Report) {
         "seeded: depth={} events, active likers in fold={} ids",
         r.seed_depth, r.active_ids
     );
-    println!(
-        "store:  EventStore over FjallSnapshotBackend<LogEngine>, real fs"
-    );
+    println!("store:  EventStore over PackSnapshotBackend<LogEngine>, real fs");
     println!("---------------------------------------------------");
     println!("(a) plain command per like @depth (full replay each)");
     println!(

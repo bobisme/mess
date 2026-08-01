@@ -1,7 +1,14 @@
 //! Shared test support for the bn-20b engine swap: a thin backend wrapper that
-//! bundles a [`LogEngine`] (or a snapshot-capable `FjallSnapshotBackend` over
+//! bundles a [`LogEngine`] (or a snapshot-capable `PackSnapshotBackend` over
 //! one) with the temp directory it lives in, so the existing Phase 1/2 suites
 //! run **unchanged** against the composed production engine.
+//!
+//! bn-3l8n: the snapshot half is the **pack sidecar**
+//! ([`PackSnapshotBackend`]), not the retired fjall head table — these types
+//! are infrastructure for testing the facade, so they follow the production
+//! composition. The fjall backend's own suite (`tests/fjall_snapshot.rs`) and
+//! the pack/fjall differential (`tests/pack_snapshot.rs`) still name it
+//! directly; they retire with it.
 //!
 //! The wrapper is [`Clone`] and shares one `Arc`-held temp dir + engine handle,
 //! matching the interim `MockBackend`'s reuse-the-handle semantics (a facade
@@ -17,7 +24,7 @@ use mess_store::backend::{
     StoredRecord,
 };
 use mess_store::snapshot::{SnapshotStore, StoredSnapshot};
-use mess_store::{FjallSnapshotBackend, LogEngine, MockBackend, Version};
+use mess_store::{LogEngine, MockBackend, PackSnapshotBackend, Version};
 use mess_testkit::{SweepingTempDir, sweeping_temp_dir};
 
 /// Simulate a full process restart over a backend's own durable directory
@@ -58,8 +65,8 @@ impl<B: Clone> Clone for Tmp<B> {
 pub type TestBackend = Tmp<LogEngine>;
 
 /// The snapshot-capable composed backend: the production
-/// `FjallSnapshotBackend` over the composed engine.
-pub type TestSnapshotBackend = Tmp<FjallSnapshotBackend<LogEngine>>;
+/// `PackSnapshotBackend` over the composed engine.
+pub type TestSnapshotBackend = Tmp<PackSnapshotBackend<LogEngine>>;
 
 impl TestBackend {
     /// A fresh composed engine on its own temp dir.
@@ -88,7 +95,7 @@ impl TestSnapshotBackend {
         let engine =
             LogEngine::open(dir.path().join("store")).expect("open engine");
         let backend =
-            FjallSnapshotBackend::open(engine, dir.path().join("snap"))
+            PackSnapshotBackend::open(engine, dir.path().join("snap"))
                 .expect("open snapshot backend");
         Tmp { backend, _dir: Arc::new(dir) }
     }
@@ -100,11 +107,12 @@ impl Default for TestSnapshotBackend {
 
 impl Reopen for TestSnapshotBackend {
     /// A genuine process restart: drop the live engine + snapshot backend
-    /// FIRST (releasing the D9 `StoreLock` and fjall's own locks), then
-    /// `LogEngine::open` / `FjallSnapshotBackend::open` the SAME directories
-    /// fresh — so recovery rehydrates the record book from the durable log with
-    /// no shared in-process state carried over. The temp dir (the durable
-    /// bytes) survives via the retained `Arc<SweepingTempDir>`.
+    /// FIRST (releasing the D9 `StoreLock` and the sidecar's own writer lock),
+    /// then `LogEngine::open` / `PackSnapshotBackend::open` the SAME
+    /// directories fresh — so recovery rehydrates the record book from the
+    /// durable log with no shared in-process state carried over, and the
+    /// sidecar re-selects its published root off disk. The temp dir (the
+    /// durable bytes) survives via the retained `Arc<SweepingTempDir>`.
     fn reopen(self) -> Self {
         let Tmp { backend, _dir } = self;
         // Release every handle to the old engine before re-acquiring its lock.
@@ -112,7 +120,7 @@ impl Reopen for TestSnapshotBackend {
         let root = _dir.path().to_path_buf();
         let engine =
             LogEngine::open(root.join("store")).expect("reopen engine");
-        let backend = FjallSnapshotBackend::open(engine, root.join("snap"))
+        let backend = PackSnapshotBackend::open(engine, root.join("snap"))
             .expect("reopen snapshot backend");
         Tmp { backend, _dir }
     }
@@ -133,12 +141,10 @@ impl Reopen for TestBackend {
 /// Open a snapshot-capable composed backend rooted at a caller-supplied dir,
 /// for the tests that assert reopen behaviour against a fixed path.
 #[must_use]
-pub fn open_snapshot(
-    root: &std::path::Path,
-) -> FjallSnapshotBackend<LogEngine> {
+pub fn open_snapshot(root: &std::path::Path) -> PackSnapshotBackend<LogEngine> {
     std::fs::create_dir_all(root).expect("create root");
     let engine = LogEngine::open(root.join("store")).expect("open engine");
-    FjallSnapshotBackend::open(engine, root.join("snap"))
+    PackSnapshotBackend::open(engine, root.join("snap"))
         .expect("open snapshot backend")
 }
 

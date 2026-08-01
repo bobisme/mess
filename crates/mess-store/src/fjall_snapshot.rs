@@ -1,8 +1,21 @@
-//! [`FjallSnapshotBackend`]: the **production** snapshot path — snapshot *heads*
-//! in mess-index's fjall
+//! [`FjallSnapshotBackend`]: the **superseded** snapshot path — snapshot
+//! *heads* in mess-index's fjall
 //! [`SnapshotHeads`](mess_index::meta::MetaTable::SnapshotHeads) table (O(1)
 //! point lookup, journal-buffered, rebuildable per I5) plus state **blobs** in
 //! a plain content-addressed directory.
+//!
+//! # Retiring (bn-3l8n / bn-fj34)
+//!
+//! [`PackSnapshotBackend`](crate::PackSnapshotBackend) is the production
+//! sidecar as of bn-3l8n: every application, example, tool, and test-support
+//! path composes *that* over [`LogEngine`](crate::LogEngine). What is left
+//! consuming this type is its own suite (`tests/fjall_snapshot.rs`) and the
+//! pack/fjall differential (`tests/pack_snapshot.rs`), which exists precisely
+//! to prove the replacement returns byte-identical snapshots. Both retire with
+//! the type in bn-fj34. Do not construct it in new code.
+//!
+//! Everything below describes the old design, and is kept until deletion so the
+//! differential's counterpart is documented.
 //!
 //! # Why this shape, and why the API does not change
 //!

@@ -14,7 +14,9 @@
 //! The facade sits on the [`Backend`] trait (`head` / `read_stream` /
 //! `read_global` / borrowed and owned append), distilled from how
 //! `spikes/dx_api` drove the original database actor. Production composes
-//! [`FjallSnapshotBackend`] over [`LogEngine`]; the optional in-memory
+//! [`PackSnapshotBackend`] over [`LogEngine`] (bn-3l8n; the retiring
+//! [`FjallSnapshotBackend`] is the same seam over the old fjall head table);
+//! the optional in-memory
 //! [`MockBackend`] enforces real expected-version conflict semantics under a
 //! lock so facade retry and concurrency behavior can also be tested without
 //! durable storage.

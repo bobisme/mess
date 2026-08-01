@@ -24,7 +24,7 @@ use social::{
 };
 
 /// A fresh warm-write [`Store`] on a self-sweeping temp dir per test (the
-/// real-fs TMPDIR rule). `FjallSnapshotBackend` forwards `SubscribeBackend`
+/// real-fs TMPDIR rule). `PackSnapshotBackend` forwards `SubscribeBackend`
 /// straight to the wrapped log, so the ONE store handle serves both writes
 /// (`SnapshotStore`/`command_cached`) and the `Projections` pump's
 /// subscription — no separate read handle needed. See

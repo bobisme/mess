@@ -20,7 +20,7 @@ use mess_store::registry::{
     REGISTRY_EVENT_TYPE_NAME, RESERVED_STREAM_ID, Registry, RegistryRecord,
 };
 use mess_store::{
-    EngineOptions, EventStore, FjallSnapshotBackend, LogEngine, MockBackend,
+    EngineOptions, EventStore, LogEngine, MockBackend, PackSnapshotBackend,
     Snapshottable, StateCodecError, Version,
 };
 
@@ -150,13 +150,11 @@ async fn public_facade_moves_payloads_without_a_defensive_copy() {
 
 #[tokio::test]
 async fn production_snapshot_wrapper_forwards_owned_submission() {
-    let dir = mess_testkit::sweeping_temp_dir("owned-append-fjall-wrapper");
+    let dir = mess_testkit::sweeping_temp_dir("owned-append-pack-wrapper");
     let engine = LogEngine::open(dir.path().join("store")).expect("open");
-    let backend = FjallSnapshotBackend::open(
-        engine.clone(),
-        dir.path().join("snapshots"),
-    )
-    .expect("open snapshot wrapper");
+    let backend =
+        PackSnapshotBackend::open(engine.clone(), dir.path().join("snapshots"))
+            .expect("open snapshot wrapper");
     let store = EventStore::new(backend);
     let before = engine.metrics().commit;
 
@@ -189,7 +187,7 @@ async fn barriered_public_paths_select_borrowed_compatibility_behavior() {
             EngineOptions { durability, ..EngineOptions::default() },
         )
         .expect("open");
-        let backend = FjallSnapshotBackend::open(
+        let backend = PackSnapshotBackend::open(
             engine.clone(),
             dir.path().join("snapshots"),
         )
@@ -271,11 +269,9 @@ async fn barriered_public_paths_select_borrowed_compatibility_behavior() {
 async fn command_paths_reach_owned_log_engine_submission() {
     let dir = mess_testkit::sweeping_temp_dir("owned-append-command-paths");
     let engine = LogEngine::open(dir.path().join("store")).expect("open");
-    let backend = FjallSnapshotBackend::open(
-        engine.clone(),
-        dir.path().join("snapshots"),
-    )
-    .expect("open snapshot wrapper");
+    let backend =
+        PackSnapshotBackend::open(engine.clone(), dir.path().join("snapshots"))
+            .expect("open snapshot wrapper");
     let store = EventStore::new(backend);
 
     store
@@ -298,12 +294,12 @@ async fn command_paths_reach_owned_log_engine_submission() {
 }
 
 #[tokio::test]
-async fn large_owned_batch_survives_fjall_wrapper_reopen() {
+async fn large_owned_batch_survives_pack_wrapper_reopen() {
     let dir = mess_testkit::sweeping_temp_dir("owned-append-large-reopen");
     let store_path = dir.path().join("store");
     let snapshot_path = dir.path().join("snapshots");
     let engine = LogEngine::open(&store_path).expect("open");
-    let backend = FjallSnapshotBackend::open(engine.clone(), &snapshot_path)
+    let backend = PackSnapshotBackend::open(engine.clone(), &snapshot_path)
         .expect("open snapshot wrapper");
     let store = EventStore::new(backend.clone());
     let events = [
@@ -327,7 +323,7 @@ async fn large_owned_batch_survives_fjall_wrapper_reopen() {
     drop(engine);
 
     let reopened = LogEngine::open(&store_path).expect("reopen engine");
-    let backend = FjallSnapshotBackend::open(reopened, &snapshot_path)
+    let backend = PackSnapshotBackend::open(reopened, &snapshot_path)
         .expect("reopen snapshot wrapper");
     let records = backend
         .read_stream("large-stream", Version::NoStream, 10)

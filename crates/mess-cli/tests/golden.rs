@@ -8,7 +8,7 @@
 //!   and the background sealer produces sealed segments (columnar `.pcol` +
 //!   pointer `.pidx` + a finalized fixed trailer), the fjall meta name registry
 //!   (`stream_names`/`type_names`), and a snapshot carrying a `fold_version` in
-//!   a [`FjallSnapshotBackend`] nested under the store dir. It records an
+//!   a [`PackSnapshotBackend`] nested under the store dir. It records an
 //!   `expected-events.json` manifest and packs the store dir as `store.tar.zst`
 //!   under `tests/golden/v3/`.
 //!
@@ -16,9 +16,11 @@
 //!   v3 golden, opens it with the CURRENT code, and proves: full recovery scan
 //!   is green, the registry + names hydrated, every event replays byte-exact
 //!   against the manifest, sealed streams are served from the COLD tier, the
-//!   snapshot loads with its `fold_version`, `load_verified` is green on the
-//!   chained stream (with its fold-chain hashes pinned in the manifest), and
-//!   `mess verify --full` exits 0.
+//!   pre-pack snapshot sidecar committed in `v3`/`v4` MISSES safely under the
+//!   current pack reader without being touched (bn-3l8n's compatibility
+//!   statement — see the check's step 6), `load_verified` is green on the
+//!   chained stream (with its fold-chain hashes and state blob pinned in the
+//!   manifest), and `mess verify --full` exits 0.
 //!
 //! # The crypto chain / `load_verified` scope note
 //!
@@ -56,7 +58,7 @@ use mess_log::runtime::real::RealFs;
 use mess_log::scanner::recover_segment_with_image;
 use mess_store::backend::{Backend, RecordToAppend};
 use mess_store::{
-    BlobPtr, EngineOptions, FjallSnapshotBackend, LogEngine, SnapshotRef,
+    BlobPtr, EngineOptions, LogEngine, PackSnapshotBackend, SnapshotRef,
     SnapshotStore, StoredSnapshot, Version, interim_stream_id,
 };
 use serde_json::{Value, json};
@@ -307,10 +309,15 @@ async fn generate(version: &str, chain: bool) {
 
         // ---- 3. Save a snapshot (with fold_version) into the nested store.
         // ----
+        // bn-3l8n: a NEW golden's nested sidecar is the pack sidecar at
+        // `snapshot_pack_dir` (the same convention `doctor`/`inspect` and the
+        // social example use). The committed v3/v4 tarballs predate this and
+        // carry the old fjall `snapshots/{meta,blobs}` layout instead — see the
+        // check's step 6 and `tests/golden/README.md`.
         {
-            let snaps = FjallSnapshotBackend::open(
+            let snaps = PackSnapshotBackend::open(
                 engine.clone(),
-                store.join("snapshots"),
+                mess_cli::store::snapshot_pack_dir(&store),
             )
             .expect("open snapshot store");
             let stored = StoredSnapshot {
@@ -329,7 +336,8 @@ async fn generate(version: &str, chain: bool) {
                 .save_snapshot(CHAINED_STREAM, stored)
                 .await
                 .expect("save snapshot");
-            snaps.persist().expect("persist snapshot head");
+            // A pack save installs its root by atomic rename before it
+            // returns; there is no separate head buffer to flush.
         }
 
         // ---- 4. Build the manifest (BTreeMap keys => deterministic JSON).
@@ -555,31 +563,58 @@ async fn check(version: &str, chain: bool) {
         );
     }
 
-    // ---- 6. Snapshot loads with its fold_version + byte-exact blob. ----
+    // ---- 6. The committed sidecar is a PRE-PACK layout: it must MISS, safely.
+    // ----
+    // bn-3l8n reviewed compatibility statement. v3/v4 were generated when the
+    // snapshot sidecar was a fjall head table plus a positional blob dir under
+    // `store/snapshots/`. Goldens are immutable, so those bytes stay exactly as
+    // committed — and the current reader is a pack sidecar, which does not
+    // understand them. That is not a regression to paper over, it is the law
+    // this whole subsystem is built on: *a snapshot is discardable
+    // acceleration*, so an unknown/foreign sidecar is a MISS (never an error,
+    // never a repair, never a wrong answer), and the store answers by replaying
+    // — which steps 2-5 already proved is byte-exact.
+    //
+    // So the assertion here is the forward-compatibility one, in both
+    // directions the law demands:
+    //
+    //   a. reading the fjall-era directory yields `None`, not an error;
+    //   b. reading it *changes nothing on disk* (the read-only contract: no
+    //      LOCK, no IDENTITY, no repair);
+    //   c. the pack sidecar this golden's generator would write today is also
+    //      absent, and also misses.
+    //
+    // The snapshot's own format stability has not been dropped: the state blob
+    // and both semantic hashes are pinned against the committed payloads in
+    // step 7 below, derived rather than read out of a sidecar. A future `vN`
+    // minted by `generate()` will carry a real pack sidecar, and this step
+    // becomes a positive load assertion for that version.
     let chained = &manifest["chained_stream"];
-    let snaps =
-        FjallSnapshotBackend::open(engine.clone(), store.join("snapshots"))
-            .expect("open snapshot store");
-    let loaded = snaps
-        .load_snapshot(chained["name"].as_str().unwrap())
-        .await
-        .expect("load snapshot")
-        .expect("snapshot present");
-    assert_eq!(
-        loaded.snapshot_ref.fold_version,
-        chained["fold_version"].as_u64().unwrap() as u32,
-        "snapshot fold_version"
+    let legacy_sidecar = store.join("snapshots");
+    assert!(
+        legacy_sidecar.join("meta").is_dir(),
+        "golden {version} is expected to carry the pre-pack fjall sidecar"
     );
-    assert_eq!(
-        loaded.snapshot_ref.stream_version,
-        chained["snapshot"]["stream_version"].as_u64().unwrap(),
-        "snapshot stream_version"
-    );
-    assert_eq!(
-        loaded.state_blob,
-        from_hex(chained["snapshot"]["state_blob"].as_str().unwrap()),
-        "snapshot state blob byte-exact"
-    );
+    for root in [&legacy_sidecar, &mess_cli::store::snapshot_pack_dir(&store)] {
+        let snaps =
+            PackSnapshotBackend::open_read_only(engine.clone(), root.clone());
+        let loaded = snaps
+            .load_snapshot(chained["name"].as_str().unwrap())
+            .await
+            .expect("an unreadable sidecar is a miss, never an error");
+        assert!(
+            loaded.is_none(),
+            "a pre-pack sidecar at {} must miss, not resolve",
+            root.display()
+        );
+        for artifact in ["LOCK", "IDENTITY"] {
+            assert!(
+                !root.join(artifact).exists(),
+                "read-only open must not create {artifact} in {}",
+                root.display()
+            );
+        }
+    }
 
     // ---- 7. load_verified green on the chained stream; hashes format-stable.
     // ----
@@ -616,6 +651,14 @@ async fn check(version: &str, chain: bool) {
         to_hex(&snap_ref.state_hash),
         chained["snapshot"]["state_hash"].as_str().unwrap(),
         "state_hash drifted"
+    );
+    // bn-3l8n: the state-blob layout assertion that used to come back out of
+    // the sidecar (step 6) now rides on the derivation from committed payloads,
+    // so a state-encoding change still breaks the golden.
+    assert_eq!(
+        to_hex(&snap_blob),
+        chained["snapshot"]["state_blob"].as_str().unwrap(),
+        "snapshot state blob byte-exact"
     );
 
     let out = load_verified::<SumAgg>(&cert, Some((&snap_ref, &snap_blob)))

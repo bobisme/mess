@@ -2,21 +2,25 @@
 //! app store for the first time.
 //!
 //! Before this bone the check was structurally vacuous: an app persists its
-//! snapshots through a [`FjallSnapshotBackend`] into the sidecar
-//! `<dir>/.snapshots/meta` keyed by interim FNV stream ids, while `mess doctor`
-//! read only the engine's own `<dir>/meta` and correlated by the engine
+//! snapshots into its own sidecar keyed by interim FNV stream ids, while `mess
+//! doctor` read only the engine's own `<dir>/meta` and correlated by the engine
 //! interner's ids — two id spaces that never intersected, so `doctor` saw
 //! `no live snapshots` no matter what. And nothing persisted snapshots on the
 //! warm path anyway. This test proves both halves are fixed end-to-end:
 //!
-//! 1. an app-style store (`FjallSnapshotBackend<LogEngine>`) writing through
+//! 1. an app-style store (`PackSnapshotBackend<LogEngine>`) writing through
 //!    `command_cached` under an opt-in [`SnapshotPolicy`] actually persists
 //!    snapshots, and
 //! 2. `doctor` (run in-process the way the other doctor tests do) reports the
 //!    fold-version check as NON-vacuous — it sees every persisted snapshot, all
 //!    current — and then FLAGS the drift once a second fold_version lands.
 //!
-//! Hits the real filesystem + fjall, so it is `miri`-ignored.
+//! bn-3l8n: the sidecar is the pack sidecar at
+//! [`store::snapshot_pack_dir`](mess_cli::store::snapshot_pack_dir), and the
+//! store is opened at exactly that path so the app and the CLI agree on the
+//! convention (this test is the one that would break if they drifted apart).
+//!
+//! Hits the real filesystem, so it is `miri`-ignored.
 #![cfg(not(miri))]
 
 use mess_cli::doctor::{self, DoctorOptions};
@@ -24,7 +28,7 @@ use mess_cli::format::{self, Format};
 use mess_cli::metaread;
 use mess_core::{Aggregate, CodecError, Decide, Event};
 use mess_store::{
-    EventStore, FjallSnapshotBackend, LogEngine, SnapshotPolicy, Snapshottable,
+    EventStore, LogEngine, PackSnapshotBackend, SnapshotPolicy, Snapshottable,
     StateCodecError,
 };
 use serde_json::Value;
@@ -133,16 +137,19 @@ impl Decide<Add> for CounterV2 {
     }
 }
 
-type Store = EventStore<FjallSnapshotBackend<LogEngine>>;
+type Store = EventStore<PackSnapshotBackend<LogEngine>>;
 
 /// Open the app-style warm-write store: `EventStore` over
-/// `FjallSnapshotBackend<LogEngine>`, cache on, snapshots persisted under
-/// `policy`. The snapshot sidecar is `<dir>/.snapshots`, the location
-/// `metaread`/`doctor` look for app snapshots.
+/// `PackSnapshotBackend<LogEngine>`, cache on, snapshots persisted under
+/// `policy`. The snapshot sidecar is `mess_cli::store::snapshot_pack_dir(dir)`
+/// — the exact location `metaread`/`doctor` look for app snapshots.
 fn open_app_store(dir: &std::path::Path, policy: SnapshotPolicy) -> Store {
     let engine = LogEngine::open(dir).expect("open engine");
-    let backend = FjallSnapshotBackend::open(engine, dir.join(".snapshots"))
-        .expect("open snapshot backend");
+    let backend = PackSnapshotBackend::open(
+        engine,
+        mess_cli::store::snapshot_pack_dir(dir),
+    )
+    .expect("open snapshot backend");
     EventStore::new(backend)
         .with_cache_capacity(64)
         .with_snapshot_policy(policy)
@@ -179,9 +186,11 @@ async fn doctor_fold_version_check_fires_on_a_real_app_store() {
                     .expect("command");
             }
         }
-        // Flush the buffered snapshot heads so a fresh reader sees them.
-        store.backend().persist().expect("persist snapshot heads");
-    } // store dropped: engine + snapshot locks released, heads on disk.
+        // No flush call: a pack save installs its root by atomic rename
+        // before it returns, so a fresh reader sees it as soon as the writer
+        // lock is released. (Buffered mode promises nothing about power loss —
+        // which is the same discardable contract the fjall head buffer had.)
+    } // store dropped: engine + sidecar writer locks released.
 
     // The fold-version check's data source now SEES every app snapshot — the
     // id spaces are unified (sidecar heads joined to their stream names).
@@ -229,7 +238,6 @@ async fn doctor_fold_version_check_fires_on_a_real_app_store() {
                 .await
                 .expect("v2 command");
         }
-        store.backend().persist().expect("persist v2 snapshot head");
     }
 
     // No expectation: the live set now spans fold_versions {1, 2} -> drift.
@@ -271,7 +279,6 @@ async fn default_policy_persists_nothing_and_check_stays_ok() {
                     .expect("command");
             }
         }
-        store.backend().persist().expect("persist");
     }
 
     let facts = metaread::read(dir.path()).expect("read meta");

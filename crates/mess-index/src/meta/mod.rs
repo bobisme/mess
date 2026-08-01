@@ -89,6 +89,12 @@ const P_HW: &str = "hw";
 // side map, written ONLY by `mess-store`'s `FjallSnapshotBackend` into its own
 // `<dir>/.snapshots/meta` database.
 //
+// bn-3l8n: no live path writes it any more. The app snapshot sidecar is
+// `mess-store`'s `PackSnapshotBackend`, whose records are self-describing (they
+// carry the stream name), so no reverse side map exists to keep. What is left
+// here serves the retiring `FjallSnapshotBackend` and the CLI's legacy
+// `<dir>/meta` compatibility read; both retire with bn-fj34.
+//
 // This is NOT the engine's interner. The engine's `id -> name` bijection lived
 // in `stream_names`/`type_names` here until bn-2di moved it into the log as
 // `$registry`, and those two keyspaces are GONE: the log is the sole source of
@@ -358,10 +364,11 @@ impl MetaStore {
     /// Record the app-snapshot sidecar's `interim stream_id -> name` side map
     /// (`bn-2di`) — see [`P_SNAPSHOT_STREAM_NAMES`].
     ///
-    /// Written only by `mess-store`'s `FjallSnapshotBackend`, into its own
-    /// snapshot database. This is a diagnostic side map, NOT the engine's name
-    /// interner: that lives in the log's `$registry` now and never touches
-    /// fjall.
+    /// Written only by `mess-store`'s retiring `FjallSnapshotBackend`, into
+    /// its own snapshot database (bn-3l8n moved the production sidecar to
+    /// `PackSnapshotBackend`, which needs no side map). This is a diagnostic
+    /// side map, NOT the engine's name interner: that lives in the log's
+    /// `$registry` now and never touches fjall.
     pub fn put_snapshot_stream_name(
         &self,
         stream_id: u64,

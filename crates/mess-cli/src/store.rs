@@ -13,6 +13,11 @@
 //!   meta/                      # fjall metadata (stream/snapshot heads, ...)
 //! ```
 //!
+//! An **application** may additionally co-locate a discardable snapshot sidecar
+//! at `<dir>/.snapshots.packs/` ([`snapshot_pack_dir`]). It is not part of the
+//! engine's layout — the engine neither writes nor requires it — but the CLI
+//! knows the convention so `doctor`/`inspect` can read it.
+//!
 //! The two id widths (`:08` for `.log`, `:020` for the sidecars) mirror the
 //! engine's own `segment_path` and `SealDriver::sidecar_path`; this module is
 //! the single place the CLI encodes that.
@@ -71,23 +76,31 @@ pub fn lock_path(dir: &Path) -> PathBuf { dir.join(LOCK_FILE_NAME) }
 #[must_use]
 pub fn meta_dir(dir: &Path) -> PathBuf { dir.join("meta") }
 
-/// The **app snapshot sidecar** metadata directory: `<dir>/.snapshots/meta`.
+/// The **app snapshot sidecar** directory: `<dir>/.snapshots.packs`.
 ///
 /// An app that wraps its [`LogEngine`](mess_store::LogEngine) in a
-/// [`FjallSnapshotBackend`](mess_store::FjallSnapshotBackend) persists its
-/// snapshot heads under a co-located sidecar (the `.snapshots` convention the
-/// `examples/social` store uses, so a single `--dir` names the whole store).
-/// Those heads live in a *separate* fjall meta store from the engine's own
-/// `<dir>/meta`, keyed by the interim FNV `stream_id` and carrying the stream
-/// name as a side map (see `mess_store::fjall_snapshot`'s "Discoverability"
-/// doc). `doctor`'s fold-version check reads this location — not the engine's
+/// [`PackSnapshotBackend`](mess_store::PackSnapshotBackend) persists its
+/// snapshots under a co-located sidecar (the convention the `examples/social`
+/// store uses, so a single `--dir` names the whole store). The sidecar is a
+/// flat directory of immutable packs plus a discovery root — self-describing
+/// records that carry the stream *name*, so no reverse `id -> name` side map is
+/// needed. `doctor`'s fold-version check reads this location — not the engine's
 /// `<dir>/meta`, whose `snapshot_heads` table an app never writes — so the
 /// check can actually see app-persisted snapshots. Absent (a store with no
 /// snapshot sidecar) is normal and simply means "no app snapshots here".
+///
+/// # Why `.snapshots.packs` and not `.snapshots`
+///
+/// bn-3l8n moved the sidecar from the fjall head table + blob dir
+/// (`<dir>/.snapshots/{meta,blobs}`) to packs. The pack root is a **new,
+/// distinct directory** so the two layouts never share a root: a store written
+/// before the move keeps its `.snapshots/` bytes untouched and simply has no
+/// pack sidecar, which every reader answers with "no snapshots" and every
+/// writer answers by replaying — the discardable-acceleration law working as
+/// designed. Nothing in mess reads, migrates, or deletes an old `.snapshots/`;
+/// an operator who wants the space back removes it by hand.
 #[must_use]
-pub fn snapshot_meta_dir(dir: &Path) -> PathBuf {
-    dir.join(".snapshots").join("meta")
-}
+pub fn snapshot_pack_dir(dir: &Path) -> PathBuf { dir.join(".snapshots.packs") }
 
 /// Enumerate every `seg-<id>.log` under `dir`, ascending by id, resolving
 /// each one's sidecar paths and presence. Files that do not match the naming

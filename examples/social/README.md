@@ -27,7 +27,7 @@ seeded store.
   likers, a user's followers) are **not** aggregate state anywhere; see
   [Why relationship streams](#why-relationship-streams) below.
 - **Warm-path writes.** Every write goes through
-  `EventStore::command_cached` over a `FjallSnapshotBackend<LogEngine>`
+  `EventStore::command_cached` over a `PackSnapshotBackend<LogEngine>`
   (`src/store_backend.rs`): a hot-aggregate write-through cache proves the
   stream's version by the append itself (zero event reads on a warm hit), with
   a snapshot-accelerated cold load underneath. `tests/snapshots.rs` proves this
@@ -90,7 +90,7 @@ cargo run -p social --bin social-web   # no --dir: in-memory demo world
                                    ▼                              ▼
                       ┌────────────────────────┐  ┌─────────────────────────────┐
                       │      Projections          │  │    mess_store::EventStore    │
-                      │  (projections.rs)          │  │  over FjallSnapshotBackend    │
+                      │  (projections.rs)          │  │  over PackSnapshotBackend     │
                       │  from-0 rebuild at boot    │◀─┤       <LogEngine>             │
                       │  (or checkpoint-resume),   │  │  entities:                    │
                       │  then live-tails the log,  │  │    user-<id> / post-<id>      │
@@ -104,7 +104,7 @@ cargo run -p social --bin social-web   # no --dir: in-memory demo world
                     read handle    └───────────────┬─────────────────┘
                                                     ▼
                                     durable on-disk log + snapshots
-                                    ($STORE/seg-*.log + meta/ + .snapshots/)
+                              ($STORE/seg-*.log + meta/ + .snapshots.packs/)
 ```
 
 No aggregate reads another's state. A `Follow` edge only *records* that
@@ -130,7 +130,7 @@ reseed a fresh store rather than trying to read an old one.
 The warm write path needs `SnapshotStore` (that is where `command_cached`
 lives); the read model's live tail needs `SubscribeBackend`. As of this
 example, **no single backend type has both**: `LogEngine` is a
-`SubscribeBackend` but not a `SnapshotStore`, and `FjallSnapshotBackend<LogEngine>`
+`SubscribeBackend` but not a `SnapshotStore`, and `PackSnapshotBackend<LogEngine>`
 is a `SnapshotStore` but does not forward `SubscribeBackend`. The reconciliation
 (`store_backend::read_handle`) is clean because `LogEngine` is `Arc`-backed: the
 warm-write `Store` writes through the snapshot backend, and the read model tails
@@ -329,7 +329,9 @@ like count. `tests/hot_post_bench.rs` proves the mechanism on a deliberately
 *unbounded* aggregate (a `MegaPost` that keeps a growing liker set) so the cost
 being removed is visible. Real captured output
 (`cargo test --release -p social --test hot_post_bench -- --ignored --nocapture`,
-real fs, `EventStore` over `FjallSnapshotBackend<LogEngine>`):
+real fs, `EventStore` over `PackSnapshotBackend<LogEngine>` — captured before
+bn-3l8n swapped the sidecar; the measured path is the hot-aggregate cache, which
+the swap does not touch):
 
 ```
 ================ hot-post benchmark ================
@@ -504,14 +506,16 @@ around by editing `mess-*`):
   just hasn't opted in yet.** This used to be a two-part dead end: (1) the
   social app never *persists* snapshots (`command_cached`'s fast path is an
   in-memory write-through cache that only *reads* the snapshot store on a cold
-  miss), and (2) even saved snapshots were written to the sidecar meta store
-  (`<dir>/.snapshots/meta`) keyed by *interim* FNV stream ids, while `mess-cli`'s
-  `metaread` read only the engine's `<dir>/meta` and correlated by the engine's
-  own ids — two id spaces that never intersected, so the check always read `no
-  live snapshots`. The `mess-store`/`mess-cli` half of that is now fixed: a
-  `FjallSnapshotBackend` records each snapshot head's stream *name* alongside
-  its FNV key, `doctor`/`metaread` read the `.snapshots` sidecar and join heads
-  back to names, and `EventStore::with_snapshot_policy(SnapshotPolicy::every_n_events(N))`
+  miss), and (2) even saved snapshots were written to a sidecar keyed by
+  *interim* FNV stream ids, while `mess-cli`'s `metaread` read only the
+  engine's `<dir>/meta` and correlated by the engine's own ids — two id spaces
+  that never intersected, so the check always read `no live snapshots`. The
+  `mess-store`/`mess-cli` half of that is now fixed: the pack sidecar's records
+  are self-describing (each carries its stream *name*, so no reverse side map
+  is needed), `doctor`/`metaread` read `<dir>/.snapshots.packs` **read-only and
+  lock-free** — so the check works against a *live* store, not just a stopped
+  one — and
+  `EventStore::with_snapshot_policy(SnapshotPolicy::every_n_events(N))`
   lets the warm path persist a snapshot every N events straight from the folded
   state it already holds (default off — nothing changes until you opt in). What
   remains is purely an `examples/social` adoption choice: `store_backend`'s
@@ -519,6 +523,15 @@ around by editing `mess-*`):
   still persists none and `doctor` still (correctly) reports `no-snapshots`.
   Flip the policy on there and `mess doctor --expect-fold-version` reports a
   real, non-vacuous fold-version check over this store's persisted snapshots.
+
+- **A store seeded before bn-3l8n keeps a stale `.snapshots/` directory.** The
+  snapshot sidecar moved from fjall (`<dir>/.snapshots/{meta,blobs}`) to packs
+  (`<dir>/.snapshots.packs/`). Nothing migrates and nothing is deleted: reopen
+  an old store and the new sidecar starts empty, so every aggregate load is a
+  miss that **replays from the log** — the discardable-acceleration contract
+  working exactly as designed, not a fault. `--rebuild`'s byte-compare proof
+  passes unchanged. The old directory is inert; remove it by hand (writer
+  stopped) if you want the disk back, or `--force` a reseed.
 
 ## Development
 

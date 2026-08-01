@@ -414,11 +414,11 @@ pub trait WriteOps {
 // the speedup on a deep stream.
 //
 // Tightening the bound from `B: Backend` to `B: SnapshotStore` is what makes
-// the on-disk `Store = EventStore<FjallSnapshotBackend<LogEngine>>` (a
+// the on-disk `Store = EventStore<PackSnapshotBackend<LogEngine>>` (a
 // `SnapshotStore`) the warm-write path — see `crate::store_backend`. The demo's
 // former plain `EventStore<LogEngine>` was *not* a `SnapshotStore`, which is
 // why the flip is a construction-site change (wrap the engine in
-// `FjallSnapshotBackend`) threaded through `seed::generate` and the binaries.
+// `PackSnapshotBackend`) threaded through `seed::generate` and the binaries.
 impl<B: SnapshotStore> WriteOps for EventStore<B>
 where
     B::Error: std::fmt::Display,

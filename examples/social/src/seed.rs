@@ -775,7 +775,7 @@ where
 mod tests {
     use std::collections::{BTreeMap, HashMap};
 
-    use mess_store::{Backend, FjallSnapshotBackend, LogEngine, StoredRecord};
+    use mess_store::{Backend, LogEngine, PackSnapshotBackend, StoredRecord};
     use mess_testkit::{SweepingTempDir, sweeping_temp_dir};
 
     use super::*;
@@ -785,12 +785,12 @@ mod tests {
     /// last) for the duration of the test.
     fn snap_store(
         tag: &str,
-    ) -> (EventStore<FjallSnapshotBackend<LogEngine>>, SweepingTempDir) {
+    ) -> (EventStore<PackSnapshotBackend<LogEngine>>, SweepingTempDir) {
         let dir = sweeping_temp_dir(tag);
         let engine =
             LogEngine::open(dir.path().join("log")).expect("open engine");
         let backend =
-            FjallSnapshotBackend::open(engine, dir.path().join("snap"))
+            PackSnapshotBackend::open(engine, dir.path().join("snap"))
                 .expect("open snapshot backend");
         (EventStore::new(backend), dir)
     }

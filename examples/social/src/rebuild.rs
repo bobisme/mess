@@ -117,7 +117,7 @@ pub async fn rebuild_compare(
     store: &Store,
     checkpoint: &Path,
 ) -> RebuildReport {
-    // Both projections tail the same store directly — `FjallSnapshotBackend`
+    // Both projections tail the same store directly — `PackSnapshotBackend`
     // forwards `SubscribeBackend`, so no separate read handle is needed.
     // (1) Clean rebuild from position 0 — the cold-start cost.
     let t0 = Instant::now();

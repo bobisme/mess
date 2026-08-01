@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use mess_core::{CodecError, Event};
 use mess_log::committer::Durability;
 use mess_store::{
-    EngineOptions, EventStore, FjallSnapshotBackend, LogEngine, Version,
+    EngineOptions, EventStore, LogEngine, PackSnapshotBackend, Version,
 };
 use tokio::sync::Barrier;
 
@@ -223,7 +223,7 @@ fn run(wl: Workload) -> ResultRow {
         },
     )
     .expect("open");
-    let backend = FjallSnapshotBackend::open(
+    let backend = PackSnapshotBackend::open(
         engine.clone(),
         scratch.path().join("snapshots"),
     )

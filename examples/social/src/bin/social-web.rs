@@ -134,7 +134,7 @@ async fn mem_state() -> AppState<MemBackend, MemBackend> {
 
 /// The real, store-backed world: open `dir` as the warm-write [`Store`]
 /// ([`open_store`]) and build the read model by subscribing directly on that
-/// same store handle — `FjallSnapshotBackend` forwards
+/// same store handle — `PackSnapshotBackend` forwards
 /// [`SubscribeBackend`](mess_store::SubscribeBackend), so no second handle
 /// over a cloned log is needed — **resuming from the sidecar checkpoint** when
 /// present and valid, else a full replay from position 0 (see

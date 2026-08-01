@@ -27,7 +27,7 @@ use social::{
 async fn main() -> Result<(), WriteError> {
     // The warm-write on-disk `Store`: an `EventStore` over the composed
     // production engine (`LogEngine`: `mess-log` + `mess-index`) wrapped in a
-    // `FjallSnapshotBackend` so writes take the `command_cached` warm path.
+    // `PackSnapshotBackend` so writes take the `command_cached` warm path.
     // Nothing below this line names the backend — that is the API-first payoff.
     // See `examples/bank/examples/bank.rs`.
     //

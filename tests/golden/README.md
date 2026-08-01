@@ -8,7 +8,7 @@ Each `vN/` holds:
 
 | File | What it is |
 |---|---|
-| `store.tar.zst` | A complete store directory (segments + sealed `.pidx`/`.pcol` sidecars + finalized trailers + the fjall `meta` name registry + a nested `snapshots/` store), packed with the system `tar` + `zstd`. |
+| `store.tar.zst` | A complete store directory (segments + sealed `.pidx`/`.pcol` sidecars + finalized trailers + the fjall `meta` name registry + a nested app snapshot sidecar), packed with the system `tar` + `zstd`. |
 | `expected-events.json` | The manifest: full global event order (byte-exact payloads as hex), per-stream heads, the cold-tier stream, and the chained stream's frozen fold-chain hashes + snapshot. |
 
 `vN` tracks the **on-disk format version** (spec `docs/spec/01` — currently
@@ -24,7 +24,8 @@ format v3). The generator and check live in
 - confirms the registry / interned names hydrated (stream + type strings);
 - replays every event byte-exact against the manifest (global order);
 - serves a fully-sealed stream from the **cold** tier, byte-exact;
-- loads the snapshot with its `fold_version` and byte-exact blob;
+- proves the committed **pre-pack** snapshot sidecar misses safely and is left
+  untouched (see the compatibility statement below);
 - runs `load_verified` green on the chained stream and checks its
   genesis/chain/head hashes against the frozen manifest (fold-chain
   format-stability);
@@ -36,6 +37,36 @@ engine with `chain: true`, so its segments carry the **real on-disk**
 `crypto_chain` — `mess verify --full` recomputes the fold chain against the
 actual stored bytes, and the check additionally asserts every batch on disk
 carries the chain (flag bit 0). `v3` stays plain-frame (chain off) and immutable.
+
+## Reviewed compatibility statement: the snapshot sidecar (bn-3l8n)
+
+`v3` and `v4` were generated when the app snapshot sidecar was a fjall head
+table plus a positional blob directory at `store/snapshots/{meta,blobs}`.
+`bn-3l8n` replaced that sidecar with the **pack sidecar**
+(`<store>/.snapshots.packs/`: immutable packs plus a discovery root). Goldens
+are immutable, so the committed bytes keep the old layout, and the current
+reader does not understand them.
+
+That is not a broken contract — it is the contract:
+
+> A snapshot is **discardable acceleration**. An absent, foreign, unknown, or
+> corrupt sidecar is a **miss**, never an error and never a wrong answer, and
+> the store answers by replaying the events.
+
+So the check did not lose an assertion, it changed which one it makes:
+
+- step 6 now proves the committed `store/snapshots/` directory yields `None`
+  (not an error) through the pack reader, and that the read-only open creates
+  nothing in it (no `LOCK`, no `IDENTITY`, no repair);
+- the snapshot's *format stability* — the state blob and both semantic hashes —
+  is pinned in step 7, derived from the committed payloads via `build_cert` /
+  `take_snapshot` rather than read back out of a sidecar. A change to the
+  state-blob encoding still breaks the golden.
+
+Every other assertion (recovery, registry hydration, byte-exact replay, cold
+tier, fold chain, `verify --full`) is untouched and still runs on the untouched
+bytes. The generator writes a **pack** sidecar, so the next `vN` minted will
+pin the new layout positively and step 6 becomes a load assertion for it.
 
 ## The rule: OLD GOLDENS ARE IMMUTABLE
 

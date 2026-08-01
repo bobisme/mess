@@ -11,8 +11,9 @@ use mess_index::meta::{CommitGroup, MetaStore, SnapshotHead, StreamId};
 use mess_index::sealed::retention::{RetentionDecision, decide_segment};
 use mess_index::sealed::segment::SealedSegmentIndex;
 
-/// The 14-byte snapshot-ref v1 image (tag||fold_version||flags||ptr), matching
-/// `mess_store::fjall_snapshot::encode_ref` so `metaread` decodes it.
+/// The 14-byte snapshot-ref v1 image (tag||fold_version||flags||ptr) as a
+/// legacy `<dir>/meta` `snapshot_heads` row carries it, so `metaread` decodes
+/// it.
 fn ref_v1(fold_version: u32, covers_empty_prefix: bool) -> Vec<u8> {
     let mut v = vec![0x01u8];
     v.extend_from_slice(&fold_version.to_le_bytes());
@@ -25,10 +26,14 @@ fn ref_v1(fold_version: u32, covers_empty_prefix: bool) -> Vec<u8> {
 /// store, so the store presents a live snapshot for the retention decision.
 ///
 /// `bn-2di`: the snapshot-head join is keyed off the snapshot side map
-/// (`snapshot_stream_names`), the way a real `FjallSnapshotBackend` writes it —
-/// it can no longer piggy-back on the engine's name tables, because those are
-/// gone (names live in the log's `$registry` now). So the fixture writes the
-/// side-map row too, exactly as the real snapshot backend does.
+/// (`snapshot_stream_names`) — it can no longer piggy-back on the engine's name
+/// tables, because those are gone (names live in the log's `$registry` now). So
+/// the fixture writes the side-map row too.
+///
+/// `bn-3l8n`: this exercises `metaread`'s **legacy** source (1), the engine's
+/// own `<dir>/meta` `snapshot_heads`, which no production writer produces. The
+/// app sidecar is packs now and is read separately; keeping this fixture on the
+/// legacy table is what keeps the compatibility path covered.
 fn inject_snapshot(dir: &std::path::Path, stream_id: u64, version: u64) {
     let meta =
         MetaStore::open(mess_cli::store::meta_dir(dir)).expect("open meta");
