@@ -1,0 +1,3 @@
+{"ts":"2026-08-01T15:56:43.863108783Z","author":"mess-foldhash","event":"ReviewCreated","data":{"review_id":"cr-21ujmm","jj_change_id":"detached:e4009d8e66a0c58662af9b19260e08d041bc2bef","scm_kind":"git","scm_anchor":"detached:e4009d8e66a0c58662af9b19260e08d041bc2bef","initial_commit":"e4009d8e66a0c58662af9b19260e08d041bc2bef","title":"bn-dcr: foldhash for the sealed-segment stream directory (premise reproduced, adopted)"}}
+{"ts":"2026-08-01T15:56:47.455625736Z","author":"mess-foldhash","event":"ReviewersRequested","data":{"review_id":"cr-21ujmm","reviewers":["mess-reviewer"]}}
+{"ts":"2026-08-01T16:01:03.125988284Z","author":"mess-dev","event":"ReviewApproved","data":{"review_id":"cr-21ujmm"}}

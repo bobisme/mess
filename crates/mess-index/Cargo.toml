@@ -39,6 +39,13 @@ xorf = "0.12"
 # the row-fallback dictionary tier uses (bn-zge / D6): a magic-stripped frame
 # per row block saves the 4-byte magic on the rare fallback tier.
 zstd = { version = "0.13", features = ["experimental"] }
+# bn-dcr (Spike H follow-up): the hasher for the sealed-segment stream
+# directory's `HashMap<u64, DirEntry>` (`sealed::segment::DirMap`). Default
+# features only (`std`, needed for `fast::RandomState`); foldhash 0.2 is
+# already in the lock tree via `quick_cache`, so this adds a dependency edge
+# and no new packages. NOT a general-purpose hasher for this crate — see the
+# collision/DoS note on `DirMap`.
+foldhash = "0.2"
 # bn-2za: Reed-Solomon parity for the seal-time `.par` sidecar + offline
 # `verify --repair`. MDS-optimal erasure coding, deterministic, O(n log n)
 # SIMD encode/decode (fast at our 4 KiB-shard sizes). Pinned; license

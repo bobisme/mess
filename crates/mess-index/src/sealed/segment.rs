@@ -407,6 +407,44 @@ struct DirEntry {
     skip_len:      u32,
 }
 
+/// The in-memory stream directory: interned stream id → [`DirEntry`], hashed
+/// with `foldhash` instead of std's SipHash-1-3 (bn-dcr, Spike H's `h0f` arm).
+///
+/// # Why a non-SipHash hasher is safe *here specifically*
+///
+/// The keys are **internal interned stream ids** — sequential `u64`s the
+/// `$registry` stream hands out, never a caller-supplied name, byte string, or
+/// any other externally-chosen value. An attacker who can pick stream *names*
+/// cannot pick the *ids*: interning assigns them in registration order, so the
+/// key an adversary influences is "the next integer", not a preimage they get
+/// to choose. That removes the HashDoS threat model SipHash exists to defend
+/// against, which is the whole reason the swap is admissible.
+///
+/// Two consequences, both load-bearing:
+///
+/// * **Do not reuse this alias, or `foldhash`, for any string/byte-keyed map in
+///   this crate.** Payload dictionaries, skeleton/path tries, name lookups —
+///   anything whose key an untrusted producer can shape — must keep the default
+///   SipHash `RandomState`. `foldhash::fast` is explicitly not
+///   HashDoS-resistant.
+/// * The hasher is still **per-process randomly seeded** (`fast::RandomState`,
+///   not `FixedState`), so bucket layout is not reproducible across runs. That
+///   is fine because nothing observable depends on it: this map is only ever
+///   probed by key ([`SealedSegmentIndex::stream_head`],
+///   [`SealedSegmentIndex::resolve`], [`SealedSegmentIndex::stream_entries`]),
+///   never iterated. Every ordered product — [`SealedSegmentIndex::stream_ids`]
+///   and [`SealedSegmentIndex::global_entries`] — walks the ascending
+///   `stream_ids` vector, and serialization ([`seal_sidecar`] /
+///   [`crate::sealed::pack`]) is built from the ascending [`SealStream`] input,
+///   not from this map. Keep it that way: an iteration over `dir` would make
+///   output order hasher-dependent.
+///
+/// Measured (bn-dcr, 39 engine-written segment directories + synthetic
+/// sparse/clustered shapes, ABBA-ordered with a second SipHash map as a null
+/// control): +47.7% median batch-lookup throughput, +38.5% p99, +27.4% serial
+/// latency; 39/39 real segments clear the +20% admission bar.
+type DirMap = HashMap<u64, DirEntry, foldhash::fast::RandomState>;
+
 /// The read-only sealed pointer index for one segment. Owns the sidecar bytes
 /// in memory; every query is a slice + decode with no further I/O.
 #[derive(Debug)]
@@ -415,7 +453,7 @@ pub struct SealedSegmentIndex {
     base_pos:    u64,
     event_count: u64,
     bytes:       Vec<u8>,
-    dir:         HashMap<u64, DirEntry>,
+    dir:         DirMap,
     /// Stream ids ascending — for global replay and deterministic iteration.
     stream_ids:  Vec<u64>,
     /// The seal-time `BinaryFuse16` stream-id membership filter (bn-1i7), if
@@ -507,7 +545,10 @@ impl SealedSegmentIndex {
         if dir_off > footer_start || footer_start - dir_off != dir_len {
             return Err(SidecarError::Corrupt("dir region size mismatch"));
         }
-        let mut dir = HashMap::with_capacity(n_streams);
+        let mut dir = DirMap::with_capacity_and_hasher(
+            n_streams,
+            foldhash::fast::RandomState::default(),
+        );
         let mut stream_ids = Vec::with_capacity(n_streams);
         for i in 0..n_streams {
             let b = dir_off + i * DIR_ENTRY_LEN;
@@ -578,7 +619,10 @@ impl SealedSegmentIndex {
         )
         .map_err(|pack::PackError::Corrupt(m)| SidecarError::Corrupt(m))?;
 
-        let mut dir = HashMap::with_capacity(n_streams);
+        let mut dir = DirMap::with_capacity_and_hasher(
+            n_streams,
+            foldhash::fast::RandomState::default(),
+        );
         let mut stream_ids = Vec::with_capacity(n_streams);
         for r in raws {
             // Rebase the section-relative offsets onto absolute pack offsets so
@@ -1161,6 +1205,130 @@ mod tests {
         // The filter attached through the pack (no false negatives).
         for &sid in packed.stream_ids() {
             assert!(packed.might_contain_stream(sid));
+        }
+    }
+
+    /// bn-dcr: the directory map's hasher (`DirMap` = foldhash, replacing std's
+    /// SipHash) must be invisible from outside. `fast::RandomState` reseeds per
+    /// instance, so every `from_bytes`/`from_pack` call builds a differently
+    /// laid-out map from identical bytes — if any observable product depended
+    /// on bucket order, this test would flap. Covers both directory codecs
+    /// (a dense stream-id set selects `DIRCODEC_BITRANK`, a sparse one
+    /// `DIRCODEC_SORTED`) and both readers, and pins the AC: present/absent
+    /// lookups exact, ascending iteration deterministic, serialization
+    /// hasher-independent.
+    #[test]
+    fn directory_products_are_hasher_independent() {
+        use crate::sealed::pack::{self, PackInput};
+
+        // Two key shapes: dense (U/n = 1, bitrank codec) and sparse
+        // (U/n ~ 1000, sorted codec) — the two arms of the §12.6 chooser.
+        for stride in [1u64, 1013] {
+            let streams: Vec<SealStream> = (0..64u64)
+                .map(|i| {
+                    let id = 5 + i * stride;
+                    seal_stream(
+                        id,
+                        &[
+                            (0, 2, 1000 + i * 3, 4096 * (i + 1)),
+                            (2, 1, 1002 + i * 3, 8192 * (i + 1)),
+                        ],
+                    )
+                })
+                .collect();
+            let input = SealInput {
+                segment_id: 11,
+                base_pos: 1000,
+                streams,
+                payloads: None,
+                event_type_ids: None,
+            };
+            let sidecar_bytes = encode_sidecar(&input);
+            let pack_bytes = pack::encode_pack(&PackInput {
+                segment_id:     input.segment_id,
+                base_pos:       input.base_pos,
+                streams:        &input.streams,
+                event_type_ids: &[],
+                filter:         None,
+                payload_bytes:  None,
+            });
+            // Serialization is built from the ascending input, never from the
+            // map — re-encoding must be byte-identical.
+            assert_eq!(encode_sidecar(&input), sidecar_bytes);
+            assert_eq!(
+                pack::encode_pack(&PackInput {
+                    segment_id:     input.segment_id,
+                    base_pos:       input.base_pos,
+                    streams:        &input.streams,
+                    event_type_ids: &[],
+                    filter:         None,
+                    payload_bytes:  None,
+                }),
+                pack_bytes
+            );
+
+            let present: Vec<u64> =
+                input.streams.iter().map(|s| s.stream_id).collect();
+            // Absent probes: below, above, and between the present ids.
+            let absent: Vec<u64> = std::iter::once(0)
+                .chain(std::iter::once(u64::MAX))
+                .chain(present.iter().map(|&id| id + 1))
+                .chain(present.iter().filter_map(|&id| id.checked_sub(1)))
+                .filter(|k| !present.contains(k))
+                .collect();
+
+            let mut expected_ids: Option<Vec<u64>> = None;
+            let mut expected_global: Option<Vec<GlobalEntry>> = None;
+            // 8 independent opens per reader = 16 independent hasher seeds.
+            for _ in 0..8 {
+                for idx in [
+                    SealedSegmentIndex::from_bytes(sidecar_bytes.clone())
+                        .unwrap(),
+                    SealedSegmentIndex::from_pack(pack_bytes.clone()).unwrap(),
+                ] {
+                    let ids = idx.stream_ids().to_vec();
+                    assert!(
+                        ids.windows(2).all(|w| w[0] < w[1]),
+                        "stream_ids not strictly ascending (stride {stride})"
+                    );
+                    assert_eq!(ids, present);
+                    match &expected_ids {
+                        None => expected_ids = Some(ids),
+                        Some(e) => assert_eq!(e, &idx.stream_ids().to_vec()),
+                    }
+
+                    let ge = idx.global_entries().unwrap();
+                    match &expected_global {
+                        None => expected_global = Some(ge),
+                        Some(e) => assert_eq!(
+                            e, &ge,
+                            "global_entries order depends on the hasher \
+                             (stride {stride})"
+                        ),
+                    }
+
+                    for (i, &id) in present.iter().enumerate() {
+                        assert_eq!(idx.stream_head(id), Some(2));
+                        assert_eq!(
+                            idx.resolve(id, 0).unwrap().map(|p| p.offset),
+                            Some(4096 * (i as u64 + 1))
+                        );
+                        assert_eq!(
+                            idx.resolve(id, 2).unwrap().map(|p| p.offset),
+                            Some(8192 * (i as u64 + 1))
+                        );
+                        assert_eq!(idx.resolve(id, 3).unwrap(), None);
+                        assert_eq!(idx.stream_entries(id).unwrap().len(), 2);
+                        assert_eq!(idx.stream_range(id), Some((0, 2)));
+                    }
+                    for &k in &absent {
+                        assert_eq!(idx.stream_head(k), None, "absent {k}");
+                        assert_eq!(idx.resolve(k, 0).unwrap(), None);
+                        assert!(idx.stream_entries(k).unwrap().is_empty());
+                        assert_eq!(idx.stream_range(k), None);
+                    }
+                }
+            }
         }
     }
 
