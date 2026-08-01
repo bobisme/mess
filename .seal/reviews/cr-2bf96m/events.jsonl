@@ -1,0 +1,4 @@
+{"ts":"2026-08-01T16:17:47.864184228Z","author":"mess-pack-rss","event":"ReviewCreated","data":{"review_id":"cr-2bf96m","jj_change_id":"detached:f22cb7e51b5454625dc334cac0ce29e0e1a654c7","scm_kind":"git","scm_anchor":"detached:f22cb7e51b5454625dc334cac0ce29e0e1a654c7","initial_commit":"f22cb7e51b5454625dc334cac0ce29e0e1a654c7","title":"bn-dbz: Eliminate SealPack whole-pack reopen residency"}}
+{"ts":"2026-08-01T16:17:47.864295265Z","author":"mess-pack-rss","event":"ReviewersRequested","data":{"review_id":"cr-2bf96m","reviewers":["mess-dev"]}}
+{"ts":"2026-08-01T16:17:51.906471153Z","author":"mess-pack-rss","event":"ReviewersRequested","data":{"review_id":"cr-2bf96m","reviewers":["mess-dev"]}}
+{"ts":"2026-08-01T16:25:33.944534978Z","author":"mess-pack-rss","event":"ReviewAbandoned","data":{"review_id":"cr-2bf96m"}}

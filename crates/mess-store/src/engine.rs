@@ -938,8 +938,11 @@ impl BlockReader {
         {
             let lo = b.first_global_pos - seg.base_pos();
             let hi = lo + u64::from(b.frame_count);
-            let type_ids: Option<Vec<u32>> =
-                (lo..hi).map(|i| seg.event_type_id(i)).collect();
+            // bn-dbz: one range call, not one call per frame — a lazily opened
+            // pack serves the whole batch from the one index block the run
+            // almost always lies inside, instead of re-reading that block per
+            // event.
+            let type_ids: Option<Vec<u32>> = seg.event_type_ids_range(lo, hi);
             if let Some(type_ids) = type_ids
                 && let Ok((data, offs)) =
                     self.pcol_range(segment_id, generation, pcol, lo, hi)

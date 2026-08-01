@@ -79,12 +79,15 @@
 //! p50 1.67 µs / p99 0.79 µs per point read.
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::io;
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::active::{EventPtr, GlobalEntry, StreamEntry};
 use crate::sealed::filter::SegmentFilter;
+use crate::sealed::pack::EventTypeColumn;
 use crate::sealed::payload::{DictResolver, PayloadError, SealedPayloadIndex};
 use crate::sealed::ptr_block::{
     self, BatchPtr, DecodeError, SkipEntry, encode_ptr_block, encode_skips,
@@ -475,7 +478,11 @@ pub struct SealedSegmentIndex {
     /// resolves an event's `message_type` **without decoding the raw batch**;
     /// `None` (legacy sidecars, or a dropped/corrupt section) falls back to
     /// the raw-batch decode exactly as before.
-    event_types: Option<Vec<u32>>,
+    ///
+    /// bn-dbz: for a lazily opened pack the column is **file-backed** — the
+    /// resident part is the type dictionary plus one `u32` per 4096 events —
+    /// where it used to be a `Vec<u32>` per event (~1.5 GB at 385M events).
+    event_types: Option<EventTypeColumn>,
 }
 
 impl SealedSegmentIndex {
@@ -670,9 +677,11 @@ impl SealedSegmentIndex {
             });
         let event_types =
             parsed.section(pack::KIND_EVENT_TYPE_IDS).and_then(|s| {
-                pack::decode_event_types(&bytes[s.offset..s.offset + s.length])
-                    .ok()
-                    .filter(|v| v.len() as u64 == parsed.event_count)
+                EventTypeColumn::from_body(
+                    bytes[s.offset..s.offset + s.length].to_vec(),
+                )
+                .ok()
+                .filter(|c| c.event_count() == parsed.event_count)
             });
 
         Ok(SealedSegmentIndex {
@@ -688,12 +697,194 @@ impl SealedSegmentIndex {
         })
     }
 
-    /// Read and parse a SealPack from `path` (bn-3of). The whole artifact —
-    /// pointers, filter, payload columns, event-type ids — lives in the one
-    /// file, so there are no sibling opens (unlike [`Self::open`]).
+    /// Read a SealPack from `path` **lazily** (bn-3of open path, bn-dbz
+    /// residency fix). The whole artifact — pointers, filter, payload columns,
+    /// event-type ids — lives in the one file, so there are no sibling opens
+    /// (unlike [`Self::open`]); what this does *not* do is read the one file
+    /// whole.
+    ///
+    /// Eagerly read and verified, because a pointer resolution needs every byte
+    /// of them and they are sized by the segment's **stream count**:
+    ///
+    /// - the 64-byte header, the 40-byte trailer, and the section directory
+    ///   (the trailer's blake3 binds the two, so the directory's per-section
+    ///   checksums are trustworthy from here on);
+    /// - the three mandatory sections — `STREAM_DIRECTORY`, `POINTER_BLOCKS`,
+    ///   `POINTER_SKIPS` — each checked against its directory-committed
+    ///   `crc32c` + `content_hash_prefix`. A failure is
+    ///   [`SidecarError::Corrupt`] and the caller raw-scans, as before;
+    /// - the `STREAM_FILTER` (a few bytes per stream), dropped on any fault.
+    ///
+    /// Left on disk behind the retained handle, because they are sized by the
+    /// segment's **content**:
+    ///
+    /// - `PAYLOAD_COLUMNS`, attached through [`SealedPayloadIndex::attach_at`]
+    ///   — block table now, block bytes at first touch, each checksummed then
+    ///   (bn-bka2);
+    /// - `EVENT_TYPE_IDS`, attached through [`EventTypeColumn::attach`] —
+    ///   dictionary and CRC table now, index blocks at first touch, each
+    ///   checksummed then (bn-dbz).
+    ///
+    /// `STATS` is informational and never read, so it is neither read nor
+    /// verified here (it was, when the whole image was in hand).
+    ///
+    /// Reading the pack whole cost a resident copy of every sealed byte plus a
+    /// second copy of the payload columns plus 4 B/event of decoded type ids;
+    /// Spike J measured that as +18%/+36% reopen RSS at 2M/10M events. See the
+    /// [`pack`](crate::sealed::pack) module docs for where each integrity check
+    /// moved to.
+    ///
+    /// The retained handle is **one file descriptor per sealed segment**, and
+    /// only when the pack actually carries a lazily attachable section — the
+    /// same fd cost the `.pcol` path has had since bn-bka2, not a new one (the
+    /// pack's two file-backed sections share the single handle).
     pub fn open_pack(path: &Path) -> Result<Self, SidecarError> {
-        let bytes = std::fs::read(path)?;
-        Self::from_pack(bytes)
+        let file = File::open(path)?;
+        let len = file.metadata()?.len();
+        Self::attach_pack(Arc::new(file), len)
+    }
+
+    /// The lazy pack attach proper, split out so tests can hand in a handle.
+    fn attach_pack(file: Arc<File>, len: u64) -> Result<Self, SidecarError> {
+        use crate::sealed::pack;
+        let corrupt = |pack::PackError::Corrupt(m)| SidecarError::Corrupt(m);
+
+        if len < (pack::HEADER_LEN + pack::TRAILER_LEN) as u64 {
+            return Err(SidecarError::Corrupt("shorter than header + trailer"));
+        }
+        let mut head = [0u8; pack::HEADER_LEN];
+        file.read_exact_at(&mut head, 0)?;
+        let h = pack::parse_pack_header(&head).map_err(corrupt)?;
+        let mut dirbuf = vec![0u8; h.dir_len()];
+        file.read_exact_at(&mut dirbuf, pack::HEADER_LEN as u64)?;
+        let mut trailer = [0u8; pack::TRAILER_LEN];
+        file.read_exact_at(&mut trailer, len - pack::TRAILER_LEN as u64)?;
+        let parsed = pack::parse_pack_directory(&head, &dirbuf, &trailer, len)
+            .map_err(corrupt)?;
+        drop(dirbuf);
+        let n_streams = parsed.n_streams as usize;
+
+        // The three mandatory sections, read and fully verified: without any
+        // one of them the pack cannot resolve a pointer at all.
+        let read_mandatory = |kind| -> Result<(_, Vec<u8>), SidecarError> {
+            let s = parsed.section(kind).ok_or(SidecarError::Corrupt(
+                "missing/corrupt mandatory section",
+            ))?;
+            let mut body = vec![0u8; s.length];
+            file.read_exact_at(&mut body, s.offset as u64)?;
+            if !s.verify(&body) {
+                return Err(SidecarError::Corrupt(
+                    "missing/corrupt mandatory section",
+                ));
+            }
+            Ok((s, body))
+        };
+        let (dir_sec, dir_body) = read_mandatory(pack::KIND_STREAM_DIRECTORY)?;
+        let (_, ptr_body) = read_mandatory(pack::KIND_POINTER_BLOCKS)?;
+        let (_, skip_body) = read_mandatory(pack::KIND_POINTER_SKIPS)?;
+
+        let raws = pack::decode_stream_directory(
+            dir_sec.codec_id,
+            &dir_body,
+            n_streams,
+        )
+        .map_err(corrupt)?;
+        drop(dir_body);
+
+        // The retained bytes are the two pointer sections back to back — the
+        // only pack regions `resolve`/`stream_entries`/`global_entries` slice.
+        // Directory offsets rebase onto that concatenation instead of onto
+        // absolute pack offsets, so every read path below is unchanged.
+        let ptr_len = ptr_body.len();
+        let skip_len = skip_body.len();
+        let mut bytes = ptr_body;
+        bytes.reserve_exact(skip_len);
+        bytes.extend_from_slice(&skip_body);
+        drop(skip_body);
+
+        let mut dir = DirMap::with_capacity_and_hasher(
+            n_streams,
+            foldhash::fast::RandomState::default(),
+        );
+        let mut stream_ids = Vec::with_capacity(n_streams);
+        for r in raws {
+            let ptr_end = (r.ptr_off as usize)
+                .checked_add(r.ptr_len as usize)
+                .ok_or(SidecarError::Corrupt("dir ptr span overflow"))?;
+            let skip_end = (r.skip_off as usize)
+                .checked_add(r.skip_len as usize)
+                .ok_or(SidecarError::Corrupt("dir skip span overflow"))?;
+            if ptr_end > ptr_len || skip_end > skip_len {
+                return Err(SidecarError::Corrupt("dir span out of section"));
+            }
+            dir.insert(
+                r.stream_id,
+                DirEntry {
+                    first_version: r.first_version,
+                    last_version:  r.last_version,
+                    ptr_off:       r.ptr_off,
+                    ptr_len:       r.ptr_len,
+                    n_batches:     r.n_batches,
+                    skip_off:      ptr_len as u64 + r.skip_off,
+                    skip_len:      r.skip_len,
+                },
+            );
+            stream_ids.push(r.stream_id);
+        }
+        stream_ids.sort_unstable();
+
+        // Optional accelerators. Each is attached only when it verifies and
+        // cross-checks the segment id; anything else drops it and degrades
+        // locally, exactly as the eager path does.
+        let filter = parsed.section(pack::KIND_STREAM_FILTER).and_then(|s| {
+            let mut body = vec![0u8; s.length];
+            file.read_exact_at(&mut body, s.offset as u64).ok()?;
+            if !s.verify(&body) {
+                return None;
+            }
+            SegmentFilter::from_bytes(&body)
+                .ok()
+                .filter(|f| f.segment_id() == parsed.segment_id)
+        });
+        let payload =
+            parsed.section(pack::KIND_PAYLOAD_COLUMNS).and_then(|s| {
+                SealedPayloadIndex::attach_at(
+                    Arc::clone(&file),
+                    s.offset as u64,
+                    s.length as u64,
+                )
+                .ok()
+                .filter(|p| p.segment_id() == parsed.segment_id)
+            });
+        let event_types =
+            parsed.section(pack::KIND_EVENT_TYPE_IDS).and_then(|s| {
+                EventTypeColumn::attach(&file, &s)
+                    .ok()
+                    .filter(|c| c.event_count() == parsed.event_count)
+            });
+
+        Ok(SealedSegmentIndex {
+            segment_id: parsed.segment_id,
+            base_pos: parsed.base_pos,
+            event_count: parsed.event_count,
+            bytes,
+            dir,
+            stream_ids,
+            filter,
+            payload,
+            event_types,
+        })
+    }
+
+    /// Read and parse a SealPack from `path` **eagerly**: the whole image is
+    /// pulled into memory and every section — including the ones
+    /// [`Self::open_pack`] leaves on disk — verified against its
+    /// directory-committed checksums before anything else happens. An offline
+    /// verifier or a differential test wants the strongest check the format
+    /// offers and is about to touch every byte anyway; engine open uses
+    /// [`Self::open_pack`].
+    pub fn open_pack_eager(path: &Path) -> Result<Self, SidecarError> {
+        Self::from_pack(std::fs::read(path)?)
     }
 
     /// The `event_type_id` of the event at **segment-local** stored index
@@ -703,16 +894,44 @@ impl SealedSegmentIndex {
     /// section is attached (legacy sidecars, or the section was dropped as
     /// corrupt) or `local_idx` is out of range; the caller then decodes the raw
     /// batch exactly as before.
+    ///
+    /// bn-dbz: on a lazily opened pack this may `pread` (and checksum) the
+    /// covering index block, so a caller reading a contiguous run should use
+    /// [`Self::event_type_ids_range`] and pay that once for the whole run.
+    /// `None` now additionally covers a failed read or a block whose checksum
+    /// does not match — the same degradation an absent section produces.
     #[inline]
     pub fn event_type_id(&self, local_idx: u64) -> Option<u32> {
-        self.event_types
-            .as_ref()
-            .and_then(|v| v.get(local_idx as usize).copied())
+        self.event_types.as_ref().and_then(|c| c.get(local_idx))
+    }
+
+    /// The `event_type_id`s of the **segment-local** stored events in
+    /// `[lo, hi)`, in order — the batch-shaped form of [`Self::event_type_id`]
+    /// (bn-dbz). `None` under exactly the same conditions, and for the same
+    /// caller response (decode the raw batch).
+    ///
+    /// This is the shape the read path actually wants: one batch's frames are a
+    /// contiguous run, and a file-backed column serves the whole run from the
+    /// one index block it almost always lies inside.
+    #[inline]
+    pub fn event_type_ids_range(&self, lo: u64, hi: u64) -> Option<Vec<u32>> {
+        self.event_types.as_ref().and_then(|c| c.range(lo, hi))
     }
 
     /// Whether a verified `EVENT_TYPE_IDS` section is attached (bn-3of).
     #[inline]
     pub fn has_event_types(&self) -> bool { self.event_types.is_some() }
+
+    /// Whether every attached accelerator holds its bytes in memory rather than
+    /// reading them on demand — the bn-dbz laziness observable, mirroring
+    /// [`SealedPayloadIndex::is_resident`]. `true` for
+    /// [`Self::from_bytes`]/[`Self::from_pack`]/[`Self::open_pack_eager`] and
+    /// for a legacy sidecar; `false` for a pack opened by [`Self::open_pack`]
+    /// that carries a lazily attachable payload or event-type section.
+    pub fn sections_resident(&self) -> bool {
+        self.payload.as_ref().is_none_or(SealedPayloadIndex::is_resident)
+            && self.event_types.as_ref().is_none_or(|c| c.is_resident())
+    }
 
     /// Read and parse a sidecar from `path`, opportunistically attaching the
     /// sibling `.filter` file ([`filter_path_for`]) if one exists, parses,
@@ -1430,5 +1649,440 @@ mod tests {
             "filter should skip the overwhelming majority of absent streams: \
              {skip_rate}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // bn-dbz: the lazy pack open
+    // -----------------------------------------------------------------------
+
+    /// A pack big enough to have several payload blocks and several event-type
+    /// CRC blocks, with a filter — i.e. every section a real seal emits.
+    fn big_pack(segment_id: u64) -> (Vec<u8>, Vec<Vec<u8>>, Vec<u32>) {
+        use crate::sealed::pack::{self, PackInput};
+        use crate::sealed::payload::{PayloadSealOpts, encode_payload_sidecar};
+
+        const N: usize = 9000; // > 2 event-type CRC blocks
+        const STREAMS: u64 = 12;
+        let per = N as u64 / STREAMS;
+        let streams: Vec<SealStream> = (0..STREAMS)
+            .map(|s| SealStream {
+                stream_id: 100 + s,
+                batches:   (0..per / 10)
+                    .map(|b| SealBatch {
+                        first_version:    b * 10,
+                        frame_count:      10,
+                        first_global_pos: s * per + b * 10,
+                        offset:           4096 + (s * per + b * 10) * 8,
+                    })
+                    .collect(),
+            })
+            .collect();
+        let payloads: Vec<Vec<u8>> = (0..N)
+            .map(|i| {
+                format!("{{\"n\":{i},\"kind\":\"ev\",\"pad\":\"{:0>32}\"}}", i)
+                    .into_bytes()
+            })
+            .collect();
+        let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
+        let pcol = encode_payload_sidecar(
+            segment_id,
+            &refs,
+            &PayloadSealOpts::default(),
+        )
+        .unwrap();
+        let type_ids: Vec<u32> = (0..N as u32).map(|i| (i % 6) + 1).collect();
+        let ids: Vec<u64> = streams.iter().map(|s| s.stream_id).collect();
+        let filter =
+            crate::sealed::filter::SegmentFilter::build(segment_id, &ids);
+        let bytes = pack::encode_pack(&PackInput {
+            segment_id,
+            base_pos: 0,
+            streams: &streams,
+            event_type_ids: &type_ids,
+            filter: filter.as_ref(),
+            payload_bytes: Some(&pcol),
+        });
+        (bytes, payloads, type_ids)
+    }
+
+    fn write_pack(dir: &Path, seg: u64, bytes: &[u8]) -> std::path::PathBuf {
+        let p = crate::sealed::pack::seal_pack_path(dir, seg);
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    /// A lazily opened pack answers every query — pointers, heads, replay,
+    /// filter, event types, payloads — byte-identically to the same pack read
+    /// whole, and reports itself as non-resident while doing so.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn lazy_pack_open_matches_eager_on_every_query() {
+        use crate::sealed::payload::NoDicts;
+        let dir = mess_testkit::sweeping_temp_dir("seg-pack-lazy-parity");
+        let seg = 41u64;
+        let (bytes, payloads, type_ids) = big_pack(seg);
+        let path = write_pack(dir.path(), seg, &bytes);
+
+        let lazy = SealedSegmentIndex::open_pack(&path).unwrap();
+        let eager = SealedSegmentIndex::open_pack_eager(&path).unwrap();
+        assert!(!lazy.sections_resident(), "open_pack must attach lazily");
+        assert!(eager.sections_resident(), "open_pack_eager must be resident");
+
+        assert_eq!(lazy.segment_id(), eager.segment_id());
+        assert_eq!(lazy.base_pos(), eager.base_pos());
+        assert_eq!(lazy.event_count(), eager.event_count());
+        assert_eq!(lazy.stream_ids(), eager.stream_ids());
+        assert_eq!(lazy.stream_count(), eager.stream_count());
+        for &sid in eager.stream_ids() {
+            for v in [0u64, 1, 9, 10, 55, 749, 750, 10_000] {
+                assert_eq!(
+                    lazy.resolve(sid, v).unwrap(),
+                    eager.resolve(sid, v).unwrap(),
+                    "resolve {sid}/{v}"
+                );
+            }
+            assert_eq!(lazy.stream_head(sid), eager.stream_head(sid));
+            assert_eq!(lazy.stream_range(sid), eager.stream_range(sid));
+            assert_eq!(
+                lazy.stream_entries(sid).unwrap(),
+                eager.stream_entries(sid).unwrap()
+            );
+            assert!(lazy.might_contain_stream(sid));
+        }
+        assert_eq!(
+            lazy.global_entries().unwrap(),
+            eager.global_entries().unwrap()
+        );
+        assert_eq!(lazy.resolve(9_999_999, 0).unwrap(), None);
+
+        assert!(lazy.has_event_types());
+        for (i, &t) in type_ids.iter().enumerate() {
+            assert_eq!(lazy.event_type_id(i as u64), Some(t), "type id {i}");
+        }
+        assert_eq!(
+            lazy.event_type_ids_range(0, type_ids.len() as u64).unwrap(),
+            type_ids
+        );
+        assert_eq!(lazy.event_type_id(type_ids.len() as u64), None);
+
+        assert!(lazy.has_payload());
+        for i in [0usize, 1, 127, 128, 5000, payloads.len() - 1] {
+            assert_eq!(
+                lazy.reassemble_payload(i as u64, &NoDicts).unwrap(),
+                Some(payloads[i].clone()),
+                "payload {i}"
+            );
+        }
+    }
+
+    /// The direct laziness proof (bn-bka2's pattern, applied to the pack).
+    /// `open_pack` never reads the `PAYLOAD_COLUMNS` or `EVENT_TYPE_IDS`
+    /// bodies, so a pack whose optional bodies are torn still opens and still
+    /// resolves every pointer exactly; the damage surfaces as a `None`/`Err`
+    /// at the read that touches it, which every caller already treats like an
+    /// absent accelerator (raw log stays authority, D1/I5). The whole-image
+    /// read (`open_pack_eager`) catches the same damage at open, and drops the
+    /// same two sections — the difference is purely *when*.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn lazy_pack_open_skips_optional_bodies_and_tears_surface_at_read() {
+        use crate::sealed::pack;
+        use crate::sealed::payload::NoDicts;
+        let dir = mess_testkit::sweeping_temp_dir("seg-pack-lazy-torn");
+        let seg = 42u64;
+        let (mut bytes, _payloads, type_ids) = big_pack(seg);
+        let parsed = pack::parse_pack(&bytes).unwrap();
+        let pl = parsed.section(pack::KIND_PAYLOAD_COLUMNS).unwrap();
+        let et = parsed.section(pack::KIND_EVENT_TYPE_IDS).unwrap();
+        // Tear a byte deep inside each optional body — no directory or trailer
+        // repair, exactly what bitrot produces.
+        bytes[pl.offset + pl.length / 2] ^= 0xFF;
+        bytes[et.offset + et.length / 2] ^= 0xFF;
+        let path = write_pack(dir.path(), seg, &bytes);
+
+        // (a) The pack still OPENS: neither body was read.
+        let lazy = SealedSegmentIndex::open_pack(&path).unwrap();
+        assert!(lazy.has_payload(), "the block table is intact and attached");
+        assert!(lazy.has_event_types(), "the prologue is intact and attached");
+
+        // (b) Pointer resolution is untouched and byte-identical to a clean
+        //     pack — the mandatory sections were verified at open.
+        let clean_path = write_pack(dir.path(), seg + 1, &big_pack(seg + 1).0);
+        let clean = SealedSegmentIndex::open_pack(&clean_path).unwrap();
+        for &sid in clean.stream_ids() {
+            for v in [0u64, 10, 55, 740] {
+                assert_eq!(
+                    lazy.resolve(sid, v).unwrap().map(|p| p.offset),
+                    clean.resolve(sid, v).unwrap().map(|p| p.offset),
+                    "resolve {sid}/{v} after optional-section damage"
+                );
+            }
+        }
+
+        // (c) The damage surfaces at the read that touches it, and only there.
+        let n = type_ids.len() as u64;
+        let torn_et_reads = (0..n)
+            .step_by(97)
+            .filter(|&i| lazy.event_type_id(i).is_none())
+            .count();
+        assert!(torn_et_reads > 0, "the torn event-type block must refuse");
+        assert!(
+            (0..n).step_by(97).any(|i| lazy.event_type_id(i).is_some()),
+            "untouched event-type blocks must keep serving"
+        );
+        let torn_payload_reads = (0..n)
+            .step_by(97)
+            .filter(|&i| lazy.reassemble_payload(i, &NoDicts).is_err())
+            .count();
+        assert!(torn_payload_reads > 0, "the torn payload block must refuse");
+        assert!(
+            (0..n)
+                .step_by(97)
+                .any(|i| lazy.reassemble_payload(i, &NoDicts).is_ok()),
+            "untouched payload blocks must keep serving"
+        );
+
+        // (d) Control: reading the same file whole drops both sections at open
+        //     — same verdict, discovered earlier.
+        let eager = SealedSegmentIndex::open_pack_eager(&path).unwrap();
+        assert!(!eager.has_payload());
+        assert!(!eager.has_event_types());
+    }
+
+    /// A corrupt MANDATORY section still rejects the whole pack on the lazy
+    /// path: those three sections ARE read and fully verified at open, because
+    /// nothing resolves without them (the reader raw-scans instead).
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn lazy_pack_open_rejects_a_corrupt_mandatory_section() {
+        use crate::sealed::pack;
+        let dir = mess_testkit::sweeping_temp_dir("seg-pack-lazy-mandatory");
+        let seg = 43u64;
+        for kind in [
+            pack::KIND_STREAM_DIRECTORY,
+            pack::KIND_POINTER_BLOCKS,
+            pack::KIND_POINTER_SKIPS,
+        ] {
+            let (mut bytes, ..) = big_pack(seg);
+            let s = pack::parse_pack(&bytes).unwrap().section(kind).unwrap();
+            bytes[s.offset + s.length / 2] ^= 0xFF;
+            let path = write_pack(dir.path(), seg, &bytes);
+            assert!(
+                matches!(
+                    SealedSegmentIndex::open_pack(&path),
+                    Err(SidecarError::Corrupt(_))
+                ),
+                "a torn mandatory section (kind {kind}) must reject the pack"
+            );
+        }
+    }
+
+    /// Header/directory damage is fatal on the lazy path too — the trailer's
+    /// blake3 is what makes the directory (and therefore every section
+    /// checksum a lazy read relies on) trustworthy in the first place.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn lazy_pack_open_rejects_header_or_directory_damage() {
+        use crate::sealed::pack;
+        let dir = mess_testkit::sweeping_temp_dir("seg-pack-lazy-hdr");
+        let seg = 44u64;
+        for at in [8usize, pack::HEADER_LEN, pack::HEADER_LEN + 12] {
+            let (mut bytes, ..) = big_pack(seg);
+            bytes[at] ^= 0xFF;
+            let path = write_pack(dir.path(), seg, &bytes);
+            assert!(
+                matches!(
+                    SealedSegmentIndex::open_pack(&path),
+                    Err(SidecarError::Corrupt(_))
+                ),
+                "a flip at {at} must reject the pack"
+            );
+        }
+        // A truncated tail loses the trailer entirely.
+        let (bytes, ..) = big_pack(seg);
+        let path = write_pack(dir.path(), seg, &bytes[..bytes.len() - 8]);
+        assert!(SealedSegmentIndex::open_pack(&path).is_err());
+        let path = write_pack(dir.path(), seg, &bytes[..16]);
+        assert!(SealedSegmentIndex::open_pack(&path).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Bench: the sealed PACK read surface, lazy vs eager, on a 1M-event pack.
+    // The AC's latency question — does moving the payload columns and the
+    // event-type column off the heap cost the reads that use them? Run with:
+    //   TMPDIR=$HOME/.cache/mess-test-tmp cargo test -p mess-index --release \
+    //     sealed::segment::tests::pack_read_bench -- --ignored --nocapture
+    // -----------------------------------------------------------------------
+    #[test]
+    #[ignore = "perf bench; run explicitly with --release --ignored --nocapture"]
+    fn pack_read_bench() {
+        use std::time::Instant;
+
+        use crate::sealed::pack::{self, PackInput};
+        use crate::sealed::payload::{
+            NoDicts, PayloadSealOpts, encode_payload_sidecar,
+        };
+
+        const N: usize = 1_000_000;
+        const STREAMS: u64 = 1_000;
+        const PER: u64 = N as u64 / STREAMS;
+        let seg = 7u64;
+        let streams: Vec<SealStream> = (0..STREAMS)
+            .map(|s| SealStream {
+                stream_id: s,
+                batches:   (0..PER / 10)
+                    .map(|b| SealBatch {
+                        first_version:    b * 10,
+                        frame_count:      10,
+                        first_global_pos: s * PER + b * 10,
+                        offset:           4096 + (s * PER + b * 10) * 8,
+                    })
+                    .collect(),
+            })
+            .collect();
+        let payloads: Vec<Vec<u8>> = (0..N)
+            .map(|i| {
+                format!(
+                    "{{\"seq\":{i},\"account\":\"acct-{:07}\",\"amount\":{},\"\
+                     memo\":\"{:0>64}\"}}",
+                    i % 1000,
+                    i * 7 % 100_000,
+                    i
+                )
+                .into_bytes()
+            })
+            .collect();
+        let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
+        let pcol =
+            encode_payload_sidecar(seg, &refs, &PayloadSealOpts::default())
+                .unwrap();
+        let type_ids: Vec<u32> = (0..N as u32).map(|i| (i % 6) + 1).collect();
+        let ids: Vec<u64> = streams.iter().map(|s| s.stream_id).collect();
+        let filter = crate::sealed::filter::SegmentFilter::build(seg, &ids);
+        let bytes = pack::encode_pack(&PackInput {
+            segment_id:     seg,
+            base_pos:       0,
+            streams:        &streams,
+            event_type_ids: &type_ids,
+            filter:         filter.as_ref(),
+            payload_bytes:  Some(&pcol),
+        });
+        let dir = mess_testkit::sweeping_temp_dir("seg-pack-read-bench");
+        let path = write_pack(dir.path(), seg, &bytes);
+        println!(
+            "pack: {:.1} MiB, {N} events, {STREAMS} streams",
+            bytes.len() as f64 / 1048576.0
+        );
+
+        let mut xs: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            xs ^= xs << 13;
+            xs ^= xs >> 7;
+            xs ^= xs << 17;
+            xs
+        };
+        let probes: Vec<u64> = (0..20_000).map(|_| next() % N as u64).collect();
+
+        for (label, idx) in [
+            ("eager", SealedSegmentIndex::open_pack_eager(&path).unwrap()),
+            ("lazy ", SealedSegmentIndex::open_pack(&path).unwrap()),
+        ] {
+            let t = Instant::now();
+            let _ = SealedSegmentIndex::open_pack(&path);
+            let _ = t;
+            let mut times: Vec<u64> = Vec::with_capacity(probes.len());
+            let mut sink = 0u64;
+            for &p in &probes {
+                let t = Instant::now();
+                sink += u64::from(idx.event_type_id(p).unwrap());
+                times.push(t.elapsed().as_nanos() as u64);
+            }
+            report(&format!("{label} event_type_id  "), &mut times);
+            times.clear();
+            for &p in &probes {
+                let lo = p.min(N as u64 - 10);
+                let t = Instant::now();
+                sink +=
+                    idx.event_type_ids_range(lo, lo + 10).unwrap()[0] as u64;
+                times.push(t.elapsed().as_nanos() as u64);
+            }
+            report(&format!("{label} type range x10"), &mut times);
+            times.clear();
+            for &p in &probes {
+                let sid = p % STREAMS;
+                let v = p % PER;
+                let t = Instant::now();
+                sink += idx.resolve(sid, v).unwrap().map_or(0, |e| e.offset);
+                times.push(t.elapsed().as_nanos() as u64);
+            }
+            report(&format!("{label} resolve       "), &mut times);
+            times.clear();
+            for &p in &probes[..5_000] {
+                let t = Instant::now();
+                sink += idx
+                    .reassemble_payload(p, &NoDicts)
+                    .unwrap()
+                    .map_or(0, |v| v.len() as u64);
+                times.push(t.elapsed().as_nanos() as u64);
+            }
+            report(&format!("{label} payload point "), &mut times);
+            assert!(sink > 0);
+        }
+    }
+
+    #[cfg(test)]
+    fn report(label: &str, times: &mut Vec<u64>) {
+        times.sort_unstable();
+        let pct = |p: f64| {
+            times[((times.len() as f64 * p) as usize).min(times.len() - 1)]
+        };
+        let mean = times.iter().sum::<u64>() as f64 / times.len() as f64;
+        println!(
+            "{label}  n={:<6} mean={:>8.0}ns p50={:>8}ns p99={:>8}ns \
+             p999={:>9}ns",
+            times.len(),
+            mean,
+            pct(0.50),
+            pct(0.99),
+            pct(0.999)
+        );
+    }
+
+    /// One lazily opened pack behind an `Arc` serves concurrent readers with no
+    /// lock on the read path: positioned reads do not touch a shared file
+    /// offset, and both file-backed sections share the one handle.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn lazy_pack_serves_concurrent_readers() {
+        use crate::sealed::payload::NoDicts;
+        let dir = mess_testkit::sweeping_temp_dir("seg-pack-lazy-concurrent");
+        let seg = 45u64;
+        let (bytes, payloads, type_ids) = big_pack(seg);
+        let path = write_pack(dir.path(), seg, &bytes);
+        let idx = Arc::new(SealedSegmentIndex::open_pack(&path).unwrap());
+
+        std::thread::scope(|s| {
+            for t in 0..4u64 {
+                let idx = Arc::clone(&idx);
+                let payloads = &payloads;
+                let type_ids = &type_ids;
+                s.spawn(move || {
+                    let n = type_ids.len() as u64;
+                    for round in 0..3u64 {
+                        for k in (0..n).step_by(53) {
+                            let i = (k + t * 37 + round) % n;
+                            assert_eq!(
+                                idx.event_type_id(i),
+                                Some(type_ids[i as usize])
+                            );
+                            assert_eq!(
+                                idx.reassemble_payload(i, &NoDicts).unwrap(),
+                                Some(payloads[i as usize].clone())
+                            );
+                        }
+                    }
+                });
+            }
+        });
     }
 }

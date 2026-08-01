@@ -98,6 +98,57 @@
 //! | 11 | `STATS` | no | informational summary |
 //!
 //! Unknown section kinds are skipped by readers (forward compat, D-FMT-3).
+//!
+//! # What a reopen reads, and what it does not (bn-dbz)
+//!
+//! A pack is opened one of two ways, and the difference is *when* section
+//! bytes are read, never what they decode to:
+//!
+//! - [`parse_pack`] — the **eager** form: the whole image is already in memory
+//!   (the sealer's parse-back, an offline verifier, a test), so every section's
+//!   `crc32c` + `content_hash_prefix` is checked up front.
+//! - [`PackDirectory::attach`] — the **lazy** form used by
+//!   [`SealedSegmentIndex::open_pack`](crate::sealed::segment::SealedSegmentIndex::open_pack)
+//!   at engine open. It preads the 64-byte header, the 40-byte trailer, and the
+//!   `n_sections × 48`-byte directory, verifies the trailer's blake3 over
+//!   header+directory, and stops. The reader then pulls in only the sections a
+//!   *pointer* resolution needs — `STREAM_DIRECTORY`, `POINTER_BLOCKS`,
+//!   `POINTER_SKIPS`, and the small `STREAM_FILTER` — each verified against its
+//!   directory-committed checksums as it is read. `PAYLOAD_COLUMNS` and
+//!   `EVENT_TYPE_IDS`, the two sections that scale with the segment's *content*
+//!   rather than its stream count, stay on disk behind the retained file handle.
+//!
+//! Reading the whole pack at open made reopen residency linear in total sealed
+//! bytes: bn-2u01 measured `open_pack` materializing the entire pack **plus** a
+//! second copy of the payload columns **plus** a `Vec<u32>` per event from
+//! `EVENT_TYPE_IDS` (~1.5 GB at 385M events), and Spike J measured +18%/+36%
+//! reopen RSS at 2M/10M events with SealPack on. Lazy open makes it linear in
+//! stream count instead.
+//!
+//! Integrity moves with the laziness rather than eroding, exactly as it did for
+//! the `.pcol` sidecar in bn-bka2:
+//!
+//! - The trailer hash covers header + directory, so the directory's per-section
+//!   `crc32c` + `content_hash_prefix` are themselves trustworthy without
+//!   reading a single section body.
+//! - A **mandatory** section is read and fully verified at open; a failure
+//!   rejects the pack and the reader raw-scans, as before.
+//! - `PAYLOAD_COLUMNS` is handed to
+//!   [`SealedPayloadIndex::attach_at`](crate::sealed::payload::SealedPayloadIndex::attach_at),
+//!   whose own `FLAG_SPLIT_CRC` block index + per-block CRCs are verified at
+//!   attach and at first block read respectively.
+//! - `EVENT_TYPE_IDS` written with [`ETFLAG_BLOCK_CRC`] carries a per-block
+//!   checksum table (see [`encode_event_types`]) verified at first touch of
+//!   that block. A section written *without* the flag has only a whole-section
+//!   CRC, so it is read whole and verified at open — trunk-identical behaviour
+//!   for any pack sealed before bn-dbz, on the bn-bka2 legacy ruling.
+//!
+//! Damage found late is the same typed degradation the read path already
+//! handles: the accelerator drops and the raw log answers (D1/I5).
+
+use std::fs::File;
+use std::os::unix::fs::FileExt;
+use std::sync::Arc;
 
 use crate::sealed::filter::SegmentFilter;
 use crate::sealed::ptr_block::{
@@ -539,7 +590,8 @@ fn encode_dir_bitrank(entries: &[DirEntryRaw]) -> Vec<u8> {
 
 /// Encode the `EVENT_TYPE_IDS` section: a dictionary of distinct type ids plus
 /// per-event indices into it, with the index width chosen by the distinct
-/// count.
+/// count, plus (bn-dbz) a per-block checksum table so a reader can serve a
+/// point read without materializing — or even reading — the whole column.
 ///
 /// # Why dictionary + width-adaptive indices
 ///
@@ -552,14 +604,41 @@ fn encode_dir_bitrank(entries: &[DirEntryRaw]) -> Vec<u8> {
 /// section is optional and small next to the payload columns, so the modest
 /// dictionary header is free.
 ///
+/// # Why a per-block checksum table (bn-dbz)
+///
+/// "Small next to the payload columns" is not the same as small: 1 B/event is
+/// 385 MB at 385M events, and the reader used to *decode* it into a
+/// `Vec<u32>` (4 B/event, ~1.5 GB) at open. Keeping the column on disk and
+/// `pread`ing the piece a read actually needs removes both, but the section's
+/// directory-committed `crc32c` covers the whole body — verifying it would mean
+/// reading everything, which is the cost being removed. So the body carries its
+/// own split coverage, the same shape `.pcol` gained in bn-bka2:
+///
+/// - a **prologue CRC** over the 12-byte header + dictionary, verified when the
+///   column is attached; and
+/// - one CRC per fixed run of [`ET_BLOCK_EVENTS`] index entries, verified
+///   before that block's bytes are used.
+///
+/// [`ETFLAG_BLOCK_CRC`] in the formerly-reserved `flags` byte says the table is
+/// present. A body written without it (a pack sealed before bn-dbz) is read
+/// whole and whole-section-CRC verified, exactly as it always was.
+///
+/// The table is appended *after* the index region and the header keeps its
+/// original field layout, so a pre-bn-dbz [`decode_event_types`] reads a new
+/// body correctly and ignores the trailing bytes.
+///
 /// ```text
 ///   0   u32  event_count
 ///   4   u32  dict_len
 ///   8   u8   index_width (1 | 2 | 4)
-///   9   u8   reserved
-///   10  u16  reserved
+///   9   u8   flags            (bit0 ETFLAG_BLOCK_CRC — was `reserved`)
+///   10  u16  block_shift      (events per CRC block = 1 << block_shift;
+///                              0 unless ETFLAG_BLOCK_CRC — was `reserved`)
 ///   12  dict:    dict_len × u32   (distinct type ids, first-seen order)
 ///   ..  indices: event_count × index_width bytes
+///   ..  crcs:    (1 + n_blocks) × u32   (only when ETFLAG_BLOCK_CRC)
+///                [0]     crc32c(header ++ dict)          — the prologue
+///                [1 + i] crc32c(block i's index bytes)
 /// ```
 pub fn encode_event_types(type_ids: &[u32]) -> Vec<u8> {
     // Build a first-seen-order dictionary.
@@ -583,17 +662,25 @@ pub fn encode_event_types(type_ids: &[u32]) -> Vec<u8> {
         4
     };
 
+    let n_blocks = type_ids.len().div_ceil(ET_BLOCK_EVENTS);
     let mut buf = Vec::with_capacity(
-        12 + dict.len() * 4 + type_ids.len() * width as usize,
+        ET_HEADER_LEN
+            + dict.len() * 4
+            + type_ids.len() * width as usize
+            + (1 + n_blocks) * 4,
     );
     put_u32(&mut buf, type_ids.len() as u32);
     put_u32(&mut buf, dict.len() as u32);
     buf.push(width);
-    buf.push(0);
-    put_u16(&mut buf, 0);
+    buf.push(ETFLAG_BLOCK_CRC);
+    put_u16(&mut buf, ET_BLOCK_SHIFT);
     for &t in &dict {
         put_u32(&mut buf, t);
     }
+    // The prologue (header + dictionary) is what an attach reads and keeps
+    // resident; checksum it before the index region starts.
+    let prologue_crc = crc32c::crc32c(&buf);
+    let idx_start = buf.len();
     for &i in &indices {
         match width {
             1 => buf.push(i as u8),
@@ -601,47 +688,167 @@ pub fn encode_event_types(type_ids: &[u32]) -> Vec<u8> {
             _ => put_u32(&mut buf, i),
         }
     }
+    // One CRC per ET_BLOCK_EVENTS run of index entries, so a lazily attached
+    // reader checksums exactly the bytes it preads.
+    let mut crcs: Vec<u32> = Vec::with_capacity(1 + n_blocks);
+    crcs.push(prologue_crc);
+    let block_bytes = ET_BLOCK_EVENTS * width as usize;
+    for b in 0..n_blocks {
+        let lo = idx_start + b * block_bytes;
+        let hi = (lo + block_bytes).min(buf.len());
+        crcs.push(crc32c::crc32c(&buf[lo..hi]));
+    }
+    for c in crcs {
+        put_u32(&mut buf, c);
+    }
     buf
 }
 
+/// The `EVENT_TYPE_IDS` body's fixed header length (bytes).
+pub const ET_HEADER_LEN: usize = 12;
+/// `EVENT_TYPE_IDS` body `flags` bit 0 (bn-dbz): the body carries the trailing
+/// per-block `crc32c` table described on [`encode_event_types`], so a reader
+/// can attach the column **file-backed** and checksum each `pread` before using
+/// it. Clear on a body written before bn-dbz (the field was `reserved = 0`),
+/// which is therefore read whole and verified against the section's own
+/// directory-committed `crc32c`, exactly as it always was.
+pub const ETFLAG_BLOCK_CRC: u8 = 0x01;
+/// `log2` of the per-CRC-block event count for [`ETFLAG_BLOCK_CRC`] bodies.
+///
+/// 1024 events is 1 KiB of index at the common `width = 1`. The block size is
+/// a latency/residency knob and 1024 is where both flatten out: measured on the
+/// `pack_read_bench` 1M-event pack, a random point read costs p50 741 ns at
+/// 4096 events/block (the `crc32c` dominates), **260 ns at 1024**, and 201 ns
+/// at 256 — while the resident CRC table grows 4× per step down, and the
+/// `pread` syscall floor (~200 ns) caps what the last step can buy. At 1024 the
+/// table is 4 B per 1024 events (1.5 MB at 385M events) against the 4 B/event
+/// (1.5 GB) of decoded column it replaces.
+pub const ET_BLOCK_SHIFT: u16 = 10;
+/// Events per CRC block (see [`ET_BLOCK_SHIFT`]).
+pub const ET_BLOCK_EVENTS: usize = 1 << ET_BLOCK_SHIFT;
+
+/// The `EVENT_TYPE_IDS` body's fixed-header fields plus the derived region
+/// offsets, parsed from the first [`ET_HEADER_LEN`] bytes alone — so a reader
+/// can lay the section out before reading (or without ever reading) the
+/// dictionary and index regions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EtLayout {
+    pub event_count: usize,
+    pub dict_len:    usize,
+    pub width:       usize,
+    pub flags:       u8,
+    pub block_shift: u32,
+    /// Offset of the dictionary within the section body.
+    pub dict_start:  usize,
+    /// Offset of the per-event index region within the section body.
+    pub idx_start:   usize,
+    /// Offset of the trailing CRC table, and one past the index region.
+    pub crc_start:   usize,
+    /// Total body length implied by the header (index region, plus the CRC
+    /// table when [`ETFLAG_BLOCK_CRC`] is set).
+    pub body_len:    usize,
+    /// Number of CRC-covered index blocks (0 without [`ETFLAG_BLOCK_CRC`]).
+    pub n_blocks:    usize,
+}
+
+impl EtLayout {
+    /// Parse the fixed header. Every derived offset is overflow-checked, so a
+    /// caller may use them to bound `pread`s against a section length without
+    /// re-validating the arithmetic.
+    pub(crate) fn parse(head: &[u8]) -> Result<Self, PackError> {
+        if head.len() < ET_HEADER_LEN {
+            return Err(PackError::Corrupt("event-type section too short"));
+        }
+        let event_count = rd_u32(head, 0) as usize;
+        let dict_len = rd_u32(head, 4) as usize;
+        let width = head[8] as usize;
+        if width != 1 && width != 2 && width != 4 {
+            return Err(PackError::Corrupt("event-type bad index width"));
+        }
+        let flags = head[9];
+        let block_shift = u32::from(rd_u16(head, 10));
+        let dict_start = ET_HEADER_LEN;
+        let dict_bytes = dict_len
+            .checked_mul(4)
+            .ok_or(PackError::Corrupt("dict overflow"))?;
+        let idx_start = dict_start
+            .checked_add(dict_bytes)
+            .ok_or(PackError::Corrupt("event-type layout overflow"))?;
+        let idx_bytes = event_count
+            .checked_mul(width)
+            .ok_or(PackError::Corrupt("event-type index overflow"))?;
+        let crc_start = idx_start
+            .checked_add(idx_bytes)
+            .ok_or(PackError::Corrupt("event-type layout overflow"))?;
+        let (n_blocks, body_len) = if flags & ETFLAG_BLOCK_CRC != 0 {
+            // A zero/absurd shift would make the block count meaningless; the
+            // encoder only ever writes ET_BLOCK_SHIFT, but a corrupt header
+            // must not divide by zero or allocate wildly.
+            if block_shift == 0 || block_shift > 32 {
+                return Err(PackError::Corrupt("event-type bad block shift"));
+            }
+            let per = 1usize << block_shift;
+            let n = event_count.div_ceil(per);
+            let table = n
+                .checked_add(1)
+                .and_then(|k| k.checked_mul(4))
+                .ok_or(PackError::Corrupt("event-type crc table overflow"))?;
+            (
+                n,
+                crc_start
+                    .checked_add(table)
+                    .ok_or(PackError::Corrupt("event-type layout overflow"))?,
+            )
+        } else {
+            (0, crc_start)
+        };
+        Ok(EtLayout {
+            event_count,
+            dict_len,
+            width,
+            flags,
+            block_shift,
+            dict_start,
+            idx_start,
+            crc_start,
+            body_len,
+            n_blocks,
+        })
+    }
+
+    /// The index-region byte span of CRC block `b`, relative to the body.
+    fn block_span(&self, b: usize) -> (usize, usize) {
+        let per_block = (1usize << self.block_shift) * self.width;
+        let lo = self.idx_start + b * per_block;
+        ((lo), (lo + per_block).min(self.crc_start))
+    }
+}
+
+/// Read one index entry at body offset `at`.
+#[inline]
+fn rd_index(buf: &[u8], at: usize, width: usize) -> usize {
+    match width {
+        1 => buf[at] as usize,
+        2 => rd_u16(buf, at) as usize,
+        _ => rd_u32(buf, at) as usize,
+    }
+}
+
 /// Decode the `EVENT_TYPE_IDS` section back into the per-event type id column.
+/// Tolerates a body longer than the header implies (a bn-dbz body's trailing
+/// CRC table), so the two encodings share one whole-body decoder.
 pub fn decode_event_types(body: &[u8]) -> Result<Vec<u32>, PackError> {
-    if body.len() < 12 {
-        return Err(PackError::Corrupt("event-type section too short"));
-    }
-    let event_count = rd_u32(body, 0) as usize;
-    let dict_len = rd_u32(body, 4) as usize;
-    let width = body[8] as usize;
-    if width != 1 && width != 2 && width != 4 {
-        return Err(PackError::Corrupt("event-type bad index width"));
-    }
-    let dict_start = 12usize;
-    let dict_bytes =
-        dict_len.checked_mul(4).ok_or(PackError::Corrupt("dict overflow"))?;
-    let idx_start = dict_start
-        .checked_add(dict_bytes)
-        .ok_or(PackError::Corrupt("event-type layout overflow"))?;
-    let idx_bytes = event_count
-        .checked_mul(width)
-        .ok_or(PackError::Corrupt("event-type index overflow"))?;
-    let end = idx_start
-        .checked_add(idx_bytes)
-        .ok_or(PackError::Corrupt("event-type layout overflow"))?;
-    if body.len() < end {
+    let l = EtLayout::parse(body)?;
+    if body.len() < l.crc_start {
         return Err(PackError::Corrupt("event-type section truncated"));
     }
-    let mut dict = Vec::with_capacity(dict_len);
-    for i in 0..dict_len {
-        dict.push(rd_u32(body, dict_start + i * 4));
+    let mut dict = Vec::with_capacity(l.dict_len);
+    for i in 0..l.dict_len {
+        dict.push(rd_u32(body, l.dict_start + i * 4));
     }
-    let mut out = Vec::with_capacity(event_count);
-    for i in 0..event_count {
-        let at = idx_start + i * width;
-        let idx = match width {
-            1 => body[at] as usize,
-            2 => rd_u16(body, at) as usize,
-            _ => rd_u32(body, at) as usize,
-        };
+    let mut out = Vec::with_capacity(l.event_count);
+    for i in 0..l.event_count {
+        let idx = rd_index(body, l.idx_start + i * l.width, l.width);
         let t = *dict
             .get(idx)
             .ok_or(PackError::Corrupt("event-type index out of range"))?;
@@ -704,34 +911,83 @@ impl ParsedPack {
     }
 }
 
-/// Validate a SealPack byte image: magic/version, whole-pack blake3 hash,
-/// directory bounds, and every section's `crc32c` + `content_hash_prefix`.
-/// Mandatory-section corruption (or any structural fault) is fatal; an optional
-/// section that fails its CRC is kept but flagged `crc_ok=false`.
-pub(crate) fn parse_pack(bytes: &[u8]) -> Result<ParsedPack, PackError> {
-    if bytes.len() < HEADER_LEN + TRAILER_LEN {
-        return Err(PackError::Corrupt("shorter than header + trailer"));
+/// A section's directory entry: where its bytes are and what they must hash to.
+/// Unlike [`ValidSection`] this carries the *committed* checksums rather than
+/// the verdict, because a lazily attached pack (bn-dbz) checks a section's
+/// bytes when it reads them, not at open.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SectionRef {
+    pub kind:        u16,
+    pub codec_id:    u16,
+    /// Absolute byte offset of the section body within the pack file.
+    pub offset:      usize,
+    pub length:      usize,
+    pub crc:         u32,
+    pub hash_prefix: u64,
+}
+
+impl SectionRef {
+    /// Whether `body` is exactly this section's committed bytes. Both the
+    /// `crc32c` and the blake3 `content_hash_prefix` must match — they are
+    /// independent, so a fault is caught even if one algorithm collides.
+    pub fn verify(&self, body: &[u8]) -> bool {
+        body.len() == self.length
+            && crc32c::crc32c(body) == self.crc
+            && hash_prefix(body) == self.hash_prefix
     }
-    if rd_u32(bytes, 0) != PACK_MAGIC {
+}
+
+/// A pack's header + section directory, structurally validated and bound by the
+/// trailer's blake3 hash — everything a reader needs to *locate* and *check*
+/// any section without having read one (bn-dbz).
+pub(crate) struct PackDirectory {
+    pub segment_id:  u64,
+    pub base_pos:    u64,
+    pub event_count: u64,
+    pub n_streams:   u32,
+    pub sections:    Vec<SectionRef>,
+}
+
+impl PackDirectory {
+    /// The first section of `kind`, or `None`.
+    pub fn section(&self, kind: u16) -> Option<SectionRef> {
+        self.sections.iter().find(|s| s.kind == kind).copied()
+    }
+}
+
+/// The header fields a reader needs before it can even size the directory.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PackHeader {
+    pub segment_id:   u64,
+    pub base_pos:     u64,
+    pub event_count:  u64,
+    pub n_streams:    u32,
+    pub n_sections:   usize,
+    /// First byte after the directory = first section body byte.
+    pub sections_off: usize,
+}
+
+impl PackHeader {
+    /// Directory length in bytes.
+    pub fn dir_len(&self) -> usize { self.n_sections * SECTION_REF_LEN }
+}
+
+/// Parse and self-check a pack's 64-byte header: magic, `format_version`, and
+/// the directory/section offsets' internal consistency. Reads nothing else, so
+/// a lazy open can size its next two `pread`s from the result.
+pub(crate) fn parse_pack_header(head: &[u8]) -> Result<PackHeader, PackError> {
+    if head.len() < HEADER_LEN {
+        return Err(PackError::Corrupt("shorter than header"));
+    }
+    if rd_u32(head, 0) != PACK_MAGIC {
         return Err(PackError::Corrupt("bad header magic"));
     }
-    if rd_u16(bytes, 4) != FORMAT_VERSION {
+    if rd_u16(head, 4) != FORMAT_VERSION {
         return Err(PackError::Corrupt("unknown format_version"));
     }
-    let segment_id = rd_u64(bytes, 8);
-    let base_pos = rd_u64(bytes, 16);
-    let event_count = rd_u64(bytes, 24);
-    let n_streams = rd_u32(bytes, 32);
-    let n_sections = rd_u32(bytes, 36) as usize;
-    let directory_off = rd_u64(bytes, 40) as usize;
-    let sections_off = rd_u64(bytes, 48) as usize;
-
-    let trailer_start = bytes.len() - TRAILER_LEN;
-    let trailer = &bytes[trailer_start..];
-    if rd_u32(trailer, 36) != PACK_MAGIC {
-        return Err(PackError::Corrupt("bad trailer magic"));
-    }
-
+    let n_sections = rd_u32(head, 36) as usize;
+    let directory_off = rd_u64(head, 40) as usize;
+    let sections_off = rd_u64(head, 48) as usize;
     if directory_off != HEADER_LEN {
         return Err(PackError::Corrupt("directory_off != header len"));
     }
@@ -741,7 +997,45 @@ pub(crate) fn parse_pack(bytes: &[u8]) -> Result<ParsedPack, PackError> {
     let dir_end = directory_off
         .checked_add(dir_len)
         .ok_or(PackError::Corrupt("directory end overflow"))?;
-    if sections_off != dir_end || sections_off > trailer_start {
+    if sections_off != dir_end {
+        return Err(PackError::Corrupt("sections_off inconsistent"));
+    }
+    Ok(PackHeader {
+        segment_id: rd_u64(head, 8),
+        base_pos: rd_u64(head, 16),
+        event_count: rd_u64(head, 24),
+        n_streams: rd_u32(head, 32),
+        n_sections,
+        sections_off,
+    })
+}
+
+/// Validate the trailer against `head` + `dir` and decode the section
+/// directory, bounds-checking every span against the file — **without reading a
+/// single section body** (bn-dbz).
+///
+/// The trailer's blake3 covers header + directory only (review F1), so this is
+/// the complete integrity check for those two regions; each section's own
+/// `crc32c` + `content_hash_prefix` then rides in the (now-trusted) directory,
+/// to be checked by whoever reads that section's bytes.
+pub(crate) fn parse_pack_directory(
+    head: &[u8],
+    dir: &[u8],
+    trailer: &[u8],
+    file_len: u64,
+) -> Result<PackDirectory, PackError> {
+    let h = parse_pack_header(head)?;
+    if dir.len() != h.dir_len() || trailer.len() != TRAILER_LEN {
+        return Err(PackError::Corrupt("directory/trailer size mismatch"));
+    }
+    if rd_u32(trailer, 36) != PACK_MAGIC {
+        return Err(PackError::Corrupt("bad trailer magic"));
+    }
+    if file_len < (HEADER_LEN + TRAILER_LEN) as u64 {
+        return Err(PackError::Corrupt("shorter than header + trailer"));
+    }
+    let trailer_start = (file_len - TRAILER_LEN as u64) as usize;
+    if h.sections_off > trailer_start {
         return Err(PackError::Corrupt("sections_off inconsistent"));
     }
 
@@ -749,33 +1043,76 @@ pub(crate) fn parse_pack(bytes: &[u8]) -> Result<ParsedPack, PackError> {
     // per-section crc32c + content_hash_prefix bind the section bodies
     // transitively, and a corrupt OPTIONAL section must fail its OWN checksum
     // (local degradation), not this pack-wide one.
-    let got = blake3::hash(&bytes[..sections_off]);
-    if got.as_bytes() != &trailer[0..32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&head[..HEADER_LEN]);
+    hasher.update(dir);
+    if hasher.finalize().as_bytes() != &trailer[0..32] {
         return Err(PackError::Corrupt("pack header/directory hash mismatch"));
     }
 
-    let mut sections = Vec::with_capacity(n_sections);
-    for i in 0..n_sections {
-        let b = directory_off + i * SECTION_REF_LEN;
-        let kind = rd_u16(bytes, b);
-        let codec_id = rd_u16(bytes, b + 36);
-        let offset = rd_u64(bytes, b + 8) as usize;
-        let length = rd_u64(bytes, b + 16) as usize;
-        let crc = rd_u32(bytes, b + 32);
-        let hp = rd_u64(bytes, b + 40);
+    let mut sections = Vec::with_capacity(h.n_sections);
+    for i in 0..h.n_sections {
+        let b = i * SECTION_REF_LEN;
+        let offset = rd_u64(dir, b + 8) as usize;
+        let length = rd_u64(dir, b + 16) as usize;
         let end = offset
             .checked_add(length)
             .ok_or(PackError::Corrupt("section span overflow"))?;
-        if offset < sections_off || end > trailer_start {
+        if offset < h.sections_off || end > trailer_start {
             return Err(PackError::Corrupt("section span out of range"));
         }
-        let body = &bytes[offset..end];
-        // A section verifies when BOTH its crc32c and its content-hash prefix
-        // match (the two are independent so a fault is caught even if one
-        // algorithm collides).
-        let crc_ok = crc32c::crc32c(body) == crc && hash_prefix(body) == hp;
-        sections.push(ValidSection { kind, codec_id, offset, length, crc_ok });
+        sections.push(SectionRef {
+            kind: rd_u16(dir, b),
+            codec_id: rd_u16(dir, b + 36),
+            offset,
+            length,
+            crc: rd_u32(dir, b + 32),
+            hash_prefix: rd_u64(dir, b + 40),
+        });
     }
+    Ok(PackDirectory {
+        segment_id: h.segment_id,
+        base_pos: h.base_pos,
+        event_count: h.event_count,
+        n_streams: h.n_streams,
+        sections,
+    })
+}
+
+/// Validate a SealPack byte image: magic/version, whole-pack blake3 hash,
+/// directory bounds, and every section's `crc32c` + `content_hash_prefix`.
+/// Mandatory-section corruption (or any structural fault) is fatal; an optional
+/// section that fails its CRC is kept but flagged `crc_ok=false`.
+///
+/// This is the **eager** form (the sealer's parse-back, an offline verifier, a
+/// test). Engine open goes through [`parse_pack_directory`] instead and checks
+/// each section as it reads it.
+pub(crate) fn parse_pack(bytes: &[u8]) -> Result<ParsedPack, PackError> {
+    if bytes.len() < HEADER_LEN + TRAILER_LEN {
+        return Err(PackError::Corrupt("shorter than header + trailer"));
+    }
+    let h = parse_pack_header(bytes)?;
+    if h.sections_off > bytes.len() - TRAILER_LEN {
+        return Err(PackError::Corrupt("sections_off inconsistent"));
+    }
+    let dir = parse_pack_directory(
+        &bytes[..HEADER_LEN],
+        &bytes[HEADER_LEN..h.sections_off],
+        &bytes[bytes.len() - TRAILER_LEN..],
+        bytes.len() as u64,
+    )?;
+
+    let sections: Vec<ValidSection> = dir
+        .sections
+        .iter()
+        .map(|s| ValidSection {
+            kind:     s.kind,
+            codec_id: s.codec_id,
+            offset:   s.offset,
+            length:   s.length,
+            crc_ok:   s.verify(&bytes[s.offset..s.offset + s.length]),
+        })
+        .collect();
 
     // Mandatory sections must be present and CRC-valid, else the whole pack is
     // untrustworthy and the reader must raw-scan.
@@ -787,7 +1124,201 @@ pub(crate) fn parse_pack(bytes: &[u8]) -> Result<ParsedPack, PackError> {
         }
     }
 
-    Ok(ParsedPack { segment_id, base_pos, event_count, n_streams, sections })
+    Ok(ParsedPack {
+        segment_id: dir.segment_id,
+        base_pos: dir.base_pos,
+        event_count: dir.event_count,
+        n_streams: dir.n_streams,
+        sections,
+    })
+}
+
+// -------------------------------------------------------------------------
+// The file-backed event-type column (bn-dbz)
+// -------------------------------------------------------------------------
+
+/// Where an [`EventTypeColumn`]'s per-event index bytes come from.
+///
+/// The dictionary is always resident (it is O(distinct types), not O(events),
+/// and every read needs it). The index region — 1 B/event in the common case —
+/// is either already in memory or `pread` per read, which is the whole
+/// difference between an eager and a lazy attach.
+#[derive(Debug)]
+enum EtSource {
+    /// The whole section body, resident: the eager pack parse, or a body
+    /// written before [`ETFLAG_BLOCK_CRC`] (which has no per-block checksums to
+    /// attach lazily against, so it keeps the whole-section check it has
+    /// today).
+    Memory(Vec<u8>),
+    /// The pack file plus the section's absolute offset. An index block is
+    /// `pread` per read, checksummed against the body's CRC table, and dropped.
+    File {
+        file: Arc<File>,
+        base: u64,
+        /// `[0]` is the prologue CRC (verified at attach); `[1 + b]` covers
+        /// index block `b`.
+        crcs: Vec<u32>,
+    },
+}
+
+/// One segment's `EVENT_TYPE_IDS` column: the resident dictionary plus a source
+/// for the per-event indices ([`EtSource`]).
+///
+/// A point read is a dictionary lookup plus — for a file-backed column — one
+/// `pread` of the covering [`ET_BLOCK_EVENTS`]-entry block and one `crc32c`
+/// over it. `&self` throughout and `Sync` with no interior locking: positioned
+/// reads do not touch the shared file offset, so concurrent readers of one
+/// `Arc<SealedSegmentIndex>` never serialise.
+#[derive(Debug)]
+pub(crate) struct EventTypeColumn {
+    layout: EtLayout,
+    dict:   Vec<u32>,
+    src:    EtSource,
+}
+
+impl EventTypeColumn {
+    /// Total events the column covers.
+    pub fn event_count(&self) -> u64 { self.layout.event_count as u64 }
+
+    /// Whether the per-event index region is held in memory rather than read on
+    /// demand — the bn-dbz laziness observable.
+    pub fn is_resident(&self) -> bool {
+        matches!(self.src, EtSource::Memory(_))
+    }
+
+    /// Build an **eager** column over an already-verified section body.
+    pub fn from_body(body: Vec<u8>) -> Result<Self, PackError> {
+        let layout = EtLayout::parse(&body)?;
+        if body.len() < layout.crc_start {
+            return Err(PackError::Corrupt("event-type section truncated"));
+        }
+        let dict = read_dict(&body[layout.dict_start..], layout.dict_len)?;
+        Ok(EventTypeColumn { layout, dict, src: EtSource::Memory(body) })
+    }
+
+    /// **Lazily** attach the `EVENT_TYPE_IDS` section `sec` of the pack behind
+    /// `file`: read the fixed header, the dictionary, and the trailing
+    /// per-block CRC table — bytes proportional to the *distinct type
+    /// count* and the *block count*, not to the event count — and retain
+    /// the handle.
+    ///
+    /// A body without [`ETFLAG_BLOCK_CRC`] (a pack sealed before bn-dbz) has no
+    /// per-block checksums, so attaching it lazily would run with no integrity
+    /// check on the bytes actually read. It is instead read whole and verified
+    /// against the section's directory-committed `crc32c` +
+    /// `content_hash_prefix` — byte-for-byte the check the eager path makes —
+    /// exactly the bn-bka2 legacy ruling for pre-`FLAG_SPLIT_CRC` `.pcol`s.
+    pub fn attach(
+        file: &Arc<File>,
+        sec: &SectionRef,
+    ) -> Result<Self, PackError> {
+        let base = sec.offset as u64;
+        let mut head = [0u8; ET_HEADER_LEN];
+        if sec.length < ET_HEADER_LEN {
+            return Err(PackError::Corrupt("event-type section too short"));
+        }
+        pread(file, &mut head, base)?;
+        let layout = EtLayout::parse(&head)?;
+        if layout.body_len != sec.length {
+            return Err(PackError::Corrupt("event-type body/section mismatch"));
+        }
+
+        if layout.flags & ETFLAG_BLOCK_CRC == 0 {
+            let mut body = vec![0u8; sec.length];
+            pread(file, &mut body, base)?;
+            if !sec.verify(&body) {
+                return Err(PackError::Corrupt("event-type section CRC"));
+            }
+            return Self::from_body(body);
+        }
+
+        // Prologue = header + dictionary; the CRC table's first entry covers
+        // it.
+        let mut prologue = vec![0u8; layout.idx_start];
+        pread(file, &mut prologue, base)?;
+        let mut table = vec![0u8; (1 + layout.n_blocks) * 4];
+        pread(file, &mut table, base + layout.crc_start as u64)?;
+        let crcs: Vec<u32> =
+            table.chunks_exact(4).map(|c| rd_u32(c, 0)).collect();
+        if crc32c::crc32c(&prologue) != crcs[0] {
+            return Err(PackError::Corrupt("event-type prologue CRC"));
+        }
+        let dict = read_dict(&prologue[layout.dict_start..], layout.dict_len)?;
+        Ok(EventTypeColumn {
+            layout,
+            dict,
+            src: EtSource::File { file: Arc::clone(file), base, crcs },
+        })
+    }
+
+    /// The type ids of the stored-order events in `[lo, hi)`, or `None` if the
+    /// range is out of bounds or any byte it needs fails its checksum / cannot
+    /// be read. `None` is the caller's cue to decode the raw batch instead
+    /// (D1: the log is the authority), which is exactly what an absent section
+    /// already means.
+    ///
+    /// A file-backed column reads each covering [`ET_BLOCK_EVENTS`] block once,
+    /// so a whole batch costs one `pread` in the overwhelmingly common case
+    /// rather than one per event.
+    pub fn range(&self, lo: u64, hi: u64) -> Option<Vec<u32>> {
+        if hi < lo || hi > self.layout.event_count as u64 {
+            return None;
+        }
+        let (lo, hi) = (lo as usize, hi as usize);
+        let mut out = Vec::with_capacity(hi - lo);
+        match &self.src {
+            EtSource::Memory(body) => {
+                for i in lo..hi {
+                    let at = self.layout.idx_start + i * self.layout.width;
+                    let idx = rd_index(body, at, self.layout.width);
+                    out.push(*self.dict.get(idx)?);
+                }
+            }
+            EtSource::File { file, base, crcs } => {
+                if lo == hi {
+                    return Some(out);
+                }
+                let per = 1usize << self.layout.block_shift;
+                let mut buf: Vec<u8> = Vec::new();
+                for b in (lo / per)..=((hi - 1) / per) {
+                    let (blo, bhi) = self.layout.block_span(b);
+                    buf.resize(bhi - blo, 0);
+                    pread(file, &mut buf, base + blo as u64).ok()?;
+                    if crc32c::crc32c(&buf) != *crcs.get(1 + b)? {
+                        return None;
+                    }
+                    let first = lo.max(b * per);
+                    let last = hi.min((b + 1) * per);
+                    for i in first..last {
+                        let at = (i - b * per) * self.layout.width;
+                        let idx = rd_index(&buf, at, self.layout.width);
+                        out.push(*self.dict.get(idx)?);
+                    }
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// The type id of the stored-order event at `idx`, or `None` (see
+    /// [`Self::range`]).
+    pub fn get(&self, idx: u64) -> Option<u32> {
+        self.range(idx, idx.checked_add(1)?)?.pop()
+    }
+}
+
+/// `pread` exactly `buf.len()` bytes at `off`, as a [`PackError`].
+fn pread(file: &File, buf: &mut [u8], off: u64) -> Result<(), PackError> {
+    file.read_exact_at(buf, off)
+        .map_err(|_| PackError::Corrupt("pack read failed"))
+}
+
+/// Decode `dict_len` `u32`s from the head of `buf`.
+fn read_dict(buf: &[u8], dict_len: usize) -> Result<Vec<u32>, PackError> {
+    if buf.len() < dict_len * 4 {
+        return Err(PackError::Corrupt("event-type dictionary truncated"));
+    }
+    Ok((0..dict_len).map(|i| rd_u32(buf, i * 4)).collect())
 }
 
 /// Decode a `STREAM_DIRECTORY` section body (codec `DIRCODEC_SORTED` or
@@ -913,8 +1444,10 @@ mod tests {
     fn event_types_round_trip_small_dict() {
         let ids = vec![7u32, 7, 3, 7, 9, 3, 3];
         let enc = encode_event_types(&ids);
-        // dict {7,3,9} -> width 1; header 12 + dict 12 + 7 indices = 31 bytes
-        assert_eq!(enc.len(), 12 + 3 * 4 + 7);
+        // dict {7,3,9} -> width 1; header 12 + dict 12 + 7 indices = 31 bytes,
+        // plus the bn-dbz CRC table (prologue + one block) = 8 bytes.
+        assert_eq!(enc.len(), 12 + 3 * 4 + 7 + 2 * 4);
+        assert_eq!(enc[9], ETFLAG_BLOCK_CRC, "block-CRC flag set");
         assert_eq!(decode_event_types(&enc).unwrap(), ids);
     }
 
@@ -1069,5 +1602,235 @@ mod tests {
         assert!(reparsed.section(KIND_STREAM_DIRECTORY).is_some());
         assert!(reparsed.section(KIND_POINTER_BLOCKS).is_some());
         assert!(reparsed.section(KIND_POINTER_SKIPS).is_some());
+    }
+
+    // ---------------------------------------------------------------------
+    // bn-dbz: the file-backed event-type column
+    // ---------------------------------------------------------------------
+
+    /// The pre-bn-dbz `EVENT_TYPE_IDS` body: identical header layout with
+    /// `flags`/`block_shift` still zero `reserved`s, and no trailing CRC table.
+    /// This is byte-for-byte what a pack sealed before bn-dbz carries, so a
+    /// column attached over it exercises the legacy path exactly.
+    fn encode_event_types_legacy(type_ids: &[u32]) -> Vec<u8> {
+        let mut dict: Vec<u32> = Vec::new();
+        let mut indices: Vec<u32> = Vec::with_capacity(type_ids.len());
+        for &t in type_ids {
+            let i = dict.iter().position(|&d| d == t).unwrap_or_else(|| {
+                dict.push(t);
+                dict.len() - 1
+            });
+            indices.push(i as u32);
+        }
+        assert!(dict.len() <= 256, "test corpora stay in the width-1 regime");
+        let mut buf = Vec::new();
+        put_u32(&mut buf, type_ids.len() as u32);
+        put_u32(&mut buf, dict.len() as u32);
+        buf.push(1); // width
+        buf.push(0); // flags: pre-bn-dbz reserved
+        put_u16(&mut buf, 0); // block_shift: pre-bn-dbz reserved
+        for &t in &dict {
+            put_u32(&mut buf, t);
+        }
+        for &i in &indices {
+            buf.push(i as u8);
+        }
+        buf
+    }
+
+    /// Write `body` into a scratch file at `base` (with junk in front, so the
+    /// base-offset arithmetic is genuinely exercised) and hand back the open
+    /// handle plus the directory entry a pack would carry for it.
+    fn section_file(
+        dir: &std::path::Path,
+        name: &str,
+        base: usize,
+        body: &[u8],
+    ) -> (Arc<File>, SectionRef) {
+        let path = dir.join(name);
+        let mut image = vec![0xA5u8; base];
+        image.extend_from_slice(body);
+        image.extend_from_slice(&[0x5Au8; 16]); // trailing junk
+        std::fs::write(&path, &image).unwrap();
+        let sec = SectionRef {
+            kind:        KIND_EVENT_TYPE_IDS,
+            codec_id:    0,
+            offset:      base,
+            length:      body.len(),
+            crc:         crc32c::crc32c(body),
+            hash_prefix: hash_prefix(body),
+        };
+        (Arc::new(File::open(&path).unwrap()), sec)
+    }
+
+    /// A body written before bn-dbz has no per-block checksums, so attaching it
+    /// lazily would read bytes with nothing to check them against. It must
+    /// therefore attach EAGERLY — whole body, section `crc32c` +
+    /// `content_hash_prefix` verified — which is byte-for-byte what an open did
+    /// before this change (the bn-bka2 legacy ruling). Reads are unaffected.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn legacy_event_type_body_attaches_eagerly_and_reads() {
+        let dir = mess_testkit::sweeping_temp_dir("pack-et-legacy");
+        let ids: Vec<u32> = (0..5000u32).map(|i| (i % 7) + 1).collect();
+        let body = encode_event_types_legacy(&ids);
+        // The whole-body decoder handles both encodings.
+        assert_eq!(decode_event_types(&body).unwrap(), ids);
+
+        let (file, sec) = section_file(dir.path(), "legacy.bin", 97, &body);
+        let col = EventTypeColumn::attach(&file, &sec).unwrap();
+        assert!(
+            col.is_resident(),
+            "a flags==0 body must attach eagerly: lazily it would carry no \
+             checksum at all"
+        );
+        assert_eq!(col.event_count(), ids.len() as u64);
+        for (i, &t) in ids.iter().enumerate() {
+            assert_eq!(col.get(i as u64), Some(t));
+        }
+        assert_eq!(col.range(10, 4200).unwrap(), ids[10..4200]);
+    }
+
+    /// The legacy path must not lose integrity: a torn byte in a pre-bn-dbz
+    /// body's index region is caught by the section's whole-body `crc32c` and
+    /// the column is DROPPED AT ATTACH, exactly as it was before bn-dbz.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn torn_legacy_event_type_body_is_dropped_at_attach() {
+        let dir = mess_testkit::sweeping_temp_dir("pack-et-legacy-torn");
+        let ids: Vec<u32> = (0..5000u32).map(|i| (i % 7) + 1).collect();
+        let mut body = encode_event_types_legacy(&ids);
+        let (_, sec) = section_file(dir.path(), "clean.bin", 97, &body);
+        // Tear a byte in the index region AFTER computing the committed
+        // checksums — real media damage, invisible to any structural check.
+        let torn_at = body.len() - 100;
+        body[torn_at] ^= 0xFF;
+        let path = dir.path().join("torn.bin");
+        let mut image = vec![0xA5u8; 97];
+        image.extend_from_slice(&body);
+        std::fs::write(&path, &image).unwrap();
+        let file = Arc::new(File::open(&path).unwrap());
+        assert!(
+            EventTypeColumn::attach(&file, &sec).is_err(),
+            "a torn legacy body must be dropped at attach"
+        );
+    }
+
+    /// A bn-dbz body attaches file-backed and answers every point and range
+    /// read identically to the eager, whole-body column — across CRC-block
+    /// boundaries, which is where a blocked reader can go wrong.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn lazy_event_type_column_matches_eager_across_block_boundaries() {
+        let dir = mess_testkit::sweeping_temp_dir("pack-et-lazy");
+        // Two and a bit CRC blocks.
+        let n = ET_BLOCK_EVENTS * 2 + 37;
+        let ids: Vec<u32> = (0..n as u32).map(|i| (i % 11) * 3 + 2).collect();
+        let body = encode_event_types(&ids);
+        let (file, sec) = section_file(dir.path(), "lazy.bin", 4096, &body);
+
+        let lazy = EventTypeColumn::attach(&file, &sec).unwrap();
+        assert!(!lazy.is_resident(), "a bn-dbz body must attach file-backed");
+        let eager = EventTypeColumn::from_body(body).unwrap();
+        assert!(eager.is_resident());
+
+        for i in 0..n as u64 {
+            assert_eq!(lazy.get(i), Some(ids[i as usize]), "point read {i}");
+            assert_eq!(lazy.get(i), eager.get(i));
+        }
+        assert_eq!(lazy.get(n as u64), None, "out of range");
+        // Ranges that stay inside one block, straddle one boundary, and span
+        // every block including the short tail.
+        let b = ET_BLOCK_EVENTS as u64;
+        for (lo, hi) in [
+            (0u64, 10u64),
+            (b - 6, b + 10),
+            (b + 1, 2 * b - 1),
+            (0, n as u64),
+            (2 * b, n as u64),
+            (7, 7),
+        ] {
+            assert_eq!(
+                lazy.range(lo, hi).unwrap(),
+                ids[lo as usize..hi as usize],
+                "range {lo}..{hi}"
+            );
+            assert_eq!(lazy.range(lo, hi), eager.range(lo, hi));
+        }
+        assert_eq!(lazy.range(0, n as u64 + 1), None, "range past the end");
+    }
+
+    /// The direct laziness proof: `attach` never reads the index region, so a
+    /// body whose index bytes are garbage still attaches — and the damage
+    /// surfaces at the read of the affected BLOCK, as a `None` the caller
+    /// degrades on, while every other block keeps answering exactly.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn lazy_event_type_block_tear_surfaces_at_read_and_stays_local() {
+        let dir = mess_testkit::sweeping_temp_dir("pack-et-lazy-torn");
+        let n = ET_BLOCK_EVENTS * 3;
+        let ids: Vec<u32> = (0..n as u32).map(|i| (i % 5) + 1).collect();
+        let mut body = encode_event_types(&ids);
+        let layout = EtLayout::parse(&body).unwrap();
+        // Tear one byte inside CRC block 1's index bytes.
+        body[layout.idx_start + ET_BLOCK_EVENTS + 5] ^= 0xFF;
+        let (file, mut sec) = section_file(dir.path(), "torn.bin", 8, &body);
+        // Recompute the section checksums over the torn body: the pack
+        // directory would commit whatever was written. This isolates the
+        // per-block table as the ONLY thing that can catch the tear — the
+        // situation a lazy open is actually in.
+        sec.crc = crc32c::crc32c(&body);
+        sec.hash_prefix = hash_prefix(&body);
+
+        let col = EventTypeColumn::attach(&file, &sec)
+            .expect("attach must not read the index region");
+        assert!(!col.is_resident());
+        // Block 0 and block 2 are untouched and exact.
+        assert_eq!(col.get(0), Some(ids[0]));
+        assert_eq!(col.range(0, 128).unwrap(), ids[0..128]);
+        let b2 = ET_BLOCK_EVENTS as u64 * 2;
+        assert_eq!(col.get(b2), Some(ids[b2 as usize]));
+        // Block 1 refuses to serve — the caller falls back to the raw batch.
+        assert_eq!(col.get(ET_BLOCK_EVENTS as u64 + 5), None);
+        assert_eq!(col.get(ET_BLOCK_EVENTS as u64), None);
+        // A range that merely touches the torn block refuses as a whole.
+        assert_eq!(col.range(0, ET_BLOCK_EVENTS as u64 + 1), None);
+    }
+
+    /// A torn PROLOGUE (header + dictionary) is caught at attach: it is the one
+    /// part a lazy column keeps resident, so it is checked exactly once, up
+    /// front, against the CRC table's first entry.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn lazy_event_type_prologue_tear_is_caught_at_attach() {
+        let dir = mess_testkit::sweeping_temp_dir("pack-et-prologue-torn");
+        let ids: Vec<u32> = (0..1000u32).map(|i| (i % 9) + 4).collect();
+        let mut body = encode_event_types(&ids);
+        let layout = EtLayout::parse(&body).unwrap();
+        body[layout.dict_start + 1] ^= 0xFF; // a dictionary byte
+        let (file, mut sec) = section_file(dir.path(), "torn.bin", 0, &body);
+        sec.crc = crc32c::crc32c(&body);
+        sec.hash_prefix = hash_prefix(&body);
+        assert_eq!(
+            EventTypeColumn::attach(&file, &sec).unwrap_err(),
+            PackError::Corrupt("event-type prologue CRC")
+        );
+    }
+
+    /// A header that disagrees with the directory's section length is refused
+    /// at attach: the header is what every subsequent `pread` is bounded by, so
+    /// it must be pinned to something the trailer hash already covers.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn event_type_header_must_agree_with_the_section_length() {
+        let dir = mess_testkit::sweeping_temp_dir("pack-et-badlen");
+        let ids: Vec<u32> = (0..100u32).map(|i| i % 3).collect();
+        let body = encode_event_types(&ids);
+        let (file, mut sec) = section_file(dir.path(), "b.bin", 0, &body);
+        sec.length -= 1;
+        assert_eq!(
+            EventTypeColumn::attach(&file, &sec).unwrap_err(),
+            PackError::Corrupt("event-type body/section mismatch")
+        );
     }
 }

@@ -131,6 +131,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::columnar::{self, Block, CodecError, EncodeOpts, FLAG_COLUMNAR};
 
@@ -821,10 +822,17 @@ pub struct BlockEntry {
 enum BlockSource {
     /// The whole sidecar image, resident. Block bytes are slices of it.
     Memory(Vec<u8>),
-    /// A retained handle on the `.pcol`. Block bytes are `pread` per read and
-    /// dropped after it; residency is the kernel page cache's business, and
-    /// mess-store's decoded-block cache keeps the *decoded* form hot.
-    File(File),
+    /// A retained handle on the file the image lives in. Block bytes are
+    /// `pread` per read and dropped after it; residency is the kernel page
+    /// cache's business, and mess-store's decoded-block cache keeps the
+    /// *decoded* form hot.
+    ///
+    /// `base` is where the image starts in that file: `0` for a standalone
+    /// `.pcol`, and the `PAYLOAD_COLUMNS` section's offset when the image is
+    /// embedded in a SealPack (bn-dbz). Every in-image offset the block table
+    /// carries is read at `base + off`. The handle is shared (`Arc`) because a
+    /// pack serves several lazily attached sections from one open file.
+    File { file: Arc<File>, base: u64 },
 }
 
 /// The read-only sealed payload index for one segment: the block table plus a
@@ -874,12 +882,12 @@ impl SealedPayloadIndex {
     fn into_bytes(self) -> Result<Vec<u8>, PayloadError> {
         match self.src {
             BlockSource::Memory(b) => Ok(b),
-            BlockSource::File(f) => {
+            BlockSource::File { file, base } => {
                 let total = self.index_off as usize
                     + self.blocks.len() * BLOCK_ENTRY_LEN
                     + FOOTER_LEN;
                 let mut buf = vec![0u8; total];
-                f.read_exact_at(&mut buf, 0)?;
+                file.read_exact_at(&mut buf, base)?;
                 Ok(buf)
             }
         }
@@ -948,11 +956,28 @@ impl SealedPayloadIndex {
 
     /// The lazy attach proper, split out so tests can hand in a handle.
     fn attach(file: File, len: u64) -> Result<Self, PayloadError> {
+        Self::attach_at(Arc::new(file), 0, len)
+    }
+
+    /// **Lazily** attach a `.pcol` image that occupies `[base, base + len)` of
+    /// an already-open file (bn-dbz): the SealPack `PAYLOAD_COLUMNS` section.
+    ///
+    /// Identical in every respect to [`Self::open`] — same header/footer/block
+    /// index validation, same [`FLAG_SPLIT_CRC`] requirement for laziness with
+    /// the same eager fallback for a pre-flag image, same per-block checksum
+    /// before a block is decoded — except that every offset is taken relative
+    /// to `base` and the handle is shared, so one open file serves a pack's
+    /// payload columns and its event-type column at once.
+    pub fn attach_at(
+        file: Arc<File>,
+        base: u64,
+        len: u64,
+    ) -> Result<Self, PayloadError> {
         if len < (HEADER_LEN + FOOTER_LEN) as u64 {
             return Err(PayloadError::Corrupt("shorter than header + footer"));
         }
         let mut hbuf = [0u8; HEADER_LEN];
-        file.read_exact_at(&mut hbuf, 0)?;
+        file.read_exact_at(&mut hbuf, base)?;
         let head = Header::parse(&hbuf)?;
 
         // LEGACY SIDECARS ATTACH EAGERLY (bn-bka2 review). Without
@@ -967,19 +992,19 @@ impl SealedPayloadIndex {
         // `archive_reblock` upgrades an old sidecar's format when it runs.
         if head.flags & FLAG_SPLIT_CRC == 0 {
             let mut bytes = vec![0u8; len as usize];
-            file.read_exact_at(&mut bytes, 0)?;
+            file.read_exact_at(&mut bytes, base)?;
             return Self::from_bytes(bytes);
         }
 
         let footer_start = len - FOOTER_LEN as u64;
         let mut fbuf = [0u8; FOOTER_LEN];
-        file.read_exact_at(&mut fbuf, footer_start)?;
+        file.read_exact_at(&mut fbuf, base + footer_start)?;
         let index_off = parse_footer(&fbuf, &head, footer_start)?;
 
         // The one length-bounded allocation: the block table, whose size the
         // footer just proved equals `footer_start - index_off`.
         let mut ibuf = vec![0u8; (footer_start - index_off) as usize];
-        file.read_exact_at(&mut ibuf, index_off)?;
+        file.read_exact_at(&mut ibuf, base + index_off)?;
         if head.flags & FLAG_SPLIT_CRC != 0
             && crc32c::crc32c(&ibuf) != head.index_crc
         {
@@ -990,7 +1015,7 @@ impl SealedPayloadIndex {
         Ok(SealedPayloadIndex {
             segment_id: head.segment_id,
             event_count: head.event_count,
-            src: BlockSource::File(file),
+            src: BlockSource::File { file, base },
             index_off,
             blocks,
         })
@@ -1049,9 +1074,9 @@ impl SealedPayloadIndex {
             BlockSource::Memory(bytes) => {
                 Ok(Cow::Borrowed(&bytes[off..off + len]))
             }
-            BlockSource::File(f) => {
+            BlockSource::File { file, base } => {
                 let mut buf = vec![0u8; len];
-                f.read_exact_at(&mut buf, e.byte_off)?;
+                file.read_exact_at(&mut buf, base + e.byte_off)?;
                 if let Some(crc) = e.crc
                     && crc32c::crc32c(&buf) != crc
                 {
