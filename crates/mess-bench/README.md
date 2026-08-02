@@ -4,9 +4,13 @@ The envelope regression suite: one runner over the reference workload set
 `docs/perf/envelope.md` recorded by hand — buffered append, durable append,
 sealed pointer-index reads (global scan + stream replay), the sealed
 columnar payload codec, engine end-to-end buffered append + sealed replay,
-fold-chain overhead, `load_verified` throughput, and recovery time. Emits a
-JSON ledger per run and compares it against a committed `floors.json` with a
-per-metric tolerance (default -10%).
+fold-chain overhead, `load_verified` throughput, and recovery time — plus two
+workloads added because the suite was blind to them: concurrent reads against
+a live writer (`reader_contention`, bn-1dlb) and the subscriber shape
+(`live_tail`, bn-1r9c: catch-up + live tail over `read_global_page`, wake
+latency, and hot multi-stream `read_stream` paging). Emits a JSON ledger per
+run and compares it against a committed `floors.json` with a per-metric
+tolerance (default -10%).
 
 See the crate-level doc comment in `src/lib.rs` for the design rationale
 (why in-process ports of the existing bench entry points rather than
@@ -38,6 +42,42 @@ cargo run -p mess-bench -- compare --ledger ledger.json \
 Exit code: `0` if every floor-gated metric is within tolerance, `1` if any
 metric regressed, `2` on a setup error (bad args, tmpfs scratch dir, I/O
 failure).
+
+## Running one workload (`--only`)
+
+```bash
+./target/release/mess-bench list-workloads          # the selector vocabulary
+./target/release/mess-bench run --only live_tail --no-compare
+./target/release/mess-bench run --only recovery,reader_contention
+```
+
+`--only` narrows the run to the named workloads. Everything about a selected
+workload is unchanged — same function, same size, same order, and the settle
+pause still separates whichever workloads did get selected. Use it when
+developing or re-seeding a single workload: this repo is built on a shared
+box, and running the other nine to look at one of them is both slow and
+antisocial.
+
+**A narrowed run is a measurement, not a gate.** `compare` skips any floor
+whose metric is absent from the ledger, so `run --mode full --only X`
+enforces X's floors and nothing else. The nightly gate must never pass
+`--only`.
+
+The comparison output says which of the two happened, and the distinction is
+load-bearing — CI and the pre-merge checks grep for the PASS line, so a
+narrowed run must not be able to emit the full-gate one:
+
+```text
+# every floor in the file was checked
+PASS: all 20 floor-gated metrics within tolerance of crates/mess-bench/floors.json
+
+# the ledger did not carry every gated metric (e.g. after --only)
+PASS (narrowed): 6 of 20 floor-gated metrics checked; 14 absent from this ledger — NOT a full gate.
+```
+
+Both exit `0` — a narrowed run genuinely found no regression in what it
+checked. The string is the guard, not the exit code. Anything grepping for a
+green gate must match `PASS: all `, never a bare `PASS`.
 
 ## CI / nightly wiring
 
@@ -86,3 +126,18 @@ Two floors files exist:
 
 When re-seeding either file, state the source run/host in each entry's
 `source` field.
+
+The concurrent workloads (`engine.reader_contention.*`, `engine.live_tail.*`)
+are seeded in `floors.json` only, deliberately: their numbers depend on core
+count and scheduling, and nobody has characterised what a GitHub
+`ubuntu-latest` runner does with 4-8 contending readers. Adding a guessed
+number to `floors-ci.json` would buy a flaky gate, not coverage.
+
+New floors are seeded **loose — roughly half the measured value** (or, for a
+`max` ceiling, a multiple of it), with the measurement, the host's
+`/proc/loadavg` at the time, and the "tighten later" intent written into
+`source`. A brand-new workload has no variance history, and a tight floor on
+one flakes CI before it ever catches a regression. Ambient load only depresses
+a throughput reading, so measuring under load makes a `min` floor looser — the
+safe direction — but the `source` field must still say what the load was, so
+nobody later mistakes a load-suppressed number for this path's ceiling.

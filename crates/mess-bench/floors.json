@@ -97,6 +97,48 @@
       "floor": 1500000.0,
       "source": "bn-1dlb first measurement on trunk 70d21095: 2.98M op/s. Floor at ~half measured; see the note on writer_loaded about variance.",
       "tolerance": 0.1
+    },
+    {
+      "metric": "engine.live_tail.catchup_solo.ev_per_s",
+      "direction": "min",
+      "floor": 3800000.0,
+      "source": "bn-1r9c first seeding, 2026-08-02, trunk ef02c03c, 3 runs: 7.603M / 7.602M / 7.635M ev/s. Floor at ~half the cluster low, the bn-1dlb loose-seed convention: this metric has three data points and the shape of its run-to-run variance is uncharacterised, so a tight floor on a brand-new workload would flake CI before it caught anything. Host state at seeding: /proc/loadavg 1.39-1.59 (1min), two sibling workers building and testing this repo concurrently. Load only ever depresses a throughput measurement, so it makes a min-floor LOOSER, which is the safe direction — but the numbers above are not quiet-host numbers and must not be treated as the ceiling of what this path can do. Tighten once several quiet runs exist.",
+      "tolerance": 0.1
+    },
+    {
+      "metric": "engine.live_tail.catchup_loaded.ev_per_s",
+      "direction": "min",
+      "floor": 7400000.0,
+      "source": "bn-1r9c first seeding, 2026-08-02, trunk ef02c03c, 3 runs: 14.82M / 15.90M / 15.90M ev/s aggregate over 4 concurrent readers. Floor at ~half the cluster low; same loose-seed rationale and same loadavg 1.39-1.59 host state as catchup_solo above.",
+      "tolerance": 0.1
+    },
+    {
+      "metric": "engine.live_tail.writer_tailed.ev_per_s",
+      "direction": "min",
+      "floor": 4900000.0,
+      "source": "bn-1r9c first seeding, 2026-08-02, trunk ef02c03c, 3 runs: 12.60M / 9.86M / 12.17M ev/s. Floor at ~half the cluster low (9.86M). Visibly the noisiest of the five seeded here — it is a writer competing with 4 global scans, so it inherits both the committer's and the read path's scheduling luck; the loose seed matters more for this one than for the others. Same loadavg 1.39-1.59 host state as catchup_solo above.",
+      "tolerance": 0.1
+    },
+    {
+      "metric": "engine.live_tail.tail_reader.ev_per_s",
+      "direction": "min",
+      "floor": 5700000.0,
+      "source": "bn-1r9c first seeding, 2026-08-02, trunk ef02c03c, 3 runs: 13.16M / 11.58M / 11.97M ev/s aggregate over 4 tailers. Floor at ~half the cluster low; same loose-seed rationale and same loadavg 1.39-1.59 host state as catchup_solo above.",
+      "tolerance": 0.1
+    },
+    {
+      "metric": "engine.live_tail.append_to_delivery_us",
+      "direction": "max",
+      "floor": 66.0,
+      "source": "bn-1r9c first seeding, 2026-08-02, trunk ef02c03c, 3 runs: 16.71 / 22.03 / 16.56 us mean over 1200 parked deliveries each. This is the suite's only latency CEILING, so 'loose' inverts: the ceiling is 3x the cluster HIGH (22.03), not 2x, because a mean latency's upper tail under ambient load is far fatter than a throughput mean's lower tail — the same host noise that merely shaves a few percent off ev/s can double a wake-to-delivery mean. Same loadavg 1.39-1.59 host state as catchup_solo above. Tighten toward ~2x once several runs exist.",
+      "tolerance": 0.1
+    },
+    {
+      "metric": "engine.live_tail.stream_paging.ev_per_s",
+      "direction": "min",
+      "floor": 6800000.0,
+      "source": "bn-1r9c first seeding, 2026-08-02, trunk ef02c03c, 3 runs: 14.82M / 13.63M / 14.54M ev/s aggregate over 4 readers paging every hot stream. Floor at ~half the cluster low; same loose-seed rationale and same loadavg 1.39-1.59 host state as catchup_solo above.",
+      "tolerance": 0.1
     }
   ]
 }

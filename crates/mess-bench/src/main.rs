@@ -10,6 +10,10 @@
 //!
 //! # compare an existing ledger against a floors file without re-running
 //! cargo run -p mess-bench -- compare --ledger ledger.json --floors floors.json
+//!
+//! # one workload only, for developing/re-measuring it on a shared box
+//! cargo run -p mess-bench --release -- run --only live_tail --no-compare
+//! cargo run -p mess-bench -- list-workloads
 //! ```
 //!
 //! CI/nightly wiring (documented here + `crates/mess-bench/README.md`):
@@ -25,8 +29,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use mess_bench::{
-    Ledger, MachineProfile, RunSize, assert_real_fs, compare,
-    default_scratch_root, load_floors, load_ledger, run_all, today,
+    Ledger, MachineProfile, RunSize, assert_real_fs, compare_report,
+    default_scratch_root, load_floors, load_ledger, run_selected, today,
     write_ledger,
 };
 
@@ -62,6 +66,12 @@ enum Command {
         /// Skip the floors comparison even in full mode.
         #[arg(long)]
         no_compare:  bool,
+        /// Run only these workloads (repeat the flag or comma-separate).
+        /// Names: see `list-workloads`. A narrowed run is a MEASUREMENT, not
+        /// a gate — floors for workloads that did not run are skipped, so the
+        /// nightly gate must never pass this.
+        #[arg(long, value_delimiter = ',')]
+        only:        Vec<String>,
     },
     /// Compare an existing ledger JSON against a floors file.
     Compare {
@@ -70,6 +80,8 @@ enum Command {
         #[arg(long, default_value = "floors.json")]
         floors: PathBuf,
     },
+    /// Print the workload selector names accepted by `run --only`.
+    ListWorkloads,
 }
 
 fn main() -> ExitCode {
@@ -82,7 +94,24 @@ fn main() -> ExitCode {
             settle_secs,
             floors,
             no_compare,
+            only,
         } => {
+            let unknown: Vec<&String> = only
+                .iter()
+                .filter(|n| !mess_bench::WORKLOAD_NAMES.contains(&n.as_str()))
+                .collect();
+            if !unknown.is_empty() {
+                eprintln!(
+                    "unknown --only workload(s): {}\nknown: {}",
+                    unknown
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    mess_bench::WORKLOAD_NAMES.join(", ")
+                );
+                return ExitCode::from(2);
+            }
             let size = match mode.as_str() {
                 "full" => RunSize::Full,
                 "smoke" => RunSize::Smoke,
@@ -106,7 +135,12 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
 
-            let metrics = run_all(size, &scratch, settle_secs);
+            let metrics = run_selected(
+                size,
+                &scratch,
+                settle_secs,
+                (!only.is_empty()).then_some(only.as_slice()),
+            );
             let ledger = Ledger {
                 date: today(),
                 mode: mode.clone(),
@@ -129,6 +163,16 @@ fn main() -> ExitCode {
                 );
                 return ExitCode::SUCCESS;
             }
+            if !only.is_empty() {
+                eprintln!(
+                    "NOTE: --only narrowed this run to {}; floors for every \
+                     other workload are skipped because their metrics are \
+                     absent from the ledger. Expect the `PASS (narrowed):` \
+                     line below, never `PASS: all N ...` — this is a \
+                     measurement, not a gate.",
+                    only.join(", ")
+                );
+            }
 
             run_compare(&ledger, &floors)
         }
@@ -145,6 +189,12 @@ fn main() -> ExitCode {
             };
             run_compare(&ledger, &floors)
         }
+        Command::ListWorkloads => {
+            for name in mess_bench::WORKLOAD_NAMES {
+                println!("{name}");
+            }
+            ExitCode::SUCCESS
+        }
     }
 }
 
@@ -159,22 +209,37 @@ fn run_compare(ledger: &Ledger, floors_path: &Path) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let regressions = compare(ledger, &floors);
-    if regressions.is_empty() {
-        eprintln!(
-            "PASS: all {} floor-gated metrics within tolerance of {}",
-            floors.floors.len(),
-            floors_path.display()
-        );
-        ExitCode::SUCCESS
-    } else {
+    let report = compare_report(ledger, &floors);
+    if !report.regressions.is_empty() {
         eprintln!(
             "FAIL: {} metric(s) below floor tolerance:",
-            regressions.len()
+            report.regressions.len()
         );
-        for r in &regressions {
+        for r in &report.regressions {
             eprintln!("  {r}");
         }
-        ExitCode::FAILURE
+        return ExitCode::FAILURE;
     }
+    // Two different claims, so two different strings. "No regressions" is not
+    // "the gate passed": `compare` skips a floor whose metric is absent from
+    // the ledger, and since `run --only` (bn-1r9c) a ledger can legitimately
+    // be missing most of them. The PASS line below is what CI and the lead's
+    // gate checks grep for, so a narrowed run must not be able to emit it —
+    // a `NOTE:` printed above a false assertion does not cure the assertion.
+    if report.is_full_gate() {
+        eprintln!(
+            "PASS: all {} floor-gated metrics within tolerance of {}",
+            report.total,
+            floors_path.display()
+        );
+    } else {
+        eprintln!(
+            "PASS (narrowed): {} of {} floor-gated metrics checked; {} absent \
+             from this ledger — NOT a full gate.",
+            report.matched,
+            report.total,
+            report.absent()
+        );
+    }
+    ExitCode::SUCCESS
 }

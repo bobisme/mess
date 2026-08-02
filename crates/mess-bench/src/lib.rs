@@ -359,20 +359,62 @@ impl std::fmt::Display for Regression {
     }
 }
 
+/// The outcome of a [`compare_report`]: which floors were actually checked,
+/// and which of those failed.
+///
+/// `matched < total` is the case that makes this struct necessary. [`compare`]
+/// silently skips a floor whose metric is absent from the ledger, which is
+/// correct behaviour — but it means "no regressions" and "the full gate
+/// passed" are different statements, and a caller that reports the second when
+/// it only established the first is lying about coverage. That skip path used
+/// to be unreachable in the gate flow (a full-mode ledger always carried every
+/// gated metric, and smoke mode never reached the comparison at all);
+/// `run --only` (bn-1r9c) made it reachable, so the counts have to be
+/// reportable.
+#[derive(Debug, Clone)]
+pub struct Comparison {
+    /// Floors in the file whose metric was present in the ledger and was
+    /// therefore actually checked.
+    pub matched:     usize,
+    /// Floors in the file, checked or not.
+    pub total:       usize,
+    /// Checked floors that fell outside their tolerance band.
+    pub regressions: Vec<Regression>,
+}
+
+impl Comparison {
+    /// Floors that were skipped because the ledger has no such metric.
+    #[must_use]
+    pub fn absent(&self) -> usize { self.total - self.matched }
+
+    /// Whether every floor in the file was actually checked. Only a run for
+    /// which this is true may claim the full gate passed.
+    #[must_use]
+    pub fn is_full_gate(&self) -> bool { self.matched == self.total }
+}
+
 /// Compare `ledger` against `floors`. Returns every metric that has a floor
 /// AND is present in the ledger AND falls outside its tolerance band.
 /// Metrics with no floor entry are ignored (recorded, not gated) — e.g. the
 /// fold-chain/`load_verified` rows are tracked but not (yet) named gates in
 /// `docs/perf/envelope.md`.
 pub fn compare(ledger: &Ledger, floors: &FloorsFile) -> Vec<Regression> {
-    let mut out = Vec::new();
+    compare_report(ledger, floors).regressions
+}
+
+/// [`compare`], plus how many floors were actually checked — see
+/// [`Comparison`].
+pub fn compare_report(ledger: &Ledger, floors: &FloorsFile) -> Comparison {
+    let mut regressions = Vec::new();
+    let mut matched = 0usize;
     for floor in &floors.floors {
         let Some(m) = ledger.metrics.iter().find(|m| m.metric == floor.metric)
         else {
             continue;
         };
+        matched += 1;
         if !floor.passes(m.value) {
-            out.push(Regression {
+            regressions.push(Regression {
                 metric:    floor.metric.clone(),
                 value:     m.value,
                 bound:     floor.bound(),
@@ -381,7 +423,7 @@ pub fn compare(ledger: &Ledger, floors: &FloorsFile) -> Vec<Regression> {
             });
         }
     }
-    out
+    Comparison { matched, total: floors.floors.len(), regressions }
 }
 
 pub fn load_floors(path: &Path) -> std::io::Result<FloorsFile> {
@@ -428,43 +470,125 @@ pub fn today() -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// Every workload's selector name, in run order — the vocabulary
+/// [`run_selected`]'s `only` filter (and the CLI's `--only`) accepts.
+pub const WORKLOAD_NAMES: &[&str] = &[
+    "buffered_append",
+    "durable_append",
+    "sealed_pointer",
+    "sealed_payload",
+    "engine",
+    "fold_chain",
+    "load_verified",
+    "recovery",
+    "reader_contention",
+    "live_tail",
+];
+
 /// Run every workload at `size`, settle-paced in between when `size ==
 /// Full`. `scratch` MUST already have passed [`assert_real_fs`] — this
 /// function does not re-check (callers run the check once over the shared
 /// root; individual workload functions do not each open their own root).
 pub fn run_all(size: RunSize, scratch: &Path, settle_secs: u64) -> Vec<Metric> {
+    run_selected(size, scratch, settle_secs, None)
+}
+
+/// [`run_all`], restricted to the workloads named in `only` (see
+/// [`WORKLOAD_NAMES`]); `None` runs all of them.
+///
+/// This exists because the suite's own workloads are the main tool for
+/// *developing* a workload, and on a shared box re-running all ten to look at
+/// one of them is both slow and antisocial — the settle-pacing that keeps one
+/// workload's write burst from poisoning the next one's fsync latency is pure
+/// waste when only one is selected. Selection changes nothing about how a
+/// selected workload runs: same function, same size, same order, and settles
+/// still separate whichever workloads did get selected.
+///
+/// **Gating caveat**: [`compare`] ignores floors whose metric is absent from
+/// the ledger, so `run --mode full --only X` enforces X's floors and nothing
+/// else. A narrowed run is a measurement, not a gate — and it must not be able
+/// to *claim* to be one, which is why the CLI reports a narrowed comparison as
+/// `PASS (narrowed): {matched} of {total} floor-gated metrics checked; ...`
+/// and reserves the historical `PASS: all {N} floor-gated metrics within
+/// tolerance of {path}` line for a ledger that actually covered every floor.
+/// See [`Comparison`].
+pub fn run_selected(
+    size: RunSize,
+    scratch: &Path,
+    settle_secs: u64,
+    only: Option<&[String]>,
+) -> Vec<Metric> {
+    let selected =
+        |name: &str| only.is_none_or(|names| names.iter().any(|n| n == name));
     let mut metrics = Vec::new();
+    let mut ran_any = false;
 
     macro_rules! step {
-        ($name:literal, $f:expr) => {{
-            eprintln!("=== {} ({:?}) ===", $name, size);
-            metrics.extend($f);
+        ($name:literal, $label:literal, $f:expr) => {{
+            if selected($name) {
+                // Settle *before* each step but the first one that actually
+                // runs, which is the same pause pattern as the original
+                // between-every-pair placement when nothing is filtered out,
+                // and avoids a pointless trailing sleep when it is.
+                if ran_any {
+                    settle(size, settle_secs);
+                }
+                ran_any = true;
+                eprintln!("=== {} ({:?}) ===", $label, size);
+                metrics.extend($f);
+            }
         }};
     }
 
-    step!("buffered append", workloads::buffered_append::run(size, scratch));
-    settle(size, settle_secs);
-    step!("durable append", workloads::durable_append::run(size, scratch));
-    settle(size, settle_secs);
-    step!("sealed pointer replay", workloads::sealed_pointer::run(size));
-    settle(size, settle_secs);
-    step!("sealed payload codec", workloads::sealed_payload::run(size));
-    settle(size, settle_secs);
     step!(
+        "buffered_append",
+        "buffered append",
+        workloads::buffered_append::run(size, scratch)
+    );
+    step!(
+        "durable_append",
+        "durable append",
+        workloads::durable_append::run(size, scratch)
+    );
+    step!(
+        "sealed_pointer",
+        "sealed pointer replay",
+        workloads::sealed_pointer::run(size)
+    );
+    step!(
+        "sealed_payload",
+        "sealed payload codec",
+        workloads::sealed_payload::run(size)
+    );
+    step!(
+        "engine",
         "engine buffered + sealed replay",
         workloads::engine::run(size, scratch)
     );
-    settle(size, settle_secs);
-    step!("fold-chain overhead", workloads::fold_chain::run(size));
-    settle(size, settle_secs);
-    step!("load_verified throughput", workloads::load_verified::run(size));
-    settle(size, settle_secs);
-    step!("recovery time", workloads::recovery::run(size, scratch));
-    settle(size, settle_secs);
     step!(
+        "fold_chain",
+        "fold-chain overhead",
+        workloads::fold_chain::run(size)
+    );
+    step!(
+        "load_verified",
+        "load_verified throughput",
+        workloads::load_verified::run(size)
+    );
+    step!("recovery", "recovery time", workloads::recovery::run(size, scratch));
+    step!(
+        "reader_contention",
         "reader contention",
         workloads::reader_contention::run(size, scratch)
     );
+    step!(
+        "live_tail",
+        "live tail / global read",
+        workloads::live_tail::run(size, scratch)
+    );
 
+    // The last `step!` writes `ran_any` and nothing reads it again; consume it
+    // here so adding a workload after this line stays a one-line change.
+    let _ = ran_any;
     metrics
 }
