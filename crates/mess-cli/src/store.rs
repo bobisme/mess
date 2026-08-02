@@ -76,6 +76,8 @@ pub struct SegmentFile {
     pub pcol_path:   PathBuf,
     /// The membership-filter sidecar path (may or may not exist).
     pub filter_path: PathBuf,
+    /// The registry-delta sidecar path (bn-26pp; may or may not exist).
+    pub reg_path:    PathBuf,
     /// The Reed-Solomon parity sidecar path (bn-2za; may or may not exist).
     pub par_path:    PathBuf,
     /// The consolidated SealPack path (bn-3of; may or may not exist).
@@ -84,6 +86,11 @@ pub struct SegmentFile {
     pub has_pidx:    bool,
     /// Whether the `.pcol` sidecar exists on disk.
     pub has_pcol:    bool,
+    /// Whether the `.reg` registry-delta sidecar exists on disk (bn-26pp). A
+    /// pack-sealed segment normally has none — its delta rides the pack's
+    /// `REGISTRY_DELTA` section instead (bn-3h64) — and a segment that
+    /// registered no name has none in either shape.
+    pub has_reg:     bool,
     /// Whether the `.par` parity sidecar exists on disk (bn-2za).
     pub has_par:     bool,
     /// Whether the consolidated `.seal` pack exists on disk (bn-3of).
@@ -213,6 +220,15 @@ pub fn par_path(dir: &Path, segment_id: u64) -> PathBuf {
     pidx_path(dir, segment_id).with_extension("par")
 }
 
+/// The registry-delta sidecar path for a segment id
+/// (`sealed/seg-<id:020>.reg`, bn-26pp) — the same naming
+/// [`mess_index::sealed::regdelta::reg_path`] owns, expressed in the CLI's
+/// layout module so `backup`/`verify` resolve it exactly as the engine does.
+#[must_use]
+pub fn reg_path(dir: &Path, segment_id: u64) -> PathBuf {
+    pidx_path(dir, segment_id).with_extension("reg")
+}
+
 /// The consolidated SealPack path for a segment id
 /// (`sealed/seg-<id:020>.seal`, bn-3of) — the same naming
 /// [`mess_index::sealed::seal_pack_path`] owns, expressed in the CLI's layout
@@ -275,6 +291,7 @@ pub fn discover_segments(dir: &Path) -> Vec<SegmentFile> {
             let pidx = pidx_path(dir, segment_id);
             let pcol = pidx.with_extension("pcol");
             let filter = pidx.with_extension("filter");
+            let reg = pidx.with_extension("reg");
             let par = pidx.with_extension("par");
             let seal = pidx.with_extension("seal");
             SegmentFile {
@@ -282,11 +299,13 @@ pub fn discover_segments(dir: &Path) -> Vec<SegmentFile> {
                 log_path: log_path(dir, segment_id),
                 has_pidx: pidx.exists(),
                 has_pcol: pcol.exists(),
+                has_reg: reg.exists(),
                 has_par: par.exists(),
                 has_seal: seal.exists(),
                 pidx_path: pidx,
                 pcol_path: pcol,
                 filter_path: filter,
+                reg_path: reg,
                 par_path: par,
                 seal_path: seal,
             }

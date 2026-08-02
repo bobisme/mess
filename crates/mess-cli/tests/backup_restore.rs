@@ -8,6 +8,8 @@
 //! 4. A torn backup (missing `BACKUP_MANIFEST`) makes restore refuse.
 //! 5. A retention lease blocks a segment's deletion during a backup and
 //!    releases it after.
+//! 6. `bn-w5my`: the `.reg` registry delta rides the cut, so the restored store
+//!    opens on the accelerated `$registry` path instead of point-reading.
 
 mod common;
 
@@ -378,6 +380,150 @@ fn retention_lease_blocks_deletion_during_backup_and_releases_after() {
         "released lease unblocks"
     );
     assert!(!has_kind(&after, "lease-hold"));
+}
+
+/// Shape 6 (bn-w5my): the `.reg` registry delta (bn-26pp) rides the cut with
+/// the rest of the `.pidx` family, and the restored store is therefore *fast*,
+/// not merely correct.
+///
+/// The proof is the engine's own counter (bn-11ba): opening the restored store
+/// reports `registry_delta_admitted == 1` and no fallback, i.e. recovery folded
+/// `$registry` out of the copied delta. Deleting the delta from a second
+/// restore of the SAME backup flips exactly that pair — `admitted == 0`,
+/// `fallback == 1` — with an identical event count, which is the discardable
+/// law stated as a measurement: leaving the file out costs speed and nothing
+/// else.
+#[test]
+fn registry_delta_rides_the_cut_and_the_restore_admits_it() {
+    let src = mess_testkit::sweeping_temp_dir("cli-backup-reg-src");
+    let dest = mess_testkit::sweeping_temp_dir("cli-backup-reg-dest");
+    let fast = mess_testkit::sweeping_temp_dir("cli-backup-reg-fast");
+    let slow = mess_testkit::sweeping_temp_dir("cli-backup-reg-slow");
+
+    // A store whose log actually ROLLS: the engine only takes the
+    // sidecar-trusted path (the one that reads a delta) for a sealed,
+    // non-head segment, so a single-segment corpus could never exercise it.
+    // Only seg-1 carries a `.reg` — registrations happen once per name, ever.
+    build_rolling_sidecar_store(src.path());
+    let reg = store::reg_path(src.path(), 1);
+    assert!(reg.exists(), "the rolled+sealed seg-1 wrote a .reg");
+
+    let report =
+        backup::run(src.path(), dest.path(), &BackupOptions::default());
+    assert_eq!(report.exit_code(), 0, "backup clean: {:?}", report.findings);
+
+    // It is in the cut, under the same `sidecar` role as `.pcol`/`.filter`.
+    let reg_rows: Vec<&Value> = report
+        .collection
+        .iter()
+        .filter(|row| row["path"].as_str().is_some_and(|p| p.ends_with(".reg")))
+        .collect();
+    assert_eq!(
+        reg_rows.len(),
+        1,
+        "one .reg in the cut: {:?}",
+        report.collection
+    );
+    assert_eq!(reg_rows[0]["role"], "sidecar");
+    assert_eq!(reg_rows[0]["action"], "copied");
+    // ...and named in the manifest the restore verifies against.
+    let manifest: backup::BackupManifest = serde_json::from_slice(
+        &std::fs::read(dest.path().join(BACKUP_MANIFEST)).expect("manifest"),
+    )
+    .expect("manifest parses");
+    assert!(
+        manifest.files.iter().any(|f| f.path.ends_with(".reg")
+            && f.role == "sidecar"
+            && f.len > 0),
+        "manifest lists the .reg: {:?}",
+        manifest.files
+    );
+
+    let rr = restore::run(dest.path(), fast.path(), &RestoreOptions::default());
+    assert_eq!(rr.exit_code(), 0, "restore clean: {:?}", rr.findings);
+    assert!(store::reg_path(fast.path(), 1).exists(), ".reg restored");
+
+    // The restored store opens on the accelerated path.
+    let (fast_events, fast_admitted, fast_fallback) =
+        open_and_count(fast.path());
+    assert_eq!(
+        fast_admitted, 1,
+        "restored store folded $registry from the delta"
+    );
+    assert_eq!(fast_fallback, 0, "no segment fell back to point reads");
+
+    // The same backup, restored again with the delta removed: identical events,
+    // the slow path. The delta is acceleration, never authority (D1).
+    let rr2 =
+        restore::run(dest.path(), slow.path(), &RestoreOptions::default());
+    assert_eq!(rr2.exit_code(), 0, "second restore clean: {:?}", rr2.findings);
+    std::fs::remove_file(store::reg_path(slow.path(), 1))
+        .expect("drop the .reg");
+    let (slow_events, slow_admitted, slow_fallback) =
+        open_and_count(slow.path());
+    assert_eq!(slow_admitted, 0);
+    assert_eq!(slow_fallback, 1, "that segment point-read its registrations");
+    assert_eq!(
+        fast_events, slow_events,
+        "same store either way — the delta only changes how fast open is"
+    );
+}
+
+/// Open a store and report `(total_events, deltas admitted, deltas fallen
+/// back)` from the engine's own fallback counters (bn-11ba).
+fn open_and_count(dir: &Path) -> (usize, u64, u64) {
+    let engine =
+        LogEngine::open_with(dir, rolling_sidecar_opts()).expect("open store");
+    let o = engine.observability();
+    (
+        engine.total_events(),
+        o.fallbacks.registry_delta_admitted,
+        o.fallbacks.registry_delta_fallback,
+    )
+}
+
+/// Loose-sidecar (`seal_pack: false`) options with a segment small enough that
+/// the corpus below rolls several times.
+fn rolling_sidecar_opts() -> EngineOptions {
+    EngineOptions {
+        segment_size: 4096,
+        seal_pack: false,
+        ..EngineOptions::default()
+    }
+}
+
+/// Append until the log has rolled and the background sealer has installed at
+/// least two sealed segments, so seg-1 is a sealed **non-head** segment — the
+/// only shape whose `.reg` engine open ever reads.
+fn build_rolling_sidecar_store(dir: &Path) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let engine =
+        LogEngine::open_with(dir, rolling_sidecar_opts()).expect("open engine");
+    rt.block_on(async {
+        for i in 0..120u64 {
+            let expected =
+                if i == 0 { Version::NoStream } else { Version::At(i - 1) };
+            engine
+                .append_batch("acct-1", expected, &[rec(&[b'x'; 64])])
+                .await
+                .expect("append");
+        }
+    });
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while engine.sealed_segment_count() < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "sealer never installed 2 segments (got {})",
+            engine.sealed_segment_count()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    drop(engine); // lock released
 }
 
 /// Copy a sealed segment's immutable files (`.log` + sidecars) to a new

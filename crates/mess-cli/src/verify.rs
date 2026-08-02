@@ -22,6 +22,7 @@ use std::path::Path;
 
 use mess_index::sealed::parity::{ParityError, ParitySidecar};
 use mess_index::sealed::payload::{NoDicts, SealedPayloadIndex};
+use mess_index::sealed::regdelta::{RegDeltaError, RegistryDelta};
 use mess_index::sealed::segment::{SealedSegmentIndex, SidecarError};
 use mess_log::fold_chain::{self, Hash as ChainHash};
 use mess_log::footer_ext::{SealPackIdentity, decode_extension};
@@ -31,12 +32,13 @@ use mess_log::scanner::{
     AcceptedBatch, ScanStop, recover_segment_with_image, scan_image,
 };
 use mess_log::sealer::{SegmentCatalogEntry, read_extension};
+use mess_store::registry::REGISTRY_STREAM_ID;
 use serde_json::{Value, json};
 
 use crate::lockprobe;
 use crate::report::{Finding, Report, Severity};
 use crate::scan::{SegmentScan, scan_segment, scan_stop_kind};
-use crate::store;
+use crate::store::{self, SealedArtifact};
 
 /// Lowercase-hex render of a 32-byte chain value, for finding messages/fields.
 fn hex(h: &ChainHash) -> String {
@@ -114,6 +116,16 @@ pub fn run(dir: &Path, opts: &VerifyOptions) -> Report {
         }
         if seg.has_pcol {
             verify_pcol(&mut report, seg.segment_id, &seg.pcol_path, opts.full);
+        }
+        // bn-26pp/bn-w5my: the registry delta, when the segment carries one as
+        // a sibling file. A pack-sealed segment carries its delta as a pack
+        // section instead (bn-3h64) and so has no sibling at all — that
+        // section's bytes are already inside the whole-image trailer hash and
+        // the per-section checksums `verify_seal_pack`'s eager open
+        // recomputes, so it is covered there and its absence here is the
+        // design, not damage.
+        if seg.has_reg {
+            verify_reg(&mut report, seg);
         }
         if opts.full {
             verify_fold_chain(&mut report, seg.segment_id, &seg.log_path);
@@ -768,6 +780,208 @@ fn verify_pcol(report: &mut Report, segment_id: u64, path: &Path, full: bool) {
             .with("segment_id", index.segment_id()),
         );
     }
+}
+
+/// Validate a registry-delta sidecar (`.reg`, bn-26pp): its own
+/// magic/version/flags and content CRC, then the **layout cross-check** the
+/// engine itself applies before admitting one.
+///
+/// # Absence is silence, corruption is a report the store survives
+///
+/// A `.reg` is discardable acceleration in the exact mould of the `.pcol`: it
+/// copies the segment's `$registry` payload bytes so recovery folds them
+/// sequentially instead of chasing one cold `pread` per registration. Absent,
+/// truncated, corrupt, or refused, engine open point-reads the same batches out
+/// of the `.log` and folds an identical registry (D1) — so this pass is only
+/// ever reached for a `.reg` that *exists* ([`store::SegmentFile::has_reg`]),
+/// and a segment with none is not a finding of any severity. A pack-sealed
+/// segment never has one (bn-3h64); nor does a segment that registered no name.
+///
+/// What *is* worth a report is a sibling that exists and is wrong, for the same
+/// reason a damaged `.pcol` is: nothing is at risk, but a permanently refused
+/// accelerator is a silent, unbounded slowdown at every open, and `verify` is
+/// where an operator learns that offline. The severity therefore matches
+/// `pcol-corrupt` exactly — `Error`, non-zero exit — and means the same thing:
+/// delete the file (or re-seal the segment) and the store is whole and fast
+/// again.
+///
+/// # The cross-check is the engine's own, not a re-derivation
+///
+/// [`SealedSegmentIndex::accepts_registry_delta`] is the predicate engine
+/// recovery gates the fast path on, so it is what runs here: the delta's
+/// `segment_id`/`base_pos`/`event_count` must match the sidecar it would ride
+/// on, and its `(first_global_pos, frame_count)` list must be **exactly** the
+/// list that sidecar's pointer directory yields for the stream. The index it is
+/// asked against is the one a reader would actually serve this segment from
+/// ([`store::SegmentFile::sealed_artifact`] — the pack wins over a shadowed
+/// `.pidx`, as in `LogEngine::load_sealed`), and it is validated independently
+/// of the delta: `verify_pidx`/`verify_seal_pack` have already reported it if
+/// it does not open at all, in which case there is no directory to compare
+/// against and the layout step is skipped rather than blamed on the `.reg`.
+fn verify_reg(report: &mut Report, seg: &store::SegmentFile) {
+    let id = seg.segment_id;
+    let path = &seg.reg_path;
+
+    let delta = match RegistryDelta::open(path) {
+        Ok(d) => d,
+        Err(RegDeltaError::Io(e)) => {
+            report.push_finding(
+                Finding::new(
+                    Severity::Error,
+                    "registry-delta",
+                    "reg-io",
+                    format!(
+                        "registry delta {} unreadable: {e}",
+                        path.display()
+                    ),
+                )
+                .with("segment_id", id)
+                .with("fallback", "registry-point-read")
+                .with("path", path.display().to_string()),
+            );
+            return;
+        }
+        Err(e) => {
+            report.push_finding(
+                Finding::new(
+                    Severity::Error,
+                    "registry-delta",
+                    "reg-corrupt",
+                    format!(
+                        "registry delta {} failed CRC/parse: {e}. Open drops \
+                         it and point-reads this segment's $registry batches \
+                         from the log, the only authority (D1); delete it or \
+                         re-seal the segment to restore the fast path",
+                        path.display()
+                    ),
+                )
+                .with("segment_id", id)
+                .with("fallback", "registry-point-read")
+                .with("path", path.display().to_string()),
+            );
+            return;
+        }
+    };
+
+    // The pointer directory a reader would serve this segment from. A lazy pack
+    // open is enough: only the (already checksum-verified) stream directory and
+    // pointer blocks are consulted, and `verify_seal_pack` above has separately
+    // recomputed the pack's whole-image hash.
+    let index = match seg.sealed_artifact() {
+        SealedArtifact::Pack => SealedSegmentIndex::open_pack(&seg.seal_path),
+        SealedArtifact::Sidecar => SealedSegmentIndex::open(&seg.pidx_path),
+        SealedArtifact::None => {
+            // No sealed index at all, so no reader ever consults this delta and
+            // there is no directory to cross-check it against. Its own bytes
+            // are sound, which is all that can be said here.
+            report.push_finding(
+                Finding::new(
+                    Severity::Ok,
+                    "registry-delta",
+                    "reg-verified",
+                    format!(
+                        "registry delta {} CRC verified ({} batch(es), {} \
+                         record(s)); no sealed index on this segment, so the \
+                         layout cross-check was not run",
+                        path.display(),
+                        delta.batch_count(),
+                        delta.record_count()
+                    ),
+                )
+                .with("segment_id", id)
+                .with("cross_checked", false),
+            );
+            return;
+        }
+    };
+    let Ok(index) = index else {
+        // The serving artifact does not open — already reported as
+        // `pidx-corrupt` / `seal-pack-corrupt`. Not the delta's fault, and not
+        // reported twice.
+        report.push_finding(
+            Finding::new(
+                Severity::Ok,
+                "registry-delta",
+                "reg-verified",
+                format!(
+                    "registry delta {} CRC verified ({} batch(es), {} \
+                     record(s)); its segment's sealed index does not open, so \
+                     the layout cross-check was not run",
+                    path.display(),
+                    delta.batch_count(),
+                    delta.record_count()
+                ),
+            )
+            .with("segment_id", id)
+            .with("cross_checked", false),
+        );
+        return;
+    };
+
+    // The two reasons engine open refuses a parseable delta: it is not the
+    // `$registry`'s, or the pointer directory disagrees with its batch layout.
+    let refusal = if delta.stream_id() != REGISTRY_STREAM_ID {
+        Some(format!(
+            "it carries stream {}, not the $registry stream \
+             {REGISTRY_STREAM_ID}",
+            delta.stream_id()
+        ))
+    } else if !index.accepts_registry_delta(&delta) {
+        Some(format!(
+            "the segment's pointer directory does not vouch for it (delta \
+             segment {} base_pos {} event_count {} with {} batch(es) vs index \
+             segment {} base_pos {} event_count {})",
+            delta.segment_id(),
+            delta.base_pos(),
+            delta.event_count(),
+            delta.batch_count(),
+            index.segment_id(),
+            index.base_pos(),
+            index.event_count(),
+        ))
+    } else {
+        None
+    };
+
+    if let Some(reason) = refusal {
+        report.push_finding(
+            Finding::new(
+                Severity::Error,
+                "registry-delta",
+                "reg-layout-mismatch",
+                format!(
+                    "registry delta {} parses but open would refuse it: \
+                     {reason}. This segment's $registry batches are \
+                     point-read from the log, the only authority (D1); delete \
+                     it or re-seal the segment to restore the fast path",
+                    path.display()
+                ),
+            )
+            .with("segment_id", id)
+            .with("fallback", "registry-point-read")
+            .with("delta_segment_id", delta.segment_id())
+            .with("delta_batches", delta.batch_count() as u64)
+            .with("path", path.display().to_string()),
+        );
+        return;
+    }
+
+    report.push_finding(
+        Finding::new(
+            Severity::Ok,
+            "registry-delta",
+            "reg-verified",
+            format!(
+                "registry delta {} verified: CRC clean and {} batch(es) / {} \
+                 record(s) match the segment's pointer directory",
+                path.display(),
+                delta.batch_count(),
+                delta.record_count()
+            ),
+        )
+        .with("segment_id", id)
+        .with("cross_checked", true),
+    );
 }
 
 /// Under `--full`, recompute the fold chain (spec 05 §3, §6) across every

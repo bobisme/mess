@@ -305,10 +305,9 @@ fn segment_row(seg: &SegmentFile) -> SegmentRow {
     // carries the same content as sections inside the `.seal` rather than as
     // separate files, which is why they read "absent" there and that is
     // correct, not a fault.
-    let reg_path = seg.pidx_path.with_extension("reg");
     let pcol_state = presence(seg.has_pcol);
     let filter_state = presence(seg.filter_path.exists());
-    let reg_state = presence(reg_path.exists());
+    let reg_state = presence(seg.has_reg);
     let par_state = presence(seg.has_par);
 
     // Pack identity + directory codec: what the *serving* artifact is, read

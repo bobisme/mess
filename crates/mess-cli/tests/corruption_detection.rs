@@ -162,3 +162,28 @@ fn detects_pcol_corruption() {
         report.findings
     );
 }
+
+/// Class 6 (bn-w5my): a flipped byte in the `.reg` registry delta — its
+/// end-to-end `crc32c` catches it. Reported at the same severity as `.pcol`
+/// damage: the store is never at risk (open point-reads the same `$registry`
+/// batches out of the log) but a permanently refused accelerator is exactly
+/// what `verify` exists to name. `tests/registry_delta_verify.rs` pins the
+/// surrounding discardable semantics (absence is silence, the layout
+/// cross-check, the pack shape).
+#[test]
+fn detects_reg_corruption() {
+    let d = tmp();
+    common::build_corpus(d.path(), 4);
+
+    let path = mess_cli::store::reg_path(d.path(), common::SEG_ID);
+    let len = std::fs::metadata(&path).unwrap().len();
+    common::flip_byte(&path, len / 2);
+
+    let report = verify_full(d.path());
+    assert_ne!(report.exit_code(), 0, "flipped .reg must exit non-zero");
+    assert!(
+        has_error(&report, "reg-corrupt"),
+        "expected reg-corrupt, got: {:#?}",
+        report.findings
+    );
+}

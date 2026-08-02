@@ -53,8 +53,8 @@ pub struct BackupFileEntry {
     /// `sealed` | `active` | `sidecar` (bn-fj34 retired the `meta` role).
     /// Every derived per-segment artifact travels under `sidecar`, whichever
     /// shape it is: a consolidated `.seal` pack or a legacy `.pidx`/`.pcol`/
-    /// `.filter` (bn-1w4h keeps the role token stable so an existing manifest
-    /// consumer needs no change).
+    /// `.filter`/`.reg` (bn-1w4h keeps the role token stable so an existing
+    /// manifest consumer needs no change).
     pub role:       String,
     /// Bytes copied from the source (for the active segment, the cut
     /// `safe_offset`; for a whole file, equal to `len`).
@@ -88,8 +88,8 @@ pub struct CutFile {
     /// `sealed` | `active` | `sidecar` (bn-fj34 retired the `meta` role).
     /// Every derived per-segment artifact travels under `sidecar`, whichever
     /// shape it is: a consolidated `.seal` pack or a legacy `.pidx`/`.pcol`/
-    /// `.filter` (bn-1w4h keeps the role token stable so an existing manifest
-    /// consumer needs no change).
+    /// `.filter`/`.reg` (bn-1w4h keeps the role token stable so an existing
+    /// manifest consumer needs no change).
     pub role:           &'static str,
     /// Content-stable (immutable) files can be skipped on an incremental run;
     /// the active prefix cannot.
@@ -181,13 +181,14 @@ pub fn compute_cut(dir: &Path) -> Cut {
 
         // The segment's sealed index (content-stable) travels with it, in
         // whichever shape it exists on disk — the consolidated `.seal` pack
-        // (bn-3of) or the legacy `.pidx`+`.pcol`+`.filter` family. See the
-        // policy note below on why the pack rides the cut.
+        // (bn-3of) or the legacy `.pidx`+`.pcol`+`.filter`+`.reg` family. See
+        // the policy note below on why the pack rides the cut.
         for (path, present) in [
             (&seg.seal_path, seg.has_seal),
             (&seg.pidx_path, seg.has_pidx),
             (&seg.pcol_path, seg.has_pcol),
             (&seg.filter_path, seg.filter_path.exists()),
+            (&seg.reg_path, seg.has_reg),
         ] {
             if present && let Ok(meta) = std::fs::metadata(path) {
                 cut.files.push(CutFile {
@@ -239,13 +240,26 @@ pub fn compute_cut(dir: &Path) -> Cut {
     //   Copying one would import an anomaly the destination never had and
     //   re-queue a seal for a segment the restore just wrote clean. An operator
     //   investigating a refutation reads the source store, not a copy of it.
-    // - `.par` (bn-2za) and `.reg` (bn-26pp). Neither is in the cut today; the
-    //   `.reg` policy is bn-w5my's to settle and is left untouched here.
-    //   Restoring without them costs the restored store parity-repair
-    //   acceleration and a registry-delta fast path, never a committed byte —
-    //   both are recomputable from the `.log` bytes the cut carries — and
-    //   neither is named by a footer, so neither can produce the identity gap
-    //   the `.seal` exclusion did.
+    // - `.par` (bn-2za). Restoring without it costs the restored store
+    //   parity-repair acceleration, never a committed byte — the parity is
+    //   recomputable from the `.log` bytes the cut carries — and no footer
+    //   names it, so it cannot produce the identity gap the `.seal` exclusion
+    //   did.
+    //
+    // bn-w5my, deliberate INCLUSION: the `.reg` registry delta (bn-26pp) rides
+    // the cut with the rest of the `.pidx` family, under the same discardable
+    // classification as `.pcol`/`.filter`. It is derived acceleration in the
+    // strictest sense — absent, truncated, or refused by its layout
+    // cross-check, engine open simply point-reads the same `$registry` batches
+    // out of the `.log` bytes the cut already carries, folding an identical
+    // registry — so leaving it out could never cost a committed byte. What it
+    // costs is the acceleration itself: at 250k streams that fallback is
+    // `O(#names)` cold random `pread`s and was 89.9% of a 10.5 s cold open
+    // (bn-2u01), so a restored store without its deltas is correct and
+    // dramatically slower to open. Copying it is exactly the restore-speed
+    // optimisation `.pcol`/`.filter` already are. Pack-sealed segments have no
+    // sibling `.reg` at all (bn-3h64 — the delta is a section inside the
+    // `.seal` the cut copies whole), so they need nothing extra here.
 
     // bn-3l8n, deliberate exclusion: the app snapshot sidecar
     // (`store::snapshot_pack_dir`) is NOT in the cut. It is discardable
