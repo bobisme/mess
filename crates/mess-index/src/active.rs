@@ -196,6 +196,34 @@ pub struct IndexSnapshot {
 
 struct Shard {
     /// `stream_id -> entries in ascending (version == global-position) order`.
+    ///
+    /// # Why this keeps std's SipHash (bn-3odg: measured, declined)
+    ///
+    /// This map is the identical *shape* to the sealed directory bn-dcr
+    /// converted to `foldhash` ([`crate::sealed::segment`]'s `DirMap`):
+    /// interned `u64` keys an attacker cannot choose, probed by key on every
+    /// read, never iterated order-sensitively (the one iteration, in
+    /// [`ActiveIndex::snapshot`], collects into a `BTreeMap`). So the same
+    /// swap is *admissible* here — it was built, tested green, and measured.
+    /// It is not adopted, because the engine cannot see it:
+    ///
+    /// * Map-level microbenchmark (64 shards, real `apply_committed` bursts +
+    ///   `stream_entries_from`/`resolve`/`stream_head` probes, ABBA-ordered
+    ///   with a second SipHash arm as a null control, 2 independent runs):
+    ///   foldhash wins **+21..35%** on insert ns/batch and **+5..13%** on the
+    ///   read probe, across 40 → 250k streams. The map-level win is real.
+    /// * Composed engine A/B (`mess-bench --only live_tail`, `--only
+    ///   reader_contention`, 8 ABBA blocks each plus a trunk-vs-trunk-rebuild
+    ///   null control): **every metric landed inside the ±5..8% null band**.
+    /// * Arithmetic says why, independent of the noise: an `apply_committed`
+    ///   insert costs ~18 ns against a ~90 µs per-batch engine cost, and one
+    ///   `stream_entries_from` costs ~0.3 µs against a ~19 µs page. The whole
+    ///   hasher is worth **≤0.12%** of any composed metric — consistent with
+    ///   bn-3hm4 measuring the entire active index at 0.5% of engine time.
+    ///
+    /// Reopen this only if a workload makes the *map* the cost (many more
+    /// streams per shard, or a read path that probes far more often per
+    /// materialised event) — not because the microbenchmark looks good.
     streams: RwLock<HashMap<u64, Vec<StreamEntry>>>,
 }
 
