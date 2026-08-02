@@ -19,6 +19,15 @@
 //! as quarantined-with-state, never deleted or repaired: it is preserved
 //! evidence and the durable trigger for the segment's re-seal.
 //!
+//! bn-3m62: that marker is also what tells `sidecar-missing` whether a repair
+//! is actually coming. The re-seal trigger is the durable slot, never the
+//! absence of an artifact, so a sealed segment whose index was *deleted* is
+//! owed nothing and this check must not say otherwise — see
+//! [`sidecar_missing_finding`]. `mess verify` splits the narrower
+//! footer-names-an-absent-pack case on the same bit
+//! (`seal-pack-reseal-pending` vs `seal-pack-missing`); the two tools describe
+//! one store with one vocabulary.
+//!
 //! # What the fold-version check sees
 //!
 //! The persisted snapshots this check inspects are the app's, written by a
@@ -253,6 +262,14 @@ fn check_lock(report: &mut Report, lock: &LockState) {
 /// Epoch sanity + footer/trailer + sidecar presence across the segment chain.
 fn check_segments(report: &mut Report, dir: &Path) {
     let segments = store::discover_segments(dir);
+    // bn-3m62: the segments whose durable re-seal request is already on disk.
+    // `sidecar-missing` below used to promise every artifact-less sealed
+    // segment a re-seal; only these actually get one.
+    let owed_reseal: std::collections::BTreeSet<u64> =
+        store::discover_quarantined(dir)
+            .iter()
+            .filter_map(|q| q.segment_id)
+            .collect();
     if segments.is_empty() {
         report.push_finding(Finding::new(
             Severity::Warn,
@@ -381,21 +398,12 @@ fn check_segments(report: &mut Report, dir: &Path) {
                 // shape (bn-3of): a consolidated `.seal` pack or the legacy
                 // `.pidx`. Missing means missing both.
                 match seg.sealed_artifact() {
-                    store::SealedArtifact::None => report.push_finding(
-                        Finding::new(
-                            Severity::Warn,
-                            "sidecar",
-                            "sidecar-missing",
-                            format!(
-                                "segment {}: sealed but no sealed index \
-                                 artifact (neither a .seal pack nor a .pidx \
-                                 sidecar); the segment is served from the raw \
-                                 log and is owed a re-seal",
-                                seg.segment_id
-                            ),
-                        )
-                        .with("segment_id", seg.segment_id),
-                    ),
+                    store::SealedArtifact::None => {
+                        report.push_finding(sidecar_missing_finding(
+                            seg.segment_id,
+                            owed_reseal.contains(&seg.segment_id),
+                        ))
+                    }
                     artifact => check_sealed_artifact(report, seg, artifact),
                 }
             }
@@ -432,6 +440,52 @@ fn check_segments(report: &mut Report, dir: &Path) {
         "epochs_seen",
         json!(epochs_seen.iter().copied().collect::<Vec<_>>()),
     );
+}
+
+/// bn-3m62: a **sealed** segment carrying no sealed index at all — and whether
+/// anything is actually going to fix that.
+///
+/// This finding used to tell every such operator that the segment "is owed a
+/// re-seal", unconditionally. That is true only when the segment's quarantine
+/// slot under `sealed/` is occupied: the re-seal trigger is the durable
+/// `*.refuted` marker, never the absence of an artifact, so a pack that was
+/// simply *deleted* leaves nothing to trigger on and the engine never re-queues
+/// the segment. bn-3qh0 pinned that as
+/// `never_reseals_a_deleted_pack_on_its_own` — three consecutive reopens,
+/// nothing refuted, nothing pending, the pack never returns. Promising a repair
+/// that will not happen is the one thing an operational report must not do.
+///
+/// Both states stay `Warn` here — reads are correct off the log either way, and
+/// `doctor`'s severity scale is about operational health, not exit codes. The
+/// split lives in the message, the `state` field, and the remedy. `mess verify`
+/// makes the same split on the same bit and adds the exit-code judgement
+/// (`seal-pack-reseal-pending` Warn vs `seal-pack-missing` Error) for the
+/// narrower case where the footer *names* the absent pack.
+fn sidecar_missing_finding(segment_id: u64, owed_reseal: bool) -> Finding {
+    let f = Finding::new(
+        Severity::Warn,
+        "sidecar",
+        "sidecar-missing",
+        format!(
+            "segment {segment_id}: sealed but no sealed index artifact \
+             (neither a .seal pack nor a .pidx sidecar); the segment is \
+             served from the raw log (D1) and {}",
+            if owed_reseal {
+                "is owed a re-seal — its quarantine slot under sealed/ is \
+                 occupied, so the next engine open rebuilds the index"
+            } else {
+                "nothing on disk requests a re-seal, so the engine will not \
+                 rebuild the index on its own; run mess rebuild-index"
+            },
+        ),
+    )
+    .with("segment_id", segment_id)
+    .with("state", if owed_reseal { "pending-reseal" } else { "lost" });
+    if owed_reseal {
+        f.with("converges", "next-open")
+    } else {
+        f.with("remedy", "mess rebuild-index")
+    }
 }
 
 /// Integrity of the segment's load-bearing sealed index, whichever shape it is

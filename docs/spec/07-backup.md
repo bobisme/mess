@@ -89,6 +89,15 @@ recovery path, not a licence to leave the pack out of a cut: a restored store
 whose footer names an absent pack reports `seal-pack-missing` and fails
 `restore`'s own verify gate long before anyone runs `rebuild-index` on it (§3).
 
+`bn-3m62` split that finding in two, and the gate is unaffected **by
+construction**. `verify` reports the absent pack as `seal-pack-reseal-pending`
+(Warn, converges at the next open) when the segment's `*.refuted` quarantine
+slot is occupied, and as `seal-pack-missing` (Error) when it is not. A cut never
+carries a `*.refuted` marker — they are the source store's evidence and its
+durable re-seal trigger, and copying one would import an anomaly the destination
+never had — so a restored store has no quarantine slot and a torn cut always
+lands in the Error arm.
+
 **There is no exception.** There used to be one: the name↔id interner lived in
 `stream_names` / `type_names` tables under a `<dir>/meta` key-value directory
 (`bn-20b` / `bn-150`), because the log stored only interned numeric ids. Those

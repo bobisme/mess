@@ -77,6 +77,11 @@ pub fn run(dir: &Path, opts: &VerifyOptions) -> Report {
     }
 
     let segments = store::discover_segments(dir);
+    // bn-3m62: enumerated ONCE, before the segment loop, because two checks
+    // need it — the seal-pack-missing severity split below, and the quarantine
+    // inventory at the end of this function. One `readdir`, one truth.
+    let quarantined_artifacts = store::discover_quarantined(dir);
+    let quarantined = QuarantineSlots::from_dir(&quarantined_artifacts);
     if segments.is_empty() {
         report.push_finding(Finding::new(
             Severity::Warn,
@@ -108,7 +113,7 @@ pub fn run(dir: &Path, opts: &VerifyOptions) -> Report {
         // and mandatory-section checksums, then whether the segment footer
         // NAMES it and the pack on disk is that exact one. One open feeds both
         // checks.
-        verify_seal_pack(&mut report, seg, &scan);
+        verify_seal_pack(&mut report, seg, &scan, &quarantined);
 
         // Sidecar integrity for sealed segments (or any segment with sidecars).
         if seg.has_pidx {
@@ -208,7 +213,7 @@ pub fn run(dir: &Path, opts: &VerifyOptions) -> Report {
     // evidence this command exists to surface; `mess doctor` reports their
     // re-seal state. Never an error — the raw log is authority and nothing
     // committed is at risk (D1).
-    for q in store::discover_quarantined(dir) {
+    for q in &quarantined_artifacts {
         if !q.is_primary {
             continue; // a derived sibling dragged along; doctor accounts for it
         }
@@ -385,6 +390,7 @@ fn verify_seal_pack(
     report: &mut Report,
     seg: &store::SegmentFile,
     scan: &SegmentScan,
+    quarantined: &QuarantineSlots,
 ) {
     let id = seg.segment_id;
     // `open_pack_eager`, not `open_pack`: engine open attaches the
@@ -459,7 +465,35 @@ fn verify_seal_pack(
         Some(Err(_)) | None => {}
     }
 
-    verify_seal_identity(report, seg, scan, opened.as_ref());
+    verify_seal_identity(report, seg, scan, opened.as_ref(), quarantined);
+}
+
+/// bn-3m62: the segment ids that own an occupied **quarantine slot** under
+/// `sealed/` — the engine's own durable re-seal trigger, read offline.
+///
+/// The membership rule mirrors `LogEngine::load_sealed` exactly (`engine.rs`,
+/// the `Some("refuted")` arm): ANY `*.refuted` whose name parses to a segment
+/// id marks that segment owed, not only a `.seal.refuted`. A `.pidx.refuted`
+/// dragged along by bn-3qh0's shadowed-sidecar withdrawal re-queues the segment
+/// just the same, and a CLI that keyed on the primary extension alone would
+/// report "lost" for a store the next open converges. There must not be two
+/// notions of "owed a re-seal" in this tree.
+#[derive(Debug, Default)]
+pub(crate) struct QuarantineSlots {
+    segments: std::collections::BTreeSet<u64>,
+}
+
+impl QuarantineSlots {
+    fn from_dir(quarantined: &[store::QuarantinedArtifact]) -> Self {
+        QuarantineSlots {
+            segments: quarantined.iter().filter_map(|q| q.segment_id).collect(),
+        }
+    }
+
+    /// Whether `segment_id` has a durable re-seal request on disk.
+    fn owes_reseal(&self, segment_id: u64) -> bool {
+        self.segments.contains(&segment_id)
+    }
 }
 
 /// bn-11g: check the segment footer's **SealPack identity** binding
@@ -483,6 +517,7 @@ fn verify_seal_identity(
     seg: &store::SegmentFile,
     scan: &SegmentScan,
     opened: Option<&Result<SealedSegmentIndex, SidecarError>>,
+    quarantined: &QuarantineSlots,
 ) {
     let id = seg.segment_id;
     let Some(trailer) = &scan.trailer else {
@@ -540,23 +575,7 @@ fn verify_seal_identity(
     let expected = named.hex();
 
     if !seg.has_seal {
-        report.push_finding(
-            Finding::new(
-                Severity::Error,
-                "seal-pack",
-                "seal-pack-missing",
-                format!(
-                    "segment {id}: footer names SealPack {expected} but {} \
-                     does not exist",
-                    seg.seal_path.display()
-                ),
-            )
-            .with("segment_id", id)
-            .with("expected_identity", expected.clone())
-            .with("observed_identity", Value::Null)
-            .with("fallback", "raw-segment-scan")
-            .with("path", seg.seal_path.display().to_string()),
-        );
+        report.push_finding(missing_pack_finding(seg, &expected, quarantined));
         return;
     }
 
@@ -622,6 +641,89 @@ fn verify_seal_identity(
         .with("expected_identity", expected.clone())
         .with("observed_identity", expected),
     );
+}
+
+/// bn-3m62: the finding for "the footer names a SealPack and the pack is not on
+/// disk" — **two** states that used to be one `Error`.
+///
+/// The distinction is the segment's durable quarantine slot, the same bit the
+/// engine keys its re-seal on, and it is the difference between a store that
+/// repairs itself at the next open and one that never will:
+///
+/// - **slot occupied** ⇒ `seal-pack-reseal-pending`, **Warn**. bn-3qh0's
+///   withdrawal (or a bn-30u refutation) took the pack out of the candidate
+///   namespace and left the request behind; the next `LogEngine::open` re-seals
+///   the segment from the log and re-finalizes the footer to name the fresh
+///   pack. Nothing is lost and no operator action is required. This is also
+///   exactly what `doctor` says about the same store (`quarantined-candidate`,
+///   Warn, `state: pending-reseal`) — before this split the two tools
+///   contradicted each other, `verify` calling Error what `doctor` called a
+///   converging Warn.
+/// - **no slot** ⇒ `seal-pack-missing`, **Error**, kind and severity unchanged.
+///   Nothing on disk requests a re-seal, and the engine will not invent one:
+///   bn-3qh0's `never_reseals_a_deleted_pack_on_its_own` pins that a deleted
+///   pack never comes back by itself. Only `mess rebuild-index` closes it.
+///
+/// # Why the lost arm keeps `Error` (the backup contract)
+///
+/// This severity is load-bearing outside `verify`. A backup cut that copies a
+/// segment's `.log` but not its `.seal` restores a store whose footer names an
+/// absent pack, and `mess restore`'s gate is `verify.worst() < Error`
+/// (`restore.rs`); spec 07 §1 and §1.2 name `seal-pack-missing` as the Error
+/// that makes the cut identity-complete rather than merely data-complete, and
+/// `backup.rs` includes the pack for that reason. Downgrading it wholesale
+/// would let a torn backup pass silently.
+///
+/// The split cannot weaken that gate, and not by luck: `*.refuted` markers are
+/// deliberately excluded from the cut (`backup.rs`), so a restored store never
+/// has a quarantine slot and a torn cut lands in the Error arm by construction.
+/// `a_torn_backup_still_errors` pins it.
+fn missing_pack_finding(
+    seg: &store::SegmentFile,
+    expected: &str,
+    quarantined: &QuarantineSlots,
+) -> Finding {
+    let id = seg.segment_id;
+    let base = if quarantined.owes_reseal(id) {
+        Finding::new(
+            Severity::Warn,
+            "seal-pack",
+            "seal-pack-reseal-pending",
+            format!(
+                "segment {id}: footer names SealPack {expected} and {} does \
+                 not exist, but the segment's quarantine slot under sealed/ \
+                 is occupied — the re-seal is durably owed (bn-30u/bn-3qh0). \
+                 The next engine open rebuilds the pack from the log and \
+                 re-finalizes the footer to name the fresh one; until then \
+                 the segment is served from the raw log, the only authority \
+                 (D1). No operator action is required.",
+                seg.seal_path.display()
+            ),
+        )
+        .with("state", "pending-reseal")
+        .with("converges", "next-open")
+    } else {
+        Finding::new(
+            Severity::Error,
+            "seal-pack",
+            "seal-pack-missing",
+            format!(
+                "segment {id}: footer names SealPack {expected} but {} does \
+                 not exist, and no quarantine slot under sealed/ requests a \
+                 re-seal — the engine will NOT restore it on its own. Reads \
+                 stay correct off the raw log (D1); run mess rebuild-index on \
+                 the store to re-seal the segment.",
+                seg.seal_path.display()
+            ),
+        )
+        .with("state", "lost")
+        .with("remedy", "mess rebuild-index")
+    };
+    base.with("segment_id", id)
+        .with("expected_identity", expected.to_string())
+        .with("observed_identity", Value::Null)
+        .with("fallback", "raw-segment-scan")
+        .with("path", seg.seal_path.display().to_string())
 }
 
 /// The `SealPackIdentity` a segment footer names, or `None` if it cannot be

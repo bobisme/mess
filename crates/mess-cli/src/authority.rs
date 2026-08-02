@@ -37,6 +37,8 @@ use std::path::Path;
 
 use mess_index::sealed::segment::SealedSegmentIndex;
 use mess_index::sealed::{dir_codec_of, dircodec_name};
+use mess_log::runtime::real::RealFs;
+use mess_log::sealer::read_trailer;
 use mess_store::observability::{AUTHORITY_MODEL, Role};
 use serde_json::{Value, json};
 
@@ -89,9 +91,10 @@ pub fn check(report: &mut Report, dir: &Path) {
     let mut rows: Vec<Value> = Vec::with_capacity(segs.len());
     let (mut present, mut absent, mut degraded) = (0usize, 0usize, 0usize);
     let (mut packs, mut sidecars, mut unindexed) = (0usize, 0usize, 0usize);
+    let mut unsealed = 0usize;
 
     for seg in &segs {
-        let row = segment_row(seg);
+        let row = segment_row(seg, is_footer_sealed(&seg.log_path));
         for state in row.states {
             match state {
                 ArtifactState::Present => present += 1,
@@ -104,6 +107,7 @@ pub fn check(report: &mut Report, dir: &Path) {
             Serving::SealPack => packs += 1,
             Serving::LooseSidecar => sidecars += 1,
             Serving::LogScan => unindexed += 1,
+            Serving::Unsealed => unsealed += 1,
         }
         rows.push(row.json);
     }
@@ -133,6 +137,11 @@ pub fn check(report: &mut Report, dir: &Path) {
                 "served_by_seal_pack": packs,
                 "served_by_loose_sidecar": sidecars,
                 "served_by_log_scan": unindexed,
+                // bn-3m62: segments that are not sealed yet. Counted apart
+                // from `served_by_log_scan` because "has no sealed index" is
+                // the NORMAL state for them and a deficiency for a sealed
+                // segment; see `Serving::Unsealed`.
+                "unsealed_segments": unsealed,
                 "artifacts_present": present,
                 "artifacts_absent": absent,
                 "artifacts_degraded": degraded,
@@ -157,19 +166,31 @@ pub fn check(report: &mut Report, dir: &Path) {
         (
             Severity::Info,
             format!(
-                "{unindexed} segment(s) have no sealed index and are served \
-                 by scanning their log bytes; the log is canonical, so reads \
-                 are correct and complete"
+                "{unindexed} SEALED segment(s) have no sealed index and are \
+                 served by scanning their log bytes; the log is canonical, so \
+                 reads are correct and complete"
             ),
         )
     } else {
+        // bn-3m62: unsealed segments do NOT drag this off Ok. Every store with
+        // a live head has one, so counting it here meant a healthy
+        // pack-default store could never report Ok — and it hid the state that
+        // matters (a SEALED segment with no index) behind a permanent Info.
         (
             Severity::Ok,
             format!(
                 "the log and its $registry records are canonical; all {} \
                  accelerator class(es) are discardable and every installed \
-                 one validated",
-                accelerator_class_count()
+                 one validated{}",
+                accelerator_class_count(),
+                if unsealed > 0 {
+                    format!(
+                        ". {unsealed} segment(s) are not sealed yet and carry \
+                         no sealed index by design"
+                    )
+                } else {
+                    String::new()
+                },
             ),
         )
     };
@@ -178,7 +199,8 @@ pub fn check(report: &mut Report, dir: &Path) {
             .with("artifacts_present", present)
             .with("artifacts_absent", absent)
             .with("artifacts_degraded", degraded)
-            .with("served_by_log_scan", unindexed),
+            .with("served_by_log_scan", unindexed)
+            .with("unsealed_segments", unsealed),
     );
 
     report.advice.push(json!({
@@ -222,8 +244,13 @@ fn class_json(c: &mess_store::ArtifactClass) -> Value {
 enum Serving {
     SealPack,
     LooseSidecar,
-    /// No usable sealed index: the engine scans the segment's log bytes.
+    /// No usable sealed index for a segment that **is** sealed: the engine
+    /// scans the segment's log bytes and is owed a re-seal.
     LogScan,
+    /// bn-3m62: the segment carries no footer trailer, so it is not sealed
+    /// yet — the live head, or a segment rolled but not yet roll-sealed.
+    /// Having no sealed index is its normal state, not a missing accelerator.
+    Unsealed,
 }
 
 impl Serving {
@@ -232,6 +259,7 @@ impl Serving {
             Serving::SealPack => "seal-pack",
             Serving::LooseSidecar => "pidx",
             Serving::LogScan => "log-scan",
+            Serving::Unsealed => "unsealed",
         }
     }
 
@@ -252,6 +280,12 @@ impl Serving {
                  bytes and the background sealer is owed a seal. Reads are \
                  correct and complete throughout — the log is the authority"
             }
+            Serving::Unsealed => {
+                "not sealed yet (no footer trailer), so it has no sealed index \
+                 by design: reads come from the active tier and the recovery \
+                 scan of its log bytes, and the roll-seal indexes it. Nothing \
+                 is missing and no re-seal is owed"
+            }
         }
     }
 }
@@ -263,7 +297,27 @@ struct SegmentRow {
     states:  Vec<ArtifactState>,
 }
 
-fn segment_row(seg: &SegmentFile) -> SegmentRow {
+/// Whether a segment's `.log` carries a valid footer trailer, i.e. whether it
+/// has been sealed at all (bn-3m62).
+///
+/// One positioned 100-byte read from EOF ([`read_trailer`]'s documented fast
+/// path), not a scan — this section is a file-state view and adds one `pread`
+/// per segment. It reads the same fact `doctor`'s segment pass already has as
+/// `SegmentScan::trailer`, deliberately through the same `mess-log` decoder, so
+/// the two can never disagree about which segments are sealed.
+///
+/// A read error or a short/invalid tail is `false`: unsealed is the safe
+/// reading, and it is the one `mess_log`'s own §8.3 rule takes.
+fn is_footer_sealed(log_path: &Path) -> bool {
+    matches!(read_trailer(&RealFs, log_path), Ok(Some(_)))
+}
+
+/// `sealed` is [`is_footer_sealed`] for this segment: whether the `.log`
+/// carries a footer trailer at all. It separates "no sealed index because
+/// nothing has sealed this segment yet" from "no sealed index because the
+/// accelerator is gone" — states that look identical on the `sealed/` listing
+/// and could not be more different to an operator.
+fn segment_row(seg: &SegmentFile, sealed: bool) -> SegmentRow {
     // The pack and the sidecar are the two *primary* candidates, and the
     // engine's dual read prefers the pack. Validate whichever is load-bearing
     // the same way the engine would (header + section directory + trailer;
@@ -294,9 +348,14 @@ fn segment_row(seg: &SegmentFile) -> SegmentRow {
         }
     };
 
+    // bn-3m62: an artifact that IS installed serves the segment whether or not
+    // the segment is footer-sealed — `seal_active` legitimately writes a pack
+    // over a still-live head. Only the no-artifact case splits, and it splits
+    // on the one honest axis: has anything sealed this segment yet.
     let serving = match (seal_state, pidx_state) {
         (ArtifactState::Present, _) => Serving::SealPack,
         (_, ArtifactState::Present) => Serving::LooseSidecar,
+        _ if !sealed => Serving::Unsealed,
         _ => Serving::LogScan,
     };
 
@@ -322,11 +381,15 @@ fn segment_row(seg: &SegmentFile) -> SegmentRow {
             dir_codec_of(&seg.seal_path).ok(),
         ),
         Serving::LooseSidecar => (None, dir_codec_of(&seg.pidx_path).ok()),
-        Serving::LogScan => (None, None),
+        Serving::LogScan | Serving::Unsealed => (None, None),
     };
 
     let json = json!({
         "segment_id": seg.segment_id,
+        // bn-3m62: whether the `.log` carries a footer trailer. Without it the
+        // reader cannot tell an unsealed head's empty artifact row from a
+        // sealed segment that lost every accelerator.
+        "sealed": sealed,
         "serving": serving.as_str(),
         "serving_role": Role::DiscardableAccelerator.as_str(),
         "canonical_source": "seg-*.log",

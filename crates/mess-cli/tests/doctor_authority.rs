@@ -165,10 +165,16 @@ fn a_healthy_pack_sealed_store_reports_the_pack_as_serving() {
 /// **Delete the sidecar.** The row flips to `log-scan`, the artifact reads
 /// `absent`, the summary counts it, and the finding drops to `info` — the
 /// store is fine, it is just unaccelerated.
+///
+/// bn-3m62: the segment is footer-sealed first. `log-scan` now means "a SEALED
+/// segment lost its index and is owed a re-seal"; a segment with no footer is
+/// `unsealed` instead, because having no sealed index is its normal state and
+/// nothing is owed for it. This test is about the former, so it seals.
 #[test]
 fn deleting_the_sidecar_flips_the_row_to_a_log_scan() {
     let d = mess_testkit::sweeping_temp_dir("cli-authority-sidecar-deleted");
     common::build_corpus(d.path(), 8);
+    common::seal_log_trailer(d.path());
     assert_eq!(
         segment_row(&run_json(d.path()), common::SEG_ID)["serving"],
         "pidx",
@@ -203,6 +209,9 @@ fn deleting_the_sidecar_flips_the_row_to_a_log_scan() {
 fn a_corrupt_sidecar_reads_degraded_not_absent() {
     let d = mess_testkit::sweeping_temp_dir("cli-authority-sidecar-corrupt");
     common::build_corpus(d.path(), 8);
+    // bn-3m62: seal the footer so `serving` reports the sealed-but-unindexed
+    // state (`log-scan`) rather than the unsealed one — see the test above.
+    common::seal_log_trailer(d.path());
     let pidx = common::pidx(d.path());
     let bytes = std::fs::read(&pidx).expect("read");
     std::fs::write(&pidx, &bytes[..bytes.len() / 2]).expect("truncate");

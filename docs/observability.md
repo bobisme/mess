@@ -192,12 +192,14 @@ authority.accelerators[]            = { name, role, on_loss }
 authority.summary                   = { segments, served_by_seal_pack,
                                         served_by_loose_sidecar,
                                         served_by_log_scan,
+                                        unsealed_segments,
                                         artifacts_present, artifacts_absent,
                                         artifacts_degraded }
-authority.segments[]                = { segment_id, serving, serving_role,
-                                        canonical_source, fallback,
-                                        sealed_artifact, pack_identity,
-                                        dir_codec, dir_codec_name,
+authority.segments[]                = { segment_id, sealed, serving,
+                                        serving_role, canonical_source,
+                                        fallback, sealed_artifact,
+                                        pack_identity, dir_codec,
+                                        dir_codec_name,
                                         artifacts{ ".seal", ".pidx", ".pcol",
                                                    ".filter", ".reg", ".par" } }
 ```
@@ -208,9 +210,24 @@ material, and carrying it would roughly double a `text`-format doctor run.
 `on_loss` is the half an operator cannot look up fast enough mid-incident, so
 that one is always in the payload.
 
-`serving` is `seal-pack` \| `pidx` \| `log-scan` — which shape a reader would
-actually use, following the engine's own dual-read preference
+`serving` is `seal-pack` \| `pidx` \| `log-scan` \| `unsealed` — which shape a
+reader would actually use, following the engine's own dual-read preference
 (`LogEngine::load_sealed`: the pack wins).
+
+`sealed` (bn-3m62) is whether the segment's `.log` carries a footer trailer,
+and it is what separates the last two values. A segment that is **not** sealed
+yet — the live head, or one rolled but not yet roll-sealed — has no sealed
+index *by design*: nothing is missing and no re-seal is owed, because sealing
+writes the footer and the engine excludes the head from the re-seal queue
+unconditionally. That is `unsealed`. `log-scan` is reserved for a segment that
+**is** sealed and has no usable index anyway — the accelerator was lost,
+refuted, or never landed — which is a real, actionable state.
+
+Keeping them apart matters twice over. Every store has a live head, so folding
+it into `log-scan` meant a perfectly healthy store could never report `ok`, and
+the permanent count hid the one segment an operator actually needs to see.
+`unsealed_segments` counts the first kind; `served_by_log_scan` counts only the
+second.
 
 Per-artifact state is four-way, and the distinction is the useful part:
 
@@ -222,8 +239,10 @@ Per-artifact state is four-way, and the distinction is the useful part:
 | `shadowed` | inert because a higher-preference artifact serves this segment (a `.pidx` under a healthy `.seal`) |
 
 One finding, `authority-accelerators`: `ok` when everything installed
-validated, `info` when some segment is served by a log scan, `warn` when any
-artifact is `degraded`. It is a *summary* — the per-segment `sidecar-missing`
+validated (unsealed segments do not lower it — they are accounted for in the
+`ok` message), `info` when some **sealed** segment is served by a log scan,
+`warn` when any artifact is `degraded`. It is a *summary* — the per-segment
+`sidecar-missing`
 / `seal-pack-corrupt` findings from the other doctor checks are the
 per-artifact voice, and a second finding at a different severity for the same
 file would make the report argue with itself. The severity never rises to
