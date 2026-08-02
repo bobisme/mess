@@ -290,8 +290,18 @@ mod test_actor {
 
     impl TmpHandle {
         fn new() -> Self {
-            let path = std::env::temp_dir().join(Id::new().to_string());
-            let db = DB::new(&path).unwrap();
+            // bn-2lir: `temp_dir()/<Id>` is NOT collision-proof across the
+            // processes nextest spawns — see `rocks::db::test::tmp_db_path`.
+            let path = crate::rocks::db::test::tmp_db_path();
+            let db = DB::new(&path).unwrap_or_else(|e| {
+                panic!(
+                    "{}",
+                    crate::rocks::db::test::tmp_db_report(
+                        &path,
+                        &format!("DB::new: {e}")
+                    )
+                )
+            });
             Self { handle: ActorHandle::new(db), path }
         }
 

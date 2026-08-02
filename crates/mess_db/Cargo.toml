@@ -36,6 +36,10 @@ features = ["derive"]
 
 [dev-dependencies]
 assert2 = { workspace = true }
+# bn-2lir: the temp-path regression test pins the *mechanism* by seeding the
+# same thread-local RNG `ident::Id::new()` draws from. Already in the lock
+# graph as a transitive dep of `ident`; no new third-party code.
+fastrand = "2"
 pretty_assertions = "1.4.0"
 proptest = "1.2"
 rstest = { workspace = true }
