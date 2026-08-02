@@ -34,8 +34,9 @@ use std::time::Duration;
 use mess_core::{Aggregate, CodecError, Event};
 use mess_store::pack_snapshot::{SaveMode, SidecarOptions};
 use mess_store::{
-    EventStore, Loaded, LogEngine, PackSnapshotBackend, SnapshotStore,
-    Snapshottable, StateCodecError, StoredSnapshot, Version,
+    EventStore, Loaded, LogEngine, PackSnapshotBackend, SnapshotCoverage,
+    SnapshotSaveOutcome, SnapshotStore, Snapshottable, StableSnapshotId,
+    StateCodecError, StoredSnapshot, Version,
 };
 
 // ---------------------------------------------------------------------------
@@ -95,6 +96,8 @@ impl Aggregate for Counter {
 }
 
 impl Snapshottable for Counter {
+    const AGGREGATE_SCHEMA_ID: StableSnapshotId =
+        StableSnapshotId::new("mess-store.test.counter");
     const FOLD_VERSION: u32 = 1;
 
     fn encode_state(&self) -> Result<Vec<u8>, StateCodecError> {
@@ -119,6 +122,8 @@ impl Aggregate for CounterV2 {
 }
 
 impl Snapshottable for CounterV2 {
+    const AGGREGATE_SCHEMA_ID: StableSnapshotId =
+        StableSnapshotId::new("mess-store.test.counter");
     const FOLD_VERSION: u32 = 2;
 
     fn encode_state(&self) -> Result<Vec<u8>, StateCodecError> {
@@ -211,11 +216,15 @@ async fn snapshot_plus_tail_equals_full_replay_on_packs() {
                 .unwrap();
         }
         let snap = store.save_snapshot::<Counter>(&stream).await.unwrap();
-        if p == 0 {
-            assert!(snap.covers_empty_prefix, "iter {iter}: empty prefix flag");
+        let want = if p == 0 {
+            SnapshotCoverage::Empty
         } else {
-            assert_eq!(snap.stream_version, (p - 1) as u64, "iter {iter}");
-        }
+            SnapshotCoverage::Through((p - 1) as u64)
+        };
+        assert_eq!(
+            snap.snapshot_ref.coverage, want,
+            "iter {iter}: coverage must be exactly the appended prefix"
+        );
         if p < n {
             let expect = if p == 0 {
                 Version::NoStream
@@ -294,29 +303,35 @@ async fn pack_snapshots_match_their_replay_derived_expectation() {
 
         // 1. The save's own answer, against the prefix that produced it.
         let saved = pack.save_snapshot::<Counter>(&stream).await.unwrap();
-        if p == 0 {
-            assert!(
-                saved.covers_empty_prefix,
-                "iter {iter}: a snapshot of an empty prefix must say so"
-            );
-        } else {
-            assert!(!saved.covers_empty_prefix, "iter {iter}: prefix is v0..");
-            assert_eq!(
-                saved.stream_version,
-                (p - 1) as u64,
-                "iter {iter}: snapshot must cover exactly the appended prefix"
-            );
-        }
         assert_eq!(
-            saved.fold_version,
-            Counter::FOLD_VERSION,
-            "iter {iter}: snapshot carries the fold that produced it"
+            saved.outcome,
+            SnapshotSaveOutcome::Published,
+            "iter {iter}: a fresh save publishes"
+        );
+        let saved = saved.snapshot_ref;
+        assert_eq!(
+            saved.coverage,
+            if p == 0 {
+                SnapshotCoverage::Empty
+            } else {
+                SnapshotCoverage::Through((p - 1) as u64)
+            },
+            "iter {iter}: snapshot must cover exactly the appended prefix"
+        );
+        assert_eq!(
+            saved.compatibility,
+            Counter::snapshot_compatibility(),
+            "iter {iter}: snapshot carries the identity that produced it"
         );
 
         // 2. The PERSISTED blob — what a later load resumes from — must decode
         //    to the prefix fold, byte for byte.
-        let stored: Option<StoredSnapshot> =
-            pack.backend().load_snapshot(&stream).await.unwrap();
+        let stored: Option<StoredSnapshot> = pack
+            .backend()
+            .load_snapshot(&stream, Counter::snapshot_compatibility())
+            .await
+            .unwrap()
+            .hit();
         let stored = stored.unwrap_or_else(|| {
             panic!("iter {iter}: a saved snapshot must load")
         });
@@ -599,7 +614,7 @@ async fn fold_version_bump_invalidates_and_replaces_persisted_snapshot() {
 
     store.append(stream, Version::NoStream, &events).await.unwrap();
     let v1 = store.save_snapshot::<Counter>(stream).await.unwrap();
-    assert_eq!(v1.fold_version, 1);
+    assert_eq!(v1.snapshot_ref.compatibility.fold_version, 1);
     assert_eq!(store.snapshot_metrics().invalidated(), 0);
 
     let loaded = store.load_cached::<CounterV2>(stream).await.unwrap();
@@ -613,13 +628,25 @@ async fn fold_version_bump_invalidates_and_replaces_persisted_snapshot() {
 
     let replaced = store
         .backend()
-        .load_snapshot(stream)
+        .load_snapshot(stream, CounterV2::snapshot_compatibility())
         .await
         .unwrap()
-        .expect("head still present after rebuild");
+        .hit()
+        .expect("a head is present under the NEW identity after rebuild");
     assert_eq!(
-        replaced.snapshot_ref.fold_version, 2,
+        replaced.snapshot_ref.compatibility.fold_version, 2,
         "the replacement persisted record carries the new fold_version"
+    );
+    // The old identity's head is still there, untouched: one identity never
+    // deletes another's (ADR 0002 §1).
+    assert!(
+        store
+            .backend()
+            .load_snapshot(stream, Counter::snapshot_compatibility())
+            .await
+            .unwrap()
+            .is_hit(),
+        "the stale record is orphaned, not destroyed"
     );
 
     let tail: Vec<CounterEvent> = vec![CounterEvent::Added(100)];
@@ -668,8 +695,16 @@ async fn an_offline_reader_can_inspect_a_live_sidecar() {
             "s4".to_string(),
         ]
     );
-    let got = reader.load_snapshot("s3").await.unwrap().expect("head");
-    let want = store.backend().load_snapshot("s3").await.unwrap().unwrap();
+    let compat = Counter::snapshot_compatibility();
+    let got =
+        reader.load_snapshot("s3", compat).await.unwrap().hit().expect("head");
+    let want = store
+        .backend()
+        .load_snapshot("s3", compat)
+        .await
+        .unwrap()
+        .hit()
+        .unwrap();
     assert_eq!(got, want, "an offline reader sees the same bytes");
 
     // …and cannot write.
@@ -763,8 +798,13 @@ async fn cloned_stores_share_one_writer_and_all_saves_land() {
     for t in 0..4u64 {
         for i in 0..25u64 {
             let stream = format!("t{t}-{i}");
-            let snap =
-                store.backend().load_snapshot(&stream).await.unwrap().unwrap();
+            let snap = store
+                .backend()
+                .load_snapshot(&stream, Counter::snapshot_compatibility())
+                .await
+                .unwrap()
+                .hit()
+                .unwrap();
             assert_eq!(
                 snap.state_blob,
                 (i as i64).to_le_bytes().to_vec(),
@@ -772,4 +812,212 @@ async fn cloned_stores_share_one_writer_and_all_saves_land() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// bn-2gns: what happens to snapshots written before the stable identity
+// ---------------------------------------------------------------------------
+
+/// Encode a record body in the **pre-identity** layout (record format 1),
+/// frozen here so the compatibility claim survives the code that wrote it:
+/// `fmt(2) trust(1) flags(1) fold(4) version(8) ptr(8) name_len(2)
+/// state_len(4) || name || state`.
+fn v1_record_body(
+    stream: &str,
+    fold: u32,
+    version: u64,
+    state: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.push(0); // UnverifiedCache
+    out.push(0); // covers_empty_prefix
+    out.extend_from_slice(&fold.to_le_bytes());
+    out.extend_from_slice(&version.to_le_bytes());
+    out.extend_from_slice(&0u64.to_le_bytes()); // the retired blob pointer
+    out.extend_from_slice(&(stream.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(state.len() as u32).to_le_bytes());
+    out.extend_from_slice(stream.as_bytes());
+    out.extend_from_slice(state);
+    out
+}
+
+/// Encode a root descriptor in the **pre-identity** layout (root format 1),
+/// likewise frozen: one leaf keyed by stream name plus a bare `fold_version`.
+#[allow(clippy::too_many_arguments)]
+fn v1_root(
+    uuid: mess_store::pack_snapshot::StoreUuid,
+    generation: u64,
+    active_pack: u64,
+    active_pack_len: u64,
+    stream: &str,
+    fold: u32,
+    version: u64,
+    offset: u64,
+    frame_len: u32,
+    record_crc: u32,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"MRT1");
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.push(0); // Buffered
+    out.push(0);
+    out.extend_from_slice(&uuid.0);
+    out.extend_from_slice(&generation.to_le_bytes());
+    out.extend_from_slice(&active_pack.to_le_bytes());
+    out.extend_from_slice(&active_pack_len.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes()); // sealed_count
+    out.extend_from_slice(&1u32.to_le_bytes()); // entry_count
+    out.extend_from_slice(&active_pack.to_le_bytes());
+    out.extend_from_slice(&offset.to_le_bytes());
+    out.extend_from_slice(&frame_len.to_le_bytes());
+    out.extend_from_slice(&record_crc.to_le_bytes());
+    out.extend_from_slice(&fold.to_le_bytes());
+    out.push(0); // covers_empty_prefix
+    out.extend_from_slice(&version.to_le_bytes());
+    out.extend_from_slice(&(stream.len() as u16).to_le_bytes());
+    out.extend_from_slice(stream.as_bytes());
+    let crc = mess_store::pack_snapshot::format::crc32(&out);
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.extend_from_slice(
+        &mess_store::pack_snapshot::format::COMMIT_MARKER.to_le_bytes(),
+    );
+    out
+}
+
+/// Build a complete, internally consistent sidecar directory in the layout the
+/// previous build wrote — right down to a valid CRC on every artifact — so the
+/// only thing wrong with it is that its *formats* predate the stable identity.
+fn plant_pre_identity_sidecar(root: &std::path::Path, stream: &str) {
+    use mess_store::pack_snapshot::StoreUuid;
+    use mess_store::pack_snapshot::format::{
+        encode_frame, encode_identity, encode_pack_header, pack_name, root_name,
+    };
+
+    std::fs::create_dir_all(root).expect("mkdir");
+    let uuid = StoreUuid([0x5A; 16]);
+    std::fs::write(root.join("IDENTITY"), encode_identity(uuid, 4096))
+        .expect("identity");
+
+    let header = encode_pack_header(uuid, 0);
+    let offset = header.len() as u64;
+    let body = v1_record_body(stream, 1, 3, b"pre-identity state");
+    let frame = encode_frame(&body);
+    let mut pack = header;
+    pack.extend_from_slice(&frame);
+    let pack_len = pack.len() as u64;
+    std::fs::write(root.join(pack_name(uuid, 0, false)), &pack).expect("pack");
+
+    std::fs::write(
+        root.join(root_name(uuid, 1)),
+        v1_root(
+            uuid,
+            1,
+            0,
+            pack_len,
+            stream,
+            1,
+            3,
+            offset,
+            frame.len() as u32,
+            mess_store::pack_snapshot::format::crc32(&body),
+        ),
+    )
+    .expect("root");
+}
+
+/// A sidecar written under the OLD identity scheme is a **discardable
+/// accelerator**: it misses cleanly, it is never repaired or migrated, it never
+/// produces a wrong hit, and the store carries on from the log.
+///
+/// This is the whole migration story for `bn-2gns`. There is no converter,
+/// because a snapshot is not data — it is a cache of the log.
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn a_pre_identity_sidecar_misses_cleanly_and_is_never_touched() {
+    let dir = mess_testkit::sweeping_temp_dir("pack-pre-identity");
+    let snap_root = dir.path().join("snap");
+    let stream = "orders-42";
+    plant_pre_identity_sidecar(&snap_root, stream);
+    let planted: Vec<String> = sorted_names(&snap_root);
+
+    let engine = LogEngine::open(dir.path().join("store")).expect("engine");
+
+    // (a) An OFFLINE reader misses and changes nothing on disk.
+    {
+        let reader =
+            PackSnapshotBackend::open_read_only(engine.clone(), &snap_root);
+        let got = reader
+            .load_snapshot(stream, Counter::snapshot_compatibility())
+            .await
+            .expect("a foreign format is a miss, never an error");
+        assert_eq!(
+            got.miss(),
+            Some(mess_store::SnapshotMiss::Absent),
+            "an unreadable root leaves the store with no heads at all"
+        );
+        assert!(
+            !snap_root.join("LOCK").exists(),
+            "a read-only open must not take the writer lock"
+        );
+        assert_eq!(
+            sorted_names(&snap_root),
+            planted,
+            "a read-only open must not create, repair, rename or delete"
+        );
+    }
+
+    // (b) A WRITER also misses — and does not resurrect, rewrite or delete the
+    //     old artifacts. It starts a fresh namespace beside them.
+    let store = EventStore::new(
+        PackSnapshotBackend::open(engine, &snap_root).expect("writer"),
+    );
+    let events: Vec<CounterEvent> = (1..=4).map(CounterEvent::Added).collect();
+    store.append(stream, Version::NoStream, &events).await.unwrap();
+
+    let loaded = store.load_cached::<Counter>(stream).await.unwrap();
+    assert_eq!(
+        loaded.state,
+        fold(&events),
+        "the answer comes from the log, and it is right"
+    );
+    assert_eq!(
+        loaded.events_replayed,
+        events.len(),
+        "a pre-identity record must never be folded onto: full replay"
+    );
+
+    // (c) The new scheme works normally on top: save, then hit.
+    store.save_snapshot::<Counter>(stream).await.unwrap();
+    let again = store.load_cached::<Counter>(stream).await.unwrap();
+    assert_eq!(again.state, fold(&events));
+    assert_eq!(again.events_replayed, 0, "the new head is used");
+
+    // (d) Every planted artifact is still byte-for-byte where it was.
+    for name in &planted {
+        assert!(
+            snap_root.join(name).exists(),
+            "the old artifact {name} was touched"
+        );
+    }
+    let planted_pack = planted
+        .iter()
+        .find(|n| n.ends_with(".open"))
+        .expect("the planted pack");
+    assert!(
+        !sorted_names(&snap_root)
+            .iter()
+            .filter(|n| n.ends_with(".open"))
+            .any(|n| n != planted_pack),
+        "a fresh namespace should reuse the identity, not mint a second pack"
+    );
+}
+
+fn sorted_names(dir: &std::path::Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir)
+        .expect("read_dir")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    v
 }

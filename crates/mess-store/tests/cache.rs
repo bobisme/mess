@@ -24,10 +24,13 @@ use mess_store::backend::{
     AppendError, Appended, Backend, OwnedAppendBatch, RecordToAppend,
     StoredRecord,
 };
-use mess_store::snapshot::{SnapshotStore, StoredSnapshot};
+use mess_store::snapshot::{
+    SnapshotCompatibility, SnapshotLookup, SnapshotSaveOutcome, SnapshotStore,
+    StoredSnapshot,
+};
 use mess_store::{
-    EventStore, RetryPolicy, Snapshottable, StateCache, StateCodecError,
-    Version,
+    EventStore, RetryPolicy, Snapshottable, StableSnapshotId, StateCache,
+    StateCodecError, Version,
 };
 
 mod common;
@@ -120,15 +123,16 @@ impl<B: SnapshotStore> SnapshotStore for Counting<B> {
         &self,
         stream_id: &str,
         snapshot: StoredSnapshot,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<SnapshotSaveOutcome, Self::Error> {
         self.inner.save_snapshot(stream_id, snapshot).await
     }
 
     async fn load_snapshot(
         &self,
         stream_id: &str,
-    ) -> Result<Option<StoredSnapshot>, Self::Error> {
-        self.inner.load_snapshot(stream_id).await
+        compatibility: SnapshotCompatibility,
+    ) -> Result<SnapshotLookup, Self::Error> {
+        self.inner.load_snapshot(stream_id, compatibility).await
     }
 }
 
@@ -211,6 +215,8 @@ impl Aggregate for Account {
 }
 
 impl Snapshottable for Account {
+    const AGGREGATE_SCHEMA_ID: StableSnapshotId =
+        StableSnapshotId::new("mess-store.test.cache-account");
     const FOLD_VERSION: u32 = 1;
 
     fn encode_state(&self) -> Result<Vec<u8>, StateCodecError> {
@@ -849,15 +855,16 @@ impl SnapshotStore for AlwaysConflict {
         &self,
         _stream_id: &str,
         _snapshot: StoredSnapshot,
-    ) -> Result<(), Self::Error> {
-        Ok(())
+    ) -> Result<SnapshotSaveOutcome, Self::Error> {
+        Ok(SnapshotSaveOutcome::Published)
     }
 
     async fn load_snapshot(
         &self,
         _stream_id: &str,
-    ) -> Result<Option<StoredSnapshot>, Self::Error> {
-        Ok(None)
+        _compatibility: SnapshotCompatibility,
+    ) -> Result<SnapshotLookup, Self::Error> {
+        Ok(SnapshotLookup::Miss(mess_store::SnapshotMiss::Absent))
     }
 }
 

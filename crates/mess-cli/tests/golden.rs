@@ -59,8 +59,9 @@ use mess_log::runtime::real::RealFs;
 use mess_log::scanner::recover_segment_with_image;
 use mess_store::backend::{Backend, RecordToAppend};
 use mess_store::{
-    BlobPtr, EngineOptions, LogEngine, PackSnapshotBackend, SnapshotRef,
-    SnapshotStore, StoredSnapshot, Version, interim_stream_id,
+    EngineOptions, LogEngine, PackSnapshotBackend, SnapshotCompatibility,
+    SnapshotCoverage, SnapshotRef, SnapshotStore, SnapshotTrust,
+    StableSnapshotId, StoredSnapshot, Version, interim_stream_id,
 };
 use serde_json::{Value, json};
 
@@ -93,6 +94,16 @@ const CHAINED_STREAM_ID: u64 = 0x0007_0000_0007;
 const CHAINED_BATCH_SIZE: usize = 4;
 /// The 0-based last version the committed snapshot summarizes.
 const SNAPSHOT_VERSION: u64 = 19;
+/// The stable identity the golden's snapshot is written under. Frozen with the
+/// rest of the fixture: a future `vN` pins these exact bytes, and a change to
+/// any of the four values is a deliberate new-identity decision, not a
+/// refactor.
+const GOLDEN_COMPAT: SnapshotCompatibility = SnapshotCompatibility {
+    aggregate_schema_id: StableSnapshotId::new("mess-cli.golden.sum"),
+    fold_version:        SumAgg::FOLD_VERSION,
+    codec_id:            StableSnapshotId::new("mess-cli.golden.sum"),
+    codec_version:       1,
+};
 /// The stream that must be served entirely from the COLD (sealed) tier.
 const COLD_STREAM: &str = "orders-0";
 
@@ -323,13 +334,10 @@ async fn generate(version: &str, chain: bool) {
             .expect("open snapshot store");
             let stored = StoredSnapshot {
                 snapshot_ref: SnapshotRef {
-                    stream_id:           interim_stream_id(CHAINED_STREAM),
-                    stream_version:      SNAPSHOT_VERSION,
-                    fold_version:        SumAgg::FOLD_VERSION,
-                    covers_empty_prefix: false,
-                    event_prefix_hash:   None,
-                    state_hash:          None,
-                    snapshot_ptr:        BlobPtr(0),
+                    compatibility: GOLDEN_COMPAT,
+                    coverage:      SnapshotCoverage::Through(SNAPSHOT_VERSION),
+                    trust:         SnapshotTrust::UnverifiedCache,
+                    stream_id:     interim_stream_id(CHAINED_STREAM),
                 },
                 state_blob:   snap_blob.clone(),
             };
@@ -612,11 +620,12 @@ async fn check(version: &str, chain: bool) {
         let snaps =
             PackSnapshotBackend::open_read_only(engine.clone(), root.clone());
         let loaded = snaps
-            .load_snapshot(chained["name"].as_str().unwrap())
+            .load_snapshot(chained["name"].as_str().unwrap(), GOLDEN_COMPAT)
             .await
             .expect("an unreadable sidecar is a miss, never an error");
-        assert!(
-            loaded.is_none(),
+        assert_eq!(
+            loaded.miss(),
+            Some(mess_store::SnapshotMiss::Absent),
             "a pre-pack sidecar at {} must miss, not resolve",
             root.display()
         );

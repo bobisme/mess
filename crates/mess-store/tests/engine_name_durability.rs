@@ -46,8 +46,9 @@ use std::time::{Duration, Instant};
 
 use mess_store::backend::{Backend, RecordToAppend};
 use mess_store::{
-    BlobPtr, Durability, EngineOptions, LogEngine, SnapshotRef, SnapshotStore,
-    StoredSnapshot, Version, interim_stream_id,
+    Durability, EngineOptions, LogEngine, SnapshotCompatibility,
+    SnapshotCoverage, SnapshotRef, SnapshotStore, SnapshotTrust,
+    StableSnapshotId, StoredSnapshot, Version, interim_stream_id,
 };
 
 fn rec(message_type: &str, data: &[u8]) -> RecordToAppend {
@@ -663,13 +664,19 @@ async fn an_app_store_with_snapshots_adds_the_pack_sidecar_and_nothing_else() {
                 "acct-1",
                 StoredSnapshot {
                     snapshot_ref: SnapshotRef {
-                        stream_id:           interim_stream_id("acct-1"),
-                        stream_version:      version,
-                        fold_version:        1,
-                        covers_empty_prefix: false,
-                        event_prefix_hash:   None,
-                        state_hash:          None,
-                        snapshot_ptr:        BlobPtr(0),
+                        compatibility: SnapshotCompatibility {
+                            aggregate_schema_id: StableSnapshotId::new(
+                                "mess-store.test.acct",
+                            ),
+                            fold_version:        1,
+                            codec_id:            StableSnapshotId::new(
+                                "mess-store.test.acct",
+                            ),
+                            codec_version:       1,
+                        },
+                        coverage:      SnapshotCoverage::Through(version),
+                        trust:         SnapshotTrust::UnverifiedCache,
+                        stream_id:     interim_stream_id("acct-1"),
                     },
                     state_blob:   pass.as_bytes().to_vec(),
                 },

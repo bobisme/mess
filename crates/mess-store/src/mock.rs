@@ -22,7 +22,10 @@ use crate::backend::{
     AppendError, Appended, Backend, RecordToAppend, StoredRecord,
     SubscribeBackend,
 };
-use crate::snapshot::{SnapshotStore, StoredSnapshot};
+use crate::snapshot::{
+    CurrentHead, SnapshotCompatibility, SnapshotLookup, SnapshotMiss,
+    SnapshotSaveOutcome, SnapshotStore, StoredSnapshot, publication_decision,
+};
 use crate::version::Version;
 
 #[derive(Default)]
@@ -31,10 +34,12 @@ struct Inner {
     streams:   HashMap<String, Vec<StoredRecord>>,
     /// Every event across all streams, in global order.
     global:    Vec<StoredRecord>,
-    /// The throwaway snapshot keyspace: at most one snapshot per stream. This
-    /// is a plain map keyed by stream name — explicitly *not* part of the
-    /// commit authority, wiped whenever this backend is dropped.
-    snapshots: HashMap<String, StoredSnapshot>,
+    /// The throwaway snapshot keyspace, keyed by the same complete
+    /// `(stream, compatibility)` key the durable sidecar uses — a test double
+    /// that keyed by stream alone would let a fold bump silently overwrite an
+    /// older identity's head, which the real store forbids. Explicitly *not*
+    /// part of the commit authority; wiped whenever this backend is dropped.
+    snapshots: HashMap<(String, SnapshotCompatibility), StoredSnapshot>,
 }
 
 impl Inner {
@@ -203,29 +208,58 @@ impl SubscribeBackend for MockBackend {
 }
 
 impl SnapshotStore for MockBackend {
+    /// Applies the same [`publication_decision`] rule as the durable sidecar,
+    /// so a test that passes against the mock is testing the real contract and
+    /// not a permissive stand-in. The canonical identity bytes here are the
+    /// state blob: the mock has no frame to encode.
     async fn save_snapshot(
         &self,
         stream_id: &str,
         snapshot: StoredSnapshot,
-    ) -> Result<(), Self::Error> {
-        self.inner
-            .lock()
-            .expect("mock lock poisoned")
-            .snapshots
-            .insert(stream_id.to_string(), snapshot);
-        Ok(())
+    ) -> Result<SnapshotSaveOutcome, Self::Error> {
+        let key = (stream_id.to_string(), snapshot.snapshot_ref.compatibility);
+        let mut inner = self.inner.lock().expect("mock lock poisoned");
+        let current =
+            inner.snapshots.get(&key).map_or(CurrentHead::Vacant, |cur| {
+                CurrentHead::Published(cur.snapshot_ref.coverage)
+            });
+        let outcome = publication_decision(
+            current,
+            snapshot.snapshot_ref.coverage,
+            &snapshot.state_blob,
+            || inner.snapshots.get(&key).map(|c| c.state_blob.clone()),
+        );
+        if matches!(
+            outcome,
+            SnapshotSaveOutcome::Published | SnapshotSaveOutcome::Repaired
+        ) {
+            inner.snapshots.insert(key, snapshot);
+        }
+        Ok(outcome)
     }
 
     async fn load_snapshot(
         &self,
         stream_id: &str,
-    ) -> Result<Option<StoredSnapshot>, Self::Error> {
-        Ok(self
-            .inner
-            .lock()
-            .expect("mock lock poisoned")
+        compatibility: SnapshotCompatibility,
+    ) -> Result<SnapshotLookup, Self::Error> {
+        let inner = self.inner.lock().expect("mock lock poisoned");
+        let key = (stream_id.to_string(), compatibility);
+        if let Some(found) = inner.snapshots.get(&key) {
+            return Ok(SnapshotLookup::Hit(found.clone()));
+        }
+        // Same reporting the durable store gives: a head under another
+        // identity is "incompatible", which is what makes the deploy wave
+        // observable.
+        let foreign = inner
             .snapshots
-            .get(stream_id)
-            .cloned())
+            .iter()
+            .filter(|((s, c), _)| s == stream_id && *c != compatibility)
+            .max_by_key(|(_, v)| v.snapshot_ref.coverage)
+            .map(|((_, c), _)| *c);
+        Ok(SnapshotLookup::Miss(match foreign {
+            Some(stored) => SnapshotMiss::Incompatible { stored },
+            None => SnapshotMiss::Absent,
+        }))
     }
 }

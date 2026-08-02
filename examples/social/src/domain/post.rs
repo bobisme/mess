@@ -40,9 +40,10 @@
 
 use mess_core::Decide;
 use mess_derive::{Aggregate, Event};
-use mess_store::{Snapshottable, StateCodecError};
+use mess_store::{Snapshottable, StableSnapshotId, StateCodecError};
 
 use crate::Id;
+use crate::domain::snapshot_codec;
 use crate::domain::snapshot_codec::{Reader, put_bool, put_opt_id, put_str};
 
 // ---------------------------------------------------------------------------
@@ -117,6 +118,12 @@ impl Post {
 /// new/removed field, a reordered blob). A bump invalidates older snapshots
 /// (rebuilt by full replay, §9); a pure refactor preserving both does not bump.
 impl Snapshottable for Post {
+    const AGGREGATE_SCHEMA_ID: StableSnapshotId =
+        StableSnapshotId::new("social.post");
+    // The state codec is shared with the other three aggregates, so it is
+    // named and versioned separately from this fold.
+    const CODEC_ID: StableSnapshotId = snapshot_codec::CODEC_ID;
+    const CODEC_VERSION: u32 = snapshot_codec::CODEC_VERSION;
     const FOLD_VERSION: u32 = 1;
 
     fn encode_state(&self) -> Result<Vec<u8>, StateCodecError> {

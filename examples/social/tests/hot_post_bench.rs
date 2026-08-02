@@ -49,8 +49,8 @@ use std::time::{Duration, Instant};
 use mess_core::Decide;
 use mess_derive::{Aggregate, Event};
 use mess_store::{
-    EventStore, LogEngine, PackSnapshotBackend, Snapshottable, StateCodecError,
-    Version,
+    EventStore, LogEngine, PackSnapshotBackend, Snapshottable,
+    StableSnapshotId, StateCodecError, Version,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -148,6 +148,8 @@ impl Decide<MegaUnlike> for MegaPost {
 /// *point* of measurement (d) is that this blob grows with the crowd, unlike a
 /// bounded aggregate's fixed-size snapshot.
 impl Snapshottable for MegaPost {
+    const AGGREGATE_SCHEMA_ID: StableSnapshotId =
+        StableSnapshotId::new("social.bench.mega-post");
     const FOLD_VERSION: u32 = 1;
 
     fn encode_state(&self) -> Result<Vec<u8>, StateCodecError> {

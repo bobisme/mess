@@ -89,6 +89,15 @@ identity; an unqualified unbounded "latest for stream" scan is forbidden.
 `bn-3l8n` migrates every application, example, test, CLI, and public document to
 the stable identity.
 
+> **Implementation note (`bn-2gns`).** The source-breaking trait change deferred
+> by `bn-ozi5` shipped in `bn-2gns`, together with the public
+> `SnapshotCompatibility`/`SnapshotCoverage` types, the equal-coverage conflict
+> rule below, and the pinned-root bounded scan. `docs/snapshots.md` is the
+> caller-facing contract page for the resulting API; this section remains
+> normative. `CertifiedSnapshotRef` is still deferred — the snapshot-side
+> fold-chain wiring it needs does not exist — and the public trust enum is
+> `#[non_exhaustive]` so adding it is not a second source break.
+
 Coverage is encoded as a tag plus, only for `Through`, a `u64`. Its total order
 is exactly:
 

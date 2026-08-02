@@ -39,20 +39,43 @@ use super::format::{
     encode_record, parse_pack_name, parse_root_name, root_name,
 };
 use super::sidecar::{FaultHook, PackSidecarError, Sidecar, SidecarOptions};
+use crate::snapshot::{
+    SnapshotCompatibility, SnapshotCoverage, SnapshotSaveOutcome,
+    SnapshotScanDiagnostic, StableSnapshotId,
+};
 
 fn dir(name: &str) -> SweepingTempDir {
     mess_testkit::sweeping_temp_dir(&format!("pack-snapshot-{name}"))
 }
 
+/// The identity nearly every test in this file writes under.
+fn compat(fold: u32) -> SnapshotCompatibility {
+    SnapshotCompatibility {
+        aggregate_schema_id: StableSnapshotId::new("pack.test"),
+        fold_version:        fold,
+        codec_id:            StableSnapshotId::new("pack.test"),
+        codec_version:       1,
+    }
+}
+
 fn rec(stream: &str, version: u64, state: &[u8]) -> Record {
     Record {
-        stream_name:         stream.to_owned(),
-        fold_version:        1,
-        covers_empty_prefix: false,
-        stream_version:      version,
-        snapshot_ptr:        7,
-        trust_mode:          TRUST_UNVERIFIED_CACHE,
-        state:               state.to_vec(),
+        stream_name:   stream.to_owned(),
+        compatibility: compat(1),
+        coverage:      SnapshotCoverage::Through(version),
+        trust_mode:    TRUST_UNVERIFIED_CACHE,
+        state:         state.to_vec(),
+    }
+}
+
+/// Test shorthand: resolve a head under the default identity, as an `Option`.
+trait LoadDefaultIdentity {
+    fn load1(&self, stream: &str) -> Option<Record>;
+}
+
+impl LoadDefaultIdentity for Sidecar {
+    fn load1(&self, stream: &str) -> Option<Record> {
+        self.load(stream, compat(1)).hit()
     }
 }
 
@@ -165,8 +188,14 @@ fn clones_share_one_serialized_writer_owner() {
     });
     ta.join().expect("alpha thread");
     tb.join().expect("beta thread");
-    assert_eq!(s.load("alpha").expect("alpha").stream_version, 49);
-    assert_eq!(s.load("beta").expect("beta").stream_version, 49);
+    assert_eq!(
+        s.load1("alpha").expect("alpha").coverage,
+        SnapshotCoverage::Through(49)
+    );
+    assert_eq!(
+        s.load1("beta").expect("beta").coverage,
+        SnapshotCoverage::Through(49)
+    );
 }
 
 #[test]
@@ -182,7 +211,7 @@ fn a_reader_never_mutates_the_directory_and_takes_no_lock() {
     // A live writer plus a reader must coexist.
     let _writer = Sidecar::open_writer(d.path(), durable()).expect("writer");
     let r = Sidecar::open_reader(d.path());
-    assert_eq!(r.load("s1").expect("reader sees the head").state, b"state");
+    assert_eq!(r.load1("s1").expect("reader sees the head").state, b"state");
     let err = r.save(&rec("s1", 4, b"nope")).expect_err("reader cannot write");
     assert!(matches!(err, PackSidecarError::ReadOnly(_)), "got {err:?}");
     assert!(r.roll_now().is_err(), "reader cannot roll");
@@ -204,12 +233,12 @@ fn a_reader_on_a_missing_or_empty_sidecar_simply_has_no_heads() {
     let missing = d.path().join("not-here");
     let r = Sidecar::open_reader(&missing);
     assert_eq!(r.head_count(), 0);
-    assert!(r.load("anything").is_none());
+    assert!(r.load1("anything").is_none());
     assert!(!missing.exists(), "opening a reader must not create the dir");
 
     std::fs::create_dir_all(&missing).expect("mkdir");
     let r = Sidecar::open_reader(&missing);
-    assert!(r.load("anything").is_none());
+    assert!(r.load1("anything").is_none());
     assert_eq!(listing(&missing), Vec::new(), "still nothing created");
 }
 
@@ -228,7 +257,7 @@ fn identity_is_created_once_and_reused_across_reopen() {
     };
     let s = Sidecar::open_writer(d.path(), durable()).expect("reopen");
     assert_eq!(s.uuid(), first, "the store UUID is persisted, not reminted");
-    assert_eq!(s.load("s").expect("head survives").state, b"x");
+    assert_eq!(s.load1("s").expect("head survives").state, b"x");
 }
 
 #[test]
@@ -325,9 +354,9 @@ fn save_load_and_reopen_are_idempotent() {
         let s = Sidecar::open_writer(d.path(), durable()).expect("reopen");
         assert_eq!(s.head_count(), 20, "round {round}");
         for i in 0..20u64 {
-            let r = s.load(&format!("stream-{i}")).expect("head");
+            let r = s.load1(&format!("stream-{i}")).expect("head");
             assert_eq!(r.state, vec![i as u8; 16]);
-            assert_eq!(r.stream_version, i);
+            assert_eq!(r.coverage, SnapshotCoverage::Through(i));
             assert_eq!(r.stream_name, format!("stream-{i}"));
         }
         assert_eq!(s.stream_names().len(), 20);
@@ -359,55 +388,174 @@ fn coverage_never_regresses_and_identical_saves_are_idempotent() {
     let after_first = s.metrics.records_written.load(Ordering::Relaxed);
 
     // Lower coverage must not become the head.
-    s.save(&rec("s", 2, b"two")).expect("save");
-    assert_eq!(s.load("s").expect("head").state, b"five");
+    assert_eq!(
+        s.save(&rec("s", 2, b"two")).expect("save"),
+        SnapshotSaveOutcome::CoverageRegressed {
+            current: SnapshotCoverage::Through(5),
+        }
+    );
+    assert_eq!(s.load1("s").expect("head").state, b"five");
     assert_eq!(s.metrics.coverage_regressions.load(Ordering::Relaxed), 1);
     assert_eq!(s.metrics.records_written.load(Ordering::Relaxed), after_first);
 
     // Byte-identical re-save at the same coverage writes nothing.
-    s.save(&rec("s", 5, b"five")).expect("save");
+    assert_eq!(
+        s.save(&rec("s", 5, b"five")).expect("save"),
+        SnapshotSaveOutcome::Idempotent
+    );
     assert_eq!(s.metrics.idempotent_saves.load(Ordering::Relaxed), 1);
     assert_eq!(s.metrics.records_written.load(Ordering::Relaxed), after_first);
 
-    // Same coverage, different bytes: a single-writer sidecar supersedes.
-    s.save(&rec("s", 5, b"FIVE")).expect("save");
-    assert_eq!(s.load("s").expect("head").state, b"FIVE");
-
     // Higher coverage replaces.
-    s.save(&rec("s", 9, b"nine")).expect("save");
-    assert_eq!(s.load("s").expect("head").stream_version, 9);
+    assert_eq!(
+        s.save(&rec("s", 9, b"nine")).expect("save"),
+        SnapshotSaveOutcome::Published
+    );
+    assert_eq!(
+        s.load1("s").expect("head").coverage,
+        SnapshotCoverage::Through(9)
+    );
 
     // The empty prefix is strictly below Through(0) and must not displace it.
     let mut empty = rec("t", 0, b"init");
-    empty.covers_empty_prefix = true;
+    empty.coverage = SnapshotCoverage::Empty;
     s.save(&empty).expect("save empty");
-    assert!(s.load("t").expect("head").covers_empty_prefix);
+    assert_eq!(s.load1("t").expect("head").coverage, SnapshotCoverage::Empty);
     s.save(&rec("t", 0, b"zero")).expect("save through(0)");
-    let t = s.load("t").expect("head");
-    assert!(!t.covers_empty_prefix, "Through(0) outranks Empty");
-    s.save(&empty).expect("save empty again");
-    assert!(
-        !s.load("t").expect("head").covers_empty_prefix,
+    assert_eq!(
+        s.load1("t").expect("head").coverage,
+        SnapshotCoverage::Through(0),
+        "Through(0) outranks Empty"
+    );
+    assert_eq!(
+        s.save(&empty).expect("save empty again"),
+        SnapshotSaveOutcome::CoverageRegressed {
+            current: SnapshotCoverage::Through(0),
+        },
         "Empty must not regress a Through(0) head"
+    );
+    assert_eq!(
+        s.load1("t").expect("head").coverage,
+        SnapshotCoverage::Through(0)
     );
 }
 
 #[test]
 #[cfg_attr(miri, ignore)]
-fn a_different_fold_version_always_replaces_the_head() {
-    // The seam exposes exactly one head per stream, and
-    // `EventStore::load_cached` relies on a fold-version bump *replacing* the
-    // stale record — including when the rebuilt snapshot covers the same
-    // version.
-    let d = dir("fold-version");
+fn equal_coverage_with_different_state_is_a_conflict_the_current_head_wins() {
+    // ADR 0002 §1 rule 3. Two records claiming to fold the same prefix of the
+    // same stream under the same identity to different states cannot both be
+    // right; the store keeps the older evidence and reports the disagreement
+    // rather than alternating between two answers.
+    let d = dir("equal-coverage-conflict");
+    let s = Sidecar::open_writer(d.path(), durable()).expect("open");
+    s.save(&rec("s", 5, b"five")).expect("save");
+    let after_first = s.metrics.records_written.load(Ordering::Relaxed);
+
+    assert_eq!(
+        s.save(&rec("s", 5, b"FIVE")).expect("save"),
+        SnapshotSaveOutcome::Conflict {
+            coverage: SnapshotCoverage::Through(5),
+        }
+    );
+    assert_eq!(
+        s.load1("s").expect("head").state,
+        b"five",
+        "the valid current record remains current"
+    );
+    assert_eq!(s.metrics.conflicts.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        s.metrics.records_written.load(Ordering::Relaxed),
+        after_first,
+        "a refused save writes nothing at all"
+    );
+
+    // ... and it survives a reopen: nothing was written to be recovered.
+    drop(s);
+    let s = Sidecar::open_writer(d.path(), durable()).expect("reopen");
+    assert_eq!(s.load1("s").expect("head").state, b"five");
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn an_unreadable_head_at_equal_coverage_is_repaired_not_refused() {
+    // ADR 0002 §1 rule 1: validating the current record *before* superseding
+    // it is what lets a corrupt head be healed without weakening rule 3.
+    let d = dir("equal-coverage-repair");
+    let s = Sidecar::open_writer(d.path(), durable()).expect("open");
+    s.save(&rec("s", 5, b"five")).expect("save");
+
+    // Bit rot under a live writer: the committed record's bytes go bad in
+    // place, same length, so the root still names a frame that is simply no
+    // longer the one it named. (Corrupting across a reopen instead would be a
+    // torn tail, which the writer truncates — a different contract.)
+    let pack = pack_path(d.path(), false).expect("active pack");
+    let mut bytes = std::fs::read(&pack).expect("read pack");
+    // Locate the state by its full byte pattern: the pack header carries 16
+    // random identity bytes, and a single-byte search would sometimes hit one
+    // of those instead (a header a reader never validates — a flaky no-op).
+    let at =
+        bytes.windows(4).position(|w| w == b"five").expect("the state bytes");
+    bytes[at] = b'F';
+    std::fs::write(&pack, &bytes).expect("write pack");
+
+    assert!(s.load1("s").is_none(), "a corrupt head is a miss");
+    assert_eq!(
+        s.save(&rec("s", 5, b"five")).expect("save"),
+        SnapshotSaveOutcome::Repaired
+    );
+    assert_eq!(s.load1("s").expect("head").state, b"five");
+    assert_eq!(s.metrics.repairs.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_different_identity_gets_its_own_head_and_never_hides_another() {
+    // ADR 0002 §1: stream name plus compatibility is the complete key, so a
+    // deploy's new identity does not overwrite the old one — and a *late* save
+    // under the old identity cannot hide or delete the new one.
+    let d = dir("identity-keys");
     let s = Sidecar::open_writer(d.path(), durable()).expect("open");
     s.save(&rec("s", 5, b"v1")).expect("save");
+
     let mut bumped = rec("s", 5, b"v2");
-    bumped.fold_version = 2;
+    bumped.compatibility = compat(2);
     s.save(&bumped).expect("save bumped");
-    let head = s.load("s").expect("head");
-    assert_eq!(head.fold_version, 2);
-    assert_eq!(head.state, b"v2");
+
+    assert_eq!(s.load1("s").expect("v1 head").state, b"v1");
+    assert_eq!(s.load("s", compat(2)).hit().expect("v2 head").state, b"v2");
+    assert_eq!(s.head_count(), 2, "one head per identity");
+    assert_eq!(s.stream_names(), vec!["s".to_string()], "one stream");
+
+    // A late save under the OLD identity at a HIGHER coverage advances only
+    // its own head.
+    s.save(&rec("s", 9, b"v1-late")).expect("late save");
+    assert_eq!(s.load1("s").expect("v1 head").state, b"v1-late");
+    assert_eq!(
+        s.load("s", compat(2)).hit().expect("v2 head").state,
+        b"v2",
+        "the newer identity is untouched"
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_miss_says_whether_the_stream_has_a_foreign_identity() {
+    use crate::snapshot::{SnapshotLookup, SnapshotMiss};
+
+    let d = dir("miss-reasons");
+    let s = Sidecar::open_writer(d.path(), durable()).expect("open");
+    assert_eq!(
+        s.load("nothing", compat(1)),
+        SnapshotLookup::Miss(SnapshotMiss::Absent)
+    );
+
+    s.save(&rec("s", 5, b"v1")).expect("save");
+    assert_eq!(
+        s.load("s", compat(2)),
+        SnapshotLookup::Miss(SnapshotMiss::Incompatible { stored: compat(1) }),
+        "a post-deploy load must be able to say why it missed"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -455,7 +603,7 @@ fn rolling_seals_packs_that_are_then_never_appended() {
     let r = Sidecar::open_reader(d.path());
     for i in 0..80u64 {
         assert_eq!(
-            r.load(&format!("s{i}")).expect("head").state,
+            r.load1(&format!("s{i}")).expect("head").state,
             vec![i as u8; 64],
             "head {i} must survive multi-pack reopen"
         );
@@ -496,12 +644,12 @@ fn a_torn_active_tail_is_truncated_at_the_last_valid_frame() {
         "the writer truncates to the last valid frame end"
     );
     assert!(s.metrics.tail_truncated_bytes.load(Ordering::Relaxed) > 0);
-    assert_eq!(s.load("keep").expect("head").state, b"kept");
-    assert!(s.load("after").is_none(), "an unreachable frame is not a head");
+    assert_eq!(s.load1("keep").expect("head").state, b"kept");
+    assert!(s.load1("after").is_none(), "an unreachable frame is not a head");
 
     // And the writer can keep appending after the truncation.
     s.save(&rec("next", 4, b"more")).expect("save after recovery");
-    assert_eq!(s.load("next").expect("head").state, b"more");
+    assert_eq!(s.load1("next").expect("head").state, b"more");
 }
 
 #[test]
@@ -525,11 +673,11 @@ fn a_corrupt_frame_mid_pack_is_a_miss_never_a_wrong_answer() {
 
     let r = Sidecar::open_reader(d.path());
     assert!(
-        r.load("victim").is_none(),
+        r.load1("victim").is_none(),
         "a CRC-broken record is a miss, so the caller replays"
     );
     assert_eq!(
-        r.load("bystander").expect("intact head").state,
+        r.load1("bystander").expect("intact head").state,
         b"BBBBBBBBBBBBBBBB",
         "one corrupt record must not take down its neighbours"
     );
@@ -589,7 +737,7 @@ fn a_stale_root_naming_a_missing_pack_falls_back_to_an_older_root() {
     assert!(r.head_count() > 0, "the fallback must find a usable root");
     for name in r.stream_names() {
         assert!(
-            r.load(&name).is_some(),
+            r.load1(&name).is_some(),
             "selected root must be independently resolvable ({name})"
         );
     }
@@ -632,13 +780,13 @@ fn every_root_corrupt_degrades_to_no_snapshots_not_an_error() {
 
     let r = Sidecar::open_reader(d.path());
     assert_eq!(r.head_count(), 0, "no usable root => no heads");
-    assert!(r.load("s").is_none());
+    assert!(r.load1("s").is_none());
 
     // The writer must also open cleanly and start publishing again.
     let w = Sidecar::open_writer(d.path(), durable()).expect("writer opens");
     assert_eq!(w.head_count(), 0);
     w.save(&rec("s", 3, b"z")).expect("save");
-    assert_eq!(w.load("s").expect("head").state, b"z");
+    assert_eq!(w.load1("s").expect("head").state, b"z");
 }
 
 #[test]
@@ -652,11 +800,11 @@ fn deleting_the_whole_sidecar_degrades_to_no_heads() {
     }
     std::fs::remove_dir_all(&inner).expect("nuke");
     let r = Sidecar::open_reader(&inner);
-    assert!(r.load("s").is_none());
+    assert!(r.load1("s").is_none());
     let w = Sidecar::open_writer(&inner, durable()).expect("recreates");
     assert_eq!(w.head_count(), 0);
     w.save(&rec("s", 1, b"x")).expect("save");
-    assert_eq!(w.load("s").expect("head").state, b"x");
+    assert_eq!(w.load1("s").expect("head").state, b"x");
 }
 
 #[test]
@@ -685,10 +833,10 @@ fn reserved_tmp_names_are_never_discovery_candidates() {
     std::fs::write(&liar_pack, b"junk").expect("plant");
 
     let r = Sidecar::open_reader(d.path());
-    assert_eq!(r.load("s").expect("real head").state, b"real");
+    assert_eq!(r.load1("s").expect("real head").state, b"real");
     drop(r);
     let w = Sidecar::open_writer(d.path(), durable()).expect("writer opens");
-    assert_eq!(w.load("s").expect("real head").state, b"real");
+    assert_eq!(w.load1("s").expect("real head").state, b"real");
     w.save(&rec("s", 2, b"more")).expect("save");
     assert!(liar.exists() && liar_pack.exists(), "and nothing was cleaned up");
 }
@@ -726,11 +874,11 @@ fn assert_crash_recovers(
     let s =
         Sidecar::open_writer(d.path(), options).expect("reopen after crash");
     assert_eq!(
-        s.load("before").map(|r| r.state),
+        s.load1("before").map(|r| r.state),
         Some(b"committed".to_vec()),
         "[{step}] a head published before the crash must survive"
     );
-    if let Some(r) = s.load("during") {
+    if let Some(r) = s.load1("during") {
         assert_eq!(
             r.state,
             b"in-flight".to_vec(),
@@ -739,10 +887,10 @@ fn assert_crash_recovers(
     }
     // And the sidecar is immediately usable again.
     s.save(&rec("after", 99, b"recovered")).expect("save after recovery");
-    assert_eq!(s.load("after").expect("head").state, b"recovered");
+    assert_eq!(s.load1("after").expect("head").state, b"recovered");
     drop(s);
     let r = Sidecar::open_reader(d.path());
-    assert_eq!(r.load("after").expect("head").state, b"recovered");
+    assert_eq!(r.load1("after").expect("head").state, b"recovered");
 }
 
 #[test]
@@ -824,7 +972,7 @@ fn crash_at_every_prune_step_keeps_at_least_two_roots() {
             "[{step}] at least two complete roots must remain, saw {gens:?}"
         );
         let s = Sidecar::open_writer(d.path(), opts).expect("reopen");
-        assert!(s.load("s").is_some(), "[{step}] a head must still resolve");
+        assert!(s.load1("s").is_some(), "[{step}] a head must still resolve");
         s.save(&rec("s", 10, b"ten")).expect("still writable");
     }
 }
@@ -849,8 +997,8 @@ fn pruning_retains_at_least_two_roots_and_keeps_loading() {
     assert!(s.metrics.roots_pruned.load(Ordering::Relaxed) > 0);
     drop(s);
     assert_eq!(
-        Sidecar::open_reader(d.path()).load("s").expect("head").stream_version,
-        29
+        Sidecar::open_reader(d.path()).load1("s").expect("head").coverage,
+        SnapshotCoverage::Through(29)
     );
 }
 
@@ -890,7 +1038,7 @@ fn a_partially_persisted_footer_recovers_by_truncation() {
         before_len,
         "an incomplete footer is truncated back to the last valid frame"
     );
-    assert_eq!(s.load("before").expect("head").state, b"committed");
+    assert_eq!(s.load1("before").expect("head").state, b"committed");
     s.save(&rec("after", 3, b"recovered")).expect("still writable");
 }
 
@@ -914,11 +1062,14 @@ fn buffered_issues_no_barriers_and_durable_does() {
         "a Buffered save is a discardable cache write: no fsync at all"
     );
     // …yet it is still ordered and atomically visible.
-    assert_eq!(s.load("s").expect("head").stream_version, 9);
+    assert_eq!(
+        s.load1("s").expect("head").coverage,
+        SnapshotCoverage::Through(9)
+    );
     drop(s);
     assert_eq!(
-        Sidecar::open_reader(d.path()).load("s").expect("head").stream_version,
-        9
+        Sidecar::open_reader(d.path()).load1("s").expect("head").coverage,
+        SnapshotCoverage::Through(9)
     );
 
     let d2 = dir("durable");
@@ -991,12 +1142,15 @@ fn readers_pread_committed_ranges_while_the_writer_appends() {
     let t = std::thread::spawn(move || {
         let mut seen = 0u64;
         while !stop_r.load(Ordering::Relaxed) {
-            if let Some(r) = reader.load("hot") {
+            if let Some(r) = reader.load1("hot") {
                 // Every observation must be an internally consistent record,
                 // never a shred of one.
                 assert_eq!(r.state.len(), 128);
                 assert!(r.state.iter().all(|b| *b == r.state[0]));
-                assert_eq!(u64::from(r.state[0]), r.stream_version % 251);
+                assert_eq!(
+                    u64::from(r.state[0]),
+                    r.coverage.covered_version().unwrap_or(0) % 251
+                );
                 seen += 1;
             }
         }
@@ -1009,4 +1163,227 @@ fn readers_pread_committed_ranges_while_the_writer_appends() {
     let seen = t.join().expect("reader thread");
     assert!(seen > 0, "the reader must have observed something");
     assert_eq!(s.metrics.degraded_loads.load(Ordering::Relaxed), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Bounded administrative scan (ADR 0002 §1, "Bounded copy-on-write discovery")
+// ---------------------------------------------------------------------------
+
+/// Walk every page of one pin, asserting the page contract as it goes.
+fn drain_scan(
+    s: &Sidecar,
+    pin: &crate::snapshot::PinnedSnapshotRoot,
+    limit: u32,
+) -> (Vec<crate::snapshot::SnapshotScanEntry>, Vec<SnapshotScanDiagnostic>) {
+    let limit = std::num::NonZeroU32::new(limit).expect("nonzero");
+    let mut all = Vec::new();
+    let mut diags = Vec::new();
+    let mut cursor = None;
+    let mut pages = 0;
+    loop {
+        let page = s.scan(pin, cursor.as_ref(), limit);
+        assert!(
+            page.entries.len() <= limit.get() as usize,
+            "a page must never exceed its limit"
+        );
+        diags.push(page.diagnostic);
+        all.extend(page.entries);
+        pages += 1;
+        assert!(pages < 10_000, "pagination must terminate");
+        match page.next_cursor {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+    (all, diags)
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_bounded_scan_pages_every_head_exactly_once_in_key_order() {
+    // The scale shape: many heads, small pages, no page holding more than its
+    // limit, and the concatenation being the complete set in key order.
+    let d = dir("scan-scale");
+    let s = Sidecar::open_writer(d.path(), SidecarOptions::default())
+        .expect("open");
+    const HEADS: u64 = 2_000;
+    for i in 0..HEADS {
+        s.save(&rec(&format!("stream-{i:06}"), i, &[i as u8; 8]))
+            .expect("save");
+    }
+
+    let pin = s.pin_root().expect("a published root");
+    let (entries, diags) = drain_scan(&s, &pin, 64);
+    assert_eq!(entries.len() as u64, HEADS, "every head, exactly once");
+    assert!(
+        diags.iter().all(|d| *d == SnapshotScanDiagnostic::Complete),
+        "an intact sidecar scans clean: {diags:?}"
+    );
+    assert!(
+        entries.windows(2).all(|w| w[0].key < w[1].key),
+        "strictly ascending key order, so pages neither overlap nor skip"
+    );
+    assert_eq!(entries[0].key.stream_id, "stream-000000");
+    assert_eq!(entries[0].coverage, SnapshotCoverage::Through(0));
+    assert_eq!(entries[0].key.compatibility, compat(1));
+    assert_eq!(entries[0].state_len, 8);
+    assert_eq!(
+        entries[0].trust,
+        crate::snapshot::SnapshotTrust::UnverifiedCache
+    );
+
+    // The limit is capped, not merely trusted: an unbounded request yields at
+    // most the cap, and the cap is below the head count here on purpose.
+    let huge = std::num::NonZeroU32::new(u32::MAX).expect("nonzero");
+    let page = s.scan(&pin, None, huge);
+    assert_eq!(
+        page.entries.len() as u64,
+        u64::from(crate::snapshot::MAX_SNAPSHOT_SCAN_LIMIT).min(HEADS),
+        "an unbounded request is clamped, never honoured"
+    );
+    assert!(
+        (page.entries.len() as u64) < HEADS
+            || HEADS <= u64::from(crate::snapshot::MAX_SNAPSHOT_SCAN_LIMIT)
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn one_stream_under_two_identities_is_two_scan_entries() {
+    let d = dir("scan-identities");
+    let s = Sidecar::open_writer(d.path(), SidecarOptions::default())
+        .expect("open");
+    s.save(&rec("s", 1, b"v1")).expect("save");
+    let mut v2 = rec("s", 1, b"v2");
+    v2.compatibility = compat(2);
+    s.save(&v2).expect("save");
+
+    let pin = s.pin_root().expect("root");
+    let (entries, _) = drain_scan(&s, &pin, 8);
+    assert_eq!(entries.len(), 2);
+    assert!(entries.iter().all(|e| e.key.stream_id == "s"));
+    assert_eq!(entries[0].key.compatibility, compat(1));
+    assert_eq!(entries[1].key.compatibility, compat(2));
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_cursor_from_another_root_is_rejected_not_reinterpreted() {
+    let d1 = dir("scan-root-a");
+    let s1 =
+        Sidecar::open_writer(d1.path(), SidecarOptions::default()).expect("a");
+    for i in 0..4u64 {
+        s1.save(&rec(&format!("s{i}"), i, b"x")).expect("save");
+    }
+    let pin1 = s1.pin_root().expect("root");
+    let page = s1.scan(&pin1, None, std::num::NonZeroU32::new(2).unwrap());
+    let cursor = page.next_cursor.expect("more pages");
+
+    // A different store entirely.
+    let d2 = dir("scan-root-b");
+    let s2 =
+        Sidecar::open_writer(d2.path(), SidecarOptions::default()).expect("b");
+    s2.save(&rec("s0", 0, b"x")).expect("save");
+    let pin2 = s2.pin_root().expect("root");
+    assert_eq!(
+        s2.scan(&pin2, Some(&cursor), std::num::NonZeroU32::new(2).unwrap())
+            .diagnostic,
+        SnapshotScanDiagnostic::Rejected,
+        "a foreign cursor names a key that may mean something else here"
+    );
+    assert_eq!(
+        s1.scan(&pin2, None, std::num::NonZeroU32::new(2).unwrap()).diagnostic,
+        SnapshotScanDiagnostic::Rejected,
+        "so is a foreign pin"
+    );
+
+    // The same store, but a generation later: the old pin no longer names the
+    // served root, so a destructive caller fails closed.
+    s1.save(&rec("s9", 9, b"new")).expect("save");
+    assert_eq!(
+        s1.scan(&pin1, None, std::num::NonZeroU32::new(2).unwrap()).diagnostic,
+        SnapshotScanDiagnostic::Rejected,
+        "a stale pin is rejected, not silently upgraded"
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_corrupt_head_makes_its_page_partial_and_is_skipped_never_faked() {
+    let d = dir("scan-partial");
+    {
+        let s = Sidecar::open_writer(d.path(), durable()).expect("open");
+        s.save(&rec("a", 1, b"AAAAAAAAAAAAAAAA")).expect("save");
+        s.save(&rec("b", 2, b"BBBBBBBBBBBBBBBB")).expect("save");
+    }
+    // Corrupt exactly one committed record's bytes.
+    let pack = pack_path(d.path(), false).expect("active pack");
+    let mut bytes = std::fs::read(&pack).expect("read");
+    let at = bytes
+        .windows(16)
+        .position(|w| w == b"AAAAAAAAAAAAAAAA")
+        .expect("the victim's state bytes");
+    bytes[at] = b'Z';
+    std::fs::write(&pack, &bytes).expect("write");
+
+    let r = Sidecar::open_reader(d.path());
+    let pin = r.pin_root().expect("root");
+    let (entries, diags) = drain_scan(&r, &pin, 8);
+    assert_eq!(entries.len(), 1, "the intact head is still reported");
+    assert_eq!(entries[0].key.stream_id, "b");
+    assert!(
+        diags.contains(&SnapshotScanDiagnostic::Partial { unresolved: 1 }),
+        "the damaged head is counted, not fabricated: {diags:?}"
+    );
+    assert!(
+        !diags.contains(&SnapshotScanDiagnostic::Complete),
+        "and the page must not claim to be complete"
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_pin_holds_its_view_while_the_writer_publishes_over_it() {
+    // The lease: a scan walking a pinned root sees exactly that root's heads,
+    // however many generations land on top of it.
+    let d = dir("scan-lease");
+    let s = Sidecar::open_writer(d.path(), SidecarOptions::default())
+        .expect("open");
+    for i in 0..8u64 {
+        s.save(&rec(&format!("s{i}"), i, b"x")).expect("save");
+    }
+    let pin = s.pin_root().expect("root");
+    let first = s.scan(&pin, None, std::num::NonZeroU32::new(4).unwrap());
+    assert_eq!(first.entries.len(), 4);
+
+    // Publish more heads mid-scan. The pin is now stale, which is exactly the
+    // fail-closed signal — and the immutable view it leased is still alive.
+    for i in 8..16u64 {
+        s.save(&rec(&format!("s{i}"), i, b"x")).expect("save");
+    }
+    assert_eq!(
+        s.scan(
+            &pin,
+            first.next_cursor.as_ref(),
+            std::num::NonZeroU32::new(4).unwrap()
+        )
+        .diagnostic,
+        SnapshotScanDiagnostic::Rejected
+    );
+
+    // Re-pinning sees the new generation and the complete set.
+    let pin = s.pin_root().expect("root");
+    let (entries, diags) = drain_scan(&s, &pin, 4);
+    assert_eq!(entries.len(), 16);
+    assert!(diags.iter().all(|d| *d == SnapshotScanDiagnostic::Complete));
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_store_with_no_published_root_has_nothing_to_pin() {
+    let d = dir("scan-empty");
+    let s = Sidecar::open_writer(d.path(), SidecarOptions::default())
+        .expect("open");
+    assert!(s.pin_root().is_none(), "no root, nothing to enumerate");
+    assert!(Sidecar::open_reader(d.path()).pin_root().is_none());
 }

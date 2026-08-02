@@ -15,8 +15,8 @@
 
 use mess_core::{Aggregate, CodecError, Event};
 use mess_store::{
-    EventStore, MockBackend, SnapshotStore, Snapshottable, StateCodecError,
-    Version,
+    EventStore, MockBackend, SnapshotStore, Snapshottable, StableSnapshotId,
+    StateCodecError, Version,
 };
 
 // ---------------------------------------------------------------------------
@@ -107,6 +107,8 @@ impl Aggregate for Counter {
 }
 
 impl Snapshottable for Counter {
+    const AGGREGATE_SCHEMA_ID: StableSnapshotId =
+        StableSnapshotId::new("mess-store.test.counter");
     const FOLD_VERSION: u32 = 1;
 
     fn encode_state(&self) -> Result<Vec<u8>, StateCodecError> {
@@ -134,6 +136,8 @@ impl Aggregate for CounterV2 {
 }
 
 impl Snapshottable for CounterV2 {
+    const AGGREGATE_SCHEMA_ID: StableSnapshotId =
+        StableSnapshotId::new("mess-store.test.counter");
     const FOLD_VERSION: u32 = 2;
 
     fn encode_state(&self) -> Result<Vec<u8>, StateCodecError> {
@@ -171,7 +175,10 @@ async fn deploy_bump_invalidates_rebuilds_once_and_replaces() {
     ];
     store.append(stream, Version::NoStream, &events).await.unwrap();
     let v1_ref = store.save_snapshot::<Counter>(stream).await.unwrap();
-    assert_eq!(v1_ref.fold_version, 1, "old snapshot carries the v1 fold");
+    assert_eq!(
+        v1_ref.snapshot_ref.compatibility.fold_version, 1,
+        "old snapshot carries the v1 fold"
+    );
 
     // The stored (v1) blob summarizes total=8, marks=0 — WRONG for v2, whose
     // correct answer counts the two marks.
@@ -208,12 +215,13 @@ async fn deploy_bump_invalidates_rebuilds_once_and_replaces() {
     // (c) the stale snapshot was REPLACED with a fresh v2 one.
     let replaced = store
         .backend()
-        .load_snapshot(stream)
+        .load_snapshot(stream, CounterV2::snapshot_compatibility())
         .await
         .unwrap()
-        .expect("a snapshot is still present after the rebuild");
+        .hit()
+        .expect("a snapshot is present under the NEW identity");
     assert_eq!(
-        replaced.snapshot_ref.fold_version, 2,
+        replaced.snapshot_ref.compatibility.fold_version, 2,
         "the replacement snapshot carries the new fold_version"
     );
 

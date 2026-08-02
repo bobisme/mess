@@ -69,7 +69,8 @@ use mess_derive::{Aggregate, Event};
 use mess_store::registry::RESERVED_STREAM_NAME;
 use mess_store::{
     AppendError, Appended, Backend, EventStore, LogEngine, OwnedAppendBatch,
-    PackSnapshotBackend, RecordToAppend, SnapshotStore, Snapshottable,
+    PackSnapshotBackend, RecordToAppend, SnapshotCompatibility, SnapshotLookup,
+    SnapshotSaveOutcome, SnapshotStore, Snapshottable, StableSnapshotId,
     StateCodecError, StoredRecord, StoredSnapshot, SubscribeBackend, Version,
 };
 use mess_testkit::{SweepingTempDir, sweeping_temp_dir};
@@ -115,6 +116,8 @@ impl Decide<Touch> for Rel {
 }
 
 impl Snapshottable for Rel {
+    const AGGREGATE_SCHEMA_ID: StableSnapshotId =
+        StableSnapshotId::new("social.bench.rel");
     const FOLD_VERSION: u32 = 1;
 
     fn encode_state(&self) -> Result<Vec<u8>, StateCodecError> {
@@ -272,7 +275,7 @@ impl<B: SnapshotStore> SnapshotStore for ProfilingBackend<B> {
         &self,
         stream_id: &str,
         snapshot: StoredSnapshot,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<SnapshotSaveOutcome, Self::Error> {
         let t = Instant::now();
         let r = self.inner.save_snapshot(stream_id, snapshot).await;
         self.hist.record("save_snapshot", t.elapsed());
@@ -282,9 +285,10 @@ impl<B: SnapshotStore> SnapshotStore for ProfilingBackend<B> {
     async fn load_snapshot(
         &self,
         stream_id: &str,
-    ) -> Result<Option<StoredSnapshot>, Self::Error> {
+        compatibility: SnapshotCompatibility,
+    ) -> Result<SnapshotLookup, Self::Error> {
         let t = Instant::now();
-        let r = self.inner.load_snapshot(stream_id).await;
+        let r = self.inner.load_snapshot(stream_id, compatibility).await;
         self.hist.record("load_snapshot", t.elapsed());
         r
     }

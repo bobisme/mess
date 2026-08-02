@@ -25,7 +25,8 @@ use mess_cli::retention;
 use mess_index::sealed::retention::{RetentionDecision, decide_segment};
 use mess_index::sealed::segment::SealedSegmentIndex;
 use mess_store::{
-    BlobPtr, LogEngine, PackSnapshotBackend, SnapshotRef, SnapshotStore,
+    LogEngine, PackSnapshotBackend, SnapshotCompatibility, SnapshotCoverage,
+    SnapshotRef, SnapshotStore, SnapshotTrust, StableSnapshotId,
     StoredSnapshot, interim_stream_id,
 };
 
@@ -55,13 +56,19 @@ fn inject_snapshot(dir: &std::path::Path, version: u64) {
                 "acct-1",
                 StoredSnapshot {
                     snapshot_ref: SnapshotRef {
-                        stream_id:           interim_stream_id("acct-1"),
-                        stream_version:      version,
-                        fold_version:        1,
-                        covers_empty_prefix: false,
-                        event_prefix_hash:   None,
-                        state_hash:          None,
-                        snapshot_ptr:        BlobPtr(0),
+                        compatibility: SnapshotCompatibility {
+                            aggregate_schema_id: StableSnapshotId::new(
+                                "mess-cli.test.acct",
+                            ),
+                            fold_version:        1,
+                            codec_id:            StableSnapshotId::new(
+                                "mess-cli.test.acct",
+                            ),
+                            codec_version:       1,
+                        },
+                        coverage:      SnapshotCoverage::Through(version),
+                        trust:         SnapshotTrust::UnverifiedCache,
+                        stream_id:     interim_stream_id("acct-1"),
                     },
                     state_blob:   version.to_le_bytes().to_vec(),
                 },

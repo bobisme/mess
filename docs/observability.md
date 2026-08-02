@@ -271,7 +271,9 @@ Reported honestly rather than faked:
   a different (per-subscriber) surface.
 - **Separate write latency.** See §4.
 - **Snapshot-sidecar counters.** `pack_snapshot::SidecarMetrics`
-  (`degraded_loads`, `roots_rejected`, `packs_rolled`, …) is a
-  `PackSnapshotBackend` fact, not a `LogEngine` fact, and lives one layer up.
+  (`degraded_loads`, `roots_rejected`, `packs_rolled`, plus `repairs` and
+  `conflicts` — the ADR 0002 §1 equal-coverage outcomes, see
+  [snapshots.md](snapshots.md) §4) is a `PackSnapshotBackend` fact, not a
+  `LogEngine` fact, and lives one layer up.
   It is reachable through `PackSnapshotBackend::sidecar().metrics` and is not
   folded into `EngineObservability`, which reports the engine.

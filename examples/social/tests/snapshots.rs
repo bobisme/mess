@@ -20,7 +20,8 @@
 
 use mess_store::snapshot::{SnapshotStore, StoredSnapshot};
 use mess_store::{
-    BlobPtr, CommandError, EventStore, MockBackend, SnapshotRef, Snapshottable,
+    CommandError, EventStore, MockBackend, SnapshotCompatibility,
+    SnapshotCoverage, SnapshotRef, SnapshotTrust, Snapshottable,
     interim_stream_id,
 };
 use social::Id;
@@ -244,8 +245,9 @@ async fn stale_fold_version_is_invalidated_not_trusted() {
         .unwrap();
     let correct = store.load::<User>(&s).await.unwrap().state;
 
-    // Plant a snapshot with a mismatched fold_version whose blob decodes to a
-    // completely different user.
+    // Plant a snapshot under a DIFFERENT identity whose blob decodes to a
+    // completely different user. `load_cached` must never fall back across
+    // identities, however plausible the bytes look.
     let bogus = User {
         registered:   true,
         handle:       "wronghandle".into(),
@@ -253,13 +255,13 @@ async fn stale_fold_version_is_invalidated_not_trusted() {
     };
     let planted = StoredSnapshot {
         snapshot_ref: SnapshotRef {
-            stream_id:           interim_stream_id(&s),
-            stream_version:      0,
-            fold_version:        User::FOLD_VERSION.wrapping_add(9999),
-            covers_empty_prefix: false,
-            event_prefix_hash:   None,
-            state_hash:          None,
-            snapshot_ptr:        BlobPtr(0),
+            compatibility: SnapshotCompatibility {
+                fold_version: User::FOLD_VERSION.wrapping_add(9999),
+                ..User::snapshot_compatibility()
+            },
+            coverage:      SnapshotCoverage::Through(0),
+            trust:         SnapshotTrust::UnverifiedCache,
+            stream_id:     interim_stream_id(&s),
         },
         state_blob:   bogus.encode_state().unwrap(),
     };

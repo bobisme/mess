@@ -21,8 +21,22 @@
 //! [`parse_pack_name`]) and only ever accepts the exact final suffixes, so a
 //! `.tmp` file is never a discovery candidate — not by convention, but because
 //! its name cannot parse.
+//!
+//! # Format versions and what a bump means
+//!
+//! [`RECORD_FORMAT`] and [`ROOT_FORMAT`] are `2`: `bn-2gns` widened both to
+//! carry the stable [`SnapshotCompatibility`] identity. A decoder that meets a
+//! format it does not understand returns `None`, which every caller turns into
+//! a **miss** — so every sidecar written by an earlier build is simply not
+//! found, and the aggregate is rebuilt by replay. That is the whole migration
+//! story, and it is the law working, not a gap in it: snapshots are discardable
+//! acceleration.
 
 use std::fmt;
+
+use crate::snapshot::{
+    SnapshotCompatibility, SnapshotCoverage, SnapshotTrust, StableSnapshotId,
+};
 
 /// Reserved suffix for every staging file. Never a discovery candidate.
 pub const TMP_SUFFIX: &str = ".tmp";
@@ -97,34 +111,74 @@ impl fmt::Display for StoreUuid {
 }
 
 // ---------------------------------------------------------------------------
-// Coverage
+// Coverage and identity on the wire
 // ---------------------------------------------------------------------------
 
-/// What prefix of a stream a snapshot summarizes.
-///
-/// The total order is `Empty < Through(0) < Through(1) < …` (ADR 0002: an
-/// empty-prefix snapshot is strictly weaker than one covering event index 0,
-/// and the two can never collide). The public typed `SnapshotCoverage` in the
-/// ADR is deferred to the trait-breaking follow-up bone; this is the internal
-/// equivalent the storage core orders heads by.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Coverage {
-    /// Summarizes nothing — the aggregate's initial state.
-    Empty,
-    /// Summarizes events `0..=n`.
-    Through(u64),
-}
+/// Wire tag for [`SnapshotCoverage::Empty`].
+const COVERAGE_EMPTY: u8 = 0;
+/// Wire tag for [`SnapshotCoverage::Through`].
+const COVERAGE_THROUGH: u8 = 1;
 
-impl Coverage {
-    /// Build from the wire pair the current seam carries.
-    #[must_use]
-    pub fn from_parts(covers_empty_prefix: bool, stream_version: u64) -> Self {
-        if covers_empty_prefix {
-            Coverage::Empty
-        } else {
-            Coverage::Through(stream_version)
+/// Encode a coverage as `tag(1) || version(8)`.
+///
+/// The tag is what keeps `Empty` and `Through(0)` distinct on disk, exactly as
+/// the lattice keeps them distinct in memory: the version byte for `Empty` is
+/// written as zero and ignored on the way back in.
+fn put_coverage(out: &mut Vec<u8>, coverage: SnapshotCoverage) {
+    match coverage {
+        SnapshotCoverage::Empty => {
+            out.push(COVERAGE_EMPTY);
+            out.extend_from_slice(&0u64.to_le_bytes());
+        }
+        SnapshotCoverage::Through(n) => {
+            out.push(COVERAGE_THROUGH);
+            out.extend_from_slice(&n.to_le_bytes());
         }
     }
+}
+
+/// Decode a coverage. An unknown tag is `None` — a miss, never a guess.
+fn coverage_from_parts(tag: u8, version: u64) -> Option<SnapshotCoverage> {
+    match tag {
+        COVERAGE_EMPTY => Some(SnapshotCoverage::Empty),
+        COVERAGE_THROUGH => Some(SnapshotCoverage::Through(version)),
+        _ => None,
+    }
+}
+
+/// Decode a stored trust-mode byte.
+///
+/// ADR 0002 §1: exactly one semantic hash, or an unknown mode, is invalid and
+/// becomes a miss. This build writes and understands only
+/// [`TRUST_UNVERIFIED_CACHE`], so every other byte is `None`.
+#[must_use]
+pub fn trust_from_u8(mode: u8) -> Option<SnapshotTrust> {
+    (mode == TRUST_UNVERIFIED_CACHE).then_some(SnapshotTrust::UnverifiedCache)
+}
+
+/// Encode a stable id as `len(1) || bytes`. The length cap is
+/// [`StableSnapshotId::MAX_LEN`], so one byte is always enough and a corrupt
+/// length can never exceed the frame.
+fn put_id(out: &mut Vec<u8>, id: StableSnapshotId) {
+    let bytes = id.as_bytes();
+    out.push(bytes.len() as u8);
+    out.extend_from_slice(bytes);
+}
+
+/// Encoded size of `id`.
+fn id_len(id: StableSnapshotId) -> usize { 1 + id.as_bytes().len() }
+
+/// Encode a complete compatibility identity.
+fn put_compat(out: &mut Vec<u8>, compat: &SnapshotCompatibility) {
+    put_id(out, compat.aggregate_schema_id);
+    out.extend_from_slice(&compat.fold_version.to_le_bytes());
+    put_id(out, compat.codec_id);
+    out.extend_from_slice(&compat.codec_version.to_le_bytes());
+}
+
+/// Encoded size of `compat`.
+fn compat_len(compat: &SnapshotCompatibility) -> usize {
+    id_len(compat.aggregate_schema_id) + 4 + id_len(compat.codec_id) + 4
 }
 
 // ---------------------------------------------------------------------------
@@ -313,62 +367,55 @@ pub fn decode_frame(raw: &[u8]) -> Option<Frame> {
 // Record body
 // ---------------------------------------------------------------------------
 
-const RECORD_FORMAT: u16 = 1;
-/// The only trust mode v1 writes: physical integrity only, no semantic fold
-/// proof. ADR 0002's `CertifiedSnapshotRef` mode is reserved for the Phase 5
-/// fold certificate and is deliberately not written here — a record that
-/// claimed certification without the hashes would be a lie.
+/// Record body format. `2` since `bn-2gns` widened the body to carry the
+/// stable [`SnapshotCompatibility`] identity; a `1` body no longer decodes and
+/// is therefore a clean miss.
+pub const RECORD_FORMAT: u16 = 2;
+
+/// The only trust mode this build writes: physical integrity only, no semantic
+/// fold proof. ADR 0002's `CertifiedSnapshotRef` needs both semantic hashes and
+/// the snapshot-side fold-chain wiring; a record claiming certification without
+/// them would be a lie, so none is written.
 pub const TRUST_UNVERIFIED_CACHE: u8 = 0;
 
 /// The decoded, self-describing snapshot record.
 ///
-/// It carries the stream **name**, which is what makes the sidecar
-/// self-joinable: unlike the retired head table (which needed a separate
-/// `snapshot_stream_names` side map to be enumerable at all), a pack record
-/// names its own stream.
+/// It carries the stream **name** and the complete
+/// [`SnapshotCompatibility`], so the pair that forms the lookup key is
+/// recoverable from the record alone — no side map, and a leaf that disagrees
+/// with the record it names is detectable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
     /// The canonical stream identity at the `Backend` seam.
-    pub stream_name:         String,
-    /// The aggregate's declared fold version (the v1 compatibility key).
-    pub fold_version:        u32,
-    /// Coverage flag: summarizes the empty prefix.
-    pub covers_empty_prefix: bool,
-    /// 0-based index of the last summarized event (ignored when empty).
-    pub stream_version:      u64,
-    /// Opaque blob pointer the caller stored.
-    pub snapshot_ptr:        u64,
-    /// Semantic trust mode ([`TRUST_UNVERIFIED_CACHE`] in v1).
-    pub trust_mode:          u8,
+    pub stream_name:   String,
+    /// The complete compatibility identity; the other half of the key.
+    pub compatibility: SnapshotCompatibility,
+    /// What prefix of the stream this record summarizes.
+    pub coverage:      SnapshotCoverage,
+    /// Semantic trust mode ([`TRUST_UNVERIFIED_CACHE`] today).
+    pub trust_mode:    u8,
     /// The encoded aggregate state.
-    pub state:               Vec<u8>,
+    pub state:         Vec<u8>,
 }
 
-impl Record {
-    /// This record's coverage.
-    #[must_use]
-    pub fn coverage(&self) -> Coverage {
-        Coverage::from_parts(self.covers_empty_prefix, self.stream_version)
-    }
-}
-
-/// fmt(2) trust(1) flags(1) fold(4) version(8) ptr(8) name_len(2) state_len(4)
-const RECORD_FIXED: usize = 2 + 1 + 1 + 4 + 8 + 8 + 2 + 4;
+/// fmt(2) trust(1) cov_tag(1) cov_version(8) name_len(2) state_len(4)
+const RECORD_FIXED: usize = 2 + 1 + 1 + 8 + 2 + 4;
 
 /// Encode a record body.
 #[must_use]
 pub fn encode_record(rec: &Record) -> Vec<u8> {
     let mut out = Vec::with_capacity(
-        RECORD_FIXED + rec.stream_name.len() + rec.state.len(),
+        RECORD_FIXED
+            + compat_len(&rec.compatibility)
+            + rec.stream_name.len()
+            + rec.state.len(),
     );
     out.extend_from_slice(&RECORD_FORMAT.to_le_bytes());
     out.push(rec.trust_mode);
-    out.push(u8::from(rec.covers_empty_prefix));
-    out.extend_from_slice(&rec.fold_version.to_le_bytes());
-    out.extend_from_slice(&rec.stream_version.to_le_bytes());
-    out.extend_from_slice(&rec.snapshot_ptr.to_le_bytes());
+    put_coverage(&mut out, rec.coverage);
     out.extend_from_slice(&(rec.stream_name.len() as u16).to_le_bytes());
     out.extend_from_slice(&(rec.state.len() as u32).to_le_bytes());
+    put_compat(&mut out, &rec.compatibility);
     out.extend_from_slice(rec.stream_name.as_bytes());
     out.extend_from_slice(&rec.state);
     out
@@ -384,25 +431,25 @@ pub fn decode_record(raw: &[u8]) -> Option<Record> {
         return None;
     }
     let trust_mode = raw[2];
-    let covers_empty_prefix = raw[3] != 0;
-    let fold_version = u32::from_le_bytes(raw[4..8].try_into().ok()?);
-    let stream_version = u64::from_le_bytes(raw[8..16].try_into().ok()?);
-    let snapshot_ptr = u64::from_le_bytes(raw[16..24].try_into().ok()?);
-    let name_len = u16::from_le_bytes(raw[24..26].try_into().ok()?) as usize;
-    let state_len = u32::from_le_bytes(raw[26..30].try_into().ok()?) as usize;
-    if raw.len() != RECORD_FIXED + name_len + state_len {
+    let coverage = coverage_from_parts(
+        raw[3],
+        u64::from_le_bytes(raw[4..12].try_into().ok()?),
+    )?;
+    let name_len = u16::from_le_bytes(raw[12..14].try_into().ok()?) as usize;
+    let state_len = u32::from_le_bytes(raw[14..18].try_into().ok()?) as usize;
+
+    let mut c = Cur { b: raw, i: RECORD_FIXED };
+    let compatibility = c.compat()?;
+    let name = std::str::from_utf8(c.take(name_len)?).ok()?.to_owned();
+    let state = c.take(state_len)?.to_vec();
+    // Trailing garbage means the body is not exactly what we wrote.
+    if c.i != raw.len() {
         return None;
     }
-    let name = std::str::from_utf8(&raw[RECORD_FIXED..RECORD_FIXED + name_len])
-        .ok()?
-        .to_owned();
-    let state = raw[RECORD_FIXED + name_len..].to_vec();
     Some(Record {
         stream_name: name,
-        fold_version,
-        covers_empty_prefix,
-        stream_version,
-        snapshot_ptr,
+        compatibility,
+        coverage,
         trust_mode,
         state,
     })
@@ -499,7 +546,10 @@ pub fn decode_footer(raw: &[u8]) -> Option<Footer> {
 // ---------------------------------------------------------------------------
 
 const ROOT_MAGIC: [u8; 4] = *b"MRT1";
-const ROOT_FORMAT: u16 = 1;
+/// Root descriptor format. `2` since `bn-2gns` widened the leaf key to the
+/// stable identity; a `1` descriptor no longer decodes, so an older sidecar's
+/// roots are all rejected and the store simply has no snapshots.
+pub const ROOT_FORMAT: u16 = 2;
 
 /// Publication mode recorded in a root descriptor.
 ///
@@ -534,33 +584,27 @@ impl SaveMode {
 }
 
 /// One head in a root descriptor: the exact `(PackId, offset, length, hash)`
-/// leaf ADR 0002 requires, plus the routing fields a lookup filters on.
+/// leaf ADR 0002 requires, plus the complete key a lookup filters on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootEntry {
-    /// Stream name (the head key).
-    pub stream_name:         String,
+    /// Stream name — the first half of the head key.
+    pub stream_name:   String,
+    /// The complete compatibility identity — the second half of the key.
+    ///
+    /// Stored once per *distinct* identity in the root's intern table and
+    /// referenced by index, so a million heads of one aggregate cost one copy
+    /// of the ids, not a million.
+    pub compatibility: SnapshotCompatibility,
+    /// What prefix of the stream this head summarizes.
+    pub coverage:      SnapshotCoverage,
     /// Which pack the record lives in.
-    pub pack_seq:            u64,
+    pub pack_seq:      u64,
     /// Byte offset of the frame in that pack.
-    pub offset:              u64,
+    pub offset:        u64,
     /// Total frame length.
-    pub frame_len:           u32,
+    pub frame_len:     u32,
     /// CRC32C of the record body — binds the leaf to exact bytes.
-    pub record_crc:          u32,
-    /// The record's fold version (v1 compatibility key).
-    pub fold_version:        u32,
-    /// Coverage flag.
-    pub covers_empty_prefix: bool,
-    /// Coverage version.
-    pub stream_version:      u64,
-}
-
-impl RootEntry {
-    /// This head's coverage.
-    #[must_use]
-    pub fn coverage(&self) -> Coverage {
-        Coverage::from_parts(self.covers_empty_prefix, self.stream_version)
-    }
+    pub record_crc:    u32,
 }
 
 /// A decoded root descriptor — the complete, independently resolvable
@@ -583,12 +627,22 @@ pub struct Root {
     pub entries:         Vec<RootEntry>,
 }
 
-const ROOT_FIXED: usize = 4 + 2 + 1 + 1 + 16 + 8 + 8 + 8 + 4 + 4;
+const ROOT_FIXED: usize = 4 + 2 + 1 + 1 + 16 + 8 + 8 + 8 + 4 + 4 + 4;
 const NO_ACTIVE_PACK: u64 = u64::MAX;
 
 /// Encode a root descriptor.
 #[must_use]
 pub fn encode_root(root: &Root) -> Vec<u8> {
+    // Intern the distinct identities. Deployments have a handful; heads have
+    // millions. Sorted + deduped so the table is canonical for a given set.
+    let mut compats: Vec<SnapshotCompatibility> =
+        root.entries.iter().map(|e| e.compatibility).collect();
+    compats.sort_unstable();
+    compats.dedup();
+    let index_of = |c: &SnapshotCompatibility| -> u32 {
+        compats.partition_point(|x| x < c) as u32
+    };
+
     let mut out = Vec::with_capacity(ROOT_FIXED + root.entries.len() * 48);
     out.extend_from_slice(&ROOT_MAGIC);
     out.extend_from_slice(&ROOT_FORMAT.to_le_bytes());
@@ -601,18 +655,21 @@ pub fn encode_root(root: &Root) -> Vec<u8> {
     );
     out.extend_from_slice(&root.active_pack_len.to_le_bytes());
     out.extend_from_slice(&(root.sealed_packs.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(compats.len() as u32).to_le_bytes());
     out.extend_from_slice(&(root.entries.len() as u32).to_le_bytes());
     for seq in &root.sealed_packs {
         out.extend_from_slice(&seq.to_le_bytes());
+    }
+    for compat in &compats {
+        put_compat(&mut out, compat);
     }
     for e in &root.entries {
         out.extend_from_slice(&e.pack_seq.to_le_bytes());
         out.extend_from_slice(&e.offset.to_le_bytes());
         out.extend_from_slice(&e.frame_len.to_le_bytes());
         out.extend_from_slice(&e.record_crc.to_le_bytes());
-        out.extend_from_slice(&e.fold_version.to_le_bytes());
-        out.push(u8::from(e.covers_empty_prefix));
-        out.extend_from_slice(&e.stream_version.to_le_bytes());
+        out.extend_from_slice(&index_of(&e.compatibility).to_le_bytes());
+        put_coverage(&mut out, e.coverage);
         out.extend_from_slice(&(e.stream_name.len() as u16).to_le_bytes());
         out.extend_from_slice(e.stream_name.as_bytes());
     }
@@ -649,6 +706,31 @@ impl<'a> Cur<'a> {
     fn u64(&mut self) -> Option<u64> {
         Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
     }
+
+    /// A length-prefixed stable id. The length byte is validated against the
+    /// cap *and* the alphabet, so a corrupt id is a miss rather than a value
+    /// that no author could ever have written.
+    fn id(&mut self) -> Option<StableSnapshotId> {
+        let len = self.u8()? as usize;
+        if len > StableSnapshotId::MAX_LEN {
+            return None;
+        }
+        StableSnapshotId::parse(std::str::from_utf8(self.take(len)?).ok()?).ok()
+    }
+
+    fn compat(&mut self) -> Option<SnapshotCompatibility> {
+        Some(SnapshotCompatibility {
+            aggregate_schema_id: self.id()?,
+            fold_version:        self.u32()?,
+            codec_id:            self.id()?,
+            codec_version:       self.u32()?,
+        })
+    }
+
+    fn coverage(&mut self) -> Option<SnapshotCoverage> {
+        let tag = self.u8()?;
+        coverage_from_parts(tag, self.u64()?)
+    }
 }
 
 /// Decode a root descriptor. `None` = truncated, corrupt, uncommitted, or a
@@ -680,9 +762,10 @@ pub fn decode_root(raw: &[u8]) -> Option<Root> {
     let active = c.u64()?;
     let active_pack_len = c.u64()?;
     let sealed_count = c.u32()? as usize;
+    let compat_count = c.u32()? as usize;
     let entry_count = c.u32()? as usize;
 
-    // Bound both counts against the remaining bytes before reserving, so a
+    // Bound every count against the remaining bytes before reserving, so a
     // corrupt count cannot drive a huge allocation.
     let remaining = c.b.len().saturating_sub(c.i);
     if sealed_count.saturating_mul(8) > remaining {
@@ -691,6 +774,15 @@ pub fn decode_root(raw: &[u8]) -> Option<Root> {
     let mut sealed_packs = Vec::with_capacity(sealed_count);
     for _ in 0..sealed_count {
         sealed_packs.push(c.u64()?);
+    }
+    // Smallest possible identity is two one-byte ids plus two versions.
+    const COMPAT_MIN: usize = 1 + 1 + 4 + 1 + 1 + 4;
+    if compat_count.saturating_mul(COMPAT_MIN) > c.b.len().saturating_sub(c.i) {
+        return None;
+    }
+    let mut compats = Vec::with_capacity(compat_count);
+    for _ in 0..compat_count {
+        compats.push(c.compat()?);
     }
     // Smallest possible entry is the fixed part with a zero-length name.
     const ENTRY_FIXED: usize = 8 + 8 + 4 + 4 + 4 + 1 + 8 + 2;
@@ -703,20 +795,18 @@ pub fn decode_root(raw: &[u8]) -> Option<Root> {
         let offset = c.u64()?;
         let frame_len = c.u32()?;
         let record_crc = c.u32()?;
-        let fold_version = c.u32()?;
-        let covers_empty_prefix = c.u8()? != 0;
-        let stream_version = c.u64()?;
+        let compatibility = *compats.get(c.u32()? as usize)?;
+        let coverage = c.coverage()?;
         let name_len = c.u16()? as usize;
         let name = std::str::from_utf8(c.take(name_len)?).ok()?.to_owned();
         entries.push(RootEntry {
             stream_name: name,
+            compatibility,
+            coverage,
             pack_seq,
             offset,
             frame_len,
             record_crc,
-            fold_version,
-            covers_empty_prefix,
-            stream_version,
         });
     }
     // Trailing garbage means the descriptor is not exactly what we wrote.
@@ -794,12 +884,61 @@ mod tests {
 
     fn uuid() -> StoreUuid { StoreUuid([7u8; 16]) }
 
+    fn compat(fold: u32) -> SnapshotCompatibility {
+        SnapshotCompatibility {
+            aggregate_schema_id: StableSnapshotId::new("test.agg"),
+            fold_version:        fold,
+            codec_id:            StableSnapshotId::new("test.codec"),
+            codec_version:       1,
+        }
+    }
+
     #[test]
-    fn coverage_total_order_puts_empty_below_through_zero() {
-        assert!(Coverage::Empty < Coverage::Through(0));
-        assert!(Coverage::Through(0) < Coverage::Through(1));
-        assert_eq!(Coverage::from_parts(true, 99), Coverage::Empty);
-        assert_eq!(Coverage::from_parts(false, 3), Coverage::Through(3));
+    fn coverage_survives_the_wire_with_empty_below_through_zero() {
+        for cov in [
+            SnapshotCoverage::Empty,
+            SnapshotCoverage::Through(0),
+            SnapshotCoverage::Through(u64::MAX),
+        ] {
+            let mut raw = Vec::new();
+            put_coverage(&mut raw, cov);
+            let mut c = Cur { b: &raw, i: 0 };
+            assert_eq!(c.coverage(), Some(cov));
+        }
+        // The tag, not the version, is what separates the two: Empty writes a
+        // zero version, and Through(0) writes the same version under a
+        // different tag.
+        let mut empty = Vec::new();
+        put_coverage(&mut empty, SnapshotCoverage::Empty);
+        let mut zero = Vec::new();
+        put_coverage(&mut zero, SnapshotCoverage::Through(0));
+        assert_ne!(empty, zero);
+        assert_eq!(coverage_from_parts(2, 0), None, "unknown tag is a miss");
+    }
+
+    #[test]
+    fn an_unknown_trust_mode_is_a_miss() {
+        assert_eq!(
+            trust_from_u8(TRUST_UNVERIFIED_CACHE),
+            Some(SnapshotTrust::UnverifiedCache)
+        );
+        assert_eq!(trust_from_u8(1), None, "certified is not written yet");
+        assert_eq!(trust_from_u8(200), None);
+    }
+
+    #[test]
+    fn a_corrupt_identity_byte_is_a_miss_not_a_forged_id() {
+        let mut raw = Vec::new();
+        put_compat(&mut raw, &compat(1));
+        // An id length past the cap.
+        let mut too_long = raw.clone();
+        too_long[0] = 200;
+        assert_eq!(Cur { b: &too_long, i: 0 }.compat(), None);
+        // A byte outside the canonical alphabet.
+        let mut not_canonical = raw.clone();
+        not_canonical[1] = b'A';
+        assert_eq!(Cur { b: &not_canonical, i: 0 }.compat(), None);
+        assert_eq!(Cur { b: &raw, i: 0 }.compat(), Some(compat(1)));
     }
 
     #[test]
@@ -880,13 +1019,11 @@ mod tests {
     #[test]
     fn record_roundtrip() {
         let rec = Record {
-            stream_name:         "orders-42".into(),
-            fold_version:        3,
-            covers_empty_prefix: false,
-            stream_version:      17,
-            snapshot_ptr:        0xDEAD_BEEF,
-            trust_mode:          TRUST_UNVERIFIED_CACHE,
-            state:               vec![1, 2, 3, 4],
+            stream_name:   "orders-42".into(),
+            compatibility: compat(3),
+            coverage:      SnapshotCoverage::Through(17),
+            trust_mode:    TRUST_UNVERIFIED_CACHE,
+            state:         vec![1, 2, 3, 4],
         };
         let raw = encode_record(&rec);
         assert_eq!(decode_record(&raw), Some(rec.clone()));
@@ -898,6 +1035,44 @@ mod tests {
             None,
             "unknown format is a miss, never a guess"
         );
+    }
+
+    #[test]
+    fn a_record_body_written_by_the_previous_format_never_decodes() {
+        // The exact v1 body layout, frozen here so the law survives the code
+        // that used to write it: fmt(2) trust(1) flags(1) fold(4) version(8)
+        // ptr(8) name_len(2) state_len(4) || name || state.
+        let mut v1 = Vec::new();
+        v1.extend_from_slice(&1u16.to_le_bytes());
+        v1.push(TRUST_UNVERIFIED_CACHE);
+        v1.push(0);
+        v1.extend_from_slice(&1u32.to_le_bytes());
+        v1.extend_from_slice(&17u64.to_le_bytes());
+        v1.extend_from_slice(&0u64.to_le_bytes());
+        v1.extend_from_slice(&9u16.to_le_bytes());
+        v1.extend_from_slice(&4u32.to_le_bytes());
+        v1.extend_from_slice(b"orders-42");
+        v1.extend_from_slice(&[1, 2, 3, 4]);
+        assert_eq!(
+            decode_record(&v1),
+            None,
+            "a pre-identity record is a clean miss, never a wrong hit"
+        );
+    }
+
+    #[test]
+    fn every_record_truncation_and_flip_is_a_miss() {
+        let raw = encode_record(&Record {
+            stream_name:   "s".into(),
+            compatibility: compat(1),
+            coverage:      SnapshotCoverage::Empty,
+            trust_mode:    TRUST_UNVERIFIED_CACHE,
+            state:         vec![9],
+        });
+        for n in 0..raw.len() {
+            assert!(decode_record(&raw[..n]).is_none(), "prefix {n} decoded");
+        }
+        assert!(decode_record(&raw).is_some());
     }
 
     #[test]
@@ -929,24 +1104,22 @@ mod tests {
             sealed_packs:    vec![0, 1],
             entries:         vec![
                 RootEntry {
-                    stream_name:         "a".into(),
-                    pack_seq:            0,
-                    offset:              36,
-                    frame_len:           64,
-                    record_crc:          0xABCD,
-                    fold_version:        1,
-                    covers_empty_prefix: true,
-                    stream_version:      0,
+                    stream_name:   "a".into(),
+                    compatibility: compat(1),
+                    coverage:      SnapshotCoverage::Empty,
+                    pack_seq:      0,
+                    offset:        36,
+                    frame_len:     64,
+                    record_crc:    0xABCD,
                 },
                 RootEntry {
-                    stream_name:         "stream/with/slashes".into(),
-                    pack_seq:            2,
-                    offset:              100,
-                    frame_len:           4096,
-                    record_crc:          0x1234,
-                    fold_version:        2,
-                    covers_empty_prefix: false,
-                    stream_version:      77,
+                    stream_name:   "stream/with/slashes".into(),
+                    compatibility: compat(2),
+                    coverage:      SnapshotCoverage::Through(77),
+                    pack_seq:      2,
+                    offset:        100,
+                    frame_len:     4096,
+                    record_crc:    0x1234,
                 },
             ],
         }
@@ -957,6 +1130,74 @@ mod tests {
         let root = sample_root();
         let raw = encode_root(&root);
         assert_eq!(decode_root(&raw), Some(root));
+    }
+
+    #[test]
+    fn identities_are_interned_once_however_many_heads_share_them() {
+        let one = |n: usize| Root {
+            entries: (0..n)
+                .map(|i| RootEntry {
+                    stream_name:   format!("s-{i:04}"),
+                    compatibility: compat(1),
+                    coverage:      SnapshotCoverage::Through(i as u64),
+                    pack_seq:      0,
+                    offset:        i as u64 * 64,
+                    frame_len:     64,
+                    record_crc:    i as u32,
+                })
+                .collect(),
+            ..sample_root()
+        };
+        let small = encode_root(&one(1)).len();
+        let big = encode_root(&one(101)).len();
+        // 100 extra heads must not carry 100 extra copies of the ids: the
+        // per-head cost is the leaf (37 bytes) plus its 6-byte name.
+        assert!(
+            big - small <= 100 * 64,
+            "per-head cost {} is carrying the identity bytes",
+            (big - small) / 100
+        );
+        assert_eq!(decode_root(&encode_root(&one(101))), Some(one(101)));
+    }
+
+    #[test]
+    fn a_root_written_by_the_previous_format_never_decodes() {
+        // Frozen v1 root prologue: magic, format 1, mode, reserved. The format
+        // check rejects it before any field is interpreted, so an older
+        // sidecar's roots are all unusable and the store has no snapshots.
+        let mut v1 = Vec::new();
+        v1.extend_from_slice(&ROOT_MAGIC);
+        v1.extend_from_slice(&1u16.to_le_bytes());
+        v1.push(0);
+        v1.push(0);
+        v1.extend_from_slice(&uuid().0);
+        v1.extend_from_slice(&1u64.to_le_bytes());
+        v1.extend_from_slice(&NO_ACTIVE_PACK.to_le_bytes());
+        v1.extend_from_slice(&0u64.to_le_bytes());
+        v1.extend_from_slice(&0u32.to_le_bytes());
+        v1.extend_from_slice(&0u32.to_le_bytes());
+        let crc = crc32(&v1);
+        v1.extend_from_slice(&crc.to_le_bytes());
+        v1.extend_from_slice(&COMMIT_MARKER.to_le_bytes());
+        assert_eq!(decode_root(&v1), None);
+    }
+
+    #[test]
+    fn a_leaf_naming_a_missing_intern_slot_is_a_miss() {
+        let root = sample_root();
+        let mut raw = encode_root(&root);
+        // The first leaf's compat index sits after the sealed-pack list and
+        // the intern table; find it by re-encoding with a forged index.
+        let idx = raw
+            .windows(4)
+            .position(|w| w == 0xABCDu32.to_le_bytes())
+            .expect("record_crc marks the leaf")
+            + 4;
+        raw[idx..idx + 4].copy_from_slice(&999u32.to_le_bytes());
+        let n = raw.len();
+        let crc = crc32(&raw[..n - 8]);
+        raw[n - 8..n - 4].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(decode_root(&raw), None);
     }
 
     #[test]
@@ -985,7 +1226,7 @@ mod tests {
         let mut raw = encode_root(&sample_root());
         // Forge a colossal entry count and repair the CRC so only the
         // bounds check can reject it.
-        let off = 4 + 2 + 1 + 1 + 16 + 8 + 8 + 8 + 4;
+        let off = 4 + 2 + 1 + 1 + 16 + 8 + 8 + 8 + 4 + 4;
         raw[off..off + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         let n = raw.len();
         let crc = crc32(&raw[..n - 8]);

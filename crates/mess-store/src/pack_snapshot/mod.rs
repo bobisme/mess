@@ -72,15 +72,8 @@
 //!   streams), any unproven directory entry, then the root file, its rename,
 //!   and the directory.
 //!
-//! # What this v1 deliberately does not do
+//! # What this deliberately does not do
 //!
-//! - **No public trait break.** ADR 0002's typed `SnapshotCompatibility` /
-//!   `SnapshotCoverage` API, aggregate/schema IDs and codec IDs are a
-//!   source-breaking change to [`Snapshottable`](crate::Snapshottable) /
-//!   [`SnapshotStore`] and are deferred to a follow-up bone. The concepts are
-//!   present internally: `fold_version` is the compatibility key and
-//!   [`format::Coverage`] is the ordered coverage lattice (`Empty < Through(0)
-//!   < Through(1)`).
 //! - **Flat root, not a COW radix tree.** The root descriptor lists every head,
 //!   so a save is `O(N)` in published heads. The bounded `O(k log N)` sharded
 //!   design is documented at the exact substitution point in
@@ -102,7 +95,7 @@ mod tests;
 use std::path::Path;
 use std::sync::Arc;
 
-pub use format::{Coverage, Record, SaveMode, StoreUuid};
+pub use format::{Record, SaveMode, StoreUuid};
 pub use sidecar::{PackSidecarError, Sidecar, SidecarMetrics, SidecarOptions};
 
 use crate::backend::{
@@ -110,7 +103,8 @@ use crate::backend::{
     StoredRecord, SubscribeBackend,
 };
 use crate::snapshot::{
-    BlobPtr, SnapshotRef, SnapshotStore, StoredSnapshot, interim_stream_id,
+    SnapshotCompatibility, SnapshotLookup, SnapshotRef, SnapshotSaveOutcome,
+    SnapshotStore, SnapshotTrust, StoredSnapshot, interim_stream_id,
 };
 use crate::version::Version;
 
@@ -186,10 +180,10 @@ impl<B> PackSnapshotBackend<B> {
     /// Borrow the wrapped event-log backend.
     pub fn inner(&self) -> &B { &self.inner }
 
-    /// Borrow the sidecar, for diagnostics
-    /// ([`Sidecar::stream_names`], [`Sidecar::metrics`]) and for
-    /// [`Sidecar::save_with_mode`] when a caller wants a one-off
-    /// [`SaveMode::Durable`] publication.
+    /// Borrow the sidecar, for the bounded administrative scan
+    /// ([`Sidecar::pin_root`] + [`Sidecar::scan`]), diagnostics
+    /// ([`Sidecar::metrics`]) and [`Sidecar::save_with_mode`] when a caller
+    /// wants a one-off [`SaveMode::Durable`] publication.
     pub fn sidecar(&self) -> &Arc<Sidecar> { &self.sidecar }
 }
 
@@ -263,46 +257,37 @@ impl<B: Backend> SnapshotStore for PackSnapshotBackend<B> {
         &self,
         stream_id: &str,
         snapshot: StoredSnapshot,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<SnapshotSaveOutcome, Self::Error> {
         let snap = &snapshot.snapshot_ref;
-        // An empty-prefix snapshot covers version 0 by convention; the flag is
-        // what disambiguates "folds the empty prefix" from "folds index 0",
-        // and `Coverage` keeps them strictly ordered.
-        let stream_version =
-            if snap.covers_empty_prefix { 0 } else { snap.stream_version };
         let record = Record {
-            stream_name: stream_id.to_owned(),
-            fold_version: snap.fold_version,
-            covers_empty_prefix: snap.covers_empty_prefix,
-            stream_version,
-            snapshot_ptr: snap.snapshot_ptr.0,
-            trust_mode: format::TRUST_UNVERIFIED_CACHE,
-            state: snapshot.state_blob,
+            stream_name:   stream_id.to_owned(),
+            compatibility: snap.compatibility,
+            coverage:      snap.coverage,
+            // This sidecar writes only `UnverifiedCache`: a record claiming
+            // certification without both semantic hashes would be a lie.
+            trust_mode:    format::TRUST_UNVERIFIED_CACHE,
+            state:         snapshot.state_blob,
         };
-        self.sidecar.save(&record)?;
-        Ok(())
+        Ok(self.sidecar.save(&record)?)
     }
 
     async fn load_snapshot(
         &self,
         stream_id: &str,
-    ) -> Result<Option<StoredSnapshot>, Self::Error> {
-        // Infallible by design: any sidecar problem is `None`, which the
-        // `EventStore` answers with a full replay.
-        Ok(self.sidecar.load(stream_id).map(|rec| StoredSnapshot {
-            snapshot_ref: SnapshotRef {
-                stream_id:           interim_stream_id(stream_id),
-                stream_version:      rec.stream_version,
-                fold_version:        rec.fold_version,
-                covers_empty_prefix: rec.covers_empty_prefix,
-                // Reserved until the Phase 5 fold chain: this sidecar writes
-                // only `UnverifiedCache` records, and a record that claimed
-                // certification without both semantic hashes would be a lie.
-                event_prefix_hash:   None,
-                state_hash:          None,
-                snapshot_ptr:        BlobPtr(rec.snapshot_ptr),
-            },
-            state_blob:   rec.state,
+        compatibility: SnapshotCompatibility,
+    ) -> Result<SnapshotLookup, Self::Error> {
+        // Infallible by design: every sidecar problem is a miss carrying its
+        // reason, which the `EventStore` answers with a full replay.
+        Ok(self.sidecar.load(stream_id, compatibility).map(|rec| {
+            StoredSnapshot {
+                snapshot_ref: SnapshotRef {
+                    compatibility: rec.compatibility,
+                    coverage:      rec.coverage,
+                    trust:         SnapshotTrust::UnverifiedCache,
+                    stream_id:     interim_stream_id(stream_id),
+                },
+                state_blob:   rec.state,
+            }
         }))
     }
 }

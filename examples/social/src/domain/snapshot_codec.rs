@@ -24,9 +24,25 @@
 //! blob yields a [`StateCodecError`], never a panic — a corrupt snapshot must
 //! degrade to full replay, not crash the load.
 
-use mess_store::StateCodecError;
+use mess_store::{StableSnapshotId, StateCodecError};
 
 use crate::Id;
+
+/// The stable name of *this* codec, shared by all four aggregates.
+///
+/// `bn-2gns`: [`Snapshottable`](mess_store::Snapshottable) separates the
+/// aggregate's identity from its state codec's, and this module is exactly why.
+/// The four aggregates fold four different things but serialize through one
+/// hand-rolled format, so one name and one version cover all of them. Change
+/// the wire shape below — a new tag, a different length width, a reordered
+/// field — and bump [`CODEC_VERSION`] once: every aggregate's snapshots become
+/// a different identity together, miss, and rebuild. No `FOLD_VERSION` moves,
+/// because no *fold* changed.
+pub(crate) const CODEC_ID: StableSnapshotId =
+    StableSnapshotId::new("social.length-prefixed");
+
+/// The wire-shape version of [`CODEC_ID`]. See its docs for the bump rule.
+pub(crate) const CODEC_VERSION: u32 = 1;
 
 /// Append a `bool` as one byte.
 pub(crate) fn put_bool(out: &mut Vec<u8>, b: bool) { out.push(u8::from(b)); }

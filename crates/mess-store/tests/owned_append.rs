@@ -21,7 +21,7 @@ use mess_store::registry::{
 };
 use mess_store::{
     EngineOptions, EventStore, LogEngine, MockBackend, PackSnapshotBackend,
-    Snapshottable, StateCodecError, Version,
+    Snapshottable, StableSnapshotId, StateCodecError, Version,
 };
 
 #[derive(Debug, Clone)]
@@ -104,6 +104,8 @@ impl Decide<Increment> for Counter {
 }
 
 impl Snapshottable for Counter {
+    const AGGREGATE_SCHEMA_ID: StableSnapshotId =
+        StableSnapshotId::new("mess-store.test.owned-counter");
     const FOLD_VERSION: u32 = 1;
 
     fn encode_state(&self) -> Result<Vec<u8>, StateCodecError> {

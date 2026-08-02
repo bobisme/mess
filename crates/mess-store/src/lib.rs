@@ -106,12 +106,18 @@ pub use sealed_candidate::{
     WITHDRAWAL_MARKER_BANNER, Withdrawal, withdraw_sealed_index,
 };
 pub use snapshot::{
-    BlobPtr, Hash256, SnapshotPolicy, SnapshotRef, SnapshotStore,
-    Snapshottable, StateCodecError, StoredSnapshot, interim_stream_id,
+    CurrentHead, Hash256, MAX_SNAPSHOT_SCAN_LIMIT, PinnedSnapshotRoot,
+    SnapshotCompatibility, SnapshotCoverage, SnapshotIdentityConflict,
+    SnapshotLookup, SnapshotMiss, SnapshotPolicy, SnapshotRef, SnapshotRootId,
+    SnapshotSaveOutcome, SnapshotScanCursor, SnapshotScanDiagnostic,
+    SnapshotScanEntry, SnapshotScanKey, SnapshotScanPage, SnapshotStore,
+    SnapshotTrust, Snapshottable, StableSnapshotId, StableSnapshotIdError,
+    StateCodecError, StoredSnapshot, clamp_scan_limit, interim_stream_id,
+    publication_decision, register_snapshot_identity,
 };
 pub use store::{
     AuthoredCommandError, Commit, DEFAULT_PAGE_SIZE, EventStore, Loaded,
-    SnapshotMetrics, StoreError,
+    SnapshotMetrics, SnapshotSave, StoreError,
 };
 pub use subscription::Subscription;
 pub use version::Version;

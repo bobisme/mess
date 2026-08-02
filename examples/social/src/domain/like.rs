@@ -45,8 +45,9 @@
 
 use mess_core::Decide;
 use mess_derive::{Aggregate, Event};
-use mess_store::{Snapshottable, StateCodecError};
+use mess_store::{Snapshottable, StableSnapshotId, StateCodecError};
 
+use crate::domain::snapshot_codec;
 use crate::domain::snapshot_codec::Reader;
 
 // ---------------------------------------------------------------------------
@@ -106,6 +107,12 @@ impl Like {
 /// pure refactor that leaves the folded state and blob shape identical does
 /// **not** bump.
 impl Snapshottable for Like {
+    const AGGREGATE_SCHEMA_ID: StableSnapshotId =
+        StableSnapshotId::new("social.like");
+    // The state codec is shared with the other three aggregates, so it is
+    // named and versioned separately from this fold.
+    const CODEC_ID: StableSnapshotId = snapshot_codec::CODEC_ID;
+    const CODEC_VERSION: u32 = snapshot_codec::CODEC_VERSION;
     const FOLD_VERSION: u32 = 1;
 
     fn encode_state(&self) -> Result<Vec<u8>, StateCodecError> {

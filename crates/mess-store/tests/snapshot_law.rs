@@ -19,8 +19,9 @@
 
 use mess_core::{Aggregate, CodecError, Event};
 use mess_store::{
-    EventStore, Loaded, SnapshotStore, Snapshottable, StateCodecError,
-    StoredSnapshot, Version,
+    EventStore, Loaded, SnapshotCoverage, SnapshotRef, SnapshotStore,
+    SnapshotTrust, Snapshottable, StableSnapshotId, StateCodecError,
+    StoredSnapshot, Version, interim_stream_id,
 };
 
 mod common;
@@ -97,6 +98,8 @@ impl Aggregate for Counter {
 }
 
 impl Snapshottable for Counter {
+    const AGGREGATE_SCHEMA_ID: StableSnapshotId =
+        StableSnapshotId::new("mess-store.test.counter");
     const FOLD_VERSION: u32 = 1;
 
     fn encode_state(&self) -> Result<Vec<u8>, StateCodecError> {
@@ -138,6 +141,10 @@ impl Aggregate for CounterV2 {
 }
 
 impl Snapshottable for CounterV2 {
+    // The SAME aggregate, a bumped fold: the schema id is shared and the
+    // fold version is what separates the two identities.
+    const AGGREGATE_SCHEMA_ID: StableSnapshotId =
+        StableSnapshotId::new("mess-store.test.counter");
     const FOLD_VERSION: u32 = 2;
 
     fn encode_state(&self) -> Result<Vec<u8>, StateCodecError> {
@@ -269,18 +276,15 @@ async fn snapshot_plus_tail_equals_full_replay() {
         append_all(&store, &stream, &events[..p]).await;
         let snap_ref = store.save_snapshot::<Counter>(&stream).await.unwrap();
         // The snapshot summarizes exactly the prefix we appended.
-        if p == 0 {
-            assert!(
-                snap_ref.covers_empty_prefix,
-                "iter {iter}: empty prefix must set covers_empty_prefix"
-            );
-        } else {
-            assert_eq!(
-                snap_ref.stream_version,
-                (p - 1) as u64,
-                "iter {iter}: stream_version must be the last summarized index"
-            );
-        }
+        assert_eq!(
+            snap_ref.snapshot_ref.coverage,
+            if p == 0 {
+                SnapshotCoverage::Empty
+            } else {
+                SnapshotCoverage::Through((p - 1) as u64)
+            },
+            "iter {iter}: coverage must be exactly the summarized prefix"
+        );
         if !events[p..].is_empty() {
             store
                 .append(&stream, tail_expected_version(p), &events[p..])
@@ -348,22 +352,34 @@ async fn stale_fold_version_falls_back_to_full_replay() {
     let expected_v2 = fold::<CounterV2>(&events);
     assert_eq!(expected_v2, CounterV2(Counter { total: 17, marks: 2 }));
 
-    // Hand-craft a STALE snapshot: fold_version = 1 (v1), and a deliberately
-    // WRONG state blob. If load_cached wrongly trusted it, the result would be
-    // this garbage; the fold_version mismatch must reject it instead.
+    // Hand-craft a STALE snapshot: the v1 identity, covering the whole stream,
+    // with a deliberately WRONG state blob. If load_cached wrongly fell back
+    // across identities the result would be this garbage. Nothing is written
+    // under the v2 identity, so the only record present is the poisoned one.
     let mut wrong = expected_v2.clone();
     wrong.0.total = -999_999;
     wrong.0.marks = -999_999;
-    let mut stale = StoredSnapshot {
-        snapshot_ref: store.save_snapshot::<CounterV2>(stream).await.unwrap(),
+    let stale = StoredSnapshot {
+        snapshot_ref: SnapshotRef {
+            compatibility: Counter::snapshot_compatibility(),
+            coverage:      SnapshotCoverage::Through((events.len() - 1) as u64),
+            trust:         SnapshotTrust::UnverifiedCache,
+            stream_id:     interim_stream_id(stream),
+        },
         state_blob:   wrong.encode_state().unwrap(),
     };
-    // Downgrade the stored ref to the old fold version and poison the blob.
-    stale.snapshot_ref.fold_version = 1;
     store.backend().save_snapshot(stream, stale).await.unwrap();
 
-    // Sanity: a snapshot IS present (so a non-fallback would use it).
-    assert!(store.backend().load_snapshot(stream).await.unwrap().is_some());
+    // Sanity: a snapshot IS present under the OLD identity (so a store that
+    // fell back across identities would use it).
+    assert!(
+        store
+            .backend()
+            .load_snapshot(stream, Counter::snapshot_compatibility())
+            .await
+            .unwrap()
+            .is_hit()
+    );
 
     // load_cached as v2 must ignore the fold_version-1 snapshot and
     // full-replay.
@@ -391,8 +407,8 @@ async fn matching_fold_version_uses_snapshot() {
     let head = [CounterEvent::Added(10), CounterEvent::Scaled(2)];
     store.append(stream, Version::NoStream, &head).await.unwrap();
     let snap = store.save_snapshot::<CounterV2>(stream).await.unwrap();
-    assert_eq!(snap.fold_version, 2);
-    assert_eq!(snap.stream_version, 1);
+    assert_eq!(snap.snapshot_ref.compatibility.fold_version, 2);
+    assert_eq!(snap.snapshot_ref.coverage, SnapshotCoverage::Through(1));
 
     let tail = [CounterEvent::Added(1), CounterEvent::Marked];
     store.append(stream, Version::At(1), &tail).await.unwrap();

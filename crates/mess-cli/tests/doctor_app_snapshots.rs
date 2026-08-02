@@ -29,7 +29,7 @@ use mess_cli::metaread;
 use mess_core::{Aggregate, CodecError, Decide, Event};
 use mess_store::{
     EventStore, LogEngine, PackSnapshotBackend, SnapshotPolicy, Snapshottable,
-    StateCodecError,
+    StableSnapshotId, StateCodecError,
 };
 use serde_json::Value;
 
@@ -70,6 +70,8 @@ impl Aggregate for Counter {
 }
 
 impl Snapshottable for Counter {
+    const AGGREGATE_SCHEMA_ID: StableSnapshotId =
+        StableSnapshotId::new("mess-cli.test.app-counter");
     const FOLD_VERSION: u32 = 1;
 
     fn encode_state(&self) -> Result<Vec<u8>, StateCodecError> {
@@ -96,6 +98,9 @@ impl Aggregate for CounterV2 {
 }
 
 impl Snapshottable for CounterV2 {
+    // Same aggregate, bumped fold: the schema id is shared on purpose.
+    const AGGREGATE_SCHEMA_ID: StableSnapshotId =
+        StableSnapshotId::new("mess-cli.test.app-counter");
     const FOLD_VERSION: u32 = 2;
 
     fn encode_state(&self) -> Result<Vec<u8>, StateCodecError> {

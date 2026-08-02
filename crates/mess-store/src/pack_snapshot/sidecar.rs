@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -25,6 +26,13 @@ use super::format::{
     decode_record, decode_root, encode_frame, encode_identity,
     encode_index_and_footer, encode_pack_header, encode_record, encode_root,
     pack_name, parse_pack_name, parse_root_name, peek_frame_len, root_name,
+    trust_from_u8,
+};
+use crate::snapshot::{
+    CurrentHead, PinnedSnapshotRoot, SnapshotCompatibility, SnapshotLookup,
+    SnapshotMiss, SnapshotRootId, SnapshotSaveOutcome, SnapshotScanCursor,
+    SnapshotScanDiagnostic, SnapshotScanEntry, SnapshotScanKey,
+    SnapshotScanPage, clamp_scan_limit, publication_decision,
 };
 
 /// A failure that could not be degraded into "no snapshot".
@@ -92,6 +100,13 @@ pub struct SidecarMetrics {
     pub idempotent_saves:     AtomicU64,
     /// Saves skipped because they would have regressed coverage.
     pub coverage_regressions: AtomicU64,
+    /// Saves that superseded a head whose bytes did not validate. A nonzero
+    /// value means something damaged the sidecar and a save healed it.
+    pub repairs:              AtomicU64,
+    /// Saves refused because a *valid*, different record already held the same
+    /// coverage under the same identity (ADR 0002 §1 rule 3). A nonzero value
+    /// means two writers disagree about the same fold — a real bug, not noise.
+    pub conflicts:            AtomicU64,
     /// Loads that found a head but could not use it (missing pack, corrupt
     /// frame, identity mismatch) and therefore reported a miss.
     pub degraded_loads:       AtomicU64,
@@ -203,6 +218,89 @@ struct Writer {
     hook:            Option<FaultHook>,
 }
 
+/// The published discovery state of one root generation.
+///
+/// # Why two views of the same heads
+///
+/// The ordinary path wants `O(1)` point lookup by `(stream, compatibility)`;
+/// the administrative path wants a bounded, ordered walk. `by_stream` serves
+/// the first and is mutated in place per save; `sorted` serves the second and
+/// is exactly the `Vec` a save already builds to encode the root, retained
+/// behind an `Arc` so [`Sidecar::pin_root`] is a refcount bump rather than a
+/// traversal.
+///
+/// The duplication is the flat root's, not this type's: ADR 0002's
+/// copy-on-write discovery tree removes both views together (see
+/// [`select_root`]). Until it does, resident cost is roughly two `RootEntry`
+/// per head, each carrying its identity inline — the on-disk root interns
+/// identities, this does not, because the point of the resident copy is an
+/// `O(1)` compare on the lookup path.
+struct Published {
+    /// Generation of the root these heads came from, or `None` when no root
+    /// resolved and the store simply has no snapshots.
+    generation: Option<u64>,
+    /// Heads by stream name — usually one, one more per compatibility that
+    /// stream has ever been snapshotted under.
+    by_stream:  HashMap<String, Vec<RootEntry>>,
+    /// The same heads in scan order: by stream name, then compatibility.
+    sorted:     Arc<Vec<RootEntry>>,
+}
+
+impl Published {
+    fn empty() -> Self {
+        Self {
+            generation: None,
+            by_stream:  HashMap::new(),
+            sorted:     Arc::new(Vec::new()),
+        }
+    }
+
+    /// Build both views from one root's leaf list.
+    fn from_root(root: Root) -> Self {
+        let mut sorted = root.entries;
+        sorted.sort_by(scan_order);
+        let mut by_stream: HashMap<String, Vec<RootEntry>> = HashMap::new();
+        for e in &sorted {
+            by_stream.entry(e.stream_name.clone()).or_default().push(e.clone());
+        }
+        Self {
+            generation: Some(root.generation),
+            by_stream,
+            sorted: Arc::new(sorted),
+        }
+    }
+
+    /// The head for exactly this key, if one is published.
+    fn head(
+        &self,
+        stream: &str,
+        compat: &SnapshotCompatibility,
+    ) -> Option<&RootEntry> {
+        self.by_stream.get(stream)?.iter().find(|e| e.compatibility == *compat)
+    }
+
+    /// The highest-coverage head this stream has under *any* other identity —
+    /// what makes a post-deploy miss say "incompatible" instead of "absent".
+    fn foreign_head(
+        &self,
+        stream: &str,
+        compat: &SnapshotCompatibility,
+    ) -> Option<&RootEntry> {
+        self.by_stream
+            .get(stream)?
+            .iter()
+            .filter(|e| e.compatibility != *compat)
+            .max_by_key(|e| e.coverage)
+    }
+}
+
+/// The total order every scan and cursor uses: stream name, then identity.
+fn scan_order(a: &RootEntry, b: &RootEntry) -> std::cmp::Ordering {
+    a.stream_name
+        .cmp(&b.stream_name)
+        .then_with(|| a.compatibility.cmp(&b.compatibility))
+}
+
 /// A pack-based snapshot sidecar directory.
 ///
 /// Cheap to clone via `Arc` at the layer above; a `Sidecar` itself is held
@@ -211,9 +309,9 @@ pub struct Sidecar {
     dir:         PathBuf,
     uuid:        StoreUuid,
     options:     SidecarOptions,
-    /// The published head per stream. Rebuilt from the selected root at open
+    /// The published discovery state. Rebuilt from the selected root at open
     /// and updated only after a successful root publication.
-    heads:       RwLock<HashMap<String, RootEntry>>,
+    published:   RwLock<Published>,
     /// Read handles per pack sequence. An already-open handle keeps working
     /// across the `.open` -> `.pack` rename (same inode), which is what makes
     /// a stale descriptor yield *old correct bytes or a miss*, never a
@@ -478,14 +576,8 @@ impl Sidecar {
 
         // 3. Discovery: highest final, independently resolvable, valid root;
         //    fall back progressively to an older root, then to empty.
-        let heads = select_root(dir, uuid, &listing.roots, &metrics)
-            .map(|root| {
-                root.entries
-                    .into_iter()
-                    .map(|e| (e.stream_name.clone(), e))
-                    .collect::<HashMap<_, _>>()
-            })
-            .unwrap_or_default();
+        let published = select_root(dir, uuid, &listing.roots, &metrics)
+            .map_or_else(Published::empty, Published::from_root);
 
         // 4. Ids never restart: the shared counter resumes at the durably
         //    reserved high-water, and (belt and braces, in case the identity
@@ -515,7 +607,7 @@ impl Sidecar {
             dir: dir.to_path_buf(),
             uuid,
             options,
-            heads: RwLock::new(heads),
+            published: RwLock::new(published),
             readers: RwLock::new(HashMap::new()),
             writer: Some(Mutex::new(Writer {
                 active,
@@ -544,18 +636,12 @@ impl Sidecar {
             .ok()
             .and_then(|raw| decode_identity(&raw))
             .map(|(uuid, _reserved)| uuid);
-        let heads = match uuid {
+        let published = match uuid {
             Some(uuid) => list_dir(&dir, uuid)
                 .ok()
                 .and_then(|l| select_root(&dir, uuid, &l.roots, &metrics))
-                .map(|root| {
-                    root.entries
-                        .into_iter()
-                        .map(|e| (e.stream_name.clone(), e))
-                        .collect::<HashMap<_, _>>()
-                })
-                .unwrap_or_default(),
-            None => HashMap::new(),
+                .map_or_else(Published::empty, Published::from_root),
+            None => Published::empty(),
         };
         Self {
             dir,
@@ -563,7 +649,7 @@ impl Sidecar {
             // heads, so nothing ever resolves to a pack.
             uuid: uuid.unwrap_or(StoreUuid([0; 16])),
             options: SidecarOptions::default(),
-            heads: RwLock::new(heads),
+            published: RwLock::new(published),
             readers: RwLock::new(HashMap::new()),
             writer: None,
             _lock: None,
@@ -579,44 +665,69 @@ impl Sidecar {
     #[must_use]
     pub fn uuid(&self) -> StoreUuid { self.uuid }
 
-    /// Number of published heads (cheap; this is the in-memory map).
+    /// Number of published heads. One stream contributes one head per distinct
+    /// identity it has been snapshotted under.
     #[must_use]
-    pub fn head_count(&self) -> usize { self.read_heads().len() }
+    pub fn head_count(&self) -> usize { self.read_published().sorted.len() }
 
-    /// Every published head's stream name. Because a pack record is
-    /// self-describing, no reverse `id -> name` side map is needed (the retired
-    /// path required one).
+    /// Every published head's stream name, deduplicated and sorted. Because a
+    /// pack record is self-describing, no reverse `id -> name` side map is
+    /// needed (the retired path required one).
+    ///
+    /// This materializes every name and is therefore **not** the administrative
+    /// enumeration path: use [`pin_root`](Self::pin_root) and
+    /// [`scan`](Self::scan), which are bounded.
     #[must_use]
     pub fn stream_names(&self) -> Vec<String> {
-        let mut v: Vec<String> = self.read_heads().keys().cloned().collect();
+        let published = self.read_published();
+        let mut v: Vec<String> = published.by_stream.keys().cloned().collect();
         v.sort();
         v
     }
 
-    fn read_heads(
-        &self,
-    ) -> std::sync::RwLockReadGuard<'_, HashMap<String, RootEntry>> {
-        self.heads.read().unwrap_or_else(|e| e.into_inner())
+    fn read_published(&self) -> std::sync::RwLockReadGuard<'_, Published> {
+        self.published.read().unwrap_or_else(|e| e.into_inner())
     }
 
     // -----------------------------------------------------------------
     // Load
     // -----------------------------------------------------------------
 
-    /// Resolve the current record for `stream`, or `None`.
+    /// Resolve the record published for exactly `(stream, compatibility)`.
     ///
-    /// **Never fails.** A missing head, a missing pack, a corrupt frame, a
-    /// record whose bytes do not match the leaf's `(offset, length, hash)`, a
-    /// record naming a different stream, an unknown record format — all of
-    /// them are a miss, which the caller answers with a full replay.
+    /// **Never fails.** A missing head, a head under a different identity, a
+    /// missing pack, a corrupt frame, a record whose bytes do not match the
+    /// leaf's `(offset, length, hash)`, a record naming a different stream, an
+    /// unknown record format — every one of them is a
+    /// [`SnapshotLookup::Miss`] carrying its reason, and every reason means the
+    /// caller replays.
     #[must_use]
-    pub fn load(&self, stream: &str) -> Option<Record> {
-        let entry = self.read_heads().get(stream).cloned()?;
+    pub fn load(
+        &self,
+        stream: &str,
+        compatibility: SnapshotCompatibility,
+    ) -> SnapshotLookup<Record> {
+        let entry = {
+            let published = self.read_published();
+            match published.head(stream, &compatibility) {
+                Some(e) => e.clone(),
+                None => {
+                    return SnapshotLookup::Miss(
+                        match published.foreign_head(stream, &compatibility) {
+                            Some(other) => SnapshotMiss::Incompatible {
+                                stored: other.compatibility,
+                            },
+                            None => SnapshotMiss::Absent,
+                        },
+                    );
+                }
+            }
+        };
         match self.resolve(&entry) {
-            Some(rec) if rec.stream_name == stream => Some(rec),
+            Some(rec) if rec.stream_name == stream => SnapshotLookup::Hit(rec),
             _ => {
                 SidecarMetrics::bump(&self.metrics.degraded_loads);
-                None
+                SnapshotLookup::Miss(SnapshotMiss::Unreadable)
             }
         }
     }
@@ -638,13 +749,16 @@ impl Sidecar {
             return None;
         }
         let rec = decode_record(&frame.body)?;
-        // Routing fields must agree with the leaf as well.
-        if rec.fold_version != entry.fold_version
-            || rec.covers_empty_prefix != entry.covers_empty_prefix
-            || rec.stream_version != entry.stream_version
+        // The key and coverage the leaf routes on must be the ones the record
+        // itself claims, or the leaf is not describing this record.
+        if rec.compatibility != entry.compatibility
+            || rec.coverage != entry.coverage
         {
             return None;
         }
+        // An unknown trust mode is invalid (ADR 0002 §1), never "probably
+        // fine".
+        trust_from_u8(rec.trust_mode)?;
         Some(rec)
     }
 
@@ -673,16 +787,38 @@ impl Sidecar {
 
     /// Persist `record` and publish a new root, using this sidecar's
     /// configured [`SaveMode`].
-    pub fn save(&self, record: &Record) -> Result<(), PackSidecarError> {
+    ///
+    /// # Errors
+    ///
+    /// [`PackSidecarError`] only when the write plumbing failed. A refused save
+    /// is a successful call reporting its [`SnapshotSaveOutcome`].
+    pub fn save(
+        &self,
+        record: &Record,
+    ) -> Result<SnapshotSaveOutcome, PackSidecarError> {
         self.save_with_mode(record, self.options.mode)
     }
 
     /// Persist `record` under an explicit publication mode.
+    ///
+    /// # The publication rule
+    ///
+    /// Heads are keyed by `(stream, compatibility)`, so a record under a new
+    /// identity never touches an old one's head and a *late* save under an old
+    /// identity can neither hide nor delete a new one (ADR 0002 §1). Within one
+    /// key the decision is [`publication_decision`]'s, including the
+    /// equal-coverage rule: the current record is read and fully validated
+    /// before anything supersedes it, so a corrupt head can be repaired without
+    /// weakening split-brain detection.
+    ///
+    /// # Errors
+    ///
+    /// [`PackSidecarError`] only when the write plumbing failed.
     pub fn save_with_mode(
         &self,
         record: &Record,
         mode: SaveMode,
-    ) -> Result<(), PackSidecarError> {
+    ) -> Result<SnapshotSaveOutcome, PackSidecarError> {
         let Some(writer) = self.writer.as_ref() else {
             return Err(PackSidecarError::ReadOnly(self.dir.clone()));
         };
@@ -692,30 +828,43 @@ impl Sidecar {
         let body_crc = format::crc32(&body);
 
         // --- head comparison, serialized with publication -----------------
-        if let Some(cur) = self.read_heads().get(&record.stream_name) {
-            // Different compatibility (fold version) is a different identity:
-            // it always replaces, because this seam exposes exactly one head
-            // per stream and `EventStore::load_cached` relies on a
-            // fold-version bump replacing the stale record.
-            if cur.fold_version == record.fold_version {
-                let new_cov = record.coverage();
-                let cur_cov = cur.coverage();
-                if new_cov < cur_cov {
-                    // Coverage never regresses; the save is dropped rather
-                    // than written as an unreachable orphan.
-                    SidecarMetrics::bump(&self.metrics.coverage_regressions);
-                    return Ok(());
-                }
-                if new_cov == cur_cov && cur.record_crc == body_crc {
-                    // Byte-identical re-save at the same coverage: idempotent.
-                    SidecarMetrics::bump(&self.metrics.idempotent_saves);
-                    return Ok(());
-                }
-                // Equal coverage with different bytes, or higher coverage:
-                // supersede. See the module docs for why a single-writer
-                // sidecar resolves an equal-coverage difference as
-                // last-write-wins rather than as a split-brain conflict.
+        //
+        // The identity bytes compared at equal coverage are the encoded record
+        // body: everything that distinguishes two records, and nothing that
+        // does not (the frame around it, its offset, which pack it landed in).
+        let current = {
+            let published = self.read_published();
+            published
+                .head(&record.stream_name, &record.compatibility)
+                .map_or(CurrentHead::Vacant, |e| {
+                    CurrentHead::Published(e.coverage)
+                })
+        };
+        let decision =
+            publication_decision(current, record.coverage, &body, || {
+                let entry = self
+                    .read_published()
+                    .head(&record.stream_name, &record.compatibility)
+                    .cloned()?;
+                self.resolve(&entry).map(|rec| encode_record(&rec))
+            });
+        match decision {
+            SnapshotSaveOutcome::Idempotent => {
+                SidecarMetrics::bump(&self.metrics.idempotent_saves);
+                return Ok(decision);
             }
+            SnapshotSaveOutcome::CoverageRegressed { .. } => {
+                SidecarMetrics::bump(&self.metrics.coverage_regressions);
+                return Ok(decision);
+            }
+            SnapshotSaveOutcome::Conflict { .. } => {
+                SidecarMetrics::bump(&self.metrics.conflicts);
+                return Ok(decision);
+            }
+            SnapshotSaveOutcome::Repaired => {
+                SidecarMetrics::bump(&self.metrics.repairs);
+            }
+            _ => {}
         }
 
         // --- 1. append + re-read/validate the frame -----------------------
@@ -747,24 +896,27 @@ impl Sidecar {
         // --- 2. build the new head set ------------------------------------
         let entry = RootEntry {
             stream_name: record.stream_name.clone(),
+            compatibility: record.compatibility,
+            coverage: record.coverage,
             pack_seq,
             offset,
             frame_len,
             record_crc: body_crc,
-            fold_version: record.fold_version,
-            covers_empty_prefix: record.covers_empty_prefix,
-            stream_version: record.stream_version,
         };
         let mut entries: Vec<RootEntry> = {
-            let heads = self.read_heads();
-            heads
+            let published = self.read_published();
+            published
+                .sorted
                 .iter()
-                .filter(|(k, _)| *k != &record.stream_name)
-                .map(|(_, v)| v.clone())
+                .filter(|e| {
+                    e.stream_name != record.stream_name
+                        || e.compatibility != record.compatibility
+                })
+                .cloned()
                 .collect()
         };
         entries.push(entry.clone());
-        entries.sort_by(|a, b| a.stream_name.cmp(&b.stream_name));
+        entries.sort_by(scan_order);
 
         // --- 3. durable closure promotion ---------------------------------
         //
@@ -826,25 +978,42 @@ impl Sidecar {
         }
 
         // --- 4/5. publish the root ----------------------------------------
-        self.publish_root(&mut w, entries, mode)?;
+        let generation = self.publish_root(&mut w, entries.clone(), mode)?;
 
         // --- 6. in-memory publication -------------------------------------
-        self.heads
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(record.stream_name.clone(), entry);
+        {
+            let mut published =
+                self.published.write().unwrap_or_else(|e| e.into_inner());
+            let heads = published
+                .by_stream
+                .entry(record.stream_name.clone())
+                .or_default();
+            match heads
+                .iter_mut()
+                .find(|e| e.compatibility == record.compatibility)
+            {
+                Some(slot) => *slot = entry,
+                None => {
+                    heads.push(entry);
+                    heads.sort_by(scan_order);
+                }
+            }
+            published.generation = Some(generation);
+            published.sorted = Arc::new(entries);
+        }
 
         self.maybe_prune(&mut w)?;
-        Ok(())
+        Ok(decision)
     }
 
-    /// Write and atomically install the next root generation.
+    /// Write and atomically install the next root generation, returning its
+    /// generation number.
     fn publish_root(
         &self,
         w: &mut Writer,
         entries: Vec<RootEntry>,
         mode: SaveMode,
-    ) -> Result<(), PackSidecarError> {
+    ) -> Result<u64, PackSidecarError> {
         let hook = w.hook.clone();
         let generation =
             w.ids.alloc(&self.dir, self.uuid, &self.metrics, hook.as_ref())?;
@@ -877,7 +1046,135 @@ impl Sidecar {
             // proved nothing about the directory.
             w.dir_proven = false;
         }
-        Ok(())
+        Ok(generation)
+    }
+
+    // -----------------------------------------------------------------
+    // Bounded administrative enumeration
+    // -----------------------------------------------------------------
+
+    /// Pin the discovery root this sidecar currently serves, or `None` when no
+    /// root resolved and the store has no snapshots.
+    ///
+    /// Takes no lock, creates nothing and repairs nothing, so an offline tool
+    /// may pin a live store's root. The lease is the published head list
+    /// itself: while the pin lives, that immutable view stays readable no
+    /// matter how many generations the writer publishes on top of it.
+    ///
+    /// # Its cost, honestly
+    ///
+    /// `O(1)` — a refcount bump. What is *not* `O(1)` is the flat root behind
+    /// it: `bn-ozi5` documented that v1 keeps every head resident, so a pin
+    /// borrows an `O(N)` list rather than walking an `O(height)` page path.
+    /// When ADR 0002's copy-on-write discovery tree lands, the lease becomes
+    /// the page path and this signature does not change.
+    #[must_use]
+    pub fn pin_root(&self) -> Option<PinnedSnapshotRoot> {
+        let published = self.read_published();
+        let generation = published.generation?;
+        let lease: Arc<dyn std::any::Any + Send + Sync> =
+            Arc::clone(&published.sorted) as Arc<Vec<RootEntry>>;
+        Some(PinnedSnapshotRoot::new(
+            SnapshotRootId::new(self.uuid.0, generation),
+            lease,
+        ))
+    }
+
+    /// Read one bounded page of `pin`'s heads, resuming strictly after
+    /// `cursor`.
+    ///
+    /// # Its law
+    ///
+    /// - the page holds at most `limit` entries, itself capped at
+    ///   [`MAX_SNAPSHOT_SCAN_LIMIT`](crate::snapshot::MAX_SNAPSHOT_SCAN_LIMIT);
+    /// - a cursor minted against a different root is
+    ///   [`Rejected`](SnapshotScanDiagnostic::Rejected), never reinterpreted;
+    /// - every returned entry is **validated** — the frame is read, the leaf's
+    ///   `(offset, length, hash)` binding checked and the record decoded;
+    /// - a head that does not validate is *skipped* and counted in
+    ///   [`Partial`](SnapshotScanDiagnostic::Partial), never fabricated and
+    ///   never repaired. Only [`Complete`](SnapshotScanDiagnostic::Complete)
+    ///   licenses a destructive caller to act.
+    ///
+    /// Work is `O(log N + limit)`; page memory is `O(limit)`.
+    #[must_use]
+    pub fn scan(
+        &self,
+        pin: &PinnedSnapshotRoot,
+        cursor: Option<&SnapshotScanCursor>,
+        limit: NonZeroU32,
+    ) -> SnapshotScanPage {
+        let published = self.read_published();
+        let root_id = match published.generation {
+            Some(g) => SnapshotRootId::new(self.uuid.0, g),
+            None => return SnapshotScanPage::rejected(),
+        };
+        if pin.id() != root_id {
+            return SnapshotScanPage::rejected();
+        }
+        if let Some(c) = cursor
+            && c.root() != root_id
+        {
+            return SnapshotScanPage::rejected();
+        }
+        let heads = Arc::clone(&published.sorted);
+        drop(published);
+
+        // Seek: O(log N) to the first key strictly after the cursor.
+        let start = match cursor {
+            None => 0,
+            Some(c) => heads.partition_point(|e| {
+                (e.stream_name.as_str(), &e.compatibility)
+                    <= (c.after().stream_id.as_str(), &c.after().compatibility)
+            }),
+        };
+
+        let limit = clamp_scan_limit(limit) as usize;
+        let end = heads.len().min(start.saturating_add(limit));
+        let mut entries = Vec::with_capacity(end - start);
+        let mut unresolved = 0u64;
+        for head in &heads[start..end] {
+            let Some(rec) = self.resolve(head) else {
+                unresolved += 1;
+                continue;
+            };
+            let Some(trust) = trust_from_u8(rec.trust_mode) else {
+                unresolved += 1;
+                continue;
+            };
+            entries.push(SnapshotScanEntry {
+                key: SnapshotScanKey {
+                    stream_id:     head.stream_name.clone(),
+                    compatibility: head.compatibility,
+                },
+                coverage: head.coverage,
+                trust,
+                state_len: rec.state.len() as u64,
+                frame_len: u64::from(head.frame_len),
+            });
+        }
+
+        // The cursor names the last key *visited*, not the last one returned,
+        // so a page whose entries were all skipped still makes progress.
+        let next_cursor = (end < heads.len()).then(|| {
+            let last = &heads[end - 1];
+            SnapshotScanCursor::new(
+                root_id,
+                SnapshotScanKey {
+                    stream_id:     last.stream_name.clone(),
+                    compatibility: last.compatibility,
+                },
+            )
+        });
+        SnapshotScanPage {
+            entries,
+            next_cursor,
+            diagnostic: if unresolved == 0 {
+                SnapshotScanDiagnostic::Complete
+            } else {
+                SnapshotScanDiagnostic::Partial { unresolved }
+            },
+        }
     }
 
     // -----------------------------------------------------------------

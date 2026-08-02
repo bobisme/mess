@@ -36,7 +36,7 @@ use mess_cli::format::{self, Format};
 use mess_core::{Aggregate, CodecError, Decide, Event};
 use mess_store::{
     EventStore, LogEngine, PackSnapshotBackend, SnapshotPolicy, Snapshottable,
-    StateCodecError,
+    StableSnapshotId, StateCodecError,
 };
 use serde_json::Value;
 
@@ -77,6 +77,8 @@ impl Aggregate for Counter {
 }
 
 impl Snapshottable for Counter {
+    const AGGREGATE_SCHEMA_ID: StableSnapshotId =
+        StableSnapshotId::new("mess-cli.test.lock-counter");
     const FOLD_VERSION: u32 = 1;
 
     fn encode_state(&self) -> Result<Vec<u8>, StateCodecError> {

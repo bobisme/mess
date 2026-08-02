@@ -23,7 +23,10 @@ use mess_store::backend::{
     AppendError, Appended, Backend, OwnedAppendBatch, RecordToAppend,
     StoredRecord,
 };
-use mess_store::snapshot::{SnapshotStore, StoredSnapshot};
+use mess_store::snapshot::{
+    SnapshotCompatibility, SnapshotLookup, SnapshotSaveOutcome, SnapshotStore,
+    StoredSnapshot,
+};
 use mess_store::{LogEngine, MockBackend, PackSnapshotBackend, Version};
 use mess_testkit::{SweepingTempDir, sweeping_temp_dir};
 
@@ -203,15 +206,16 @@ impl<B: SnapshotStore + Clone> SnapshotStore for Tmp<B> {
         &self,
         stream_id: &str,
         snapshot: StoredSnapshot,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+    ) -> impl Future<Output = Result<SnapshotSaveOutcome, Self::Error>> + Send
+    {
         self.backend.save_snapshot(stream_id, snapshot)
     }
 
     fn load_snapshot(
         &self,
         stream_id: &str,
-    ) -> impl Future<Output = Result<Option<StoredSnapshot>, Self::Error>> + Send
-    {
-        self.backend.load_snapshot(stream_id)
+        compatibility: SnapshotCompatibility,
+    ) -> impl Future<Output = Result<SnapshotLookup, Self::Error>> + Send {
+        self.backend.load_snapshot(stream_id, compatibility)
     }
 }

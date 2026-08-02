@@ -81,7 +81,7 @@ use std::fmt;
 
 use mess_core::{Aggregate, CodecError, CommandError, Decide, Event};
 use mess_store::backend::AppendError;
-use mess_store::snapshot::{Snapshottable, StateCodecError};
+use mess_store::snapshot::{Snapshottable, StableSnapshotId, StateCodecError};
 use mess_store::{EventStore, MockBackend, StoreError, Version};
 
 // ===========================================================================
@@ -202,6 +202,8 @@ impl Aggregate for Account {
 }
 
 impl Snapshottable for Account {
+    const AGGREGATE_SCHEMA_ID: StableSnapshotId =
+        StableSnapshotId::new("mess-store.test.differential-account");
     const FOLD_VERSION: u32 = 1;
 
     fn encode_state(&self) -> Result<Vec<u8>, StateCodecError> {
