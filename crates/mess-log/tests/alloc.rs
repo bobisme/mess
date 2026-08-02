@@ -65,14 +65,15 @@ use mess_log::encode::{BatchEncoder, BatchInput, Subframe};
 use mess_log::runtime::{RealRuntime, Runtime};
 use mess_log::writer::{BatchSpec, SegmentParams, SegmentWriter};
 
-/// Number of allocating calls (alloc / alloc_zeroed / grow-via-realloc) made
-/// by **this thread** since process start. Deallocs and shrinks are not
-/// counted — we care that the hot path requests no NEW memory.
-///
-/// `const`-initialised on purpose: a lazily initialised thread-local would
-/// have to allocate on first touch, and touching it from inside the global
-/// allocator would then recurse. `Cell<usize>` has no destructor, so no TLS
-/// destructor is registered either.
+// Number of allocating calls (alloc / alloc_zeroed / grow-via-realloc) made
+// by **this thread** since process start. Deallocs and shrinks are not
+// counted — we care that the hot path requests no NEW memory.
+//
+// `const`-initialised on purpose: a lazily initialised thread-local would
+// have to allocate on first touch, and touching it from inside the global
+// allocator would then recurse. `Cell<usize>` has no destructor, so no TLS
+// destructor is registered either. (Plain comment: rustdoc ignores doc
+// comments on macro invocations and rustc warns on them.)
 thread_local! {
     static THREAD_ALLOCS: Cell<usize> = const { Cell::new(0) };
 }
