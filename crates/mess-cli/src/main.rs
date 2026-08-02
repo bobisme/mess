@@ -117,26 +117,34 @@ enum Command {
         #[command(flatten)]
         common: Common,
     },
-    /// Rebuild the legacy `.pidx` pointer sidecars (byte-equal) from the log
-    /// segments.
+    /// Rebuild each segment's sealed index from the log segments.
     ///
-    /// Pack-sealed segments (bn-3of `.seal`) are skipped: this command emits
-    /// only the legacy sidecar shape, which a pack-sealed segment either
-    /// shadows or — when its footer names a SealPack (bn-11g) — refuses
-    /// outright. Re-sealing is the engine's job for those.
+    /// A legacy `.pidx` pointer sidecar is rebuilt offline and byte-equal to
+    /// the sealer's own output. A pack-sealed segment (bn-3of `.seal`) cannot
+    /// take a `.pidx` — the pack shadows it, and a footer that names a
+    /// SealPack (bn-11g) refuses it outright — so its rebuild is a **re-seal
+    /// request** (bn-3qh0): the sealed index is withdrawn into its quarantine
+    /// slot and the engine rebuilds the pack, from the log, at the next open.
+    /// Pass `--reseal` to have this command do that open itself.
     ///
-    /// KNOWN GAP since bn-ccx1 made pack sealing the engine default: every
-    /// newly sealed segment is pack-sealed, so on a store written by a current
-    /// engine this command rebuilds nothing and reports
-    /// `pack-sealed-segment-skipped` per segment. It still rebuilds legacy
-    /// loose-sidecar stores (and any store run with `seal_pack: false`). An
-    /// offline pack encoder is tracked as bn-3qh0.
+    /// A healthy pack is left alone (`pack-sealed-segment-skipped`); a broken
+    /// one — named but absent, unreadable, or not the pack the footer names —
+    /// is repaired. Reads are served from the raw log, the only authority,
+    /// from the withdrawal until the re-seal lands.
     RebuildIndex {
         /// The store directory.
         dir:     PathBuf,
         /// Preview without writing anything.
         #[arg(long)]
         dry_run: bool,
+        /// Withdraw a HEALTHY pack too, so the next open rebuilds it from the
+        /// log. Not needed to repair a broken one.
+        #[arg(long)]
+        force:   bool,
+        /// Finish the job now: open the store once so the engine re-seals
+        /// every withdrawn segment before this command exits.
+        #[arg(long)]
+        reseal:  bool,
         #[command(flatten)]
         common:  Common,
     },
@@ -240,11 +248,12 @@ fn main() -> ExitCode {
             let report = verify::run(&dir, &VerifyOptions { full, repair });
             emit(&report, resolve_format(&common))
         }
-        Command::RebuildIndex { dir, dry_run, common } => {
+        Command::RebuildIndex { dir, dry_run, force, reseal, common } => {
             if let Err(code) = require_dir(&dir) {
                 return code;
             }
-            let report = rebuild::run(&dir, &RebuildOptions { dry_run });
+            let report =
+                rebuild::run(&dir, &RebuildOptions { dry_run, force, reseal });
             emit(&report, resolve_format(&common))
         }
         Command::Retention { what } => match what {

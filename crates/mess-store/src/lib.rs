@@ -103,6 +103,7 @@ pub use pack_snapshot::{
 pub use retry::{DEFAULT_MAX_ATTEMPTS, RetryPolicy};
 pub use sealed_candidate::{
     QUARANTINE_SUFFIX, Refutation, RefutationReason, SealedCandidateHealth,
+    WITHDRAWAL_MARKER_BANNER, Withdrawal, withdraw_sealed_index,
 };
 pub use snapshot::{
     BlobPtr, Hash256, SnapshotPolicy, SnapshotRef, SnapshotStore,

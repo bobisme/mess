@@ -2578,10 +2578,14 @@ pub struct EngineOptions {
     /// store, and a legacy segment is never spontaneously re-sealed, so
     /// existing stores stay loose until natural re-rolls convert their tail.
     ///
-    /// Known gap under the default: `mess rebuild-index` has no offline pack
-    /// encoder, so it reports `pack-sealed-segment-skipped` and writes nothing
-    /// for pack-sealed segments (bn-3qh0). The engine's re-seal path is the
-    /// replacement.
+    /// bn-3qh0 closed the one gap the flip left. `mess rebuild-index` still
+    /// has no offline pack encoder and deliberately never will: for a
+    /// pack-sealed segment it calls
+    /// [`withdraw_sealed_index`](crate::withdraw_sealed_index) and the
+    /// engine's own re-seal path rebuilds the pack from the log at the
+    /// next open. That is what restores a segment whose `.seal` was lost —
+    /// the one state bn-30u's candidate lifecycle cannot reach by itself,
+    /// because a deleted artifact is no candidate to refute.
     ///
     /// Decision record: bn-1yor (default-on scale and fault matrix) / bn-ccx1
     /// (the flip).

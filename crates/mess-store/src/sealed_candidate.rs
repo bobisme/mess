@@ -117,13 +117,64 @@
 //!
 //! A healthy store enqueues nothing at all: it has no markers.
 //!
+//! # bn-3qh0: the offline entry point, and the artifact that is not there
+//!
+//! Everything above is driven by the engine finding a candidate and judging
+//! it. An **offline** repair tool (`mess rebuild-index`) needs the same
+//! outcome for a segment the engine will never judge at all — the one whose
+//! sealed artifact is simply *gone*.
+//!
+//! That gap is precise. A pack that is corrupt, stale, or substituted is a
+//! candidate: open classifies it, refutes it, quarantines it, and the segment
+//! converges. A pack that was **deleted** (an operator cleaned `sealed/`, a
+//! restore dropped it, a disk lost it) is not a candidate, so nothing is
+//! refuted, so no marker is written, so `owed_reseal` is empty and the segment
+//! is *never* re-queued — it is served from the log forever, correct and
+//! permanently un-accelerated. Since bn-ccx1 made pack sealing the default
+//! that is the whole of `rebuild-index`'s lost capability: it used to answer
+//! "your index is missing, here it is again".
+//!
+//! [`withdraw_sealed_index`] closes it without inventing anything. The re-seal
+//! trigger has always been a **structural name parse** — the extension is
+//! `refuted` and [`segment_id_from_name`] reads the id — and never the file's
+//! content. So the request is simply the segment's own quarantine slot,
+//! occupied: with the refuted bytes when there are any to preserve, and with a
+//! short self-describing note when there were none. One slot per (segment,
+//! kind) either way, so the bound in the section above is untouched, and the
+//! engine needs no new code to honour it.
+//!
+//! The write order is the same law the rest of this module obeys — **the
+//! durable intent lands before the thing it is about is destroyed**:
+//!
+//! 1. create the marker with `create_new`, so preserved evidence already in the
+//!    slot is never clobbered, and `fsync` it plus its directory;
+//! 2. [`quarantine`] the primary candidate if one exists, which renames the
+//!    real bytes *onto* the marker (atomic replace — the evidence wins the
+//!    slot, and the trigger name never stops existing for an instant).
+//!
+//! A crash between the two is benign in both directions: the slot is occupied
+//! from step 1 onward, so the re-seal is already owed, and the pack that did
+//! not get quarantined is either healthy (open admits it, and an admitted
+//! segment is never re-queued — the marker goes inert exactly as above) or
+//! refutable (open refutes and quarantines it itself). Re-running the
+//! withdrawal converges: step 1 is an `AlreadyExists` no-op and step 2 is the
+//! `NotFound`-tolerant rename it always was.
+//!
 //! # What this module does NOT touch
 //!
 //! The raw log stays authority throughout. A missing, corrupt, or quarantined
 //! candidate costs the segment its cold-tier acceleration and nothing else:
 //! reads, verify, repair, and a later successful seal all run off the `.log`
-//! bytes, which no step here reads, writes, or renames.
+//! bytes, which no step here reads, writes, or renames. That includes the
+//! offline path: a withdrawal writes and renames inside `sealed/` only. In
+//! particular it does **not** rewrite the segment footer, which goes on naming
+//! the pack that is no longer there — and must, because the footer is a `.log`
+//! byte and the fresh seal is what re-finalizes it. A footer naming an absent
+//! pack is a miss, not an error: with no candidate to judge there is nothing
+//! for spec 01 §3.3.3's fail-closed rule to fail on, and the segment is served
+//! from the raw log until the re-seal lands.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::{fmt, io};
 
@@ -416,6 +467,113 @@ pub fn quarantine(primary: &Path) -> io::Result<u32> {
     Ok(moved)
 }
 
+/// The first line of a marker [`withdraw_sealed_index`] had to synthesise
+/// because there were no refuted bytes to preserve.
+///
+/// Content is advisory — the engine's trigger is the file *name* — so this
+/// exists purely so an operator who opens the file learns what put it there
+/// instead of finding an unexplained husk.
+pub const WITHDRAWAL_MARKER_BANNER: &str =
+    "mess: sealed index withdrawn offline (bn-3qh0)";
+
+/// What one [`withdraw_sealed_index`] did to a segment's quarantine slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Withdrawal {
+    /// The quarantine slot that now carries the durable re-seal request.
+    pub marker:      PathBuf,
+    /// Whether this call created the marker. `false` means the slot was
+    /// already occupied — by an earlier withdrawal, or by evidence some open
+    /// quarantined — which is already the request, so it was left untouched.
+    pub created:     bool,
+    /// The primary candidate this call renamed into the slot, or `None` when
+    /// the segment had no `.seal` on disk at all (the deleted-pack case the
+    /// engine cannot see).
+    pub quarantined: Option<PathBuf>,
+}
+
+impl Withdrawal {
+    /// The stable machine token for the shape of this withdrawal:
+    /// `quarantined` (a real artifact was preserved), `marked` (there was
+    /// nothing to preserve, so the request was synthesised), or `already`
+    /// (the slot was occupied before this call).
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match (self.created, self.quarantined.is_some()) {
+            (_, true) => "quarantined",
+            (true, false) => "marked",
+            (false, false) => "already",
+        }
+    }
+}
+
+/// Withdraw a segment's consolidated `.seal` from the candidate namespace
+/// **offline** and leave the durable re-seal request behind (bn-3qh0).
+///
+/// This is the out-of-process counterpart to
+/// [`SealedCandidateHealth::refute`]: same slot, same trigger, same bound —
+/// see the module docs for why the request is the quarantine slot itself and
+/// why the marker is written before the rename.
+///
+/// Idempotent, and crash-safe at every step. Repeating the call after any
+/// interruption converges to the same on-disk state and never grows it: the
+/// marker is `create_new` (so a second call is a no-op and preserved evidence
+/// is never overwritten) and the quarantine rename tolerates `NotFound`.
+///
+/// The caller is expected to hold the store's writer lock — the whole point is
+/// that the next engine open sees this — but nothing here depends on it: a
+/// concurrent engine that quarantines the same pack first simply wins the
+/// slot, which is the same outcome.
+///
+/// # Errors
+///
+/// Any I/O failure other than "the marker already exists" or "the candidate
+/// does not exist": a read-only or full filesystem, a permissions problem. The
+/// store is unharmed — the log is authority and nothing outside `sealed/` was
+/// touched — it simply has not converged, and the caller should say so.
+pub fn withdraw_sealed_index(
+    sealed_dir: &Path,
+    segment_id: u64,
+    reason: &str,
+) -> io::Result<Withdrawal> {
+    std::fs::create_dir_all(sealed_dir)?;
+    let primary = mess_index::sealed::seal_pack_path(sealed_dir, segment_id);
+    let marker = quarantine_path(&primary);
+
+    // Step 1: the durable intent. `create_new` is load-bearing twice over — it
+    // is what makes a repeated withdrawal a no-op, and it is what stops this
+    // from truncating refuted bytes an earlier open preserved in the same slot.
+    let created = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+    {
+        Ok(mut f) => {
+            writeln!(f, "{WITHDRAWAL_MARKER_BANNER}")?;
+            writeln!(f, "segment={segment_id}")?;
+            writeln!(f, "reason={reason}")?;
+            writeln!(
+                f,
+                "There was no sealed artifact to preserve; this file IS the \
+                 durable re-seal request. The next engine open re-seals \
+                 segment {segment_id} from the log and re-finalizes its \
+                 footer. Reads are served from the log meanwhile."
+            )?;
+            f.sync_all()?;
+            true
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => false,
+        Err(e) => return Err(e),
+    };
+    // Same best-effort directory fsync, for the same reason, as `quarantine`.
+    if created && let Ok(dir) = std::fs::File::open(sealed_dir) {
+        let _ = dir.sync_all();
+    }
+
+    // Step 2: the real bytes, if any, replace the synthesised marker.
+    let quarantined = (quarantine(&primary)? > 0).then_some(primary);
+    Ok(Withdrawal { marker, created, quarantined })
+}
+
 /// The segment id encoded in a sealed-sidecar file name (`seg-<id:020>.<ext>`),
 /// by structural name parse — the fallback identity for a candidate whose
 /// bytes could not be parsed at all, so the refutation can still name a
@@ -556,6 +714,129 @@ mod tests {
             vec![4u8],
             "the newest refuted bytes win the slot"
         );
+    }
+
+    // -- bn-3qh0: the offline withdrawal ------------------------------------
+
+    /// The deleted-pack case: nothing to preserve, so the request is
+    /// synthesised — and it lands in the slot the engine already reads, under
+    /// a name that is not a candidate.
+    #[test]
+    fn withdrawal_with_no_artifact_synthesises_the_request() {
+        let d = mess_testkit::sweeping_temp_dir("cand-withdraw-absent");
+        let sealed = d.path();
+
+        let w = withdraw_sealed_index(sealed, 7, "pack-named-but-absent")
+            .expect("withdraw");
+        assert!(w.created, "the marker was synthesised");
+        assert_eq!(w.quarantined, None, "there was nothing to quarantine");
+        assert_eq!(w.as_str(), "marked");
+        assert!(w.marker.exists(), "{} landed", w.marker.display());
+        assert_eq!(
+            w.marker.extension().and_then(|e| e.to_str()),
+            Some("refuted"),
+            "the request occupies the segment's quarantine slot"
+        );
+        assert!(!is_candidate(&w.marker), "and is not itself a candidate");
+        assert_eq!(segment_id_from_name(&w.marker), Some(7));
+
+        let text = std::fs::read_to_string(&w.marker).expect("read marker");
+        assert!(text.starts_with(WITHDRAWAL_MARKER_BANNER), "{text}");
+        assert!(text.contains("reason=pack-named-but-absent"), "{text}");
+    }
+
+    /// A pack that IS on disk is preserved, not deleted: the rename replaces
+    /// the synthesised marker with the real bytes, so the slot always holds
+    /// the strongest evidence available.
+    #[test]
+    fn withdrawal_preserves_the_pack_bytes_in_the_slot() {
+        let d = mess_testkit::sweeping_temp_dir("cand-withdraw-present");
+        let sealed = d.path();
+        let pack = sealed.join(format!("seg-{:020}.seal", 3));
+        std::fs::write(&pack, b"the real pack bytes").expect("write pack");
+
+        let w = withdraw_sealed_index(sealed, 3, "pack-unreadable")
+            .expect("withdraw");
+        assert_eq!(w.quarantined.as_deref(), Some(pack.as_path()));
+        assert_eq!(w.as_str(), "quarantined");
+        assert!(!pack.exists(), "the candidate left the namespace");
+        assert_eq!(
+            std::fs::read(&w.marker).expect("read slot"),
+            b"the real pack bytes",
+            "the real bytes win the slot over the synthesised note"
+        );
+    }
+
+    /// Evidence an engine open already quarantined is never overwritten by a
+    /// later offline withdrawal — `create_new` is what guarantees it.
+    #[test]
+    fn withdrawal_never_clobbers_preserved_evidence() {
+        let d = mess_testkit::sweeping_temp_dir("cand-withdraw-evidence");
+        let sealed = d.path();
+        let slot = quarantine_path(&sealed.join(format!("seg-{:020}.seal", 5)));
+        std::fs::write(&slot, b"bytes an open refuted earlier").expect("write");
+
+        let w = withdraw_sealed_index(sealed, 5, "pack-named-but-absent")
+            .expect("withdraw");
+        assert!(!w.created, "the slot was already the request");
+        assert_eq!(w.as_str(), "already");
+        assert_eq!(
+            std::fs::read(&slot).expect("read slot"),
+            b"bytes an open refuted earlier",
+            "the earlier evidence survives untouched"
+        );
+    }
+
+    /// Idempotent and bounded: repeating the withdrawal converges to one slot
+    /// and never grows the directory, whichever step a crash interrupted.
+    #[test]
+    fn withdrawal_is_idempotent_and_bounded() {
+        let d = mess_testkit::sweeping_temp_dir("cand-withdraw-idempotent");
+        let sealed = d.path();
+
+        for round in 0..4u8 {
+            let w = withdraw_sealed_index(sealed, 9, "pack-named-but-absent")
+                .expect("withdraw");
+            assert_eq!(
+                w.created,
+                round == 0,
+                "only the first call creates the marker"
+            );
+            let entries: Vec<_> = std::fs::read_dir(sealed)
+                .expect("read_dir")
+                .flatten()
+                .map(|e| e.file_name())
+                .collect();
+            assert_eq!(
+                entries.len(),
+                1,
+                "exactly one slot, round {round}: {entries:?}"
+            );
+        }
+    }
+
+    /// Crash between step 1 and step 2 (marker durable, rename not yet done):
+    /// the next call finishes the job, and the preserved bytes replace the
+    /// note. This is the interruption the write order exists to survive.
+    #[test]
+    fn withdrawal_resumes_after_a_crash_between_marker_and_rename() {
+        let d = mess_testkit::sweeping_temp_dir("cand-withdraw-resume");
+        let sealed = d.path();
+        let pack = sealed.join(format!("seg-{:020}.seal", 11));
+        std::fs::write(&pack, b"pack bytes").expect("write pack");
+        // Step 1 only.
+        std::fs::write(
+            quarantine_path(&pack),
+            format!("{WITHDRAWAL_MARKER_BANNER}\nsegment=11\n"),
+        )
+        .expect("marker");
+
+        let w = withdraw_sealed_index(sealed, 11, "pack-identity-mismatch")
+            .expect("resume");
+        assert!(!w.created, "the marker was already there");
+        assert_eq!(w.quarantined.as_deref(), Some(pack.as_path()));
+        assert!(!pack.exists());
+        assert_eq!(std::fs::read(&w.marker).expect("read slot"), b"pack bytes");
     }
 
     #[test]

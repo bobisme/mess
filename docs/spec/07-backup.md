@@ -77,6 +77,17 @@ index (active pointers, sealed directory summaries, per-stream heads) are
 not need them for correctness: restore runs full recovery, which re-derives
 every index and catalog from the segment bytes.
 
+That holds for both sealed shapes, by different routes (`bn-3qh0`). A legacy
+`.pidx` is re-encoded offline, byte-equal to the sealer's own output. A
+consolidated `.seal` pack is **not** encoded offline — `rebuild-index` withdraws
+the segment's sealed index into its quarantine slot (`bn-30u`) and the engine's
+re-seal path rebuilds the pack from the log at the next open, re-finalizing the
+footer to name the fresh one, which is the only way to honour `bn-11g`'s
+footer↔pack binding without an offline tool rewriting a `.log` byte. That is a
+recovery path, not a licence to leave the pack out of a cut: a restored store
+whose footer names an absent pack reports `seal-pack-missing` and fails
+`restore`'s own verify gate long before anyone runs `rebuild-index` on it (§3).
+
 **There is no exception.** There used to be one: the name↔id interner lived in
 `stream_names` / `type_names` tables under a `<dir>/meta` key-value directory
 (`bn-20b` / `bn-150`), because the log stored only interned numeric ids. Those

@@ -616,7 +616,7 @@ fn verify_seal_identity(
 /// resolved — the same four rejections the engine makes (spec 01 §3.3.3 reader
 /// rule 2): the extension fails `ext_crc`, carries no (or more than one)
 /// kind-`3` section, names another segment, or uses an unknown `identity_kind`.
-fn read_named_identity(
+pub(crate) fn read_named_identity(
     seg: &store::SegmentFile,
     trailer: &SegmentCatalogEntry,
 ) -> Option<SealPackIdentity> {

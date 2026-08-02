@@ -35,6 +35,14 @@
 //!
 //! # Quarantined candidates are not unknown files
 //!
+//! bn-3qh0 puts one more thing in that same slot: `mess rebuild-index`'s
+//! offline **re-seal request** for a pack-sealed segment. When there were
+//! refuted bytes to preserve the slot holds them as always; when the pack was
+//! simply gone — the state that has no candidate and so no refutation — it
+//! holds a short self-describing note instead. Both mean the same thing to the
+//! engine and to an operator: this segment's sealed index was withdrawn and a
+//! fresh seal is owed.
+//!
 //! bn-30u renames a refuted candidate to `<name>.refuted`, which is exactly
 //! what makes it invisible to the structural name parses above (its extension
 //! is no longer `seal`/`pidx`). That invisibility is deliberate for *readers*
