@@ -139,6 +139,12 @@ use mess_log::format::{
     SEAL_PACK_IDENTITY_HDRDIR_BLAKE3, SUBFRAME_HDR_LEN,
 };
 use mess_log::lock::StoreLock;
+// bn-11ba: the shared lock-free metrics primitives. The composed
+// observability surface records with the same fixed-bucket histogram and
+// relaxed counter the committer already uses on its own barrier — no
+// second metrics core, and nothing on the hot path more expensive than a
+// `fetch_add` plus a timestamp diff (spec 03 §2.6's budget).
+use mess_log::metrics::{Counter, LatencyHistogram};
 use mess_log::runtime::{
     FileHandle, Fs as LogFs, OpenOpts, RealRuntime, Runtime,
 };
@@ -157,6 +163,11 @@ use tokio::sync::{
 use crate::backend::{
     AppendError, Appended, Backend, GlobalPage, OwnedAppendBatch,
     OwnedTypeLayout, RecordToAppend, StoredRecord, SubscribeBackend,
+};
+use crate::observability::{
+    AUTHORITY_MODEL, AcceleratorReport, BacklogReport, DurabilityMode,
+    DurabilityReport, EngineObservability, FallbackReport, OwnerReport,
+    SealedRepresentation, SealedSegmentReport, StateReport,
 };
 use crate::registry::{self, RegistryRecord};
 use crate::sealed_candidate::{self, RefutationReason, SealedCandidateHealth};
@@ -1126,20 +1137,20 @@ enum ResumePlan {
 struct Recovered {
     /// Interners (folded out of `$registry`, or — for an unmigrated legacy
     /// store — reloaded from the meta name tables) + per-stream heads.
-    book:        Book,
+    book:               Book,
     /// How to resume the live head segment.
-    plan:        ResumePlan,
+    plan:               ResumePlan,
     /// Per-stream fold-chain exit heads (chain-on stores only; spec 05 §6).
-    chain_heads: HashMap<u64, ChainHead>,
+    chain_heads:        HashMap<u64, ChainHead>,
     /// The recovered durable/published canonical event count — the exclusive
     /// end of the global-position sequence, including `$registry` events that
     /// application reads filter. Seeds both the publish sequencer and the
     /// published read watermark.
-    watermark:   u64,
+    watermark:          u64,
     /// Payload frames materialised during recovery — 0 on every chain-off
     /// open (the bn-2ib gate observable,
     /// [`LogEngine::recover_payload_decodes`]).
-    decodes:     u64,
+    decodes:            u64,
     /// bn-30u: every segment recovery **scanned** (so: every segment not
     /// already served from a footer-verified sidecar) that carries a valid
     /// header and at least one event, with the roll summary a fresh seal would
@@ -1150,7 +1161,18 @@ struct Recovered {
     /// owed a re-seal (a durable `*.refuted` quarantine marker, and no
     /// footer-verified sidecar) and excludes the live head, which must never
     /// be footer-finalized while it is still being appended to.
-    resealable:  Vec<SegmentSummary>,
+    resealable:         Vec<SegmentSummary>,
+    /// bn-11ba: sealed segments whose `$registry` batches came out of an
+    /// admitted registry delta (the pack's `REGISTRY_DELTA` section or the
+    /// sibling `.reg`), i.e. the accelerated `O(#segments)` path.
+    reg_delta_admitted: u64,
+    /// bn-11ba: sealed segments that carry `$registry` batches but whose
+    /// delta was absent, unreadable, or rejected by the layout cross-check,
+    /// so recovery point-read the same batches through the pointer index
+    /// instead. Always correct — the delta is discardable acceleration (D1) —
+    /// but the `O(#names)` path, and the number an operator needs in order to
+    /// know a cold open is slow *because* the accelerator was refused.
+    reg_delta_fallback: u64,
 }
 
 /// A sealed-index candidate that parsed but is not yet admitted: the parsed
@@ -1327,15 +1349,35 @@ struct OwnerIntent {
 struct OwnerCompletion {
     _permit: OwnedSemaphorePermit,
     done:    oneshot::Sender<OwnerResult>,
+    /// bn-11ba: where this append's outcome is counted. One `Arc` clone per
+    /// *append* (a relaxed refcount bump, no allocation) buys the conflict,
+    /// cancellation and end-to-end ack-latency numbers with no extra
+    /// plumbing through `plan_domain`/`commit_plans`.
+    status:  Arc<OwnerStatus>,
+    /// When this intent was admitted to the owner ring. One `Instant::now`
+    /// per append batch — never per event.
+    queued:  Instant,
 }
 
 impl OwnerCompletion {
     /// Append completion is an ownership boundary: once the receiver wakes,
     /// both the channel slot and byte permits must be reusable.
+    ///
+    /// bn-11ba: this is also the one funnel every append outcome passes
+    /// through, so it is where the outcome counters are recorded. A `send`
+    /// that fails means the caller dropped its future before the outcome
+    /// landed — the events are still committed and published (`bn-3nz`), so
+    /// this is a *cancellation*, not a loss.
     fn finish(self, result: OwnerResult) {
-        let Self { _permit, done } = self;
+        let Self { _permit, done, status, queued } = self;
         drop(_permit);
-        let _ = done.send(result);
+        if matches!(result, Err(AppendError::Conflict { .. })) {
+            status.outcomes.conflicts.incr();
+        }
+        status.outcomes.ack.record(queued.elapsed());
+        if done.send(result).is_err() {
+            status.outcomes.cancellations.incr();
+        }
     }
 }
 
@@ -1343,6 +1385,26 @@ struct InFlightGuard(Arc<AtomicUsize>);
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) { self.0.fetch_sub(1, Ordering::AcqRel); }
+}
+
+/// bn-11ba: holds one unit of the background-seal backlog gauge for the
+/// lifetime of one seal job. A guard rather than a bare `fetch_sub` because
+/// [`LogEngine::run_roll_sealer`]'s loop body has four `continue` exits;
+/// a hand-placed decrement would eventually be forgotten on a new one.
+/// Saturating, so an over-counted enqueue (see `seal_queue_depth`'s
+/// construction) can never wrap the gauge.
+struct SealJobGuard<'a> {
+    backlog: &'a AtomicUsize,
+}
+
+impl Drop for SealJobGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.backlog.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |d| Some(d.saturating_sub(1)),
+        );
+    }
 }
 
 /// One-shot, test-only rendezvous at the append owner's admission boundary.
@@ -1502,6 +1564,42 @@ struct OwnerStatus {
     outcome_scratch_retained_slots: AtomicUsize,
     outcome_scratch_retained_bytes: AtomicUsize,
     outcome_scratch_trims:          AtomicUsize,
+    /// bn-11ba: the append-outcome and group-shape counters the composed
+    /// observability surface reports. Every one of these is recorded exactly
+    /// once per *append* or once per *group* — never per event — and each
+    /// record is one relaxed `fetch_add` (plus, for the histograms, a
+    /// timestamp diff the site already had or one extra `Instant::now`).
+    ///
+    /// They live on `OwnerStatus` because that is the one handle both the
+    /// owner thread and the producer side already share, so nothing new is
+    /// threaded through the append path to reach them.
+    outcomes:                       OutcomeCounters,
+}
+
+/// Append-outcome, queue-delay and group-shape counters (`bn-11ba`).
+///
+/// `group_width` reuses [`LatencyHistogram`] as a general bounded-error
+/// distribution over `u64`; its unit is **intents per group**, not
+/// nanoseconds. That is deliberate — a second histogram implementation for
+/// the sake of a unit name would be strictly worse.
+#[derive(Default)]
+struct OutcomeCounters {
+    /// Appends refused for an expected-version mismatch.
+    conflicts:      Counter,
+    /// Appends whose caller dropped its future before the outcome landed.
+    /// The events still committed and published (`bn-3nz`); this counts a
+    /// caller that stopped listening.
+    cancellations:  Counter,
+    /// Admission-to-outcome latency, nanoseconds.
+    ack:            LatencyHistogram,
+    /// Gather-window duration per committed group, nanoseconds — the
+    /// owner-side queue delay.
+    group_wait:     LatencyHistogram,
+    /// Intents per gathered group.
+    group_width:    LatencyHistogram,
+    /// The owner's durable-commit span per group (write + barrier),
+    /// nanoseconds.
+    commit_latency: LatencyHistogram,
 }
 
 struct AppendOwner {
@@ -1661,6 +1759,11 @@ impl FlatOwner {
         // `Os` is deliberately sync-per-batch. It is a durability contract,
         // not merely a performance setting, so it never coalesces here.
         if matches!(self.durability, Durability::Os) {
+            // bn-11ba: still a group of one, with no gather wait. Recording
+            // it keeps `group_width` an honest distribution across modes
+            // rather than an empty histogram under `Os`.
+            self.status.outcomes.group_width.record_nanos(1);
+            self.status.outcomes.group_wait.record_nanos(0);
             return vec![first];
         }
         let mut bytes = first.cost;
@@ -1701,6 +1804,12 @@ impl FlatOwner {
             }
         }
         self.target = group.len().max(1);
+        // bn-11ba: once per gathered group (never per append, never per
+        // event) — the width the coalescer achieved and the wall time it
+        // spent achieving it. `start` was already taken above for the
+        // deadline, so the wait costs one extra `Instant::now`.
+        self.status.outcomes.group_width.record_nanos(group.len() as u64);
+        self.status.outcomes.group_wait.record(start.elapsed());
         group
     }
 
@@ -1881,6 +1990,12 @@ impl FlatOwner {
         let mut completed = std::mem::take(&mut self.outcomes);
         completed.clear();
         completed.resize_with(plans.len(), PlanOutcomes::default);
+        // bn-11ba: the owner-side durable-commit span — write + barrier as
+        // this thread sees it. One timestamp pair per *group*. The barrier
+        // half alone is already timed by the committer
+        // (`CommitterMetrics::fsync`), so the difference is the write half,
+        // which nothing else measures.
+        let commit_started = Instant::now();
         let outcomes =
             self.direct.commit_ordered_group(units, |unit, batch, outcome| {
                 completed[unit].record(
@@ -1889,6 +2004,7 @@ impl FlatOwner {
                     outcome,
                 );
             });
+        self.status.outcomes.commit_latency.record(commit_started.elapsed());
         self.refresh_status();
         match outcomes {
             Err(e) => {
@@ -2334,6 +2450,16 @@ struct Inner {
     /// classification runs once, before any reader exists) and read back via
     /// [`LogEngine::sealed_candidate_health`].
     candidate_health:     SealedCandidateHealth,
+    /// bn-11ba: seal jobs queued or in progress right now (rolls reported by
+    /// the committer plus owed re-seals enqueued at open, minus jobs the
+    /// sealer thread has finished). The live background-seal backlog.
+    seal_queue_depth:     Arc<AtomicUsize>,
+    /// bn-11ba: cumulative seal jobs the sealer thread has dequeued.
+    seal_jobs_dequeued:   Arc<AtomicU64>,
+    /// bn-11ba: this open's registry-delta accelerator hit count.
+    reg_delta_admitted:   u64,
+    /// bn-11ba: this open's registry-delta fallback (point-read) count.
+    reg_delta_fallback:   u64,
 }
 
 impl Drop for Inner {
@@ -2748,6 +2874,8 @@ impl LogEngine {
             watermark,
             decodes,
             resealable,
+            reg_delta_admitted,
+            reg_delta_fallback,
         } = recovered;
         // The active segment is the highest-id `seg-*.log`; on a fresh store it
         // is `ACTIVE_SEGMENT_ID`. A roll numbers the next one `+1` from here.
@@ -2805,8 +2933,30 @@ impl LogEngine {
         // still exits when the committer drops its `Roller`.
         let reseal_tx = roll_tx.clone();
         let dir_for_paths = dir.to_path_buf();
-        let roller =
-            Roller::new(move |id| segment_path(&dir_for_paths, id), roll_tx);
+        // bn-11ba: the live background-seal backlog. Incremented once per job
+        // *queued* and decremented once per job the sealer thread *finishes*,
+        // so a non-zero reading means the sealer is behind — the number the
+        // "is background work accumulating?" question actually wants, which
+        // neither `SealMetrics` (completions only) nor `SealedCandidateHealth`
+        // (open-time owed set only) could answer before.
+        //
+        // The roll half is counted inside the `path_for` callback because
+        // that is the one hook mess-store owns on the roll path: the
+        // committer invokes it exactly once per roll, naming the *next*
+        // segment, immediately before it reports the rolled one. The single
+        // inaccuracy is a roll whose `open_next` then fails (StoreFull/EIO) —
+        // an error the append itself also surfaces — which leaves the depth
+        // one high until the next completion; the decrement side saturates so
+        // it can never wrap.
+        let seal_queue_depth = Arc::new(AtomicUsize::new(0));
+        let roll_depth = Arc::clone(&seal_queue_depth);
+        let roller = Roller::new(
+            move |id| {
+                roll_depth.fetch_add(1, Ordering::Relaxed);
+                segment_path(&dir_for_paths, id)
+            },
+            roll_tx,
+        );
         // Fold chain (`bn-3l0`, spec 05 §6): opt-in. When on, seed the
         // committer with the per-stream heads rehydrated by recovery so
         // an append after reopen continues each stream's chain from its
@@ -2842,6 +2992,9 @@ impl LogEngine {
         // by every seal still queued at shutdown (see the `Inner` field doc).
         let shutdown_deadline: Arc<OnceLock<Instant>> =
             Arc::new(OnceLock::new());
+        // bn-11ba: cumulative seal jobs the sealer thread has taken off the
+        // channel — the drain-side companion to `seal_queue_depth`.
+        let seal_jobs_dequeued = Arc::new(AtomicU64::new(0));
         // The published read watermark seeds at the recovered event count —
         // 0 on a fresh store. Created before the seal thread so the sealer can
         // gate each rolled segment's seal on the canonical published
@@ -2860,6 +3013,8 @@ impl LogEngine {
             let dir = dir.to_path_buf();
             let seal_metrics_for_thread = Arc::clone(&seal_metrics);
             let shutdown_deadline = Arc::clone(&shutdown_deadline);
+            let backlog = Arc::clone(&seal_queue_depth);
+            let dequeued = Arc::clone(&seal_jobs_dequeued);
             std::thread::Builder::new()
                 .name("mess-engine-roll-sealer".into())
                 .spawn(move || {
@@ -2873,6 +3028,8 @@ impl LogEngine {
                         seal_metrics_for_thread,
                         shutdown_deadline,
                         SpinConfig::default(),
+                        backlog,
+                        dequeued,
                     )
                 })
                 .map_err(|e| EngineError::Open(format!("spawn sealer: {e}")))?
@@ -2923,6 +3080,9 @@ impl LogEngine {
                 continue;
             }
             if reseal_tx.send(summary).is_ok() {
+                // bn-11ba: an owed re-seal is a queued seal job like any
+                // other, so it joins the same backlog gauge.
+                seal_queue_depth.fetch_add(1, Ordering::Relaxed);
                 pending_reseal.push(seg_id);
             }
         }
@@ -2952,6 +3112,7 @@ impl LogEngine {
             outcome_scratch_retained_slots: AtomicUsize::new(0),
             outcome_scratch_retained_bytes: AtomicUsize::new(0),
             outcome_scratch_trims:          AtomicUsize::new(0),
+            outcomes:                       OutcomeCounters::default(),
         });
         let owner = FlatOwner {
             direct,
@@ -3016,6 +3177,10 @@ impl LogEngine {
                 shutdown_deadline,
                 shutdown_seal_budget: opts.shutdown_seal_budget,
                 candidate_health,
+                seal_queue_depth,
+                seal_jobs_dequeued,
+                reg_delta_admitted,
+                reg_delta_fallback,
             }),
         })
     }
@@ -3104,6 +3269,9 @@ impl LogEngine {
         // bn-30u: the roll summaries a fresh seal of each scanned segment
         // would need (see `Recovered::resealable`).
         let mut resealable: Vec<SegmentSummary> = Vec::new();
+        // bn-11ba: registry-delta accelerator use vs. fallback at this open.
+        let mut reg_delta_admitted = 0u64;
+        let mut reg_delta_fallback = 0u64;
 
         // Enumerate the segment chain in ascending id order.
         let segment_ids = enumerate_segment_ids(dir);
@@ -3120,6 +3288,8 @@ impl LogEngine {
                 watermark: 0,
                 decodes,
                 resealable,
+                reg_delta_admitted,
+                reg_delta_fallback,
             });
         }
 
@@ -3235,6 +3405,7 @@ impl LogEngine {
                         });
                     match delta {
                         Some(delta) => {
+                            reg_delta_admitted += 1;
                             for b in delta.batches() {
                                 scan.registry_batches.push((
                                     b.first_global_pos(),
@@ -3243,6 +3414,10 @@ impl LogEngine {
                             }
                         }
                         None => {
+                            // bn-11ba: the accelerator was absent or refused
+                            // its cross-check; this open pays the point-read
+                            // path for this segment's registrations.
+                            reg_delta_fallback += 1;
                             let entries = sref
                                 .stream_entries(registry::REGISTRY_STREAM_ID)
                                 .map_err(|e| {
@@ -3488,6 +3663,8 @@ impl LogEngine {
             watermark,
             decodes,
             resealable,
+            reg_delta_admitted,
+            reg_delta_fallback,
         })
     }
 
@@ -3671,8 +3848,15 @@ impl LogEngine {
         seal_metrics: Arc<SealMetrics>,
         shutdown_deadline: Arc<OnceLock<Instant>>,
         spin: SpinConfig,
+        // bn-11ba: the live backlog gauge and its cumulative drain counter.
+        // Decremented once per job, however that job ends (sealed, skipped,
+        // or empty), so the gauge returns to zero on a quiescent store.
+        backlog: Arc<AtomicUsize>,
+        dequeued: Arc<AtomicU64>,
     ) {
         for summary in rx {
+            let _job = SealJobGuard { backlog: &backlog };
+            dequeued.fetch_add(1, Ordering::Relaxed);
             let base = summary.base_pos;
             let end = summary.end_pos;
 
@@ -4128,6 +4312,150 @@ impl LogEngine {
                 .inner
                 .candidate_health
                 .reseals_enqueued(),
+        }
+    }
+
+    /// The composed operational account of this engine (`bn-11ba`) — one
+    /// report that says which state is canonical, which accelerators are
+    /// installed, and whether background work or fallback paths are
+    /// accumulating.
+    ///
+    /// This is a **composition** of surfaces that already existed
+    /// ([`metrics`](Self::metrics),
+    /// [`append_input_metrics`](Self::append_input_metrics),
+    /// [`sealed_candidate_health`](Self::sealed_candidate_health), the sealed
+    /// tier's per-segment accessors, and the canonical registry fold's
+    /// high-water marks) plus the append-outcome, group-shape and backlog
+    /// counters this bone added. Nothing here is authoritative that was not
+    /// authoritative before: see
+    /// [`observability::AUTHORITY_MODEL`](crate::observability::AUTHORITY_MODEL).
+    ///
+    /// Cost: this walks the installed sealed segments and takes a short read
+    /// lock on the record book, so it is a **diagnostic** call, not something
+    /// to poll in a tight loop. [`metrics`](Self::metrics) remains the cheap
+    /// scalar surface.
+    #[must_use]
+    pub fn observability(&self) -> EngineObservability {
+        let m = self.metrics();
+        let seal = self.inner.seal_metrics.snapshot();
+        let durability = self.inner.owner.durability;
+        let outcomes = &self.inner.owner.status.outcomes;
+
+        // --- accelerators: one row per installed sealed segment ------------
+        let mut rows: Vec<SealedSegmentReport> = self
+            .inner
+            .sealed
+            .segments_with_gens()
+            .into_iter()
+            .map(|(sref, generation)| {
+                let evicted = self.inner.sealed.is_evicted(sref.segment_id());
+                SealedSegmentReport::of(&sref, generation, evicted)
+            })
+            .collect();
+        rows.sort_unstable_by_key(|r| r.segment_id);
+        let seal_pack_segments = rows
+            .iter()
+            .filter(|r| r.representation == SealedRepresentation::SealPack)
+            .count();
+        let sealed_index_resident_bytes: u64 =
+            rows.iter().map(|r| r.resident_bytes).sum();
+        let sealed_install_generation =
+            rows.iter().map(|r| r.install_generation).max().unwrap_or(0);
+
+        // --- canonical registry high-water marks ---------------------------
+        let (stream_hwm, category_hwm, event_type_hwm, dict_hwm) = {
+            let book = self.inner.book.read().expect("book lock");
+            let st = &book.registry;
+            (
+                st.stream_high_water_mark(),
+                st.category_high_water_mark(),
+                st.event_type_high_water_mark(),
+                st.dict_high_water_mark(),
+            )
+        };
+
+        let health = &self.inner.candidate_health;
+        EngineObservability {
+            authority:    AUTHORITY_MODEL,
+            owner:        OwnerReport {
+                durability_mode:       DurabilityMode::of(durability),
+                queue_slots_in_use:    m.owner_intent_slots_in_use,
+                queue_slots_capacity:  OWNER_RING_CAPACITY,
+                queue_bytes_in_use:    m.owner_intent_bytes_in_use,
+                queue_bytes_capacity:  OWNER_RING_BYTES,
+                group_width:           outcomes.group_width.snapshot(),
+                group_wait:            outcomes.group_wait.snapshot(),
+                ack_latency:           outcomes.ack.snapshot(),
+                commit_latency:        outcomes.commit_latency.snapshot(),
+                conflicts:             outcomes.conflicts.get(),
+                cancellations:         outcomes.cancellations.get(),
+                groups:                m.commit.groups,
+                batches:               m.commit.batches,
+                events:                m.commit.events,
+                bytes:                 m.commit.bytes,
+                outcome_scratch_slots: m.owner_outcome_scratch_retained_slots,
+                outcome_scratch_bytes: m.owner_outcome_scratch_retained_bytes,
+                outcome_scratch_trims: m.owner_outcome_scratch_trims,
+                append_input:          self.append_input_metrics(),
+            },
+            durability:   DurabilityReport::compose(
+                durability,
+                &m.commit,
+                &seal,
+                m.degraded_poisoned,
+                self.inner.owner.chain_enabled,
+            ),
+            state:        StateReport {
+                log_format_version: mess_log::format::FORMAT_VERSION,
+                published_watermark: m.total_events,
+                durable_watermark: m.durable_watermark,
+                active_index_applied_end: self.inner.active.applied_end(),
+                active_segment_age_secs: m.active_segment_age_secs,
+                sealed_segment_count: m.sealed_segment_count,
+                sealed_install_generation,
+                sealed_index_resident_bytes,
+                block_cache_entries: m.cache_entries,
+                block_cache_bytes: m.cache_weight_bytes,
+                block_cache_hits: m.cache_hits,
+                block_cache_misses: m.cache_misses,
+                block_cache_hit_rate: m.cache_hit_rate,
+                registry_stream_hwm: stream_hwm,
+                registry_category_hwm: category_hwm,
+                registry_event_type_hwm: event_type_hwm,
+                registry_dict_hwm: dict_hwm,
+                recover_payload_decodes: self.inner.recover_decodes,
+            },
+            accelerators: AcceleratorReport {
+                seal_pack_enabled: self.inner.seal_pack,
+                seal_pack_segments,
+                loose_sidecar_segments: rows.len() - seal_pack_segments,
+                segments: rows,
+            },
+            fallbacks:    FallbackReport {
+                sealed_candidates_refuted:     m.sealed_candidates_refuted,
+                sealed_candidates_quarantined: m.sealed_candidates_quarantined,
+                quarantine_failures:           m
+                    .sealed_candidate_quarantine_failures,
+                refutations:                   health.refutations.clone(),
+                registry_delta_admitted:       self.inner.reg_delta_admitted,
+                registry_delta_fallback:       self.inner.reg_delta_fallback,
+                seals_skipped:                 m.seals_skipped,
+            },
+            backlog:      BacklogReport {
+                reseals_owed_at_open: m.sealed_reseals_enqueued,
+                pending_reseal:       health.pending_reseal.clone(),
+                seal_queue_depth:     self
+                    .inner
+                    .seal_queue_depth
+                    .load(Ordering::Relaxed),
+                seal_jobs_dequeued:   self
+                    .inner
+                    .seal_jobs_dequeued
+                    .load(Ordering::Relaxed),
+                seals_completed:      m.seals,
+                seals_skipped:        m.seals_skipped,
+                seal_duration:        m.seal_duration,
+            },
         }
     }
 
@@ -4649,7 +4977,14 @@ impl LogEngine {
         let intent = OwnerIntent {
             kind,
             cost,
-            completion: OwnerCompletion { _permit: permit, done },
+            completion: OwnerCompletion {
+                _permit: permit,
+                done,
+                // bn-11ba: one `Arc` clone + one `Instant::now` per append
+                // batch (not per event) — see `OwnerCompletion`.
+                status: Arc::clone(&self.inner.owner.status),
+                queued: Instant::now(),
+            },
         };
         self.inner
             .owner
@@ -5490,6 +5825,9 @@ mod seal_skip_tests {
             Arc::clone(&seal_metrics),
             shutdown_deadline,
             spin,
+            // bn-11ba: the backlog gauge + drain counter this loop maintains.
+            Arc::new(AtomicUsize::new(1)),
+            Arc::new(AtomicU64::new(0)),
         );
         let elapsed = start.elapsed();
 
@@ -5548,6 +5886,9 @@ mod seal_skip_tests {
             Arc::clone(&seal_metrics),
             shutdown_deadline,
             spin,
+            // bn-11ba: the backlog gauge + drain counter this loop maintains.
+            Arc::new(AtomicUsize::new(1)),
+            Arc::new(AtomicU64::new(0)),
         );
         let elapsed = start.elapsed();
 

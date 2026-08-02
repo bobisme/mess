@@ -7,7 +7,9 @@
 //! implement.
 //!
 //! Commands:
-//! - [`doctor`] — lock, epoch, footer/trailer, sidecar, fsync, fold-version.
+//! - [`doctor`] — lock, epoch, footer/trailer, sidecar, fsync, fold-version,
+//!   and the [`authority`] view (which state is canonical, which is discardable
+//!   acceleration, and what the engine falls back to).
 //! - [`inspect`] — segment chain, stream heads, registry.
 //! - [`verify`] — the recovery scanner over every corruption class.
 //! - [`rebuild`] — I5: rebuild pointer sidecars (byte-equal) + meta.
@@ -15,6 +17,7 @@
 //! - [`backup`] / [`restore`] — bn-2ln online backup: consistent cut,
 //!   incremental copy, retention lease ([`lease`]).
 
+pub mod authority;
 pub mod backup;
 pub mod doctor;
 pub mod format;

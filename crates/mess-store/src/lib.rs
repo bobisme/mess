@@ -51,6 +51,7 @@ pub mod cache;
 pub mod engine;
 #[cfg(feature = "mock")]
 pub mod mock;
+pub mod observability;
 pub mod pack_snapshot;
 pub mod registry;
 pub mod retry;
@@ -86,6 +87,16 @@ pub use mess_core::{Actor, BoxedStoreError, CommandError};
 pub use mess_log::committer::Durability;
 #[cfg(feature = "mock")]
 pub use mock::MockBackend;
+// bn-11ba: the composed observability account
+// (`LogEngine::observability`). `AUTHORITY_MODEL` is the one ADR-0002
+// authority table the engine report and the offline `mess doctor`
+// authority view both render.
+pub use observability::{
+    AUTHORITY_MODEL, AcceleratorReport, ArtifactClass, BacklogReport,
+    DurabilityMode, DurabilityReport, EngineObservability, FallbackReport,
+    OwnerReport, Role, SealedRepresentation, SealedSegmentReport, StateReport,
+    artifact_class,
+};
 pub use pack_snapshot::{
     PackBackendError, PackSnapshotBackend, SaveMode, Sidecar, SidecarOptions,
 };

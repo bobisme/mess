@@ -53,6 +53,7 @@ use std::path::Path;
 use mess_index::sealed::segment::SealedSegmentIndex;
 use serde_json::json;
 
+use crate::authority;
 use crate::lockprobe::{self, LockState};
 use crate::metaread;
 use crate::report::{Finding, Report, Severity};
@@ -77,6 +78,11 @@ pub fn run(dir: &Path, opts: &DoctorOptions) -> Report {
     let lock = lockprobe::probe(dir);
     check_lock(&mut report, &lock);
     check_segments(&mut report, dir);
+    // bn-11ba: the authority view — canonical vs discardable, per-segment
+    // accelerator inventory, and the fallback the engine would take. Runs
+    // after the segment walk so its summary reads against the same on-disk
+    // state the per-segment findings above describe.
+    authority::check(&mut report, dir);
     check_quarantine(&mut report, dir);
     check_fsync(&mut report, dir);
     check_fold_version(&mut report, dir, opts);
