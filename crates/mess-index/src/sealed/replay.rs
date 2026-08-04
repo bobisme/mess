@@ -220,6 +220,94 @@ impl ReplaySet {
         Ok(out)
     }
 
+    /// **Seeking stream replay** (bn-1u6p): the batches of `stream_id` that
+    /// hold `from_version` or any later version, version-ascending, decoding
+    /// only enough blocks to cover `max_events` events at or past
+    /// `from_version`.
+    ///
+    /// This is the sealed-tier twin of
+    /// [`ActiveIndex::stream_entries_from`](crate::active::ActiveIndex::stream_entries_from),
+    /// and it exists for the same reason: a *paged* read of a deep stream must
+    /// cost O(page), not O(stream history).
+    /// [`stream_replay`](Self::stream_replay) answers "the whole stream"
+    /// and is the right shape for a projection rebuild; serving one page
+    /// through it makes every page of a 1.37M-event stream pay 140 ms of
+    /// entry resolution to deliver 0.2 ms of records (measured, bn-e93g).
+    ///
+    /// Two facts already in the format make the seek free:
+    ///
+    /// - each segment's per-stream directory entry records the stream's **head
+    ///   version in that segment**
+    ///   ([`stream_head`](crate::sealed::segment::SealedSegmentIndex::stream_head)),
+    ///   so a segment whose head is below the cursor is skipped **without
+    ///   decoding its block at all** — the directory probe is a hash lookup;
+    /// - a decoded block is **version-ascending by construction**, so the first
+    ///   batch at or past the cursor is a binary search inside the one segment
+    ///   that straddles it.
+    ///
+    /// # Batch granularity
+    ///
+    /// Entries are batches, so the batch **straddling** the cursor
+    /// (`first_version < from_version <= last_version`) IS returned — the
+    /// caller needs it to serve the events at and past the cursor and trims
+    /// the earlier frames itself. `partition_point` on `last_version <
+    /// from_version` is what keeps it in.
+    ///
+    /// # Boundedness contract
+    ///
+    /// The walk stops as soon as the returned entries cover `max_events`
+    /// events at or past `from_version`. So the result is **truncated only
+    /// when it is also over-full**: if it covers fewer than `max_events`
+    /// events, it is the complete sealed remainder of the stream. Callers
+    /// merging this with another tier rely on that (see `LogEngine`'s
+    /// sealed/hot merge) — a short result can be trusted to have no missing
+    /// suffix.
+    pub fn stream_replay_from(
+        &self,
+        stream_id: u64,
+        from_version: u64,
+        max_events: usize,
+        cache: &BlockCache,
+    ) -> Result<Vec<StreamEntry>, DecodeError> {
+        let mut out: Vec<StreamEntry> = Vec::new();
+        let mut covered = 0usize;
+        for seg in &self.segments {
+            if covered >= max_events {
+                break;
+            }
+            // Directory probe only: a segment whose head for this stream is
+            // below the cursor is skipped without touching its block.
+            match seg.stream_head(stream_id) {
+                None => continue,
+                Some(head) if head < from_version => continue,
+                Some(_) => {}
+            }
+            let block = cache.get_or_load(seg, stream_id)?;
+            // First batch whose LAST event is at/after the cursor — keeps the
+            // straddling batch.
+            let start =
+                block.partition_point(|e| e.last_version() < from_version);
+            for e in &block[start..] {
+                if covered >= max_events {
+                    break;
+                }
+                out.push(*e);
+                // Events this batch contributes at or past the cursor.
+                let lo = from_version.max(e.first_version);
+                covered += (e.last_version() - lo + 1) as usize;
+            }
+        }
+        debug_assert!(
+            out.windows(2).all(|w| w[0].first_version < w[1].first_version),
+            "seeking stream replay must be strictly version-ascending"
+        );
+        debug_assert!(
+            out.first().is_none_or(|e| e.last_version() >= from_version),
+            "seeking stream replay must not return pre-cursor batches"
+        );
+        Ok(out)
+    }
+
     /// **Batched coalesced stream replay**: replay each stream in `streams`,
     /// fanning the per-stream coalesces across the scoped-thread pool. Returns
     /// one `(stream_id, entries)` per input, **input order preserved**. This is
@@ -529,6 +617,173 @@ mod tests {
 
         // Absent stream.
         assert!(set.stream_replay(999, &cache).unwrap().is_empty());
+    }
+
+    /// bn-1u6p reference: the bounded seek must equal the whole-stream
+    /// coalesce filtered to `[from_version, ..)` and cut once `max_events`
+    /// events at or past the cursor are covered. Written independently of
+    /// [`ReplaySet::stream_replay_from`] so it is a real oracle.
+    fn seek_oracle(
+        all: &[StreamEntry],
+        from_version: u64,
+        max_events: usize,
+    ) -> Vec<StreamEntry> {
+        let mut out = Vec::new();
+        let mut covered = 0usize;
+        for e in all {
+            // A batch is in the answer iff any of its events is at or past
+            // the cursor — including one that STRADDLES it.
+            if e.last_version() < from_version {
+                continue;
+            }
+            if covered >= max_events {
+                break;
+            }
+            out.push(*e);
+            covered += (e.last_version() - from_version.max(e.first_version)
+                + 1) as usize;
+        }
+        out
+    }
+
+    /// Exhaustive cursor x limit sweep over a three-segment stream: every
+    /// cursor from before the start to past the head, at page sizes that cut
+    /// inside a batch, at a batch boundary, and past the end.
+    #[test]
+    fn stream_replay_from_matches_filtered_whole_stream_replay() {
+        let set = sample_set();
+        let cache = BlockCache::disabled();
+        let all = set.stream_replay(10, &cache).unwrap();
+        // Stream 10 spans versions 0..=59 in six 10-frame batches across
+        // segments 1, 2, 3.
+        assert_eq!(all.len(), 6);
+        assert_eq!(all.last().unwrap().last_version(), 59);
+
+        for from in 0..=62u64 {
+            for max in [0usize, 1, 5, 9, 10, 11, 20, 60, 1_000] {
+                let got =
+                    set.stream_replay_from(10, from, max, &cache).unwrap();
+                assert_eq!(
+                    got,
+                    seek_oracle(&all, from, max),
+                    "stream 10, from_version {from}, max_events {max}"
+                );
+            }
+        }
+
+        // A stream present in only one segment, and an absent stream.
+        let all20 = set.stream_replay(20, &cache).unwrap();
+        for from in 0..=25u64 {
+            for max in [1usize, 10, 1_000] {
+                assert_eq!(
+                    set.stream_replay_from(20, from, max, &cache).unwrap(),
+                    seek_oracle(&all20, from, max),
+                    "stream 20, from_version {from}, max_events {max}"
+                );
+            }
+        }
+        assert!(
+            set.stream_replay_from(999, 0, 1_000, &cache).unwrap().is_empty()
+        );
+    }
+
+    /// The straddling batch is the one that silently drops records if the
+    /// partition predicate is off by one: with 10-frame batches, a cursor at
+    /// v25 sits inside the batch `[20, 29]`, which MUST be returned so the
+    /// caller can trim frames 20..24 itself.
+    #[test]
+    fn stream_replay_from_returns_the_batch_straddling_the_cursor() {
+        let set = sample_set();
+        let cache = BlockCache::disabled();
+        let got = set.stream_replay_from(10, 25, 1, &cache).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].first_version, 20);
+        assert_eq!(got[0].last_version(), 29);
+        // Exactly at a batch's first version: that batch, not the one before.
+        let got = set.stream_replay_from(10, 30, 1, &cache).unwrap();
+        assert_eq!(got[0].first_version, 30);
+        // Exactly at a batch's last version: still that batch.
+        let got = set.stream_replay_from(10, 29, 1, &cache).unwrap();
+        assert_eq!(got[0].first_version, 20);
+        // Past the head: nothing.
+        assert!(
+            set.stream_replay_from(10, 60, 1_000, &cache).unwrap().is_empty()
+        );
+    }
+
+    /// Structural boundedness, not wall-clock: a cursor inside the last
+    /// segment must DECODE only that segment's block. The earlier segments are
+    /// skipped on their directory head alone, so an enabled cache records one
+    /// miss and holds one block.
+    #[test]
+    fn stream_replay_from_decodes_only_the_segments_it_needs() {
+        let set = sample_set();
+
+        // Whole-stream replay: all three of stream 10's blocks.
+        let all_cache = BlockCache::with_budget_bytes(1 << 20, 16);
+        set.stream_replay(10, &all_cache).unwrap();
+        assert_eq!(all_cache.misses(), 3, "baseline touches every segment");
+        assert_eq!(all_cache.len(), 3);
+
+        // Seek into segment 3's range (versions 50..=59), page of 5.
+        let seek_cache = BlockCache::with_budget_bytes(1 << 20, 16);
+        let got = set.stream_replay_from(10, 52, 5, &seek_cache).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].ptr.segment_id, 3);
+        assert_eq!(
+            seek_cache.misses(),
+            1,
+            "a seek past segments 1 and 2 must not decode their blocks"
+        );
+        assert_eq!(seek_cache.len(), 1);
+
+        // A one-batch page from version 0 stops after the first segment's
+        // first batch: one block decoded, not three.
+        let page_cache = BlockCache::with_budget_bytes(1 << 20, 16);
+        let got = set.stream_replay_from(10, 0, 10, &page_cache).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(page_cache.misses(), 1);
+
+        // Past the head: no block decoded at all.
+        let none_cache = BlockCache::with_budget_bytes(1 << 20, 16);
+        assert!(
+            set.stream_replay_from(10, 1_000, 1_000, &none_cache)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(none_cache.misses(), 0);
+        assert_eq!(none_cache.len(), 0);
+    }
+
+    /// The contract the engine's sealed/hot merge leans on: a result shorter
+    /// than `max_events` is the COMPLETE remainder of the sealed stream, never
+    /// a truncated one.
+    #[test]
+    fn stream_replay_from_short_result_is_complete() {
+        let set = sample_set();
+        let cache = BlockCache::disabled();
+        let all = set.stream_replay(10, &cache).unwrap();
+        for from in 0..=59u64 {
+            for max in [1usize, 3, 10, 25, 100] {
+                let got =
+                    set.stream_replay_from(10, from, max, &cache).unwrap();
+                let covered: usize = got
+                    .iter()
+                    .map(|e| {
+                        (e.last_version() - from.max(e.first_version) + 1)
+                            as usize
+                    })
+                    .sum();
+                if covered < max {
+                    let want = seek_oracle(&all, from, usize::MAX);
+                    assert_eq!(
+                        got, want,
+                        "short result must be the whole remainder (from \
+                         {from}, max {max})"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
