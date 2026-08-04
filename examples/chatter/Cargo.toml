@@ -1,0 +1,50 @@
+[package]
+name = "chatter"
+version = "0.1.0"
+edition = "2024"
+workspace = "../../"
+
+[lib]
+name = "chatter"
+path = "src/lib.rs"
+
+[dependencies]
+mess-core = { workspace = true }
+mess-derive = { workspace = true }
+mess-store = { workspace = true }
+# The crate's `Id` newtype wraps `uuid::Uuid` (v7, time-ordered) and renders
+# as 26-char lowercase Crockford base32 — same shape as `examples/social`'s
+# `Id` (see `src/id.rs` for why the encoding matters to stream naming).
+uuid = { workspace = true }
+# The `#[derive(Event)]` expansion emits `#[derive(::serde::Serialize)]` /
+# `Deserialize` wrapper structs for each variant's payload, so any crate using
+# the derive needs `serde` as a direct dependency.
+serde = { version = "1.0.188", features = ["derive"] }
+# `Id`'s parse error (`id.rs`) is a `thiserror::Error` typed rejection, the
+# same domain-error convention `examples/social` uses.
+thiserror = { workspace = true }
+# rmp-serde: msgpack codec for the projection checkpoint sidecar and the
+# store-config sidecar. Same choice (and same reasoning) as
+# `examples/social`: it is the codec `#[derive(Event)]` already uses for
+# event payloads, so the checkpoint reuses the workspace's established
+# serialization strategy instead of introducing a second one, and a truncated
+# file reliably fails to decode (the corrupt-checkpoint rebuild path).
+rmp-serde = "1"
+tokio = { workspace = true }
+# `chatter bench` emits its cell timings as JSON on stdout so an A/B harness
+# can consume them directly (bn-1m6c). serde_json is already the workspace's
+# JSON codec (mess-core, mess-cli, mess-bench all use it) — no new format
+# enters the tree.
+serde_json = "1"
+# A tiny, explicitly-seeded PRNG for the deterministic corpus. `fastrand` is
+# already in-tree (mess_db) and — unlike `rand`'s `StdRng` — its
+# `Rng::with_seed` stream is a plain documented wyrand sequence, which is all
+# a corpus generator needs. Nothing here is security-sensitive.
+fastrand = "2"
+
+[[bin]]
+name = "chatter"
+path = "src/bin/chatter.rs"
+
+[dev-dependencies]
+mess-testkit = { workspace = true }
