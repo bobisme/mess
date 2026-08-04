@@ -222,19 +222,42 @@ The bone (bn-1m6c) filed this example so the following became measurable from
 Backward paging cost is **linear in the channel's stream depth and independent
 of page size** — at `--scale large`, release build, one machine:
 
-| channel | stream events | ms per page (100 records) |
+| channel | stream events | ms per page (20 records) |
 |---|---|---|
-| `#storage` | ~1.37 M | ~122 |
-| `#oncall` | ~596 k | ~53 |
-| `#hiring` | ~160 k | ~10 |
-| `#growth` | ~38 k | ~1.8 |
+| `#storage` | 1,370,418 | ~142 |
+| `#oncall` | 595,966 | ~62 |
+| `#hiring` | 160,467 | ~10 |
+| `#growth` | 38,212 | ~1.9 |
 
-A 20-record page and a 1,000-record page on `#storage` both cost ~130 ms, so
-this is a fixed per-`read_stream` seek cost that scales with how deep the stream
-is, not with how much of it you asked for. Whether that is worth attacking is a
-question for a bone with a measurement behind it — but until this example
-existed, `examples/` could not ask the question at all, because no example
-stream was ever more than one event deep.
+A 20-record page and a 5,000-record page on `#storage` both cost ~145 ms, so
+this is a fixed per-`read_stream` cost that scales with how deep the stream is,
+not with how much of it you asked for. Until this example existed, `examples/`
+could not ask the question at all, because no example stream was ever more than
+one event deep.
+
+**bn-e93g named the mechanism and found that scroll-back was the least of it.**
+`LogEngine::read_stream` pushes the cursor and the limit into the index only on
+the *unsealed* branch (`ActiveIndex::stream_entries_from`, which binary-searches
+to the cursor and stops once the page is covered — bn-2ib). The **sealed**
+branch calls `sealed_and_hot_entries(sid)`, which takes neither cursor nor
+limit: it coalesces *every* batch entry of the stream across *every* sealed
+segment into a `BTreeMap` and returns the whole list, which `read_stream` then
+skips through linearly. At 1.37 M events that is 137 ms of entry resolution
+(60 % `BTreeMap` inserts, 24 % the final `collect`) wrapped around **0.2 ms** of
+actual page materialisation — and a read positioned at the head that returns
+zero records still costs 135 ms. On a twin corpus seeded identically but with a
+segment size large enough that nothing seals, the same page on the same
+132,555-event stream costs **0.01 ms instead of 9.5 ms**.
+
+The consequence nobody had costed is on the *write* path, not the scroll-back
+path. `EventStore::load` pages from position 0 with `limit = 1000`, so a
+cache-miss rehydration of a sealed stream pays that whole-stream resolve once
+per page — quadratic. Rehydrating `#storage` measures **180 s**; the same
+aggregate on the unsealed twin extrapolates to ~1.4 s. And a snapshot does not
+fix it: a snapshot bounds the *number* of `read_stream` calls, not the cost of
+each, so even a correctly snapshotted deep aggregate pays a ~140 ms floor that
+grows with total stream depth forever. The fix is named and bounded in bn-e93g:
+give the sealed tier the seek the active tier already has.
 
 By contrast, the checkpoint resume is doing exactly what it promises: at
 `--scale large` the read model rebuilds from the log in **8.15 s** and resumes
