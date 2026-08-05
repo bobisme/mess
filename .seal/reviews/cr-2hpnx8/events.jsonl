@@ -1,0 +1,3 @@
+{"ts":"2026-08-04T23:22:14.641436145Z","author":"opus-21ow","event":"ReviewCreated","data":{"review_id":"cr-2hpnx8","jj_change_id":"detached:e8f67cedc8782697669e8b95665b35b49a343d61","scm_kind":"git","scm_anchor":"detached:e8f67cedc8782697669e8b95665b35b49a343d61","initial_commit":"e8f67cedc8782697669e8b95665b35b49a343d61","title":"bn-21ow: refactor: extract the seal/roll/reseal machinery from engine.rs (move-only seam split, part 2 of 3)"}}
+{"ts":"2026-08-04T23:22:14.641567603Z","author":"opus-21ow","event":"ReviewersRequested","data":{"review_id":"cr-2hpnx8","reviewers":["mess-dev"]}}
+{"ts":"2026-08-05T03:47:07.432264919Z","author":"mess-dev","event":"ReviewApproved","data":{"review_id":"cr-2hpnx8"}}
