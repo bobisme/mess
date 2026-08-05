@@ -1,0 +1,3 @@
+{"ts":"2026-08-05T04:03:46.349053981Z","author":"sonnet-3g9f","event":"ReviewCreated","data":{"review_id":"cr-1vtt8d","jj_change_id":"detached:6602eed78978a168d37c3fde8fef0d5a29f92be8","scm_kind":"git","scm_anchor":"detached:6602eed78978a168d37c3fde8fef0d5a29f92be8","initial_commit":"6602eed78978a168d37c3fde8fef0d5a29f92be8","title":"bn-3g9f: refactor: extract open/recovery from engine.rs (move-only seam split, part 3 of 3)"}}
+{"ts":"2026-08-05T04:03:46.349185699Z","author":"sonnet-3g9f","event":"ReviewersRequested","data":{"review_id":"cr-1vtt8d","reviewers":["mess-dev"]}}
+{"ts":"2026-08-05T04:07:04.313382430Z","author":"mess-dev","event":"ReviewApproved","data":{"review_id":"cr-1vtt8d"}}
