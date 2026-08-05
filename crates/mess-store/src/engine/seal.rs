@@ -372,6 +372,17 @@ fn finalize_footer(
     Ok(())
 }
 
+/// White-box unit tests for `bn-u6o` items 1 and 3:
+/// [`LogEngine::run_roll_sealer`]'s bounded per-segment wait, and the bounded
+/// TOTAL shutdown wait [`Inner::drop`] arranges via the shared
+/// `shutdown_deadline`. Both drive `run_roll_sealer` directly with a synthetic
+/// [`SegmentSummary`] whose `end_pos` an intentionally never-advanced
+/// [`ActiveIndex`]/published watermark can never reach — the shape of a
+/// publish an abandoned append future left stranded — so the skip path is
+/// forced deterministically instead of waiting out the real ~10s default
+/// bound. This needs access to private items (`run_roll_sealer`,
+/// `SpinConfig`), so it lives inside this module rather than as a `tests/`
+/// integration test.
 #[cfg(test)]
 mod seal_skip_tests {
     use mess_index::sealed::SealedStore;
